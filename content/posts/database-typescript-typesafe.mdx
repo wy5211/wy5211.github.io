@@ -1,0 +1,1249 @@
+---
+title: "数据库设计与 TypeScript 类型安全"
+date: "2026-01-05"
+summary: "深入探讨关系型数据库设计原则，Prisma ORM 的全面解析，以及如何在整个全栈应用中实现端到端的类型安全数据库操作。"
+tags: ["数据库", "Prisma", "TypeScript", "类型安全", "全栈开发"]
+category: "技术"
+cover: ""
+draft: false
+---
+
+# 数据库设计与 TypeScript 类型安全
+
+在全栈开发中，数据库是应用的核心。一个良好设计的数据库可以支撑应用的长期发展，而类型安全的数据库操作则能在编译时和运行时保证数据的正确性。
+
+本文将深入探讨关系型数据库设计、Prisma ORM 的使用，以及如何构建类型安全的数据库层。
+
+## 关系型数据库设计原则
+
+### 数据库设计基础
+
+关系型数据库基于关系模型，使用表格（Table）、行（Row）、列（Column）来存储数据。
+
+**核心概念**：
+
+```sql
+-- 用户表
+CREATE TABLE users (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  name VARCHAR(255) NOT NULL,
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  role ENUM('admin', 'user') DEFAULT 'user',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- 文章表
+CREATE TABLE posts (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  title VARCHAR(255) NOT NULL,
+  content TEXT NOT NULL,
+  author_id INT NOT NULL,
+  status ENUM('draft', 'published', 'archived') DEFAULT 'draft',
+  published_at TIMESTAMP NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- 评论表
+CREATE TABLE comments (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  content TEXT NOT NULL,
+  author_id INT NOT NULL,
+  post_id INT NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE
+);
+```
+
+### 规范化（Normalization）
+
+规范化是减少数据冗余、提高数据一致性的设计原则。
+
+**第一范式（1NF）**：每个字段都是原子的，不可再分
+
+```sql
+-- ❌ 违反 1NF
+CREATE TABLE users (
+  id INT PRIMARY KEY,
+  name VARCHAR(255),
+  tags VARCHAR(255) -- "tech, design, programming"
+);
+
+-- ✅ 符合 1NF
+CREATE TABLE users (
+  id INT PRIMARY KEY,
+  name VARCHAR(255)
+);
+
+CREATE TABLE user_tags (
+  user_id INT,
+  tag VARCHAR(50),
+  FOREIGN KEY (user_id) REFERENCES users(id)
+);
+```
+
+**第二范式（2NF）**：非主键字段必须完全依赖于主键
+
+```sql
+-- ❌ 违反 2NF
+CREATE TABLE order_items (
+  id INT PRIMARY KEY,
+  order_id INT,
+  product_id INT,
+  product_name VARCHAR(255), -- 依赖于 product_id，而非 (order_id, product_id)
+  quantity INT
+);
+
+-- ✅ 符合 2NF
+CREATE TABLE order_items (
+  id INT PRIMARY KEY,
+  order_id INT,
+  product_id INT,
+  quantity INT
+);
+
+CREATE TABLE products (
+  id INT PRIMARY KEY,
+  name VARCHAR(255)
+);
+```
+
+**第三范式（3NF）**：非主键字段不能依赖于其他非主键字段
+
+```sql
+-- ❌ 违反 3NF
+CREATE TABLE users (
+  id INT PRIMARY KEY,
+  name VARCHAR(255),
+  city VARCHAR(255),
+  state VARCHAR(255), -- 依赖于 city
+  zip_code VARCHAR(10)
+);
+
+-- ✅ 符合 3NF
+CREATE TABLE users (
+  id INT PRIMARY KEY,
+  name VARCHAR(255),
+  city_id INT,
+  FOREIGN KEY (city_id) REFERENCES cities(id)
+);
+
+CREATE TABLE cities (
+  id INT PRIMARY KEY,
+  name VARCHAR(255),
+  state VARCHAR(255),
+  zip_code VARCHAR(10)
+);
+```
+
+### 索引设计
+
+索引是提高查询性能的关键，但需要平衡查询性能和写入性能。
+
+**何时创建索引**：
+
+```sql
+-- 1. WHERE 子句中的字段
+CREATE INDEX idx_user_email ON users(email);
+
+-- 2. JOIN 条件中的字段
+CREATE INDEX idx_post_author ON posts(author_id);
+
+-- 3. ORDER BY 中的字段
+CREATE INDEX idx_post_published ON posts(published_at DESC);
+
+-- 4. 组合索引（多字段查询）
+CREATE INDEX idx_post_status_published ON posts(status, published_at DESC);
+```
+
+**索引最佳实践**：
+
+```sql
+-- ✅ 为高频查询字段创建索引
+CREATE INDEX idx_user_email ON users(email);
+CREATE INDEX idx_post_author_status ON posts(author_id, status);
+
+-- ❌ 避免过度索引
+CREATE INDEX idx_user_name ON users(name); -- name 很少用于查询
+CREATE INDEX idx_user_created ON users(created_at); -- created_at 很少单独使用
+
+-- ✅ 复合索引注意顺序
+-- 经常按 status 和 created_at 查询
+CREATE INDEX idx_post_status_date ON posts(status, published_at DESC);
+
+-- ✅ 使用覆盖索引
+CREATE INDEX idx_post_list ON posts(author_id, status, published_at, title);
+-- 查询 SELECT title FROM posts WHERE author_id = ? AND status = ?
+-- 只需访问索引，无需回表
+```
+
+### 外键和关系
+
+```sql
+-- 一对一关系（User -> Profile）
+CREATE TABLE profiles (
+  user_id INT PRIMARY KEY,
+  bio TEXT,
+  avatar_url VARCHAR(255),
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- 一对多关系（User -> Posts）
+CREATE TABLE posts (
+  id INT PRIMARY KEY AUTO_INCREMENT,
+  author_id INT NOT NULL,
+  title VARCHAR(255),
+  FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE SET NULL
+);
+
+-- 多对多关系（User -> Roles）
+CREATE TABLE user_roles (
+  user_id INT,
+  role_id INT,
+  assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+  FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE,
+  PRIMARY KEY (user_id, role_id)
+);
+```
+
+## Prisma ORM 深入解析
+
+Prisma 是一个现代的 TypeScript-first ORM，提供了类型安全的数据库访问、自动迁移和强大的查询能力。
+
+### 安装和初始化
+
+```bash
+# 安装 Prisma
+npm install prisma --save-dev
+npm install @prisma/client
+
+# 初始化 Prisma
+npx prisma init
+
+# 生成 Prisma Client
+npx prisma generate
+```
+
+### Prisma Schema 设计
+
+```prisma
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql" // 或 "mysql", "sqlite", "mongodb"
+  url      = env("DATABASE_URL")
+}
+
+// 模型定义
+model User {
+  id            Int       @id @default(autoincrement())
+  name          String
+  email         String    @unique
+  passwordHash  String    @map("password_hash")
+  role          UserRole  @default(USER)
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // 关系
+  posts         Post[]
+  comments      Comment[]
+  profile       Profile?
+
+  @@map("users") // 指定表名
+}
+
+model Profile {
+  id        Int      @id @default(autoincrement())
+  userId    Int      @unique @map("user_id")
+  bio       String?
+  avatarUrl String?  @map("avatar_url")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // 关系
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("profiles")
+}
+
+model Post {
+  id          Int          @id @default(autoincrement())
+  title       String
+  content     String       @db.Text
+  status      PostStatus   @default(DRAFT)
+  publishedAt DateTime?    @map("published_at")
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+
+  // 关系
+  authorId    Int          @map("author_id")
+  author      User         @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments    Comment[]
+
+  @@index([authorId, status])
+  @@index([publishedAt(sort: Desc)])
+  @@map("posts")
+}
+
+model Comment {
+  id        Int      @id @default(autoincrement())
+  content   String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // 关系
+  authorId  Int      @map("author_id")
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  postId    Int      @map("post_id")
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@index([postId, createdAt(sort: Desc)])
+  @@map("comments")
+}
+
+// 枚举
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum PostStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+```
+
+### 数据库迁移
+
+```bash
+# 创建迁移（自动生成）
+npx prisma migrate dev --name init
+
+# 应用迁移
+npx prisma migrate deploy
+
+# 查看迁移状态
+npx prisma migrate status
+
+# 重置数据库（开发环境）
+npx prisma migrate reset
+
+# 生成迁移 SQL（不执行）
+npx prisma migrate diff --from-empty --to-schema-datamodel prisma/schema.prisma --script > migration.sql
+```
+
+**迁移文件示例**：
+
+```prisma
+// prisma/migrations/20240308_init/migration.sql
+
+-- CreateTable
+CREATE TABLE "users" (
+    "id" SERIAL NOT NULL,
+    "name" VARCHAR(255) NOT NULL,
+    "email" VARCHAR(255) NOT NULL,
+    "password_hash" VARCHAR(255) NOT NULL,
+    "role" "UserRole" NOT NULL DEFAULT 'USER',
+    "created_at" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updated_at" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "users_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateIndex
+CREATE UNIQUE INDEX "users_email_key" ON "users"("email");
+
+-- CreateEnum
+CREATE TYPE "UserRole" AS ENUM ('USER', 'ADMIN');
+
+-- CreateEnum
+CREATE TYPE "PostStatus" AS ENUM ('DRAFT', 'PUBLISHED', 'ARCHIVED');
+```
+
+**种子数据（Seeding）**：
+
+```typescript
+// prisma/seed.ts
+import { PrismaClient } from '@prisma/client';
+import * as bcrypt from 'bcrypt';
+
+const prisma = new PrismaClient();
+
+async function main() {
+  // 创建管理员用户
+  const hashedPassword = await bcrypt.hash('admin123', 10);
+
+  const admin = await prisma.user.upsert({
+    where: { email: 'admin@example.com' },
+    update: {},
+    create: {
+      name: 'Admin',
+      email: 'admin@example.com',
+      passwordHash: hashedPassword,
+      role: 'ADMIN'
+    }
+  });
+
+  // 创建示例文章
+  await prisma.post.create({
+    data: {
+      title: 'Welcome to Our Blog',
+      content: 'This is the first post...',
+      status: 'PUBLISHED',
+      publishedAt: new Date(),
+      authorId: admin.id
+    }
+  });
+
+  console.log('Database seeded successfully!');
+}
+
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });
+```
+
+```bash
+# 配置 package.json
+{
+  "prisma": {
+    "seed": "ts-node prisma/seed.ts"
+  }
+}
+
+# 运行种子
+npx prisma db seed
+```
+
+### Prisma Client 使用
+
+```typescript
+// lib/db.ts
+import { PrismaClient } from '@prisma/client';
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+export const prisma = globalForPrisma.prisma ?? new PrismaClient();
+
+if (process.env.NODE_ENV !== 'production') {
+  globalForPrisma.prisma = prisma;
+}
+```
+
+```typescript
+// 基础 CRUD 操作
+
+// 创建（Create）
+const newUser = await prisma.user.create({
+  data: {
+    name: 'Alice',
+    email: 'alice@example.com',
+    passwordHash: 'hashed_password',
+    role: 'USER'
+  }
+});
+
+// 批量创建
+const users = await prisma.user.createMany({
+  data: [
+    { name: 'Bob', email: 'bob@example.com', passwordHash: 'hash1', role: 'USER' },
+    { name: 'Charlie', email: 'charlie@example.com', passwordHash: 'hash2', role: 'USER' }
+  ]
+});
+
+// 读取（Read）
+const user = await prisma.user.findUnique({
+  where: { id: 1 }
+});
+
+const userByEmail = await prisma.user.findUnique({
+  where: { email: 'alice@example.com' }
+});
+
+// 查找多个
+const users = await prisma.user.findMany({
+  where: { role: 'ADMIN' }
+});
+
+// 带关系查询
+const userWithPosts = await prisma.user.findUnique({
+  where: { id: 1 },
+  include: {
+    posts: {
+      include: {
+        comments: true
+      }
+    }
+  }
+});
+
+// 更新（Update）
+const updatedUser = await prisma.user.update({
+  where: { id: 1 },
+  data: {
+    name: 'Alice Updated',
+    role: 'ADMIN'
+  }
+});
+
+// 更新或创建
+const user = await prisma.user.upsert({
+  where: { email: 'alice@example.com' },
+  update: { name: 'Alice Updated' },
+  create: {
+    name: 'Alice',
+    email: 'alice@example.com',
+    passwordHash: 'hashed_password',
+    role: 'USER'
+  }
+});
+
+// 批量更新
+const result = await prisma.user.updateMany({
+  where: { role: 'USER' },
+  data: { role: 'ADMIN' }
+});
+
+// 删除（Delete）
+const deletedUser = await prisma.user.delete({
+  where: { id: 1 }
+});
+
+// 批量删除
+const result = await prisma.user.deleteMany({
+  where: { role: 'ADMIN' }
+});
+```
+
+### 高级查询
+
+```typescript
+// 条件查询
+const users = await prisma.user.findMany({
+  where: {
+    email: { endsWith: '@example.com' },
+    createdAt: { gte: new Date('2024-01-01') },
+    OR: [
+      { name: { contains: 'Alice' } },
+      { email: { contains: 'alice' } }
+    ],
+    NOT: { role: 'ADMIN' }
+  }
+});
+
+// 排序和分页
+const posts = await prisma.post.findMany({
+  where: { status: 'PUBLISHED' },
+  orderBy: {
+    publishedAt: 'desc'
+  },
+  skip: 0,    // 偏移量
+  take: 10,   // 返回数量
+  cursor: { id: lastId } // 游标分页
+});
+
+// 选择字段
+const users = await prisma.user.findMany({
+  select: {
+    id: true,
+    name: true,
+    email: true
+    // 不返回 passwordHash
+  }
+});
+
+// 关联查询
+const posts = await prisma.post.findMany({
+  include: {
+    author: {
+      select: {
+        id: true,
+        name: true,
+        email: true
+      }
+    },
+    comments: {
+      orderBy: { createdAt: 'desc' },
+      take: 5
+    }
+  }
+});
+
+// 聚合查询
+const stats = await prisma.user.aggregate({
+  _count: true,        // 总数
+  _sum: { id: true }, // 总和（id 只是为了演示）
+  _avg: { id: true }, // 平均值
+  _min: { id: true }, // 最小值
+  _max: { id: true }  // 最大值
+});
+
+// 分组查询
+const postsByAuthor = await prisma.post.groupBy({
+  by: ['authorId'],
+  _count: { id: true },
+  having: {
+    id: { _count: { gt: 5 } }
+  }
+});
+```
+
+### 事务处理
+
+```typescript
+// 简单事务
+await prisma.$transaction(async (tx) => {
+  const user = await tx.user.create({
+    data: { name: 'Alice', email: 'alice@example.com', passwordHash: 'hash', role: 'USER' }
+  });
+
+  await tx.post.create({
+    data: {
+      title: 'First Post',
+      content: 'Hello World',
+      authorId: user.id,
+      status: 'PUBLISHED'
+    }
+  });
+});
+
+// 交互式事务
+const result = await prisma.$transaction([
+  prisma.user.create({ data: { name: 'Bob', email: 'bob@example.com', passwordHash: 'hash', role: 'USER' } }),
+  prisma.post.create({ data: { title: 'Post 1', content: 'Content', authorId: 1, status: 'PUBLISHED' } }),
+  prisma.post.create({ data: { title: 'Post 2', content: 'Content', authorId: 1, status: 'PUBLISHED' } })
+]);
+
+// 带隔离级别的事务
+await prisma.$transaction(
+  async (tx) => {
+    const user = await tx.user.findUnique({ where: { email: 'alice@example.com' } });
+    if (!user) throw new Error('User not found');
+
+    await tx.post.create({
+      data: {
+        title: 'New Post',
+        content: 'Content',
+        authorId: user.id,
+        status: 'PUBLISHED'
+      }
+    });
+  },
+  {
+    maxWait: 5000,    // 最大等待时间
+    timeout: 10000,    // 事务超时
+    isolationLevel: 'ReadCommitted' // 隔离级别
+  }
+);
+```
+
+## 类型安全的数据库操作
+
+### 从 Prisma 推断类型
+
+```typescript
+// 直接使用 Prisma 生成的类型
+import { User, Post, Prisma } from '@prisma/client';
+
+const user: User = {
+  id: 1,
+  name: 'Alice',
+  email: 'alice@example.com',
+  passwordHash: 'hash',
+  role: 'USER',
+  createdAt: new Date(),
+  updatedAt: new Date()
+};
+
+// 类型安全的查询结果
+const user = await prisma.user.findUnique({
+  where: { id: 1 }
+});
+// user 的类型是 User | null
+
+const users = await prisma.user.findMany();
+// users 的类型是 User[]
+
+// 带关系查询的类型
+const userWithPosts = await prisma.user.findUnique({
+  where: { id: 1 },
+  include: {
+    posts: true
+  }
+});
+// userWithPosts 的类型是 User & { posts: Post[] }
+```
+
+### Prisma 类型工具
+
+```typescript
+import { Prisma } from '@prisma/client';
+
+// UserCreateInput：创建用户时的输入类型
+type CreateUserInput = Prisma.UserCreateInput;
+
+// UserUpdateInput：更新用户时的输入类型
+type UpdateUserInput = Prisma.UserUpdateInput;
+
+// UserWhereInput：查询条件类型
+type UserWhereInput = Prisma.UserWhereInput;
+
+// 使用
+function createUser(data: CreateUserInput) {
+  return prisma.user.create({ data });
+}
+
+function findUsers(where: UserWhereInput) {
+  return prisma.user.findMany({ where });
+}
+```
+
+### 排除敏感字段
+
+```typescript
+// 不包含密码的用户类型
+type PublicUser = Omit<User, 'passwordHash'>;
+
+async function getPublicUser(id: number): Promise<PublicUser | null> {
+  const user = await prisma.user.findUnique({
+    where: { id }
+  });
+
+  if (!user) return null;
+
+  const { passwordHash, ...publicUser } = user;
+  return publicUser;
+}
+
+// 使用 select
+async function getPublicUser(id: number) {
+  return prisma.user.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      name: true,
+      email: true,
+      role: true,
+      createdAt: true,
+      updatedAt: true
+    }
+  });
+}
+```
+
+### DTO 和 Entity 转换
+
+```typescript
+// 创建 DTO（不包含所有字段）
+interface CreateUserDto {
+  name: string;
+  email: string;
+  password: string;
+  role?: 'USER' | 'ADMIN';
+}
+
+interface UpdateUserDto {
+  name?: string;
+  email?: string;
+  role?: 'USER' | 'ADMIN';
+}
+
+// 类型安全的 DTO 到 Entity 转换
+async function createUser(dto: CreateUserDto): Promise<PublicUser> {
+  const passwordHash = await hashPassword(dto.password);
+
+  const user = await prisma.user.create({
+    data: {
+      name: dto.name,
+      email: dto.email,
+      passwordHash,
+      role: dto.role || 'USER'
+    }
+  });
+
+  return toPublicUser(user);
+}
+
+async function updateUser(id: number, dto: UpdateUserDto): Promise<PublicUser> {
+  const user = await prisma.user.update({
+    where: { id },
+    data: dto
+  });
+
+  return toPublicUser(user);
+}
+
+// Entity 到 DTO 转换
+function toPublicUser(user: User): PublicUser {
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt
+  };
+}
+```
+
+### 分页和排序类型
+
+```typescript
+interface PaginationParams {
+  page: number;
+  limit: number;
+  sortBy?: string;
+  sortOrder?: 'asc' | 'desc';
+}
+
+interface PaginatedResult<T> {
+  data: T[];
+  total: number;
+  page: number;
+  limit: number;
+  totalPages: number;
+}
+
+async function findPaginatedUsers(
+  params: PaginationParams
+): Promise<PaginatedResult<User>> {
+  const { page, limit, sortBy = 'createdAt', sortOrder = 'desc' } = params;
+
+  const [data, total] = await Promise.all([
+    prisma.user.findMany({
+      skip: (page - 1) * limit,
+      take: limit,
+      orderBy: {
+        [sortBy]: sortOrder
+      }
+    }),
+    prisma.user.count()
+  ]);
+
+  return {
+    data,
+    total,
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit)
+  };
+}
+```
+
+## 索引优化与查询性能
+
+### 查询分析
+
+```sql
+-- PostgreSQL EXPLAIN ANALYZE
+EXPLAIN ANALYZE
+SELECT * FROM users WHERE email = 'alice@example.com';
+
+-- 输出示例：
+-- Index Scan using users_email_key on users  (cost=0.28..8.29 rows=1 width=...)
+--   Index Cond: (email = 'alice@example.com'::text)
+```
+
+```typescript
+// Prisma 查询日志
+const prisma = new PrismaClient({
+  log: [
+    { level: 'query', emit: 'event' },
+    { level: 'error', emit: 'stdout' }
+  ]
+});
+
+prisma.$on('query', (e) => {
+  console.log('Query: ' + e.query);
+  console.log('Duration: ' + e.duration + 'ms');
+});
+```
+
+### 索引优化策略
+
+```prisma
+// prisma/schema.prisma
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String?
+
+  @@index([email]) // 单列索引
+  @@index([name])  // 用于 LIKE 查询
+}
+
+model Post {
+  id        String   @id @default(cuid())
+  title     String
+  status    PostStatus
+  publishedAt DateTime?
+
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id])
+
+  // 复合索引
+  @@index([authorId, status]) // 查询作者的特定状态文章
+  @@index([status, publishedAt(sort: Desc)]) // 按状态和发布时间查询
+  @@index([publishedAt(sort: Desc)]) // 最新文章列表
+}
+```
+
+### 查询优化技巧
+
+```typescript
+// ❌ N+1 查询问题
+const posts = await prisma.post.findMany();
+for (const post of posts) {
+  const author = await prisma.user.findUnique({
+    where: { id: post.authorId }
+  });
+  // 对每个 post 都执行一次查询
+}
+
+// ✅ 使用 include
+const posts = await prisma.post.findMany({
+  include: {
+    author: true
+  }
+});
+
+// ❌ 过度查询
+const posts = await prisma.post.findMany({
+  include: {
+    author: {
+      include: {
+        posts: true
+      }
+    }
+  }
+});
+
+// ✅ 只查询需要的字段
+const posts = await prisma.post.findMany({
+  include: {
+    author: {
+      select: {
+        id: true,
+        name: true
+      }
+    }
+  }
+});
+```
+
+## 性能调优
+
+### 连接池配置
+
+```typescript
+// lib/db.ts
+import { PrismaClient } from '@prisma/client';
+
+export const prisma = new PrismaClient({
+  datasources: {
+    db: {
+      url: process.env.DATABASE_URL
+    }
+  },
+  log: ['query', 'error', 'warn'],
+  errorFormat: 'pretty'
+});
+
+// 连接池配置（环境变量）
+// DATABASE_URL="postgresql://user:password@localhost:5432/db?connection_limit=10&pool_timeout=20"
+```
+
+### 批量操作
+
+```typescript
+// ❌ 循环插入
+for (const user of users) {
+  await prisma.user.create({ data: user });
+}
+
+// ✅ 批量插入
+await prisma.user.createMany({
+  data: users
+});
+
+// ❌ 循环更新
+for (const user of users) {
+  await prisma.user.update({
+    where: { id: user.id },
+    data: user
+  });
+}
+
+// ✅ 批量更新
+await prisma.user.updateMany({
+  where: { id: { in: users.map(u => u.id) } },
+  data: { role: 'ADMIN' }
+});
+```
+
+### 缓存策略
+
+```typescript
+import { unstable_cache } from 'next/cache';
+
+// 缓存数据库查询
+export const getCachedUser = unstable_cache(
+  async (id: string) => {
+    return prisma.user.findUnique({ where: { id } });
+  },
+  ['user', id],
+  {
+    revalidate: 3600, // 1 小时
+    tags: ['users']
+  }
+);
+
+// 使用
+export default async function UserPage({ params }: { params: { id: string } }) {
+  const user = await getCachedUser(params.id);
+  // ...
+}
+
+// 数据修改时清除缓存
+'use server';
+import { revalidateTag } from 'next/cache';
+
+export async function updateUser(id: string, data: UpdateUserDto) {
+  await prisma.user.update({ where: { id }, data });
+  revalidateTag('users');
+}
+```
+
+## 实践案例：博客系统数据库层
+
+### Repository 模式
+
+```typescript
+// lib/repositories/user.repository.ts
+import { prisma } from '@/lib/db';
+import type { User, Prisma } from '@prisma/client';
+
+export type CreateUserInput = Prisma.UserCreateInput;
+export type UpdateUserInput = Prisma.UserUpdateInput;
+
+export class UserRepository {
+  async findById(id: number): Promise<User | null> {
+    return prisma.user.findUnique({ where: { id } });
+  }
+
+  async findByEmail(email: string): Promise<User | null> {
+    return prisma.user.findUnique({ where: { email } });
+  }
+
+  async findAll(params: {
+    skip?: number;
+    take?: number;
+    where?: Prisma.UserWhereInput;
+  }): Promise<User[]> {
+    const { skip = 0, take = 10, where } = params;
+    return prisma.user.findMany({
+      where,
+      skip,
+      take,
+      orderBy: { createdAt: 'desc' }
+    });
+  }
+
+  async count(where?: Prisma.UserWhereInput): Promise<number> {
+    return prisma.user.count({ where });
+  }
+
+  async create(data: CreateUserInput): Promise<User> {
+    return prisma.user.create({ data });
+  }
+
+  async update(id: number, data: UpdateUserInput): Promise<User> {
+    return prisma.user.update({ where: { id }, data });
+  }
+
+  async delete(id: number): Promise<User> {
+    return prisma.user.delete({ where: { id } });
+  }
+
+  async findWithPosts(id: number): Promise<User | null> {
+    return prisma.user.findUnique({
+      where: { id },
+      include: {
+        posts: {
+          where: { status: 'PUBLISHED' },
+          orderBy: { publishedAt: 'desc' }
+        }
+      }
+    });
+  }
+}
+
+export const userRepository = new UserRepository();
+```
+
+```typescript
+// lib/repositories/post.repository.ts
+import { prisma } from '@/lib/db';
+import type { Post, Prisma } from '@prisma/client';
+
+export type CreatePostInput = Omit<Prisma.PostCreateInput, 'authorId'>;
+
+export class PostRepository {
+  async findById(id: number): Promise<Post | null> {
+    return prisma.post.findUnique({ where: { id } });
+  }
+
+  async findAll(params: {
+    page?: number;
+    limit?: number;
+    authorId?: number;
+    status?: Prisma.PostStatusWhereInput;
+  }): Promise<{ posts: Post[]; total: number }> {
+    const { page = 1, limit = 10, authorId, status } = params;
+    const where: Prisma.PostWhereInput = {};
+
+    if (authorId) where.authorId = authorId;
+    if (status) where.status = status;
+
+    const [posts, total] = await Promise.all([
+      prisma.post.findMany({
+        where,
+        skip: (page - 1) * limit,
+        take: limit,
+        orderBy: { publishedAt: 'desc' }
+      }),
+      prisma.post.count({ where })
+    ]);
+
+    return { posts, total };
+  }
+
+  async create(authorId: number, data: CreatePostInput): Promise<Post> {
+    return prisma.post.create({
+      data: {
+        ...data,
+        authorId
+      }
+    });
+  }
+
+  async update(id: number, data: Prisma.PostUpdateInput): Promise<Post> {
+    return prisma.post.update({ where: { id }, data });
+  }
+
+  async delete(id: number): Promise<Post> {
+    return prisma.post.delete({ where: { id } });
+  }
+
+  async publish(id: number): Promise<Post> {
+    return prisma.post.update({
+      where: { id },
+      data: {
+        status: 'PUBLISHED',
+        publishedAt: new Date()
+      }
+    });
+  }
+}
+
+export const postRepository = new PostRepository();
+```
+
+### Service 层
+
+```typescript
+// lib/services/user.service.ts
+import { userRepository } from '@/repositories/user.repository';
+import type { CreateUserInput, UpdateUserInput } from '@/repositories/user.repository';
+import * as bcrypt from 'bcrypt';
+
+export class UserService {
+  async getPublicUser(id: number) {
+    const user = await userRepository.findById(id);
+
+    if (!user) {
+      throw new Error('User not found');
+    }
+
+    const { passwordHash, ...publicUser } = user;
+    return publicUser;
+  }
+
+  async createUser(data: CreateUserInput & { password: string }) {
+    // 检查邮箱是否已存在
+    const existing = await userRepository.findByEmail(data.email);
+    if (existing) {
+      throw new Error('Email already exists');
+    }
+
+    // 哈希密码
+    const passwordHash = await bcrypt.hash(data.password, 10);
+
+    const { password, ...userData } = data;
+
+    return userRepository.create({
+      ...userData,
+      passwordHash
+    });
+  }
+
+  async updateUser(id: number, data: UpdateUserInput) {
+    return userRepository.update(id, data);
+  }
+
+  async deleteUser(id: number) {
+    return userRepository.delete(id);
+  }
+
+  async verifyPassword(email: string, password: string): Promise<boolean> {
+    const user = await userRepository.findByEmail(email);
+
+    if (!user) {
+      return false;
+    }
+
+    return bcrypt.compare(password, user.passwordHash);
+  }
+}
+
+export const userService = new UserService();
+```
+
+## 总结
+
+数据库设计和类型安全是全栈开发的基石。通过 Prisma ORM，你可以获得类型安全的数据库操作，同时充分利用关系型数据库的强大功能。
+
+### 核心要点
+
+1. **数据库设计原则**：规范化、合理索引、正确的关系设计
+2. **Prisma Schema**：定义数据模型和关系
+3. **类型安全**：利用 Prisma 生成的类型，避免手动类型注解
+4. **Repository 模式**：封装数据库操作，提高可维护性
+5. **性能优化**：合理使用索引、批量操作、缓存
+
+### 最佳实践
+
+- 使用 Prisma 迁移管理数据库 schema
+- 遵循数据库设计原则，合理设计表结构
+- 利用 Prisma 的类型推断，减少手动类型定义
+- 实现 Repository 和 Service 层，提高代码可维护性
+- 定期分析和优化查询性能
+- 使用缓存减少数据库负载
+
+良好的数据库设计能够支撑应用的长期发展，而类型安全则能保证数据的正确性和一致性。
