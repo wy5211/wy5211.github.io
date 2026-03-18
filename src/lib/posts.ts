@@ -3,6 +3,8 @@ import path from "path";
 import matter from "gray-matter";
 import { compileMDX } from "next-mdx-remote/rsc";
 import { ReactElement } from "react";
+import rehypeRaw from "rehype-raw";
+import remarkGfm from "remark-gfm";
 
 const postsDirectory = path.join(process.cwd(), "content/posts");
 
@@ -95,7 +97,13 @@ export async function getPostBySlug(slug: string): Promise<Post | null> {
     draft: boolean;
   }>({
     source: fileContents,
-    options: { parseFrontmatter: true },
+    options: {
+      parseFrontmatter: true,
+      mdxOptions: {
+        remarkPlugins: [remarkGfm],
+        rehypePlugins: [rehypeRaw],
+      },
+    },
   });
 
   return {
