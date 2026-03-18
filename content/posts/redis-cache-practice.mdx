@@ -1,0 +1,478 @@
+---
+title: "Redis 缓存实战：Node.js 项目中的高效缓存策略"
+date: "2026-03-18"
+summary: "从零开始掌握 Redis 缓存在 Node.js 项目中的实战应用，包括数据结构选择、缓存策略、常见问题解决方案（穿透/击穿/雪崩）以及性能优化技巧。"
+tags: ["Redis", "Node.js", "缓存", "性能优化", "后端"]
+category: "后端"
+cover: ""
+draft: false
+---
+
+# Redis 缓存实战：Node.js 项目中的高效缓存策略
+
+Redis 是全栈项目中最常用的缓存方案，也是后端工程师必须掌握的核心技能。本文将从实战角度出发，带你掌握 Redis 在 Node.js 项目中的应用。
+
+## 为什么需要 Redis？
+
+在 Web 应用中，性能瓶颈通常出现在数据库查询。当用户量增长，频繁的数据库查询会导致：
+
+- **响应变慢**：复杂查询可能需要几百毫秒甚至几秒
+- **数据库压力**：高并发下数据库连接池耗尽
+- **系统不稳定**：数据库成为单点故障源
+
+Redis 作为内存数据库，读写速度可达 **10万+ QPS**，比 MySQL 快 **100 倍**以上。合理的缓存策略能让接口响应时间从秒级降到毫秒级。
+
+## Redis 核心数据结构与使用场景
+
+### 1. String（字符串）
+
+最基础的类型，适合存储简单键值对。
+
+```typescript
+// 常见用途：缓存用户信息、配置项、计数器
+import Redis from 'ioredis';
+
+const redis = new Redis({
+  host: 'localhost',
+  port: 6379,
+  password: 'your-password', // 生产环境务必设置密码
+  db: 0,
+});
+
+// 缓存用户信息
+await redis.set('user:1001', JSON.stringify({
+  id: 1001,
+  name: '张三',
+  email: 'zhangsan@example.com',
+}), 'EX', 3600); // 1小时过期
+
+// 读取缓存
+const userStr = await redis.get('user:1001');
+const user = userStr ? JSON.parse(userStr) : null;
+
+// 计数器（文章阅读量）
+await redis.incr('article:views:100');
+
+// 批量操作
+await redis.mset('key1', 'value1', 'key2', 'value2');
+const values = await redis.mget('key1', 'key2');
+```
+
+### 2. Hash（哈希）
+
+适合存储对象，比 String 更灵活。
+
+```typescript
+// 用户 Session 存储
+await redis.hset('session:abc123', {
+  userId: '1001',
+  username: 'zhangsan',
+  role: 'admin',
+  loginAt: Date.now().toString(),
+});
+await redis.expire('session:abc123', 86400); // 24小时过期
+
+// 获取单个字段
+const userId = await redis.hget('session:abc123', 'userId');
+
+// 获取所有字段
+const session = await redis.hgetall('session:abc123');
+
+// 购物车存储
+await redis.hset('cart:user:1001', 'product:2001', '2'); // 商品ID -> 数量
+await redis.hincrby('cart:user:1001', 'product:2001', 1); // 加1
+```
+
+### 3. List（列表）
+
+适合存储有序集合，如消息队列、最新列表。
+
+```typescript
+// 最新文章列表（只保留最新100篇）
+await redis.lpush('articles:latest', JSON.stringify({
+  id: 100,
+  title: 'Redis 缓存实战',
+  createdAt: Date.now(),
+}));
+await redis.ltrim('articles:latest', 0, 99); // 只保留前100条
+
+// 获取列表
+const latestArticles = await redis.lrange('articles:latest', 0, 9);
+
+// 简单消息队列
+await redis.rpush('task:queue', JSON.stringify({ type: 'email', to: 'user@example.com' }));
+const task = await redis.lpop('task:queue');
+```
+
+### 4. Set（集合）
+
+适合存储不重复元素，如标签、关注关系。
+
+```typescript
+// 文章标签
+await redis.sadd('article:100:tags', 'Redis', 'Node.js', '缓存');
+
+// 获取标签
+const tags = await redis.smembers('article:100:tags');
+
+// 用户关注关系
+await redis.sadd('user:1001:following', '2001', '2002', '2003');
+await redis.sadd('user:2001:followers', '1001');
+
+// 共同关注
+const mutual = await redis.sinter('user:1001:following', 'user:1002:following');
+
+// 判断是否关注（O(1) 复杂度）
+const isFollowing = await redis.sismember('user:1001:following', '2001');
+```
+
+### 5. Sorted Set（有序集合）
+
+适合排行榜、延时队列等场景。
+
+```typescript
+// 排行榜
+await redis.zadd('leaderboard:daily', 100, 'user:1001');
+await redis.zincrby('leaderboard:daily', 10, 'user:1001'); // 加10分
+
+// 获取前10名（从高到低）
+const top10 = await redis.zrevrange('leaderboard:daily', 0, 9, 'WITHSCORES');
+
+// 获取用户排名
+const rank = await redis.zrevrank('leaderboard:daily', 'user:1001');
+
+// 延时队列（score 为执行时间戳）
+await redis.zadd('delayed:tasks', Date.now() + 60000, JSON.stringify({
+  id: 'task1',
+  type: 'reminder',
+}));
+
+// 查询到期任务
+const due = await redis.zrangebyscore('delayed:tasks', 0, Date.now());
+```
+
+## 缓存策略实战
+
+### Cache-Aside Pattern（旁路缓存）
+
+最常用的模式：先查缓存，没有则查数据库并写入缓存。
+
+```typescript
+async function getUser(userId: string) {
+  const cacheKey = `user:${userId}`;
+  
+  // 1. 先查缓存
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+  
+  // 2. 缓存未命中，查数据库
+  const user = await db.user.findUnique({ where: { id: userId } });
+  if (!user) {
+    return null;
+  }
+  
+  // 3. 写入缓存，设置过期时间
+  await redis.set(cacheKey, JSON.stringify(user), 'EX', 3600);
+  
+  return user;
+}
+
+// 更新数据时：先更新数据库，再删除缓存
+async function updateUser(userId: string, data: object) {
+  // 1. 更新数据库
+  await db.user.update({ where: { id: userId }, data });
+  
+  // 2. 删除缓存（下次查询会重新加载）
+  await redis.del(`user:${userId}`);
+}
+```
+
+### Write-Through Pattern（写穿透）
+
+写入时同时更新缓存和数据库。
+
+```typescript
+async function setUser(userId: string, data: object) {
+  const cacheKey = `user:${userId}`;
+  
+  // 1. 更新数据库
+  const user = await db.user.update({
+    where: { id: userId },
+    data,
+  });
+  
+  // 2. 更新缓存
+  await redis.set(cacheKey, JSON.stringify(user), 'EX', 3600);
+  
+  return user;
+}
+```
+
+## 缓存三大问题及解决方案
+
+### 1. 缓存穿透（Cache Penetration）
+
+**问题**：查询不存在的数据，请求直接打到数据库。
+
+**解决方案：缓存空值 + 布隆过滤器**
+
+```typescript
+async function getUser(userId: string) {
+  const cacheKey = `user:${userId}`;
+  
+  // 查缓存
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    const data = JSON.parse(cached);
+    // 空值标记
+    if (data.__null__) return null;
+    return data;
+  }
+  
+  // 查数据库
+  const user = await db.user.findUnique({ where: { id: userId } });
+  
+  if (!user) {
+    // 缓存空值，防止穿透
+    await redis.set(cacheKey, JSON.stringify({ __null__: true }), 'EX', 60);
+    return null;
+  }
+  
+  await redis.set(cacheKey, JSON.stringify(user), 'EX', 3600);
+  return user;
+}
+```
+
+### 2. 缓存击穿（Cache Breakdown）
+
+**问题**：热点数据过期瞬间，大量请求同时访问数据库。
+
+**解决方案：互斥锁 + 永不过期**
+
+```typescript
+async function getHotData(key: string) {
+  const cached = await redis.get(key);
+  if (cached) return JSON.parse(cached);
+  
+  // 获取分布式锁
+  const lockKey = `lock:${key}`;
+  const locked = await redis.set(lockKey, '1', 'NX', 'EX', 10);
+  
+  if (locked) {
+    try {
+      // 获取锁成功，查数据库
+      const data = await db.getData(key);
+      await redis.set(key, JSON.stringify(data), 'EX', 3600);
+      return data;
+    } finally {
+      await redis.del(lockKey);
+    }
+  } else {
+    // 等待并重试
+    await sleep(100);
+    return getHotData(key);
+  }
+}
+
+// 方案2：逻辑过期（缓存永不过期，后台异步刷新）
+async function getWithLogicalExpiry(key: string) {
+  const cached = await redis.get(key);
+  if (!cached) {
+    return refreshCache(key);
+  }
+  
+  const data = JSON.parse(cached);
+  
+  // 检查逻辑过期时间
+  if (data.expireAt < Date.now()) {
+    // 异步刷新（不阻塞当前请求）
+    refreshCache(key).catch(console.error);
+  }
+  
+  return data.value;
+}
+```
+
+### 3. 缓存雪崩（Cache Avalanche）
+
+**问题**：大量缓存同时过期，数据库压力骤增。
+
+**解决方案：随机过期时间 + 多级缓存**
+
+```typescript
+// 随机过期时间
+function getRandomExpire(baseSeconds: number) {
+  const random = Math.random() * 0.2 + 0.9; // 0.9 ~ 1.1
+  return Math.floor(baseSeconds * random);
+}
+
+await redis.set(key, value, 'EX', getRandomExpire(3600));
+
+// 多级缓存：本地缓存 + Redis
+import NodeCache from 'node-cache';
+
+const localCache = new NodeCache({ stdTTL: 60, maxKeys: 1000 });
+
+async function getWithMultiCache(key: string) {
+  // L1: 本地缓存
+  const local = localCache.get(key);
+  if (local) return local;
+  
+  // L2: Redis
+  const remote = await redis.get(key);
+  if (remote) {
+    localCache.set(key, JSON.parse(remote));
+    return JSON.parse(remote);
+  }
+  
+  // L3: 数据库
+  const data = await db.getData(key);
+  await redis.set(key, JSON.stringify(data), 'EX', 3600);
+  localCache.set(key, data, 60);
+  
+  return data;
+}
+```
+
+## 实战：完整缓存封装
+
+```typescript
+// cache.ts
+import Redis from 'ioredis';
+
+class CacheService {
+  private redis: Redis;
+  private prefix: string;
+  
+  constructor(options: { prefix?: string } = {}) {
+    this.redis = new Redis(process.env.REDIS_URL!);
+    this.prefix = options.prefix || 'app:';
+  }
+  
+  private getKey(key: string) {
+    return `${this.prefix}${key}`;
+  }
+  
+  // 获取或设置缓存
+  async getOrSet<T>(
+    key: string,
+    fetcher: () => Promise<T>,
+    ttl: number = 3600
+  ): Promise<T> {
+    const fullKey = this.getKey(key);
+    const cached = await this.redis.get(fullKey);
+    
+    if (cached) {
+      const data = JSON.parse(cached);
+      if (data.__null__) return null as T;
+      return data;
+    }
+    
+    const data = await fetcher();
+    
+    if (data === null) {
+      await this.redis.set(fullKey, JSON.stringify({ __null__: true }), 'EX', 60);
+    } else {
+      await this.redis.set(fullKey, JSON.stringify(data), 'EX', ttl);
+    }
+    
+    return data;
+  }
+  
+  // 删除缓存
+  async del(key: string): Promise<void> {
+    await this.redis.del(this.getKey(key));
+  }
+  
+  // 批量删除（支持通配符）
+  async delPattern(pattern: string): Promise<number> {
+    const keys = await this.redis.keys(this.getKey(pattern));
+    if (keys.length === 0) return 0;
+    return this.redis.del(...keys);
+  }
+  
+  // 健康检查
+  async healthCheck(): Promise<boolean> {
+    try {
+      await this.redis.ping();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+export const cache = new CacheService({ prefix: 'myapp:' });
+
+// 使用示例
+const user = await cache.getOrSet(
+  `user:${userId}`,
+  () => db.user.findUnique({ where: { id: userId } }),
+  3600
+);
+
+// 更新时删除缓存
+await cache.del(`user:${userId}`);
+```
+
+## 性能优化建议
+
+1. **连接池管理**：使用单例模式，避免频繁创建连接
+
+2. **Pipeline 批量操作**：减少网络往返
+
+```typescript
+const pipeline = redis.pipeline();
+for (let i = 0; i < 1000; i++) {
+  pipeline.set(`key:${i}`, `value:${i}`);
+}
+await pipeline.exec();
+```
+
+3. **合理的 Key 设计**：使用冒号分隔，便于管理
+
+```typescript
+// 好的设计
+user:1001:profile
+user:1001:settings
+article:2001:content
+
+// 避免
+user_1001_profile_random_string
+```
+
+4. **监控内存使用**：设置 maxmemory 和淘汰策略
+
+```
+# redis.conf
+maxmemory 2gb
+maxmemory-policy allkeys-lru
+```
+
+5. **持久化配置**：根据场景选择 RDB 或 AOF
+
+```
+# RDB（快照，适合备份）
+save 900 1
+save 300 10
+
+# AOF（日志，数据更安全）
+appendonly yes
+appendfsync everysec
+```
+
+## 小结
+
+Redis 缓存是提升系统性能的利器，但需要根据业务场景选择合适的策略：
+
+| 场景 | 推荐方案 |
+|------|----------|
+| 用户信息 | String + Cache-Aside |
+| 购物车 | Hash |
+| 排行榜 | Sorted Set |
+| 消息队列 | List |
+| 分布式锁 | SET NX EX |
+
+记住：**缓存是锦上添花，不是雪中送炭**。先优化数据库查询和索引，再引入缓存，才能发挥最大价值。
