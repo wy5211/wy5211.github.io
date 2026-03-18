@@ -1,0 +1,964 @@
+---
+title: "全栈状态管理实战：从 Redux 到 Zustand 与服务端状态协调"
+date: "2026-03-18"
+summary: "深入探讨全栈应用中的状态管理策略，涵盖前端状态（Redux、Zustand、Jotai）、服务端状态（React Query、SWR）以及前后端状态同步的最佳实践"
+tags: ["状态管理", "Redux", "Zustand", "React Query", "全栈"]
+category: "全栈"
+cover: ""
+draft: false
+---
+
+# 全栈状态管理实战：从 Redux 到 Zustand 与服务端状态协调
+
+状态管理是全栈应用开发中最具挑战性的问题之一。前端需要管理 UI 状态、用户交互状态，后端需要管理业务状态、缓存状态，而两者之间的同步更是复杂。本文将系统性地探讨全栈状态管理的最佳实践。
+
+## 为什么状态管理如此复杂？
+
+### 状态的多样性
+
+在全栈应用中，我们需要处理多种类型的状态：
+
+1. **客户端状态**（Client State）
+   - UI 状态（模态框开关、表单输入）
+   - 应用状态（主题、语言偏好）
+   - 临时状态（加载中、错误提示）
+
+2. **服务端状态**（Server State）
+   - 数据库数据
+   - API 响应缓存
+   - 实时数据订阅
+
+3. **URL 状态**
+   - 路由参数
+   - 查询字符串
+   - 浏览器历史
+
+4. **全局状态 vs 本地状态**
+   - 需要跨组件共享的状态
+   - 组件内部私有的状态
+
+### 常见问题
+
+```typescript
+// 问题1: 状态不同步
+const UserList = () => {
+  const [users, setUsers] = useState([]); // 客户端状态
+  const { data } = useQuery("users"); // 服务端状态
+
+  // 两份数据可能不一致！
+};
+
+// 问题2: 过度使用全局状态
+const GlobalStore = createContext({
+  modalOpen: false, // 应该是本地状态
+  theme: "dark", // 应该是全局状态
+  userName: "", // 应该是服务端状态
+});
+
+// 问题3: 状态更新竞态条件
+const updateUser = async (id, data) => {
+  await fetch(`/api/users/${id}`, { method: "PUT", body: data });
+  // 同时其他地方也在更新，如何处理？
+};
+```
+
+## 前端状态管理方案对比
+
+### Redux：经典但繁琐
+
+Redux 是最早的状态管理方案之一，虽然强大，但样板代码较多。
+
+**优点：**
+
+- 可预测的状态变更
+- 强大的中间件生态
+- 时间旅行调试
+- 适合大型团队
+
+**缺点：**
+
+- 样板代码多
+- 学习曲线陡峭
+- 对简单场景过度设计
+
+```typescript
+// Redux 示例：典型的样板代码
+// 1. 定义 Action Types
+const INCREMENT = 'INCREMENT';
+const DECREMENT = 'DECREMENT';
+
+// 2. 定义 Action Creators
+const increment = (payload) => ({ type: INCREMENT, payload });
+const decrement = (payload) => ({ type: DECREMENT, payload });
+
+// 3. 定义 Reducer
+const counterReducer = (state = 0, action) => {
+  switch (action.type) {
+    case INCREMENT:
+      return state + action.payload;
+    case DECREMENT:
+      return state - action.payload;
+    default:
+      return state;
+  }
+};
+
+// 4. 创建 Store
+const store = createStore(counterReducer);
+
+// 5. 在组件中使用
+const Counter = () => {
+  const count = useSelector(state => state.count);
+  const dispatch = useDispatch();
+
+  return (
+    &lt;button onClick={() =&gt; dispatch(increment(1))}&gt;
+      Count: {count}
+    &lt;/button&gt;
+  );
+};
+```
+
+**Redux Toolkit 改进：**
+
+```typescript
+import { createSlice, configureStore } from '@reduxjs/toolkit';
+
+// 简化后的写法
+const counterSlice = createSlice({
+  name: 'counter',
+  initialState: { value: 0 },
+  reducers: {
+    increment: (state) =&gt; { state.value += 1; },
+    decrement: (state) =&gt; { state.value -= 1; },
+    incrementByAmount: (state, action) =&gt; {
+      state.value += action.payload;
+    },
+  },
+});
+
+const store = configureStore({
+  reducer: { counter: counterSlice.reducer },
+});
+
+// 组件中使用
+const Counter = () => {
+  const count = useSelector(state =&gt; state.counter.value);
+  const dispatch = useDispatch();
+
+  return (
+    &lt;button onClick={() =&gt; dispatch(increment())}&gt;
+      Count: {count}
+    &lt;/button&gt;
+  );
+};
+```
+
+### Zustand：简单而强大
+
+Zustand 是一个轻量级状态管理库，API 简洁直观。
+
+**优点：**
+
+- API 简单，学习成本低
+- 无需 Provider 包裹
+- TypeScript 支持优秀
+- 性能优秀（基于 hooks）
+- 支持中间件
+
+**缺点：**
+
+- 生态相对较小
+- 调试工具不如 Redux 完善
+
+```typescript
+import { create } from 'zustand';
+import { devtools, persist } from 'zustand/middleware';
+
+// 创建 store
+const useCounterStore = create(
+  devtools(
+    persist(
+      (set, get) =&gt; ({
+        count: 0,
+        increment: () =&gt; set({ count: get().count + 1 }),
+        decrement: () =&gt; set({ count: get().count - 1 }),
+        incrementByAmount: (amount) =&gt;
+          set({ count: get().count + amount }),
+        // 异步操作
+        fetchCount: async () =&gt; {
+          const response = await fetch('/api/count');
+          const data = await response.json();
+          set({ count: data.count });
+        },
+      }),
+      { name: 'counter-storage' }
+    ),
+    { name: 'CounterStore' }
+  )
+);
+
+// 组件中使用
+const Counter = () =&gt; {
+  const count = useCounterStore(state =&gt; state.count);
+  const increment = useCounterStore(state =&gt; state.increment);
+
+  // 选择器优化：只在 count 变化时重渲染
+  const doubleCount = useCounterStore(
+    state =&gt; state.count * 2,
+    (oldVal, newVal) =&gt; oldVal === newVal // 自定义比较函数
+  );
+
+  return (
+    &lt;div&gt;
+      &lt;p&gt;Count: {count}&lt;/p&gt;
+      &lt;p&gt;Double: {doubleCount}&lt;/p&gt;
+      &lt;button onClick={increment}&gt;Increment&lt;/button&gt;
+    &lt;/div&gt;
+  );
+};
+```
+
+**Zustand 高级用法：**
+
+```typescript
+// 1. 组合多个 store
+const useUserStore = create((set) =&gt; ({
+  user: null,
+  setUser: (user) =&gt; set({ user }),
+}));
+
+const useCartStore = create((set, get) =&gt; ({
+  items: [],
+  addItem: (item) =&gt; {
+    const user = useUserStore.getState().user;
+    if (!user) throw new Error('请先登录');
+    set({ items: [...get().items, item] });
+  },
+}));
+
+// 2. 动态创建 store（适用于列表项）
+const createItemStore = (id) =&gt;
+  create((set) =&gt; ({
+    id,
+    quantity: 1,
+    increase: () =&gt; set(s =&gt; ({ quantity: s.quantity + 1 })),
+  }));
+
+// 3. 订阅外部变化
+const useStore = create((set) =&gt; ({
+  value: 0,
+}));
+
+// 外部订阅
+useStore.subscribe((state, prevState) =&gt; {
+  if (state.value !== prevState.value) {
+    console.log('Value changed:', state.value);
+  }
+});
+```
+
+### Jotai：原子化状态管理
+
+Jotai 采用原子化（Atomic）设计，类似于 Recoil。
+
+**优点：**
+
+- 原子化设计，灵活性高
+- 自动依赖追踪
+- 无需额外配置即可实现细粒度更新
+- 适合复杂依赖关系
+
+**缺点：**
+
+- 概念较新，学习成本
+- 调试体验一般
+
+```typescript
+import { atom, useAtom, useAtomValue, useSetAtom } from 'jotai';
+
+// 基础 atom
+const countAtom = atom(0);
+
+// 派生 atom（只读）
+const doubleCountAtom = atom((get) =&gt; get(countAtom) * 2);
+
+// 可写派生 atom
+const incrementAtom = atom(
+  (get) =&gt; get(countAtom),
+  (get, set) =&gt; set(countAtom, get(countAtom) + 1)
+);
+
+// 异步 atom
+const userAtom = atom(async (get) =&gt; {
+  const response = await fetch('/api/user');
+  return response.json();
+});
+
+// 组件中使用
+const Counter = () =&gt; {
+  const [count, setCount] = useAtom(countAtom);
+  const doubleCount = useAtomValue(doubleCountAtom);
+  const increment = useSetAtom(incrementAtom);
+
+  return (
+    &lt;div&gt;
+      &lt;p&gt;Count: {count}&lt;/p&gt;
+      &lt;p&gt;Double: {doubleCount}&lt;/p&gt;
+      &lt;button onClick={() =&gt; increment()}&gt;Increment&lt;/button&gt;
+    &lt;/div&gt;
+  );
+};
+
+// 依赖关系示例
+const firstNameAtom = atom('John');
+const lastNameAtom = atom('Doe');
+const fullNameAtom = atom((get) =&gt;
+  `${get(firstNameAtom)} ${get(lastNameAtom)}`
+);
+```
+
+## 服务端状态管理
+
+### 为什么不能用客户端状态管理服务端数据？
+
+```typescript
+// ❌ 错误做法：用 Zustand 管理 API 数据
+const useUserStore = create((set) =&gt; ({
+  users: [],
+  fetchUsers: async () =&gt; {
+    const response = await fetch('/api/users');
+    const users = await response.json();
+    set({ users });
+  },
+}));
+
+// 问题：
+// 1. 没有缓存机制
+// 2. 没有自动重新验证
+// 3. 没有处理加载/错误状态
+// 4. 没有竞态条件处理
+// 5. 没有窗口聚焦时刷新
+```
+
+### React Query：服务端状态的最佳实践
+
+React Query 专为服务端状态设计，解决了上述所有问题。
+
+```typescript
+import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+
+// 基础查询
+const UserList = () =&gt; {
+  const { data, isLoading, error, refetch } = useQuery({
+    queryKey: ['users'],
+    queryFn: () =&gt; fetch('/api/users').then(r =&gt; r.json()),
+    staleTime: 5 * 60 * 1000, // 5分钟内认为数据新鲜
+    cacheTime: 10 * 60 * 1000, // 10分钟后清除缓存
+    refetchOnWindowFocus: true, // 窗口聚焦时刷新
+    retry: 3, // 失败重试3次
+  });
+
+  if (isLoading) return &lt;div&gt;Loading...&lt;/div&gt;;
+  if (error) return &lt;div&gt;Error: {error.message}&lt;/div&gt;;
+
+  return (
+    &lt;ul&gt;
+      {data.map(user =&gt; (
+        &lt;li key={user.id}&gt;{user.name}&lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+};
+
+// Mutation 和缓存更新
+const AddUser = () =&gt; {
+  const queryClient = useQueryClient();
+
+  const mutation = useMutation({
+    mutationFn: (newUser) =&gt;
+      fetch('/api/users', {
+        method: 'POST',
+        body: JSON.stringify(newUser),
+      }).then(r =&gt; r.json()),
+    onSuccess: (data) =&gt; {
+      // 方式1：让查询失效，触发重新获取
+      queryClient.invalidateQueries({ queryKey: ['users'] });
+
+      // 方式2：乐观更新
+      queryClient.setQueryData(['users'], (old) =&gt; [...old, data]);
+    },
+  });
+
+  return (
+    &lt;button onClick={() =&gt; mutation.mutate({ name: 'New User' })}&gt;
+      Add User
+    &lt;/button&gt;
+  );
+};
+
+// 乐观更新示例
+const UpdateUser = ({ userId }) =&gt; {
+  const queryClient = useQueryClient();
+
+  const mutation = useMutation({
+    mutationFn: (newName) =&gt;
+      fetch(`/api/users/${userId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name: newName }),
+      }),
+    onMutate: async (newName) =&gt; {
+      // 取消正在进行的查询
+      await queryClient.cancelQueries({ queryKey: ['users'] });
+
+      // 保存旧数据以便回滚
+      const previousUsers = queryClient.getQueryData(['users']);
+
+      // 乐观更新
+      queryClient.setQueryData(['users'], (old) =&gt;
+        old.map(user =&gt;
+          user.id === userId ? { ...user, name: newName } : user
+        )
+      );
+
+      return { previousUsers };
+    },
+    onError: (err, newName, context) =&gt; {
+      // 回滚
+      queryClient.setQueryData(['users'], context.previousUsers);
+    },
+    onSettled: () =&gt; {
+      queryClient.invalidateQueries({ queryKey: ['users'] });
+    },
+  });
+
+  return (
+    &lt;button onClick={() =&gt; mutation.mutate('Updated Name')}&gt;
+      Update
+    &lt;/button&gt;
+  );
+};
+
+// 预加载和并行查询
+const UserDashboard = () =&gt; {
+  // 并行查询
+  const [usersQuery, postsQuery] = useQueries({
+    queries: [
+      { queryKey: ['users'], queryFn: fetchUsers },
+      { queryKey: ['posts'], queryFn: fetchPosts },
+    ],
+  });
+
+  return (
+    &lt;div&gt;
+      &lt;UserList data={usersQuery.data} /&gt;
+      &lt;PostList data={postsQuery.data} /&gt;
+    &lt;/div&gt;
+  );
+};
+
+// 依赖查询
+const UserPosts = ({ userId }) =&gt; {
+  const { data: user } = useQuery({
+    queryKey: ['user', userId],
+    queryFn: () =&gt; fetchUser(userId),
+  });
+
+  const { data: posts } = useQuery({
+    queryKey: ['posts', userId],
+    queryFn: () =&gt; fetchUserPosts(userId),
+    enabled: !!user, // 只有在 user 加载完成后才执行
+  });
+
+  return &lt;div&gt;{/* ... */}&lt;/div&gt;;
+};
+```
+
+### SWR：轻量级替代方案
+
+SWR（stale-while-revalidate）是 Vercel 出品的轻量级方案。
+
+```typescript
+import useSWR, { SWRConfig } from 'swr';
+
+const fetcher = (url) =&gt; fetch(url).then(r =&gt; r.json());
+
+// 基础用法
+const UserList = () =&gt; {
+  const { data, error, isLoading, mutate } = useSWR('/api/users', fetcher, {
+    revalidateOnFocus: true,
+    refreshInterval: 3000, // 每3秒刷新一次
+  });
+
+  // 手动触发重新验证
+  const handleRefresh = () =&gt; mutate();
+
+  // 乐观更新
+  const handleAddUser = async (newUser) =&gt; {
+    mutate([...data, newUser], false); // 立即更新 UI
+    await fetch('/api/users', {
+      method: 'POST',
+      body: JSON.stringify(newUser),
+    });
+    mutate(); // 触发重新验证
+  };
+
+  if (isLoading) return &lt;div&gt;Loading...&lt;/div&gt;;
+  if (error) return &lt;div&gt;Error&lt;/div&gt;;
+
+  return &lt;ul&gt;{data.map(u =&gt; &lt;li key={u.id}&gt;{u.name}&lt;/li&gt;)}&lt;/ul&gt;;
+};
+
+// 全局配置
+const App = () =&gt; (
+  &lt;SWRConfig
+    value={{
+      fetcher,
+      revalidateOnFocus: false,
+      shouldRetryOnError: false,
+    }}
+  &gt;
+    &lt;UserList /&gt;
+  &lt;/SWRConfig&gt;
+);
+```
+
+## 前后端状态同步策略
+
+### 策略1：乐观更新 + 后端确认
+
+适用于用户交互频繁的场景（点赞、收藏）。
+
+```typescript
+const useLikePost = (postId) =&gt; {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: () =&gt; fetch(`/api/posts/${postId}/like`, { method: 'POST' }),
+    onMutate: () =&gt; {
+      // 乐观更新
+      queryClient.setQueryData(['post', postId], (old) =&gt; ({
+        ...old,
+        likes: old.likes + 1,
+        liked: true,
+      }));
+    },
+    onError: () =&gt; {
+      // 回滚
+      queryClient.invalidateQueries({ queryKey: ['post', postId] });
+    },
+  });
+};
+
+// 使用
+const LikeButton = ({ postId }) =&gt; {
+  const likeMutation = useLikePost(postId);
+
+  return (
+    &lt;button onClick={() =&gt; likeMutation.mutate()}&gt;
+      {likeMutation.isPending ? '...' : '❤️'}
+    &lt;/button&gt;
+  );
+};
+```
+
+### 策略2：实时同步（WebSocket）
+
+适用于协作应用（在线文档、聊天）。
+
+```typescript
+// 后端：NestJS WebSocket Gateway
+@WebSocketGateway()
+export class PostsGateway {
+  @WebSocketServer()
+  server: Server;
+
+  @SubscribeMessage('postUpdated')
+  async handlePostUpdated(
+    @MessageBody() postId: string,
+    @ConnectedSocket() client: Socket,
+  ) {
+    const post = await this.postsService.findById(postId);
+    // 广播给所有客户端
+    this.server.emit('postUpdated', post);
+  }
+}
+
+// 前端：自定义 hook
+const useRealtimePost = (postId) =&gt; {
+  const queryClient = useQueryClient();
+  const { data: post } = useQuery({
+    queryKey: ['post', postId],
+    queryFn: () =&gt; fetchPost(postId),
+  });
+
+  useEffect(() =&gt; {
+    const socket = io('ws://localhost:3000');
+
+    socket.on('postUpdated', (updatedPost) =&gt; {
+      queryClient.setQueryData(['post', postId], updatedPost);
+    });
+
+    return () =&gt; socket.disconnect();
+  }, [postId, queryClient]);
+
+  return post;
+};
+```
+
+### 策略3：增量同步（Delta Sync）
+
+适用于离线优先应用。
+
+```typescript
+const useOfflineSync = () =&gt; {
+  const [pendingChanges, setPendingChanges] = useState([]);
+
+  // 保存到本地存储
+  const saveLocal = (change) =&gt; {
+    const changes = JSON.parse(localStorage.getItem('pendingChanges') || '[]');
+    changes.push({ ...change, timestamp: Date.now() });
+    localStorage.setItem('pendingChanges', JSON.stringify(changes));
+    setPendingChanges(changes);
+  };
+
+  // 网络恢复后同步
+  const syncChanges = async () =&gt; {
+    const changes = JSON.parse(localStorage.getItem('pendingChanges') || '[]');
+
+    for (const change of changes) {
+      await fetch(change.url, {
+        method: change.method,
+        body: JSON.stringify(change.data),
+      });
+    }
+
+    localStorage.removeItem('pendingChanges');
+    setPendingChanges([]);
+  };
+
+  useEffect(() =&gt; {
+    window.addEventListener('online', syncChanges);
+    return () =&gt; window.removeEventListener('online', syncChanges);
+  }, []);
+
+  return { saveLocal, pendingChanges };
+};
+
+// 使用示例
+const EditPost = ({ postId }) =&gt; {
+  const { saveLocal } = useOfflineSync();
+
+  const handleSave = async (content) =&gt; {
+    if (navigator.onLine) {
+      await fetch(`/api/posts/${postId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ content }),
+      });
+    } else {
+      saveLocal({
+        url: `/api/posts/${postId}`,
+        method: 'PATCH',
+        data: { content },
+      });
+    }
+  };
+
+  return &lt;Editor onSave={handleSave} /&gt;;
+};
+```
+
+## 实战案例：电商购物车
+
+下面是一个完整的购物车状态管理示例，结合客户端和服务端状态。
+
+```typescript
+// 1. 定义类型
+interface CartItem {
+  productId: string;
+  quantity: number;
+  price: number;
+  name: string;
+}
+
+interface CartState {
+  items: CartItem[];
+  isOpen: boolean;
+}
+
+// 2. 客户端状态：购物车 UI 状态
+const useCartUIStore = create&lt;CartState&gt;((set) =&gt; ({
+  isOpen: false,
+  openCart: () =&gt; set({ isOpen: true }),
+  closeCart: () =&gt; set({ isOpen: false }),
+  toggleCart: () =&gt; set((s) =&gt; ({ isOpen: !s.isOpen })),
+}));
+
+// 3. 服务端状态：购物车数据
+const useCart = () =&gt; {
+  const queryClient = useQueryClient();
+  const { openCart } = useCartUIStore();
+
+  // 获取购物车
+  const { data: cart, isLoading } = useQuery({
+    queryKey: ['cart'],
+    queryFn: () =&gt; fetch('/api/cart').then(r =&gt; r.json()),
+  });
+
+  // 添加商品
+  const addToCart = useMutation({
+    mutationFn: (item: Omit&lt;CartItem, 'quantity'&gt;) =&gt;
+      fetch('/api/cart/items', {
+        method: 'POST',
+        body: JSON.stringify({ ...item, quantity: 1 }),
+      }).then(r =&gt; r.json()),
+    onSuccess: () =&gt; {
+      queryClient.invalidateQueries({ queryKey: ['cart'] });
+      openCart();
+    },
+  });
+
+  // 更新数量
+  const updateQuantity = useMutation({
+    mutationFn: ({ productId, quantity }: { productId: string; quantity: number }) =&gt;
+      fetch(`/api/cart/items/${productId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ quantity }),
+      }),
+    onMutate: async ({ productId, quantity }) =&gt; {
+      await queryClient.cancelQueries({ queryKey: ['cart'] });
+      const previousCart = queryClient.getQueryData(['cart']);
+
+      queryClient.setQueryData(['cart'], (old) =&gt; ({
+        ...old,
+        items: old.items.map(item =&gt;
+          item.productId === productId ? { ...item, quantity } : item
+        ),
+      }));
+
+      return { previousCart };
+    },
+    onError: (err, variables, context) =&gt; {
+      queryClient.setQueryData(['cart'], context.previousCart);
+    },
+  });
+
+  // 计算总价
+  const total = cart?.items.reduce((sum, item) =&gt;
+    sum + item.price * item.quantity, 0
+  ) || 0;
+
+  return {
+    cart,
+    isLoading,
+    addToCart: addToCart.mutate,
+    updateQuantity: updateQuantity.mutate,
+    total,
+  };
+};
+
+// 4. 组件使用
+const ProductCard = ({ product }) =&gt; {
+  const { addToCart } = useCart();
+
+  return (
+    &lt;div className="product-card"&gt;
+      &lt;img src={product.image} alt={product.name} /&gt;
+      &lt;h3&gt;{product.name}&lt;/h3&gt;
+      &lt;p&gt;¥{product.price}&lt;/p&gt;
+      &lt;button onClick={() =&gt; addToCart(product)}&gt;
+        加入购物车
+      &lt;/button&gt;
+    &lt;/div&gt;
+  );
+};
+
+const CartDrawer = () =&gt; {
+  const { cart, isLoading, updateQuantity, total } = useCart();
+  const { isOpen, closeCart } = useCartUIStore();
+
+  if (!isOpen) return null;
+
+  return (
+    &lt;div className="cart-drawer"&gt;
+      &lt;button onClick={closeCart}&gt;关闭&lt;/button&gt;
+
+      {isLoading ? (
+        &lt;div&gt;Loading...&lt;/div&gt;
+      ) : (
+        &lt;&gt;
+          {cart.items.map(item =&gt; (
+            &lt;div key={item.productId}&gt;
+              &lt;span&gt;{item.name}&lt;/span&gt;
+              &lt;input
+                type="number"
+                value={item.quantity}
+                onChange={(e) =&gt;
+                  updateQuantity({
+                    productId: item.productId,
+                    quantity: Number(e.target.value),
+                  })
+                }
+              /&gt;
+              &lt;span&gt;¥{item.price * item.quantity}&lt;/span&gt;
+            &lt;/div&gt;
+          ))}
+          &lt;div&gt;Total: ¥{total}&lt;/div&gt;
+        &lt;/&gt;
+      )}
+    &lt;/div&gt;
+  );
+};
+```
+
+## 最佳实践总结
+
+### 1. 选择正确的状态类型
+
+| 状态类型         | 推荐工具                   | 示例                 |
+| ---------------- | -------------------------- | -------------------- |
+| UI 状态（本地）  | useState, useReducer       | 模态框开关、表单输入 |
+| 应用状态（全局） | Zustand, Jotai             | 主题、用户偏好       |
+| 服务端状态       | React Query, SWR           | API 数据、实时数据   |
+| URL 状态         | React Router, Next.js 路由 | 查询参数、路径参数   |
+
+### 2. 状态放置原则
+
+```typescript
+// ❌ 错误：所有状态都放在全局
+const useGlobalStore = create((set) =&gt; ({
+  modalOpen: false,      // 应该是本地状态
+  userName: '',          // 应该是服务端状态
+  currentTab: 'home',    // 应该是 URL 状态
+  theme: 'dark',         // ✅ 正确：全局状态
+}));
+
+// ✅ 正确：分层管理
+// 本地状态
+const Modal = () =&gt; {
+  const [isOpen, setIsOpen] = useState(false);
+  // ...
+};
+
+// URL 状态
+const Tabs = () =&gt; {
+  const router = useRouter();
+  const currentTab = router.query.tab || 'home';
+  // ...
+};
+
+// 服务端状态
+const UserProfile = () =&gt; {
+  const { data: user } = useQuery({ queryKey: ['user'], queryFn: fetchUser });
+  // ...
+};
+
+// 全局状态
+const ThemeToggle = () =&gt; {
+  const theme = useThemeStore(state =&gt; state.theme);
+  // ...
+};
+```
+
+### 3. 性能优化
+
+```typescript
+// 1. 使用选择器避免不必要的重渲染
+const UserCard = ({ userId }) =&gt; {
+  // ❌ 不好：订阅整个 store
+  const store = useUserStore();
+
+  // ✅ 好：只订阅需要的字段
+  const userName = useUserStore(state =&gt; state.users[userId]?.name);
+
+  return &lt;div&gt;{userName}&lt;/div&gt;;
+};
+
+// 2. 派生状态使用 useMemo
+const CartTotal = () =&gt; {
+  const items = useCartStore(state =&gt; state.items);
+
+  // 计算总价
+  const total = useMemo(() =&gt;
+    items.reduce((sum, item) =&gt; sum + item.price * item.quantity, 0),
+    [items]
+  );
+
+  return &lt;div&gt;Total: ¥{total}&lt;/div&gt;;
+};
+
+// 3. React Query 的选择性订阅
+const UserName = ({ userId }) =&gt; {
+  // 只在 name 变化时重渲染
+  const name = useQuery({
+    queryKey: ['user', userId],
+    queryFn: () =&gt; fetchUser(userId),
+    select: (data) =&gt; data.name,
+  });
+
+  return &lt;div&gt;{name}&lt;/div&gt;;
+};
+```
+
+### 4. 测试策略
+
+```typescript
+// Zustand store 测试
+import { act } from '@testing-library/react';
+import { useCounterStore } from './counterStore';
+
+test('should increment count', () =&gt; {
+  const { increment, count } = useCounterStore.getState();
+
+  act(() =&gt; {
+    increment();
+  });
+
+  expect(useCounterStore.getState().count).toBe(1);
+});
+
+// React Query 测试
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { render, screen, waitFor } from '@testing-library/react';
+
+const createWrapper = () =&gt; {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+
+  return ({ children }) =&gt; (
+    &lt;QueryClientProvider client={queryClient}&gt;
+      {children}
+    &lt;/QueryClientProvider&gt;
+  );
+};
+
+test('should fetch users', async () =&gt; {
+  const wrapper = createWrapper();
+  render(&lt;UserList /&gt;, { wrapper });
+
+  await waitFor(() =&gt; {
+    expect(screen.getByText('John')).toBeInTheDocument();
+  });
+});
+```
+
+## 总结
+
+全栈状态管理是一个系统工程，需要：
+
+1. **分类管理**：区分客户端状态、服务端状态、URL 状态
+2. **工具选择**：客户端用 Zustand/Jotai，服务端用 React Query/SWR
+3. **同步策略**：乐观更新、实时同步、增量同步
+4. **性能优化**：选择器、缓存、派生状态
+5. **测试覆盖**：单元测试、集成测试
+
+记住：**没有银弹，只有最适合场景的方案**。从小处着手，随着应用复杂度增长，逐步引入更强大的状态管理工具。
+
+## 参考资料
+
+- [Zustand 官方文档](https://github.com/pmndrs/zustand)
+- [Jotai 官方文档](https://jotai.org/)
+- [React Query 官方文档](https://tanstack.com/query/latest)
+- [SWR 官方文档](https://swr.vercel.app/)
+- [Redux Toolkit 官方文档](https://redux-toolkit.js.org/)

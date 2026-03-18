@@ -1,0 +1,953 @@
+---
+title: "AI Agent 开发实战：从 Function Calling 到自主智能体"
+date: "2026-03-18"
+summary: "深入解析 AI Agent 开发全流程，从基础的 Function Calling 到复杂的自主智能体，涵盖 LangChain Agent、ReAct 模式、工具调用、记忆管理等核心技术，手把手教你构建具有规划、推理和执行能力的 AI 应用"
+tags: ["AI Agent", "Function Calling", "LangChain", "OpenAI", "大模型应用"]
+category: "大模型/AI"
+cover: ""
+draft: false
+---
+
+# AI Agent 开发实战：从 Function Calling 到自主智能体
+
+AI Agent（智能体）是 2024-2025 年 AI 领域最热门的方向之一。不同于传统的单轮问答，Agent 具备**规划、推理、工具使用和记忆**能力，能够自主完成复杂的多步骤任务。
+
+本文将从零开始，带你深入理解 AI Agent 的核心原理，并通过实战代码构建一个具有完整能力的智能体。
+
+## 目录
+
+1. [什么是 AI Agent](#什么是-ai-agent)
+2. [核心技术原理](#核心技术原理)
+3. [Function Calling 入门](#function-calling-入门)
+4. [构建基础 Agent](#构建基础-agent)
+5. [LangChain Agent 实战](#langchain-agent-实战)
+6. [高级特性：记忆与规划](#高级特性记忆与规划)
+7. [生产环境最佳实践](#生产环境最佳实践)
+
+---
+
+## 什么是 AI Agent
+
+### 从 Chatbot 到 Agent
+
+传统 LLM 应用的局限性：
+
+```typescript
+// 传统单轮问答
+const response = await openai.chat.completions.create({
+  model: "gpt-4",
+  messages: [{ role: "user", content: "今天北京天气如何？" }],
+});
+
+// 问题：LLM 无法获取实时数据，只能回答"我不知道"
+```
+
+**AI Agent 的核心能力：**
+
+| 能力         | 描述                   | 示例                                            |
+| ------------ | ---------------------- | ----------------------------------------------- |
+| **规划**     | 将复杂任务分解为子任务 | "帮我订明天去上海的机票" → 查航班 → 比价 → 下单 |
+| **工具使用** | 调用外部 API 和服务    | 搜索、查询数据库、发送邮件                      |
+| **推理**     | 基于上下文做出决策     | "用户想省钱，优先推荐经济舱"                    |
+| **记忆**     | 记住对话历史和用户偏好 | "记住我喜欢靠窗座位"                            |
+
+### Agent 架构图
+
+```
+┌─────────────────────────────────────────┐
+│            用户输入                      │
+└──────────────┬──────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────────┐
+│        Agent 大脑 (LLM)                  │
+│  ┌─────────────────────────────────┐   │
+│  │  1. 理解任务                     │   │
+│  │  2. 规划步骤                     │   │
+│  │  3. 选择工具                     │   │
+│  │  4. 执行推理                     │   │
+│  └─────────────────────────────────┘   │
+└──────────────┬──────────────────────────┘
+               │
+        ┌──────┴──────┐
+        ▼             ▼
+   ┌────────┐    ┌────────┐
+   │ 工具集  │    │  记忆   │
+   └────────┘    └────────┘
+   - 搜索        - 短期记忆
+   - 计算器      - 长期记忆
+   - 数据库      - 向量存储
+   - API
+```
+
+---
+
+## 核心技术原理
+
+### ReAct 模式
+
+ReAct (Reasoning + Acting) 是 Agent 的核心推理模式：
+
+```
+Thought: 用户想知道北京天气，我需要调用天气 API
+Action: get_weather("北京")
+Observation: 北京今天晴，温度 15-25°C
+Thought: 获得了天气信息，现在可以回答用户
+Answer: 北京今天天气晴朗，温度 15-25°C，适合外出。
+```
+
+**TypeScript 实现：**
+
+```typescript
+interface ReActStep {
+  thought: string;    // 思考
+  action?: string;    // 行动
+  observation?: string; // 观察
+}
+
+async function reactLoop(
+  query: string,
+  tools: Map&lt;string, Function&gt;,
+  maxIterations: number = 5
+): Promise&lt;string&gt; {
+  const steps: ReActStep[] = [];
+  let iteration = 0;
+
+  while (iteration &lt; maxIterations) {
+    // 1. 思考阶段
+    const thought = await llmThink(query, steps);
+
+    // 2. 决定是否需要行动
+    if (thought.action) {
+      // 3. 执行工具
+      const observation = await executeTool(tools, thought.action);
+      steps.push({ ...thought, observation });
+    } else {
+      // 4. 得出最终答案
+      return thought.answer;
+    }
+
+    iteration++;
+  }
+
+  return "达到最大迭代次数，任务未完成";
+}
+```
+
+---
+
+## Function Calling 入门
+
+### OpenAI Function Calling 基础
+
+OpenAI 的 Function Calling 是构建 Agent 的基础能力。
+
+**1. 定义工具函数**
+
+```typescript
+// tools.ts
+export const weatherTool = {
+  type: "function" as const,
+  function: {
+    name: "get_weather",
+    description: "获取指定城市的当前天气",
+    parameters: {
+      type: "object",
+      properties: {
+        city: {
+          type: "string",
+          description: "城市名称，如：北京、上海",
+        },
+      },
+      required: ["city"],
+    },
+  },
+};
+
+export const calculatorTool = {
+  type: "function" as const,
+  function: {
+    name: "calculate",
+    description: "执行数学计算",
+    parameters: {
+      type: "object",
+      properties: {
+        expression: {
+          type: "string",
+          description: "数学表达式，如：2 + 2, 100 * 5",
+        },
+      },
+      required: ["expression"],
+    },
+  },
+};
+```
+
+**2. 实现工具执行器**
+
+```typescript
+// executor.ts
+async function getWeather(city: string): Promise&lt;string&gt; {
+  // 实际项目中调用真实天气 API
+  const mockData: Record&lt;string, string&gt; = {
+    "北京": "晴天，15-25°C，空气质量良好",
+    "上海": "多云，18-26°C，有轻微雾霾",
+    "深圳": "阴天，22-28°C，可能有小雨"
+  };
+
+  return mockData[city] || `未找到 ${city} 的天气信息`;
+}
+
+async function calculate(expression: string): Promise&lt;string&gt; {
+  try {
+    // 注意：生产环境应使用安全的数学表达式解析库
+    const result = Function(`"use strict"; return (${expression})`)();
+    return `计算结果：${result}`;
+  } catch (error) {
+    return `计算错误：${error}`;
+  }
+}
+
+export async function executeFunctionCall(
+  functionName: string,
+  args: Record&lt;string, any&gt;
+): Promise&lt;string&gt; {
+  switch (functionName) {
+    case "get_weather":
+      return await getWeather(args.city);
+    case "calculate":
+      return await calculate(args.expression);
+    default:
+      return `未知函数：${functionName}`;
+  }
+}
+```
+
+**3. 完整的 Function Calling 流程**
+
+```typescript
+// agent-basic.ts
+import OpenAI from "openai";
+
+const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
+
+async function runAgent(userMessage: string) {
+  const messages: OpenAI.ChatCompletionMessageParam[] = [
+    {
+      role: "system",
+      content: "你是一个有用的助手，可以使用工具来帮助用户。",
+    },
+    { role: "user", content: userMessage },
+  ];
+
+  const tools = [weatherTool, calculatorTool];
+
+  // 第一次调用：LLM 决定是否使用工具
+  let response = await openai.chat.completions.create({
+    model: "gpt-4-turbo-preview",
+    messages,
+    tools,
+    tool_choice: "auto",
+  });
+
+  // 循环处理工具调用
+  while (response.choices[0].finish_reason === "tool_calls") {
+    const assistantMessage = response.choices[0].message;
+    messages.push(assistantMessage);
+
+    // 执行所有工具调用
+    for (const toolCall of assistantMessage.tool_calls || []) {
+      const args = JSON.parse(toolCall.function.arguments);
+      const result = await executeFunctionCall(toolCall.function.name, args);
+
+      // 将工具结果添加到消息历史
+      messages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: result,
+      });
+    }
+
+    // 第二次调用：LLM 基于工具结果生成最终回复
+    response = await openai.chat.completions.create({
+      model: "gpt-4-turbo-preview",
+      messages,
+      tools,
+    });
+  }
+
+  return response.choices[0].message.content;
+}
+
+// 测试
+const result = await runAgent("北京今天天气怎么样？");
+console.log(result);
+// 输出：根据查询，北京今天是晴天，温度在 15-25°C 之间，空气质量良好...
+```
+
+---
+
+## 构建基础 Agent
+
+### 封装 Agent 类
+
+```typescript
+// agent.ts
+interface Tool {
+  name: string;
+  description: string;
+  parameters: any;
+  execute: (args: any) => Promise&lt;string&gt;;
+}
+
+class SimpleAgent {
+  private messages: OpenAI.ChatCompletionMessageParam[] = [];
+  private tools: Tool[] = [];
+  private maxIterations: number;
+
+  constructor(
+    private model: string = "gpt-4-turbo-preview",
+    options: { maxIterations?: number } = {}
+  ) {
+    this.maxIterations = options.maxIterations || 10;
+  }
+
+  // 注册工具
+  registerTool(tool: Tool) {
+    this.tools.push(tool);
+  }
+
+  // 转换为 OpenAI 工具格式
+  private getOpenAITools() {
+    return this.tools.map(tool => ({
+      type: "function" as const,
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.parameters
+      }
+    }));
+  }
+
+  // 执行工具
+  private async executeTool(name: string, args: any): Promise&lt;string&gt; {
+    const tool = this.tools.find(t => t.name === name);
+    if (!tool) {
+      return `错误：未找到工具 ${name}`;
+    }
+    return await tool.execute(args);
+  }
+
+  // 运行 Agent
+  async run(userInput: string): Promise&lt;string&gt; {
+    this.messages = [
+      {
+        role: "system",
+        content: this.buildSystemPrompt()
+      },
+      { role: "user", content: userInput }
+    ];
+
+    for (let i = 0; i &lt; this.maxIterations; i++) {
+      const response = await openai.chat.completions.create({
+        model: this.model,
+        messages: this.messages,
+        tools: this.getOpenAITools(),
+        tool_choice: "auto"
+      });
+
+      const assistantMessage = response.choices[0].message;
+      this.messages.push(assistantMessage);
+
+      // 检查是否需要调用工具
+      if (response.choices[0].finish_reason === "tool_calls") {
+        // 执行所有工具调用
+        for (const toolCall of assistantMessage.tool_calls || []) {
+          const args = JSON.parse(toolCall.function.arguments);
+          const result = await this.executeTool(
+            toolCall.function.name,
+            args
+          );
+
+          this.messages.push({
+            role: "tool",
+            tool_call_id: toolCall.id,
+            content: result
+          });
+
+          console.log(`[Tool] ${toolCall.function.name}(${JSON.stringify(args)}) => ${result}`);
+        }
+      } else {
+        // 任务完成
+        return assistantMessage.content || "";
+      }
+    }
+
+    return "达到最大迭代次数";
+  }
+
+  private buildSystemPrompt(): string {
+    const toolDescriptions = this.tools
+      .map(t => `- ${t.name}: ${t.description}`)
+      .join("\n");
+
+    return `你是一个智能助手，可以使用以下工具：
+
+${toolDescriptions}
+
+请根据用户需求，合理使用工具来完成任务。`;
+  }
+}
+
+// 使用示例
+const agent = new SimpleAgent();
+
+agent.registerTool({
+  name: "search",
+  description: "搜索互联网信息",
+  parameters: {
+    type: "object",
+    properties: {
+      query: { type: "string", description: "搜索关键词" }
+    },
+    required: ["query"]
+  },
+  execute: async (args) => {
+    // 实际项目中调用搜索 API
+    return `搜索结果：${args.query} 的相关信息...`;
+  }
+});
+
+agent.registerTool({
+  name: "get_current_time",
+  description: "获取当前时间",
+  parameters: { type: "object", properties: {} },
+  execute: async () => {
+    return new Date().toLocaleString("zh-CN");
+  }
+});
+
+const answer = await agent.run("现在几点了？帮我搜索一下最新的 AI 新闻");
+console.log(answer);
+```
+
+---
+
+## LangChain Agent 实战
+
+### 为什么选择 LangChain
+
+LangChain 提供了完整的 Agent 框架，包含：
+
+- 预置的工具库（搜索、计算、文件操作等）
+- 多种 Agent 类型（ReAct、Plan-and-Execute 等）
+- 记忆管理
+- 回调系统
+
+### 安装依赖
+
+```bash
+npm install langchain @langchain/openai @langchain/core
+```
+
+### 快速开始
+
+```typescript
+// langchain-agent.ts
+import { ChatOpenAI } from "@langchain/openai";
+import { AgentExecutor, createOpenAIFunctionsAgent } from "langchain/agents";
+import { pull } from "langchain/hub";
+import { DynamicTool } from "@langchain/core/tools";
+import { BufferMemory } from "langchain/memory";
+
+// 1. 创建 LLM
+const llm = new ChatOpenAI({
+  modelName: "gpt-4-turbo-preview",
+  temperature: 0
+});
+
+// 2. 定义工具
+const weatherTool = new DynamicTool({
+  name: "get_weather",
+  description: "获取指定城市的天气信息。输入应为城市名称。",
+  func: async (input: string) => {
+    // 模拟天气 API
+    const weathers: Record&lt;string, string&gt; = {
+      "北京": "晴天，15°C",
+      "上海": "多云，18°C"
+    };
+    return weathers[input] || `${input}：天气数据暂不可用`;
+  }
+});
+
+const calculatorTool = new DynamicTool({
+  name: "calculator",
+  description: "执行数学计算。输入应为数学表达式。",
+  func: async (input: string) => {
+    try {
+      const result = Function(`"use strict"; return (${input})`)();
+      return String(result);
+    } catch {
+      return "计算错误";
+    }
+  }
+});
+
+const tools = [weatherTool, calculatorTool];
+
+// 3. 创建 Agent
+const prompt = await pull&lt;ChatPromptTemplate&gt;("hwchase17/openai-functions-agent");
+
+const agent = await createOpenAIFunctionsAgent({
+  llm,
+  tools,
+  prompt
+});
+
+// 4. 创建 Agent Executor
+const agentExecutor = new AgentExecutor({
+  agent,
+  tools,
+  memory: new BufferMemory({
+    returnMessages: true,
+    memoryKey: "chat_history",
+    inputKey: "input",
+    outputKey: "output"
+  }),
+  verbose: true // 打印执行过程
+});
+
+// 5. 运行
+const result = await agentExecutor.invoke({
+  input: "北京天气怎么样？如果温度是 15 度，换算成华氏度是多少？"
+});
+
+console.log(result.output);
+```
+
+### 使用内置工具
+
+LangChain 提供了丰富的内置工具：
+
+```typescript
+import { SerpAPI } from "@langchain/community/tools/serpapi";
+import { Calculator } from "langchain/tools/calculator";
+import { WebBrowser } from "langchain/tools/webbrowser";
+
+// Google 搜索工具
+const searchTool = new SerpAPI(process.env.SERPAPI_API_KEY);
+
+// 计算器工具
+const calculatorTool = new Calculator();
+
+// 网页浏览工具
+const browserTool = new WebBrowser({
+  model: llm,
+  embeddings: new OpenAIEmbeddings(),
+});
+
+const tools = [searchTool, calculatorTool, browserTool];
+
+// 创建 Agent...
+```
+
+### Structured Tool（结构化工具）
+
+对于复杂参数，使用 Structured Tool：
+
+```typescript
+import { StructuredTool } from "@langchain/core/tools";
+import { z } from "zod";
+
+// 定义输入 Schema
+const emailSchema = z.object({
+  to: z.string().describe("收件人邮箱地址"),
+  subject: z.string().describe("邮件主题"),
+  body: z.string().describe("邮件正文")
+});
+
+// 创建结构化工具
+class EmailTool extends StructuredTool&lt;z.infer&lt;typeof emailSchema&gt;&gt; {
+  name = "send_email";
+  description = "发送邮件";
+  schema = emailSchema;
+
+  async _call(input: z.infer&lt;typeof emailSchema&gt;): Promise&lt;string&gt; {
+    // 实际发送邮件逻辑
+    console.log(`发送邮件给 ${input.to}: ${input.subject}`);
+    return "邮件发送成功";
+  }
+}
+
+const emailTool = new EmailTool();
+```
+
+---
+
+## 高级特性：记忆与规划
+
+### 1. 短期记忆（对话历史）
+
+```typescript
+import { BufferMemory, ChatMessageHistory } from "langchain/memory";
+
+const memory = new BufferMemory({
+  chatHistory: new ChatMessageHistory(),
+  returnMessages: true,
+  memoryKey: "chat_history",
+});
+
+// Agent 会自动使用记忆
+const agentExecutor = new AgentExecutor({
+  agent,
+  tools,
+  memory,
+  verbose: true,
+});
+
+// 多轮对话
+await agentExecutor.invoke({ input: "我叫张三" });
+await agentExecutor.invoke({ input: "我叫什么？" });
+// 输出：你叫张三
+```
+
+### 2. 长期记忆（向量存储）
+
+```typescript
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { OpenAIEmbeddings } from "@langchain/openai";
+import { VectorStoreRetrieverMemory } from "langchain/memory";
+
+// 创建向量存储
+const vectorStore = await MemoryVectorStore.fromTexts(
+  ["我喜欢喝咖啡", "我的生日是 3 月 15 日"],
+  [{}, {}],
+  new OpenAIEmbeddings()
+);
+
+// 向量记忆
+const vectorMemory = new VectorStoreRetrieverMemory({
+  retriever: vectorStore.asRetriever(1),
+  memoryKey: "history",
+});
+
+// 查询相关记忆
+const result = await vectorMemory.loadMemoryVariables({
+  input: "我喜欢什么饮料？",
+});
+console.log(result.history); // "我喜欢喝咖啡"
+```
+
+### 3. Plan-and-Execute Agent
+
+对于复杂任务，使用规划型 Agent：
+
+```typescript
+import { PlanAndExecuteAgentExecutor } from "langchain/agents/plan_and_execute";
+
+// 创建规划 Agent
+const planner = new ChatOpenAI({
+  modelName: "gpt-4",
+  temperature: 0,
+});
+
+const executor = new ChatOpenAI({
+  modelName: "gpt-4-turbo-preview",
+  temperature: 0,
+});
+
+const agentExecutor = PlanAndExecuteAgentExecutor.fromLLMAndTools({
+  plannerLLM: planner,
+  executorLLM: executor,
+  tools,
+});
+
+// 执行复杂任务
+const result = await agentExecutor.invoke({
+  input: "帮我研究一下 2024 年最受欢迎的编程语言，并写一份简短的报告",
+});
+
+console.log(result);
+```
+
+---
+
+## 生产环境最佳实践
+
+### 1. 错误处理与重试
+
+```typescript
+import { RetryPolicy } from "langchain/experimental/chat_models";
+
+const llmWithRetry = new ChatOpenAI({
+  modelName: "gpt-4-turbo-preview",
+  maxRetries: 3,
+  timeout: 30000
+});
+
+// 工具执行也应有重试机制
+async function executeWithRetry(
+  fn: () =&gt; Promise&lt;string&gt;,
+  maxRetries: number = 3
+): Promise&lt;string&gt; {
+  let lastError: Error | null = null;
+
+  for (let i = 0; i &lt; maxRetries; i++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error as Error;
+      await new Promise(resolve =&gt; setTimeout(resolve, 1000 * (i + 1)));
+    }
+  }
+
+  return `工具执行失败：${lastError?.message}`;
+}
+```
+
+### 2. 限制成本与超时
+
+```typescript
+const agentExecutor = new AgentExecutor({
+  agent,
+  tools,
+  maxIterations: 5, // 限制迭代次数
+  timeout: 60000, // 超时时间（毫秒）
+  earlyStoppingMethod: "generate", // 超时后生成答案
+});
+```
+
+### 3. 日志与监控
+
+```typescript
+import { CallbackHandler } from "langchain/callbacks";
+
+const handler = new CallbackHandler({
+  handleLLMStart: (llm, prompts) =&gt; {
+    console.log("[LLM Start]", prompts);
+  },
+  handleLLMEnd: (output) =&gt; {
+    console.log("[LLM End]", output.llmOutput);
+  },
+  handleToolStart: (tool, input) =&gt; {
+    console.log("[Tool Start]", tool.name, input);
+  },
+  handleToolEnd: (output) =&gt; {
+    console.log("[Tool End]", output);
+  }
+});
+
+// 使用回调
+const result = await agentExecutor.invoke(
+  { input: "..." },
+  { callbacks: [handler] }
+);
+```
+
+### 4. 安全性考虑
+
+```typescript
+// 1. 输入验证
+function sanitizeInput(input: string): string {
+  // 移除潜在的恶意代码
+  return input.replace(/&lt;script&gt;.*?&lt;\/script&gt;/gi, "");
+}
+
+// 2. 工具权限控制
+const allowedTools = ["search", "calculator"];
+const safeTools = tools.filter(t =&gt; allowedTools.includes(t.name));
+
+// 3. 敏感信息过滤
+function filterSensitiveInfo(output: string): string {
+  return output.replace(/\b\d{16}\b/g, "[CARD_NUMBER]");
+}
+```
+
+### 5. 流式输出
+
+```typescript
+import { IterableReadableStream } from "@langchain/core/utils/stream";
+
+const stream = await agentExecutor.stream({
+  input: "帮我搜索最新的 AI 新闻并总结",
+});
+
+for await (const chunk of stream) {
+  if (chunk.output) {
+    process.stdout.write(chunk.output);
+  }
+}
+```
+
+---
+
+## 实战案例：构建智能客服 Agent
+
+```typescript
+// customer-service-agent.ts
+import { ChatOpenAI } from "@langchain/openai";
+import { AgentExecutor, createOpenAIFunctionsAgent } from "langchain/agents";
+import { DynamicTool } from "@langchain/core/tools";
+import { BufferMemory } from "langchain/memory";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+
+// 模拟数据库
+const orderDatabase = {
+  "12345": {
+    status: "已发货",
+    trackingNumber: "SF123456789",
+    items: ["iPhone 15 Pro", "AirPods Pro"]
+  },
+  "67890": {
+    status: "处理中",
+    trackingNumber: null,
+    items: ["MacBook Pro"]
+  }
+};
+
+const userDatabase = {
+  "user123": {
+    name: "张三",
+    email: "zhangsan@example.com",
+    orders: ["12345"]
+  }
+};
+
+// 定义工具
+const queryOrderTool = new DynamicTool({
+  name: "query_order",
+  description: "查询订单状态。输入订单号。",
+  func: async (orderId: string) =&gt; {
+    const order = orderDatabase[orderId];
+    if (!order) {
+      return `未找到订单 ${orderId}`;
+    }
+    return JSON.stringify(order);
+  }
+});
+
+const checkUserOrdersTool = new DynamicTool({
+  name: "check_user_orders",
+  description: "查询用户的所有订单。输入用户ID。",
+  func: async (userId: string) =&gt; {
+    const user = userDatabase[userId];
+    if (!user) {
+      return `未找到用户 ${userId}`;
+    }
+    return `用户 ${user.name} 的订单：${user.orders.join(", ")}`;
+  }
+});
+
+const createTicketTool = new DynamicTool({
+  name: "create_ticket",
+  description: "创建客服工单。输入问题描述。",
+  func: async (description: string) =&gt; {
+    const ticketId = `TK${Date.now()}`;
+    console.log(`创建工单 ${ticketId}: ${description}`);
+    return `已创建工单 ${ticketId}，我们的客服会在 24 小时内联系您`;
+  }
+});
+
+// 创建 Agent
+const llm = new ChatOpenAI({
+  modelName: "gpt-4-turbo-preview",
+  temperature: 0
+});
+
+const tools = [queryOrderTool, checkUserOrdersTool, createTicketTool];
+
+const prompt = ChatPromptTemplate.fromMessages([
+  ["system", `你是一个友好的客服助手，可以使用工具帮助用户：
+- 查询订单状态
+- 查看用户订单
+- 创建客服工单
+
+请礼貌、专业地回答用户问题。如果无法解决，主动创建工单。`],
+  ["placeholder", "{chat_history}"],
+  ["human", "{input}"],
+  ["placeholder", "{agent_scratchpad}"]
+]);
+
+const agent = await createOpenAIFunctionsAgent({
+  llm,
+  tools,
+  prompt
+});
+
+const agentExecutor = new AgentExecutor({
+  agent,
+  tools,
+  memory: new BufferMemory({
+    returnMessages: true,
+    memoryKey: "chat_history",
+    inputKey: "input",
+    outputKey: "output"
+  }),
+  verbose: true,
+  maxIterations: 5
+});
+
+// 测试对话
+async function chat(userInput: string) {
+  const result = await agentExecutor.invoke({ input: userInput });
+  console.log("客服:", result.output);
+  return result.output;
+}
+
+await chat("你好，我是张三，用户ID是 user123");
+await chat("帮我查一下我的订单");
+await chat("订单 12345 现在什么状态？");
+await chat("好的，我还有一个问题想反馈");
+```
+
+**运行效果：**
+
+```
+客服: 您好！张三先生，很高兴为您服务。请问有什么可以帮您的？
+
+客服: 我查到您有以下订单：12345。需要我帮您查询具体订单的详情吗？
+
+客服: 您的订单 12345 已经发货了！快递单号是 SF123456789，包含商品：iPhone 15 Pro 和 AirPods Pro。
+
+客服: 好的，请告诉我您的问题，我会为您创建工单。
+```
+
+---
+
+## 总结
+
+### 关键要点
+
+1. **Function Calling 是基础**：掌握 OpenAI 的工具调用机制
+2. **ReAct 是核心**：理解"思考-行动-观察"的循环
+3. **LangChain 提供完整方案**：工具、记忆、Agent 类型
+4. **生产环境需要防护**：错误处理、超时、权限控制
+
+### 学习路径
+
+```
+入门 → Function Calling 实践
+     ↓
+进阶 → 自定义 Agent 类
+     ↓
+实战 → LangChain Agent
+     ↓
+高级 → 多 Agent 协作、规划型 Agent
+```
+
+### 推荐资源
+
+- [OpenAI Function Calling 文档](https://platform.openai.com/docs/guides/function-calling)
+- [LangChain 官方文档](https://python.langchain.com/docs/get_started/introduction)
+- [ReAct 论文](https://arxiv.org/abs/2210.03629)
+- [AutoGPT 项目](https://github.com/Significant-Gravitas/Auto-GPT)
+
+---
+
+AI Agent 是 LLM 应用的重要方向，掌握 Agent 开发能力将让你能够构建更智能、更实用的 AI 应用。希望本文能帮助你快速上手 Agent 开发！🚀
+
+## 扩展阅读
+
+- [RAG 知识库搭建指南](/posts/rag-knowledge-base-guide)
+- [大模型本地部署实战](/posts/llm-local-deployment-guide)
+- [Cursor AI 编程助手使用指南](/posts/cursor-ai-coding-guide)
