@@ -1,0 +1,504 @@
+---
+title: "PostgreSQL 实战：从入门到生产优化"
+date: "2025-03-27"
+summary: "全面讲解 PostgreSQL 核心特性、性能优化、高可用方案和生产最佳实践，助你成为 PostgreSQL 高手。"
+tags: ["PostgreSQL", "数据库", "性能优化", "运维"]
+category: "数据库"
+cover: ""
+draft: false
+---
+
+# PostgreSQL 实战：从入门到生产优化
+
+PostgreSQL 是世界上最先进的开源关系数据库，功能强大且稳定可靠。本文从实战角度讲解核心特性和生产优化技巧。
+
+## 一、PostgreSQL 基础
+
+### 1.1 安装
+
+**macOS:**
+```bash
+brew install postgresql@16
+brew services start postgresql@16
+```
+
+**Ubuntu:**
+```bash
+sudo apt install postgresql postgresql-contrib
+sudo systemctl start postgresql
+```
+
+**Docker:**
+```bash
+docker run -d --name postgres \
+  -e POSTGRES_PASSWORD=secret \
+  -e POSTGRES_DB=mydb \
+  -p 5432:5432 \
+  postgres:16-alpine
+```
+
+### 1.2 连接数据库
+
+```bash
+# 本地连接
+psql -U postgres
+
+# 连接指定数据库
+psql -h localhost -U postgres -d mydb
+
+# 使用连接字符串
+psql "postgresql://user:password@localhost:5432/mydb"
+```
+
+### 1.3 常用命令
+
+```sql
+-- 数据库操作
+CREATE DATABASE mydb;
+DROP DATABASE mydb;
+\l              -- 列出所有数据库
+\c mydb         -- 切换数据库
+
+-- 表操作
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(100) NOT NULL,
+  email VARCHAR(255) UNIQUE,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+\dt             -- 列出所有表
+\d users        -- 查看表结构
+
+-- 其他
+\du             -- 列出所有用户
+\x              -- 切换扩展显示模式
+\q              -- 退出
+```
+
+## 二、高级数据类型
+
+### 2.1 JSONB（二进制 JSON）
+
+```sql
+-- 创建表
+CREATE TABLE products (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(100),
+  attributes JSONB
+);
+
+-- 插入 JSON 数据
+INSERT INTO products (name, attributes) VALUES
+  ('iPhone', '{"brand": "Apple", "colors": ["black", "white"], "price": 999}'),
+  ('Pixel', '{"brand": "Google", "colors": ["black"], "storage": [128, 256]}');
+
+-- 查询 JSON 字段
+SELECT name, attributes->>'brand' AS brand
+FROM products;
+
+-- JSON 路径查询
+SELECT * FROM products
+WHERE attributes @> '{"brand": "Apple"}';
+
+-- 更新 JSON
+UPDATE products
+SET attributes = attributes || '{"warranty": "1 year"}'
+WHERE name = 'iPhone';
+
+-- 创建 GIN 索引加速 JSON 查询
+CREATE INDEX idx_products_attributes ON products USING GIN (attributes);
+```
+
+### 2.2 数组类型
+
+```sql
+CREATE TABLE posts (
+  id SERIAL PRIMARY KEY,
+  title VARCHAR(200),
+  tags TEXT[]
+);
+
+-- 插入数组
+INSERT INTO posts (title, tags) VALUES
+  ('PostgreSQL Guide', ARRAY['database', 'postgresql', 'tutorial']),
+  ('Redis Cache', '{cache,redis,nosql}');
+
+-- 查询包含某个标签
+SELECT * FROM posts WHERE 'postgresql' = ANY(tags);
+
+-- 查询包含多个标签之一
+SELECT * FROM posts WHERE tags && ARRAY['redis', 'mongodb'];
+
+-- 数组聚合
+SELECT array_agg(tags) FROM posts;
+```
+
+### 2.3 枚举类型
+
+```sql
+CREATE TYPE order_status AS ENUM ('pending', 'paid', 'shipped', 'completed', 'cancelled');
+
+CREATE TABLE orders (
+  id SERIAL PRIMARY KEY,
+  status order_status DEFAULT 'pending'
+);
+
+-- 查询
+SELECT * FROM orders WHERE status = 'paid';
+```
+
+## 三、索引优化
+
+### 3.1 索引类型
+
+```sql
+-- B-Tree（默认，适合等值和范围查询）
+CREATE INDEX idx_users_email ON users(email);
+
+-- Hash（仅适合等值查询）
+CREATE INDEX idx_users_name_hash ON users USING HASH (name);
+
+-- GIN（适合数组和全文搜索）
+CREATE INDEX idx_posts_tags ON posts USING GIN (tags);
+
+-- GiST（适合地理空间数据）
+CREATE INDEX idx_locations_coords ON locations USING GIST (coords);
+```
+
+### 3.2 复合索引
+
+```sql
+-- 单列索引
+CREATE INDEX idx_orders_user_id ON orders(user_id);
+CREATE INDEX idx_orders_created ON orders(created_at);
+
+-- 复合索引（查询时遵循最左前缀）
+CREATE INDEX idx_orders_user_created ON orders(user_id, created_at);
+
+-- 覆盖索引（包含查询所需的所有列）
+CREATE INDEX idx_orders_user_status_total ON orders(user_id, status) INCLUDE (total_amount);
+```
+
+### 3.3 部分索引
+
+```sql
+-- 只索引活跃用户
+CREATE INDEX idx_active_users ON users(email) WHERE active = true;
+
+-- 只索引未完成订单
+CREATE INDEX idx_pending_orders ON orders(created_at) WHERE status = 'pending';
+```
+
+### 3.4 查看索引使用情况
+
+```sql
+-- 查看表的索引
+\di+ tablename
+
+-- 查看索引大小
+SELECT indexname, pg_size_pretty(pg_relation_size(indexname::regclass))
+FROM pg_indexes WHERE tablename = 'users';
+
+-- 查找未使用的索引
+SELECT schemaname, relname, indexrelname
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0;
+```
+
+## 四、查询优化
+
+### 4.1 使用 EXPLAIN ANALYZE
+
+```sql
+-- 查看执行计划
+EXPLAIN SELECT * FROM users WHERE email = 'test@example.com';
+
+-- 实际执行并显示时间
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'test@example.com';
+
+-- 更详细的输出
+EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
+SELECT * FROM orders WHERE user_id = 123;
+```
+
+### 4.2 常见优化技巧
+
+**避免 SELECT ***
+```sql
+-- 差
+SELECT * FROM users;
+
+-- 好
+SELECT id, name, email FROM users;
+```
+
+**使用 LIMIT**
+```sql
+-- 分页查询
+SELECT * FROM orders
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 0;
+
+-- 更高效的分页（游标分页）
+SELECT * FROM orders
+WHERE id > 12345
+ORDER BY id
+LIMIT 20;
+```
+
+**避免在 WHERE 中使用函数**
+```sql
+-- 差（无法使用索引）
+SELECT * FROM users WHERE LOWER(email) = 'test@example.com';
+
+-- 好
+SELECT * FROM users WHERE email = 'test@example.com';
+```
+
+**使用批量插入**
+```sql
+-- 差（多次单条插入）
+INSERT INTO users (name) VALUES ('Alice');
+INSERT INTO users (name) VALUES ('Bob');
+
+-- 好（批量插入）
+INSERT INTO users (name) VALUES ('Alice'), ('Bob'), ('Charlie');
+```
+
+### 4.3 统计信息更新
+
+```sql
+-- 手动更新统计信息
+ANALYZE users;
+
+-- 分析整个数据库
+ANALYZE;
+
+-- 重建表（清理碎片）
+VACUUM FULL ANALYZE users;
+```
+
+## 五、事务和并发控制
+
+### 5.1 事务基础
+
+```sql
+BEGIN;
+
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+
+COMMIT;
+-- 或 ROLLBACK;
+```
+
+### 5.2 隔离级别
+
+```sql
+-- 查看当前隔离级别
+SHOW default_transaction_isolation;
+
+-- 设置隔离级别
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- 隔离级别说明
+-- READ COMMITTED:   默认，防止脏读
+-- REPEATABLE READ:  防止不可重复读
+-- SERIALIZABLE:     最高隔离级别，防止幻读
+```
+
+### 5.3 行级锁
+
+```sql
+-- 悲观锁（SELECT FOR UPDATE）
+BEGIN;
+SELECT * FROM accounts WHERE id = 1 FOR UPDATE;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+COMMIT;
+
+-- 乐观锁（版本号）
+UPDATE products SET stock = stock - 1, version = version + 1
+WHERE id = 1 AND version = 10;
+
+-- SKIP LOCKED（跳过已锁定的行）
+SELECT * FROM tasks WHERE status = 'pending' FOR UPDATE SKIP LOCKED LIMIT 1;
+```
+
+## 六、备份与恢复
+
+### 6.1 pg_dump 逻辑备份
+
+```bash
+# 备份单个数据库
+pg_dump -U postgres mydb > backup.sql
+
+# 备份为自定义格式（推荐）
+pg_dump -U postgres -F c mydb > backup.dump
+
+# 只备份结构
+pg_dump -U postgres --schema-only mydb > schema.sql
+
+# 只备份数据
+pg_dump -U postgres --data-only mydb > data.sql
+
+# 恢复
+psql -U postgres mydb < backup.sql
+# 或
+pg_restore -U postgres -d mydb backup.dump
+```
+
+### 6.2 WAL 归档（增量备份）
+
+```sql
+-- postgresql.conf
+wal_level = replica
+archive_mode = on
+archive_command = 'cp %p /backup/wal/%f'
+```
+
+### 6.3 定时备份脚本
+
+```bash
+#!/bin/bash
+BACKUP_DIR="/backup/postgresql"
+DATE=$(date +%Y%m%d_%H%M%S)
+
+# 备份所有数据库
+pg_dumpall -U postgres | gzip > "$BACKUP_DIR/all_$DATE.sql.gz"
+
+# 保留最近 7 天
+find "$BACKUP_DIR" -name "*.gz" -mtime +7 -delete
+```
+
+## 七、性能监控
+
+### 7.1 慢查询日志
+
+```sql
+-- postgresql.conf
+log_min_duration_statement = 1000  -- 记录超过 1 秒的查询
+```
+
+### 7.2 查看活动连接
+
+```sql
+-- 查看当前连接
+SELECT pid, usename, state, query, query_start
+FROM pg_stat_activity
+WHERE state = 'active';
+
+-- 终止长时间运行的查询
+SELECT pg_cancel_backend(pid);
+
+-- 强制断开连接
+SELECT pg_terminate_backend(pid);
+```
+
+### 7.3 表统计信息
+
+```sql
+-- 表大小
+SELECT relname, pg_size_pretty(pg_total_relation_size(relid))
+FROM pg_stat_user_tables
+ORDER BY pg_total_relation_size(relid) DESC;
+
+-- 缓存命中率
+SELECT relname,
+       heap_blks_read,
+       heap_blks_hit,
+       round(heap_blks_hit::numeric / (heap_blks_hit + heap_blks_read), 4) AS ratio
+FROM pg_statio_user_tables
+WHERE heap_blks_read > 0;
+```
+
+## 八、生产最佳实践
+
+### 8.1 核心配置优化
+
+```ini
+# postgresql.conf
+
+# 内存
+shared_buffers = 4GB              # 系统内存的 25%
+effective_cache_size = 12GB       # 系统内存的 75%
+work_mem = 64MB                   # 排序/哈希内存
+maintenance_work_mem = 1GB        # 维护操作内存
+
+# 连接
+max_connections = 200
+superuser_reserved_connections = 3
+
+# WAL
+wal_buffers = 64MB
+checkpoint_completion_target = 0.9
+
+# 查询规划
+random_page_cost = 1.1            # SSD 设置为 1.1
+effective_io_concurrency = 200    # SSD 设置为 200
+
+# 并行查询
+max_worker_processes = 8
+max_parallel_workers_per_gather = 4
+```
+
+### 8.2 连接池（PgBouncer）
+
+```bash
+# 安装
+sudo apt install pgbouncer
+
+# 配置 /etc/pgbouncer/pgbouncer.ini
+[databases]
+mydb = host=127.0.0.1 port=5432 dbname=mydb
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt
+pool_mode = transaction
+max_client_conn = 1000
+default_pool_size = 20
+```
+
+### 8.3 高可用方案
+
+| 方案 | 特点 |
+|------|------|
+| **主从复制** | 简单，手动故障转移 |
+| **Patroni** | 自动故障转移，etcd 存储 |
+| **PgPool-II** | 连接池 + 负载均衡 + 故障转移 |
+| **云服务** | RDS、Cloud SQL 等，托管高可用 |
+
+### 8.4 安全配置
+
+```sql
+-- 创建只读用户
+CREATE USER readonly WITH PASSWORD 'secret';
+GRANT CONNECT ON DATABASE mydb TO readonly;
+GRANT USAGE ON SCHEMA public TO readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly;
+
+-- 限制访问 IP（pg_hba.conf）
+host    mydb    myuser    10.0.0.0/24    md5
+```
+
+## 总结
+
+PostgreSQL 是一个功能强大、稳定可靠的数据库。
+
+**核心要点**：
+1. **高级类型** - JSONB、数组、枚举
+2. **索引优化** - B-Tree、GIN、部分索引
+3. **查询优化** - EXPLAIN、避免全表扫描
+4. **并发控制** - MVCC、行级锁
+5. **备份恢复** - pg_dump、WAL 归档
+6. **性能监控** - 慢查询、连接池
+7. **高可用** - 主从复制、Patroni
+
+**学习路径**：
+```
+基础 SQL → 高级类型 → 索引优化 → 事务并发 → 备份恢复 → 高可用
+```
+
+PostgreSQL 文档非常完善，遇到问题多查官方文档，善用 `\h` 和 `\d` 命令。
