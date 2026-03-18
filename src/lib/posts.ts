@@ -58,6 +58,22 @@ export function getAllPosts(): PostMeta[] {
     });
 }
 
+// 按类别分组获取文章
+export function getPostsByCategory(): Record<string, PostMeta[]> {
+  const posts = getAllPosts();
+  const grouped: Record<string, PostMeta[]> = {};
+
+  posts.forEach((post) => {
+    const category = post.category || "未分类";
+    if (!grouped[category]) {
+      grouped[category] = [];
+    }
+    grouped[category].push(post);
+  });
+
+  return grouped;
+}
+
 // 获取单篇文章详情（包含编译后的内容）
 export async function getPostBySlug(slug: string): Promise<Post | null> {
   const realSlug = slug.replace(/\.mdx$/, "");
