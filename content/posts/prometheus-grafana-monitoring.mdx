@@ -1,0 +1,897 @@
+---
+title: Prometheus + Grafana 监控实战：从零搭建企业级监控告警系统
+date: 2026-03-18
+tags: [DevOps, Prometheus, Grafana, 监控, 告警, 容器化]
+category: 运维
+description: 手把手教你搭建生产级的监控系统，涵盖 Prometheus 数据采集、Grafana 可视化、AlertManager 告警配置，以及 Docker Compose 一键部署方案。
+---
+
+# Prometheus + Grafana 监控实战：从零搭建企业级监控告警系统
+
+在生产环境中，**没有监控的系统就像闭着眼睛开车** —— 你不知道前面是悬崖还是坦途。Prometheus + Grafana 组合已成为云原生监控的事实标准，本文将带你从零搭建一套企业级的监控告警系统。
+
+## 为什么选择 Prometheus + Grafana？
+
+### Prometheus 的优势
+
+- **多维数据模型**：基于指标名称和键值对的时间序列数据
+- **强大的查询语言**：PromQL 支持复杂的数据聚合和计算
+- **拉取式采集**：无需在应用端配置推送，易于管理
+- **服务发现**：自动发现 Kubernetes、Consul 等环境中的目标
+- **生态丰富**：支持数十种数据库、中间件、系统的 Exporter
+
+### Grafana 的优势
+
+- **美观的可视化**：开箱即用的专业监控面板
+- **多数据源支持**：Prometheus、InfluxDB、MySQL 等
+- **告警通知**：支持邮件、Slack、钉钉、企业微信等
+- **模板变量**：动态切换监控维度（服务、环境、实例等）
+- **社区活跃**：数千个现成的 Dashboard 模板
+
+## 架构概览
+
+```
+┌─────────────┐
+│  应用服务    │ ──┐
+├─────────────┤   │
+│  MySQL      │ ──┤
+├─────────────┤   │    ┌──────────┐    ┌─────────┐
+│  Redis      │ ──┼───&gt;│Prometheus│───&gt;│ Grafana │
+├─────────────┤   │    └──────────┘    └─────────┘
+│  Node.js    │ ──┤         │               │
+├─────────────┤   │         ↓               ↓
+│  Nginx      │ ──┘    ┌──────────┐    ┌─────────┐
+└─────────────┘        │  Alter   │    │  告警   │
+                       │ Manager  │───&gt;│  通知   │
+                       └──────────┘    └─────────┘
+```
+
+## 快速开始：Docker Compose 一键部署
+
+### 1. 创建项目结构
+
+```bash
+mkdir prometheus-grafana-stack
+cd prometheus-grafana-stack
+
+# 创建配置目录
+mkdir -p prometheus grafana/provisioning
+```
+
+### 2. Prometheus 配置文件
+
+创建 `prometheus/prometheus.yml`：
+
+```yaml
+global:
+  scrape_interval: 15s # 默认采集间隔
+  evaluation_interval: 15s # 规则评估间隔
+  external_labels:
+    monitor: "production"
+
+# 告警规则文件
+rule_files:
+  - /etc/prometheus/alert.rules.yml
+
+# 告警管理器配置
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+# 采集配置
+scrape_configs:
+  # Prometheus 自身监控
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Node Exporter - 系统指标
+  - job_name: "node-exporter"
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # MySQL Exporter
+  - job_name: "mysql-exporter"
+    static_configs:
+      - targets: ["mysql-exporter:9104"]
+
+  # Redis Exporter
+  - job_name: "redis-exporter"
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+
+  # 应用服务监控（假设暴露 /metrics 端点）
+  - job_name: "nodejs-app"
+    static_configs:
+      - targets: ["app:3000"]
+```
+
+### 3. 告警规则配置
+
+创建 `prometheus/alert.rules.yml`：
+
+```yaml
+groups:
+  - name: instance_alerts
+    rules:
+      # 实例宕机告警
+      - alert: InstanceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "实例 {{ $labels.instance }} 宕机"
+          description: "{{ $labels.instance }} 已经超过 1 分钟无响应"
+
+      # CPU 使用率告警
+      - alert: HighCPUUsage
+        expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) &gt; 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU 使用率过高: {{ $labels.instance }}"
+          description: "CPU 使用率 {{ $value }}% 超过 80%"
+
+      # 内存使用率告警
+      - alert: HighMemoryUsage
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 &gt; 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "内存使用率过高: {{ $labels.instance }}"
+          description: "内存使用率 {{ $value }}% 超过 85%"
+
+      # 磁盘使用率告警
+      - alert: DiskSpaceLow
+        expr: (1 - (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"})) * 100 &gt; 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "磁盘空间不足: {{ $labels.instance }}"
+          description: "挂载点 {{ $labels.mountpoint }} 使用率 {{ $value }}%"
+
+  - name: mysql_alerts
+    rules:
+      # MySQL 连接数告警
+      - alert: MySQLTooManyConnections
+        expr: (mysql_global_status_threads_connected / mysql_global_variables_max_connections) * 100 &gt; 80
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MySQL 连接数过高"
+          description: "当前连接数占最大连接数的 {{ $value }}%"
+
+  - name: redis_alerts
+    rules:
+      # Redis 内存使用告警
+      - alert: RedisHighMemory
+        expr: (redis_memory_used_bytes / redis_memory_max_bytes) * 100 &gt; 80
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Redis 内存使用率过高"
+          description: "Redis 内存使用率 {{ $value }}%"
+```
+
+### 4. AlertManager 配置
+
+创建 `alertmanager/config.yml`：
+
+```yaml
+global:
+  # SMTP 配置（邮件告警）
+  smtp_smarthost: "smtp.example.com:587"
+  smtp_from: "alertmanager@example.com"
+  smtp_auth_username: "alertmanager@example.com"
+  smtp_auth_password: "your-password"
+
+  # 钉钉 Webhook（可选）
+  # 需要部署 prometheus-webhook-dingtalk
+
+# 路由配置
+route:
+  group_by: ["alertname", "severity"]
+  group_wait: 10s # 等待同组告警聚合
+  group_interval: 10s # 同组告警发送间隔
+  repeat_interval: 12h # 重复告警发送间隔
+  receiver: "team-ops"
+  routes:
+    # 严重告警立即通知
+    - match:
+        severity: critical
+      receiver: "team-ops"
+      continue: true
+
+    # 警告级别告警
+    - match:
+        severity: warning
+      receiver: "team-ops"
+
+# 接收器配置
+receivers:
+  - name: "team-ops"
+    email_configs:
+      - to: "ops-team@example.com"
+        send_resolved: true
+
+    # 钉钉通知（需要 webhook-dingtalk）
+    # webhook_configs:
+    #   - url: 'http://dingtalk-webhook:8060/dingtalk/ops/send'
+    #     send_resolved: true
+
+# 告警抑制规则
+inhibit_rules:
+  # 如果实例宕机，抑制该实例的其他告警
+  - source_match:
+      severity: "critical"
+    target_match:
+      severity: "warning"
+    equal: ["alertname", "instance"]
+```
+
+### 5. Docker Compose 完整配置
+
+创建 `docker-compose.yml`：
+
+```yaml
+version: "3.8"
+
+networks:
+  monitoring:
+    driver: bridge
+
+volumes:
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:
+
+services:
+  # Prometheus 服务
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: prometheus
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./prometheus/alert.rules.yml:/etc/prometheus/alert.rules.yml
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d" # 数据保留 30 天
+      - "--web.enable-lifecycle" # 支持热重载
+    ports:
+      - "9090:9090"
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # AlertManager 服务
+  alertmanager:
+    image: prom/alertmanager:v0.26.0
+    container_name: alertmanager
+    volumes:
+      - ./alertmanager/config.yml:/etc/alertmanager/config.yml
+      - alertmanager-data:/alertmanager
+    command:
+      - "--config.file=/etc/alertmanager/config.yml"
+      - "--storage.path=/alertmanager"
+    ports:
+      - "9093:9093"
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # Grafana 服务
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: grafana
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_INSTALL_PLUGINS=grafana-clock-panel
+    ports:
+      - "3000:3000"
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # Node Exporter - 系统指标采集
+  node-exporter:
+    image: prom/node-exporter:v1.7.0
+    container_name: node-exporter
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - "--path.procfs=/host/proc"
+      - "--path.sysfs=/host/sys"
+      - "--path.rootfs=/rootfs"
+    ports:
+      - "9100:9100"
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # MySQL Exporter（可选）
+  mysql-exporter:
+    image: prom/mysqld-exporter:v0.15.0
+    container_name: mysql-exporter
+    environment:
+      - DATA_SOURCE_NAME=user:password@(mysql-host:3306)/
+    ports:
+      - "9104:9104"
+    networks:
+      - monitoring
+    restart: unless-stopped
+
+  # Redis Exporter（可选）
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.55.0
+    container_name: redis-exporter
+    environment:
+      - REDIS_ADDR=redis://redis-host:6379
+    ports:
+      - "9121:9121"
+    networks:
+      - monitoring
+    restart: unless-stopped
+```
+
+### 6. 启动监控栈
+
+```bash
+# 启动所有服务
+docker-compose up -d
+
+# 查看服务状态
+docker-compose ps
+
+# 查看日志
+docker-compose logs -f prometheus
+```
+
+访问地址：
+
+- **Prometheus**: http://localhost:9090
+- **Grafana**: http://localhost:3000 (admin/admin123)
+- **AlertManager**: http://localhost:9093
+
+## 应用接入：暴露 Metrics 端点
+
+### Node.js 应用接入
+
+使用 `prom-client` 库：
+
+```javascript
+const express = require("express");
+const client = require("prom-client");
+
+const app = express();
+
+// 启用默认指标（CPU、内存、事件循环等）
+const collectDefaultMetrics = client.collectDefaultMetrics;
+collectDefaultMetrics({ register: client.register });
+
+// 自定义业务指标
+const httpRequestDuration = new client.Histogram({
+  name: "http_request_duration_seconds",
+  help: "HTTP 请求耗时分布",
+  labelNames: ["method", "route", "status_code"],
+  buckets: [0.1, 0.5, 1, 2, 5], // 秒
+});
+
+const activeUsers = new client.Gauge({
+  name: "active_users_total",
+  help: "当前活跃用户数",
+});
+
+// 业务逻辑中记录指标
+app.get("/api/users", async (req, res) => {
+  const start = Date.now();
+
+  try {
+    // 业务逻辑...
+    const users = await getUsers();
+    res.json(users);
+
+    // 记录成功请求
+    httpRequestDuration
+      .labels("GET", "/api/users", "200")
+      .observe((Date.now() - start) / 1000);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+
+    // 记录失败请求
+    httpRequestDuration
+      .labels("GET", "/api/users", "500")
+      .observe((Date.now() - start) / 1000);
+  }
+});
+
+// 更新活跃用户数
+setInterval(async () => {
+  const count = await getActiveUserCount();
+  activeUsers.set(count);
+}, 60000);
+
+// 暴露 metrics 端点
+app.get("/metrics", async (req, res) => {
+  res.set("Content-Type", client.register.contentType);
+  res.end(await client.register.metrics());
+});
+
+app.listen(3000, () => {
+  console.log("Server running on port 3000");
+});
+```
+
+### Python 应用接入
+
+使用 `prometheus-client` 库：
+
+```python
+from prometheus_client import Counter, Histogram, Gauge, generate_latest
+from flask import Flask, Response
+import time
+
+app = Flask(__name__)
+
+# 定义指标
+REQUEST_COUNT = Counter(
+    'app_request_count',
+    '应用请求总数',
+    ['method', 'endpoint', 'status']
+)
+
+REQUEST_LATENCY = Histogram(
+    'app_request_latency_seconds',
+    '请求延迟',
+    ['endpoint'],
+    buckets=[0.1, 0.5, 1.0, 2.0, 5.0]
+)
+
+ACTIVE_CONNECTIONS = Gauge(
+    'app_active_connections',
+    '活跃连接数'
+)
+
+@app.route('/api/data')
+def get_data():
+    start_time = time.time()
+
+    # 业务逻辑
+    data = {"message": "Hello"}
+
+    # 记录指标
+    REQUEST_COUNT.labels(method='GET', endpoint='/api/data', status=200).inc()
+    REQUEST_LATENCY.labels(endpoint='/api/data').observe(time.time() - start_time)
+
+    return data
+
+@app.route('/metrics')
+def metrics():
+    return Response(generate_latest(), mimetype='text/plain')
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
+```
+
+## PromQL 实战：常用查询语句
+
+### 1. CPU 相关
+
+```promql
+# CPU 使用率（5分钟平均）
+100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+
+# 各模式 CPU 使用率
+avg by(mode) (rate(node_cpu_seconds_total[5m])) * 100
+
+# CPU 负载（1/5/15分钟）
+node_load1
+node_load5
+node_load15
+```
+
+### 2. 内存相关
+
+```promql
+# 内存使用率
+(1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
+
+# 已用内存（GB）
+(node_memory_MemTotal_bytes - node_memory_MemAvailable_bytes) / 1024 / 1024 / 1024
+
+# Swap 使用率
+(1 - (node_memory_SwapFree_bytes / node_memory_SwapTotal_bytes)) * 100
+```
+
+### 3. 磁盘相关
+
+```promql
+# 磁盘使用率（按挂载点）
+(1 - (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"})) * 100
+
+# 磁盘 IO 使用率
+rate(node_disk_io_time_seconds_total[5m]) * 100
+
+# 磁盘读写速率（MB/s）
+rate(node_disk_read_bytes_total[5m]) / 1024 / 1024
+rate(node_disk_written_bytes_total[5m]) / 1024 / 1024
+```
+
+### 4. 网络相关
+
+```promql
+# 网络流量（入站/出站 MB/s）
+rate(node_network_receive_bytes_total{device!="lo"}[5m]) / 1024 / 1024
+rate(node_network_transmit_bytes_total{device!="lo"}[5m]) / 1024 / 1024
+
+# TCP 连接数
+node_netstat_Tcp_CurrEstab
+
+# 网络错误率
+rate(node_network_receive_errs_total[5m]) + rate(node_network_transmit_errs_total[5m])
+```
+
+### 5. 应用相关
+
+```promql
+# HTTP 请求速率（QPS）
+sum(rate(http_request_duration_seconds_count[5m])) by (route)
+
+# HTTP 请求 P95 延迟
+histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, route))
+
+# HTTP 错误率
+sum(rate(http_request_duration_seconds_count{status_code=~"5.."}[5m]))
+  / sum(rate(http_request_duration_seconds_count[5m])) * 100
+
+# 活跃用户数
+active_users_total
+```
+
+### 6. 聚合计算
+
+```promql
+# 所有实例的平均 CPU 使用率
+avg(100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100))
+
+# CPU 使用率 Top 5
+topk(5, 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100))
+
+# 一小时内的 CPU 使用率变化
+rate(node_cpu_seconds_total{mode="idle"}[1h]) - rate(node_cpu_seconds_total{mode="idle"}[1h] offset 1h)
+```
+
+## Grafana Dashboard 配置
+
+### 1. 自动配置数据源
+
+创建 `grafana/provisioning/datasources/prometheus.yml`：
+
+```yaml
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+```
+
+### 2. 导入社区 Dashboard
+
+推荐导入以下 Dashboard ID：
+
+- **Node Exporter Full**: 1860
+- **Docker Monitoring**: 179
+- **MySQL Overview**: 7362
+- **Redis Dashboard**: 11835
+- **Nginx**: 12759
+
+导入方式：Grafana → Dashboards → Import → 输入 Dashboard ID
+
+### 3. 自定义 Dashboard 示例
+
+创建系统监控面板：
+
+**Panel 1: CPU 使用率趋势**
+
+```yaml
+Title: CPU 使用率
+Visualization: Time series
+Query: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+Legend: { { instance } }
+```
+
+**Panel 2: 内存使用率**
+
+```yaml
+Title: 内存使用情况
+Visualization: Stat
+Query: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100
+Unit: Percent (0-100)
+Thresholds:
+  - Yellow: 70
+  - Red: 85
+```
+
+**Panel 3: 磁盘使用率**
+
+```yaml
+Title: 磁盘空间
+Visualization: Bar gauge
+Query: (1 - (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"})) * 100
+Legend: { { mountpoint } }
+```
+
+**Panel 4: 网络流量**
+
+```yaml
+Title: 网络流量
+Visualization: Time series
+Query A: rate(node_network_receive_bytes_total{device!="lo"}[5m])
+Query B: rate(node_network_transmit_bytes_total{device!="lo"}[5m])
+Legend A: 入站
+Legend B: 出站
+Unit: bytes/sec
+```
+
+## 告警通知配置
+
+### 1. 钉钉告警
+
+部署 prometheus-webhook-dingtalk：
+
+```yaml
+# docker-compose.yml 添加
+dingtalk-webhook:
+  image: timonwong/prometheus-webhook-dingtalk:v2.1.0
+  container_name: dingtalk-webhook
+  volumes:
+    - ./dingtalk/config.yml:/etc/prometheus-webhook-dingtalk/config.yml
+  ports:
+    - "8060:8060"
+  networks:
+    - monitoring
+  restart: unless-stopped
+```
+
+创建 `dingtalk/config.yml`：
+
+```yaml
+targets:
+  ops:
+    url: https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN
+    secret: YOUR_SECRET
+```
+
+### 2. 企业微信告警
+
+AlertManager 配置：
+
+```yaml
+receivers:
+  - name: "wechat"
+    wechat_configs:
+      - corp_id: "your-corp-id"
+        to_party: "party-id"
+        agent_id: "agent-id"
+        api_secret: "api-secret"
+        send_resolved: true
+```
+
+### 3. Slack 告警
+
+```yaml
+receivers:
+  - name: "slack"
+    slack_configs:
+      - api_url: "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+        channel: "#alerts"
+        send_resolved: true
+        title: "{{ .Status | toUpper }}: {{ .CommonAnnotations.summary }}"
+        text: "{{ .CommonAnnotations.description }}"
+```
+
+## 生产环境最佳实践
+
+### 1. 性能优化
+
+```yaml
+# prometheus.yml
+global:
+  scrape_interval: 15s # 采集间隔
+  evaluation_interval: 15s # 规则评估间隔
+
+# 数据存储优化
+command:
+  - "--storage.tsdb.retention.time=30d" # 保留 30 天
+  - "--storage.tsdb.retention.size=10GB" # 最大 10GB
+  - "--storage.tsdb.wal-compression" # 启用 WAL 压缩
+```
+
+### 2. 高可用部署
+
+**方案一：双实例 + 负载均衡**
+
+```yaml
+# 部署两个 Prometheus 实例
+# 使用相同的配置，独立采集数据
+# Grafana 配置多个数据源，查询时合并结果
+```
+
+**方案二：联邦集群**
+
+```yaml
+# prometheus.yml - 联邦配置
+scrape_configs:
+  - job_name: "federate"
+    scrape_interval: 15s
+    honor_labels: true
+    metrics_path: "/federate"
+    params:
+      "match[]":
+        - '{job="prometheus"}'
+        - '{__name__=~"job:.*"}'
+    static_configs:
+      - targets:
+          - "prometheus-1:9090"
+          - "prometheus-2:9090"
+```
+
+### 3. 远程存储
+
+对于大规模部署，使用长期存储方案：
+
+```yaml
+# prometheus.yml
+remote_write:
+  - url: http://remote-storage:9201/write
+
+remote_read:
+  - url: http://remote-storage:9201/read
+```
+
+推荐方案：
+
+- **VictoriaMetrics**：高性能，兼容 Prometheus
+- **Thanos**：支持长期存储，多集群查询
+- **Cortex**：多租户，可扩展
+
+### 4. 安全加固
+
+```yaml
+# 启用认证（使用反向代理）
+# nginx.conf
+server {
+listen 9090;
+
+auth_basic "Prometheus";
+auth_basic_user_file /etc/nginx/.htpasswd;
+
+location / {
+proxy_pass http://prometheus:9090;
+}
+}
+```
+
+```yaml
+# Grafana 安全配置
+environment:
+  - GF_AUTH_ANONYMOUS_ENABLED=false
+  - GF_AUTH_BASIC_ENABLED=true
+  - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+  - GF_SECURITY_SECRET_KEY=${SECRET_KEY}
+```
+
+### 5. 监控覆盖清单
+
+确保监控以下核心指标：
+
+**系统层**：
+
+- ✅ CPU 使用率（总体 + 各核心）
+- ✅ 内存使用率（物理 + Swap）
+- ✅ 磁盘使用率（各挂载点）
+- ✅ 磁盘 IO（读写速率、延迟）
+- ✅ 网络流量（入站/出站）
+- ✅ TCP 连接数
+- ✅ 系统负载（1/5/15分钟）
+
+**应用层**：
+
+- ✅ HTTP 请求 QPS
+- ✅ 请求延迟（P50/P95/P99）
+- ✅ 错误率（4xx + 5xx）
+- ✅ 活跃连接数
+- ✅ 业务指标（用户数、订单数等）
+
+**中间件层**：
+
+- ✅ MySQL：连接数、QPS、慢查询
+- ✅ Redis：内存、连接数、命中率
+- ✅ Nginx：请求数、响应时间、上游状态
+- ✅ RabbitMQ：队列深度、消费速率
+
+## 故障排查
+
+### 1. Prometheus 无法采集数据
+
+```bash
+# 检查目标状态
+curl http://localhost:9090/api/v1/targets
+
+# 手动测试 metrics 端点
+curl http://target-host:port/metrics
+
+# 查看 Prometheus 日志
+docker-compose logs prometheus | grep error
+```
+
+### 2. 告警未触发
+
+```bash
+# 检查告警规则
+curl http://localhost:9090/api/v1/rules
+
+# 查看 AlertManager 日志
+docker-compose logs alertmanager
+
+# 测试告警发送
+curl -X POST http://localhost:9093/api/v1/alerts -d '[{
+  "labels": {"alertname": "TestAlert"},
+  "annotations": {"summary": "Test alert"}
+}]'
+```
+
+### 3. Grafana 查询慢
+
+- 优化 PromQL 查询（减少时间范围）
+- 增加数据采样间隔
+- 使用 recording rules 预计算
+- 考虑远程存储方案
+
+## 总结
+
+Prometheus + Grafana 监控系统核心要点：
+
+1. **数据采集**：通过 Exporter 或应用暴露的 /metrics 端点
+2. **数据存储**：TSDB 时序数据库，支持远程存储
+3. **查询分析**：PromQL 强大的查询语言
+4. **可视化**：Grafana 丰富的图表和 Dashboard
+5. **告警通知**：AlertManager 灵活的告警路由
+
+**建议学习路径**：
+
+1. 先搭建基础监控栈（Prometheus + Grafana + Node Exporter）
+2. 接入应用指标（QPS、延迟、错误率）
+3. 配置关键告警（CPU、内存、磁盘、应用错误）
+4. 优化 Dashboard（业务视角 + 技术视角）
+5. 探索高级特性（联邦、远程存储、服务发现）
+
+监控系统是生产环境的"眼睛"，投入时间搭建好监控系统，能让你在故障发生时胸有成竹，快速定位问题！
+
+---
+
+**相关资源**：
+
+- [Prometheus 官方文档](https://prometheus.io/docs/)
+- [Grafana 官方文档](https://grafana.com/docs/)
+- [Awesome Prometheus](https://github.com/roaldnefs/awesome-prometheus)
+- [PromQL 速查表](https://promlabs.com/promql-cheat-sheet/)
