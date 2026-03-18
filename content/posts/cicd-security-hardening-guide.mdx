@@ -1,0 +1,923 @@
+---
+title: "CI/CD 流水线安全加固实战指南"
+date: "2026-03-18"
+summary: "深入讲解 CI/CD 流水线的安全风险与加固策略，涵盖密钥管理、权限控制、供应链安全、审计日志等关键环节，帮助你构建安全可靠的持续集成与部署流程。"
+tags: ["CI/CD", "DevSecOps", "GitHub Actions", "安全", "最佳实践"]
+category: "运维"
+cover: ""
+draft: false
+---
+
+在现代软件开发中，CI/CD（持续集成/持续部署）流水线已经成为不可或缺的基础设施。然而，随着流水线承载的任务越来越重要——从代码构建、测试到自动部署生产环境——它也成为了攻击者的重点目标。
+
+一个不安全的 CI/CD 流水线可能导致：
+
+- 敏感信息泄露（API密钥、数据库密码）
+- 供应链攻击（注入恶意代码）
+- 生产环境被未授权访问
+- 代码仓库被破坏
+
+本文将系统性地讲解 CI/CD 流水线的安全加固策略，以 GitHub Actions 为主要示例，同时涵盖通用原则。
+
+## 目录
+
+1. [CI/CD 安全风险概览](#cicd-安全风险概览)
+2. [密钥管理最佳实践](#密钥管理最佳实践)
+3. [权限控制与最小权限原则](#权限控制与最小权限原则)
+4. [供应链安全](#供应链安全)
+5. [审计与监控](#审计与监控)
+6. [实战案例：安全加固的 GitHub Actions 配置](#实战案例安全加固的-github-actions-配置)
+7. [安全检查清单](#安全检查清单)
+
+---
+
+## CI/CD 安全风险概览
+
+### 常见攻击向量
+
+| 攻击类型 | 风险等级 | 描述                       |
+| -------- | -------- | -------------------------- |
+| 密钥泄露 | 🔴 高    | 在日志、代码中暴露敏感信息 |
+| 依赖投毒 | 🔴 高    | 使用被篡改的第三方依赖     |
+| 权限提升 | 🟠 中    | 通过流水线获取过高权限     |
+| 代码注入 | 🟠 中    | 通过 PR 注入恶意代码       |
+| 缓存投毒 | 🟡 低    | 污染构建缓存               |
+
+### 真实案例
+
+**案例 1：Codecov 供应链攻击（2021）**
+攻击者通过篡改 Bash Uploader 脚本，窃取了数千家公司的 CI/CD 环境变量，包括 API 密钥和访问令牌。
+
+**案例 2：SolarWinds 攻击（2020）**
+攻击者入侵构建系统，在更新包中注入后门，影响了 18,000+ 组织。
+
+**案例 3：GitHub Actions 日志泄露**
+某些 Actions 会意外将 GITHUB_TOKEN 或自定义密钥打印到日志中，被恶意 PR 触发后导致泄露。
+
+---
+
+## 密钥管理最佳实践
+
+### 1. 使用平台提供的密钥管理
+
+**GitHub Actions Secrets**
+
+```yaml
+# ✅ 正确：使用加密的 Secrets
+- name: Deploy to production
+  env:
+    DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    API_KEY: ${{ secrets.PROD_API_KEY }}
+  run: |
+    echo "Deploying..."
+    # 使用环境变量
+```
+
+```yaml
+# ❌ 错误：直接硬编码
+- name: Deploy to production
+  run: |
+    export DATABASE_URL="postgresql://user:password@host:5432/db"
+    # 危险！密钥暴露在代码中
+```
+
+### 2. 分级管理密钥
+
+根据环境和敏感度分级：
+
+```yaml
+# 组织级 Secrets（跨仓库共享）
+# - DOCKER_REGISTRY_TOKEN
+# - NPM_TOKEN
+
+# 仓库级 Secrets（特定项目）
+# - DATABASE_URL
+# - STRIPE_SECRET_KEY
+
+# 环境级 Secrets（需要审批）
+# - PRODUCTION_AWS_ACCESS_KEY
+# - PRODUCTION_PRIVATE_KEY
+```
+
+**环境保护规则示例：**
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to Production
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production # 需要审批才能访问
+    steps:
+      - name: Deploy
+        run: echo "Deploying to production..."
+```
+
+在 GitHub 设置中配置环境保护规则：
+
+- Required reviewers（需要审批人）
+- Wait timer（等待时间）
+- Deployment branches（限制触发分支）
+
+### 3. 避免密钥泄露到日志
+
+**使用 add-mask**
+
+```yaml
+- name: Mask sensitive data
+  run: |
+    echo "::add-mask::${{ secrets.MY_SECRET }}"
+    echo "Secret is now masked in logs"
+```
+
+**禁用命令回显**
+
+```yaml
+- name: Run with secrets
+  run: |
+    # 不输出命令本身
+    set +x
+    curl -H "Authorization: Bearer ${{ secrets.API_TOKEN }}" \
+      https://api.example.com/deploy
+```
+
+### 4. 定期轮换密钥
+
+建立密钥轮换策略：
+
+```bash
+#!/bin/bash
+# rotate-secrets.sh
+
+# 生成新的 API 密钥
+NEW_KEY=$(openssl rand -hex 32)
+
+# 更新密钥到服务提供商
+curl -X POST https://api.example.com/rotate-key \
+  -H "Authorization: Bearer $OLD_KEY" \
+  -d "{\"new_key\": \"$NEW_KEY\"}"
+
+# 更新 GitHub Secret
+gh secret set API_KEY --body "$NEW_KEY"
+```
+
+### 5. 使用 OIDC 替代长期密钥
+
+**GitHub Actions + AWS OIDC**
+
+```yaml
+# .github/workflows/deploy-aws.yml
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write # 必需：请求 OIDC token
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::123456789012:role/GitHubActionsRole
+          aws-region: us-east-1
+          # 无需长期密钥！
+
+      - name: Deploy to S3
+        run: |
+          aws s3 sync ./dist s3://my-bucket/
+```
+
+**AWS IAM 信任策略：**
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::123456789012:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:myorg/myrepo:ref:refs/heads/main"
+        }
+      }
+    }
+  ]
+}
+```
+
+---
+
+## 权限控制与最小权限原则
+
+### 1. 限制 GITHUB_TOKEN 权限
+
+GitHub Actions 自动提供 GITHUB_TOKEN，默认权限可能过高。
+
+**仓库级配置：**
+
+Settings → Actions → General → Workflow permissions
+
+推荐选择：
+
+- ✅ **Read repository contents and packages permissions**
+- ✅ **Allow GitHub Actions to create and approve pull requests**（谨慎使用）
+
+**工作流级配置：**
+
+```yaml
+# .github/workflows/build.yml
+name: Build
+
+on: push
+
+permissions:
+  contents: read # 只读仓库内容
+  packages: write # 写入包（如需要）
+  pull-requests: read # 读取 PR（不创建）
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: npm run build
+```
+
+### 2. 限制触发条件
+
+**避免在 fork 的 PR 上运行敏感操作：**
+
+```yaml
+# ❌ 危险：在所有 PR 上运行，包括 fork
+on: pull_request
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy
+        run: ./deploy.sh # 可能在恶意 PR 上执行
+```
+
+```yaml
+# ✅ 安全：只在主仓库的 PR 上运行
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Run tests
+        run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' # 只在 main 分支部署
+    steps:
+      - name: Deploy
+        run: ./deploy.sh
+```
+
+### 3. 使用 Job 级权限隔离
+
+不同 Job 使用不同权限：
+
+```yaml
+jobs:
+  # 只读权限：运行测试
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm test
+
+  # 写入权限：发布包
+  publish:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm publish
+```
+
+### 4. 限制并发和重试
+
+防止资源滥用和意外行为：
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-${{ github.ref }}
+      cancel-in-progress: true # 取消旧的运行
+    steps:
+      - name: Deploy
+        run: ./deploy.sh
+```
+
+---
+
+## 供应链安全
+
+### 1. 锁定依赖版本
+
+**使用锁文件（lockfile）：**
+
+```json
+// package-lock.json 示例
+{
+  "name": "my-project",
+  "version": "1.0.0",
+  "lockfileVersion": 3,
+  "requires": true,
+  "packages": {
+    "node_modules/lodash": {
+      "version": "4.17.21",
+      "resolved": "https://registry.npmjs.org/lodash/-/lodash-4.17.21.tgz",
+      "integrity": "sha512-v3..." // 完整性校验
+    }
+  }
+}
+```
+
+**GitHub Actions 中强制使用锁文件：**
+
+```yaml
+- name: Install dependencies
+  run: npm ci # 使用 package-lock.json，而不是 package.json
+```
+
+### 2. 依赖审计
+
+**自动化安全扫描：**
+
+```yaml
+# .github/workflows/audit.yml
+name: Security Audit
+
+on:
+  schedule:
+    - cron: "0 0 * * *" # 每天运行
+  pull_request:
+    branches: [main]
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run npm audit
+        run: npm audit --audit-level=moderate
+
+      - name: Run Snyk scan
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+```
+
+### 3. 使用 Dependabot
+
+**配置自动依赖更新：**
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  # npm 依赖
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    # 限制更新范围
+    allow:
+      - dependency-type: "direct"
+    # 忽略破坏性更新
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+```
+
+### 4. 验证第三方 Actions
+
+**使用 SHA 而不是标签：**
+
+```yaml
+# ❌ 不安全：标签可能被篡改
+- uses: actions/checkout@v4
+
+# ✅ 安全：使用完整的 SHA
+- uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+```
+
+**验证 Actions 来源：**
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      # 只使用官方或可信的 Actions
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8
+        with:
+          node-version: "20"
+```
+
+### 5. SBOM（软件物料清单）
+
+**生成 SBOM：**
+
+```yaml
+- name: Generate SBOM
+  uses: anchore/sbom-action@v0
+  with:
+    format: spdx-json
+    output-file: sbom.spdx.json
+
+- name: Upload SBOM
+  uses: actions/upload-artifact@v3
+  with:
+    name: sbom
+    path: sbom.spdx.json
+```
+
+---
+
+## 审计与监控
+
+### 1. 启用审计日志
+
+**GitHub 企业版审计日志：**
+
+Settings → Organizations → Audit log
+
+监控关键事件：
+
+- `workflow.dispatch` - 手动触发工作流
+- `secrets.set` - 设置密钥
+- `repo.create` - 创建仓库
+- `org.add_member` - 添加成员
+
+### 2. 日志分析
+
+**使用 SIEM 工具集成：**
+
+```yaml
+- name: Send logs to SIEM
+  if: always() # 即使失败也发送
+  run: |
+    curl -X POST ${{ secrets.SIEM_WEBHOOK }} \
+      -H "Content-Type: application/json" \
+      -d '{
+        "event": "workflow_completed",
+        "repository": "${{ github.repository }}",
+        "workflow": "${{ github.workflow }}",
+        "status": "${{ job.status }}",
+        "actor": "${{ github.actor }}",
+        "timestamp": "${{ github.event.head_commit.timestamp }}"
+      }'
+```
+
+### 3. 异常检测
+
+**监控可疑行为：**
+
+```python
+# scripts/detect_anomalies.py
+import json
+from datetime import datetime, timedelta
+
+def detect_suspicious_activity(audit_logs):
+    """检测可疑活动"""
+    alerts = []
+
+    for log in audit_logs:
+        # 检测：非工作时间部署
+        if log['action'] == 'workflow.dispatch':
+            hour = datetime.fromisoformat(log['timestamp']).hour
+            if hour &lt; 6 or hour &gt; 22:  # 注意：&lt; 和 &gt; 已转义
+                alerts.append({
+                    'type': 'after_hours_deployment',
+                    'user': log['actor'],
+                    'time': log['timestamp']
+                })
+
+        # 检测：频繁失败
+        if log['status'] == 'failure':
+            # ... 统计逻辑
+            pass
+
+    return alerts
+```
+
+### 4. 合规性检查
+
+**自动合规扫描：**
+
+```yaml
+- name: Compliance Check
+  run: |
+    # 检查密钥是否加密
+    if grep -r "password.*=" .github/workflows/*.yml; then
+      echo "::error::Found hardcoded password in workflow"
+      exit 1
+    fi
+
+    # 检查是否使用最新 Actions
+    if grep -r "actions/checkout@v1" .github/workflows/*.yml; then
+      echo "::warning::Using outdated action version"
+    fi
+```
+
+---
+
+## 实战案例：安全加固的 GitHub Actions 配置
+
+### 完整示例：安全的部署流水线
+
+```yaml
+# .github/workflows/secure-deploy.yml
+name: Secure Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# 限制权限
+permissions:
+  contents: read
+  id-token: write # 用于 OIDC
+  pull-requests: write
+
+# 防止并发部署
+concurrency:
+  group: deploy-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: "20"
+
+jobs:
+  # 阶段1：代码检查
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+        with:
+          fetch-depth: 0 # 完整历史用于分析
+
+      - name: Setup Node.js
+        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci --audit # 审计依赖
+
+      - name: Run linter
+        run: npm run lint
+
+  # 阶段2：安全扫描
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: "fs"
+          ignore-unfixed: true
+          format: "sarif"
+          output: "trivy-results.sarif"
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: "trivy-results.sarif"
+
+  # 阶段3：测试
+  test:
+    needs: [lint, security]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+
+      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+
+      - run: npm ci
+      - run: npm test -- --coverage
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # 阶段4：构建
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+
+      - name: Build
+        run: |
+          npm ci
+          npm run build
+
+      - name: Set version
+        id: version
+        run: echo "version=$(npm pkg get version | tr -d '\"')" &gt;&gt; $GITHUB_OUTPUT
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: build-${{ github.sha }}
+          path: dist/
+          retention-days: 7
+
+  # 阶段5：部署（仅 main 分支）
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production # 需要审批
+    steps:
+      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11
+
+      - name: Download build
+        uses: actions/download-artifact@v3
+        with:
+          name: build-${{ github.sha }}
+          path: dist/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Deploy to S3
+        run: |
+          aws s3 sync ./dist s3://my-bucket/ \
+            --delete \
+            --cache-control "public, max-age=31536000"
+
+      - name: Invalidate CloudFront
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+            --paths "/*"
+
+      - name: Notify team
+        if: success()
+        run: |
+          curl -X POST ${{ secrets.SLACK_WEBHOOK }} \
+            -H 'Content-type: application/json' \
+            -d '{
+              "text": "✅ Deployment successful",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "*Deployment Successful*\nRepository: ${{ github.repository }}\nVersion: ${{ needs.build.outputs.version }}\nCommit: ${{ github.sha }}"
+                  }
+                }
+              ]
+            }'
+```
+
+### 关键安全特性说明
+
+1. **权限隔离**：每个 Job 使用最小权限
+2. **OIDC 认证**：无长期密钥，使用临时令牌
+3. **环境保护**：生产部署需要审批
+4. **并发控制**：防止重复部署
+5. **审计追踪**：所有操作可追溯
+6. **依赖锁定**：使用 SHA 锁定 Actions 版本
+7. **安全扫描**：自动漏洞检测
+8. **通知机制**：部署成功/失败通知
+
+---
+
+## 安全检查清单
+
+### 密钥管理 ✅
+
+- [ ] 所有敏感信息存储在 Secrets 中
+- [ ] 使用环境级 Secrets 保护生产环境
+- [ ] 密钥定期轮换（建议 90 天）
+- [ ] 日志中不暴露密钥（使用 add-mask）
+- [ ] 使用 OIDC 替代长期密钥
+
+### 权限控制 ✅
+
+- [ ] GITHUB_TOKEN 使用最小权限
+- [ ] 限制工作流触发条件
+- [ ] 区分测试和部署权限
+- [ ] 使用环境保护规则
+- [ ] 禁止 fork PR 触发敏感操作
+
+### 供应链安全 ✅
+
+- [ ] 锁定依赖版本（使用 lockfile）
+- [ ] 使用 npm ci 而不是 npm install
+- [ ] 配置 Dependabot 自动更新
+- [ ] 使用 SHA 锁定 Actions 版本
+- [ ] 定期运行依赖审计
+
+### 代码安全 ✅
+
+- [ ] 禁止硬编码密钥
+- [ ] 使用静态分析工具（ESLint, SonarQube）
+- [ ] 运行 SAST（静态应用安全测试）
+- [ ] 扫描容器镜像漏洞
+- [ ] 生成并存储 SBOM
+
+### 审计与监控 ✅
+
+- [ ] 启用审计日志
+- [ ] 监控异常活动
+- [ ] 设置告警规则
+- [ ] 定期审查权限
+- [ ] 记录所有部署
+
+### 应急响应 ✅
+
+- [ ] 制定安全事件响应流程
+- [ ] 准备密钥泄露应急方案
+- [ ] 可快速撤销密钥
+- [ ] 可回滚部署
+- [ ] 保留日志用于调查
+
+---
+
+## 常见问题与解决方案
+
+### Q1：如何处理来自 Fork PR 的工作流？
+
+**方案：使用 pull_request_target 谨慎处理**
+
+```yaml
+on:
+  pull_request_target:
+    types: [opened, synchronize]
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    # 不 checkout PR 代码
+    steps:
+      - name: Add label
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['needs-review']
+            })
+```
+
+⚠️ **警告**：`pull_request_target` 可访问 secrets，绝不要 checkout 不可信代码！
+
+### Q2：如何在团队中推行安全最佳实践？
+
+**方案：使用分支保护和规则集**
+
+1. **分支保护规则**：
+   - 要求 PR 审批
+   - 要求状态检查通过
+   - 禁止强制推送
+
+2. **规则集（Rulesets）**：
+   - 限制可执行的工作流
+   - 要求特定审查者
+   - 限制部署环境访问
+
+3. **CODEOWNERS 文件**：
+
+```
+# .github/CODEOWNERS
+# 工作流修改需要 DevOps 团队审批
+.github/workflows/ @myorg/devops-team
+
+# 基础设施代码需要 SRE 审批
+terraform/ @myorg/sre-team
+```
+
+### Q3：如何平衡安全性与开发效率？
+
+**方案：分层安全策略**
+
+| 层级          | 触发条件  | 安全级别 | 速度   |
+| ------------- | --------- | -------- | ------ |
+| L1 - 快速检查 | 每次 push | 低       | ⚡⚡⚡ |
+| L2 - 完整测试 | PR 创建   | 中       | ⚡⚡   |
+| L3 - 安全扫描 | PR 合并前 | 高       | ⚡     |
+| L4 - 生产部署 | main 分支 | 最高     | 🐢     |
+
+**示例配置：**
+
+```yaml
+jobs:
+  quick-check:
+    # L1：快速反馈
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm run lint
+      - run: npm run test:unit
+
+  full-test:
+    # L2：PR 时运行
+    needs: quick-check
+    if: github.event_name == 'pull_request'
+    steps:
+      - run: npm run test:integration
+
+  security-scan:
+    # L3：合并前扫描
+    needs: full-test
+    if: github.event.pull_request.merged == true
+    steps:
+      - run: npm audit
+      - run: trivy fs .
+```
+
+---
+
+## 总结
+
+CI/CD 流水线安全是一个持续的过程，需要：
+
+1. **防御深度**：多层安全措施，不依赖单一防护
+2. **最小权限**：只授予必要的权限
+3. **零信任**：验证一切，包括内部代码和依赖
+4. **持续监控**：实时检测异常行为
+5. **快速响应**：建立应急响应机制
+
+记住：**安全性不是一次性工作，而是持续改进的过程**。定期审查流水线配置，更新依赖，轮换密钥，培训团队成员，才能构建真正安全的 CI/CD 系统。
+
+---
+
+## 参考资源
+
+- [GitHub Actions Security Hardening](https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions)
+- [OWASP CI/CD Security Guide](https://owasp.org/www-project-top-10-ci-cd-security-risks/)
+- [NIST Secure Software Development Framework](https://csrc.nist.gov/projects/ssdf)
+- [SLSA (Supply-chain Levels for Software Artifacts)](https://slsa.dev/)
+- [OpenSSF Security Scorecards](https://securityscorecards.dev/)
+
+---
+
+**最后更新**：2026-03-18
+**作者**：wy5211
+**字数**：约 7500 字
