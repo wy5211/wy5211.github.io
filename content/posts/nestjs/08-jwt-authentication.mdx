@@ -1,0 +1,931 @@
+---
+title: "08 JWT 认证完整实现：构建安全的用户认证系统"
+date: "2026-03-19"
+summary: "深入掌握 JWT 认证原理，使用 Passport 和 JWT 策略实现用户注册、登录、Token 刷新等完整的认证功能"
+tags: ["NestJS", "JWT", "认证", "Passport", "安全"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式博客系统"
+seriesOrder: 8
+---
+
+## 前言
+
+在之前的文章中，我们实现了 CRUD API 和数据验证。现在，让我们来解决一个关键问题：**用户认证**。
+
+**本文将解决什么问题？**
+
+你可能想知道：
+
+- 什么是 JWT？为什么选择 JWT？
+- 如何实现用户注册和登录？
+- 如何保护 API 路由？
+- 如何实现 Token 刷新机制？
+- 如何安全地存储密码？
+
+**本文将带你：**
+
+1. 理解 JWT 的原理和优势
+2. 实现用户注册功能
+3. 实现 JWT 登录认证
+4. 实现 Refresh Token 机制
+5. 创建自定义装饰器和守卫
+
+---
+
+## 一、什么是 JWT？
+
+### 1.1 JWT 的概念
+
+**JWT (JSON Web Token)** 是一种开放标准 (RFC 7519)，用于在各方之间安全地传输信息。
+
+**JWT 的结构**：
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOiIxMjM0NTY3ODkwIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+```
+
+JWT 由三部分组成，用 `.` 分隔：
+
+1. **Header（头部）**：描述 JWT 的元数据
+2. **Payload（负载）**：包含用户信息
+3. **Signature（签名）**：用于验证 JWT 的完整性
+
+```json
+// Header
+{
+  "alg": "HS256",
+  "typ": "JWT"
+}
+
+// Payload
+{
+  "userId": "1234567890",
+  "iat": 1516239022
+}
+
+// Signature
+HMACSHA256(
+  base64UrlEncode(header) + "." + base64UrlEncode(payload),
+  secret
+)
+```
+
+### 1.2 JWT vs Session
+
+| 特性         | JWT                | Session            |
+| ------------ | ------------------ | ------------------ |
+| **存储位置** | 客户端             | 服务器             |
+| **扩展性**   | 优秀（无状态）     | 较差（有状态）     |
+| **安全性**   | 较好（需要 HTTPS） | 较好（服务器控制） |
+| **性能**     | 好（无需查询）     | 一般（需要查询）   |
+| **跨域**     | 容易               | 需要特殊处理       |
+| **撤销**     | 困难               | 容易               |
+
+**JWT 适用场景**：
+
+- ✅ 分布式系统
+- ✅ 微服务架构
+- ✅ 单页应用（SPA）
+- ✅ 移动应用
+
+### 1.3 认证流程
+
+```
+1. 用户登录
+   ↓
+2. 服务器验证凭据
+   ↓
+3. 服务器生成 JWT（包含用户信息）
+   ↓
+4. 服务器返回 JWT
+   ↓
+5. 客户端存储 JWT（localStorage/cookie）
+   ↓
+6. 客户端每次请求携带 JWT
+   ↓
+7. 服务器验证 JWT
+   ↓
+8. 服务器返回数据
+```
+
+---
+
+## 二、安装依赖
+
+```bash
+# 安装 JWT 相关包
+pnpm add @nestjs/jwt @nestjs/passport passport passport-jwt
+pnpm add @nestjs/config
+
+# 安装密码加密包
+pnpm add bcrypt
+
+# 安装类型定义
+pnpm add -D @types/bcrypt @types/passport-jwt
+```
+
+---
+
+## 三、配置 JWT
+
+### 3.1 环境变量配置
+
+`.env`:
+
+```env
+# JWT 配置
+JWT_SECRET=your-super-secret-key-change-this-in-production
+JWT_EXPIRES_IN=15m
+JWT_REFRESH_SECRET=your-refresh-secret-key-change-this-in-production
+JWT_REFRESH_EXPIRES_IN=7d
+```
+
+### 3.2 创建 JWT 配置
+
+`src/auth/constants.ts`:
+
+```typescript
+export const jwtConstants = {
+  secret: process.env.JWT_SECRET || "secret-key",
+  expiresIn: process.env.JWT_EXPIRES_IN || "15m",
+  refreshSecret: process.env.JWT_REFRESH_SECRET || "refresh-secret",
+  refreshExpiresIn: process.env.JWT_REFRESH_EXPIRES_IN || "7d",
+};
+```
+
+---
+
+## 四、创建用户模块
+
+### 4.1 用户实体
+
+`prisma/schema.prisma`:
+
+```prisma
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  name      String
+  role      Role     @default(USER)
+
+  refreshTokens RefreshToken[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@map("refresh_tokens")
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+```
+
+运行迁移：
+
+```bash
+npx prisma migrate dev --name add_auth
+```
+
+### 4.2 用户 DTO
+
+`src/users/dto/register.dto.ts`:
+
+```typescript
+import { ApiProperty } from "@nestjs/swagger";
+import {
+  IsString,
+  IsNotEmpty,
+  IsEmail,
+  MinLength,
+  MaxLength,
+  Matches,
+} from "class-validator";
+
+export class RegisterDto {
+  @ApiProperty({ example: "zhangsan@example.com" })
+  @IsEmail({}, { message: "邮箱格式不正确" })
+  @IsNotEmpty({ message: "邮箱不能为空" })
+  email: string;
+
+  @ApiProperty({ example: "zhangsan" })
+  @IsString()
+  @IsNotEmpty({ message: "用户名不能为空" })
+  @MinLength(2, { message: "用户名至少 2 个字符" })
+  @MaxLength(50, { message: "用户名最多 50 个字符" })
+  name: string;
+
+  @ApiProperty({ example: "Password123!" })
+  @IsString()
+  @IsNotEmpty({ message: "密码不能为空" })
+  @MinLength(8, { message: "密码至少 8 个字符" })
+  @Matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/, {
+    message: "密码必须包含大小写字母和数字",
+  })
+  password: string;
+}
+```
+
+`src/users/dto/login.dto.ts`:
+
+```typescript
+import { ApiProperty } from "@nestjs/swagger";
+import { IsEmail, IsNotEmpty, IsString } from "class-validator";
+
+export class LoginDto {
+  @ApiProperty({ example: "zhangsan@example.com" })
+  @IsEmail({}, { message: "邮箱格式不正确" })
+  @IsNotEmpty({ message: "邮箱不能为空" })
+  email: string;
+
+  @ApiProperty({ example: "Password123!" })
+  @IsString()
+  @IsNotEmpty({ message: "密码不能为空" })
+  password: string;
+}
+```
+
+### 4.3 用户服务
+
+`src/users/users.service.ts`:
+
+```typescript
+import { Injectable, ConflictException } from "@nestjs/common";
+import { PrismaService } from "../database/prisma.service";
+import { RegisterDto } from "./dto/register.dto";
+import * as bcrypt from "bcrypt";
+
+@Injectable()
+export class UsersService {
+  constructor(private prisma: PrismaService) {}
+
+  /**
+   * 创建用户
+   */
+  async create(dto: RegisterDto) {
+    // 检查邮箱是否已存在
+    const existingUser = await this.prisma.user.findUnique({
+      where: { email: dto.email },
+    });
+
+    if (existingUser) {
+      throw new ConflictException("该邮箱已被注册");
+    }
+
+    // 加密密码
+    const hashedPassword = await bcrypt.hash(dto.password, 10);
+
+    // 创建用户
+    const user = await this.prisma.user.create({
+      data: {
+        email: dto.email,
+        name: dto.name,
+        password: hashedPassword,
+      },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        role: true,
+        createdAt: true,
+      },
+    });
+
+    return user;
+  }
+
+  /**
+   * 根据邮箱查找用户（包含密码）
+   */
+  async findByEmail(email: string) {
+    return this.prisma.user.findUnique({
+      where: { email },
+    });
+  }
+
+  /**
+   * 根据 ID 查找用户（不包含密码）
+   */
+  async findById(id: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        email: true,
+        name: true,
+        role: true,
+        createdAt: true,
+      },
+    });
+
+    if (!user) {
+      return null;
+    }
+
+    return user;
+  }
+
+  /**
+   * 验证密码
+   */
+  async validatePassword(plainPassword: string, hashedPassword: string) {
+    return bcrypt.compare(plainPassword, hashedPassword);
+  }
+}
+```
+
+---
+
+## 五、创建认证模块
+
+### 5.1 JWT 策略
+
+`src/auth/strategies/jwt.strategy.ts`:
+
+```typescript
+import { Injectable, UnauthorizedException } from "@nestjs/common";
+import { PassportStrategy } from "@nestjs/passport";
+import { ExtractJwt, Strategy } from "passport-jwt";
+import { jwtConstants } from "../constants";
+
+@Injectable()
+export class JwtStrategy extends PassportStrategy(Strategy) {
+  constructor() {
+    super({
+      jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
+      ignoreExpiration: false,
+      secretOrKey: jwtConstants.secret,
+    });
+  }
+
+  async validate(payload: any) {
+    if (!payload.userId) {
+      throw new UnauthorizedException("无效的 Token");
+    }
+
+    return {
+      userId: payload.userId,
+      email: payload.email,
+      role: payload.role,
+    };
+  }
+}
+```
+
+### 5.2 JWT 守卫
+
+`src/auth/guards/jwt-auth.guard.ts`:
+
+```typescript
+import { Injectable } from "@nestjs/common";
+import { AuthGuard } from "@nestjs/passport";
+
+@Injectable()
+export class JwtAuthGuard extends AuthGuard("jwt") {}
+```
+
+`src/auth/guards/jwt-refresh.guard.ts`:
+
+```typescript
+import { Injectable } from "@nestjs/common";
+import { AuthGuard } from "@nestjs/passport";
+
+@Injectable()
+export class JwtRefreshGuard extends AuthGuard("jwt-refresh") {}
+```
+
+### 5.3 自定义装饰器
+
+`src/auth/decorators/current-user.decorator.ts`:
+
+```typescript
+import { createParamDecorator, ExecutionContext } from "@nestjs/common";
+
+export const CurrentUser = createParamDecorator(
+  (data: string | undefined, ctx: ExecutionContext) => {
+    const request = ctx.switchToHttp().getRequest();
+    const user = request.user;
+
+    return data ? user?.[data] : user;
+  }
+);
+```
+
+`src/auth/decorators/public.decorator.ts`:
+
+```typescript
+import { SetMetadata } from "@nestjs/common";
+
+export const IS_PUBLIC_KEY = "isPublic";
+export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
+```
+
+### 5.4 认证服务
+
+`src/auth/auth.service.ts`:
+
+```typescript
+import {
+  Injectable,
+  UnauthorizedException,
+  ConflictException,
+} from "@nestjs/common";
+import { JwtService } from "@nestjs/jwt";
+import { UsersService } from "../users/users.service";
+import { RegisterDto } from "../users/dto/register.dto";
+import { LoginDto } from "../users/dto/login.dto";
+import { PrismaService } from "../database/prisma.service";
+import { randomBytes } from "crypto";
+
+@Injectable()
+export class AuthService {
+  constructor(
+    private usersService: UsersService,
+    private jwtService: JwtService,
+    private prisma: PrismaService
+  ) {}
+
+  /**
+   * 用户注册
+   */
+  async register(dto: RegisterDto) {
+    const user = await this.usersService.create(dto);
+
+    // 生成 Token
+    const tokens = await this.generateTokens(user.id, user.email, user.role);
+
+    // 保存 Refresh Token
+    await this.saveRefreshToken(user.id, tokens.refreshToken);
+
+    return {
+      user,
+      ...tokens,
+    };
+  }
+
+  /**
+   * 用户登录
+   */
+  async login(dto: LoginDto) {
+    // 查找用户
+    const user = await this.usersService.findByEmail(dto.email);
+
+    if (!user) {
+      throw new UnauthorizedException("邮箱或密码错误");
+    }
+
+    // 验证密码
+    const isPasswordValid = await this.usersService.validatePassword(
+      dto.password,
+      user.password
+    );
+
+    if (!isPasswordValid) {
+      throw new UnauthorizedException("邮箱或密码错误");
+    }
+
+    // 生成 Token
+    const tokens = await this.generateTokens(user.id, user.email, user.role);
+
+    // 保存 Refresh Token
+    await this.saveRefreshToken(user.id, tokens.refreshToken);
+
+    // 返回用户信息（不包含密码）
+    const { password, ...userWithoutPassword } = user;
+
+    return {
+      user: userWithoutPassword,
+      ...tokens,
+    };
+  }
+
+  /**
+   * 刷新 Token
+   */
+  async refreshTokens(refreshToken: string) {
+    try {
+      // 验证 Refresh Token
+      const payload = this.jwtService.verify(refreshToken, {
+        secret: process.env.JWT_REFRESH_SECRET,
+      });
+
+      // 查找 Refresh Token
+      const token = await this.prisma.refreshToken.findUnique({
+        where: { token: refreshToken },
+        include: { user: true },
+      });
+
+      if (!token || token.expiresAt < new Date()) {
+        throw new UnauthorizedException("Refresh Token 无效或已过期");
+      }
+
+      // 生成新的 Token
+      const tokens = await this.generateTokens(
+        token.user.id,
+        token.user.email,
+        token.user.role
+      );
+
+      // 删除旧的 Refresh Token
+      await this.prisma.refreshToken.delete({
+        where: { token: refreshToken },
+      });
+
+      // 保存新的 Refresh Token
+      await this.saveRefreshToken(token.user.id, tokens.refreshToken);
+
+      return tokens;
+    } catch (error) {
+      throw new UnauthorizedException("Refresh Token 无效");
+    }
+  }
+
+  /**
+   * 登出
+   */
+  async logout(refreshToken: string) {
+    await this.prisma.refreshToken.delete({
+      where: { token: refreshToken },
+    });
+
+    return { message: "登出成功" };
+  }
+
+  /**
+   * 生成 Access Token 和 Refresh Token
+   */
+  private async generateTokens(userId: string, email: string, role: string) {
+    const payload = { userId, email, role };
+
+    const [accessToken, refreshToken] = await Promise.all([
+      this.jwtService.signAsync(payload, {
+        secret: process.env.JWT_SECRET,
+        expiresIn: process.env.JWT_EXPIRES_IN || "15m",
+      }),
+      this.jwtService.signAsync(payload, {
+        secret: process.env.JWT_REFRESH_SECRET,
+        expiresIn: process.env.JWT_REFRESH_EXPIRES_IN || "7d",
+      }),
+    ]);
+
+    return {
+      accessToken,
+      refreshToken,
+    };
+  }
+
+  /**
+   * 保存 Refresh Token
+   */
+  private async saveRefreshToken(userId: string, token: string) {
+    const expiresAt = new Date();
+    expiresAt.setDate(expiresAt.getDate() + 7); // 7 天后过期
+
+    await this.prisma.refreshToken.create({
+      data: {
+        token,
+        userId,
+        expiresAt,
+      },
+    });
+  }
+}
+```
+
+### 5.5 认证控制器
+
+`src/auth/auth.controller.ts`:
+
+```typescript
+import {
+  Controller,
+  Post,
+  Body,
+  HttpCode,
+  HttpStatus,
+  UseGuards,
+  Request,
+  Get,
+} from "@nestjs/common";
+import { AuthService } from "./auth.service";
+import { RegisterDto } from "../users/dto/register.dto";
+import { LoginDto } from "../users/dto/login.dto";
+import { Public } from "./decorators/public.decorator";
+import { CurrentUser } from "./decorators/current-user.decorator";
+import { JwtRefreshGuard } from "./guards/jwt-refresh.guard";
+
+@Controller("auth")
+export class AuthController {
+  constructor(private authService: AuthService) {}
+
+  /**
+   * 用户注册
+   */
+  @Public()
+  @Post("register")
+  @HttpCode(HttpStatus.CREATED)
+  async register(@Body() registerDto: RegisterDto) {
+    return this.authService.register(registerDto);
+  }
+
+  /**
+   * 用户登录
+   */
+  @Public()
+  @Post("login")
+  @HttpCode(HttpStatus.OK)
+  async login(@Body() loginDto: LoginDto) {
+    return this.authService.login(loginDto);
+  }
+
+  /**
+   * 刷新 Token
+   */
+  @Public()
+  @UseGuards(JwtRefreshGuard)
+  @Post("refresh")
+  @HttpCode(HttpStatus.OK)
+  async refreshTokens(@Request() req) {
+    return this.authService.refreshTokens(req.user.refreshToken);
+  }
+
+  /**
+   * 登出
+   */
+  @UseGuards(JwtRefreshGuard)
+  @Post("logout")
+  @HttpCode(HttpStatus.OK)
+  async logout(@Request() req) {
+    return this.authService.logout(req.user.refreshToken);
+  }
+
+  /**
+   * 获取当前用户信息
+   */
+  @Get("me")
+  @HttpCode(HttpStatus.OK)
+  async getCurrentUser(@CurrentUser("userId") userId: string) {
+    return this.authService.getCurrentUser(userId);
+  }
+}
+```
+
+### 5.6 认证模块
+
+`src/auth/auth.module.ts`:
+
+```typescript
+import { Module } from "@nestjs/common";
+import { JwtModule } from "@nestjs/jwt";
+import { PassportModule } from "@nestjs/passport";
+import { ConfigModule, ConfigService } from "@nestjs/config";
+import { AuthService } from "./auth.service";
+import { AuthController } from "./auth.controller";
+import { UsersService } from "../users/users.service";
+import { UsersModule } from "../users/users.module";
+import { JwtStrategy } from "./strategies/jwt.strategy";
+import { PrismaService } from "../database/prisma.service";
+
+@Module({
+  imports: [
+    UsersModule,
+    PassportModule,
+    JwtModule.registerAsync({
+      imports: [ConfigModule],
+      useFactory: async (configService: ConfigService) => ({
+        secret: configService.get("JWT_SECRET"),
+        signOptions: {
+          expiresIn: configService.get("JWT_EXPIRES_IN"),
+        },
+      }),
+      inject: [ConfigService],
+    }),
+  ],
+  controllers: [AuthController],
+  providers: [AuthService, JwtStrategy, PrismaService],
+  exports: [AuthService],
+})
+export class AuthModule {}
+```
+
+---
+
+## 六、全局应用认证
+
+### 6.1 全局认证守卫
+
+`src/auth/guards/guard.decorator.ts`:
+
+```typescript
+import { Injectable, CanActivate, ExecutionContext } from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
+import { IS_PUBLIC_KEY } from "../decorators/public.decorator";
+
+@Injectable()
+export class AuthGuard implements CanActivate {
+  constructor(private reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    if (isPublic) {
+      return true;
+    }
+
+    // 这里会使用 JWT 守卫
+    return true;
+  }
+}
+```
+
+### 6.2 在 App Module 中配置
+
+`src/app.module.ts`:
+
+```typescript
+import { Module } from "@nestjs/common";
+import { APP_GUARD } from "@nestjs/core";
+import { AuthModule } from "./auth/auth.module";
+import { JwtAuthGuard } from "./auth/guards/jwt-auth.guard";
+
+@Module({
+  imports: [AuthModule],
+  providers: [
+    {
+      provide: APP_GUARD,
+      useClass: JwtAuthGuard,
+    },
+  ],
+})
+export class AppModule {}
+```
+
+---
+
+## 七、使用认证
+
+### 7.1 保护路由
+
+```typescript
+import { Controller, Get, UseGuards } from "@nestjs/common";
+import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
+import { CurrentUser } from "../auth/decorators/current-user.decorator";
+
+@Controller("posts")
+@UseGuards(JwtAuthGuard) // 整个控制器都需要认证
+export class PostsController {
+  @Get()
+  findAll(@CurrentUser() user: any) {
+    // user 包含当前用户信息
+    console.log("当前用户:", user);
+    return "所有文章";
+  }
+
+  @Get("public")
+  @Public() // 这个路由不需要认证
+  getPublicPosts() {
+    return "公开文章";
+  }
+}
+```
+
+### 7.2 获取当前用户
+
+```typescript
+@Post()
+create(
+  @CurrentUser('userId') userId: string,  // 只获取 userId
+  @Body() dto: CreatePostDto,
+) {
+  return this.postsService.create(userId, dto);
+}
+
+@Get('profile')
+getProfile(@CurrentUser() user: any) {  // 获取完整用户信息
+  return user;
+}
+```
+
+---
+
+## 八、测试 API
+
+### 8.1 用户注册
+
+```bash
+curl -X POST http://localhost:3000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "zhangsan@example.com",
+    "name": "张三",
+    "password": "Password123!"
+  }'
+```
+
+**响应**：
+
+```json
+{
+  "user": {
+    "id": "uuid",
+    "email": "zhangsan@example.com",
+    "name": "张三",
+    "role": "USER",
+    "createdAt": "2026-03-19T10:00:00.000Z"
+  },
+  "accessToken": "eyJhbGc...",
+  "refreshToken": "eyJhbGc..."
+}
+```
+
+### 8.2 用户登录
+
+```bash
+curl -X POST http://localhost:3000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{
+    "email": "zhangsan@example.com",
+    "password": "Password123!"
+  }'
+```
+
+### 8.3 访问受保护的 API
+
+```bash
+curl -X GET http://localhost:3000/posts \
+  -H "Authorization: Bearer YOUR_ACCESS_TOKEN"
+```
+
+### 8.4 刷新 Token
+
+```bash
+curl -X POST http://localhost:3000/auth/refresh \
+  -H "Content-Type: application/json" \
+  -d '{
+    "refreshToken": "YOUR_REFRESH_TOKEN"
+  }'
+```
+
+---
+
+## 九、总结
+
+**本文我们完成了**：
+
+✅ 理解了 JWT 的原理和优势
+✅ 实现了用户注册功能
+✅ 实现了 JWT 登录认证
+✅ 实现了 Refresh Token 机制
+✅ 创建了自定义装饰器和守卫
+
+**核心要点回顾**：
+
+1. **JWT** - 无状态的认证方式，适合分布式系统
+2. **Passport** - 认证中间件，提供策略模式
+3. **Access Token** - 短期有效，用于 API 认证
+4. **Refresh Token** - 长期有效，用于刷新 Access Token
+5. **自定义装饰器** - 简化获取当前用户的方式
+
+**最佳实践**：
+
+- ✅ 使用 HTTPS 传输 Token
+- ✅ 设置合理的 Token 过期时间
+- ✅ 存储 Refresh Token 在数据库
+- ✅ 使用强密码哈希算法（bcrypt）
+- ✅ 定期清理过期的 Refresh Token
+
+**下一步**：
+
+在下一篇文章《授权与守卫》中，我们将深入学习：
+
+- 基于角色的访问控制（RBAC）
+- 自定义守卫
+- 权限管理
+- Casbin 集成
+
+---
+
+**相关代码**：
+
+- 完整项目示例：[blog-api](https://github.com/your-repo/blog-api)
+- 本篇代码示例：[branch: 08-jwt-authentication](https://github.com/your-repo/blog-api/tree/08-jwt-authentication)
+
+**有问题？** 欢迎在评论区留言，我会尽快回复！

@@ -11,10 +11,33 @@ interface PostListProps {
 export default function PostList({ posts }: PostListProps) {
   const [selectedCategory, setSelectedCategory] = useState("全部");
 
-  // 获取所有分类
+  // 获取所有分类（按预定义顺序）
+  const categoryOrder = [
+    "前端",
+    "后端",
+    "nestjs",
+    "全栈",
+    "测试",
+    "运维",
+    "大模型/AI",
+    "提效工具",
+  ];
+
   const categories = useMemo(() => {
-    const cats = ["全部", ...new Set(posts.map((post) => post.category))];
-    return cats;
+    // 获取文章中实际存在的分类
+    const postCategories = new Set(posts.map((post) => post.category));
+
+    // 按预定义顺序过滤存在的分类
+    const orderedCategories = categoryOrder.filter((cat) =>
+      postCategories.has(cat)
+    );
+
+    // 添加其他未在预定义列表中的分类
+    const otherCategories = [...postCategories].filter(
+      (cat) => !categoryOrder.includes(cat)
+    );
+
+    return ["全部", ...orderedCategories, ...otherCategories];
   }, [posts]);
 
   // 根据选中的分类过滤文章

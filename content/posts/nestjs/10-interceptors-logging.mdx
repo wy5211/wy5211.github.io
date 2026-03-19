@@ -1,0 +1,789 @@
+---
+title: "10 NestJS 拦截器与日志：AOP 编程与可观测性"
+date: "2026-03-19"
+summary: "深入掌握 NestJS 拦截器的使用，实现日志记录、响应转换、性能监控等横切关注点，提升应用的可观测性"
+tags: ["NestJS", "拦截器", "日志", "AOP", "可观测性"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式博客系统"
+seriesOrder: 10
+---
+
+## 前言
+
+在前面几篇文章中，我们学习了认证、授权等核心功能。现在，让我们来探讨一个重要的编程概念——**AOP（面向切面编程）**，以及它的实现方式：**拦截器（Interceptor）**。
+
+**本文将解决什么问题？**
+
+你可能想知道：
+
+- 什么是 AOP？拦截器是什么？
+- 如何统一记录所有请求的日志？
+- 如何转换响应数据格式？
+- 如何监控接口性能？
+- 如何实现缓存功能？
+
+**本文将带你：**
+
+1. 理解 AOP 和拦截器的概念
+2. 创建日志拦截器
+3. 实现响应转换
+4. 监控接口性能
+5. 实现缓存拦截器
+
+---
+
+## 一、什么是拦截器？
+
+### 1.1 AOP 编程概念
+
+**AOP (Aspect-Oriented Programming)** 是一种编程范式，它将横切关注点与业务逻辑分离。
+
+**什么是横切关注点？**
+
+```
+业务逻辑：创建用户
+   ↓
+需要处理：日志记录 ✓
+需要处理：性能监控 ✓
+需要处理：数据验证 ✓
+需要处理：权限检查 ✓
+需要处理：事务管理 ✓
+   ↓
+这些"需要处理"的就是横切关注点
+```
+
+**传统方式 vs AOP**：
+
+```typescript
+// ❌ 传统方式：每个方法都要写
+createUser() {
+  this.log.start();          // 日志
+  const start = Date.now();  // 性能监控
+
+  // ... 业务逻辑 ...
+
+  this.log.end();            // 日志
+  console.log(Date.now() - start);  // 性能监控
+}
+
+updateUser() {
+  this.log.start();          // 重复代码
+  const start = Date.now();  // 重复代码
+
+  // ... 业务逻辑 ...
+
+  this.log.end();            // 重复代码
+  console.log(Date.now() - start);  // 重复代码
+}
+
+// ✅ AOP 方式：使用拦截器
+@UseInterceptors(LoggingInterceptor)
+createUser() {
+  // 只关注业务逻辑
+}
+
+@UseInterceptors(LoggingInterceptor)
+updateUser() {
+  // 只关注业务逻辑
+}
+```
+
+### 1.2 拦截器的作用
+
+**拦截器（Interceptor）** 是 NestJS 实现 AOP 的方式，它可以：
+
+1. **在方法执行前**：添加额外逻辑
+2. **在方法执行后**：转换返回值
+3. **在异常抛出时**：处理异常
+
+**拦截器的工作流程**：
+
+```
+请求 → 拦截器前 → 控制器/服务 → 拦截器后 → 响应
+           ↓              ↓            ↓
+        日志记录      业务逻辑处理    转换数据
+```
+
+---
+
+## 二、创建拦截器
+
+### 2.1 基础拦截器
+
+```typescript
+import {
+  Injectable,
+  NestInterceptor,
+  ExecutionContext,
+  CallHandler,
+} from "@nestjs/common";
+import { Observable } from "rxjs";
+import { map } from "rxjs/operators";
+
+@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const now = Date.now();
+    const request = context.switchToHttp().getRequest();
+
+    console.log("请求前...", request.url);
+
+    return next.handle().pipe(
+      map((data) => {
+        console.log(`请求后... ${Date.now() - now}ms`);
+        return data;
+      })
+    );
+  }
+}
+```
+
+### 2.2 使用 RxJS 操作符
+
+拦截器返回 RxJS Observable，可以使用各种操作符：
+
+```typescript
+import { tap, catchError, map } from "rxjs/operators";
+import { throwError } from "rxjs";
+
+@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const request = context.switchToHttp().getRequest();
+
+    return next.handle().pipe(
+      // map - 转换响应数据
+      map((data) => ({
+        success: true,
+        data,
+      })),
+
+      // tap - 副作用（不修改数据）
+      tap(() => {
+        console.log("请求成功");
+      }),
+
+      // catchError - 捕获异常
+      catchError((error) => {
+        console.error("请求失败", error);
+        return throwError(() => error);
+      })
+    );
+  }
+}
+```
+
+---
+
+## 三、日志拦截器
+
+### 3.1 完整的日志拦截器
+
+```typescript
+// src/common/interceptors/logging.interceptor.ts
+import {
+  Injectable,
+  NestInterceptor,
+  ExecutionContext,
+  CallHandler,
+  Logger,
+} from "@nestjs/common";
+import { Observable } from "rxjs";
+import { tap } from "rxjs/operators";
+
+@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  private readonly logger = new Logger(LoggingInterceptor.name);
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const request = context.switchToHttp().getRequest();
+    const response = context.switchToHttp().getResponse();
+    const { method, url, ip } = request;
+    const userAgent = request.get("user-agent") || "";
+    const now = Date.now();
+
+    this.logger.log(`➡️  ${method} ${url} - ${ip} - ${userAgent}`);
+
+    return next.handle().pipe(
+      tap({
+        next: () => {
+          const delay = Date.now() - now;
+          this.logger.log(
+            `⬅️  ${method} ${url} - ${response.statusCode} - ${delay}ms`
+          );
+        },
+        error: (error) => {
+          const delay = Date.now() - now;
+          this.logger.error(
+            `❌ ${method} ${url} - ${error.status || 500} - ${delay}ms`
+          );
+        },
+      })
+    );
+  }
+}
+```
+
+### 3.2 全局使用
+
+在 `main.ts` 中应用：
+
+```typescript
+import { LoggingInterceptor } from "./common/interceptors/logging.interceptor";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  app.useGlobalInterceptors(new LoggingInterceptor());
+
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+### 3.3 日志输出示例
+
+```bash
+[Log] LoggingInterceptor - ➡️  GET /posts - 127.0.0.1 - Mozilla/5.0...
+[Log] LoggingInterceptor - ⬅️  GET /posts - 200 - 45ms
+
+[Log] LoggingInterceptor - ➡️  POST /posts - 127.0.0.1 - Mozilla/5.0...
+[Log] LoggingInterceptor - ⬅️  POST /posts - 201 - 123ms
+
+[Log] LoggingInterceptor - ➡️  GET /posts/invalid-id - 127.0.0.1...
+[Error] LoggingInterceptor - ❌ GET /posts/invalid-id - 404 - 23ms
+```
+
+---
+
+## 四、响应转换拦截器
+
+### 4.1 统一响应格式
+
+```typescript
+// src/common/interceptors/transform.interceptor.ts
+import {
+  Injectable,
+  NestInterceptor,
+  ExecutionContext,
+  CallHandler,
+} from "@nestjs/common";
+import { Observable } from "rxjs";
+import { map } from "rxjs/operators";
+
+export interface Response<T> {
+  success: boolean;
+  data: T;
+  timestamp: string;
+}
+
+@Injectable()
+export class TransformInterceptor<T> implements NestInterceptor<
+  T,
+  Response<T>
+> {
+  intercept(
+    context: ExecutionContext,
+    next: CallHandler
+  ): Observable<Response<T>> {
+    return next.handle().pipe(
+      map((data) => ({
+        success: true,
+        data,
+        timestamp: new Date().toISOString(),
+      }))
+    );
+  }
+}
+```
+
+### 4.2 分页响应转换
+
+```typescript
+@Injectable()
+export class PaginationInterceptor<T> implements NestInterceptor<
+  T,
+  Response<T>
+> {
+  intercept(
+    context: ExecutionContext,
+    next: CallHandler
+  ): Observable<Response<T>> {
+    return next.handle().pipe(
+      map((data) => {
+        // 如果是分页数据，特殊处理
+        if (data && data.items && data.meta) {
+          return {
+            success: true,
+            data: data.items,
+            meta: data.meta,
+            timestamp: new Date().toISOString(),
+          };
+        }
+
+        // 普通数据
+        return {
+          success: true,
+          data,
+          timestamp: new Date().toISOString(),
+        };
+      })
+    );
+  }
+}
+```
+
+---
+
+## 五、性能监控拦截器
+
+### 5.1 记录慢查询
+
+```typescript
+// src/common/interceptors/performance.interceptor.ts
+import {
+  Injectable,
+  NestInterceptor,
+  ExecutionContext,
+  CallHandler,
+  Logger,
+} from "@nestjs/common";
+import { Observable } from "rxjs";
+import { tap } from "rxjs/operators";
+
+@Injectable()
+export class PerformanceInterceptor implements NestInterceptor {
+  private readonly logger = new Logger(PerformanceInterceptor.name);
+  private readonly SLOW_QUERY_THRESHOLD = 1000; // 1 秒
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const request = context.switchToHttp().getRequest();
+    const now = Date.now();
+
+    return next.handle().pipe(
+      tap(() => {
+        const delay = Date.now() - now;
+
+        // 如果响应时间超过阈值，记录警告
+        if (delay > this.SLOW_QUERY_THRESHOLD) {
+          this.logger.warn(
+            `⚠️  慢查询: ${request.method} ${request.url} - ${delay}ms`
+          );
+        }
+      })
+    );
+  }
+}
+```
+
+### 5.2 详细性能日志
+
+```typescript
+@Injectable()
+export class DetailedPerformanceInterceptor implements NestInterceptor {
+  private readonly logger = new Logger(DetailedPerformanceInterceptor.name);
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const request = context.switchToHttp().getRequest();
+    const { method, url } = request;
+    const now = Date.now();
+
+    // 记录请求开始
+    this.logger.log(`🚀 开始处理: ${method} ${url}`);
+
+    return next.handle().pipe(
+      tap({
+        next: () => {
+          const delay = Date.now() - now;
+          this.logger.log(`✅ 处理完成: ${method} ${url} - ${delay}ms`);
+        },
+        error: (error) => {
+          const delay = Date.now() - now;
+          this.logger.error(
+            `❌ 处理失败: ${method} ${url} - ${delay}ms - ${error.message}`
+          );
+        },
+      })
+    );
+  }
+}
+```
+
+---
+
+## 六、缓存拦截器
+
+### 6.1 简单缓存拦截器
+
+```typescript
+// src/common/interceptors/cache.interceptor.ts
+import {
+  Injectable,
+  NestInterceptor,
+  ExecutionContext,
+  CallHandler,
+} from "@nestjs/common";
+import { Observable, of } from "rxjs";
+import { tap } from "rxjs/operators";
+
+@Injectable()
+export class SimpleCacheInterceptor implements NestInterceptor {
+  private cache = new Map();
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const request = context.switchToHttp().getRequest();
+    const cacheKey = `${request.method}:${request.url}`;
+
+    // 检查缓存
+    const cachedResponse = this.cache.get(cacheKey);
+    if (cachedResponse) {
+      console.log(`✅ 缓存命中: ${cacheKey}`);
+      return of(cachedResponse);
+    }
+
+    // 没有缓存，继续处理
+    return next.handle().pipe(
+      tap((response) => {
+        // 缓存响应（5 分钟后过期）
+        this.cache.set(cacheKey, response);
+        setTimeout(
+          () => {
+            this.cache.delete(cacheKey);
+          },
+          5 * 60 * 1000
+        );
+
+        console.log(`💾 缓存存储: ${cacheKey}`);
+      })
+    );
+  }
+}
+```
+
+### 6.2 使用 Redis 缓存
+
+```typescript
+import { Injectable, Inject } from "@nestjs/common";
+import { CACHE_MANAGER } from "@nestjs/cache-manager";
+import { Cache } from "cache-manager";
+
+@Injectable()
+export class RedisCacheInterceptor implements NestInterceptor {
+  constructor(@Inject(CACHE_MANAGER) private cacheManager: Cache) {}
+
+  async intercept(
+    context: ExecutionContext,
+    next: CallHandler
+  ): Promise<Observable<any>> {
+    const request = context.switchToHttp().getRequest();
+    const cacheKey = `${request.method}:${request.url}`;
+
+    // 检查缓存
+    const cachedResponse = await this.cacheManager.get(cacheKey);
+    if (cachedResponse) {
+      return of(cachedResponse);
+    }
+
+    // 继续处理
+    return next.handle().pipe(
+      tap(async (response) => {
+        // 缓存响应（5 分钟）
+        await this.cacheManager.set(cacheKey, response, 300);
+      })
+    );
+  }
+}
+```
+
+---
+
+## 七、超时拦截器
+
+### 7.1 实现请求超时
+
+```typescript
+// src/common/interceptors/timeout.interceptor.ts
+import {
+  Injectable,
+  NestInterceptor,
+  ExecutionContext,
+  CallHandler,
+  RequestTimeoutException,
+} from "@nestjs/common";
+import { Observable, throwError, TimeoutError } from "rxjs";
+import { catchError, timeout } from "rxjs/operators";
+
+@Injectable()
+export class TimeoutInterceptor implements NestInterceptor {
+  constructor(private readonly timeoutMs: number = 30000) {}
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    return next.handle().pipe(
+      timeout(this.timeoutMs),
+      catchError((err) => {
+        if (err instanceof TimeoutError) {
+          return throwError(() => new RequestTimeoutException("请求超时"));
+        }
+        return throwError(() => err);
+      })
+    );
+  }
+}
+```
+
+使用：
+
+```typescript
+@Controller("posts")
+export class PostsController {
+  @Get("export")
+  @UseInterceptors(new TimeoutInterceptor(60000)) // 60 秒超时
+  export() {
+    return this.postsService.export();
+  }
+}
+```
+
+---
+
+## 八、组合使用拦截器
+
+### 8.1 多个拦截器
+
+```typescript
+@Controller("posts")
+@UseInterceptors(
+  LoggingInterceptor,
+  TransformInterceptor,
+  PerformanceInterceptor
+)
+export class PostsController {
+  @Get()
+  findAll() {
+    return this.postsService.findAll();
+  }
+}
+```
+
+### 8.2 全局拦截器
+
+在 `main.ts` 中配置：
+
+```typescript
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  // 全局拦截器（按顺序执行）
+  app.useGlobalInterceptors(
+    new LoggingInterceptor(),
+    new TransformInterceptor(),
+    new PerformanceInterceptor()
+  );
+
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+### 8.3 条件拦截器
+
+只对特定路由应用拦截器：
+
+```typescript
+import { Reflector } from "@nestjs/core";
+
+@Injectable()
+export class ConditionalInterceptor implements NestInterceptor {
+  constructor(private reflector: Reflector) {}
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    // 检查装饰器
+    const shouldIntercept = this.reflector.get<boolean>(
+      "customInterceptor",
+      context.getHandler()
+    );
+
+    if (!shouldIntercept) {
+      return next.handle();
+    }
+
+    // 执行拦截器逻辑
+    return next.handle().pipe(
+      tap(() => {
+        console.log("拦截器执行");
+      })
+    );
+  }
+}
+```
+
+---
+
+## 九、实战：完整的日志系统
+
+### 9.1 日志服务
+
+```typescript
+// src/common/services/logger.service.ts
+import { Injectable, LoggerService, Scope } from "@nestjs/common";
+import * as fs from "fs";
+import * as path from "path";
+
+@Injectable({ scope: Scope.TRANSIENT })
+export class CustomLogger implements LoggerService {
+  private logFilePath = path.join(process.cwd(), "logs", "app.log");
+
+  log(message: any, context?: string) {
+    this.writeLog("LOG", message, context);
+  }
+
+  error(message: any, trace?: string, context?: string) {
+    this.writeLog("ERROR", message, context, trace);
+  }
+
+  warn(message: any, context?: string) {
+    this.writeLog("WARN", message, context);
+  }
+
+  debug(message: any, context?: string) {
+    this.writeLog("DEBUG", message, context);
+  }
+
+  verbose(message: any, context?: string) {
+    this.writeLog("VERBOSE", message, context);
+  }
+
+  private writeLog(
+    level: string,
+    message: any,
+    context?: string,
+    trace?: string
+  ) {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] [${level}] ${context ? `[${context}] ` : ""}${message}${trace ? `\n${trace}` : ""}\n`;
+
+    // 控制台输出
+    console.log(logMessage);
+
+    // 文件输出
+    fs.appendFileSync(this.logFilePath, logMessage);
+  }
+}
+```
+
+### 9.2 结构化日志
+
+```typescript
+interface LogData {
+  level: string;
+  message: string;
+  context?: string;
+  timestamp: string;
+  requestId?: string;
+  userId?: string;
+  method?: string;
+  url?: string;
+  statusCode?: number;
+  responseTime?: number;
+  error?: any;
+}
+
+@Injectable()
+export class StructuredLogger {
+  log(data: LogData) {
+    const logEntry = {
+      ...data,
+      timestamp: new Date().toISOString(),
+    };
+
+    console.log(JSON.stringify(logEntry));
+  }
+}
+```
+
+---
+
+## 十、最佳实践
+
+### 10.1 拦截器使用建议
+
+1. **日志拦截器** - 全局使用
+2. **转换拦截器** - 全局使用
+3. **性能拦截器** - 开发环境使用
+4. **缓存拦截器** - 只用于 GET 请求
+5. **超时拦截器** - 只用于慢接口
+
+### 10.2 性能优化
+
+```typescript
+// ❌ 不好的做法：每次都创建新实例
+@UseInterceptors(new LoggingInterceptor())
+
+// ✅ 好的做法：提供者中使用
+providers: [LoggingInterceptor]
+
+// ✅ 或使用依赖注入
+constructor(private loggingInterceptor: LoggingInterceptor) {}
+```
+
+### 10.3 错误处理
+
+```typescript
+return next.handle().pipe(
+  catchError((error) => {
+    // 记录错误
+    this.logger.error(error);
+
+    // 返回用户友好的错误
+    return throwError(() => new BadGatewayException());
+  })
+);
+```
+
+---
+
+## 十一、总结
+
+**本文我们完成了**：
+
+✅ 理解了 AOP 和拦截器的概念
+✅ 创建了日志拦截器
+✅ 实现了响应转换
+✅ 监控了接口性能
+✅ 实现了缓存拦截器
+
+**核心要点回顾**：
+
+1. **AOP** - 面向切面编程，分离横切关注点
+2. **拦截器** - 在方法前后添加逻辑
+3. **RxJS** - 使用 Observable 处理异步
+4. **日志** - 记录请求和响应
+5. **性能监控** - 监控接口响应时间
+
+**最佳实践**：
+
+- ✅ 使用拦截器处理横切关注点
+- ✅ 全局拦截器用于通用功能
+- ✅ 局部拦截器用于特定需求
+- ✅ 注意拦截器执行顺序
+- ✅ 避免在拦截器中执行耗时操作
+
+**下一步**：
+
+在下一篇文章《异常处理》中，我们将深入学习：
+
+- 异常过滤器
+- 自定义异常
+- 全局异常处理
+- 错误响应格式化
+
+---
+
+**相关代码**：
+
+- 完整项目示例：[blog-api](https://github.com/your-repo/blog-api)
+- 本篇代码示例：[branch: 10-interceptors-logging](https://github.com/your-repo/blog-api/tree/10-interceptors-logging)
+
+**有问题？** 欢迎在评论区留言，我会尽快回复！

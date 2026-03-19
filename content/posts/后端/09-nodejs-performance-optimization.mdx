@@ -1,0 +1,573 @@
+---
+title: "09 Node.js 性能优化：从内存泄漏到并发处理"
+date: "2026-03-18"
+summary: "深入讲解 Node.js 性能优化技巧，包括内存管理、事件循环、并发处理和性能监控，让你的应用更快更稳。"
+tags: ["Node.js", "后端", "性能优化", "并发"]
+category: "后端"
+cover: ""
+draft: false
+---
+
+# Node.js 性能优化：从内存泄漏到并发处理
+
+Node.js 虽然高性能，但用不好也会出现内存泄漏、CPU 飙升、并发瓶颈等问题。本文从实战角度讲解性能优化技巧。
+
+## 一、理解 Node.js 性能特点
+
+### 1.1 单线程 + 事件循环
+
+```
+┌───────────────────────────────────┐
+│           Event Loop              │
+│  ┌─────────┐ ┌─────────┐ ┌──────┐│
+│  │ Timers  │→│Poll     │→│Check ││
+│  └─────────┘ └─────────┘ └──────┘│
+└───────────────────────────────────┘
+```
+
+**关键点：**
+
+- 主线程只有一个，阻塞操作会卡住整个进程
+- 异步 I/O 由 libuv 线程池处理
+- CPU 密集任务需要用 Worker Threads
+
+### 1.2 内存模型
+
+```javascript
+// 内存结构
+// ┌─────────────┬─────────────┬──────────────┐
+// │   Code      │    Stack    │     Heap     │
+// │  代码段      │   调用栈    │    堆内存    │
+// └─────────────┴─────────────┴──────────────┘
+
+// 查看内存使用
+console.log(process.memoryUsage());
+// {
+//   rss: 35MB,        // 常驻内存
+//   heapTotal: 10MB,  // 堆总大小
+//   heapUsed: 6MB,    // 已用堆
+//   external: 1MB     // C++ 对象
+// }
+```
+
+## 二、内存优化
+
+### 2.1 常见内存泄漏
+
+**1. 全局变量**
+
+```javascript
+// ❌ 错误：全局数组无限增长
+const cache = [];
+app.get("/data", (req, res) => {
+  cache.push(req.body); // 永远不会被回收
+  res.json({ ok: true });
+});
+
+// ✅ 正确：限制大小
+const cache = new Map();
+const MAX_CACHE = 1000;
+
+app.get("/data", (req, res) => {
+  const key = req.body.id;
+  cache.set(key, req.body);
+  if (cache.size > MAX_CACHE) {
+    const firstKey = cache.keys().next().value;
+    cache.delete(firstKey);
+  }
+  res.json({ ok: true });
+});
+```
+
+**2. 闭包引用**
+
+```javascript
+// ❌ 错误：闭包持有大对象引用
+function processLargeData(data) {
+  const handler = () => {
+    console.log(data.length); // data 永远不会被释放
+  };
+  setInterval(handler, 1000);
+}
+
+// ✅ 正确：只保留需要的数据
+function processLargeData(data) {
+  const length = data.length; // 只保留需要的信息
+  const handler = () => {
+    console.log(length);
+  };
+  setInterval(handler, 1000);
+}
+```
+
+**3. 事件监听器**
+
+```javascript
+// ❌ 错误：重复添加监听器
+function connect() {
+  const client = new Client();
+  client.on("data", (data) => {
+    // 处理数据
+  });
+  // 每次连接都添加新的监听器
+}
+
+// ✅ 正确：移除旧监听器或使用 once
+function connect() {
+  const client = new Client();
+  const handler = (data) => {
+    // 处理数据
+  };
+  client.on("data", handler);
+  client.once("end", () => {
+    client.removeListener("data", handler);
+  });
+}
+```
+
+### 2.2 内存监控
+
+```javascript
+// 内存监控中间件
+setInterval(() => {
+  const used = process.memoryUsage();
+  const mb = (bytes) => (bytes / 1024 / 1024).toFixed(2);
+
+  console.log({
+    rss: mb(used.rss) + " MB",
+    heapTotal: mb(used.heapTotal) + " MB",
+    heapUsed: mb(used.heapUsed) + " MB",
+    external: mb(used.external) + " MB",
+  });
+
+  // 告警
+  if (used.heapUsed > 500 * 1024 * 1024) {
+    // 500MB
+    console.error("Memory usage too high!");
+  }
+}, 60000); // 每分钟
+```
+
+### 2.3 堆快照分析
+
+```bash
+# 安装 heapdump
+npm install heapdump
+
+# 代码中
+const heapdump = require('heapdump')
+
+# 生成快照
+kill -USR2 <pid>
+
+# 或代码触发
+heapdump.writeSnapshot('/tmp/heap-' + Date.now() + '.heapsnapshot')
+```
+
+使用 Chrome DevTools 分析：
+
+1. 打开 chrome://inspect
+2. 加载 .heapsnapshot 文件
+3. 查看 Retainers 找到泄漏源头
+
+## 三、事件循环优化
+
+### 3.1 避免阻塞事件循环
+
+```javascript
+// ❌ 错误：同步大计算
+function heavyComputation(n) {
+  let result = 0;
+  for (let i = 0; i < n; i++) {
+    result += Math.sqrt(i);
+  }
+  return result;
+}
+
+// ✅ 正确：分片处理
+async function heavyComputation(n, chunkSize = 10000) {
+  let result = 0;
+  let i = 0;
+
+  while (i < n) {
+    const end = Math.min(i + chunkSize, n);
+    for (; i < end; i++) {
+      result += Math.sqrt(i);
+    }
+    // 让出事件循环
+    await new Promise(setImmediate);
+  }
+
+  return result;
+}
+```
+
+### 3.2 使用 Worker Threads
+
+```javascript
+// 主线程
+const { Worker } = require("worker_threads");
+
+function runHeavyTask(data) {
+  return new Promise((resolve, reject) => {
+    const worker = new Worker("./heavy-task.js", {
+      workerData: data,
+    });
+
+    worker.on("message", resolve);
+    worker.on("error", reject);
+    worker.on("exit", (code) => {
+      if (code !== 0) reject(new Error(`Worker stopped with code ${code}`));
+    });
+  });
+}
+
+// heavy-task.js
+const { workerData, parentPort } = require("worker_threads");
+
+const result = heavyComputation(workerData);
+parentPort.postMessage(result);
+```
+
+### 3.3 检测事件循环延迟
+
+```javascript
+const { monitorEventLoopDelay } = require("perf_hooks");
+
+const h = monitorEventLoopDelay({
+  resolution: 10, // 采样间隔 ms
+});
+h.enable();
+
+setInterval(() => {
+  console.log({
+    min: h.min,
+    max: h.max,
+    mean: h.mean,
+    percentile99: h.percentile(99),
+  });
+  h.reset();
+}, 60000);
+```
+
+## 四、并发处理
+
+### 4.1 连接池
+
+```javascript
+// ❌ 错误：每次请求创建新连接
+app.get("/users", async (req, res) => {
+  const connection = await mysql.createConnection(config);
+  const [rows] = await connection.execute("SELECT * FROM users");
+  await connection.end();
+  res.json(rows);
+});
+
+// ✅ 正确：使用连接池
+const pool = mysql.createPool({
+  ...config,
+  connectionLimit: 10,
+  queueLimit: 0,
+});
+
+app.get("/users", async (req, res) => {
+  const [rows] = await pool.execute("SELECT * FROM users");
+  res.json(rows);
+});
+```
+
+### 4.2 请求限流
+
+```javascript
+const rateLimit = require("express-rate-limit");
+
+// 全局限流
+const limiter = rateLimit({
+  windowMs: 60 * 1000, // 1 分钟
+  max: 100, // 最多 100 次请求
+  message: "Too many requests",
+});
+
+app.use(limiter);
+
+// API 限流
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 30,
+  keyGenerator: (req) => req.ip + req.path,
+});
+
+app.use("/api/", apiLimiter);
+```
+
+### 4.3 并发控制
+
+```javascript
+// 控制并发数量
+async function processWithConcurrency(tasks, concurrency = 5) {
+  const results = []
+  const executing = new Set()
+
+  for (const task of tasks) {
+    const promise = task().then(result => {
+      executing.delete(promise)
+      return result
+    })
+
+    executing.add(promise)
+    results.push(promise)
+
+    if (executing.size >= concurrency) {
+      await Promise.race(executing)
+    }
+  }
+
+  return Promise.all(results)
+}
+
+// 使用
+const urls = ['url1', 'url2', 'url3', ...]
+const results = await processWithConcurrency(
+  urls.map(url => () => fetch(url)),
+  5  // 最多 5 个并发
+)
+```
+
+### 4.4 队列处理
+
+```javascript
+const Queue = require("bull");
+
+// 创建队列
+const emailQueue = new Queue("email", {
+  redis: { host: "localhost", port: 6379 },
+});
+
+// 添加任务
+app.post("/send-email", async (req, res) => {
+  await emailQueue.add({
+    to: req.body.to,
+    subject: req.body.subject,
+    content: req.body.content,
+  });
+  res.json({ status: "queued" });
+});
+
+// 处理任务
+emailQueue.process(5, async (job) => {
+  // 5 个并发
+  const { to, subject, content } = job.data;
+  await sendEmail(to, subject, content);
+});
+```
+
+## 五、数据库优化
+
+### 5.1 查询优化
+
+```javascript
+// ❌ 错误：N+1 查询
+const users = await db.query("SELECT * FROM users");
+for (const user of users) {
+  user.posts = await db.query("SELECT * FROM posts WHERE user_id = ?", [
+    user.id,
+  ]);
+}
+
+// ✅ 正确：批量查询
+const users = await db.query("SELECT * FROM users");
+const userIds = users.map((u) => u.id);
+const posts = await db.query("SELECT * FROM posts WHERE user_id IN (?)", [
+  userIds,
+]);
+// 在代码中关联
+const postsByUser = _.groupBy(posts, "user_id");
+users.forEach((user) => {
+  user.posts = postsByUser[user.id] || [];
+});
+```
+
+### 5.2 索引优化
+
+```javascript
+// 使用 explain 分析查询
+const result = await db.query("EXPLAIN SELECT * FROM users WHERE email = ?", [
+  email,
+]);
+console.log(result);
+
+// 确保有索引
+// CREATE INDEX idx_users_email ON users(email)
+```
+
+### 5.3 缓存策略
+
+```javascript
+const Redis = require("ioredis");
+const redis = new Redis();
+
+async function getUserWithCache(id) {
+  const cacheKey = `user:${id}`;
+
+  // 先查缓存
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+
+  // 查数据库
+  const user = await db.query("SELECT * FROM users WHERE id = ?", [id]);
+
+  // 写入缓存
+  await redis.setex(cacheKey, 3600, JSON.stringify(user)); // 1 小时
+
+  return user;
+}
+```
+
+## 六、性能监控
+
+### 6.1 APM 工具
+
+```javascript
+// 使用 New Relic / Elastic APM / SkyWalking
+require("newrelic");
+
+// 或自定义性能追踪
+const { performance, PerformanceObserver } = require("perf_hooks");
+
+const obs = new PerformanceObserver((list) => {
+  const entry = list.getEntries()[0];
+  console.log(`${entry.name}: ${entry.duration}ms`);
+});
+obs.observe({ entryTypes: ["measure"] });
+
+performance.mark("start");
+// ... 执行代码
+performance.mark("end");
+performance.measure("API Call", "start", "end");
+```
+
+### 6.2 日志性能
+
+```javascript
+const pino = require("pino");
+
+const logger = pino({
+  level: "info",
+  transport: {
+    target: "pino-pretty",
+  },
+});
+
+// 结构化日志
+logger.info({ userId: 123, action: "login" }, "User logged in");
+
+// 慢请求日志
+app.use((req, res, next) => {
+  const start = Date.now();
+  res.on("finish", () => {
+    const duration = Date.now() - start;
+    if (duration > 1000) {
+      logger.warn(
+        {
+          method: req.method,
+          url: req.url,
+          duration,
+        },
+        "Slow request"
+      );
+    }
+  });
+  next();
+});
+```
+
+### 6.3 健康检查
+
+```javascript
+app.get("/health", async (req, res) => {
+  const health = {
+    uptime: process.uptime(),
+    timestamp: Date.now(),
+    memory: process.memoryUsage(),
+    status: "ok",
+  };
+
+  // 检查数据库连接
+  try {
+    await db.ping();
+    health.database = "ok";
+  } catch (e) {
+    health.database = "error";
+    health.status = "degraded";
+  }
+
+  // 检查 Redis
+  try {
+    await redis.ping();
+    health.redis = "ok";
+  } catch (e) {
+    health.redis = "error";
+    health.status = "degraded";
+  }
+
+  const statusCode = health.status === "ok" ? 200 : 503;
+  res.status(statusCode).json(health);
+});
+```
+
+## 七、优化检查清单
+
+### 内存
+
+- [ ] 检查全局变量和缓存大小
+- [ ] 确保事件监听器正确移除
+- [ ] 使用流处理大文件
+- [ ] 定期生成堆快照分析
+
+### 事件循环
+
+- [ ] 避免同步计算阻塞
+- [ ] CPU 密集任务用 Worker Threads
+- [ ] 监控事件循环延迟
+
+### 并发
+
+- [ ] 使用连接池
+- [ ] 实现请求限流
+- [ ] 控制并发数量
+- [ ] 使用队列处理耗时任务
+
+### 数据库
+
+- [ ] 避免 N+1 查询
+- [ ] 确保索引正确
+- [ ] 使用缓存
+- [ ] 连接池配置合理
+
+### 监控
+
+- [ ] 内存使用监控
+- [ ] 慢请求日志
+- [ ] APM 工具
+- [ ] 健康检查端点
+
+## 总结
+
+Node.js 性能优化是系统工程。
+
+**核心原则：**
+
+1. **不阻塞事件循环** - 分片或用 Worker
+2. **控制内存增长** - 限制缓存，检查泄漏
+3. **合理并发** - 连接池、限流、队列
+4. **持续监控** - 内存、延迟、慢请求
+
+**优化顺序：**
+
+```
+监控定位 → 分析瓶颈 → 针对优化 → 验证效果
+```
+
+性能优化没有银弹，需要根据实际情况分析。先监控，再优化。

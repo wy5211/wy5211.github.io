@@ -1,0 +1,363 @@
+---
+title: "11 NestJS 异常处理：构建健壮的错误处理机制"
+date: "2026-03-19"
+summary: "深入掌握 NestJS 的异常处理机制，使用异常过滤器统一处理错误，提供友好的错误响应"
+tags: ["NestJS", "异常处理", "错误处理", "Exception Filter"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式博客系统"
+seriesOrder: 11
+---
+
+## 前言
+
+在应用运行过程中，错误是不可避免的。如何优雅地处理这些错误，提供友好的错误信息，是一个健壮应用的必备能力。
+
+**本文将解决什么问题？**
+
+你可能想知道：
+
+- 如何统一处理异常？
+- 如何创建自定义异常？
+- 如何提供友好的错误信息？
+- 如何记录错误日志？
+
+**本文将带你：**
+
+1. 理解异常处理机制
+2. 创建自定义异常
+3. 实现异常过滤器
+4. 全局异常处理
+5. 错误日志记录
+
+---
+
+## 一、异常处理基础
+
+### 1.1 NestJS 内置异常
+
+```typescript
+import {
+  BadRequestException,
+  UnauthorizedException,
+  ForbiddenException,
+  NotFoundException,
+  NotAcceptableException,
+  RequestTimeoutException,
+  ConflictException,
+  GoneException,
+  HttpException,
+  PayloadTooLargeException,
+  UnsupportedMediaType,
+} from "@nestjs/common";
+
+// 使用示例
+throw new BadRequestException("邮箱格式错误");
+throw new UnauthorizedException("未登录");
+throw new ForbiddenException("无权访问");
+throw new NotFoundException("资源不存在");
+throw new ConflictException("资源已存在");
+```
+
+### 1.2 HttpException 基类
+
+```typescript
+throw new HttpException("自定义错误", 418);
+
+// 带响应对象
+throw new HttpException(
+  {
+    status: 418,
+    error: "I'm a teapot",
+  },
+  418
+);
+```
+
+---
+
+## 二、自定义异常
+
+### 2.1 创建业务异常
+
+```typescript
+// src/common/exceptions/business.exception.ts
+import { HttpException, HttpStatus } from "@nestjs/common";
+
+export class BusinessException extends HttpException {
+  constructor(
+    message: string,
+    code: string,
+    statusCode: HttpStatus = HttpStatus.BAD_REQUEST
+  ) {
+    super(
+      {
+        success: false,
+        code,
+        message,
+      },
+      statusCode
+    );
+  }
+}
+
+// 使用
+throw new BusinessException(
+  "用户不存在",
+  "USER_NOT_FOUND",
+  HttpStatus.NOT_FOUND
+);
+```
+
+### 2.2 预定义业务异常
+
+```typescript
+// src/common/exceptions/user.exception.ts
+export class UserNotFoundException extends BusinessException {
+  constructor(id: string) {
+    super(`用户 ${id} 不存在`, "USER_NOT_FOUND", HttpStatus.NOT_FOUND);
+  }
+}
+
+export class UserAlreadyExistsException extends BusinessException {
+  constructor(email: string) {
+    super(`邮箱 ${email} 已被注册`, "USER_ALREADY_EXISTS", HttpStatus.CONFLICT);
+  }
+}
+
+export class InvalidCredentialsException extends BusinessException {
+  constructor() {
+    super("邮箱或密码错误", "INVALID_CREDENTIALS", HttpStatus.UNAUTHORIZED);
+  }
+}
+
+// 使用
+throw new UserNotFoundException(userId);
+throw new UserAlreadyExistsException(email);
+throw new InvalidCredentialsException();
+```
+
+---
+
+## 三、异常过滤器
+
+### 3.1 创建异常过滤器
+
+```typescript
+// src/common/filters/http-exception.filter.ts
+import {
+  ExceptionFilter,
+  Catch,
+  ArgumentsHost,
+  HttpException,
+  HttpStatus,
+} from "@nestjs/common";
+import { Request, Response } from "express";
+
+@Catch(HttpException)
+export class HttpExceptionFilter implements ExceptionFilter {
+  catch(exception: HttpException, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse<Response>();
+    const request = ctx.getRequest<Request>();
+    const status = exception.getStatus();
+    const exceptionResponse = exception.getResponse();
+
+    const error =
+      typeof exceptionResponse === "string"
+        ? { message: exceptionResponse }
+        : exceptionResponse;
+
+    response.status(status).json({
+      success: false,
+      statusCode: status,
+      timestamp: new Date().toISOString(),
+      path: request.url,
+      method: request.method,
+      error,
+    });
+  }
+}
+```
+
+### 3.2 全局异常过滤器
+
+```typescript
+// src/common/filters/all-exceptions.filter.ts
+import {
+  ExceptionFilter,
+  Catch,
+  ArgumentsHost,
+  HttpException,
+  HttpStatus,
+  Logger,
+} from "@nestjs/common";
+
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  private readonly logger = new Logger(AllExceptionsFilter.name);
+
+  catch(exception: unknown, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse();
+    const request = ctx.getRequest();
+
+    let status: number;
+    let message: string;
+    let error: any;
+
+    if (exception instanceof HttpException) {
+      status = exception.getStatus();
+      const exceptionResponse = exception.getResponse();
+      message =
+        typeof exceptionResponse === "string"
+          ? exceptionResponse
+          : (exceptionResponse as any).message;
+      error = exceptionResponse;
+    } else {
+      status = HttpStatus.INTERNAL_SERVER_ERROR;
+      message = "服务器内部错误";
+      error = { message: "Internal Server Error" };
+    }
+
+    // 记录错误日志
+    this.logger.error(
+      `${request.method} ${request.url}`,
+      exception instanceof Error ? exception.stack : exception
+    );
+
+    response.status(status).json({
+      success: false,
+      statusCode: status,
+      timestamp: new Date().toISOString(),
+      path: request.url,
+      method: request.method,
+      error,
+    });
+  }
+}
+```
+
+---
+
+## 四、全局配置
+
+### 4.1 应用全局过滤器
+
+```typescript
+// src/main.ts
+import { ValidationPipe } from "@nestjs/common";
+import { NestFactory } from "@nestjs/core";
+import { AppModule } from "./app.module";
+import { AllExceptionsFilter } from "./common/filters/all-exceptions.filter";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  // 全局异常过滤器
+  app.useGlobalFilters(new AllExceptionsFilter());
+
+  // 全局验证管道
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+    })
+  );
+
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+### 4.2 在模块中使用
+
+```typescript
+import { Module } from "@nestjs/common";
+import { APP_FILTER } from "@nestjs/core";
+import { AllExceptionsFilter } from "./common/filters/all-exceptions.filter";
+
+@Module({
+  providers: [
+    {
+      provide: APP_FILTER,
+      useClass: AllExceptionsFilter,
+    },
+  ],
+})
+export class AppModule {}
+```
+
+---
+
+## 五、实战：完整示例
+
+### 5.1 服务层异常
+
+```typescript
+@Injectable()
+export class UsersService {
+  async findOne(id: string) {
+    const user = await this.prisma.user.findUnique({ where: { id } });
+
+    if (!user) {
+      throw new UserNotFoundException(id);
+    }
+
+    return user;
+  }
+
+  async create(dto: CreateUserDto) {
+    const existing = await this.prisma.user.findUnique({
+      where: { email: dto.email },
+    });
+
+    if (existing) {
+      throw new UserAlreadyExistsException(dto.email);
+    }
+
+    return this.prisma.user.create({ data: dto });
+  }
+}
+```
+
+### 5.2 控制器层
+
+```typescript
+@Controller("users")
+export class UsersController {
+  @Get(":id")
+  async findOne(@Param("id") id: string) {
+    // 异常会在服务层抛出，控制器无需处理
+    return this.usersService.findOne(id);
+  }
+}
+```
+
+---
+
+## 六、总结
+
+**本文我们完成了**：
+
+✅ 理解了异常处理机制
+✅ 创建了自定义异常
+✅ 实现了异常过滤器
+✅ 全局异常处理
+✅ 错误日志记录
+
+**核心要点**：
+
+1. **HttpException** - NestJS 内置异常基类
+2. **自定义异常** - 针对业务场景创建
+3. **异常过滤器** - 统一处理异常
+4. **全局过滤器** - 全应用生效
+5. **错误日志** - 记录错误便于排查
+
+**下一步**：《文件上传》
+
+---
+
+**相关代码**：[branch: 11-exception-filters](https://github.com/your-repo/blog-api/tree/11-exception-filters)

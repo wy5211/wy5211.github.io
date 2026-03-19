@@ -1,0 +1,807 @@
+---
+title: "09 NestJS 授权与守卫：实现基于角色的访问控制"
+date: "2026-03-19"
+summary: "深入掌握 NestJS 的授权机制，使用守卫和装饰器实现基于角色的访问控制（RBAC），保护 API 资源"
+tags: ["NestJS", "授权", "守卫", "RBAC", "安全"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式博客系统"
+seriesOrder: 9
+---
+
+## 前言
+
+在上一篇文章中，我们实现了 JWT 认证，解决了"用户是谁"的问题。现在让我们来解决"用户能做什么"的问题——**授权**。
+
+**本文将解决什么问题？**
+
+你可能想知道：
+
+- 什么是授权？认证和授权有什么区别？
+- 如何实现基于角色的访问控制？
+- 如何保护特定的 API 路由？
+- 如何创建自定义守卫？
+
+**本文将带你：**
+
+1. 理解授权的概念和 RBAC 模型
+2. 创建角色守卫
+3. 实现基于角色的访问控制
+4. 创建权限装饰器
+5. 实现资源级权限控制
+
+---
+
+## 一、什么是授权？
+
+### 1.1 认证 vs 授权
+
+| 特性     | 认证 (Authentication) | 授权 (Authorization) |
+| -------- | --------------------- | -------------------- |
+| **问题** | 用户是谁？            | 用户能做什么？       |
+| **目的** | 验证身份              | 验证权限             |
+| **时机** | 授权之前              | 认证之后             |
+| **示例** | 登录系统              | 访问管理后台         |
+
+**类比**：
+
+```
+认证 = 身份证（证明你是谁）
+授权 = 门禁卡（决定你能进哪里）
+```
+
+### 1.2 什么是 RBAC？
+
+**RBAC (Role-Based Access Control)** 是一种基于角色的访问控制模型。
+
+**核心概念**：
+
+```
+用户 (User)
+  ↓ 分配
+角色 (Role)
+  ↓ 拥有
+权限 (Permission)
+  ↓ 允许
+操作 (Operation)
+```
+
+**示例**：
+
+```
+用户: 张三
+  ↓
+角色: ADMIN
+  ↓
+权限: [创建文章, 删除文章, 管理用户]
+  ↓
+操作: 可以执行这些操作
+```
+
+---
+
+## 二、定义角色和权限
+
+### 2.1 扩展用户模型
+
+`prisma/schema.prisma`:
+
+```prisma
+enum Role {
+  USER
+  ADMIN
+  MODERATOR
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  name      String
+  role      Role     @default(USER)
+
+  posts     Post[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+```
+
+运行迁移：
+
+```bash
+npx prisma migrate dev --name add_roles
+```
+
+### 2.2 定义角色枚举
+
+`src/common/enums/role.enum.ts`:
+
+```typescript
+export enum Role {
+  USER = "USER",
+  ADMIN = "ADMIN",
+  MODERATOR = "MODERATOR",
+}
+```
+
+---
+
+## 三、创建角色守卫
+
+### 3.1 创建 Roles Guard
+
+`src/common/guards/roles.guard.ts`:
+
+```typescript
+import { Injectable, CanActivate, ExecutionContext } from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
+import { Role } from "../enums/role.enum";
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    // 获取装饰器设置的角色
+    const requiredRoles = this.reflector.getAllAndOverride<Role[]>("roles", [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    // 如果没有设置角色要求，则允许访问
+    if (!requiredRoles) {
+      return true;
+    }
+
+    // 获取请求对象
+    const { user } = context.switchToHttp().getRequest();
+
+    // 验证用户是否有所需的角色
+    return requiredRoles.some((role) => user.role === role);
+  }
+}
+```
+
+### 3.2 创建角色装饰器
+
+`src/common/decorators/roles.decorator.ts`:
+
+```typescript
+import { SetMetadata } from "@nestjs/common";
+import { Role } from "../enums/role.enum";
+
+export const ROLES_KEY = "roles";
+export const Roles = (...roles: Role[]) => SetMetadata(ROLES_KEY, roles);
+```
+
+### 3.3 使用角色守卫
+
+在控制器中使用：
+
+```typescript
+import { Controller, Get, Post, UseGuards } from "@nestjs/common";
+import { RolesGuard } from "../common/guards/roles.guard";
+import { Roles } from "../common/decorators/roles.decorator";
+import { Role } from "../common/enums/role.enum";
+import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
+
+@Controller("admin")
+@UseGuards(JwtAuthGuard, RolesGuard) // 应用守卫
+export class AdminController {
+  // 只有 ADMIN 角色可以访问
+  @Get("users")
+  @Roles(Role.ADMIN)
+  getUsers() {
+    return "所有用户列表";
+  }
+
+  // ADMIN 和 MODERATOR 都可以访问
+  @Get("posts")
+  @Roles(Role.ADMIN, Role.MODERATOR)
+  getPosts() {
+    return "所有文章列表";
+  }
+
+  // 所有认证用户都可以访问（没有 @Roles 装饰器）
+  @Get("profile")
+  getProfile() {
+    return "个人资料";
+  }
+}
+```
+
+---
+
+## 四、创建权限守卫
+
+### 4.1 定义权限枚举
+
+`src/common/enums/permission.enum.ts`:
+
+```typescript
+export enum Permission {
+  // 用户权限
+  CREATE_USER = "create:user",
+  READ_USER = "read:user",
+  UPDATE_USER = "update:user",
+  DELETE_USER = "delete:user",
+
+  // 文章权限
+  CREATE_POST = "create:post",
+  READ_POST = "read:post",
+  UPDATE_POST = "update:post",
+  DELETE_POST = "delete:post",
+  PUBLISH_POST = "publish:post",
+
+  // 评论权限
+  CREATE_COMMENT = "create:comment",
+  DELETE_COMMENT = "delete:comment",
+}
+```
+
+### 4.2 角色权限映射
+
+`src/common/constants/permissions.ts`:
+
+```typescript
+import { Role } from "../enums/role.enum";
+import { Permission } from "../enums/permission.enum";
+
+// 定义每个角色拥有的权限
+export const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
+  [Role.USER]: [
+    Permission.READ_POST,
+    Permission.CREATE_POST,
+    Permission.UPDATE_POST,
+    Permission.DELETE_POST,
+    Permission.CREATE_COMMENT,
+  ],
+  [Role.MODERATOR]: [
+    Permission.READ_POST,
+    Permission.CREATE_POST,
+    Permission.UPDATE_POST,
+    Permission.DELETE_POST,
+    Permission.PUBLISH_POST,
+    Permission.CREATE_COMMENT,
+    Permission.DELETE_COMMENT,
+  ],
+  [Role.ADMIN]: [
+    // Admin 拥有所有权限
+    ...Object.values(Permission),
+  ],
+};
+
+// 获取角色的所有权限
+export function getRolePermissions(role: Role): Permission[] {
+  return ROLE_PERMISSIONS[role] || [];
+}
+
+// 检查角色是否有特定权限
+export function hasPermission(role: Role, permission: Permission): boolean {
+  const permissions = getRolePermissions(role);
+  return permissions.includes(permission);
+}
+```
+
+### 4.3 创建权限守卫
+
+`src/common/guards/permissions.guard.ts`:
+
+```typescript
+import {
+  Injectable,
+  CanActivate,
+  ExecutionContext,
+  ForbiddenException,
+} from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
+import { Permission } from "../enums/permission.enum";
+import { PERMISSIONS_KEY } from "../decorators/permissions.decorator";
+import { hasPermission } from "../constants/permissions";
+
+@Injectable()
+export class PermissionsGuard implements CanActivate {
+  constructor(private reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    // 获取装饰器设置的权限
+    const requiredPermissions = this.reflector.getAllAndOverride<Permission[]>(
+      PERMISSIONS_KEY,
+      [context.getHandler(), context.getClass()]
+    );
+
+    // 如果没有设置权限要求，则允许访问
+    if (!requiredPermissions) {
+      return true;
+    }
+
+    // 获取请求对象
+    const { user } = context.switchToHttp().getRequest();
+
+    // 检查用户是否有所需的权限
+    const hasAllPermissions = requiredPermissions.every((permission) =>
+      hasPermission(user.role, permission)
+    );
+
+    if (!hasAllPermissions) {
+      throw new ForbiddenException("权限不足");
+    }
+
+    return true;
+  }
+}
+```
+
+### 4.4 创建权限装饰器
+
+`src/common/decorators/permissions.decorator.ts`:
+
+```typescript
+import { SetMetadata } from "@nestjs/common";
+import { Permission } from "../enums/permission.enum";
+
+export const PERMISSIONS_KEY = "permissions";
+export const RequirePermissions = (...permissions: Permission[]) =>
+  SetMetadata(PERMISSIONS_KEY, permissions);
+```
+
+### 4.5 使用权限守卫
+
+```typescript
+import { Controller, Get, Post, Delete, UseGuards } from "@nestjs/common";
+import { PermissionsGuard } from "../common/guards/permissions.guard";
+import { RequirePermissions } from "../common/decorators/permissions.decorator";
+import { Permission } from "../common/enums/permission.enum";
+import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
+
+@Controller("posts")
+@UseGuards(JwtAuthGuard, PermissionsGuard)
+export class PostsController {
+  // 需要创建文章权限
+  @Post()
+  @RequirePermissions(Permission.CREATE_POST)
+  create() {
+    return "创建文章";
+  }
+
+  // 需要发布文章权限
+  @Post(":id/publish")
+  @RequirePermissions(Permission.PUBLISH_POST)
+  publish() {
+    return "发布文章";
+  }
+
+  // 需要删除文章权限
+  @Delete(":id")
+  @RequirePermissions(Permission.DELETE_POST)
+  delete() {
+    return "删除文章";
+  }
+}
+```
+
+---
+
+## 五、资源级权限控制
+
+### 5.1 创建所有者守卫
+
+`src/common/guards/owner.guard.ts`:
+
+```typescript
+import {
+  Injectable,
+  CanActivate,
+  ExecutionContext,
+  ForbiddenException,
+} from "@nestjs/common";
+
+@Injectable()
+export class OwnerGuard implements CanActivate {
+  constructor(private prisma: PrismaService) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    const request = context.switchToHttp().getRequest();
+    const user = request.user;
+    const postId = request.params.id;
+
+    // Admin 可以访问所有资源
+    if (user.role === Role.ADMIN) {
+      return true;
+    }
+
+    // 检查资源是否属于当前用户
+    const post = await this.prisma.post.findUnique({
+      where: { id: postId },
+    });
+
+    if (!post) {
+      throw new ForbiddenException("资源不存在");
+    }
+
+    if (post.authorId !== user.userId) {
+      throw new ForbiddenException("无权访问此资源");
+    }
+
+    return true;
+  }
+}
+```
+
+### 5.2 组合使用守卫
+
+```typescript
+import { Controller, Delete, UseGuards } from "@nestjs/common";
+import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
+import { OwnerGuard } from "../common/guards/owner.guard";
+import { RolesGuard } from "../common/guards/roles.guard";
+
+@Controller("posts")
+@UseGuards(JwtAuthGuard)
+export class PostsController {
+  // 需要认证且是资源所有者
+  @Delete(":id")
+  @UseGuards(OwnerGuard)
+  delete() {
+    return "删除文章";
+  }
+}
+```
+
+---
+
+## 六、创建自定义装饰器
+
+### 6.1 当前用户装饰器
+
+`src/common/decorators/current-user.decorator.ts`:
+
+```typescript
+import { createParamDecorator, ExecutionContext } from "@nestjs/common";
+
+export const CurrentUser = createParamDecorator(
+  (data: string | undefined, ctx: ExecutionContext) => {
+    const request = ctx.switchToHttp().getRequest();
+    const user = request.user;
+
+    return data ? user?.[data] : user;
+  }
+);
+```
+
+使用：
+
+```typescript
+@Get('profile')
+getProfile(@CurrentUser() user: any) {
+  return user;
+}
+
+@Get('profile')
+getUserId(@CurrentUser('userId') userId: string) {
+  return userId;
+}
+```
+
+### 6.2 角色装饰器（简化版）
+
+`src/common/decorators/roles.decorator.ts`:
+
+```typescript
+import { createParamDecorator, ExecutionContext } from "@nestjs/common";
+
+export const CurrentRoles = createParamDecorator(
+  (data: unknown, ctx: ExecutionContext) => {
+    const request = ctx.switchToHttp().getRequest();
+    return request.user?.role;
+  }
+);
+```
+
+### 6.3 权限检查装饰器
+
+`src/common/decorators/require-permissions.decorator.ts`:
+
+```typescript
+import { applyDecorators, UseGuards } from "@nestjs/common";
+import { PermissionsGuard } from "../guards/permissions.guard";
+import { Permission } from "../enums/permission.enum";
+
+export function RequirePermissions(...permissions: Permission[]) {
+  return applyDecorators(
+    UseGuards(PermissionsGuard)
+    // 可以添加其他装饰器
+  );
+}
+```
+
+---
+
+## 七、全局守卫配置
+
+### 7.1 配置全局守卫
+
+`src/app.module.ts`:
+
+```typescript
+import { Module } from "@nestjs/common";
+import { APP_GUARD } from "@nestjs/core";
+import { JwtAuthGuard } from "./auth/guards/jwt-auth.guard";
+import { RolesGuard } from "./common/guards/roles.guard";
+import { PermissionsGuard } from "./common/guards/permissions.guard";
+
+@Module({
+  providers: [
+    // 全局 JWT 认证守卫
+    {
+      provide: APP_GUARD,
+      useClass: JwtAuthGuard,
+    },
+    // 全局角色守卫
+    {
+      provide: APP_GUARD,
+      useClass: RolesGuard,
+    },
+    // 全局权限守卫
+    {
+      provide: APP_GUARD,
+      useClass: PermissionsGuard,
+    },
+  ],
+})
+export class AppModule {}
+```
+
+### 7.2 公开路由
+
+使用 `@Public()` 装饰器标记公开路由：
+
+```typescript
+import { Controller, Get } from "@nestjs/common";
+import { Public } from "./auth/decorators/public.decorator";
+
+@Controller("health")
+export class HealthController {
+  @Public() // 不需要认证
+  @Get()
+  check() {
+    return "OK";
+  }
+}
+```
+
+---
+
+## 八、实战：完整的授权示例
+
+### 8.1 用户管理控制器
+
+```typescript
+import {
+  Controller,
+  Get,
+  Post,
+  Put,
+  Delete,
+  Param,
+  Body,
+  UseGuards,
+} from "@nestjs/common";
+import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
+import { RolesGuard } from "../common/guards/roles.guard";
+import { Roles } from "../common/decorators/roles.decorator";
+import { RequirePermissions } from "../common/decorators/require-permissions.decorator";
+import { Role } from "../common/enums/role.enum";
+import { Permission } from "../common/enums/permission.enum";
+
+@Controller("users")
+@UseGuards(JwtAuthGuard, RolesGuard)
+export class UsersController {
+  // 只有 ADMIN 可以查看所有用户
+  @Get()
+  @Roles(Role.ADMIN)
+  @RequirePermissions(Permission.READ_USER)
+  findAll() {
+    return "所有用户";
+  }
+
+  // 所有用户都可以查看自己的信息
+  @Get("profile")
+  getProfile(@CurrentUser("userId") userId: string) {
+    return this.usersService.findOne(userId);
+  }
+
+  // 只有 ADMIN 可以创建用户
+  @Post()
+  @Roles(Role.ADMIN)
+  @RequirePermissions(Permission.CREATE_USER)
+  create() {
+    return "创建用户";
+  }
+
+  // 只有 ADMIN 可以更新用户
+  @Put(":id")
+  @Roles(Role.ADMIN)
+  @RequirePermissions(Permission.UPDATE_USER)
+  update() {
+    return "更新用户";
+  }
+
+  // 只有 ADMIN 可以删除用户
+  @Delete(":id")
+  @Roles(Role.ADMIN)
+  @RequirePermissions(Permission.DELETE_USER)
+  delete() {
+    return "删除用户";
+  }
+}
+```
+
+### 8.2 文章管理控制器
+
+```typescript
+import {
+  Controller,
+  Get,
+  Post,
+  Put,
+  Delete,
+  Param,
+  Body,
+  UseGuards,
+} from '@nestjs/common';
+import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
+import { RolesGuard } from '../common/guards/roles.guard';
+import { Roles } from '../common/decorators/roles.decorator';
+import { RequirePermissions } from '../common/decorators/require-permissions.decorator';
+import { OwnerGuard } from '../common/guards/owner.guard';
+import { Role } from '../common/enums/role.enum';
+import { Permission } from '../common/enums/permission.enum';
+
+@Controller('posts')
+@UseGuards(JwtAuthGuard, RolesGuard)
+export class PostsController {
+  // 所有认证用户都可以查看文章
+  @Get()
+  findAll() {
+    return '所有文章';
+  }
+
+  // 需要创建文章权限
+  @Post()
+  @RequirePermissions(Permission.CREATE_POST)
+  create(@CurrentUser('userId') userId: string) {
+    return this.postsService.create(userId, ...);
+  }
+
+  // 需要发布文章权限
+  @Post(':id/publish')
+  @RequirePermissions(Permission.PUBLISH_POST)
+  publish(@Param('id') id: string) {
+    return this.postsService.publish(id);
+  }
+
+  // 资源所有者或 ADMIN 可以更新
+  @Put(':id')
+  @UseGuards(OwnerGuard)
+  update() {
+    return '更新文章';
+  }
+
+  // 资源所有者或 ADMIN 可以删除
+  @Delete(':id')
+  @UseGuards(OwnerGuard)
+  delete() {
+    return '删除文章';
+  }
+}
+```
+
+---
+
+## 九、常见问题
+
+### Q1: 角色和权限有什么区别？
+
+**A**:
+
+- **角色** - 用户的身份标识（如 ADMIN、USER）
+- **权限** - 可以执行的操作（如 create:post、delete:user）
+
+RBAC 模型中，角色拥有权限，用户分配角色。
+
+### Q2: 如何处理临时权限？
+
+**A**: 可以创建临时角色或使用时间戳：
+
+```typescript
+// 方法 1：临时角色
+model TemporaryRole {
+  id        String   @id @default(uuid())
+  userId    String
+  role      Role
+  expiresAt DateTime
+}
+
+// 方法 2：时间戳检查
+if (user.temporaryRoleExpiry > new Date()) {
+  // 使用临时角色
+}
+```
+
+### Q3: 如何实现动态权限？
+
+**A**: 使用数据库存储权限配置：
+
+```typescript
+// 查询用户权限
+async getUserPermissions(userId: string) {
+  const user = await this.prisma.user.findUnique({
+    where: { id: userId },
+    include: {
+      permissions: true,
+      role: {
+        include: {
+          permissions: true,
+        },
+      },
+    },
+  });
+
+  // 合并角色权限和用户自定义权限
+  const rolePermissions = user.role.permissions;
+  const userPermissions = user.permissions;
+
+  return [...rolePermissions, ...userPermissions];
+}
+```
+
+---
+
+## 十、总结
+
+**本文我们完成了**：
+
+✅ 理解了授权的概念和 RBAC 模型
+✅ 创建了角色守卫和权限守卫
+✅ 实现了基于角色的访问控制
+✅ 创建了自定义装饰器
+✅ 实现了资源级权限控制
+
+**核心要点回顾**：
+
+1. **认证 vs 授权** - 认证解决"是谁"，授权解决"能做什么"
+2. **RBAC 模型** - 用户 → 角色 → 权限 → 操作
+3. **守卫** - 用于保护路由，验证权限
+4. **装饰器** - 简化权限配置
+5. **资源级控制** - 检查资源所有权
+
+**最佳实践**：
+
+- ✅ 使用角色守卫进行粗粒度控制
+- ✅ 使用权限守卫进行细粒度控制
+- ✅ 创建可复用的装饰器
+- ✅ 资源级验证放在服务层
+- ✅ ADMIN 角色拥有所有权限
+
+**下一步**：
+
+在下一篇文章《拦截器与日志》中，我们将深入学习：
+
+- 拦截器的作用和使用
+- 日志拦截器实现
+- 响应数据转换
+- 性能监控
+
+---
+
+**相关代码**：
+
+- 完整项目示例：[blog-api](https://github.com/your-repo/blog-api)
+- 本篇代码示例：[branch: 09-authorization-guards](https://github.com/your-repo/blog-api/tree/09-authorization-guards)
+
+**有问题？** 欢迎在评论区留言，我会尽快回复！

@@ -1,0 +1,671 @@
+---
+title: "04 GitHub Actions CI/CD 实战：从零到自动化部署"
+date: "2026-03-18"
+summary: "从基础概念到实战案例，手把手教你用 GitHub Actions 搭建完整的 CI/CD 流水线，实现自动化测试、构建和部署。"
+tags: ["CI/CD", "GitHub Actions", "DevOps", "自动化"]
+category: "运维"
+cover: ""
+draft: false
+---
+
+# GitHub Actions CI/CD 实战：从零到自动化部署
+
+每次手动部署都很痛苦：SSH 登录服务器、拉代码、安装依赖、构建、重启服务... 容易出错还浪费时间。GitHub Actions 可以让这一切全自动完成。本文从零开始，教你搭建完整的 CI/CD 流水线。
+
+## 一、GitHub Actions 基础概念
+
+### 1.1 核心概念
+
+| 概念         | 说明                                        |
+| ------------ | ------------------------------------------- |
+| **Workflow** | 工作流，一个自动化流程，定义在 YAML 文件中  |
+| **Event**    | 触发事件，如 push、pull_request、schedule   |
+| **Job**      | 任务，一个工作流包含多个 Job，默认并行执行  |
+| **Step**     | 步骤，一个 Job 包含多个 Step，顺序执行      |
+| **Action**   | 可复用的操作单元，可以是脚本或第三方 Action |
+| **Runner**   | 执行任务的虚拟机，GitHub 提供或自托管       |
+
+### 1.2 工作流文件位置
+
+```
+.github/
+└── workflows/
+    ├── ci.yml           # 持续集成
+    ├── deploy.yml       # 部署
+    └── release.yml      # 发布
+```
+
+### 1.3 最简工作流
+
+```yaml
+# .github/workflows/hello.yml
+name: Hello World
+
+on: push
+
+jobs:
+  say-hello:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print Hello
+        run: echo "Hello, GitHub Actions!"
+```
+
+## 二、CI：持续集成实战
+
+### 2.1 Node.js 项目 CI 配置
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+
+    steps:
+      # 1. 检出代码
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 2. 设置 Node.js
+      - name: Setup Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: "npm" # 启用 npm 缓存
+
+      # 3. 安装依赖
+      - name: Install dependencies
+        run: npm ci
+
+      # 4. 代码检查
+      - name: Lint
+        run: npm run lint
+
+      # 5. 单元测试
+      - name: Run tests
+        run: npm test -- --coverage
+
+      # 6. 构建检查
+      - name: Build
+        run: npm run build
+
+      # 7. 上传测试覆盖率
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+```
+
+### 2.2 多环境矩阵测试
+
+```yaml
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false # 一个失败不影响其他
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        node: [18.x, 20.x]
+        exclude:
+          # 排除某些组合
+          - os: macos-latest
+            node: 18.x
+```
+
+### 2.3 缓存优化
+
+```yaml
+# 缓存 node_modules
+- name: Cache node modules
+  uses: actions/cache@v4
+  id: cache-npm
+  with:
+    path: node_modules
+    key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+    restore-keys: |
+      ${{ runner.os }}-node-
+
+- name: Install dependencies
+  if: steps.cache-npm.outputs.cache-hit != 'true'
+  run: npm ci
+```
+
+## 三、CD：持续部署实战
+
+### 3.1 部署到 Vercel
+
+```yaml
+# .github/workflows/deploy-vercel.yml
+name: Deploy to Vercel
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: "npm"
+
+      - name: Install Vercel CLI
+        run: npm i -g vercel@latest
+
+      - name: Pull Vercel Environment
+        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Build Project
+        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
+
+      - name: Deploy to Vercel
+        run: vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }}
+```
+
+### 3.2 部署到自有服务器（SSH）
+
+```yaml
+# .github/workflows/deploy-server.yml
+name: Deploy to Server
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: 22
+          script: |
+            cd /var/www/myapp
+            git pull origin main
+            npm ci
+            npm run build
+            pm2 restart myapp
+```
+
+### 3.3 Docker 镜像构建与推送
+
+```yaml
+# .github/workflows/docker.yml
+name: Docker Build & Push
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract version
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/myapp:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/myapp:${{ steps.version.outputs.VERSION }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+### 3.4 部署到 Kubernetes
+
+```yaml
+# .github/workflows/k8s.yml
+name: Deploy to Kubernetes
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubeconfig
+        run: |
+          mkdir -p ~/.kube
+          echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > ~/.kube/config
+
+      - name: Deploy to K8s
+        run: |
+          kubectl set image deployment/myapp \
+            myapp=${{ secrets.DOCKERHUB_USERNAME }}/myapp:${{ github.sha }} \
+            -n production
+          kubectl rollout status deployment/myapp -n production
+```
+
+## 四、进阶技巧
+
+### 4.1 环境变量与 Secrets
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      # 公开环境变量
+      NODE_ENV: production
+      API_URL: https://api.example.com
+
+    steps:
+      - name: Use secrets
+        env:
+          # 敏感信息使用 secrets
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          API_KEY: ${{ secrets.API_KEY }}
+        run: |
+          echo "Connecting to database..."
+          # 使用环境变量
+```
+
+**设置 Secrets**：GitHub 仓库 → Settings → Secrets and variables → Actions
+
+### 4.2 条件执行
+
+```yaml
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # 只在 main 分支且不是 PR 时部署
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+
+    steps:
+      - name: Deploy on success
+        if: success()
+        run: echo "Deploying..."
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "Build failed!"
+
+      - name: Always run cleanup
+        if: always()
+        run: echo "Cleanup..."
+```
+
+### 4.3 Job 依赖与并行
+
+```yaml
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm test
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npm run lint
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [test, lint] # 等待 test 和 lint 完成
+    steps:
+      - run: npm run build
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build # 等待 build 完成
+    steps:
+      - run: ./deploy.sh
+```
+
+### 4.4 定时任务
+
+```yaml
+on:
+  schedule:
+    # 每天 UTC 0:00 执行（北京时间 8:00）
+    - cron: "0 0 * * *"
+    # 每周一 UTC 0:00
+    - cron: "0 0 * * 1"
+
+jobs:
+  scheduled:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run scheduled task
+        run: echo "Scheduled task running..."
+```
+
+### 4.5 手动触发
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Deploy environment"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+      version:
+        description: "Version to deploy"
+        required: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy
+        run: |
+          echo "Deploying ${{ inputs.version }} to ${{ inputs.environment }}"
+```
+
+### 4.6 使用 Artifact 传递文件
+
+```yaml
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm run build
+
+      # 上传构建产物
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: dist/
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # 下载构建产物
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: dist/
+
+      - run: ./deploy.sh
+```
+
+## 五、实用 Action 推荐
+
+### 5.1 代码质量
+
+```yaml
+# ESLint
+- uses: reviewdog/action-eslint@v1
+
+# Prettier
+- uses: creyD/prettier_action@v4.3
+
+# TypeScript 类型检查
+- run: npx tsc --noEmit
+```
+
+### 5.2 通知
+
+```yaml
+# Slack 通知
+- name: Notify Slack
+  uses: 8398a7/action-slack@v3
+  with:
+    status: ${{ job.status }}
+    fields: repo,message,commit,author,action,eventName,ref,workflow
+  env:
+    SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+  if: always()
+
+# 钉钉通知
+- name: Notify DingTalk
+  uses: zcong1993/setup-dingtalk@v1
+  with:
+    dingtalk_token: ${{ secrets.DINGTALK_TOKEN }}
+```
+
+### 5.3 发布管理
+
+```yaml
+# 自动生成 Changelog
+- uses: release-drafter/release-drafter@v5
+  with:
+    config-name: release-drafter.yml
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+# NPM 发布
+- uses: JS-DevTools/npm-publish@v3
+  with:
+    token: ${{ secrets.NPM_TOKEN }}
+```
+
+## 六、完整实战案例
+
+### 6.1 全栈项目 CI/CD
+
+```yaml
+# .github/workflows/fullstack.yml
+name: Fullstack CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  NODE_VERSION: 20.x
+
+jobs:
+  # ========== CI ==========
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+      - run: npm ci
+      - run: npm run test:ci
+      - uses: codecov/codecov-action@v4
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: "npm"
+      - run: npm ci
+      - run: npm run build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build
+          path: dist/
+
+  # ========== CD ==========
+  deploy-staging:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: dist/
+      - name: Deploy to staging
+        run: ./scripts/deploy-staging.sh
+
+  deploy-production:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: build
+          path: dist/
+      - name: Deploy to production
+        run: ./scripts/deploy-production.sh
+```
+
+## 七、最佳实践
+
+### 7.1 安全建议
+
+1. **使用 Secrets 管理敏感信息**
+   - 不要在代码中硬编码密码、Token
+   - 使用 GitHub Secrets 存储敏感配置
+
+2. **最小权限原则**
+   - 为部署创建专用的 SSH Key
+   - 使用 Deploy Key 而不是个人 Token
+
+3. **限制并发部署**
+   ```yaml
+   concurrency:
+     group: deploy-${{ github.ref }}
+     cancel-in-progress: true
+   ```
+
+### 7.2 性能优化
+
+1. **启用缓存**
+
+   ```yaml
+   - uses: actions/setup-node@v4
+     with:
+       node-version: 20.x
+       cache: "npm" # 自动缓存 npm 依赖
+   ```
+
+2. **减少不必要的步骤**
+   - 使用 `npm ci` 而不是 `npm install`
+   - 只在必要时运行完整测试
+
+3. **并行执行**
+   - 拆分多个 Job 并行运行
+   - 使用矩阵测试
+
+### 7.3 可维护性
+
+1. **使用复合 Action 复用逻辑**
+
+   ```yaml
+   # .github/actions/setup-node/action.yml
+   name: "Setup Node.js"
+   runs:
+     using: "composite"
+     steps:
+       - uses: actions/setup-node@v4
+         with:
+           node-version: 20.x
+           cache: "npm"
+       - run: npm ci
+         shell: bash
+   ```
+
+2. **添加清晰的注释和命名**
+
+3. **保持工作流简洁，复杂逻辑放到脚本中**
+
+## 总结
+
+GitHub Actions 让 CI/CD 变得简单且免费。
+
+**核心要点**：
+
+1. **CI**：每次提交自动测试、检查
+2. **CD**：合并后自动部署
+3. **缓存**：加速构建
+4. **Secrets**：安全管理敏感信息
+5. **矩阵**：多环境测试
+
+**推荐工作流**：
+
+```
+Push → Lint + Test → Build → Deploy
+```
+
+配置好一次，终身受益。今天就开始自动化你的部署吧！

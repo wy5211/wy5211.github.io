@@ -1,0 +1,1301 @@
+---
+title: "04 NestJS 提供者与服务：业务逻辑的核心架构"
+date: "2026-03-19"
+summary: "深入理解 NestJS 的提供者（Provider）机制，掌握服务层的设计模式，学习如何编写可测试、可复用的业务逻辑代码"
+tags: ["NestJS", "服务", "提供者", "依赖注入", "业务逻辑"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式博客系统"
+seriesOrder: 4
+---
+
+## 前言
+
+在前面几篇文章中，我们学习了模块、控制器和路由。现在，让我们深入探讨 NestJS 中处理业务逻辑的核心组件——**提供者（Provider）** 和 **服务（Service）**。
+
+**本文将解决什么问题？**
+
+你可能想知道：
+
+- 什么是提供者？它和控制器有什么区别？
+- 服务层应该如何设计？
+- 如何编写可测试的业务逻辑？
+- 如何实现服务之间的复用？
+- 如何使用自定义 Provider？
+
+**本文将带你：**
+
+1. 深入理解提供者的概念和作用
+2. 掌握服务层的设计模式
+3. 学习自定义 Provider 的各种用法
+4. 实现可测试的业务逻辑
+5. 掌握服务层的最佳实践
+
+---
+
+## 一、什么是提供者（Provider）？
+
+### 1.1 提供者的概念
+
+**提供者（Provider）** 是 NestJS 中一个核心概念，它是一个可以被注入到其他类中的类。提供者实现了**依赖注入**的设计模式，使得代码更加模块化和可测试。
+
+**简单理解**：
+
+```
+Provider（提供者）
+  ↓
+Service（服务）、Repository（仓库）、Factory（工厂）、Helper（助手）
+  ↓
+可以被注入到：Controller、Service、其他 Provider
+```
+
+### 1.2 提供者 vs 控制器
+
+| 特性         | 控制器（Controller） | 提供者（Provider/Service） |
+| ------------ | -------------------- | -------------------------- |
+| **职责**     | 处理 HTTP 请求       | 处理业务逻辑               |
+| **装饰器**   | `@Controller()`      | `@Injectable()`            |
+| **关注点**   | 路由、参数、响应     | 数据处理、业务规则         |
+| **可测试性** | 需要 Mock 服务       | 可以独立测试               |
+| **复用性**   | 较低                 | 高                         |
+
+**类比**：
+
+```
+餐厅的运营模式：
+
+服务员（Controller）
+  ↓ 职责：接待顾客、传递订单
+  ↓ 不关心：菜怎么做、食材哪里来
+
+厨师（Service/Provider）
+  ↓ 职责：烹饪菜品
+  ↓ 不关心：谁点的菜、怎么端给顾客
+```
+
+### 1.3 为什么需要服务层？
+
+**没有服务层的问题**：
+
+```typescript
+// ❌ 所有逻辑都在控制器中
+@Controller("users")
+export class UsersController {
+  constructor(private prisma: PrismaService) {}
+
+  @Post()
+  async create(@Body() dto: CreateUserDto) {
+    // 验证逻辑
+    if (!dto.email || !dto.email.includes("@")) {
+      throw new Error("邮箱格式错误");
+    }
+
+    // 检查用户是否存在
+    const existing = await this.prisma.user.findUnique({
+      where: { email: dto.email },
+    });
+    if (existing) {
+      throw new Error("用户已存在");
+    }
+
+    // 密码加密
+    const hashedPassword = await bcrypt.hash(dto.password, 10);
+
+    // 创建用户
+    const user = await this.prisma.user.create({
+      data: {
+        ...dto,
+        password: hashedPassword,
+      },
+    });
+
+    // 发送欢迎邮件
+    await this.emailService.sendWelcome(user.email);
+
+    return user;
+  }
+
+  // 其他方法也会有类似的重复逻辑...
+}
+```
+
+**问题**：
+
+- 控制器变得臃肿
+- 业务逻辑无法复用
+- 难以测试（需要 Mock 数据库）
+- 违反单一职责原则
+
+**使用服务层**：
+
+```typescript
+// ✅ 控制器保持简洁
+@Controller("users")
+export class UsersController {
+  constructor(private usersService: UsersService) {}
+
+  @Post()
+  async create(@Body() dto: CreateUserDto) {
+    return this.usersService.create(dto);
+  }
+}
+
+// ✅ 服务层处理业务逻辑
+@Injectable()
+export class UsersService {
+  constructor(
+    private prisma: PrismaService,
+    private emailService: EmailService
+  ) {}
+
+  async create(dto: CreateUserDto) {
+    // 验证
+    this.validateEmail(dto.email);
+
+    // 检查是否存在
+    await this.checkUserExists(dto.email);
+
+    // 密码加密
+    const hashedPassword = await this.hashPassword(dto.password);
+
+    // 创建用户
+    const user = await this.prisma.user.create({
+      data: { ...dto, password: hashedPassword },
+    });
+
+    // 发送邮件
+    await this.emailService.sendWelcome(user.email);
+
+    return user;
+  }
+
+  // 私有辅助方法
+  private validateEmail(email: string) {
+    if (!email || !email.includes("@")) {
+      throw new BadRequestException("邮箱格式错误");
+    }
+  }
+
+  private async checkUserExists(email: string) {
+    const existing = await this.prisma.user.findUnique({
+      where: { email },
+    });
+    if (existing) {
+      throw new ConflictException("用户已存在");
+    }
+  }
+
+  private async hashPassword(password: string): Promise<string> {
+    return bcrypt.hash(password, 10);
+  }
+}
+```
+
+---
+
+## 二、创建服务（Service）
+
+### 2.1 使用 CLI 生成服务
+
+```bash
+# 生成服务
+nest g service users
+
+# 或完整命令
+nest generate service users
+```
+
+CLI 会自动创建：
+
+```
+src/users/
+├── users.service.spec.ts    # 测试文件
+└── users.service.ts         # 服务
+```
+
+### 2.2 服务的基本结构
+
+```typescript
+import { Injectable } from "@nestjs/common";
+
+@Injectable() // 标记为可注入的服务
+export class UsersService {
+  // 业务逻辑方法
+  findAll() {
+    return "返回所有用户";
+  }
+
+  findOne(id: string) {
+    return `返回用户 ${id}`;
+  }
+
+  create(data: any) {
+    return "创建用户";
+  }
+
+  update(id: string, data: any) {
+    return `更新用户 ${id}`;
+  }
+
+  remove(id: string) {
+    return `删除用户 ${id}`;
+  }
+}
+```
+
+### 2.3 在模块中注册服务
+
+```typescript
+import { Module } from "@nestjs/common";
+import { UsersController } from "./users.controller";
+import { UsersService } from "./users.service";
+
+@Module({
+  controllers: [UsersController],
+  providers: [UsersService], // 注册服务
+  exports: [UsersService], // 导出供其他模块使用
+})
+export class UsersModule {}
+```
+
+### 2.4 在控制器中使用服务
+
+```typescript
+import { Controller, Get, Post, Body, Param } from "@nestjs/common";
+import { UsersService } from "./users.service";
+
+@Controller("users")
+export class UsersController {
+  // 通过构造函数注入服务
+  constructor(private usersService: UsersService) {}
+
+  @Get()
+  findAll() {
+    return this.usersService.findAll();
+  }
+
+  @Get(":id")
+  findOne(@Param("id") id: string) {
+    return this.usersService.findOne(id);
+  }
+
+  @Post()
+  create(@Body() data: any) {
+    return this.usersService.create(data);
+  }
+}
+```
+
+---
+
+## 三、服务的依赖注入
+
+### 3.1 注入其他服务
+
+服务可以注入其他服务：
+
+```typescript
+@Injectable()
+export class UsersService {
+  constructor(
+    private prismaService: PrismaService, // 注入数据库服务
+    private emailService: EmailService, // 注入邮件服务
+    private loggerService: LoggerService // 注入日志服务
+  ) {}
+
+  async create(dto: CreateUserDto) {
+    // 使用注入的服务
+    this.loggerService.log("创建用户");
+
+    const user = await this.prismaService.user.create({ data: dto });
+
+    await this.emailService.sendWelcome(user.email);
+
+    return user;
+  }
+}
+```
+
+### 3.2 服务之间的相互调用
+
+```typescript
+// posts.service.ts
+@Injectable()
+export class PostsService {
+  constructor(
+    private prisma: PrismaService,
+    private usersService: UsersService // 注入用户服务
+  ) {}
+
+  async create(userId: string, dto: CreatePostDto) {
+    // 调用用户服务验证用户
+    const user = await this.usersService.findOne(userId);
+    if (!user) {
+      throw new NotFoundException("用户不存在");
+    }
+
+    // 创建文章
+    return this.prisma.post.create({
+      data: {
+        ...dto,
+        authorId: userId,
+      },
+    });
+  }
+}
+```
+
+### 3.3 循环依赖的解决
+
+当两个服务相互依赖时，使用 `forwardRef`：
+
+```typescript
+// users.service.ts
+import { forwardRef, Inject } from "@nestjs/common";
+
+@Injectable()
+export class UsersService {
+  constructor(
+    @Inject(forwardRef(() => PostsService))
+    private postsService: PostsService
+  ) {}
+
+  getUserWithPosts(userId: string) {
+    // 使用 postsService
+  }
+}
+
+// posts.service.ts
+@Injectable()
+export class PostsService {
+  constructor(
+    @Inject(forwardRef(() => UsersService))
+    private usersService: UsersService
+  ) {}
+
+  getPostWithAuthor(postId: string) {
+    // 使用 usersService
+  }
+}
+```
+
+**更好的方案**：重构代码，避免循环依赖。
+
+---
+
+## 四、自定义 Provider
+
+除了使用 `@Injectable()` 创建服务外，NestJS 还提供了多种自定义 Provider 的方式。
+
+### 4.1 Provider 类型对比
+
+| 类型        | 装饰器          | 用途         | 示例         |
+| ----------- | --------------- | ------------ | ------------ |
+| useClass    | `@Injectable()` | 标准服务类   | UsersService |
+| useValue    | -               | 提供固定值   | 配置对象     |
+| useFactory  | -               | 工厂函数     | 动态创建实例 |
+| useExisting | -               | 使用现有实例 | 别名         |
+
+### 4.2 useValue - 提供固定值
+
+**场景**：提供配置、常量等
+
+```typescript
+@Module({
+  providers: [
+    {
+      provide: "APP_CONFIG", // Token
+      useValue: {
+        apiUrl: "https://api.example.com",
+        apiKey: "abc123",
+        timeout: 5000,
+      },
+    },
+  ],
+})
+export class ConfigModule {}
+
+// 使用
+@Injectable()
+export class ApiService {
+  constructor(@Inject("APP_CONFIG") private config: any) {}
+
+  getData() {
+    console.log(this.config.apiUrl);
+  }
+}
+```
+
+### 4.3 useFactory - 工厂函数
+
+**场景**：需要动态创建实例，或依赖其他 Provider
+
+```typescript
+@Module({
+  providers: [
+    {
+      provide: "DATABASE_CONNECTION",
+      useFactory: async (configService: ConfigService) => {
+        // 根据配置创建数据库连接
+        const connectionString = configService.get("DB_URL");
+        const connection = await createConnection(connectionString);
+        return connection;
+      },
+      inject: [ConfigService], // 注入依赖
+    },
+  ],
+})
+export class DatabaseModule {}
+```
+
+**复杂示例**：
+
+```typescript
+@Module({
+  providers: [
+    ConfigService,
+    {
+      provide: "LoggerService",
+      useFactory: (configService: ConfigService) => {
+        const environment = configService.get("NODE_ENV");
+        const level = environment === "production" ? "error" : "debug";
+
+        return new LoggerService({
+          level,
+          format: "json",
+        });
+      },
+      inject: [ConfigService],
+    },
+  ],
+})
+export class LoggerModule {}
+```
+
+### 4.4 useClass - 动态指定类
+
+**场景**：根据条件选择不同的实现类
+
+```typescript
+@Module({
+  providers: [
+    {
+      provide: LoggerService,
+      useClass:
+        process.env.NODE_ENV === "production"
+          ? ProductionLoggerService
+          : DevelopmentLoggerService,
+    },
+  ],
+})
+export class LoggerModule {}
+```
+
+### 4.5 useExisting - 使用现有实例
+
+**场景**：创建别名
+
+```typescript
+@Module({
+  providers: [
+    LoggerService,
+    {
+      provide: "CUSTOM_LOGGER",
+      useExisting: LoggerService, // 使用同一实例
+    },
+  ],
+})
+export class LoggerModule {}
+
+// 使用
+@Injectable()
+export class UsersService {
+  constructor(@Inject("CUSTOM_LOGGER") private logger: LoggerService) {}
+}
+```
+
+---
+
+## 五、服务层设计模式
+
+### 5.1 单一职责原则
+
+每个服务只负责一个领域的业务逻辑：
+
+```typescript
+// ✅ 好的设计：职责清晰
+@Injectable()
+export class UsersService {
+  // 只负责用户相关的业务逻辑
+}
+
+@Injectable()
+export class PostsService {
+  // 只负责文章相关的业务逻辑
+}
+
+@Injectable()
+export class EmailService {
+  // 只负责邮件发送
+}
+
+// ❌ 不好的设计：职责混乱
+@Injectable()
+export class UserService {
+  createUser() {
+    /* 用户逻辑 */
+  }
+  sendEmail() {
+    /* 邮件逻辑 */
+  }
+  createPost() {
+    /* 文章逻辑 */
+  }
+  // 做了太多事情...
+}
+```
+
+### 5.2 仓储模式（Repository Pattern）
+
+将数据访问逻辑从服务中分离：
+
+```typescript
+// users.repository.ts
+@Injectable()
+export class UsersRepository {
+  constructor(private prisma: PrismaService) {}
+
+  async findById(id: string) {
+    return this.prisma.user.findUnique({ where: { id } });
+  }
+
+  async findByEmail(email: string) {
+    return this.prisma.user.findUnique({ where: { email } });
+  }
+
+  async create(data: CreateUserDto) {
+    return this.prisma.user.create({ data });
+  }
+
+  async update(id: string, data: UpdateUserDto) {
+    return this.prisma.user.update({ where: { id }, data });
+  }
+
+  async delete(id: string) {
+    return this.prisma.user.delete({ where: { id } });
+  }
+}
+
+// users.service.ts
+@Injectable()
+export class UsersService {
+  constructor(
+    private usersRepository: UsersRepository,
+    private emailService: EmailService
+  ) {}
+
+  async create(dto: CreateUserDto) {
+    // 业务逻辑
+    const existing = await this.usersRepository.findByEmail(dto.email);
+    if (existing) {
+      throw new ConflictException("用户已存在");
+    }
+
+    const user = await this.usersRepository.create(dto);
+
+    // 发送欢迎邮件
+    await this.emailService.sendWelcome(user.email);
+
+    return user;
+  }
+}
+```
+
+### 5.3 策略模式
+
+根据不同情况使用不同的处理策略：
+
+```typescript
+// payment-strategy.interface.ts
+export interface PaymentStrategy {
+  process(amount: number): Promise<void>;
+}
+
+// alipay.strategy.ts
+@Injectable()
+export class AlipayStrategy implements PaymentStrategy {
+  async process(amount: number) {
+    // 支付宝支付逻辑
+  }
+}
+
+// wechat.strategy.ts
+@Injectable()
+export class WechatStrategy implements PaymentStrategy {
+  async process(amount: number) {
+    // 微信支付逻辑
+  }
+}
+
+// payment.service.ts
+@Injectable()
+export class PaymentService {
+  private strategies: Map<string, PaymentStrategy>;
+
+  constructor(
+    private alipayStrategy: AlipayStrategy,
+    private wechatStrategy: WechatStrategy
+  ) {
+    this.strategies = new Map([
+      ["alipay", alipayStrategy],
+      ["wechat", wechatStrategy],
+    ]);
+  }
+
+  async pay(method: string, amount: number) {
+    const strategy = this.strategies.get(method);
+    if (!strategy) {
+      throw new BadRequestException("不支持的支付方式");
+    }
+
+    return strategy.process(amount);
+  }
+}
+```
+
+### 5.4 模板方法模式
+
+定义算法骨架，子类实现具体步骤：
+
+```typescript
+// base-export.service.ts
+@Injectable()
+export class BaseExportService {
+  async export(format: "csv" | "excel" | "pdf") {
+    // 1. 获取数据
+    const data = await this.getData();
+
+    // 2. 转换数据
+    const transformed = this.transformData(data);
+
+    // 3. 格式化输出
+    return this.formatOutput(transformed, format);
+  }
+
+  protected abstract getData(): Promise<any>;
+  protected abstract transformData(data: any): any;
+
+  private formatOutput(data: any, format: string) {
+    // 格式化逻辑
+  }
+}
+
+// users-export.service.ts
+@Injectable()
+export class UsersExportService extends BaseExportService {
+  constructor(private usersRepository: UsersRepository) {
+    super();
+  }
+
+  protected async getData() {
+    return this.usersRepository.findAll();
+  }
+
+  protected transformData(users: User[]) {
+    return users.map((user) => ({
+      姓名: user.name,
+      邮箱: user.email,
+      注册时间: user.createdAt,
+    }));
+  }
+}
+```
+
+---
+
+## 六、实战：博客系统服务层
+
+### 6.1 用户服务
+
+```typescript
+// users/users.service.ts
+import {
+  Injectable,
+  ConflictException,
+  NotFoundException,
+} from "@nestjs/common";
+import { UsersRepository } from "./users.repository";
+import { CreateUserDto } from "./dto/create-user.dto";
+import { UpdateUserDto } from "./dto/update-user.dto";
+import * as bcrypt from "bcrypt";
+
+@Injectable()
+export class UsersService {
+  constructor(
+    private usersRepository: UsersRepository,
+    private emailService: EmailService
+  ) {}
+
+  /**
+   * 创建用户
+   */
+  async create(dto: CreateUserDto) {
+    // 检查邮箱是否已被使用
+    const existingUser = await this.usersRepository.findByEmail(dto.email);
+    if (existingUser) {
+      throw new ConflictException("该邮箱已被注册");
+    }
+
+    // 加密密码
+    const hashedPassword = await this.hashPassword(dto.password);
+
+    // 创建用户
+    const user = await this.usersRepository.create({
+      ...dto,
+      password: hashedPassword,
+    });
+
+    // 发送欢迎邮件（异步，不阻塞）
+    this.emailService.sendWelcomeEmail(user.email).catch((err) => {
+      console.error("发送欢迎邮件失败", err);
+    });
+
+    // 返回用户信息（不包含密码）
+    return this.excludePassword(user);
+  }
+
+  /**
+   * 获取所有用户
+   */
+  async findAll(options: { page?: number; limit?: number }) {
+    const { page = 1, limit = 10 } = options;
+    const skip = (page - 1) * limit;
+
+    const [users, total] = await Promise.all([
+      this.usersRepository.findMany({ skip, take: limit }),
+      this.usersRepository.count(),
+    ]);
+
+    return {
+      items: users.map((user) => this.excludePassword(user)),
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+
+  /**
+   * 获取单个用户
+   */
+  async findOne(id: string) {
+    const user = await this.usersRepository.findById(id);
+    if (!user) {
+      throw new NotFoundException("用户不存在");
+    }
+
+    return this.excludePassword(user);
+  }
+
+  /**
+   * 更新用户
+   */
+  async update(id: string, dto: UpdateUserDto) {
+    // 检查用户是否存在
+    const user = await this.usersRepository.findById(id);
+    if (!user) {
+      throw new NotFoundException("用户不存在");
+    }
+
+    // 如果更新邮箱，检查新邮箱是否已被使用
+    if (dto.email && dto.email !== user.email) {
+      const existing = await this.usersRepository.findByEmail(dto.email);
+      if (existing) {
+        throw new ConflictException("该邮箱已被使用");
+      }
+    }
+
+    // 如果更新密码，需要加密
+    if (dto.password) {
+      dto.password = await this.hashPassword(dto.password);
+    }
+
+    const updated = await this.usersRepository.update(id, dto);
+    return this.excludePassword(updated);
+  }
+
+  /**
+   * 删除用户
+   */
+  async remove(id: string) {
+    const user = await this.usersRepository.findById(id);
+    if (!user) {
+      throw new NotFoundException("用户不存在");
+    }
+
+    await this.usersRepository.delete(id);
+    return { message: "删除成功" };
+  }
+
+  /**
+   * 验证用户（登录用）
+   */
+  async validateUser(email: string, password: string) {
+    const user = await this.usersRepository.findByEmail(email);
+    if (!user) {
+      return null;
+    }
+
+    const isPasswordValid = await bcrypt.compare(password, user.password);
+    if (!isPasswordValid) {
+      return null;
+    }
+
+    return this.excludePassword(user);
+  }
+
+  // 私有辅助方法
+
+  private async hashPassword(password: string): Promise<string> {
+    const saltRounds = 10;
+    return bcrypt.hash(password, saltRounds);
+  }
+
+  private excludePassword(user: any) {
+    const { password, ...userWithoutPassword } = user;
+    return userWithoutPassword;
+  }
+}
+```
+
+### 6.2 文章服务
+
+```typescript
+// posts/posts.service.ts
+import {
+  Injectable,
+  NotFoundException,
+  ForbiddenException,
+} from "@nestjs/common";
+import { PostsRepository } from "./posts.repository";
+import { CreatePostDto } from "./dto/create-post.dto";
+import { UpdatePostDto } from "./dto/update-post.dto";
+
+@Injectable()
+export class PostsService {
+  constructor(
+    private postsRepository: PostsRepository,
+    private usersService: UsersService
+  ) {}
+
+  /**
+   * 创建文章
+   */
+  async create(userId: string, dto: CreatePostDto) {
+    // 验证用户是否存在
+    await this.usersService.findOne(userId);
+
+    return this.postsRepository.create({
+      ...dto,
+      authorId: userId,
+    });
+  }
+
+  /**
+   * 获取所有文章（支持搜索和过滤）
+   */
+  async findAll(options: {
+    page?: number;
+    limit?: number;
+    search?: string;
+    category?: string;
+    published?: boolean;
+  }) {
+    const { page = 1, limit = 10, search, category, published } = options;
+    const skip = (page - 1) * limit;
+
+    const where = {
+      ...(search && {
+        OR: [
+          { title: { contains: search, mode: "insensitive" as const } },
+          { content: { contains: search, mode: "insensitive" as const } },
+        ],
+      }),
+      ...(category && { category }),
+      ...(published !== undefined && { published }),
+    };
+
+    const [posts, total] = await Promise.all([
+      this.postsRepository.findMany({
+        where,
+        skip,
+        take: limit,
+        orderBy: { createdAt: "desc" },
+        include: { author: { select: { id: true, name: true, email: true } } },
+      }),
+      this.postsRepository.count({ where }),
+    ]);
+
+    return {
+      items: posts,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+
+  /**
+   * 获取单篇文章
+   */
+  async findOne(id: string) {
+    const post = await this.postsRepository.findById(id);
+    if (!post) {
+      throw new NotFoundException("文章不存在");
+    }
+
+    // 增加阅读量
+    await this.postsRepository.incrementViews(id);
+
+    return post;
+  }
+
+  /**
+   * 更新文章
+   */
+  async update(id: string, userId: string, dto: UpdatePostDto) {
+    const post = await this.postsRepository.findById(id);
+    if (!post) {
+      throw new NotFoundException("文章不存在");
+    }
+
+    // 检查权限：只有作者可以修改
+    if (post.authorId !== userId) {
+      throw new ForbiddenException("无权修改此文章");
+    }
+
+    return this.postsRepository.update(id, dto);
+  }
+
+  /**
+   * 删除文章
+   */
+  async remove(id: string, userId: string) {
+    const post = await this.postsRepository.findById(id);
+    if (!post) {
+      throw new NotFoundException("文章不存在");
+    }
+
+    // 检查权限：只有作者可以删除
+    if (post.authorId !== userId) {
+      throw new ForbiddenException("无权删除此文章");
+    }
+
+    await this.postsRepository.delete(id);
+    return { message: "删除成功" };
+  }
+
+  /**
+   * 发布文章
+   */
+  async publish(id: string, userId: string) {
+    const post = await this.postsRepository.findById(id);
+    if (!post) {
+      throw new NotFoundException("文章不存在");
+    }
+
+    if (post.authorId !== userId) {
+      throw new ForbiddenException("无权发布此文章");
+    }
+
+    return this.postsRepository.update(id, { published: true });
+  }
+
+  /**
+   * 取消发布
+   */
+  async unpublish(id: string, userId: string) {
+    const post = await this.postsRepository.findById(id);
+    if (!post) {
+      throw new NotFoundException("文章不存在");
+    }
+
+    if (post.authorId !== userId) {
+      throw new ForbiddenException("无权操作此文章");
+    }
+
+    return this.postsRepository.update(id, { published: false });
+  }
+
+  /**
+   * 获取用户的文章
+   */
+  async findByUser(userId: string, options: { page?: number }) {
+    const { page = 1 } = options;
+    const limit = 10;
+    const skip = (page - 1) * limit;
+
+    const [posts, total] = await Promise.all([
+      this.postsRepository.findMany({
+        where: { authorId: userId },
+        skip,
+        take: limit,
+        orderBy: { createdAt: "desc" },
+      }),
+      this.postsRepository.count({ where: { authorId: userId } }),
+    ]);
+
+    return {
+      items: posts,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+}
+```
+
+---
+
+## 七、服务的测试
+
+### 7.1 单元测试
+
+```typescript
+// users.service.spec.ts
+import { Test, TestingModule } from "@nestjs/testing";
+import { UsersService } from "./users.service";
+import { UsersRepository } from "./users.repository";
+import { EmailService } from "../email/email.service";
+import { ConflictException } from "@nestjs/common";
+
+describe("UsersService", () => {
+  let service: UsersService;
+  let repository: UsersRepository;
+
+  const mockUsersRepository = {
+    findByEmail: jest.fn(),
+    create: jest.fn(),
+  };
+
+  const mockEmailService = {
+    sendWelcomeEmail: jest.fn(),
+  };
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        UsersService,
+        {
+          provide: UsersRepository,
+          useValue: mockUsersRepository,
+        },
+        {
+          provide: EmailService,
+          useValue: mockEmailService,
+        },
+      ],
+    }).compile();
+
+    service = module.get<UsersService>(UsersService);
+    repository = module.get<UsersRepository>(UsersRepository);
+  });
+
+  afterEach(() => {
+    jest.clearAllMocks();
+  });
+
+  describe("create", () => {
+    it("should create a new user", async () => {
+      const createUserDto = {
+        name: "张三",
+        email: "zhangsan@example.com",
+        password: "password123",
+      };
+
+      mockUsersRepository.findByEmail.mockResolvedValue(null);
+      mockUsersRepository.create.mockResolvedValue({
+        id: "1",
+        ...createUserDto,
+        password: "hashed_password",
+      });
+
+      const result = await service.create(createUserDto);
+
+      expect(result).toHaveProperty("id");
+      expect(result).not.toHaveProperty("password");
+      expect(mockEmailService.sendWelcomeEmail).toHaveBeenCalledWith(
+        createUserDto.email
+      );
+    });
+
+    it("should throw ConflictException if email already exists", async () => {
+      const createUserDto = {
+        name: "张三",
+        email: "existing@example.com",
+        password: "password123",
+      };
+
+      mockUsersRepository.findByEmail.mockResolvedValue({
+        id: "1",
+        email: "existing@example.com",
+      });
+
+      await expect(service.create(createUserDto)).rejects.toThrow(
+        ConflictException
+      );
+      expect(mockUsersRepository.create).not.toHaveBeenCalled();
+    });
+  });
+});
+```
+
+---
+
+## 八、最佳实践
+
+### 8.1 服务层设计原则
+
+1. **单一职责**：每个服务只负责一个领域
+2. **依赖倒置**：依赖接口而非具体实现
+3. **开闭原则**：对扩展开放，对修改关闭
+4. **接口隔离**：使用接口定义服务契约
+
+### 8.2 命名规范
+
+```typescript
+// ✅ 好的命名
+UsersService;
+PostsService;
+EmailService;
+AuthService;
+
+// ❌ 不好的命名
+UserManager;
+PostHandler;
+EmailHelper;
+AuthController; // 不是服务
+```
+
+### 8.3 错误处理
+
+```typescript
+@Injectable()
+export class UsersService {
+  async findOne(id: string) {
+    const user = await this.usersRepository.findById(id);
+
+    // ✅ 明确的错误处理
+    if (!user) {
+      throw new NotFoundException("用户不存在");
+    }
+
+    return user;
+  }
+
+  // ❌ 隐式错误处理
+  async findOneBad(id: string) {
+    return this.usersRepository.findById(id);
+    // 返回 null，调用者不知道是没找到还是出错了
+  }
+}
+```
+
+### 8.4 使用 DTO 传输数据
+
+```typescript
+// ✅ 使用 DTO
+@Post()
+create(@Body() dto: CreateUserDto) {
+  return this.usersService.create(dto);
+}
+
+// ❌ 直接使用对象
+@Post()
+create(@Body() data: any) {
+  // 类型不安全
+  return this.usersService.create(data);
+}
+```
+
+---
+
+## 九、常见问题
+
+### Q1: 服务和仓库有什么区别？
+
+**A**:
+
+- **服务（Service）**：处理业务逻辑
+- **仓库（Repository）**：处理数据访问
+
+```
+Controller → Service → Repository → Database
+  ↓          ↓           ↓
+HTTP 请求   业务逻辑    数据访问
+```
+
+### Q2: 什么时候需要创建单独的仓库？
+
+**A**: 当满足以下条件时：
+
+- 数据访问逻辑复杂
+- 需要复用数据访问代码
+- 想要隔离数据层（便于切换数据库）
+
+简单项目可以不用仓库，直接在服务中使用 Prisma。
+
+### Q3: 如何实现服务之间的通信？
+
+**A**: 有三种方式：
+
+1. **直接注入** - 简单场景
+2. **事件系统** - 松耦合场景
+3. **消息队列** - 异步场景
+
+---
+
+## 十、总结
+
+**本文我们完成了**：
+
+✅ 深入理解了提供者的概念和作用
+✅ 掌握了服务层的设计模式
+✅ 学会了自定义 Provider 的各种用法
+✅ 实现了可测试的业务逻辑
+✅ 掌握了服务层的最佳实践
+
+**核心要点回顾**：
+
+1. **提供者** - 可注入的组件，包括服务、仓库等
+2. **服务层** - 处理业务逻辑，保持控制器简洁
+3. **依赖注入** - 自动管理服务之间的依赖关系
+4. **自定义 Provider** - useValue、useFactory、useClass、useExisting
+
+**最佳实践**：
+
+- ✅ 服务保持单一职责
+- ✅ 使用 DTO 传输数据
+- ✅ 明确的错误处理
+- ✅ 编写单元测试
+- ✅ 考虑使用仓储模式
+
+**下一步**：
+
+在下一篇文章《PostgreSQL + Prisma 完整指南》中，我们将深入学习：
+
+- PostgreSQL 数据库设计
+- Prisma ORM 的使用
+- 数据模型关系设计
+- Migration 管理
+
+---
+
+**相关代码**：
+
+- 完整项目示例：[my-nestjs-blog](https://github.com/your-repo/my-nestjs-blog)
+- 本篇代码示例：[branch: 04-providers-services](https://github.com/your-repo/my-nestjs-blog/tree/04-providers-services)
+
+**有问题？** 欢迎在评论区留言，我会尽快回复！

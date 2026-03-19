@@ -1,0 +1,600 @@
+---
+title: "11 Node.js 安全最佳实践：从认证到防攻击"
+date: "2026-03-18"
+summary: "系统讲解 Node.js 应用安全，包括认证授权、输入验证、常见攻击防护和安全配置，让你的后端更安全。"
+tags: ["Node.js", "后端", "安全", "认证"]
+category: "后端"
+cover: ""
+draft: false
+---
+
+# Node.js 安全最佳实践：从认证到防攻击
+
+安全无小事。一个漏洞可能导致用户数据泄露、服务瘫痪。本文系统讲解 Node.js 安全最佳实践。
+
+## 一、认证与授权
+
+### 1.1 密码安全
+
+```javascript
+const bcrypt = require("bcrypt");
+const SALT_ROUNDS = 12;
+
+// ❌ 明文存储
+const user = {
+  password: "123456",
+};
+
+// ✅ 哈希存储
+async function hashPassword(password) {
+  return bcrypt.hash(password, SALT_ROUNDS);
+}
+
+// 验证密码
+async function verifyPassword(password, hash) {
+  return bcrypt.compare(password, hash);
+}
+
+// 注册
+async function register(email, password) {
+  const hashedPassword = await hashPassword(password);
+  await db.query("INSERT INTO users (email, password) VALUES (?, ?)", [
+    email,
+    hashedPassword,
+  ]);
+}
+
+// 登录
+async function login(email, password) {
+  const user = await db.query("SELECT * FROM users WHERE email = ?", [email]);
+  if (!user) {
+    throw new Error("User not found");
+  }
+
+  const isValid = await verifyPassword(password, user.password);
+  if (!isValid) {
+    throw new Error("Invalid password");
+  }
+
+  return generateToken(user);
+}
+```
+
+### 1.2 JWT 认证
+
+```javascript
+const jwt = require("jsonwebtoken");
+
+const JWT_SECRET = process.env.JWT_SECRET; // 环境变量
+const JWT_EXPIRES_IN = "7d";
+
+// 生成 Token
+function generateToken(user) {
+  return jwt.sign(
+    {
+      userId: user.id,
+      email: user.email,
+      role: user.role,
+    },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES_IN }
+  );
+}
+
+// 验证 Token 中间件
+function authMiddleware(req, res, next) {
+  const token = req.headers.authorization?.replace("Bearer ", "");
+
+  if (!token) {
+    return res.status(401).json({ error: "No token provided" });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(401).json({ error: "Invalid token" });
+  }
+}
+
+// 使用
+app.get("/api/profile", authMiddleware, (req, res) => {
+  res.json({ user: req.user });
+});
+```
+
+### 1.3 权限控制
+
+```javascript
+// RBAC 中间件
+function requireRole(...roles) {
+  return (req, res, next) => {
+    if (!req.user) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    next();
+  };
+}
+
+// 使用
+app.delete("/api/users/:id", authMiddleware, requireRole("admin"), deleteUser);
+
+// 资源所有权检查
+function requireOwnership(req, res, next) {
+  const resourceId = req.params.id;
+  const userId = req.user.userId;
+
+  if (resourceId !== userId && req.user.role !== "admin") {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+
+  next();
+}
+```
+
+### 1.4 Session + Cookie
+
+```javascript
+const session = require("express-session");
+const RedisStore = require("connect-redis")(session);
+const redis = require("redis");
+
+const redisClient = redis.createClient();
+
+app.use(
+  session({
+    store: new RedisStore({ client: redisClient }),
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      secure: process.env.NODE_ENV === "production", // HTTPS only
+      httpOnly: true, // 防止 XSS
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 天
+      sameSite: "strict", // 防止 CSRF
+    },
+  })
+);
+```
+
+## 二、输入验证
+
+### 2.1 使用验证库
+
+```javascript
+const { body, param, query, validationResult } = require("express-validator");
+
+// 验证中间件
+const validate = (req, res, next) => {
+  const errors = validationResult(req);
+  if (!errors.isEmpty()) {
+    return res.status(400).json({ errors: errors.array() });
+  }
+  next();
+};
+
+// 用户注册验证
+app.post(
+  "/api/register",
+  body("email").isEmail().normalizeEmail(),
+  body("password")
+    .isLength({ min: 8 })
+    .matches(/^(?=.*[A-Z])(?=.*[0-9])/),
+  body("name").trim().notEmpty().escape(),
+  validate,
+  register
+);
+
+// 参数验证
+app.get("/api/users/:id", param("id").isInt({ min: 1 }), validate, getUser);
+
+// 查询参数验证
+app.get(
+  "/api/posts",
+  query("page").optional().isInt({ min: 1 }).default(1),
+  query("limit").optional().isInt({ min: 1, max: 100 }).default(20),
+  validate,
+  getPosts
+);
+```
+
+### 2.2 SQL 注入防护
+
+```javascript
+// ❌ 拼接 SQL（危险！）
+app.get("/api/users", (req, res) => {
+  const { name } = req.query;
+  const sql = `SELECT * FROM users WHERE name = '${name}'`; // 可注入
+  db.query(sql);
+});
+
+// ✅ 参数化查询
+app.get("/api/users", (req, res) => {
+  const { name } = req.query;
+  const sql = "SELECT * FROM users WHERE name = ?";
+  db.query(sql, [name]); // 安全
+});
+
+// ✅ 使用 ORM
+const user = await User.findOne({
+  where: { name },
+});
+```
+
+### 2.3 XSS 防护
+
+```javascript
+const xss = require("xss");
+
+// 过滤用户输入
+app.post("/api/comments", (req, res) => {
+  const { content } = req.body;
+
+  // ❌ 直接存储
+  // db.query('INSERT INTO comments (content) VALUES (?)', [content])
+
+  // ✅ 过滤后存储
+  const safeContent = xss(content);
+  db.query("INSERT INTO comments (content) VALUES (?)", [safeContent]);
+});
+
+// 设置 Content Security Policy
+app.use((req, res, next) => {
+  res.setHeader(
+    "Content-Security-Policy",
+    "default-src 'self'; script-src 'self'"
+  );
+  next();
+});
+```
+
+## 三、常见攻击防护
+
+### 3.1 CSRF 防护
+
+```javascript
+const csrf = require("csurf");
+const csrfProtection = csrf({ cookie: true });
+
+// 生成 CSRF Token
+app.get("/api/csrf-token", csrfProtection, (req, res) => {
+  res.json({ csrfToken: req.csrfToken() });
+});
+
+// 需要 CSRF 保护的接口
+app.post("/api/transfer", csrfProtection, (req, res) => {
+  // 处理转账
+});
+
+// 或者使用 SameSite Cookie
+app.use(
+  session({
+    cookie: {
+      sameSite: "strict", // 或 'lax'
+    },
+  })
+);
+```
+
+### 3.2 速率限制
+
+```javascript
+const rateLimit = require("express-rate-limit");
+
+// 全局限流
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 分钟
+  max: 100, // 最多 100 次请求
+  message: { error: "Too many requests" },
+});
+
+app.use(limiter);
+
+// 登录限流（更严格）
+const loginLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 小时
+  max: 5, // 最多 5 次
+  message: { error: "Too many login attempts" },
+});
+
+app.post("/api/login", loginLimiter, login);
+
+// 慢速攻击防护
+const slowDown = require("express-slow-down");
+
+const speedLimiter = slowDown({
+  windowMs: 15 * 60 * 1000,
+  delayAfter: 50, // 50 次后开始延迟
+  delayMs: 500, // 每次延迟 500ms
+});
+
+app.use(speedLimiter);
+```
+
+### 3.3 安全头
+
+```javascript
+const helmet = require("helmet");
+
+app.use(helmet());
+
+// 或单独配置
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'", "trusted-cdn.com"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", "data:", "https:"],
+      },
+    },
+    hsts: {
+      maxAge: 31536000,
+      includeSubDomains: true,
+    },
+    noSniff: true,
+    xssFilter: true,
+    referrerPolicy: { policy: "strict-origin-when-cross-origin" },
+  })
+);
+```
+
+### 3.4 依赖安全
+
+```bash
+# 检查依赖漏洞
+npm audit
+
+# 自动修复
+npm audit fix
+
+# 使用 snyk
+npx snyk test
+npx snyk monitor
+```
+
+```javascript
+// package.json 添加 engines 限制
+{
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
+```
+
+## 四、敏感数据处理
+
+### 4.1 环境变量
+
+```javascript
+// ❌ 硬编码
+const dbPassword = "secret123";
+
+// ✅ 环境变量
+const dbPassword = process.env.DB_PASSWORD;
+
+// .env 文件（不要提交到 Git）
+DB_PASSWORD = secret123;
+JWT_SECRET = your - secret - key;
+API_KEY =
+  your -
+  api -
+  // .gitignore
+  key.env.env.local.env.production;
+```
+
+### 4.2 日志脱敏
+
+```javascript
+const logger = require("pino")();
+
+// ❌ 记录敏感信息
+logger.info({ password, creditCard }, "User login");
+
+// ✅ 脱敏处理
+function sanitize(user) {
+  const { password, creditCard, ...safe } = user;
+  return {
+    ...safe,
+    creditCard: creditCard ? "****" + creditCard.slice(-4) : null,
+  };
+}
+
+logger.info({ user: sanitize(user) }, "User login");
+
+// 使用 winston 的 redact
+const logger = winston.createLogger({
+  format: winston.format.json(),
+  transports: [new winston.transports.Console()],
+  redact: ["password", "creditCard", "token"],
+});
+```
+
+### 4.3 加密存储
+
+```javascript
+const crypto = require("crypto");
+
+const ALGORITHM = "aes-256-gcm";
+const KEY = Buffer.from(process.env.ENCRYPTION_KEY, "hex");
+
+// 加密
+function encrypt(text) {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(ALGORITHM, KEY, iv);
+
+  let encrypted = cipher.update(text, "utf8", "hex");
+  encrypted += cipher.final("hex");
+
+  const authTag = cipher.getAuthTag();
+
+  return {
+    iv: iv.toString("hex"),
+    encrypted,
+    authTag: authTag.toString("hex"),
+  };
+}
+
+// 解密
+function decrypt(encrypted, iv, authTag) {
+  const decipher = crypto.createDecipheriv(
+    ALGORITHM,
+    KEY,
+    Buffer.from(iv, "hex")
+  );
+
+  decipher.setAuthTag(Buffer.from(authTag, "hex"));
+
+  let decrypted = decipher.update(encrypted, "hex", "utf8");
+  decrypted += decipher.final("utf8");
+
+  return decrypted;
+}
+```
+
+## 五、错误处理
+
+### 5.1 不要暴露内部错误
+
+```javascript
+// ❌ 暴露内部错误
+app.get("/api/users/:id", async (req, res) => {
+  try {
+    const user = await getUser(req.params.id);
+    res.json(user);
+  } catch (error) {
+    res.status(500).json({ error: error.message }); // 可能泄露敏感信息
+  }
+});
+
+// ✅ 统一错误处理
+class AppError extends Error {
+  constructor(message, statusCode) {
+    super(message);
+    this.statusCode = statusCode;
+    this.isOperational = true;
+  }
+}
+
+app.use((err, req, res, next) => {
+  if (err.isOperational) {
+    res.status(err.statusCode).json({ error: err.message });
+  } else {
+    // 未知错误，不暴露细节
+    console.error(err);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+```
+
+### 5.2 404 处理
+
+```javascript
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found" });
+});
+```
+
+## 六、HTTPS 和证书
+
+### 6.1 强制 HTTPS
+
+```javascript
+// 重定向到 HTTPS
+app.use((req, res, next) => {
+  if (!req.secure && req.get("x-forwarded-proto") !== "https") {
+    return res.redirect(`https://${req.get("host")}${req.url}`);
+  }
+  next();
+});
+
+// HSTS
+app.use(
+  helmet.hsts({
+    maxAge: 31536000,
+    includeSubDomains: true,
+    preload: true,
+  })
+);
+```
+
+### 6.2 证书配置
+
+```javascript
+// 开发环境自签名证书
+const https = require("https");
+const fs = require("fs");
+
+const options = {
+  key: fs.readFileSync("key.pem"),
+  cert: fs.readFileSync("cert.pem"),
+};
+
+https.createServer(options, app).listen(443);
+
+// 生产环境使用 Let's Encrypt
+// 使用 certbot 自动管理
+```
+
+## 七、安全检查清单
+
+### 认证授权
+
+- [ ] 密码使用 bcrypt 哈希存储
+- [ ] JWT 使用强密钥，设置过期时间
+- [ ] 实现 RBAC 权限控制
+- [ ] Session 配置安全选项
+
+### 输入验证
+
+- [ ] 所有输入都验证和过滤
+- [ ] 使用参数化查询防止 SQL 注入
+- [ ] 过滤 XSS 攻击
+- [ ] 验证文件上传
+
+### 攻击防护
+
+- [ ] 配置 CSRF 保护
+- [ ] 实现速率限制
+- [ ] 配置安全头（Helmet）
+- [ ] 定期检查依赖漏洞
+
+### 数据安全
+
+- [ ] 敏感数据使用环境变量
+- [ ] 日志脱敏
+- [ ] 敏感数据加密存储
+- [ ] 使用 HTTPS
+
+### 错误处理
+
+- [ ] 不暴露内部错误信息
+- [ ] 统一错误处理
+- [ ] 记录错误日志
+- [ ] 配置 404 处理
+
+## 总结
+
+安全是持续的过程，不是一次性的任务。
+
+**核心原则：**
+
+1. **最小权限** - 只给必要的权限
+2. **深度防御** - 多层安全措施
+3. **默认拒绝** - 除非明确允许
+4. **安全编码** - 从开发阶段考虑安全
+
+**安全检查：**
+
+```
+代码审查 → 漏洞扫描 → 渗透测试 → 持续监控
+```
+
+记住：安全没有银弹，只有持续 vigilance。

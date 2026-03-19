@@ -1,0 +1,1430 @@
+---
+title: "04 全栈实时通信与协作系统实战"
+date: "2026-03-18"
+summary: "从 WebSocket 到 Server-Sent Events，深入讲解全栈实时通信技术选型、架构设计、性能优化和生产环境最佳实践，涵盖实时聊天、协作编辑、实时通知等典型场景。"
+tags: ["全栈", "WebSocket", "实时通信", "SSE", "Socket.io"]
+category: "全栈"
+cover: ""
+draft: false
+---
+
+# 全栈实时通信与协作系统实战
+
+实时通信已经成为现代应用的标配功能。从即时通讯到协作编辑，从实时通知到在线游戏，用户对实时性的期待越来越高。本文将深入讲解全栈实时通信的技术选型、架构设计和实战技巧。
+
+## 一、实时通信技术概览
+
+### 1.1 主流技术对比
+
+| 技术                     | 通信模式        | 浏览器支持               | 适用场景         | 复杂度 |
+| ------------------------ | --------------- | ------------------------ | ---------------- | ------ |
+| WebSocket                | 全双工          | IE10+                    | 聊天、游戏、协作 | 中     |
+| SSE (Server-Sent Events) | 服务端 → 客户端 | IE 不支持（需 polyfill） | 通知、推送       | 低     |
+| Long Polling             | 半双工          | 全支持                   | 兼容性要求高     | 低     |
+| WebRTC                   | P2P             | 现代浏览器               | 音视频、文件传输 | 高     |
+
+### 1.2 技术选型决策树
+
+```
+需要实时通信？
+    │
+    ├── 只需要服务端推送？
+    │       │
+    │       ├── 数据量大、频率高 → SSE
+    │       └── 数据量小、频率低 → Long Polling
+    │
+    └── 需要双向通信？
+            │
+            ├── 需要音视频 → WebRTC + WebSocket 信令
+            └── 纯数据交互 → WebSocket
+```
+
+## 二、WebSocket 基础与原生实现
+
+### 2.1 WebSocket 连接生命周期
+
+```
+客户端                              服务端
+   │                                  │
+   │──── HTTP Upgrade Request ───────&gt;│
+   │                                  │
+   │&lt;─── HTTP 101 Switching ─────────│
+   │                                  │
+   │&lt;══════ WebSocket 连接建立 ══════&gt;│
+   │                                  │
+   │&lt;─────── Frame ──────────────────│
+   │──────── Frame ──────────────────&gt;│
+   │                                  │
+   │────── Close Frame ──────────────&gt;│
+   │&lt;───── Close Frame ───────────────│
+   │                                  │
+```
+
+### 2.2 原生 Node.js WebSocket 服务端
+
+```typescript
+// server.ts - 使用 ws 库
+import { WebSocketServer, WebSocket } from 'ws';
+import http from 'http';
+
+// 创建 HTTP 服务器
+const server = http.createServer();
+const wss = new WebSocketServer({ server });
+
+// 连接管理
+const clients = new Map&lt;string, WebSocket&gt;();
+
+wss.on('connection', (ws, req) => {
+  const clientId = generateId();
+  clients.set(clientId, ws);
+
+  console.log(`Client connected: ${clientId}`);
+
+  // 发送欢迎消息
+  ws.send(JSON.stringify({
+    type: 'connected',
+    clientId,
+    timestamp: Date.now()
+  }));
+
+  // 接收消息
+  ws.on('message', (data) => {
+    try {
+      const message = JSON.parse(data.toString());
+      handleMessage(clientId, message);
+    } catch (error) {
+      ws.send(JSON.stringify({
+        type: 'error',
+        message: 'Invalid message format'
+      }));
+    }
+  });
+
+  // 连接关闭
+  ws.on('close', () => {
+    clients.delete(clientId);
+    console.log(`Client disconnected: ${clientId}`);
+  });
+
+  // 错误处理
+  ws.on('error', (error) => {
+    console.error(`WebSocket error for ${clientId}:`, error);
+    clients.delete(clientId);
+  });
+});
+
+// 消息处理
+function handleMessage(clientId: string, message: any) {
+  switch (message.type) {
+    case 'chat':
+      broadcast({
+        type: 'chat',
+        from: clientId,
+        content: message.content,
+        timestamp: Date.now()
+      });
+      break;
+
+    case 'ping':
+      const client = clients.get(clientId);
+      client?.send(JSON.stringify({ type: 'pong' }));
+      break;
+  }
+}
+
+// 广播消息
+function broadcast(message: any) {
+  const data = JSON.stringify(message);
+  clients.forEach((client) => {
+    if (client.readyState === WebSocket.OPEN) {
+      client.send(data);
+    }
+  });
+}
+
+function generateId(): string {
+  return Math.random().toString(36).substring(2, 15);
+}
+
+server.listen(8080, () => {
+  console.log('WebSocket server running on ws://localhost:8080');
+});
+```
+
+### 2.3 前端 WebSocket 封装
+
+```typescript
+// useWebSocket.ts - React Hook 封装
+import { useEffect, useRef, useState, useCallback } from 'react';
+
+interface WebSocketOptions {
+  url: string;
+  onOpen?: () => void;
+  onClose?: () => void;
+  onError?: (error: Event) => void;
+  onMessage?: (data: any) => void;
+  reconnect?: boolean;
+  reconnectInterval?: number;
+  reconnectAttempts?: number;
+}
+
+export function useWebSocket(options: WebSocketOptions) {
+  const {
+    url,
+    onOpen,
+    onClose,
+    onError,
+    onMessage,
+    reconnect = true,
+    reconnectInterval = 3000,
+    reconnectAttempts = 5
+  } = options;
+
+  const wsRef = useRef&lt;WebSocket | null&gt;(null);
+  const [isConnected, setIsConnected] = useState(false);
+  const reconnectCountRef = useRef(0);
+  const shouldReconnectRef = useRef(true);
+
+  // 连接 WebSocket
+  const connect = useCallback(() => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      return;
+    }
+
+    const ws = new WebSocket(url);
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setIsConnected(true);
+      reconnectCountRef.current = 0;
+      onOpen?.();
+    };
+
+    ws.onclose = () => {
+      setIsConnected(false);
+      onClose?.();
+
+      // 自动重连
+      if (
+        reconnect &&
+        shouldReconnectRef.current &&
+        reconnectCountRef.current &lt; reconnectAttempts
+      ) {
+        reconnectCountRef.current++;
+        setTimeout(connect, reconnectInterval);
+      }
+    };
+
+    ws.onerror = (error) => {
+      onError?.(error);
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        onMessage?.(data);
+      } catch {
+        onMessage?.(event.data);
+      }
+    };
+  }, [url, reconnect, reconnectInterval, reconnectAttempts, onOpen, onClose, onError, onMessage]);
+
+  // 发送消息
+  const send = useCallback((data: any) => {
+    if (wsRef.current?.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(data));
+      return true;
+    }
+    return false;
+  }, []);
+
+  // 断开连接
+  const disconnect = useCallback(() => {
+    shouldReconnectRef.current = false;
+    wsRef.current?.close();
+  }, []);
+
+  useEffect(() => {
+    connect();
+    return () => {
+      shouldReconnectRef.current = false;
+      wsRef.current?.close();
+    };
+  }, [connect]);
+
+  return {
+    isConnected,
+    send,
+    disconnect,
+    reconnect: connect
+  };
+}
+```
+
+### 2.4 使用示例
+
+```tsx
+// ChatRoom.tsx - 聊天室组件
+import { useWebSocket } from './useWebSocket';
+import { useState } from 'react';
+
+interface Message {
+  type: string;
+  from: string;
+  content: string;
+  timestamp: number;
+}
+
+export function ChatRoom() {
+  const [messages, setMessages] = useState&lt;Message[]&gt;([]);
+  const [input, setInput] = useState('');
+
+  const { isConnected, send } = useWebSocket({
+    url: 'ws://localhost:8080',
+    onMessage: (data) => {
+      if (data.type === 'chat') {
+        setMessages((prev) =&gt; [...prev, data]);
+      }
+    },
+    onOpen: () =&gt; {
+      console.log('Connected to chat server');
+    }
+  });
+
+  const handleSend = () =&gt; {
+    if (input.trim()) {
+      send({
+        type: 'chat',
+        content: input.trim()
+      });
+      setInput('');
+    }
+  };
+
+  return (
+    &lt;div className="chat-room"&gt;
+      &lt;div className="status"&gt;
+        {isConnected ? '🟢 已连接' : '🔴 未连接'}
+      &lt;/div&gt;
+
+      &lt;div className="messages"&gt;
+        {messages.map((msg, index) =&gt; (
+          &lt;div key={index} className="message"&gt;
+            &lt;span className="time"&gt;
+              {new Date(msg.timestamp).toLocaleTimeString()}
+            &lt;/span&gt;
+            &lt;span className="from"&gt;{msg.from}:&lt;/span&gt;
+            &lt;span className="content"&gt;{msg.content}&lt;/span&gt;
+          &lt;/div&gt;
+        ))}
+      &lt;/div&gt;
+
+      &lt;div className="input-area"&gt;
+        &lt;input
+          type="text"
+          value={input}
+          onChange={(e) =&gt; setInput(e.target.value)}
+          onKeyPress={(e) =&gt; e.key === 'Enter' &amp;&amp; handleSend()}
+          placeholder="输入消息..."
+        /&gt;
+        &lt;button onClick={handleSend}&gt;发送&lt;/button&gt;
+      &lt;/div&gt;
+    &lt;/div&gt;
+  );
+}
+```
+
+## 三、Socket.io 进阶实战
+
+原生 WebSocket 功能有限，生产环境推荐使用 Socket.io，它提供了更完善的特性。
+
+### 3.1 Socket.io 核心特性
+
+| 特性       | 说明                                 |
+| ---------- | ------------------------------------ |
+| 自动重连   | 断线后自动尝试重新连接               |
+| 降级策略   | WebSocket 不可用时降级到 HTTP 长轮询 |
+| 房间机制   | 支持分组广播，适合聊天室场景         |
+| 命名空间   | 逻辑隔离，不同业务使用不同命名空间   |
+| 消息确认   | 支持请求-响应模式                    |
+| 二进制支持 | 原生支持 ArrayBuffer、Blob           |
+
+### 3.2 服务端实现
+
+```typescript
+// socket-server.ts
+import { Server } from 'socket.io';
+import http from 'http';
+
+const server = http.createServer();
+const io = new Server(server, {
+  cors: {
+    origin: ['http://localhost:3000'],
+    methods: ['GET', 'POST']
+  },
+  // 传输方式优先级
+  transports: ['websocket', 'polling']
+});
+
+// 用户连接管理
+interface User {
+  id: string;
+  socketId: string;
+  rooms: string[];
+}
+
+const users = new Map&lt;string, User&gt;();
+
+// 命名空间：聊天
+const chatNamespace = io.of('/chat');
+
+chatNamespace.on('connection', (socket) =&gt; {
+  const userId = socket.handshake.auth.userId;
+
+  // 用户上线
+  users.set(userId, {
+    id: userId,
+    socketId: socket.id,
+    rooms: []
+  });
+
+  // 广播用户上线
+  socket.broadcast.emit('user:online', { userId });
+
+  console.log(`User connected: ${userId}`);
+
+  // 加入房间
+  socket.on('room:join', (roomId: string) =&gt; {
+    socket.join(roomId);
+    const user = users.get(userId);
+    if (user &amp;&amp; !user.rooms.includes(roomId)) {
+      user.rooms.push(roomId);
+    }
+    socket.to(roomId).emit('room:user-joined', { userId, roomId });
+  });
+
+  // 离开房间
+  socket.on('room:leave', (roomId: string) =&gt; {
+    socket.leave(roomId);
+    const user = users.get(userId);
+    if (user) {
+      user.rooms = user.rooms.filter(r =&gt; r !== roomId);
+    }
+    socket.to(roomId).emit('room:user-left', { userId, roomId });
+  });
+
+  // 聊天消息
+  socket.on('chat:message', (data: { roomId: string; content: string }, ack) =&gt; {
+    const message = {
+      id: generateId(),
+      from: userId,
+      content: data.content,
+      roomId: data.roomId,
+      timestamp: Date.now()
+    };
+
+    // 发送给房间内所有人（包括发送者）
+    chatNamespace.to(data.roomId).emit('chat:message', message);
+
+    // 确认消息已送达
+    ack?.({ success: true, messageId: message.id });
+  });
+
+  // 私聊消息
+  socket.on('chat:private', (data: { to: string; content: string }, ack) =&gt; {
+    const targetUser = users.get(data.to);
+    if (targetUser) {
+      const message = {
+        id: generateId(),
+        from: userId,
+        to: data.to,
+        content: data.content,
+        timestamp: Date.now()
+      };
+
+      socket.to(targetUser.socketId).emit('chat:private', message);
+      ack?.({ success: true, messageId: message.id });
+    } else {
+      ack?.({ success: false, error: 'User not found' });
+    }
+  });
+
+  // 正在输入
+  socket.on('chat:typing', (roomId: string) =&gt; {
+    socket.to(roomId).emit('chat:typing', { userId, roomId });
+  });
+
+  // 断开连接
+  socket.on('disconnect', () =&gt; {
+    users.delete(userId);
+    socket.broadcast.emit('user:offline', { userId });
+    console.log(`User disconnected: ${userId}`);
+  });
+});
+
+// 命名空间：通知
+const notificationNamespace = io.of('/notifications');
+
+notificationNamespace.on('connection', (socket) =&gt; {
+  const userId = socket.handshake.auth.userId;
+
+  // 用户加入自己的通知频道
+  socket.join(`user:${userId}`);
+
+  // 标记通知已读
+  socket.on('notification:read', (notificationId: string) =&gt; {
+    // 更新数据库...
+    socket.emit('notification:read-confirmed', { notificationId });
+  });
+});
+
+// 发送系统通知的辅助函数
+export function sendNotification(userId: string, notification: any) {
+  notificationNamespace.to(`user:${userId}`).emit('notification:new', notification);
+}
+
+function generateId(): string {
+  return Date.now().toString(36) + Math.random().toString(36).substring(2);
+}
+
+server.listen(8080, () =&gt; {
+  console.log('Socket.io server running on port 8080');
+});
+```
+
+### 3.3 前端 Socket.io 封装
+
+```typescript
+// socket-client.ts
+import { io, Socket } from 'socket.io-client';
+
+class SocketManager {
+  private sockets = new Map&lt;string, Socket&gt;();
+
+  connect(namespace: string, auth: { userId: string }): Socket {
+    const key = `${namespace}:${auth.userId}`;
+
+    if (this.sockets.has(key)) {
+      return this.sockets.get(key)!;
+    }
+
+    const socket = io(`http://localhost:8080${namespace}`, {
+      auth,
+      transports: ['websocket', 'polling'],
+      reconnection: true,
+      reconnectionAttempts: 10,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000
+    });
+
+    this.sockets.set(key, socket);
+    return socket;
+  }
+
+  disconnect(namespace: string, userId: string) {
+    const key = `${namespace}:${userId}`;
+    const socket = this.sockets.get(key);
+    if (socket) {
+      socket.disconnect();
+      this.sockets.delete(key);
+    }
+  }
+}
+
+export const socketManager = new SocketManager();
+```
+
+```tsx
+// useChat.ts - 聊天 Hook
+import { useEffect, useState, useCallback } from 'react';
+import { Socket } from 'socket.io-client';
+import { socketManager } from './socket-client';
+
+interface Message {
+  id: string;
+  from: string;
+  content: string;
+  roomId: string;
+  timestamp: number;
+}
+
+export function useChat(userId: string, roomId: string) {
+  const [socket, setSocket] = useState&lt;Socket | null&gt;(null);
+  const [messages, setMessages] = useState&lt;Message[]&gt;([]);
+  const [typingUsers, setTypingUsers] = useState&lt;Set&lt;string&gt;&gt;(new Set());
+  const [isConnected, setIsConnected] = useState(false);
+
+  useEffect(() =&gt; {
+    const chatSocket = socketManager.connect('/chat', { userId });
+    setSocket(chatSocket);
+
+    chatSocket.on('connect', () =&gt; setIsConnected(true));
+    chatSocket.on('disconnect', () =&gt; setIsConnected(false));
+
+    // 加入房间
+    chatSocket.emit('room:join', roomId);
+
+    // 监听消息
+    chatSocket.on('chat:message', (message: Message) =&gt; {
+      setMessages((prev) =&gt; [...prev, message]);
+    });
+
+    // 监听正在输入
+    chatSocket.on('chat:typing', ({ userId: typingUserId }) =&gt; {
+      if (typingUserId !== userId) {
+        setTypingUsers((prev) =&gt; new Set(prev).add(typingUserId));
+        // 3秒后清除
+        setTimeout(() =&gt; {
+          setTypingUsers((prev) =&gt; {
+            const next = new Set(prev);
+            next.delete(typingUserId);
+            return next;
+          });
+        }, 3000);
+      }
+    });
+
+    return () =&gt; {
+      chatSocket.emit('room:leave', roomId);
+    };
+  }, [userId, roomId]);
+
+  const sendMessage = useCallback(
+    (content: string) =&gt; {
+      return new Promise&lt;{ success: boolean; messageId?: string }&gt;((resolve) =&gt; {
+        socket?.emit('chat:message', { roomId, content }, (ack: any) =&gt; {
+          resolve(ack);
+        });
+      });
+    },
+    [socket, roomId]
+  );
+
+  const sendTyping = useCallback(() =&gt; {
+    socket?.emit('chat:typing', roomId);
+  }, [socket, roomId]);
+
+  return {
+    messages,
+    typingUsers: Array.from(typingUsers),
+    isConnected,
+    sendMessage,
+    sendTyping
+  };
+}
+```
+
+## 四、Server-Sent Events (SSE) 实战
+
+SSE 适合服务端主动推送的场景，比 WebSocket 更轻量。
+
+### 4.1 SSE 服务端实现
+
+```typescript
+// sse-server.ts
+import http from 'http';
+
+interface SSEClient {
+  id: string;
+  res: http.ServerResponse;
+  lastEventId?: number;
+}
+
+class SSEServer {
+  private clients = new Map&lt;string, SSEClient&gt;();
+  private eventId = 0;
+
+  // 处理 SSE 连接
+  handleConnection(req: http.IncomingMessage, res: http.ServerResponse) {
+    const clientId = generateId();
+    const lastEventId = parseInt(req.headers['last-event-id'] as string) || 0;
+
+    // 设置 SSE 响应头
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*'
+    });
+
+    // 发送初始消息
+    this.send(res, 'connected', { clientId });
+
+    // 注册客户端
+    this.clients.set(clientId, { id: clientId, res, lastEventId });
+
+    // 心跳保活
+    const heartbeat = setInterval(() =&gt; {
+      this.send(res, 'heartbeat', { time: Date.now() });
+    }, 30000);
+
+    // 连接关闭时清理
+    req.on('close', () =&gt; {
+      clearInterval(heartbeat);
+      this.clients.delete(clientId);
+      console.log(`SSE client disconnected: ${clientId}`);
+    });
+
+    console.log(`SSE client connected: ${clientId}`);
+  }
+
+  // 发送 SSE 消息
+  private send(res: http.ServerResponse, event: string, data: any, id?: number) {
+    const eventId = id || ++this.eventId;
+    const message = [
+      `id: ${eventId}`,
+      `event: ${event}`,
+      `data: ${JSON.stringify(data)}`,
+      '', // 空行表示消息结束
+      ''
+    ].join('\n');
+
+    res.write(message);
+  }
+
+  // 广播消息
+  broadcast(event: string, data: any) {
+    this.clients.forEach((client) =&gt; {
+      this.send(client.res, event, data);
+    });
+  }
+
+  // 发送给指定客户端
+  sendTo(clientId: string, event: string, data: any) {
+    const client = this.clients.get(clientId);
+    if (client) {
+      this.send(client.res, event, data);
+    }
+  }
+
+  // 获取客户端数量
+  getClientCount() {
+    return this.clients.size;
+  }
+}
+
+const sseServer = new SSEServer();
+
+const server = http.createServer((req, res) =&gt; {
+  if (req.url === '/events') {
+    sseServer.handleConnection(req, res);
+  }
+});
+
+// 模拟推送新闻
+setInterval(() =&gt; {
+  sseServer.broadcast('news', {
+    title: `新闻标题 ${Date.now()}`,
+    content: '这是新闻内容...'
+  });
+}, 60000);
+
+server.listen(8081, () =&gt; {
+  console.log('SSE server running on http://localhost:8081');
+});
+
+function generateId(): string {
+  return Math.random().toString(36).substring(2, 15);
+}
+```
+
+### 4.2 前端 SSE 封装
+
+```typescript
+// useSSE.ts
+import { useEffect, useState, useCallback, useRef } from 'react';
+
+interface SSEOptions {
+  url: string;
+  events?: string[];
+  onMessage?: (event: string, data: any) =&gt; void;
+  onError?: (error: Error) =&gt; void;
+  reconnect?: boolean;
+  reconnectInterval?: number;
+}
+
+export function useSSE&lt;T = any&gt;(options: SSEOptions) {
+  const {
+    url,
+    events = [],
+    onMessage,
+    onError,
+    reconnect = true,
+    reconnectInterval = 3000
+  } = options;
+
+  const [data, setData] = useState&lt;Map&lt;string, T&gt;&gt;(new Map());
+  const [isConnected, setIsConnected] = useState(false);
+  const eventSourceRef = useRef&lt;EventSource | null&gt;(null);
+  const reconnectTimeoutRef = useRef&lt;NodeJS.Timeout&gt;();
+
+  const connect = useCallback(() =&gt; {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+    }
+
+    const eventSource = new EventSource(url);
+    eventSourceRef.current = eventSource;
+
+    eventSource.onopen = () =&gt; {
+      setIsConnected(true);
+      console.log('SSE connected');
+    };
+
+    eventSource.onerror = (error) =&gt; {
+      setIsConnected(false);
+      eventSource.close();
+
+      if (reconnect) {
+        reconnectTimeoutRef.current = setTimeout(connect, reconnectInterval);
+      }
+
+      onError?.(new Error('SSE connection error'));
+    };
+
+    // 监听指定事件
+    events.forEach((eventName) =&gt; {
+      eventSource.addEventListener(eventName, (event) =&gt; {
+        try {
+          const parsed = JSON.parse(event.data);
+          setData((prev) =&gt; new Map(prev).set(eventName, parsed));
+          onMessage?.(eventName, parsed);
+        } catch {
+          onMessage?.(eventName, event.data);
+        }
+      });
+    });
+
+    // 默认 message 事件
+    eventSource.onmessage = (event) =&gt; {
+      try {
+        const parsed = JSON.parse(event.data);
+        setData((prev) =&gt; new Map(prev).set('message', parsed));
+        onMessage?.('message', parsed);
+      } catch {
+        onMessage?.('message', event.data);
+      }
+    };
+  }, [url, events, onMessage, onError, reconnect, reconnectInterval]);
+
+  useEffect(() =&gt; {
+    connect();
+
+    return () =&gt; {
+      eventSourceRef.current?.close();
+      if (reconnectTimeoutRef.current) {
+        clearTimeout(reconnectTimeoutRef.current);
+      }
+    };
+  }, [connect]);
+
+  return {
+    data: Object.fromEntries(data) as Record&lt;string, T&gt;,
+    isConnected,
+    reconnect: connect
+  };
+}
+```
+
+### 4.3 实时通知系统示例
+
+```tsx
+// NotificationSystem.tsx
+import { useSSE } from './useSSE';
+
+interface Notification {
+  id: string;
+  title: string;
+  body: string;
+  type: 'info' | 'warning' | 'error' | 'success';
+  timestamp: number;
+}
+
+export function NotificationSystem({ userId }: { userId: string }) {
+  const [notifications, setNotifications] = useState&lt;Notification[]&gt;([]);
+
+  const { isConnected } = useSSE&lt;Notification&gt;({
+    url: `http://localhost:8081/events?userId=${userId}`,
+    events: ['notification', 'alert'],
+    onMessage: (event, data) =&gt; {
+      if (event === 'notification' || event === 'alert') {
+        setNotifications((prev) =&gt; [
+          {
+            ...data,
+            id: Date.now().toString(),
+            timestamp: Date.now()
+          },
+          ...prev
+        ]);
+      }
+    }
+  });
+
+  const removeNotification = (id: string) =&gt; {
+    setNotifications((prev) =&gt; prev.filter((n) =&gt; n.id !== id));
+  };
+
+  return (
+    &lt;div className="notification-container"&gt;
+      &lt;div className="status"&gt;
+        {isConnected ? '🟢 实时通知已连接' : '🔴 未连接'}
+      &lt;/div&gt;
+
+      {notifications.map((notification) =&gt; (
+        &lt;div
+          key={notification.id}
+          className={`notification notification-${notification.type}`}
+          onClick={() =&gt; removeNotification(notification.id)}
+        &gt;
+          &lt;strong&gt;{notification.title}&lt;/strong&gt;
+          &lt;p&gt;{notification.body}&lt;/p&gt;
+          &lt;small&gt;{new Date(notification.timestamp).toLocaleTimeString()}&lt;/small&gt;
+        &lt;/div&gt;
+      ))}
+    &lt;/div&gt;
+  );
+}
+```
+
+## 五、实时协作场景实战
+
+### 5.1 协作编辑（CRDT 思想）
+
+```typescript
+// collaborative-editor.ts - 简化的协作编辑实现
+import { Server } from 'socket.io';
+
+interface TextOperation {
+  type: 'insert' | 'delete';
+  position: number;
+  content?: string;
+  length?: number;
+  userId: string;
+  version: number;
+  timestamp: number;
+}
+
+class CollaborativeDocument {
+  private content = '';
+  private version = 0;
+  private operations: TextOperation[] = [];
+
+  applyOperation(operation: TextOperation): { success: boolean; newVersion: number } {
+    // 转换操作位置（处理并发冲突）
+    const transformedOp = this.transformOperation(operation);
+
+    if (!transformedOp) {
+      return { success: false, newVersion: this.version };
+    }
+
+    // 应用操作
+    if (transformedOp.type === 'insert' && transformedOp.content) {
+      this.content =
+        this.content.slice(0, transformedOp.position) +
+        transformedOp.content +
+        this.content.slice(transformedOp.position);
+    } else if (transformedOp.type === 'delete' && transformedOp.length) {
+      this.content =
+        this.content.slice(0, transformedOp.position) +
+        this.content.slice(transformedOp.position + transformedOp.length);
+    }
+
+    this.version++;
+    this.operations.push({ ...transformedOp, version: this.version });
+
+    return { success: true, newVersion: this.version };
+  }
+
+  private transformOperation(op: TextOperation): TextOperation | null {
+    // 简化的 OT（Operational Transformation）实现
+    // 实际生产应使用成熟的 CRDT 库如 Yjs
+    let newPosition = op.position;
+
+    for (const prevOp of this.operations) {
+      if (prevOp.timestamp &gt;= op.timestamp) continue;
+
+      if (prevOp.type === 'insert' && prevOp.position &lt;= op.position) {
+        if (prevOp.content) {
+          newPosition += prevOp.content.length;
+        }
+      }
+    }
+
+    // 边界检查
+    if (newPosition &lt; 0 || newPosition &gt; this.content.length) {
+      return null;
+    }
+
+    return { ...op, position: newPosition };
+  }
+
+  getContent() {
+    return this.content;
+  }
+
+  getVersion() {
+    return this.version;
+  }
+
+  getOperationsSince(version: number) {
+    return this.operations.filter((op) =&gt; op.version &gt; version);
+  }
+}
+
+// Socket.io 服务端
+const io = new Server(8080);
+const documents = new Map&lt;string, CollaborativeDocument&gt;();
+
+io.of('/collab').on('connection', (socket) =&gt; {
+  let currentDocId: string | null = null;
+
+  socket.on('doc:join', (docId: string, callback) =&gt; {
+    currentDocId = docId;
+    socket.join(docId);
+
+    if (!documents.has(docId)) {
+      documents.set(docId, new CollaborativeDocument());
+    }
+
+    const doc = documents.get(docId)!;
+    callback({
+      content: doc.getContent(),
+      version: doc.getVersion()
+    });
+  });
+
+  socket.on('doc:edit', (operation: Omit&lt;TextOperation, 'timestamp'&gt;, callback) =&gt; {
+    if (!currentDocId) return;
+
+    const doc = documents.get(currentDocId)!;
+    const result = doc.applyOperation({
+      ...operation,
+      timestamp: Date.now()
+    });
+
+    if (result.success) {
+      // 广播给其他用户
+      socket.to(currentDocId).emit('doc:operation', {
+        operation,
+        version: result.newVersion
+      });
+
+      callback({ success: true, version: result.newVersion });
+    } else {
+      callback({ success: false });
+    }
+  });
+
+  socket.on('doc:sync', (version: number, callback) =&gt; {
+    if (!currentDocId) return;
+
+    const doc = documents.get(currentDocId)!;
+    callback({
+      operations: doc.getOperationsSince(version),
+      version: doc.getVersion()
+    });
+  });
+});
+```
+
+### 5.2 前端协作编辑组件
+
+```tsx
+// CollaborativeEditor.tsx
+import { useEffect, useRef, useState } from 'react';
+import { Socket } from 'socket.io-client';
+import { socketManager } from './socket-client';
+
+export function CollaborativeEditor({
+  docId,
+  userId
+}: {
+  docId: string;
+  userId: string;
+}) {
+  const textareaRef = useRef&lt;HTMLTextAreaElement&gt;(null);
+  const [socket, setSocket] = useState&lt;Socket | null&gt;(null);
+  const [version, setVersion] = useState(0);
+  const [isSyncing, setIsSyncing] = useState(false);
+  const localVersionRef = useRef(0);
+
+  useEffect(() =&gt; {
+    const collabSocket = socketManager.connect('/collab', { userId });
+    setSocket(collabSocket);
+
+    // 加入文档
+    collabSocket.emit('doc:join', docId, (response: any) =&gt; {
+      if (textareaRef.current) {
+        textareaRef.current.value = response.content;
+        localVersionRef.current = response.version;
+        setVersion(response.version);
+      }
+    });
+
+    // 接收远程操作
+    collabSocket.on('doc:operation', ({ operation, version: newVersion }: any) =&gt; {
+      if (!textareaRef.current) return;
+
+      const textarea = textareaRef.current;
+      const cursorPos = textarea.selectionStart;
+      let newCursorPos = cursorPos;
+
+      // 应用远程操作
+      if (operation.type === 'insert' && operation.content) {
+        const before = textarea.value.slice(0, operation.position);
+        const after = textarea.value.slice(operation.position);
+        textarea.value = before + operation.content + after;
+
+        // 调整光标位置
+        if (operation.position &lt;= cursorPos) {
+          newCursorPos += operation.content.length;
+        }
+      } else if (operation.type === 'delete' && operation.length) {
+        textarea.value =
+          textarea.value.slice(0, operation.position) +
+          textarea.value.slice(operation.position + operation.length);
+
+        if (operation.position &lt; cursorPos) {
+          newCursorPos = Math.max(
+            operation.position,
+            cursorPos - operation.length
+          );
+        }
+      }
+
+      textarea.setSelectionRange(newCursorPos, newCursorPos);
+      localVersionRef.current = newVersion;
+      setVersion(newVersion);
+    });
+
+    return () =&gt; {
+      collabSocket.off('doc:operation');
+    };
+  }, [docId, userId]);
+
+  const handleChange = () =&gt; {
+    if (!socket || !textareaRef.current || isSyncing) return;
+
+    // 简化实现：实际应使用更精确的变化检测
+    const content = textareaRef.current.value;
+
+    // 发送同步请求
+    socket.emit(
+      'doc:sync',
+      localVersionRef.current,
+      (response: { operations: any[]; version: number }) =&gt; {
+        // 处理冲突...
+        localVersionRef.current = response.version;
+        setVersion(response.version);
+      }
+    );
+  };
+
+  return (
+    &lt;div className="collaborative-editor"&gt;
+      &lt;div className="toolbar"&gt;
+        Version: {version}
+      &lt;/div&gt;
+      &lt;textarea
+        ref={textareaRef}
+        onChange={handleChange}
+        placeholder="开始协作编辑..."
+      /&gt;
+    &lt;/div&gt;
+  );
+}
+```
+
+## 六、性能优化与生产实践
+
+### 6.1 连接池与负载均衡
+
+```typescript
+// connection-pool.ts
+import { Redis } from 'ioredis';
+import { Server } from 'socket.io';
+import { createAdapter } from '@socket.io/redis-adapter';
+
+const pubClient = new Redis({ host: 'localhost', port: 6379 });
+const subClient = pubClient.duplicate();
+
+const io = new Server(8080, {
+  // 使用 Redis 适配器实现跨进程/跨服务器通信
+  adapter: createAdapter(pubClient, subClient),
+
+  // 连接配置
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  maxHttpBufferSize: 1e7 // 10MB
+});
+
+// 连接限流
+const connectionLimiter = new Map&lt;string, number[]&gt;();
+const RATE_LIMIT_WINDOW = 60000; // 1 分钟
+const MAX_CONNECTIONS_PER_WINDOW = 10;
+
+io.use((socket, next) =&gt; {
+  const ip = socket.handshake.address;
+  const now = Date.now();
+
+  const connections = connectionLimiter.get(ip) || [];
+  const recentConnections = connections.filter(
+    (time) =&gt; now - time &lt; RATE_LIMIT_WINDOW
+  );
+
+  if (recentConnections.length &gt;= MAX_CONNECTIONS_PER_WINDOW) {
+    return next(new Error('Too many connections'));
+  }
+
+  recentConnections.push(now);
+  connectionLimiter.set(ip, recentConnections);
+
+  next();
+});
+```
+
+### 6.2 消息压缩与批量处理
+
+```typescript
+// message-optimizer.ts
+import { gzipSync, gunzipSync } from 'zlib';
+
+class MessageOptimizer {
+  private messageQueue: any[] = [];
+  private flushTimer: NodeJS.Timeout | null = null;
+  private readonly FLUSH_INTERVAL = 100; // 100ms
+  private readonly MAX_QUEUE_SIZE = 50;
+
+  // 批量发送
+  queueMessage(message: any, send: (batch: any[]) =&gt; void) {
+    this.messageQueue.push(message);
+
+    if (this.messageQueue.length &gt;= this.MAX_QUEUE_SIZE) {
+      this.flush(send);
+    } else if (!this.flushTimer) {
+      this.flushTimer = setTimeout(() =&gt; this.flush(send), this.FLUSH_INTERVAL);
+    }
+  }
+
+  private flush(send: (batch: any[]) =&gt; void) {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = null;
+    }
+
+    if (this.messageQueue.length === 0) return;
+
+    const batch = [...this.messageQueue];
+    this.messageQueue = [];
+
+    // 压缩大数据
+    const compressed = this.compressBatch(batch);
+    send(compressed);
+  }
+
+  private compressBatch(batch: any[]): any {
+    const json = JSON.stringify(batch);
+    if (json.length &gt; 1024) {
+      return {
+        compressed: true,
+        data: gzipSync(Buffer.from(json)).toString('base64')
+      };
+    }
+    return { compressed: false, data: batch };
+  }
+
+  static decompress(message: any): any[] {
+    if (message.compressed) {
+      const buffer = Buffer.from(message.data, 'base64');
+      const json = gunzipSync(buffer).toString();
+      return JSON.parse(json);
+    }
+    return message.data;
+  }
+}
+```
+
+### 6.3 监控与日志
+
+```typescript
+// monitoring.ts
+import { Server } from 'socket.io';
+
+interface Metrics {
+  totalConnections: number;
+  activeConnections: number;
+  messagesReceived: number;
+  messagesSent: number;
+  errors: number;
+  avgLatency: number;
+}
+
+class SocketMonitor {
+  private metrics: Metrics = {
+    totalConnections: 0,
+    activeConnections: 0,
+    messagesReceived: 0,
+    messagesSent: 0,
+    errors: 0,
+    avgLatency: 0
+  };
+
+  private latencySamples: number[] = [];
+
+  attach(io: Server) {
+    io.on('connection', (socket) =&gt; {
+      this.metrics.totalConnections++;
+      this.metrics.activeConnections++;
+
+      // 监听所有事件
+      const originalOnEvent = socket.onevent;
+      socket.onevent = (packet) =&gt; {
+        this.metrics.messagesReceived++;
+        const startTime = Date.now();
+
+        const result = originalOnEvent.call(socket, packet);
+
+        this.latencySamples.push(Date.now() - startTime);
+        if (this.latencySamples.length &gt; 100) {
+          this.latencySamples.shift();
+        }
+
+        return result;
+      };
+
+      socket.on('disconnect', () =&gt; {
+        this.metrics.activeConnections--;
+      });
+
+      socket.on('error', () =&gt; {
+        this.metrics.errors++;
+      });
+    });
+  }
+
+  getMetrics(): Metrics & { latencyP95: number } {
+    const sorted = [...this.latencySamples].sort((a, b) =&gt; a - b);
+    const p95Index = Math.floor(sorted.length * 0.95);
+
+    return {
+      ...this.metrics,
+      latencyP95: sorted[p95Index] || 0
+    };
+  }
+}
+
+// 使用示例
+const monitor = new SocketMonitor();
+monitor.attach(io);
+
+// 定期输出监控数据
+setInterval(() =&gt; {
+  console.log('Socket Metrics:', monitor.getMetrics());
+}, 60000);
+```
+
+### 6.4 安全最佳实践
+
+```typescript
+// security.ts
+import { Server } from 'socket.io';
+import jwt from 'jsonwebtoken';
+
+const io = new Server(8080);
+
+// JWT 认证中间件
+io.use((socket, next) =&gt; {
+  const token = socket.handshake.auth.token;
+
+  if (!token) {
+    return next(new Error('Authentication required'));
+  }
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!);
+    socket.data.userId = payload.userId;
+    socket.data.roles = payload.roles;
+    next();
+  } catch (error) {
+    next(new Error('Invalid token'));
+  }
+});
+
+// 权限检查中间件
+function requireRole(role: string) {
+  return (socket: any, next: (err?: Error) =&gt; void) =&gt; {
+    if (!socket.data.roles?.includes(role)) {
+      return next(new Error('Insufficient permissions'));
+    }
+    next();
+  };
+}
+
+// 在命名空间上应用权限检查
+const adminNamespace = io.of('/admin');
+adminNamespace.use(requireRole('admin'));
+
+// 输入验证
+import { z } from 'zod';
+
+const chatMessageSchema = z.object({
+  roomId: z.string().min(1).max(100),
+  content: z.string().min(1).max(5000)
+});
+
+io.of('/chat').on('connection', (socket) =&gt; {
+  socket.on('chat:message', (data, callback) =&gt; {
+    // 验证输入
+    const result = chatMessageSchema.safeParse(data);
+    if (!result.success) {
+      return callback({ success: false, error: 'Invalid message format' });
+    }
+
+    // 处理消息...
+  });
+});
+
+// 速率限制
+import rateLimit from 'socket.io-rate-limiter';
+
+const limiter = rateLimit({
+  windowMs: 60000, // 1 分钟
+  maxRequests: 100 // 每分钟最多 100 条消息
+});
+
+io.use(limiter);
+```
+
+## 七、总结
+
+### 技术选型建议
+
+| 场景          | 推荐方案           | 理由                         |
+| ------------- | ------------------ | ---------------------------- |
+| 即时通讯/聊天 | Socket.io          | 功能完善、降级策略、房间机制 |
+| 实时通知推送  | SSE                | 简单轻量、单向通信足够       |
+| 协作编辑      | WebSocket + Yjs    | CRDT 成熟方案、冲突处理完善  |
+| 在线游戏      | 原生 WebSocket     | 低延迟、高性能               |
+| 音视频通话    | WebRTC + WebSocket | P2P 传输、WebSocket 信令     |
+
+### 关键指标
+
+- **延迟**: 实时应用应保持 &lt;100ms 延迟
+- **吞吐量**: 单服务器应支持 10000+ 并发连接
+- **可靠性**: 自动重连、消息确认、断点续传
+- **安全性**: 认证授权、输入验证、速率限制
+
+### 生产检查清单
+
+- [ ] 实现自动重连机制
+- [ ] 配置心跳保活
+- [ ] 添加消息确认机制
+- [ ] 实现连接限流
+- [ ] 配置 Redis 适配器（多实例）
+- [ ] 添加监控和告警
+- [ ] 实现优雅关闭
+- [ ] 配置 CORS 和认证
+- [ ] 测试网络异常场景
+- [ ] 准备降级方案
+
+实时通信是全栈开发的核心能力，掌握 WebSocket、SSE 等技术，能让你构建出真正实时响应的现代应用。记住：技术选型要看场景，架构设计要考虑扩展，生产部署要重视稳定和安全。

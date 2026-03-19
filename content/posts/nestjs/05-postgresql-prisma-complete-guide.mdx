@@ -1,0 +1,1235 @@
+---
+title: "05 PostgreSQL + Prisma 完整指南：NestJS 数据持久化最佳实践"
+date: "2026-03-19"
+summary: "深入掌握 PostgreSQL 数据库设计和 Prisma ORM 使用，学习数据模型关系设计、Migration 管理、以及如何在 NestJS 中实现完整的数据持久化"
+tags: ["NestJS", "PostgreSQL", "Prisma", "ORM", "数据库"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式博客系统"
+seriesOrder: 5
+---
+
+## 前言
+
+在前面几篇文章中，我们学习了 NestJS 的核心概念（模块、控制器、服务）。现在，让我们进入数据持久化的世界——**数据库**。
+
+**本文将解决什么问题？**
+
+你可能想知道：
+
+- 为什么选择 PostgreSQL 而不是 MySQL 或 MongoDB？
+- 为什么选择 Prisma 而不是 TypeORM 或 Sequelize？
+- 如何设计数据模型和关系？
+- 如何管理数据库 Migration？
+- 如何在 NestJS 中使用 Prisma？
+
+**本文将带你：**
+
+1. 理解 PostgreSQL 和 Prisma 的优势
+2. 搭建开发环境（Docker + PostgreSQL）
+3. 设计博客系统的数据模型
+4. 掌握 Prisma 的核心用法
+5. 实现 CRUD 操作
+
+---
+
+## 一、为什么选择 PostgreSQL + Prisma？
+
+### 1.1 为什么选择 PostgreSQL？
+
+**PostgreSQL** 是世界上最先进的开源关系型数据库系统。
+
+**核心优势**：
+
+| 特性         | PostgreSQL           | MySQL    | MongoDB    |
+| ------------ | -------------------- | -------- | ---------- |
+| **类型支持** | JSON/Array/HStore 等 | 有限     | JSON       |
+| **复杂查询** | 强大                 | 一般     | 弱         |
+| **事务支持** | 完整                 | 完整     | 有限       |
+| **并发性能** | MVCC，优秀           | 较好     | 一般       |
+| **扩展性**   | 丰富插件             | 有限     | 一般       |
+| **标准兼容** | SQL 标准完整         | 部分兼容 | 不适用     |
+| **全文搜索** | 内置强大             | 较弱     | 需要 Atlas |
+| **社区活跃** | 非常活跃             | 活跃     | 活跃       |
+
+**适用场景**：
+
+- ✅ 需要复杂查询和事务
+- ✅ 数据结构化程度高
+- ✅ 需要完整性和一致性保证
+- ✅ 需要处理 JSON 数据
+- ✅ 企业级应用
+
+### 1.2 为什么选择 Prisma？
+
+**Prisma** 是下一代 ORM，提供了完整的类型安全。
+
+**Prisma vs TypeORM vs Sequelize**：
+
+| 特性            | Prisma          | TypeORM     | Sequelize |
+| --------------- | --------------- | ----------- | --------- |
+| **类型安全**    | ✅ 完全类型安全 | ⚠️ 部分支持 | ❌ 不支持 |
+| **学习曲线**    | 简单            | 中等        | 中等      |
+| **性能**        | 快              | 中等        | 慢        |
+| **Migration**   | 自动且强大      | 手动        | 手动      |
+| **Schema 定义** | 声明式          | 装饰器      | 装饰器    |
+| **关系查询**    | 简洁            | 复杂        | 复杂      |
+| **查询构建**    | 类型安全        | 链式调用    | 链式调用  |
+| **开发体验**    | ⭐⭐⭐⭐⭐      | ⭐⭐⭐      | ⭐⭐⭐    |
+
+**Prisma 核心优势**：
+
+1. **类型安全**：自动生成 TypeScript 类型
+2. **简洁 API**：查询语法直观易读
+3. **自动 Migration**：数据库变更管理自动化
+4. **关系查询**：嵌套查询、连接查询非常简单
+5. **开发体验**：Prisma Studio 可视化数据库
+
+---
+
+## 二、环境搭建
+
+### 2.1 使用 Docker 启动 PostgreSQL
+
+**为什么使用 Docker？**
+
+- 环境一致，避免"在我机器上能跑"
+- 快速部署，一条命令启动
+- 易于管理，不用担心版本冲突
+
+创建 `docker-compose.yml`：
+
+```yaml
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: nestjs-postgres
+    restart: always
+    environment:
+      POSTGRES_USER: nestjs
+      POSTGRES_PASSWORD: nestjs123
+      POSTGRES_DB: nestjs_blog
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nestjs"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
+```
+
+启动 PostgreSQL：
+
+```bash
+docker-compose up -d
+```
+
+验证连接：
+
+```bash
+# 查看容器状态
+docker-compose ps
+
+# 进入数据库
+docker exec -it nestjs-postgres psql -U nestjs -d nestjs_blog
+
+# 退出
+\q
+```
+
+### 2.2 安装 Prisma
+
+```bash
+# 安装 Prisma CLI
+pnpm add -D prisma
+
+# 安装 Prisma Client
+pnpm add @prisma/client
+```
+
+初始化 Prisma：
+
+```bash
+npx prisma init
+```
+
+这会创建：
+
+- `prisma/schema.prisma` - Schema 定义文件
+- `.env` - 环境变量文件
+
+### 2.3 配置数据库连接
+
+编辑 `.env` 文件：
+
+```env
+# Database
+DATABASE_URL="postgresql://nestjs:nestjs123@localhost:5432/nestjs_blog?schema=public"
+```
+
+编辑 `prisma/schema.prisma`：
+
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+```
+
+---
+
+## 三、设计博客数据模型
+
+### 3.1 完整的 Schema 定义
+
+```prisma
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// 用户模型
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  name      String
+  avatar    String?
+  bio       String?
+  role      Role     @default(USER)
+
+  // 关系
+  posts     Post[]
+  comments  Comment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("users")
+}
+
+// 文章模型
+model Post {
+  id          String    @id @default(uuid())
+  title       String
+  content     String?   @db.Text
+  excerpt     String?   @db.Text
+  coverImage  String?
+  slug        String?   @unique
+  published   Boolean   @default(false)
+  views       Int       @default(0)
+
+  // 关系
+  authorId    String
+  author      User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments    Comment[]
+  tags        Tag[]     @relation("PostTags")
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  publishedAt DateTime?
+
+  @@map("posts")
+  @@index([authorId])
+  @@index([published])
+  @@index([createdAt])
+}
+
+// 评论模型
+model Comment {
+  id        String   @id @default(uuid())
+  content   String   @db.Text
+
+  // 关系
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  postId    String
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  parentId  String?
+  parent    Comment? @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies   Comment[] @relation("CommentReplies")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("comments")
+  @@index([postId])
+  @@index([authorId])
+}
+
+// 标签模型
+model Tag {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  slug      String?  @unique
+
+  // 关系
+  posts     Post[]   @relation("PostTags")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@map("tags")
+}
+
+// 用户角色枚举
+enum Role {
+  USER
+  ADMIN
+}
+```
+
+### 3.2 数据模型关系说明
+
+```
+User (用户)
+  ├─ 1:N ─> Post (文章)      一个用户有多篇文章
+  └─ 1:N ─> Comment (评论)   一个用户有多条评论
+
+Post (文章)
+  ├─ N:1 ─> User (用户)      一篇文章属于一个用户
+  ├─ 1:N ─> Comment (评论)   一篇文章有多条评论
+  └─ N:M ─> Tag (标签)       一篇文章有多个标签
+
+Comment (评论)
+  ├─ N:1 ─> User (用户)      一条评论属于一个用户
+  ├─ N:1 ─> Post (文章)      一条评论属于一篇文章
+  └─ 1:N ─> Comment (回复)   一条评论有多条回复
+
+Tag (标签)
+  └─ N:M ─> Post (文章)      一个标签用于多篇文章
+```
+
+**关系类型说明**：
+
+- **1:1** - 一对一（用户 ↔ 用户资料）
+- **1:N** - 一对多（用户 ↔ 文章）
+- **N:M** - 多对多（文章 ↔ 标签）
+
+---
+
+## 四、Prisma 核心 API
+
+### 4.1 创建 Prisma Service
+
+```typescript
+// database/prisma.service.ts
+import { Injectable, OnModuleInit, OnModuleDestroy } from "@nestjs/common";
+import { PrismaClient } from "@prisma/client";
+
+@Injectable()
+export class PrismaService
+  extends PrismaClient
+  implements OnModuleInit, OnModuleDestroy
+{
+  async onModuleInit() {
+    // 连接数据库
+    await this.$connect();
+    console.log("Database connected");
+  }
+
+  async onModuleDestroy() {
+    // 断开连接
+    await this.$disconnect();
+  }
+}
+```
+
+创建数据库模块：
+
+```typescript
+// database/database.module.ts
+import { Global, Module } from "@nestjs/common";
+import { PrismaService } from "./prisma.service";
+
+@Global() // 全局模块，所有模块都可以使用
+@Module({
+  providers: [PrismaService],
+  exports: [PrismaService],
+})
+export class DatabaseModule {}
+```
+
+在 `app.module.ts` 中导入：
+
+```typescript
+import { Module } from "@nestjs/common";
+import { DatabaseModule } from "./database/database.module";
+
+@Module({
+  imports: [DatabaseModule],
+  // ...
+})
+export class AppModule {}
+```
+
+### 4.2 基础 CRUD 操作
+
+```typescript
+import { Injectable } from "@nestjs/common";
+import { PrismaService } from "../database/prisma.service";
+
+@Injectable()
+export class PostsService {
+  constructor(private prisma: PrismaService) {}
+
+  // Create - 创建
+  async create(data: { title: string; content: string; authorId: string }) {
+    return this.prisma.post.create({
+      data,
+    });
+  }
+
+  // Read - 查询单个
+  async findOne(id: string) {
+    return this.prisma.post.findUnique({
+      where: { id },
+    });
+  }
+
+  // Read - 查询多个
+  async findAll() {
+    return this.prisma.post.findMany();
+  }
+
+  // Update - 更新
+  async update(id: string, data: any) {
+    return this.prisma.post.update({
+      where: { id },
+      data,
+    });
+  }
+
+  // Delete - 删除
+  async remove(id: string) {
+    return this.prisma.post.delete({
+      where: { id },
+    });
+  }
+}
+```
+
+### 4.3 查询过滤和排序
+
+```typescript
+// 查询已发布的文章
+const posts = await this.prisma.post.findMany({
+  where: { published: true },
+});
+
+// 查询包含关键词的文章
+const posts = await this.prisma.post.findMany({
+  where: {
+    OR: [
+      { title: { contains: "NestJS" } },
+      { content: { contains: "NestJS" } },
+    ],
+  },
+});
+
+// 多条件查询
+const posts = await this.prisma.post.findMany({
+  where: {
+    published: true,
+    author: {
+      email: { endsWith: "@example.com" },
+    },
+  },
+});
+
+// 排序
+const posts = await this.prisma.post.findMany({
+  orderBy: {
+    createdAt: "desc",
+  },
+});
+
+// 多字段排序
+const posts = await this.prisma.post.findMany({
+  orderBy: [{ published: "desc" }, { createdAt: "desc" }],
+});
+```
+
+### 4.4 分页查询
+
+```typescript
+async findAll(options: { page: number; limit: number }) {
+  const { page = 1, limit = 10 } = options;
+  const skip = (page - 1) * limit;
+
+  const [posts, total] = await Promise.all([
+    this.prisma.post.findMany({
+      skip,
+      take: limit,
+      orderBy: { createdAt: 'desc' },
+    }),
+    this.prisma.post.count(),
+  ]);
+
+  return {
+    items: posts,
+    total,
+    page,
+    limit,
+    totalPages: Math.ceil(total / limit),
+  };
+}
+```
+
+### 4.5 关系查询
+
+```typescript
+// 查询文章时包含作者信息
+const post = await this.prisma.post.findUnique({
+  where: { id: "123" },
+  include: {
+    author: true, // 包含作者
+    comments: true, // 包含评论
+    tags: true, // 包含标签
+  },
+});
+
+// 选择特定字段
+const post = await this.prisma.post.findUnique({
+  where: { id: "123" },
+  select: {
+    id: true,
+    title: true,
+    author: {
+      select: {
+        id: true,
+        name: true,
+        email: true,
+      },
+    },
+  },
+});
+
+// 嵌套查询
+const posts = await this.prisma.post.findMany({
+  include: {
+    author: true,
+    comments: {
+      where: { parentId: null }, // 只查询顶级评论
+      include: {
+        author: true,
+      },
+    },
+  },
+});
+```
+
+### 4.6 创建关联数据
+
+```typescript
+// 创建文章时关联作者
+const post = await this.prisma.post.create({
+  data: {
+    title: "我的第一篇文章",
+    content: "文章内容...",
+    author: {
+      connect: { id: "user-id-123" }, // 连接现有用户
+    },
+  },
+});
+
+// 创建文章时同时创建标签
+const post = await this.prisma.post.create({
+  data: {
+    title: "我的第一篇文章",
+    content: "文章内容...",
+    authorId: "user-id-123",
+    tags: {
+      create: [{ name: "NestJS" }, { name: "TypeScript" }],
+    },
+  },
+  include: { tags: true },
+});
+
+// 连接现有标签
+const post = await this.prisma.post.create({
+  data: {
+    title: "我的第一篇文章",
+    content: "文章内容...",
+    authorId: "user-id-123",
+    tags: {
+      connect: [{ id: "tag-id-1" }, { id: "tag-id-2" }],
+    },
+  },
+  include: { tags: true },
+});
+```
+
+### 4.7 更新关联数据
+
+```typescript
+// 更新文章的标签
+const post = await this.prisma.post.update({
+  where: { id: "post-id-123" },
+  data: {
+    tags: {
+      set: [], // 清空现有标签
+      connect: [
+        { id: "new-tag-id" }, // 连接新标签
+      ],
+    },
+  },
+  include: { tags: true },
+});
+
+// 添加新标签
+const post = await this.prisma.post.update({
+  where: { id: "post-id-123" },
+  data: {
+    tags: {
+      connect: { id: "new-tag-id" },
+    },
+  },
+});
+
+// 移除标签
+const post = await this.prisma.post.update({
+  where: { id: "post-id-123" },
+  data: {
+    tags: {
+      disconnect: { id: "tag-id-to-remove" },
+    },
+  },
+});
+```
+
+### 4.8 事务处理
+
+```typescript
+// 创建文章并增加用户的文章计数
+await this.prisma.$transaction(async (tx) => {
+  // 创建文章
+  const post = await tx.post.create({
+    data: {
+      title: "新文章",
+      authorId: userId,
+    },
+  });
+
+  // 更新用户统计
+  await tx.userStats.update({
+    where: { userId },
+    data: { postsCount: { increment: 1 } },
+  });
+
+  return post;
+});
+
+// 或者传递多个操作
+const [post, user] = await this.prisma.$transaction([
+  this.prisma.post.create({ data: postData }),
+  this.prisma.user.update({
+    where: { id: userId },
+    data: { postsCount: { increment: 1 } },
+  }),
+]);
+```
+
+### 4.9 批量操作
+
+```typescript
+// 批量创建
+const posts = await this.prisma.post.createMany({
+  data: [
+    { title: "文章1", authorId: "user-1" },
+    { title: "文章2", authorId: "user-1" },
+    { title: "文章3", authorId: "user-1" },
+  ],
+});
+
+// 批量更新
+const result = await this.prisma.post.updateMany({
+  where: { published: false },
+  data: { published: true },
+});
+
+// 批量删除
+const result = await this.prisma.post.deleteMany({
+  where: { views: { lt: 10 } }, // 删除阅读量小于 10 的文章
+});
+```
+
+---
+
+## 五、Migration 管理
+
+### 5.1 创建 Migration
+
+修改 Schema 后创建 Migration：
+
+```bash
+npx prisma migrate dev --name init
+```
+
+这会：
+
+1. 生成 SQL 文件
+2. 执行 Migration
+3. 重新生成 Prisma Client
+
+生成的 SQL 文件：
+
+```sql
+-- CreateTable
+CREATE TABLE "users" (
+    "id" TEXT NOT NULL,
+    "email" TEXT NOT NULL,
+    "password" TEXT NOT NULL,
+    "name" TEXT NOT NULL,
+    "avatar" TEXT,
+    "bio" TEXT,
+    "role" "Role" NOT NULL DEFAULT 'USER',
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+
+    CONSTRAINT "users_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateIndex
+CREATE UNIQUE INDEX "users_email_key" ON "users"("email");
+```
+
+### 5.2 开发环境工作流
+
+```bash
+# 1. 修改 schema.prisma
+# 2. 创建 migration
+npx prisma migrate dev --name add_post_cover_image
+
+# 3. 如果需要重置数据库
+npx prisma migrate reset
+
+# 4. 查看迁移状态
+npx prisma migrate status
+```
+
+### 5.3 生产环境部署
+
+```bash
+# 生成 Migration（不执行）
+npx prisma migrate dev --create-only --name my_migration
+
+# 部署时执行 Migration
+npx prisma migrate deploy
+```
+
+### 5.4 Seed 数据填充
+
+创建 `prisma/seed.ts`：
+
+```typescript
+import { PrismaClient } from "@prisma/client";
+import * as bcrypt from "bcrypt";
+
+const prisma = new PrismaClient();
+
+async function main() {
+  // 创建管理员用户
+  const hashedPassword = await bcrypt.hash("admin123", 10);
+
+  await prisma.user.create({
+    data: {
+      email: "admin@example.com",
+      password: hashedPassword,
+      name: "管理员",
+      role: "ADMIN",
+    },
+  });
+
+  // 创建示例标签
+  await prisma.tag.createMany({
+    data: [
+      { name: "NestJS", slug: "nestjs" },
+      { name: "TypeScript", slug: "typescript" },
+      { name: "PostgreSQL", slug: "postgresql" },
+      { name: "Prisma", slug: "prisma" },
+    ],
+  });
+
+  console.log("种子数据已创建");
+}
+
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });
+```
+
+在 `package.json` 中配置：
+
+```json
+{
+  "prisma": {
+    "seed": "ts-node prisma/seed.ts"
+  }
+}
+```
+
+运行 Seed：
+
+```bash
+npx prisma db seed
+```
+
+---
+
+## 六、实战：博客文章服务
+
+### 6.1 完整的 PostsService
+
+```typescript
+// posts/posts.service.ts
+import { Injectable, NotFoundException } from "@nestjs/common";
+import { PrismaService } from "../database/prisma.service";
+import { CreatePostDto } from "./dto/create-post.dto";
+import { UpdatePostDto } from "./dto/update-post.dto";
+
+@Injectable()
+export class PostsService {
+  constructor(private prisma: PrismaService) {}
+
+  /**
+   * 创建文章
+   */
+  async create(userId: string, dto: CreatePostDto) {
+    // 生成 slug
+    const slug = this.generateSlug(dto.title);
+
+    const post = await this.prisma.post.create({
+      data: {
+        ...dto,
+        slug,
+        authorId: userId,
+      },
+      include: {
+        author: {
+          select: { id: true, name: true, avatar: true },
+        },
+      },
+    });
+
+    return post;
+  }
+
+  /**
+   * 获取所有文章（分页、搜索、过滤）
+   */
+  async findAll(options: {
+    page?: number;
+    limit?: number;
+    search?: string;
+    published?: boolean;
+    tagId?: string;
+  }) {
+    const { page = 1, limit = 10, search, published, tagId } = options;
+    const skip = (page - 1) * limit;
+
+    const where: any = {};
+
+    // 搜索条件
+    if (search) {
+      where.OR = [
+        { title: { contains: search, mode: "insensitive" } },
+        { content: { contains: search, mode: "insensitive" } },
+      ];
+    }
+
+    // 发布状态
+    if (published !== undefined) {
+      where.published = published;
+    }
+
+    // 标签过滤
+    if (tagId) {
+      where.tags = {
+        some: { id: tagId },
+      };
+    }
+
+    const [posts, total] = await Promise.all([
+      this.prisma.post.findMany({
+        where,
+        skip,
+        take: limit,
+        orderBy: { createdAt: "desc" },
+        include: {
+          author: {
+            select: { id: true, name: true, avatar: true },
+          },
+          tags: true,
+          _count: {
+            select: { comments: true },
+          },
+        },
+      }),
+      this.prisma.post.count({ where }),
+    ]);
+
+    return {
+      items: posts,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+
+  /**
+   * 获取单篇文章
+   */
+  async findOne(id: string) {
+    const post = await this.prisma.post.findUnique({
+      where: { id },
+      include: {
+        author: {
+          select: { id: true, name: true, avatar: true, bio: true },
+        },
+        tags: true,
+        comments: {
+          where: { parentId: null },
+          include: {
+            author: {
+              select: { id: true, name: true, avatar: true },
+            },
+            replies: {
+              include: {
+                author: {
+                  select: { id: true, name: true, avatar: true },
+                },
+              },
+            },
+          },
+          orderBy: { createdAt: "desc" },
+        },
+      },
+    });
+
+    if (!post) {
+      throw new NotFoundException("文章不存在");
+    }
+
+    // 增加阅读量
+    await this.prisma.post.update({
+      where: { id },
+      data: { views: { increment: 1 } },
+    });
+
+    return post;
+  }
+
+  /**
+   * 根据 slug 获取文章
+   */
+  async findBySlug(slug: string) {
+    const post = await this.prisma.post.findUnique({
+      where: { slug },
+      include: {
+        author: {
+          select: { id: true, name: true, avatar: true },
+        },
+        tags: true,
+      },
+    });
+
+    if (!post) {
+      throw new NotFoundException("文章不存在");
+    }
+
+    return post;
+  }
+
+  /**
+   * 更新文章
+   */
+  async update(id: string, dto: UpdatePostDto) {
+    const post = await this.prisma.post.findUnique({
+      where: { id },
+    });
+
+    if (!post) {
+      throw new NotFoundException("文章不存在");
+    }
+
+    // 如果更新标题，重新生成 slug
+    if (dto.title) {
+      dto.slug = this.generateSlug(dto.title);
+    }
+
+    const updated = await this.prisma.post.update({
+      where: { id },
+      data: dto,
+      include: {
+        author: {
+          select: { id: true, name: true, avatar: true },
+        },
+      },
+    });
+
+    return updated;
+  }
+
+  /**
+   * 删除文章
+   */
+  async remove(id: string) {
+    const post = await this.prisma.post.findUnique({
+      where: { id },
+    });
+
+    if (!post) {
+      throw new NotFoundException("文章不存在");
+    }
+
+    await this.prisma.post.delete({
+      where: { id },
+    });
+
+    return { message: "删除成功" };
+  }
+
+  /**
+   * 发布文章
+   */
+  async publish(id: string) {
+    const post = await this.prisma.post.update({
+      where: { id },
+      data: {
+        published: true,
+        publishedAt: new Date(),
+      },
+    });
+
+    return post;
+  }
+
+  /**
+   * 取消发布
+   */
+  async unpublish(id: string) {
+    const post = await this.prisma.post.update({
+      where: { id },
+      data: {
+        published: false,
+        publishedAt: null,
+      },
+    });
+
+    return post;
+  }
+
+  /**
+   * 获取热门文章（按阅读量排序）
+   */
+  async findPopular(options: { limit?: number }) {
+    const { limit = 10 } = options;
+
+    return this.prisma.post.findMany({
+      where: { published: true },
+      orderBy: { views: "desc" },
+      take: limit,
+      include: {
+        author: {
+          select: { id: true, name: true, avatar: true },
+        },
+      },
+    });
+  }
+
+  /**
+   * 获取相关文章
+   */
+  async findRelated(postId: string, limit: number = 5) {
+    const post = await this.prisma.post.findUnique({
+      where: { id: postId },
+      include: { tags: true },
+    });
+
+    if (!post) {
+      return [];
+    }
+
+    const tagIds = post.tags.map((tag) => tag.id);
+
+    return this.prisma.post.findMany({
+      where: {
+        id: { not: postId },
+        published: true,
+        tags: {
+          some: {
+            id: { in: tagIds },
+          },
+        },
+      },
+      take: limit,
+      include: {
+        author: {
+          select: { id: true, name: true, avatar: true },
+        },
+      },
+    });
+  }
+
+  /**
+   * 生成 URL 友好的 slug
+   */
+  private generateSlug(title: string): string {
+    return title
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, "-")
+      .replace(/[^\w\-]+/g, "")
+      .replace(/\-\-+/g, "-");
+  }
+}
+```
+
+---
+
+## 七、Prisma Studio
+
+Prisma Studio 是一个可视化的数据库管理工具。
+
+启动 Studio：
+
+```bash
+npx prisma studio
+```
+
+访问 http://localhost:5555 查看和管理数据。
+
+**功能**：
+
+- 查看所有表和数据
+- 添加、编辑、删除记录
+- 过滤和排序
+- 查看关系数据
+
+---
+
+## 八、常见问题
+
+### Q1: Prisma Client 生成的类型在哪里？
+
+**A**: 运行 `npx prisma generate` 后，类型会自动生成在 `node_modules/.prisma/client` 中。
+
+```typescript
+import { User, Post, PrismaClient } from "@prisma/client";
+
+// 使用生成的类型
+const user: User = {
+  id: "123",
+  email: "test@example.com",
+  // ... 其他字段
+};
+```
+
+### Q2: 如何处理软删除？
+
+**A**: 添加 `deletedAt` 字段，查询时过滤：
+
+```prisma
+model User {
+  id         String    @id @default(uuid())
+  email      String    @unique
+  deletedAt  DateTime?
+}
+```
+
+```typescript
+// 查询时过滤已删除的记录
+const users = await prisma.user.findMany({
+  where: { deletedAt: null },
+});
+
+// 软删除
+await prisma.user.update({
+  where: { id },
+  data: { deletedAt: new Date() },
+});
+```
+
+### Q3: 如何优化查询性能？
+
+**A**:
+
+1. 使用 `select` 只查询需要的字段
+2. 适度使用 `include`，避免过度查询
+3. 合理使用索引
+4. 使用批量操作
+5. 考虑使用 Connection Pooling
+
+---
+
+## 九、总结
+
+**本文我们完成了**：
+
+✅ 理解了 PostgreSQL 和 Prisma 的优势
+✅ 搭建了开发环境（Docker + PostgreSQL）
+✅ 设计了博客系统的数据模型
+✅ 掌握了 Prisma 的核心 API
+✅ 实现了完整的数据持久化
+
+**核心要点回顾**：
+
+1. **PostgreSQL** - 强大的开源关系型数据库
+2. **Prisma** - 类型安全的下一代 ORM
+3. **数据模型** - 合理设计表结构和关系
+4. **CRUD 操作** - Create、Read、Update、Delete
+5. **Migration** - 数据库版本管理
+
+**最佳实践**：
+
+- ✅ 使用 Docker 管理数据库
+- ✅ 为字段添加适当的索引
+- ✅ 使用事务处理关联操作
+- ✅ 定期备份生产数据库
+- ✅ 使用 Prisma Studio 开发调试
+
+**下一步**：
+
+在下一篇文章《CRUD 实战：构建博客文章 API》中，我们将：
+
+- 整合前面学到的知识
+- 实现完整的博客 API
+- 添加数据验证
+- 统一响应格式
+
+---
+
+**相关代码**：
+
+- 完整项目示例：[my-nestjs-blog](https://github.com/your-repo/my-nestjs-blog)
+- Prisma Schema：[prisma/schema.prisma](https://github.com/your-repo/my-nestjs-blog/blob/main/prisma/schema.prisma)
+- 本篇代码示例：[branch: 05-postgresql-prisma](https://github.com/your-repo/my-nestjs-blog/tree/05-postgresql-prisma)
+
+**有问题？** 欢迎在评论区留言，我会尽快回复！

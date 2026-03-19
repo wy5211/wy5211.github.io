@@ -1,0 +1,981 @@
+---
+title: "02 NestJS 模块与依赖注入：构建可维护的应用架构"
+date: "2026-03-19"
+summary: "深入理解 NestJS 的模块化架构和依赖注入机制，掌握如何组织大型项目的代码结构，解决代码耦合和可维护性问题"
+tags: ["NestJS", "模块化", "依赖注入", "架构设计", "TypeScript"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式博客系统"
+seriesOrder: 2
+---
+
+## 前言
+
+在上一篇文章中，我们创建了第一个 NestJS 项目，初步接触了模块、控制器和服务这三个核心概念。
+
+**本文将解决什么问题？**
+
+随着项目变大，你会遇到这些问题：
+
+- 代码文件越来越多，如何组织？
+- 不同功能模块之间如何共享代码？
+- 如何避免代码之间的强耦合？
+- 如何实现代码的复用和测试？
+
+**本文将带你：**
+
+1. 深入理解模块（Module）的作用和设计
+2. 掌握依赖注入（DI）的原理和用法
+3. 学会组织大型项目的模块结构
+4. 解决循环依赖问题
+5. 实现一个多模块的博客系统架构
+
+---
+
+## 一、什么是模块？
+
+### 1.1 模块的概念
+
+**模块（Module）** 是 NestJS 应用的基本组织单元，它将相关的组件（控制器、服务、拦截器等）组合在一起，形成一个功能单元。
+
+**生活中的类比**：
+
+想象一下公司的组织架构：
+
+```
+公司（根模块）
+├── 技术部（技术模块）
+│   ├── 前端组（前端模块）
+│   └── 后端组（后端模块）
+├── 市场部（市场模块）
+└── 人事部（人事模块）
+```
+
+每个部门有自己的员工（服务）、职责（控制器），但部门之间需要协作（依赖注入）。
+
+### 1.2 为什么需要模块化？
+
+**没有模块化的问题**：
+
+```typescript
+// ❌ 所有代码都在一个文件中
+// app.module.ts
+@Module({
+  controllers: [
+    UsersController,
+    PostsController,
+    CommentsController,
+    AuthController,
+    // ... 100+ 个控制器
+  ],
+  providers: [
+    UsersService,
+    PostsService,
+    CommentsService,
+    AuthService,
+    // ... 100+ 个服务
+  ],
+})
+export class AppModule {}
+```
+
+**问题**：
+
+- 文件变得巨大
+- 代码难以维护
+- 无法复用
+- 测试困难
+
+**模块化的好处**：
+
+```typescript
+// ✅ 按功能划分模块
+@Module({
+  imports: [UsersModule, PostsModule, CommentsModule, AuthModule],
+})
+export class AppModule {}
+```
+
+**好处**：
+
+- ✅ 代码组织清晰
+- ✅ 功能独立封装
+- ✅ 便于团队协作
+- ✅ 易于测试和维护
+
+---
+
+## 二、@Module 装饰器详解
+
+### 2.1 @Module 的四个核心属性
+
+```typescript
+import { Module } from "@nestjs/common";
+
+@Module({
+  imports: [OtherModule], // 导入其他模块
+  controllers: [Controller], // 声明控制器
+  providers: [Service], // 声明服务提供者
+  exports: [Service], // 导出服务供其他模块使用
+})
+export class MyModule {}
+```
+
+#### **imports** - 导入其他模块
+
+用于引入其他模块的功能：
+
+```typescript
+@Module({
+  imports: [
+    UsersModule, // 导入用户模块
+    ConfigModule, // 导入配置模块
+    DatabaseModule, // 导入数据库模块
+  ],
+})
+export class PostsModule {}
+```
+
+**注意**：导入模块后，只能使用该模块 `exports` 出来的服务。
+
+#### **controllers** - 声明控制器
+
+指定当前模块包含哪些控制器：
+
+```typescript
+@Module({
+  controllers: [UsersController, AdminController],
+})
+export class UsersModule {}
+```
+
+#### **providers** - 声明服务提供者
+
+指定当前模块包含哪些服务：
+
+```typescript
+@Module({
+  providers: [UsersService, EmailService, LoggerService],
+})
+export class UsersModule {}
+```
+
+#### **exports** - 导出服务
+
+将服务导出，供其他模块使用：
+
+```typescript
+@Module({
+  providers: [EmailService],
+  exports: [EmailService], // 导出后，其他模块可以使用
+})
+export class CommonModule {}
+
+// 在其他模块中使用
+@Module({
+  imports: [CommonModule],
+  providers: [UsersService],
+})
+export class UsersModule {
+  constructor(private emailService: EmailService) {}
+  // EmailService 来自 CommonModule
+}
+```
+
+### 2.2 完整示例：UsersModule
+
+```typescript
+import { Module } from "@nestjs/common";
+import { UsersController } from "./users.controller";
+import { UsersService } from "./users.service";
+import { EmailModule } from "../email/email.module";
+
+@Module({
+  // 导入依赖的模块
+  imports: [EmailModule],
+
+  // 声明控制器
+  controllers: [UsersController],
+
+  // 声明服务
+  providers: [UsersService],
+
+  // 导出服务（如果需要被其他模块使用）
+  exports: [UsersService],
+})
+export class UsersModule {}
+```
+
+---
+
+## 三、依赖注入原理
+
+### 3.1 什么是依赖注入？
+
+**依赖注入（Dependency Injection，简称 DI）** 是一种设计模式，它将对象的创建和使用分离。
+
+**没有依赖注入的问题**：
+
+```typescript
+// ❌ 手动创建依赖，强耦合
+export class UsersController {
+  private usersService: UsersService;
+
+  constructor() {
+    // 手动创建服务，强耦合
+    this.usersService = new UsersService();
+  }
+
+  findAll() {
+    return this.usersService.findAll();
+  }
+}
+```
+
+**问题**：
+
+- Controllers 和 Services 强耦合
+- 无法替换实现（例如：测试时使用 Mock 对象）
+- 无法共享服务实例
+
+**使用依赖注入**：
+
+```typescript
+// ✅ NestJS 自动注入依赖
+export class UsersController {
+  constructor(private usersService: UsersService) {}
+  // 无需手动创建，NestJS 自动注入
+}
+```
+
+**好处**：
+
+- ✅ 解耦组件
+- ✅ 易于测试
+- ✅ 自动管理生命周期
+- ✅ 单例模式，节省资源
+
+### 3.2 依赖注入的工作流程
+
+```
+1. 应用启动
+   ↓
+2. NestJS 扫描 @Module 装饰器
+   ↓
+3. 创建 providers 中声明的服务实例
+   ↓
+4. 分析控制器的 constructor 参数
+   ↓
+5. 自动将服务注入到控制器
+   ↓
+6. 应用就绪，可以处理请求
+```
+
+### 3.3 实际示例
+
+```typescript
+// users.service.ts
+@Injectable() // 标记为可注入的服务
+export class UsersService {
+  findAll() {
+    return "所有用户";
+  }
+}
+
+// users.controller.ts
+@Controller("users")
+export class UsersController {
+  // NestJS 自动注入 UsersService
+  constructor(private usersService: UsersService) {}
+
+  @Get()
+  findAll() {
+    return this.usersService.findAll();
+  }
+}
+
+// users.module.ts
+@Module({
+  controllers: [UsersController],
+  providers: [UsersService], // 声明服务
+})
+export class UsersModule {}
+```
+
+**工作原理**：
+
+1. NestJS 扫描 `UsersModule` 的 `providers`
+2. 创建 `UsersService` 实例（单例）
+3. 发现 `UsersController` 需要 `UsersService`
+4. 自动将 `UsersService` 注入到 `UsersController`
+
+---
+
+## 四、模块的组织方式
+
+### 4.1 单模块架构（小型项目）
+
+适用于简单项目：
+
+```
+src/
+├── app.module.ts           # 根模块
+├── app.controller.ts       # 根控制器
+├── app.service.ts          # 根服务
+└── main.ts                 # 入口文件
+```
+
+**app.module.ts**：
+
+```typescript
+import { Module } from "@nestjs/common";
+import { AppController } from "./app.controller";
+import { AppService } from "./app.service";
+
+@Module({
+  imports: [],
+  controllers: [AppController],
+  providers: [AppService],
+})
+export class AppModule {}
+```
+
+### 4.2 多模块架构（中大型项目）
+
+适用于实际业务项目：
+
+```
+src/
+├── main.ts                     # 入口文件
+├── app.module.ts               # 根模块
+├── config/                     # 配置模块
+│   ├── config.module.ts
+│   └── config.service.ts
+├── database/                   # 数据库模块
+│   ├── database.module.ts
+│   └── database.service.ts
+├── common/                     # 公共模块
+│   ├── common.module.ts
+│   ├── logger/
+│   ├── filters/
+│   └── decorators/
+├── users/                      # 用户模块
+│   ├── users.module.ts
+│   ├── users.controller.ts
+│   ├── users.service.ts
+│   ├── dto/
+│   └── entities/
+├── posts/                      # 文章模块
+│   ├── posts.module.ts
+│   ├── posts.controller.ts
+│   ├── posts.service.ts
+│   ├── dto/
+│   └── entities/
+└── auth/                       # 认证模块
+    ├── auth.module.ts
+    ├── auth.controller.ts
+    └── auth.service.ts
+```
+
+**app.module.ts**：
+
+```typescript
+import { Module } from "@nestjs/common";
+import { ConfigModule } from "./config/config.module";
+import { DatabaseModule } from "./database/database.module";
+import { CommonModule } from "./common/common.module";
+import { UsersModule } from "./users/users.module";
+import { PostsModule } from "./posts/posts.module";
+import { AuthModule } from "./auth/auth.module";
+
+@Module({
+  imports: [
+    ConfigModule,
+    DatabaseModule,
+    CommonModule,
+    UsersModule,
+    PostsModule,
+    AuthModule,
+  ],
+})
+export class AppModule {}
+```
+
+### 4.3 模块的最佳实践
+
+#### **规则 1：按业务功能划分模块**
+
+```typescript
+// ✅ 推荐：按功能划分
+users/          # 用户相关功能
+posts/          # 文章相关功能
+comments/       # 评论相关功能
+auth/           # 认证相关功能
+
+// ❌ 不推荐：按技术层次划分
+controllers/    # 所有控制器
+services/       # 所有服务
+repositories/   # 所有仓库
+```
+
+#### **规则 2：模块应该保持独立**
+
+每个模块应该：
+
+- 有明确的职责
+- 可以独立测试
+- 可以单独复用
+
+#### **规则 3：使用共享模块存放公共功能**
+
+```typescript
+// common/logger/logger.module.ts
+import { Module, Global } from "@nestjs/common";
+import { LoggerService } from "./logger.service";
+
+@Global() // 全局模块，无需导入即可使用
+@Module({
+  providers: [LoggerService],
+  exports: [LoggerService],
+})
+export class LoggerModule {}
+
+// 现在所有模块都可以直接使用 LoggerService
+// 无需在 imports 中导入
+```
+
+---
+
+## 五、实战：构建博客系统架构
+
+让我们用模块化思想设计一个博客系统的架构。
+
+### 5.1 系统架构图
+
+```
+AppModule (根模块)
+│
+├── ConfigModule (配置模块)
+│   └── exports: ConfigService
+│
+├── DatabaseModule (数据库模块)
+│   └── exports: PrismaService
+│
+├── CommonModule (公共模块)
+│   ├── LoggerService
+│   ├── ExceptionFilter
+│   └── decorators
+│
+├── UsersModule (用户模块)
+│   ├── UsersController
+│   ├── UsersService
+│   └── imports: [DatabaseModule]
+│
+├── PostsModule (文章模块)
+│   ├── PostsController
+│   ├── PostsService
+│   └── imports: [DatabaseModule, UsersModule]
+│
+├── CommentsModule (评论模块)
+│   ├── CommentsController
+│   ├── CommentsService
+│   └── imports: [DatabaseModule, UsersModule, PostsModule]
+│
+└── AuthModule (认证模块)
+    ├── AuthController
+    ├── AuthService
+    └── imports: [UsersModule, DatabaseModule]
+```
+
+### 5.2 创建配置模块
+
+```typescript
+// config/config.module.ts
+import { Module, Global } from "@nestjs/common";
+import { ConfigService } from "./config.service";
+
+@Global()
+@Module({
+  providers: [ConfigService],
+  exports: [ConfigService],
+})
+export class ConfigModule {}
+
+// config/config.service.ts
+import { Injectable } from "@nestjs/common";
+
+@Injectable()
+export class ConfigService {
+  get(key: string): string {
+    return process.env[key];
+  }
+
+  getPort(): number {
+    return parseInt(this.get("PORT") || "3000", 10);
+  }
+
+  getNodeEnv(): string {
+    return this.get("NODE_ENV") || "development";
+  }
+}
+```
+
+### 5.3 创建数据库模块
+
+```typescript
+// database/database.module.ts
+import { Module, Global } from "@nestjs/common";
+import { PrismaService } from "./prisma.service";
+
+@Global()
+@Module({
+  providers: [PrismaService],
+  exports: [PrismaService],
+})
+export class DatabaseModule {}
+
+// database/prisma.service.ts
+import { Injectable, OnModuleInit, OnModuleDestroy } from "@nestjs/common";
+import { PrismaClient } from "@prisma/client";
+
+@Injectable()
+export class PrismaService
+  extends PrismaClient
+  implements OnModuleInit, OnModuleDestroy
+{
+  async onModuleInit() {
+    await this.$connect();
+  }
+
+  async onModuleDestroy() {
+    await this.$disconnect();
+  }
+}
+```
+
+### 5.4 创建用户模块
+
+```typescript
+// users/users.module.ts
+import { Module } from "@nestjs/common";
+import { UsersController } from "./users.controller";
+import { UsersService } from "./users.service";
+
+@Module({
+  controllers: [UsersController],
+  providers: [UsersService],
+  exports: [UsersService], // 导出供其他模块使用
+})
+export class UsersModule {}
+
+// users/users.service.ts
+import { Injectable } from "@nestjs/common";
+import { PrismaService } from "../database/prisma.service";
+
+@Injectable()
+export class UsersService {
+  constructor(private prisma: PrismaService) {}
+
+  findAll() {
+    return this.prisma.user.findMany();
+  }
+
+  findOne(id: string) {
+    return this.prisma.user.findUnique({ where: { id } });
+  }
+
+  create(data: any) {
+    return this.prisma.user.create({ data });
+  }
+}
+```
+
+### 5.5 创建文章模块（依赖用户模块）
+
+```typescript
+// posts/posts.module.ts
+import { Module } from "@nestjs/common";
+import { PostsController } from "./posts.controller";
+import { PostsService } from "./posts.service";
+import { UsersModule } from "../users/users.module";
+
+@Module({
+  imports: [UsersModule], // 导入用户模块
+  controllers: [PostsController],
+  providers: [PostsService],
+  exports: [PostsService],
+})
+export class PostsModule {}
+
+// posts/posts.service.ts
+import { Injectable } from "@nestjs/common";
+import { PrismaService } from "../database/prisma.service";
+import { UsersService } from "../users/users.service";
+
+@Injectable()
+export class PostsService {
+  constructor(
+    private prisma: PrismaService,
+    private usersService: UsersService // 注入用户服务
+  ) {}
+
+  findAll() {
+    return this.prisma.post.findMany({
+      include: { author: true }, // 包含作者信息
+    });
+  }
+
+  async create(userId: string, data: any) {
+    // 验证用户是否存在
+    const user = await this.usersService.findOne(userId);
+    if (!user) {
+      throw new Error("用户不存在");
+    }
+
+    // 创建文章
+    return this.prisma.post.create({
+      data: {
+        ...data,
+        authorId: userId,
+      },
+    });
+  }
+}
+```
+
+---
+
+## 六、循环依赖问题
+
+### 6.1 什么是循环依赖？
+
+当两个模块相互依赖时，就会出现循环依赖：
+
+```
+UsersModule ──────┐
+      │           │
+      │  相互依赖  │
+      │           │
+      └────────────┘
+   AuthModule
+```
+
+**代码示例**：
+
+```typescript
+// users/users.module.ts
+@Module({
+  imports: [AuthModule], // 导入 AuthModule
+  exports: [UsersService],
+})
+export class UsersModule {}
+
+// auth/auth.module.ts
+@Module({
+  imports: [UsersModule], // 导入 UsersModule
+  exports: [AuthService],
+})
+export class AuthModule {}
+```
+
+**问题**：
+
+- NestJS 无法初始化模块（先有鸡还是先有蛋？）
+- 运行时会报错：`Circular dependency detected`
+
+### 6.2 解决方案：forwardRef
+
+使用 `forwardRef` 延迟解析模块引用：
+
+```typescript
+// users/users.module.ts
+import { Module, forwardRef } from "@nestjs/common";
+import { AuthModule } from "../auth/auth.module";
+
+@Module({
+  imports: [forwardRef(() => AuthModule)], // 使用 forwardRef
+  exports: [UsersService],
+})
+export class UsersModule {}
+
+// auth/auth.module.ts
+import { Module, forwardRef } from "@nestjs/common";
+import { UsersModule } from "../users/users.module";
+
+@Module({
+  imports: [forwardRef(() => UsersModule)], // 使用 forwardRef
+  exports: [AuthService],
+})
+export class AuthModule {}
+```
+
+### 6.3 更好的解决方案：重构模块结构
+
+循环依赖通常是设计问题的信号。更好的做法是重构模块结构：
+
+**方案 1：提取共同依赖到新模块**
+
+```typescript
+// 原来：UsersModule ↔ AuthModule
+// 重构后：
+// UsersModule → SharedModule ← AuthModule
+
+@Module({
+  imports: [SharedModule], // 依赖共享模块
+})
+export class UsersModule {}
+
+@Module({
+  imports: [SharedModule], // 依赖共享模块
+})
+export class AuthModule {}
+```
+
+**方案 2：使用事件系统解耦**
+
+```typescript
+// 使用 EventEmitter2 实现松耦合
+@Injectable()
+export class UsersService {
+  constructor(private eventEmitter: EventEmitter2) {}
+
+  async deleteUser(userId: string) {
+    // 删除用户
+    await this.prisma.user.delete({ where: { id: userId } });
+
+    // 发送事件
+    this.eventEmitter.emit("user.deleted", { userId });
+  }
+}
+
+@Injectable()
+export class AuthService {
+  @OnEvent("user.deleted")
+  handleUserDeleted(payload: any) {
+    // 清理认证数据
+    this.invalidateTokens(payload.userId);
+  }
+}
+```
+
+---
+
+## 七、高级用法
+
+### 7.1 动态模块
+
+动态模块允许你自定义模块配置：
+
+```typescript
+// database/database.module.ts
+import { Module, DynamicModule } from "@nestjs/common";
+import { PrismaService } from "./prisma.service";
+
+@Module({})
+export class DatabaseModule {
+  static register(options: { url: string }): DynamicModule {
+    return {
+      module: DatabaseModule,
+      providers: [
+        {
+          provide: "DATABASE_URL",
+          useValue: options.url,
+        },
+        PrismaService,
+      ],
+      exports: [PrismaService],
+      global: true,
+    };
+  }
+}
+
+// 使用动态模块
+// app.module.ts
+@Module({
+  imports: [
+    DatabaseModule.register({
+      url: process.env.DATABASE_URL,
+    }),
+  ],
+})
+export class AppModule {}
+```
+
+### 7.2 自定义 Provider
+
+NestJS 提供多种自定义 Provider 的方式：
+
+#### **useValue** - 提供固定值
+
+```typescript
+@Module({
+  providers: [
+    {
+      provide: "API_KEY",
+      useValue: "abc123xyz",
+    },
+  ],
+})
+export class ConfigModule {}
+
+// 使用
+@Injectable()
+export class ApiService {
+  constructor(@Inject("API_KEY") private apiKey: string) {}
+}
+```
+
+#### **useFactory** - 工厂函数
+
+```typescript
+@Module({
+  providers: [
+    {
+      provide: "DATABASE_CONNECTION",
+      useFactory: async (configService: ConfigService) => {
+        // 根据配置创建数据库连接
+        const url = configService.get("DATABASE_URL");
+        return createConnection(url);
+      },
+      inject: [ConfigService], // 注入依赖
+    },
+  ],
+})
+export class DatabaseModule {}
+```
+
+#### **useClass** - 动态指定实现类
+
+```typescript
+@Module({
+  providers: [
+    {
+      provide: LoggerService,
+      useClass:
+        process.env.NODE_ENV === "production"
+          ? ProductionLoggerService
+          : DevelopmentLoggerService,
+    },
+  ],
+})
+export class LoggerModule {}
+```
+
+#### **useExisting** - 使用现有实例
+
+```typescript
+@Module({
+  providers: [LoggerService],
+  exports: [
+    {
+      provide: "CUSTOM_LOGGER",
+      useExisting: LoggerService, // 使用现有实例
+    },
+  ],
+})
+export class LoggerModule {}
+```
+
+### 7.3 作用域
+
+默认情况下，Provider 是单例的。你也可以指定不同的作用域：
+
+```typescript
+@Injectable({ scope: Scope.TRANSIENT }) // 每次注入都创建新实例
+export class TransientService {}
+
+@Injectable({ scope: Scope.REQUEST }) // 每个请求创建新实例
+export class RequestService {}
+```
+
+**注意**：大部分情况下应该使用默认的单例模式，除非你有特殊需求。
+
+---
+
+## 八、常见问题
+
+### Q1: 什么时候应该创建新模块？
+
+**A**: 当满足以下任一条件时：
+
+- 功能相对独立（如：用户、文章、评论）
+- 可能被多个模块复用（如：日志、缓存）
+- 团队协作时按功能分工
+
+### Q2: 模块和服务的区别？
+
+**A**:
+
+- **模块（Module）**：组织结构，告诉 NestJS 哪些组件属于一起
+- **服务（Service）**：业务逻辑，提供具体功能
+
+类比：
+
+- 模块 = 部门
+- 服务 = 员工
+
+### Q3: 为什么有时服务注入后是 undefined？
+
+**A**: 检查以下几点：
+
+1. 服务是否在 `providers` 中声明？
+2. 如果服务来自其他模块，是否在 `imports` 中导入？
+3. 是否在 `exports` 中导出服务？
+
+```typescript
+@Module({
+  imports: [OtherModule], // ✅ 导入模块
+  providers: [MyService], // ✅ 声明服务
+})
+export class MyModule {
+  constructor(
+    private otherService: OtherService, // 来自 OtherModule
+    private myService: MyService // 来自当前模块
+  ) {}
+}
+```
+
+---
+
+## 九、总结
+
+**本文我们完成了**：
+
+✅ 深入理解了模块的作用和设计
+✅ 掌握了依赖注入的原理和用法
+✅ 学会了组织大型项目的模块结构
+✅ 解决了循环依赖问题
+✅ 实现了多模块的博客系统架构
+
+**核心要点回顾**：
+
+1. **模块化** - 按业务功能划分模块，提高可维护性
+2. **依赖注入** - 自动管理依赖，解耦组件
+3. **模块通信** - 通过 `imports` 和 `exports` 实现模块间通信
+4. **循环依赖** - 使用 `forwardRef` 或重构架构来解决
+
+**最佳实践**：
+
+- ✅ 按业务功能划分模块
+- ✅ 使用共享模块存放公共功能
+- ✅ 避免循环依赖，及时重构
+- ✅ 合理使用动态模块和自定义 Provider
+
+**下一步**：
+
+在下一篇文章《控制器与路由》中，我们将深入学习：
+
+- 控制器的详细用法
+- 路由参数的获取方式
+- 请求和响应的处理
+- 如何设计 RESTful API
+
+---
+
+**相关代码**：
+
+- 完整项目示例：[my-nestjs-blog](https://github.com/your-repo/my-nestjs-blog)
+- 本篇代码示例：[branch: 02-modules-di](https://github.com/your-repo/my-nestjs-blog/tree/02-modules-di)
+
+**有问题？** 欢迎在评论区留言，我会尽快回复！

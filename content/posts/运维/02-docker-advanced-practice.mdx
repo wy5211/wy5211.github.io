@@ -1,0 +1,541 @@
+---
+title: "02 Docker 实战进阶：多阶段构建、优化与生产部署"
+date: "2026-03-18"
+summary: "深入讲解 Docker 多阶段构建、镜像优化、安全加固和生产部署最佳实践，让你的容器更快更小更安全。"
+tags: ["Docker", "DevOps", "容器化", "部署"]
+category: "运维"
+cover: ""
+draft: false
+---
+
+# Docker 实战进阶：多阶段构建、优化与生产部署
+
+Docker 基础用法大家都会，但生产环境需要更小的镜像、更快的构建、更安全的配置。本文分享 Docker 进阶技巧。
+
+## 一、多阶段构建
+
+### 1.1 为什么需要多阶段构建
+
+```dockerfile
+# ❌ 单阶段构建：镜像很大
+FROM node:20
+
+WORKDIR /app
+COPY . .
+RUN npm install
+RUN npm run build
+
+CMD ["npm", "start"]
+# 镜像大小：1.2GB（包含 node_modules、源码、构建工具）
+```
+
+```dockerfile
+# ✅ 多阶段构建：只保留运行时必需的
+# 阶段 1：构建
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# 阶段 2：运行
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./
+
+CMD ["node", "dist/main.js"]
+# 镜像大小：200MB（只有运行时必需的文件）
+```
+
+### 1.2 Node.js 多阶段构建完整示例
+
+```dockerfile
+# Dockerfile
+
+# ==================== 基础镜像 ====================
+FROM node:20-alpine AS base
+
+WORKDIR /app
+
+# 安装生产依赖
+FROM base AS deps
+COPY package*.json ./
+RUN npm ci --only=production
+
+# ==================== 构建阶段 ====================
+FROM base AS builder
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# ==================== 生产镜像 ====================
+FROM node:20-alpine AS runner
+
+WORKDIR /app
+
+# 安全：不使用 root
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nodejs
+
+# 复制构建产物
+COPY --from=builder /app/dist ./dist
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./
+
+# 设置权限
+RUN chown -R nodejs:nodejs /app
+
+USER nodejs
+
+EXPOSE 3000
+
+CMD ["node", "dist/main.js"]
+```
+
+### 1.3 前端多阶段构建
+
+```dockerfile
+# 构建阶段
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# 使用 Nginx 托管
+FROM nginx:alpine AS runner
+
+# 复制构建产物
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# 复制 Nginx 配置
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 80
+
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+## 二、镜像优化
+
+### 2.1 选择合适的基础镜像
+
+```dockerfile
+# ❌ 完整镜像：1.2GB
+FROM node:20
+
+# ✅ Alpine 镜像：180MB
+FROM node:20-alpine
+
+# ✅ 更小：Distroless（无 shell，更安全）
+FROM gcr.io/distroless/nodejs20-debian12
+```
+
+### 2.2 利用构建缓存
+
+```dockerfile
+# ❌ 错误顺序：每次都要重装依赖
+COPY . .
+RUN npm install
+
+# ✅ 正确顺序：依赖变化才重装
+COPY package*.json ./
+RUN npm install
+COPY . .
+```
+
+### 2.3 减少层数
+
+```dockerfile
+# ❌ 多层
+RUN apt-get update
+RUN apt-get install -y curl
+RUN apt-get install -y git
+RUN apt-get clean
+
+# ✅ 单层
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+```
+
+### 2.4 使用 .dockerignore
+
+```dockerignore
+# .dockerignore
+node_modules
+npm-debug.log
+Dockerfile
+.dockerignore
+.git
+.gitignore
+README.md
+.env
+coverage
+.idea
+*.log
+```
+
+### 2.5 压缩镜像
+
+```bash
+# 构建时压缩
+docker build --squash -t myapp .
+
+# 或使用 dive 分析镜像
+dive myapp:latest
+```
+
+## 三、安全加固
+
+### 3.1 使用非 root 用户
+
+```dockerfile
+FROM node:20-alpine
+
+# 创建用户
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+WORKDIR /app
+COPY --chown=appuser:appgroup . .
+
+USER appuser
+
+CMD ["node", "index.js"]
+```
+
+### 3.2 只复制必需文件
+
+```dockerfile
+# ❌ 复制所有文件
+COPY . .
+
+# ✅ 只复制必需文件
+COPY package*.json ./
+COPY src/ ./src/
+```
+
+### 3.3 不在镜像中存储密钥
+
+```dockerfile
+# ❌ 硬编码密钥
+ENV DATABASE_PASSWORD=secret123
+
+# ✅ 运行时注入
+# docker run -e DATABASE_PASSWORD=secret123 myapp
+```
+
+### 3.4 扫描漏洞
+
+```bash
+# 使用 Trivy 扫描
+trivy image myapp:latest
+
+# 使用 Docker Scout
+docker scout quickview myapp:latest
+```
+
+### 3.5 使用只读文件系统
+
+```yaml
+# docker-compose.yml
+services:
+  app:
+    image: myapp:latest
+    read_only: true
+    tmpfs:
+      - /tmp
+```
+
+## 四、Docker Compose 生产配置
+
+### 4.1 完整示例
+
+```yaml
+# docker-compose.yml
+version: "3.8"
+
+services:
+  app:
+    build:
+      context: .
+      target: runner
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgres://postgres:secret@db:5432/mydb
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 512M
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+    networks:
+      - backend
+
+  db:
+    image: postgres:15-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: mydb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - backend
+
+  redis:
+    image: redis:7-alpine
+    restart: always
+    volumes:
+      - redis_data:/data
+    networks:
+      - backend
+
+  nginx:
+    image: nginx:alpine
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./ssl:/etc/nginx/ssl:ro
+    depends_on:
+      - app
+    networks:
+      - backend
+
+networks:
+  backend:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+```
+
+### 4.2 健康检查
+
+```dockerfile
+# Dockerfile 中添加
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+  CMD wget -q --spider http://localhost:3000/health || exit 1
+```
+
+```javascript
+// Node.js 健康检查端点
+app.get("/health", (req, res) => {
+  res.json({ status: "ok", timestamp: new Date().toISOString() });
+});
+```
+
+### 4.3 日志管理
+
+```yaml
+services:
+  app:
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+```
+
+## 五、CI/CD 集成
+
+### 5.1 GitHub Actions
+
+```yaml
+# .github/workflows/docker.yml
+name: Docker Build & Push
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/myapp:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/myapp:${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+### 5.2 构建优化
+
+```yaml
+# 使用 BuildKit 缓存
+- name: Build and push
+  uses: docker/build-push-action@v5
+  with:
+    context: .
+    push: true
+    tags: myapp:latest
+    build-args: |
+      BUILD_DATE=${{ github.event.repository.updated_at }}
+    cache-from: type=registry,ref=myapp:cache
+    cache-to: type=registry,ref=myapp:cache,mode=max
+```
+
+## 六、常用命令
+
+### 6.1 构建相关
+
+```bash
+# 构建镜像
+docker build -t myapp:latest .
+
+# 指定 Dockerfile
+docker build -f Dockerfile.prod -t myapp:latest .
+
+# 构建时传参
+docker build --build-arg NODE_ENV=production -t myapp:latest .
+
+# 不使用缓存
+docker build --no-cache -t myapp:latest .
+
+# 多平台构建
+docker buildx build --platform linux/amd64,linux/arm64 -t myapp:latest .
+```
+
+### 6.2 运行相关
+
+```bash
+# 后台运行
+docker run -d -p 3000:3000 --name myapp myapp:latest
+
+# 传入环境变量
+docker run -e NODE_ENV=production -e PORT=3000 myapp:latest
+
+# 使用环境文件
+docker run --env-file .env myapp:latest
+
+# 限制资源
+docker run --memory=512m --cpus=1 myapp:latest
+
+# 挂载卷
+docker run -v $(pwd)/data:/app/data myapp:latest
+```
+
+### 6.3 调试相关
+
+```bash
+# 进入容器
+docker exec -it myapp sh
+
+# 查看日志
+docker logs -f myapp
+
+# 查看资源使用
+docker stats myapp
+
+# 查看镜像层
+docker history myapp:latest
+
+# 导出镜像
+docker save myapp:latest | gzip > myapp.tar.gz
+
+# 导入镜像
+docker load < myapp.tar.gz
+```
+
+## 七、优化检查清单
+
+### Dockerfile
+
+- [ ] 使用多阶段构建
+- [ ] 选择 alpine 基础镜像
+- [ ] 利用构建缓存（先复制 package.json）
+- [ ] 使用 .dockerignore
+- [ ] 减少层数
+- [ ] 使用非 root 用户
+- [ ] 添加 HEALTHCHECK
+
+### 运行时
+
+- [ ] 设置资源限制
+- [ ] 配置健康检查
+- [ ] 管理日志大小
+- [ ] 使用 secrets 管理敏感信息
+- [ ] 配置重启策略
+
+### CI/CD
+
+- [ ] 使用 BuildKit 缓存
+- [ ] 扫描镜像漏洞
+- [ ] 自动化构建和推送
+- [ ] 版本标签管理
+
+## 总结
+
+Docker 进阶的核心是优化和安全。
+
+**核心要点：**
+
+1. **多阶段构建** - 减小镜像体积
+2. **镜像优化** - 选择基础镜像、利用缓存
+3. **安全加固** - 非 root、最小权限、漏洞扫描
+4. **生产配置** - 健康检查、资源限制、日志管理
+5. **CI/CD** - 自动化构建、缓存优化
+
+**镜像大小对比：**
+
+```
+单阶段构建：1.2GB
+多阶段构建：200MB
+多阶段 + Alpine：80MB
+多阶段 + Distroless：50MB
+```
+
+优化永无止境，够用就好。根据实际需求选择合适的优化程度。

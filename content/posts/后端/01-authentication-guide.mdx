@@ -1,0 +1,1914 @@
+---
+title: "01 鉴权技术演进：从 Session 到 FIDO2 的全面指南"
+date: "2026-03-18"
+summary: "深入探讨鉴权技术的发展历程，从传统的 Session + Cookie 到现代的 JWT、OAuth 2.0、OIDC，再到最新的 FIDO2/WebAuthn，分析各种方案的优劣和适用场景。"
+tags: ["鉴权", "OAuth2", "JWT", "Session", "WebAuthn", "安全"]
+category: "后端"
+cover: ""
+draft: false
+---
+
+# 鉴权技术演进：从 Session 到 FIDO2 的全面指南
+
+在互联网应用的发展历程中，用户身份认证（Authentication）和授权（Authorization）始终是安全体系的核心。从最简单的用户名密码，到复杂的分布式单点登录，鉴权技术经历了多次重大演进。
+
+本文将按照时间线和技术发展脉络，深入探讨各种鉴权技术的原理、优缺点、适用场景，以及它们在实际项目中的应用实践。
+
+## 鉴权基础概念
+
+在深入具体技术之前，让我们先明确几个核心概念：
+
+### Authentication vs Authorization
+
+- **Authentication（认证）**：验证用户身份，回答"你是谁？"
+- **Authorization（授权）**：验证用户权限，回答"你能做什么？"
+
+```javascript
+// 认证示例
+login(username, password) → 返回："你是管理员张三"
+
+// 授权示例
+checkPermission(user, resource) → 返回："你有权访问这个资源"
+```
+
+### 传统认证流程
+
+最基础的认证流程包含三个核心角色：
+
+```
+┌─────────┐                     ┌──────────┐
+│ 用户    │ ──(1) 提交凭证────>  │ 服务器   │
+└─────────┘                     └──────────┘
+         <──(2) 验证成功/失败────
+         ──(3) 持有令牌────>
+```
+
+## 第一代：基础认证时代
+
+### 1. HTTP Basic Authentication
+
+**出现时间**：1990 年代
+
+HTTP Basic Authentication 是最简单的认证方式，直接在 HTTP 请求头中传输用户名和密码。
+
+#### 工作原理
+
+```http
+GET /api/resource HTTP/1.1
+Host: example.com
+Authorization: Basic dXNlcm5hbWU6cGFzc3dvcmQ=
+```
+
+`Basic` 后面的 Base64 编码内容就是 `username:password`。
+
+#### 代码实现
+
+```javascript
+// Node.js Express 实现
+const basicAuth = require("express-basic-auth");
+
+app.use(
+  basicAuth({
+    users: { admin: "supersecret" },
+    challenge: true,
+    realm: "My Application",
+  })
+);
+
+// 客户端发送请求
+const auth = btoa("admin:supersecret");
+fetch("https://api.example.com/protected", {
+  headers: {
+    Authorization: `Basic ${auth}`,
+  },
+});
+```
+
+#### 优点
+
+- 实现简单，无需额外存储
+- 所有 HTTP 客户端都支持
+- 适合内部工具或测试环境
+
+#### 缺点
+
+- **安全性差**：Base64 可轻易解码，必须配合 HTTPS 使用
+- **无法撤销**：除非修改密码，否则凭证一直有效
+- **无状态管理**：每次请求都需要发送凭证
+- **无灵活性**：不支持细粒度权限控制
+
+#### 适用场景
+
+```javascript
+// 适用场景示例
+// 1. 内部 API 管理工具
+// 2. CI/CD 部署脚本
+// 3. 快速原型开发
+// 4. 不适合生产环境
+```
+
+### 2. Session + Cookie（传统会话认证）
+
+**出现时间**：1990 年代末期
+
+Session + Cookie 是 Web 应用最经典的认证方式，也是许多开发者最早接触的认证机制。
+
+#### 工作原理
+
+Session 认证采用服务器端存储用户状态的方式：
+
+```
+1. 用户登录
+   ↓
+2. 服务器验证凭证
+   ↓
+3. 服务器创建 Session，生成 Session ID
+   ↓
+4. 服务器通过 Set-Cookie 响应头返回 Session ID
+   ↓
+5. 浏览器自动存储 Cookie
+   ↓
+6. 后续请求自动携带 Cookie
+   ↓
+7. 服务器根据 Session ID 查找用户状态
+```
+
+#### 代码实现
+
+**Node.js Express 示例**：
+
+```javascript
+const express = require("express");
+const session = require("express-session");
+const app = express();
+
+// 配置 Session 中间件
+app.use(
+  session({
+    secret: "your-secret-key", // 用于签名 Session ID
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      secure: true, // 仅 HTTPS
+      httpOnly: true, // 防止 XSS
+      maxAge: 24 * 60 * 60 * 1000, // 24 小时
+    },
+    store: new RedisStore({
+      // 使用 Redis 存储 Session
+      host: "localhost",
+      port: 6379,
+    }),
+  })
+);
+
+// 登录路由
+app.post("/login", (req, res) => {
+  const { username, password } = req.body;
+
+  // 验证用户凭证
+  if (validateUser(username, password)) {
+    req.session.userId = user.id;
+    req.session.username = username;
+    req.session.role = user.role;
+    res.json({ success: true });
+  } else {
+    res.status(401).json({ error: "Invalid credentials" });
+  }
+});
+
+// 受保护的路由
+app.get("/api/profile", (req, res) => {
+  if (!req.session.userId) {
+    return res.status(401).json({ error: "Not authenticated" });
+  }
+
+  // Session 中已包含用户信息
+  res.json({
+    userId: req.session.userId,
+    username: req.session.username,
+    role: req.session.role,
+  });
+});
+
+// 登出
+app.post("/logout", (req, res) => {
+  req.session.destroy((err) => {
+    if (err) {
+      res.status(500).json({ error: "Logout failed" });
+    } else {
+      res.clearCookie("connect.sid");
+      res.json({ success: true });
+    }
+  });
+});
+```
+
+**客户端请求示例**：
+
+```javascript
+// 登录
+fetch("https://api.example.com/login", {
+  method: "POST",
+  credentials: "include", // 携带 Cookie
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ username, password }),
+});
+
+// 访问受保护资源（自动携带 Cookie）
+fetch("https://api.example.com/api/profile", {
+  credentials: "include",
+});
+```
+
+#### Session 存储方案对比
+
+| 存储方案  | 优点             | 缺点               | 适用场景             |
+| --------- | ---------------- | ------------------ | -------------------- |
+| 内存存储  | 最快、无需配置   | 重启丢失、单机受限 | 开发环境、小型应用   |
+| Redis     | 高性能、支持集群 | 需要额外组件       | 生产环境、分布式系统 |
+| 数据库    | 持久化、易管理   | 性能较差           | 需要 Session 持久化  |
+| Memcached | 高性能           | 功能简单、无持久化 | 临时缓存场景         |
+
+#### Cookie 安全配置
+
+```javascript
+// Express Session 完整安全配置
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET,
+    name: "sessionId", // 自定义 Cookie 名称
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      secure: true, // 仅 HTTPS
+      httpOnly: true, // 防止 JavaScript 访问
+      sameSite: "strict", // 防止 CSRF
+      maxAge: 24 * 60 * 60 * 1000, // 24 小时
+      domain: ".example.com", // 跨子域
+      path: "/", // Cookie 作用路径
+    },
+    // 轮换密钥
+    rolling: true,
+  })
+);
+```
+
+#### 优点
+
+- **实现简单**：框架支持完善，开发快速
+- **服务器控制**：Session 服务器控制，可随时撤销
+- **安全性高**：配合安全配置，防护 CSRF 和 XSS
+- **灵活性强**：可存储任意用户数据
+
+#### 缺点
+
+- **服务器压力**：每个用户都需要服务器存储
+- **扩展性差**：分布式环境需要 Session 共享方案
+- **跨平台限制**：Cookie 自动携带，移动端支持不便
+- **CSRF 风险**：需要额外防护措施
+
+#### 适用场景
+
+```javascript
+// 适用场景
+// 1. 传统 Web 应用（MVC、SPA ）
+// 2. 需要服务器控制的场景（立即撤销）
+// 3. 管理后台系统
+// 4. 不适用：纯移动应用、微服务架构
+```
+
+## 第二代：Token 时代
+
+### 3. Token-based Authentication（基于令牌的认证）
+
+**出现时间**：2010 年代初
+
+随着 RESTful API 和移动应用的兴起，无状态认证需求日益增长。Token-based Authentication 应运而生。
+
+#### 工作原理
+
+```javascript
+// 1. 用户登录，服务器生成随机 Token
+const token = generateRandomToken(); // e.g., "abc123xyz789"
+
+// 2. 服务器存储 Token 和用户信息的映射
+tokenStore[token] = { userId: 123, username: "user", role: "admin" };
+
+// 3. 返回 Token 给客户端
+res.json({ token: "abc123xyz789" });
+
+// 4. 客户端后续请求携带 Token
+// Authorization: Bearer abc123xyz789
+```
+
+#### 代码实现
+
+**服务器端**：
+
+```javascript
+const express = require("express");
+const crypto = require("crypto");
+const app = express();
+
+// 简单的 Token 存储（生产环境应使用 Redis）
+const tokenStore = new Map();
+const TOKEN_EXPIRY = 24 * 60 * 60 * 1000; // 24 小时
+
+// 生成随机 Token
+function generateToken() {
+  return crypto.randomBytes(32).toString("hex");
+}
+
+// 认证中间件
+function authenticateToken(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1]; // Bearer TOKEN
+
+  if (!token) {
+    return res.status(401).json({ error: "Token required" });
+  }
+
+  const session = tokenStore.get(token);
+  if (!session) {
+    return res.status(403).json({ error: "Invalid token" });
+  }
+
+  // 检查过期
+  if (Date.now() > session.expiresAt) {
+    tokenStore.delete(token);
+    return res.status(403).json({ error: "Token expired" });
+  }
+
+  req.user = session.user;
+  next();
+}
+
+// 登录
+app.post("/login", (req, res) => {
+  const { username, password } = req.body;
+  const user = validateUser(username, password);
+
+  if (user) {
+    const token = generateToken();
+    tokenStore.set(token, {
+      user: { id: user.id, username, role: user.role },
+      createdAt: Date.now(),
+      expiresAt: Date.now() + TOKEN_EXPIRY,
+    });
+    res.json({ token });
+  } else {
+    res.status(401).json({ error: "Invalid credentials" });
+  }
+});
+
+// 受保护路由
+app.get("/api/profile", authenticateToken, (req, res) => {
+  res.json(req.user);
+});
+
+// 登出
+app.post("/logout", authenticateToken, (req, res) => {
+  const token = req.headers["authorization"].split(" ")[1];
+  tokenStore.delete(token);
+  res.json({ success: true });
+});
+```
+
+**客户端**：
+
+```javascript
+// 登录
+const response = await fetch("https://api.example.com/login", {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ username, password }),
+});
+const { token } = await response.json();
+
+// 存储 Token
+localStorage.setItem("authToken", token);
+
+// 访问受保护资源
+const profile = await fetch("https://api.example.com/api/profile", {
+  headers: {
+    Authorization: `Bearer ${localStorage.getItem("authToken")}`,
+  },
+});
+```
+
+#### 优点
+
+- **无状态**：服务器不存储状态，易于扩展
+- **跨平台**：适用于 Web、移动应用、桌面应用
+- **灵活存储**：Token 可存储在 localStorage、Cookie 等
+- **性能良好**：无需查询 Session 存储
+
+#### 缺点
+
+- **撤销困难**：Token 一旦签发，难以立即撤销
+- **Token 泄露**：需要设置合理的过期时间
+- **无标准化**：不同实现方式，兼容性问题
+- **Payload 限制**：Token 不应包含过多信息
+
+#### 适用场景
+
+```javascript
+// 适用场景
+// 1. 移动应用 API
+// 2. 微服务架构
+// 3. 跨平台应用
+// 4. 不适用：需要立即撤销 Token 的场景
+```
+
+### 4. JWT (JSON Web Token)
+
+**出现时间**：2010 年代中期
+
+JWT 是 Token-based Authentication 的标准化实现，目前已成为业界主流方案之一。
+
+#### JWT 结构
+
+JWT 由三部分组成，用点（.）分隔：
+
+```
+Header.Payload.Signature
+```
+
+**1. Header（头部）**
+
+```json
+{
+  "alg": "HS256", // 签名算法
+  "typ": "JWT" // 令牌类型
+}
+```
+
+**2. Payload（载荷）**
+
+```json
+{
+  "sub": "1234567890", // 主题（用户 ID）
+  "name": "John Doe", // 用户名
+  "role": "admin", // 角色
+  "iat": 1516239022, // 签发时间
+  "exp": 1516242622 // 过期时间
+}
+```
+
+**3. Signature（签名）**
+
+```
+HMACSHA256(
+  base64UrlEncode(header) + "." +
+  base64UrlEncode(payload),
+  secret
+)
+```
+
+#### 代码实现
+
+**生成 JWT**：
+
+```javascript
+const jwt = require("jsonwebtoken");
+
+const secretKey = process.env.JWT_SECRET;
+
+// 生成 JWT
+function generateToken(user) {
+  const payload = {
+    userId: user.id,
+    username: user.username,
+    role: user.role,
+    // 标准声明
+    sub: user.id,
+    iat: Math.floor(Date.now() / 1000),
+    exp: Math.floor(Date.now() / 1000) + 24 * 60 * 60, // 24 小时
+  };
+
+  return jwt.sign(payload, secretKey, {
+    algorithm: "HS256",
+  });
+}
+
+// 登录
+app.post("/login", (req, res) => {
+  const { username, password } = req.body;
+  const user = validateUser(username, password);
+
+  if (user) {
+    const token = generateToken(user);
+    res.json({ token });
+  } else {
+    res.status(401).json({ error: "Invalid credentials" });
+  }
+});
+```
+
+**验证 JWT**：
+
+```javascript
+// 认证中间件
+function authenticateJWT(req, res, next) {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.split(" ")[1];
+
+  if (!token) {
+    return res.status(401).json({ error: "Token required" });
+  }
+
+  jwt.verify(token, secretKey, (err, user) => {
+    if (err) {
+      if (err.name === "TokenExpiredError") {
+        return res.status(403).json({ error: "Token expired" });
+      }
+      return res.status(403).json({ error: "Invalid token" });
+    }
+
+    req.user = user;
+    next();
+  });
+}
+
+// 受保护路由
+app.get("/api/profile", authenticateJWT, (req, res) => {
+  res.json({
+    userId: req.user.userId,
+    username: req.user.username,
+    role: req.user.role,
+  });
+});
+```
+
+**JWT 解码**（仅用于调试）：
+
+```javascript
+// 解码 JWT（不验证签名）
+function decodeJWT(token) {
+  const [header, payload] = token.split(".");
+  return {
+    header: JSON.parse(Buffer.from(header, "base64").toString()),
+    payload: JSON.parse(Buffer.from(payload, "base64").toString()),
+  };
+}
+
+// 示例
+const token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...";
+const decoded = decodeJWT(token);
+console.log(decoded.payload); // { sub: "123", ... }
+```
+
+#### JWT 签名算法
+
+| 算法  | 类型  | 密钥      | 用途               |
+| ----- | ----- | --------- | ------------------ |
+| HS256 | HMAC  | 共享密钥  | 对称加密，简单场景 |
+| RS256 | RSA   | 公钥/私钥 | 非对称加密，推荐   |
+| ES256 | ECDSA | 公钥/私钥 | 椭圆曲线，更高效   |
+
+```javascript
+// RS256 示例（推荐用于生产环境）
+const fs = require("fs");
+
+const privateKey = fs.readFileSync("private.key");
+const publicKey = fs.readFileSync("public.key");
+
+// 使用私钥签名
+const token = jwt.sign(payload, privateKey, { algorithm: "RS256" });
+
+// 使用公钥验证（验证服务可以和签名服务分离）
+const decoded = jwt.verify(token, publicKey, { algorithms: ["RS256"] });
+```
+
+#### JWT 最佳实践
+
+**1. Token 存储**
+
+```javascript
+// 方案 1：localStorage（简单但易受 XSS 攻击）
+localStorage.setItem("token", token);
+
+// 方案 2：HttpOnly Cookie（推荐，防 XSS）
+document.cookie = `token=${token}; path=/; HttpOnly; Secure; SameSite=Strict`;
+
+// 方案 3：内存存储（刷新页面需重新登录）
+let authToken = token;
+```
+
+**2. Token 刷新机制**
+
+```javascript
+// 短期 Access Token + 长期 Refresh Token
+app.post('/login', (req, res) => {
+  const user = validateUser(req.body);
+
+  // Access Token：15 分钟
+  const accessToken = jwt.sign(
+    { userId: user.id, role: user.role },
+    secretKey,
+    { expiresIn: '15m' }
+  );
+
+  // Refresh Token：7 天
+  const refreshToken = jwt.sign(
+    { userId: user.id, type: 'refresh' },
+    refreshSecretKey,
+    { expiresIn: '7d' }
+  );
+
+  // 存储 Refresh Token
+  await db.saveRefreshToken(refreshToken, user.id);
+
+  res.json({ accessToken, refreshToken });
+});
+
+// 刷新 Access Token
+app.post('/refresh', async (req, res) => {
+  const { refreshToken } = req.body;
+
+  try {
+    const payload = jwt.verify(refreshToken, refreshSecretKey);
+
+    // 验证 Refresh Token 是否有效
+    const tokenRecord = await db.findRefreshToken(refreshToken);
+    if (!tokenRecord || tokenRecord.userId !== payload.userId) {
+      return res.status(403).json({ error: 'Invalid refresh token' });
+    }
+
+    // 生成新的 Access Token
+    const newAccessToken = jwt.sign(
+      { userId: payload.userId, role: payload.role },
+      secretKey,
+      { expiresIn: '15m' }
+    );
+
+    res.json({ accessToken: newAccessToken });
+  } catch (err) {
+    res.status(403).json({ error: 'Invalid refresh token' });
+  }
+});
+```
+
+**3. Token 撤销策略**
+
+```javascript
+// 黑名单机制
+const tokenBlacklist = new Set();
+
+// 登出时将 Token 加入黑名单
+app.post("/logout", (req, res) => {
+  const token = req.headers["authorization"].split(" ")[1];
+  const decoded = jwt.decode(token);
+  tokenBlacklist.add(`${decoded.jti}:${decoded.exp}`);
+  res.json({ success: true });
+});
+
+// 验证中间件检查黑名单
+function authenticateJWT(req, res, next) {
+  const token = req.headers["authorization"].split(" ")[1];
+
+  // 检查是否在黑名单中
+  const decoded = jwt.decode(token);
+  if (tokenBlacklist.has(`${decoded.jti}:${decoded.exp}`)) {
+    return res.status(403).json({ error: "Token revoked" });
+  }
+
+  jwt.verify(token, secretKey, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: "Invalid token" });
+    }
+    req.user = user;
+    next();
+  });
+}
+```
+
+#### JWT vs Session
+
+| 特性         | Session      | JWT                   |
+| ------------ | ------------ | --------------------- |
+| 存储位置     | 服务器       | 客户端                |
+| 状态管理     | 有状态       | 无状态                |
+| 扩展性       | 需要共享存储 | 天然支持              |
+| 撤销能力     | 可立即撤销   | 较难撤销              |
+| 安全性       | 服务器控制   | 防泄露关键            |
+| 跨域支持     | 受限         | 支持                  |
+| Payload 大小 | 不受限       | 受限（建议 &lt; 4KB） |
+| 实现复杂度   | 简单         | 中等                  |
+
+#### 优点
+
+- **无状态**：无需服务器存储，易于横向扩展
+- **跨域支持**：天然支持 CORS，适用于微服务
+- **标准化**：RFC 7519 标准，跨语言兼容
+- **自包含**：Token 携带用户信息，减少数据库查询
+- **性能好**：无需查询数据库验证
+
+#### 缺点
+
+- **撤销困难**：Token 一旦签发，难以立即撤销
+- **Token 泄露风险**：必须设置合理过期时间
+- **Payload 限制**：不应包含敏感信息
+- **Token 大小**：Token 越大，请求开销越大
+
+#### 适用场景
+
+```javascript
+// 适用场景
+// 1. 分布式系统和微服务
+// 2. 移动应用和桌面应用
+// 3. 跨域 API
+// 4. 单点登录（SSO）
+// 5. 不适用：需要立即撤销 Token 的场景
+```
+
+## 第三代：现代授权框架
+
+### 5. OAuth 2.0
+
+**出现时间**：2012 年（RFC 6749）
+
+OAuth 2.0 是一个授权框架，允许用户授权第三方应用访问其在其他服务上的资源，而无需将用户名密码提供给第三方。
+
+#### 核心概念
+
+OAuth 2.0 解决的核心问题是：**用户如何安全地授权第三方应用访问其资源？**
+
+```
+┌─────────┐                  ┌──────────────┐
+│  用户   │                  │ 第三方应用   │
+└────┬────┘                  └──────┬───────┘
+     │                              │
+     │   (1) 用户授权                │
+     ├─────────────────────────────>│
+     │                              │
+     │                        (2) 获取授权码
+     │                              ├──────────┐
+     │                              │          │
+     │                         (3) 交换 Token │
+     │                              │          │
+     │                              ├──────┐   │
+     │                              │      ▼   │
+     │                              │  ┌──────────┐
+     │                              │  │ 授权服务器 │
+     │                              │  └─────┬────┘
+     │                              │        │
+     │                              │  (4) 返回 Access Token
+     │                              │        │
+     │                              │<───────┘
+     │                              │
+     │                    (5) 使用 Token 访问资源
+     │                              │
+     │                              ├──────────┐
+     │                              │          │
+     │                              ▼          │
+     │                           ┌─────────┐  │
+     │                           │ 资源服务器 │  │
+     │                           └─────────┘  │
+     │                                        │
+     └────────────────────────────────────────┘
+```
+
+#### OAuth 2.0 四种授权模式
+
+**1. Authorization Code（授权码模式）- 推荐使用**
+
+适用于有后端的服务端应用，安全性最高。
+
+```javascript
+// 1. 用户点击"使用 GitHub 登录"
+// 重定向到授权服务器
+window.location.href =
+  `https://github.com/login/oauth/authorize?` +
+  `client_id=${CLIENT_ID}&` +
+  `redirect_uri=${REDIRECT_URI}&` +
+  `scope=user:email&` +
+  `state=${generateState()}`;
+
+// 2. 用户授权后，GitHub 重定向回来
+// URL: https://yourapp.com/callback?code=xxx&state=yyy
+
+// 3. 后端服务器用 code 换取 access_token
+app.get("/callback", async (req, res) => {
+  const { code, state } = req.query;
+
+  // 验证 state 防止 CSRF
+  if (state !== req.session.state) {
+    return res.status(400).send("Invalid state");
+  }
+
+  // 用授权码换取 access_token
+  const response = await axios.post(
+    "https://github.com/login/oauth/access_token",
+    {
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      code: code,
+    },
+    {
+      headers: { Accept: "application/json" },
+    }
+  );
+
+  const { access_token } = response.data;
+
+  // 4. 使用 access_token 获取用户信息
+  const userResponse = await axios.get("https://api.github.com/user", {
+    headers: { Authorization: `Bearer ${access_token}` },
+  });
+
+  const user = userResponse.data;
+
+  // 5. 创建或更新用户，生成本地的 Session 或 JWT
+  const localUser = await createOrUpdateUser(user);
+  const jwtToken = generateJWT(localUser);
+
+  res.json({ token: jwtToken });
+});
+```
+
+**2. Implicit（隐式模式）- 已不推荐**
+
+适用于纯前端应用（SPA），但已不推荐使用，推荐使用 PKCE。
+
+```javascript
+// 前端直接获取 access_token
+window.location.href =
+  `https://auth.example.com/authorize?` +
+  `client_id=${CLIENT_ID}&` +
+  `redirect_uri=${REDIRECT_URI}&` +
+  `response_type=token&` + // 直接返回 token
+  `scope=read write&` +
+  `state=${generateState()}`;
+
+// 回调 URL: https://yourapp.com/callback#access_token=xxx&state=yyy
+// Token 在 URL fragment 中
+```
+
+**3. Resource Owner Password Credentials（密码模式）**
+
+适用于高度信任的应用，如官方移动应用。
+
+```javascript
+// 用户直接在应用中输入用户名密码
+app.post("/login", async (req, res) => {
+  const { username, password } = req.body;
+
+  // 直接向授权服务器发送用户名密码
+  const response = await axios.post("https://auth.example.com/oauth/token", {
+    grant_type: "password",
+    username: username,
+    password: password,
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+  });
+
+  const { access_token, refresh_token } = response.data;
+  res.json({ access_token, refresh_token });
+});
+```
+
+**4. Client Credentials（客户端凭证模式）**
+
+适用于服务端对服务端的通信，不需要用户参与。
+
+```javascript
+// 机器对机器的认证
+app.use(async (req, res, next) => {
+  // 从授权服务器获取 access_token
+  const response = await axios.post("https://auth.example.com/oauth/token", {
+    grant_type: "client_credentials",
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+  });
+
+  const { access_token } = response.data;
+
+  // 使用 access_token 访问资源
+  const resource = await axios.get("https://api.example.com/data", {
+    headers: { Authorization: `Bearer ${access_token}` },
+  });
+
+  res.json(resource.data);
+});
+```
+
+#### PKCE (Proof Key for Code Exchange)
+
+PKCE 是授权码模式的安全增强版本，特别适用于移动应用和 SPA。
+
+```javascript
+// 1. 生成 code_verifier 和 code_challenge
+function generatePKCE() {
+  const codeVerifier = base64UrlEncode(crypto.randomBytes(32));
+  const codeChallenge = base64UrlEncode(
+    crypto.createHash("sha256").update(codeVerifier).digest()
+  );
+
+  return { codeVerifier, codeChallenge };
+}
+
+const { codeVerifier, codeChallenge } = generatePKCE();
+
+// 2. 请求授权（包含 code_challenge）
+window.location.href =
+  `https://auth.example.com/authorize?` +
+  `client_id=${CLIENT_ID}&` +
+  `redirect_uri=${REDIRECT_URI}&` +
+  `response_type=code&` +
+  `code_challenge=${codeChallenge}&` +
+  `code_challenge_method=S256&` +
+  `state=${generateState()}`;
+
+// 3. 回调后，用 code_verifier 换取 token
+app.get("/callback", async (req, res) => {
+  const { code } = req.query;
+
+  const response = await axios.post("https://auth.example.com/oauth/token", {
+    grant_type: "authorization_code",
+    code: code,
+    code_verifier: codeVerifier, // 使用 code_verifier
+    redirect_uri: REDIRECT_URI,
+    client_id: CLIENT_ID,
+  });
+
+  const { access_token } = response.data;
+  // ...
+});
+```
+
+#### OAuth 2.1（最新版本）
+
+OAuth 2.1 是 OAuth 2.0 的现代化版本，包含许多安全改进：
+
+- 移除隐式流程（不安全）
+- 移除密码模式（除高度信任场景）
+- PKCE 成为所有流程的强制要求
+- 强制使用 HTTPS
+- 更好的刷新 Token 机制
+
+#### 优点
+
+- **标准化**：工业标准，广泛支持
+- **安全性高**：用户密码不泄露给第三方
+- **灵活性**：支持多种应用场景
+- **用户体验好**：一键授权，无需重复注册
+
+#### 缺点
+
+- **复杂度高**：理解协议和实现都有难度
+- **交互多**：需要多次网络请求
+- **依赖第三方**：依赖 OAuth 提供商
+
+#### 适用场景
+
+```javascript
+// 适用场景
+// 1. 社交登录（Google、GitHub、微信）
+// 2. 第三方 API 集成
+// 3. 单点登录（SSO）
+// 4. 企业级应用
+```
+
+### 6. OpenID Connect (OIDC)
+
+**出现时间**：2014 年
+
+OpenID Connect 构建在 OAuth 2.0 之上，增加了身份认证层。
+
+#### OAuth 2.0 vs OpenID Connect
+
+- **OAuth 2.0**：授权框架（Authorization），回答"你能做什么？"
+- **OpenID Connect**：身份认证协议（Authentication），回答"你是谁？"
+
+#### OIDC 工作原理
+
+OIDC 在 OAuth 2.0 基础上增加了：
+
+1. **ID Token**：包含用户身份信息的 JWT
+2. **UserInfo Endpoint**：获取用户信息的 API
+3. **标准化的 Claims**：统一的用户信息字段
+
+#### OIDC 流程
+
+```javascript
+// 1. 请求授权（增加 openid scope）
+window.location.href =
+  `https://auth.example.com/authorize?` +
+  `client_id=${CLIENT_ID}&` +
+  `redirect_uri=${REDIRECT_URI}&` +
+  `response_type=code&` +
+  `scope=openid profile email&` + // OIDC scope
+  `state=${generateState()}`;
+
+// 2. 回调后，用 code 换取 tokens（包含 id_token）
+app.get("/callback", async (req, res) => {
+  const { code } = req.query;
+
+  const response = await axios.post("https://auth.example.com/oauth/token", {
+    grant_type: "authorization_code",
+    code: code,
+    redirect_uri: REDIRECT_URI,
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+  });
+
+  const { access_token, id_token, refresh_token } = response.data;
+
+  // 3. 验证 ID Token（JWT）
+  const decoded = jwt.verify(id_token, publicKey, {
+    algorithms: ["RS256"],
+    issuer: "https://auth.example.com",
+    audience: CLIENT_ID,
+  });
+
+  // ID Token 包含用户身份信息
+  console.log(decoded.sub); // 用户 ID
+  console.log(decoded.name); // 用户名
+  console.log(decoded.email); // 邮箱
+  console.log(decoded.picture); // 头像 URL
+
+  // 4. 可选：使用 access_token 获取更多用户信息
+  const userInfo = await axios.get("https://auth.example.com/userinfo", {
+    headers: { Authorization: `Bearer ${access_token}` },
+  });
+
+  res.json({
+    user: decoded,
+    accessToken: access_token,
+    refreshToken: refresh_token,
+  });
+});
+```
+
+#### OIDC 标准化 Claims
+
+| Claim        | 描述                    | 示例                               |
+| ------------ | ----------------------- | ---------------------------------- |
+| `sub`        | Subject（用户唯一标识） | `"123456789"`                      |
+| `name`       | 用户全名                | `"张三"`                           |
+| `email`      | 邮箱地址                | `"user@example.com"`               |
+| `picture`    | 头像 URL                | `"https://example.com/avatar.jpg"` |
+| `locale`     | 语言/地区               | `"zh-CN"`                          |
+| `updated_at` | 最后更新时间            | `1516239022`                       |
+
+#### OIDC 实现示例
+
+**使用 NextAuth.js（流行方案）**：
+
+```javascript
+// app/api/auth/[...nextauth]/route.ts
+import NextAuth from "next-auth";
+import GoogleProvider from "next-auth/providers/google";
+
+export const authOptions = {
+  providers: [
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      authorization: {
+        params: {
+          prompt: "consent",
+          access_type: "offline",
+          response_type: "code",
+        },
+      },
+    }),
+  ],
+  callbacks: {
+    async jwt({ token, account, user }) {
+      // 首次登录，保存 access_token 和 refresh_token
+      if (account) {
+        token.accessToken = account.access_token;
+        token.refreshToken = account.refresh_token;
+      }
+      return token;
+    },
+    async session({ session, token }) {
+      session.accessToken = token.accessToken;
+      session.user.id = token.sub;
+      return session;
+    },
+  },
+};
+
+const handler = NextAuth(authOptions);
+export { handler as GET, handler as POST };
+```
+
+**使用 Auth0**：
+
+```javascript
+import { Auth0Provider } from "@auth0/auth0-react";
+
+function App() {
+  const domain = process.env.REACT_APP_AUTH0_DOMAIN;
+  const clientId = process.env.REACT_APP_AUTH0_CLIENT_ID;
+
+  return (
+    <Auth0Provider
+      domain={domain}
+      clientId={clientId}
+      authorizationParams={{
+        redirect_uri: window.location.origin,
+      }}
+    >
+      <MyApp />
+    </Auth0Provider>
+  );
+}
+
+// 使用 Auth0
+import { useAuth0 } from "@auth0/auth0-react";
+
+function Profile() {
+  const { user, isAuthenticated, loginWithRedirect, logout } = useAuth0();
+
+  if (!isAuthenticated) {
+    return <button onClick={loginWithRedirect}>登录</button>;
+  }
+
+  return (
+    <div>
+      <img src={user.picture} alt={user.name} />
+      <h2>{user.name}</h2>
+      <p>{user.email}</p>
+      <button onClick={() => logout({ returnTo: window.location.origin })}>
+        登出
+      </button>
+    </div>
+  );
+}
+```
+
+#### OIDC Provider
+
+| Provider   | 类型      | 文档          |
+| ---------- | --------- | ------------- |
+| Auth0      | 商业 SaaS | auth0.com     |
+| Okta       | 商业 SaaS | okta.com      |
+| Keycloak   | 开源      | keycloak.org  |
+| CAS        | 开源      | apereo.org    |
+| FusionAuth | 开源/商业 | fusionauth.io |
+
+#### 优点
+
+- **标准化**：基于 OAuth 2.0，广泛支持
+- **身份认证**：提供完整的身份认证功能
+- **互操作性**：跨提供商、跨平台
+- **用户体验好**：统一的登录体验
+
+#### 缺点
+
+- **复杂度高**：需要深入理解协议
+- **依赖 Provider**：依赖身份提供商
+- **学习曲线**：集成需要时间
+
+#### 适用场景
+
+```javascript
+// 适用场景
+// 1. 企业级单点登录（SSO）
+// 2. 社交登录（Google、GitHub、微信）
+// 3. 多应用统一认证
+// 4. B2B SaaS 应用
+```
+
+## 第四代：企业级安全标准
+
+### 7. SAML (Security Assertion Markup Language)
+
+**出现时间**：2002 年
+
+SAML 是基于 XML 的企业级单点登录和身份联合标准，广泛用于企业环境。
+
+#### SAML vs OIDC
+
+| 特性     | SAML   | OIDC       |
+| -------- | ------ | ---------- |
+| 格式     | XML    | JSON       |
+| 协议     | 复杂   | 简单       |
+| 应用场景 | 企业级 | Web 和移动 |
+| 性能     | 较重   | 轻量       |
+| 现代化   | 较老旧 | 现代       |
+
+#### SAML 工作流程
+
+```xml
+<!-- SAML 请求示例 -->
+<samlp:AuthnRequest
+  xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+  ID="_123456"
+  Version="2.0"
+  AssertionConsumerServiceURL="https://yourapp.com/saml/acs"
+  Destination="https://idp.example.com/sso">
+  <saml:Issuer xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion">
+    https://yourapp.com
+  </saml:Issuer>
+</samlp:AuthnRequest>
+
+<!-- SAML 响应示例 -->
+<samlp:Response
+  xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol"
+  ID="_678901"
+  Version="2.0">
+  <saml:Assertion
+    xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion"
+    ID="_234567"
+    IssueInstant="2026-03-08T10:00:00Z">
+    <saml:Issuer>https://idp.example.com</saml:Issuer>
+    <saml:Subject>
+      <saml:NameID>user@example.com</saml:NameID>
+    </saml:Subject>
+    <saml:AttributeStatement>
+      <saml:Attribute Name="email">
+        <saml:AttributeValue>user@example.com</saml:AttributeValue>
+      </saml:Attribute>
+    </saml:AttributeStatement>
+  </saml:Assertion>
+</samlp:Response>
+```
+
+#### Node.js SAML 实现
+
+```javascript
+const saml = require("saml2-js");
+const express = require("express");
+const app = express();
+
+// 创建 SAML 服务提供商（SP）
+const sp = saml.ServiceProvider({
+  entity_id: "https://yourapp.com",
+  private_key: fs.readFileSync("sp-key.pem"),
+  certificate: fs.readFileSync("sp-cert.pem"),
+  assert_endpoint: "https://yourapp.com/saml/acs",
+});
+
+// 创建 SAML 身份提供商（IdP）
+const idp = saml.IdentityProvider({
+  sso_login_url: "https://idp.example.com/sso",
+  sso_logout_url: "https://idp.example.com/slo",
+  certificates: [fs.readFileSync("idp-cert.pem")],
+});
+
+// 登录
+app.get("/login", (req, res) => {
+  sp.create_login_request_url(idp, {}, (err, login_url) => {
+    if (err) return res.status(500).send(err);
+    res.redirect(login_url);
+  });
+});
+
+// 断言消费者服务（ACS）端点
+app.post("/saml/acs", (req, res) => {
+  sp.post_assert(idp, { request_body: req.body }, (err, saml_response) => {
+    if (err) return res.status(500).send(err);
+
+    // 从 SAML 响应中提取用户信息
+    const nameID = saml_response.user.name_id;
+    const attributes = saml_response.user.attributes;
+
+    // 创建本地 Session 或 JWT
+    const user = {
+      id: nameID,
+      email: attributes.email,
+      name: attributes.name,
+    };
+
+    const token = generateJWT(user);
+    res.json({ token });
+  });
+});
+
+// 登出
+app.get("/logout", (req, res) => {
+  sp.create_logout_request_url(idp, {}, (err, logout_url) => {
+    if (err) return res.status(500).send(err);
+    res.redirect(logout_url);
+  });
+});
+```
+
+#### SAML 与 OIDC 互操作
+
+2026 年的趋势是从 SAML 迁移到 OIDC，但许多企业仍需要两者共存：
+
+```javascript
+// 使用 Auth0 同时支持 SAML 和 OIDC
+const auth0 = require("auth0");
+
+const managementClient = new auth0.ManagementClient({
+  domain: "your-tenant.auth0.com",
+  clientId: process.env.AUTH0_CLIENT_ID,
+  clientSecret: process.env.AUTH0_CLIENT_SECRET,
+});
+
+// 配置 SAML 企业连接
+await managementClient.connections.create({
+  name: "saml-enterprise",
+  strategy: "samlp",
+  options: {
+    signingCert: fs.readFileSync("idp-cert.pem"),
+    entryPoint: "https://idp.example.com/sso",
+  },
+});
+
+// 配置 OIDC 社交连接
+await managementClient.connections.create({
+  name: "google-oidc",
+  strategy: "oidc",
+  options: {
+    discoveryUrl:
+      "https://accounts.google.com/.well-known/openid-configuration",
+    clientID: process.env.GOOGLE_CLIENT_ID,
+    clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+  },
+});
+```
+
+#### 优点
+
+- **企业级**：成熟、安全、广泛采用
+- **功能丰富**：支持复杂的企业需求
+- **标准化**：OASIS 标准
+- **互操作**：跨厂商、跨平台
+
+#### 缺点
+
+- **复杂度高**：XML 格式，协议复杂
+- **性能较重**：XML 解析开销大
+- **移动端支持差**：不友好
+- **维护成本高**：配置和管理复杂
+
+#### 适用场景
+
+```javascript
+// 适用场景
+// 1. 大型企业环境
+// 2. 政府、金融、医疗等合规行业
+// 3. 需要与现有 SAML 系统集成
+// 4. 需要复杂的企业级功能
+```
+
+## 第五代：无密码认证时代
+
+### 8. FIDO2 / WebAuthn
+
+**出现时间**：2018 年
+
+FIDO2（Fast IDentity Online）是一组开放标准，旨在实现无密码认证。WebAuthn 是 FIDO2 在 Web 平台的实现。
+
+#### FIDO2 核心概念
+
+**1. 公钥密码学**：不使用密码，而是使用公钥/私钥对
+
+**2. 认证器（Authenticator）**：
+
+- 平台认证器：设备内置（如 MacBook 的 Touch ID、Windows Hello）
+- 跨平台认证器：外接设备（如 YubiKey）
+
+**3. 生物识别**：指纹、面部识别、虹膜等
+
+#### FIDO2 工作流程
+
+**注册（首次登录）**：
+
+```
+1. 用户输入用户名
+   ↓
+2. 服务器生成 challenge
+   ↓
+3. 认证器生成公钥/私钥对
+   ↓
+4. 私钥保存在认证器（不出设备）
+   ↓
+5. 公钥发送给服务器存储
+```
+
+**认证（后续登录）**：
+
+```
+1. 用户输入用户名
+   ↓
+2. 服务器生成新的 challenge
+   ↓
+3. 认证器用私钥签名 challenge
+   ↓
+4. 服务器用存储的公钥验证签名
+   ↓
+5. 认证成功
+```
+
+#### WebAuthn 实现示例
+
+**服务器端（Node.js）**：
+
+```javascript
+const fido2 = require("@simplewebauthn/server");
+const { base64url } = require("@simplewebauthn/browser");
+
+// 存储用户和凭据（生产环境应使用数据库）
+const users = new Map();
+const credentials = new Map();
+
+// 注册 - 生成注册选项
+app.get("/register/start", async (req, res) => {
+  const { username } = req.query;
+
+  const options = await fido2.generateRegistrationOptions({
+    rpName: "My App",
+    rpID: "localhost",
+    userID: base64url.encode(Buffer.from(username)),
+    userName: username,
+    timeout: 60000,
+    attestationType: "none",
+    authenticatorSelection: {
+      authenticatorAttachment: "platform",
+      userVerification: "preferred",
+    },
+  });
+
+  // 保存 challenge
+  req.session.currentChallenge = options.challenge;
+
+  res.json(options);
+});
+
+// 注册 - 验证凭据
+app.post("/register/finish", async (req, res) => {
+  const { username } = req.query;
+  const body = req.body;
+
+  const verification = await fido2.verifyRegistrationResponse({
+    response: body,
+    expectedChallenge: req.session.currentChallenge,
+    expectedOrigin: "http://localhost:3000",
+    expectedRPID: "localhost",
+  });
+
+  if (!verification.verified) {
+    return res.status(400).json({ error: "Registration failed" });
+  }
+
+  // 保存用户凭据
+  const credential = {
+    id: verification.registrationInfo.credentialID,
+    publicKey: verification.registrationInfo.credentialPublicKey,
+    counter: verification.registrationInfo.counter,
+  };
+
+  users.set(username, { username, credentials: [credential] });
+  credentials.set(credential.id, { username, ...credential });
+
+  res.json({ success: true });
+});
+
+// 登录 - 生成认证选项
+app.get("/login/start", async (req, res) => {
+  const { username } = req.query;
+  const user = users.get(username);
+
+  if (!user) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  const options = await fido2.generateAuthenticationOptions({
+    rpID: "localhost",
+    userVerification: "preferred",
+    allowCredentials: user.credentials.map((cred) => ({
+      id: cred.id,
+      type: "public-key",
+    })),
+  });
+
+  req.session.currentChallenge = options.challenge;
+
+  res.json(options);
+});
+
+// 登录 - 验证凭据
+app.post("/login/finish", async (req, res) => {
+  const { username } = req.query;
+  const body = req.body;
+  const user = users.get(username);
+
+  if (!user) {
+    return res.status(404).json({ error: "User not found" });
+  }
+
+  const credential = user.credentials.find((cred) => cred.id === body.id);
+  if (!credential) {
+    return res.status(400).json({ error: "Credential not found" });
+  }
+
+  const verification = await fido2.verifyAuthenticationResponse({
+    response: body,
+    expectedChallenge: req.session.currentChallenge,
+    expectedOrigin: "http://localhost:3000",
+    expectedRPID: "localhost",
+    authenticator: {
+      credentialPublicKey: credential.publicKey,
+      credentialID: credential.id,
+      counter: credential.counter,
+    },
+  });
+
+  if (!verification.verified) {
+    return res.status(400).json({ error: "Authentication failed" });
+  }
+
+  // 更新 counter
+  credential.counter = verification.authenticationInfo.newCounter;
+
+  // 生成 JWT
+  const token = generateJWT({ username });
+
+  res.json({ success: true, token });
+});
+```
+
+**客户端（JavaScript）**：
+
+```javascript
+import {
+  startRegistration,
+  startAuthentication,
+} from "@simplewebauthn/browser";
+
+// 注册
+async function register(username) {
+  // 获取注册选项
+  const options = await fetch(`/register/start?username=${username}`).then(
+    (res) => res.json()
+  );
+
+  // 调用浏览器 WebAuthn API
+  const registration = await startRegistration(options);
+
+  // 完成注册
+  const result = await fetch(`/register/finish?username=${username}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(registration),
+  }).then((res) => res.json());
+
+  if (result.success) {
+    console.log("注册成功！");
+  }
+}
+
+// 登录
+async function login(username) {
+  // 获取认证选项
+  const options = await fetch(`/login/start?username=${username}`).then((res) =>
+    res.json()
+  );
+
+  // 调用浏览器 WebAuthn API
+  const authentication = await startAuthentication(options);
+
+  // 完成认证
+  const result = await fetch(`/login/finish?username=${username}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(authentication),
+  }).then((res) => res.json());
+
+  if (result.success) {
+    console.log("登录成功！", result.token);
+    localStorage.setItem("token", result.token);
+  }
+}
+
+// HTML 绑定
+document.getElementById("registerBtn").onclick = () => {
+  const username = document.getElementById("username").value;
+  register(username);
+};
+
+document.getElementById("loginBtn").onclick = () => {
+  const username = document.getElementById("username").value;
+  login(username);
+};
+```
+
+#### Passkeys（通行密钥）
+
+Passkeys 是 Apple 对 FIDO2/WebAuthn 的实现，提供了更好的用户体验。
+
+```javascript
+// 检查浏览器支持
+if (!window.PublicKeyCredential) {
+  console.log("您的浏览器不支持 WebAuthn");
+} else {
+  console.log("支持 WebAuthn");
+}
+
+// 检查 Passkeys 支持
+if (
+  window.PublicKeyCredential &&
+  window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable
+) {
+  window.PublicKeyCredential.isUserVerifyingPlatformAuthenticatorAvailable().then(
+    (result) => {
+      if (result) {
+        console.log("支持 Passkeys");
+      }
+    }
+  );
+}
+```
+
+#### 优点
+
+- **无密码**：无需记住密码
+- **安全性高**：私钥不出设备，钓鱼攻击无效
+- **用户体验好**：一键登录
+- **跨平台**：支持 Web、移动端、桌面
+
+#### 缺点
+
+- **浏览器支持**：需要较新的浏览器
+- **设备要求**：需要支持生物识别的设备
+- **学习成本**：用户需要适应新方式
+- **服务器实现**：相对复杂
+
+#### 适用场景
+
+```javascript
+// 适用场景
+// 1. 金融、支付等高安全场景
+// 2. 企业内网
+// 3. 密码管理器
+// 4. 对安全性要求高的应用
+```
+
+### 9. 多因素认证（MFA）
+
+**出现时间**：持续演进
+
+多因素认证通过组合多种认证方式提高安全性。
+
+#### MFA 因素
+
+| 因素类型 | 示例             | 安全性 |
+| -------- | ---------------- | ------ |
+| 知识因素 | 密码、PIN        | 低     |
+| 持有因素 | 手机、硬件 Token | 中     |
+| 生物因素 | 指纹、面部       | 高     |
+
+#### MFA 实现示例
+
+```javascript
+// 使用 TOTP（基于时间的一次性密码）
+const speakeasy = require('speakeasy');
+const QRCode = require('qrcode');
+
+// 生成 TOTP 密钥
+app.post('/mfa/setup', (req, res) => {
+  const secret = speakeasy.generateSecret({
+    name: 'My App (user@example.com)',
+    issuer: 'My App'
+  });
+
+  // 保存 secret 到数据库
+  await db.saveMFASecret(req.user.id, secret.base32);
+
+  // 生成二维码
+  QRCode.toDataURL(secret.otpauth_url, (err, url) => {
+    if (err) {
+      res.status(500).json({ error: 'Failed to generate QR code' });
+    } else {
+      res.json({
+        secret: secret.base32,
+        qrCode: url
+      });
+    }
+  });
+});
+
+// 验证 TOTP
+app.post('/mfa/verify', (req, res) => {
+  const { token } = req.body;
+  const userSecret = await db.getMFASecret(req.user.id);
+
+  const verified = speakeasy.totp.verify({
+    secret: userSecret,
+    encoding: 'base32',
+    token: token,
+    window: 2  // 允许时间窗口误差
+  });
+
+  if (verified) {
+    req.user.mfaEnabled = true;
+    await db.updateUser(req.user);
+    res.json({ success: true });
+  } else {
+    res.status(400).json({ error: 'Invalid token' });
+  }
+});
+
+// 登录时验证 MFA
+app.post('/login', async (req, res) => {
+  const { username, password, mfaToken } = req.body;
+
+  // 1. 验证用户名密码
+  const user = await validateUser(username, password);
+  if (!user) {
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+
+  // 2. 检查是否启用了 MFA
+  if (user.mfaEnabled) {
+    if (!mfaToken) {
+      // 返回需要 MFA 验证的状态
+      return res.json({
+        requiresMFA: true,
+        userId: user.id
+      });
+    }
+
+    // 验证 MFA Token
+    const secret = await db.getMFASecret(user.id);
+    const verified = speakeasy.totp.verify({
+      secret: secret,
+      encoding: 'base32',
+      token: mfaToken
+    });
+
+    if (!verified) {
+      return res.status(401).json({ error: 'Invalid MFA token' });
+    }
+  }
+
+  // 3. 生成 JWT
+  const token = generateJWT(user);
+  res.json({ success: true, token });
+});
+```
+
+#### SMS 验证码
+
+```javascript
+const twilio = require("twilio");
+
+const client = new twilio(
+  process.env.TWILIO_ACCOUNT_SID,
+  process.env.TWILIO_AUTH_TOKEN
+);
+
+// 发送验证码
+app.post("/mfa/sms/send", async (req, res) => {
+  const code = Math.floor(100000 + Math.random() * 900000).toString();
+
+  // 保存验证码（5 分钟过期）
+  await redis.setex(`sms:${req.user.phone}`, 300, code);
+
+  // 发送短信
+  await client.messages.create({
+    to: req.user.phone,
+    from: process.env.TWILIO_PHONE_NUMBER,
+    body: `您的验证码是: ${code}，5 分钟内有效。`,
+  });
+
+  res.json({ success: true });
+});
+
+// 验证 SMS 验证码
+app.post("/mfa/sms/verify", async (req, res) => {
+  const { code } = req.body;
+  const storedCode = await redis.get(`sms:${req.user.phone}`);
+
+  if (!storedCode || storedCode !== code) {
+    return res.status(400).json({ error: "Invalid code" });
+  }
+
+  // 删除已使用的验证码
+  await redis.del(`sms:${req.user.phone}`);
+
+  res.json({ success: true });
+});
+```
+
+#### 优点
+
+- **安全性高**：多重验证，降低风险
+- **灵活性**：可组合多种认证方式
+- **合规要求**：满足安全合规标准
+
+#### 缺点
+
+- **用户体验**：增加登录步骤
+- **成本**：硬件 Token、短信等有成本
+- **实施复杂**：需要开发和维护
+
+#### 适用场景
+
+```javascript
+// 适用场景
+// 1. 金融、银行
+// 2. 企业系统
+// 3. 支付平台
+// 4. 任何需要高安全性的场景
+```
+
+## 鉴权技术对比总结
+
+| 技术             | 出现时间 | 状态管理 | 复杂度 | 安全性 | 适用场景             |
+| ---------------- | -------- | -------- | ------ | ------ | -------------------- |
+| HTTP Basic       | 1990s    | 无       | 低     | 低     | 测试、内部工具       |
+| Session + Cookie | 1990s    | 服务器   | 中     | 中     | 传统 Web 应用        |
+| Token-based      | 2010s    | 服务器   | 中     | 中     | 移动应用、微服务     |
+| JWT              | 2010s    | 客户端   | 中     | 中高   | 分布式系统、SSO      |
+| OAuth 2.0        | 2012     | 服务器   | 高     | 高     | 第三方授权、社交登录 |
+| OIDC             | 2014     | 服务器   | 高     | 高     | 企业 SSO、身份认证   |
+| SAML             | 2002     | 服务器   | 高     | 高     | 企业级、合规行业     |
+| FIDO2/WebAuthn   | 2018     | 服务器   | 高     | 极高   | 无密码认证、高安全   |
+| MFA              | 持续     | 服务器   | 高     | 极高   | 金融、企业           |
+
+## 实践指南
+
+### 选择合适的鉴权方案
+
+```javascript
+// 决策树
+function chooseAuthMethod(context) {
+  if (context.isInternalTool && context.quickSetup) {
+    return "HTTP Basic"; // 内部工具，快速搭建
+  }
+
+  if (context.type === "traditional-web") {
+    return "Session + Cookie"; // 传统 Web 应用
+  }
+
+  if (context.type === "mobile-app" || context.type === "api") {
+    return "JWT"; // 移动应用、API
+  }
+
+  if (context.needsSocialLogin) {
+    return "OAuth 2.0 / OIDC"; // 社交登录
+  }
+
+  if (context.type === "enterprise") {
+    if (context.useExistingSAML) {
+      return "SAML"; // 现有 SAML 系统
+    }
+    return "OIDC"; // 新企业系统
+  }
+
+  if (context.security === "extreme") {
+    return "FIDO2/WebAuthn + MFA"; // 高安全场景
+  }
+
+  return "JWT"; // 默认选择
+}
+```
+
+### 安全最佳实践
+
+```javascript
+// 1. 使用 HTTPS
+// 2. 合理设置过期时间
+// 3. 实现安全配置（HttpOnly、Secure、SameSite）
+// 4. 使用强加密算法（RS256 > HS256）
+// 5. 实现 Token 刷新机制
+// 6. 记录安全日志
+// 7. 实现速率限制
+// 8. 启用 MFA
+```
+
+### 未来趋势
+
+2026 年及未来的鉴权趋势：
+
+1. **无密码认证普及**：FIDO2/WebAuthn 和 Passkeys 越来越普及
+2. **OIDC 取代 SAML**：企业从 SAML 迁移到 OIDC
+3. **零信任架构**：永不信任，始终验证
+4. **AI 驱动的风控**：使用 AI 检测异常行为
+5. **去中心化身份**：DID（Decentralized Identity）
+6. **生物识别增强**：更先进的生物识别技术
+
+## 总结
+
+鉴权技术从简单的 Basic Authentication 到现代的 FIDO2/WebAuthn，经历了多次重大演进。选择合适的鉴权方案需要考虑：
+
+- 应用类型（Web、移动、API）
+- 安全要求（普通、高、极高）
+- 用户体验（便捷 vs 安全）
+- 技术复杂度
+- 合规要求
+- 成本预算
+
+没有一种方案是完美的，关键是在安全性、用户体验和实施成本之间找到平衡。对于大多数现代应用，推荐使用 OAuth 2.0/OIDC 结合 JWT 的方案，对于高安全场景，可以添加 FIDO2/WebAuthn 和 MFA。
+
+希望本文能帮助你全面了解鉴权技术，并在实际项目中做出正确的技术选型！
+
+---
+
+**参考资源**：
+
+- [OAuth 2.1 规范](https://datatracker.ietf.org/doc/html/draft-ietf-oauth-v2-1-07)
+- [OpenID Connect 规范](https://openid.net/connect/)
+- [WebAuthn 规范](https://www.w3.org/TR/webauthn/)
+- [NextAuth.js](https://next-auth.js.org/)
+- [FIDO Alliance](https://fidoalliance.org/)
