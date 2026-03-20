@@ -5,6 +5,7 @@ import BackButton from "./BackButton";
 export async function generateStaticParams() {
   const posts = getAllPosts();
   return posts.map((post) => ({
+    category: post.category,
     slug: post.slug,
   }));
 }
@@ -12,10 +13,10 @@ export async function generateStaticParams() {
 export async function generateMetadata({
   params,
 }: {
-  params: Promise<{ slug: string }>;
+  params: Promise<{ category: string; slug: string }>;
 }) {
-  const { slug } = await params;
-  const post = await getPostBySlug(slug);
+  const { category, slug } = await params;
+  const post = await getPostBySlug(category, slug);
   if (!post) {
     return {};
   }
@@ -49,10 +50,10 @@ function getCategoryColor(category: string) {
 export default async function Post({
   params,
 }: {
-  params: Promise<{ slug: string }>;
+  params: Promise<{ category: string; slug: string }>;
 }) {
-  const { slug } = await params;
-  const post = await getPostBySlug(slug);
+  const { category, slug } = await params;
+  const post = await getPostBySlug(category, slug);
 
   if (!post) {
     notFound();

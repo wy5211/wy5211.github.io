@@ -131,29 +131,26 @@ export function getPostsByCategory(): Record<string, PostMeta[]> {
   return orderedGrouped;
 }
 
-// 在目录中查找匹配 slug 的文件
-function findFileBySlug(dir: string, slug: string): string | null {
-  if (!fs.existsSync(dir)) {
+// 在指定分类目录中查找匹配 slug 的文件
+function findFileByCategoryAndSlug(
+  category: string,
+  slug: string
+): string | null {
+  const categoryDir = path.join(postsDirectory, category);
+
+  if (!fs.existsSync(categoryDir)) {
     return null;
   }
 
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  const entries = fs.readdirSync(categoryDir, { withFileTypes: true });
 
   for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-
-    if (entry.isDirectory()) {
-      // 递归查找子目录
-      const found = findFileBySlug(fullPath, slug);
-      if (found) {
-        return found;
-      }
-    } else if (entry.isFile() && entry.name.endsWith(".mdx")) {
+    if (entry.isFile() && entry.name.endsWith(".mdx")) {
       // 检查文件名是否匹配 slug（去掉序号前缀和扩展名后）
-      const fileSlug = entry.name.replace(/\.mdx$/, "").replace(/^\d+-/, ""); // 去掉序号前缀
+      const fileSlug = entry.name.replace(/\.mdx$/, "").replace(/^\d+-/, "");
 
       if (fileSlug === slug) {
-        return fullPath;
+        return path.join(categoryDir, entry.name);
       }
     }
   }
@@ -162,9 +159,12 @@ function findFileBySlug(dir: string, slug: string): string | null {
 }
 
 // 获取单篇文章详情（包含编译后的内容）
-export async function getPostBySlug(slug: string): Promise<Post | null> {
+export async function getPostBySlug(
+  category: string,
+  slug: string
+): Promise<Post | null> {
   const realSlug = slug.replace(/\.mdx$/, "");
-  const fullPath = findFileBySlug(postsDirectory, realSlug);
+  const fullPath = findFileByCategoryAndSlug(category, realSlug);
 
   if (!fullPath) {
     return null;

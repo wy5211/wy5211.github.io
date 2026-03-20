@@ -1,15 +1,15 @@
 "use client";
 
 import Link from "next/link";
-import { useSearchParams } from "next/navigation";
+import { useParams } from "next/navigation";
 
 interface BackButtonProps {
   variant?: "text" | "primary";
 }
 
 export default function BackButton({ variant = "text" }: BackButtonProps) {
-  const searchParams = useSearchParams();
-  const category = searchParams.get("category");
+  const params = useParams();
+  const category = params.category as string;
 
   const href = category ? `/?category=${encodeURIComponent(category)}` : "/";
 

@@ -124,13 +124,7 @@ export default function PostList({ posts }: PostListProps) {
             className="group glass rounded-xl p-6 border border-gray-200 dark:border-neutral-700 hover:shadow-xl hover:border-blue-300 dark:hover:border-blue-600 transition-all duration-300 hover:-translate-y-1 animate-fade-in"
             style={{ animationDelay: `${index * 50}ms` }}
           >
-            <Link
-              href={
-                selectedCategory === "全部"
-                  ? `/posts/${post.slug}`
-                  : `/posts/${post.slug}?category=${encodeURIComponent(selectedCategory)}`
-              }
-            >
+            <Link href={`/posts/${post.category}/${post.slug}`}>
               <h2 className="text-xl font-bold mb-3 text-gray-900 dark:text-gray-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors line-clamp-2">
                 {post.title}
               </h2>
@@ -171,11 +165,7 @@ export default function PostList({ posts }: PostListProps) {
 
             <div className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-700">
               <Link
-                href={
-                  selectedCategory === "全部"
-                    ? `/posts/${post.slug}`
-                    : `/posts/${post.slug}?category=${encodeURIComponent(selectedCategory)}`
-                }
+                href={`/posts/${post.category}/${post.slug}`}
                 className="inline-flex items-center text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 group/link"
               >
                 阅读更多
