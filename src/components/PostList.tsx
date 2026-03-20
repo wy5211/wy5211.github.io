@@ -13,15 +13,11 @@ export default function PostList({ posts }: PostListProps) {
   const router = useRouter();
   const searchParams = useSearchParams();
   const categoryParam = searchParams.get("category");
-  const selectedCategory = categoryParam || "全部";
+  const selectedCategory = categoryParam || "";
 
   // 更新 URL 参数的函数
   const updateCategory = (category: string) => {
-    if (category === "全部") {
-      router.push("/");
-    } else {
-      router.push(`/?category=${encodeURIComponent(category)}`);
-    }
+    router.push(`/?category=${encodeURIComponent(category)}`);
   };
 
   const categories = useMemo(() => {
@@ -51,12 +47,12 @@ export default function PostList({ posts }: PostListProps) {
       (cat) => !categoryOrder.includes(cat)
     );
 
-    return ["全部", ...orderedCategories, ...otherCategories];
+    return [...orderedCategories, ...otherCategories];
   }, [posts]);
 
   // 根据选中的分类过滤文章
   const filteredPosts = useMemo(() => {
-    if (selectedCategory === "全部") {
+    if (!selectedCategory) {
       return posts;
     }
     return posts.filter((post) => post.category === selectedCategory);
@@ -108,7 +104,7 @@ export default function PostList({ posts }: PostListProps) {
       {/* 文章数量统计 */}
       <div className="mb-6 text-center">
         <p className="text-sm text-gray-500 dark:text-gray-400">
-          {selectedCategory === "全部" ? "全部" : selectedCategory} · 共{" "}
+          {selectedCategory || "全部"} · 共{" "}
           <span className="font-semibold text-blue-600 dark:text-blue-400">
             {filteredPosts.length}
           </span>{" "}
@@ -120,7 +116,7 @@ export default function PostList({ posts }: PostListProps) {
       <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
         {filteredPosts.map((post, index) => (
           <article
-            key={post.slug}
+            key={`${post.category}-${post.slug}`}
             className="group glass rounded-xl p-6 border border-gray-200 dark:border-neutral-700 hover:shadow-xl hover:border-blue-300 dark:hover:border-blue-600 transition-all duration-300 hover:-translate-y-1 animate-fade-in"
             style={{ animationDelay: `${index * 50}ms` }}
           >

@@ -203,3 +203,60 @@ export async function getPostBySlug(
     content,
   };
 }
+
+// 获取当前分类下的下一篇
+export function getNextPost(
+  category: string,
+  currentSlug: string
+): PostMeta | null {
+  const categoryDir = path.join(postsDirectory, category);
+
+  if (!fs.existsSync(categoryDir)) {
+    return null;
+  }
+
+  // 获取该分类下所有 .mdx 文件
+  const entries = fs.readdirSync(categoryDir, { withFileTypes: true });
+  const files: Array<{ fileName: string; slug: string; order: number }> = [];
+
+  for (const entry of entries) {
+    if (entry.isFile() && entry.name.endsWith(".mdx")) {
+      const fileName = entry.name;
+      // 提取序号（如 01-xxx.mdx 中的 01）
+      const match = fileName.match(/^(\d+)-/);
+
+      if (match) {
+        const order = parseInt(match[1], 10);
+        const slug = fileName.replace(/\.mdx$/, "").replace(/^\d+-/, "");
+        files.push({ fileName, slug, order });
+      }
+    }
+  }
+
+  // 按序号排序
+  files.sort((a, b) => a.order - b.order);
+
+  // 找到当前文章的位置
+  const currentIndex = files.findIndex((f) => f.slug === currentSlug);
+
+  // 如果找到了且不是最后一篇，返回下一篇
+  if (currentIndex !== -1 && currentIndex < files.length - 1) {
+    const nextFile = files[currentIndex + 1];
+    const fullPath = path.join(categoryDir, nextFile.fileName);
+    const fileContents = fs.readFileSync(fullPath, "utf8");
+    const { data } = matter(fileContents);
+
+    return {
+      slug: nextFile.slug,
+      title: data.title,
+      date: data.date,
+      summary: data.summary,
+      tags: data.tags || [],
+      category: data.category,
+      cover: data.cover,
+      draft: data.draft || false,
+    };
+  }
+
+  return null;
+}

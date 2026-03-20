@@ -1,5 +1,6 @@
-import { getAllPosts, getPostBySlug } from "@/lib/posts";
+import { getAllPosts, getPostBySlug, getNextPost } from "@/lib/posts";
 import { notFound } from "next/navigation";
+import Link from "next/link";
 import BackButton from "./BackButton";
 
 export async function generateStaticParams() {
@@ -54,6 +55,7 @@ export default async function Post({
 }) {
   const { category, slug } = await params;
   const post = await getPostBySlug(category, slug);
+  const nextPost = getNextPost(category, slug);
 
   if (!post) {
     notFound();
@@ -112,8 +114,56 @@ export default async function Post({
       </div>
 
       {/* 文章底部 */}
-      <footer className="mt-8 text-center">
-        <BackButton variant="primary" />
+      <footer className="mt-8 space-y-4">
+        {/* 下一篇链接 */}
+        {nextPost && (
+          <Link
+            href={`/posts/${nextPost.category}/${nextPost.slug}`}
+            className="glass block w-full rounded-xl p-6 border border-gray-200 dark:border-neutral-700 hover:border-blue-400 dark:hover:border-blue-500 transition-all group"
+          >
+            <div className="flex items-center justify-between">
+              <div className="flex-1">
+                <div className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400 mb-2">
+                  <svg
+                    className="w-4 h-4"
+                    fill="none"
+                    stroke="currentColor"
+                    viewBox="0 0 24 24"
+                  >
+                    <path
+                      strokeLinecap="round"
+                      strokeLinejoin="round"
+                      strokeWidth={2}
+                      d="M13 7l5 5m0 0l-5 5m5-5H6"
+                    />
+                  </svg>
+                  <span>下一篇</span>
+                </div>
+                <h3 className="text-lg font-semibold text-gray-900 dark:text-gray-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
+                  {nextPost.title}
+                </h3>
+              </div>
+              <svg
+                className="w-6 h-6 text-gray-400 group-hover:text-blue-600 dark:group-hover:text-blue-400 group-hover:translate-x-1 transition-all"
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={2}
+                  d="M9 5l7 7-7 7"
+                />
+              </svg>
+            </div>
+          </Link>
+        )}
+
+        {/* 返回按钮 */}
+        <div className="text-center">
+          <BackButton variant="primary" />
+        </div>
       </footer>
     </article>
   );
