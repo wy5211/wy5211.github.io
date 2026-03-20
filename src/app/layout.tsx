@@ -1,12 +1,14 @@
 import "./globals.css";
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
+import Header from "@/components/layout/Header";
+import Footer from "@/components/layout/Footer";
 
 const inter = Inter({ subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "博客文章",
-  description: "A personal blog built with Next.js",
+  title: "王阳的博客",
+  description: "分享前端、后端、全栈开发技术文章",
 };
 
 export default function RootLayout({
@@ -15,8 +17,12 @@ export default function RootLayout({
   children: React.ReactNode;
 }) {
   return (
-    <html lang="en">
-      <body className={inter.className}>{children}</body>
+    <html lang="zh-CN">
+      <body className={inter.className}>
+        <Header />
+        <main className="min-h-screen pt-16">{children}</main>
+        <Footer />
+      </body>
     </html>
   );
 }
