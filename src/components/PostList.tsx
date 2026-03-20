@@ -21,6 +21,7 @@ export default function PostList({ posts }: PostListProps) {
     "运维",
     "大模型/AI",
     "提效工具",
+    "数据库",
   ];
 
   const categories = useMemo(() => {

@@ -1,0 +1,478 @@
+---
+title: "09. 执行计划分析：诊断数据库性能问题的终极武器"
+date: "2026-03-19"
+summary: "深入理解 PostgreSQL 执行计划，掌握诊断性能问题的核心技能"
+tags: ["PostgreSQL", "执行计划", "性能诊断", "EXPLAIN"]
+category: "数据库"
+cover: ""
+draft: false
+series: "数据库渐进式学习路线"
+seriesOrder: 9
+---
+
+## 前言
+
+你的查询慢，但你不知道为什么？执行计划分析就是诊断性能问题的终极武器！
+
+通过执行计划，你可以看到数据库是如何执行你的查询的，哪里是瓶颈，是否使用了索引，如何优化。
+
+本文将深入讲解 PostgreSQL 执行计划的各个要素，帮助你成为性能诊断专家。
+
+---
+
+## 核心概念
+
+### 什么是执行计划？
+
+**执行计划**是数据库优化器生成的查询执行步骤图，展示了数据库如何获取数据。
+
+**如何查看执行计划**：
+
+```sql
+-- 方式 1：EXPLAIN（不执行查询）
+EXPLAIN SELECT * FROM users WHERE email = 'user@example.com';
+
+-- 方式 2：EXPLAIN ANALYZE（执行并返回实际执行时间）
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'user@example.com';
+
+-- 方式 3：详细模式
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE) SELECT * FROM users WHERE email = 'user@example.com';
+```
+
+---
+
+## 扫描方式
+
+### 1. Seq Scan（顺序扫描）
+
+全表扫描，最慢的方式。
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM users;
+
+-- 输出
+-- Seq Scan on users (cost=0.00..25.50 rows=1000 width=200) (actual time=0.123..5.678 rows=1000 loops=1)
+```
+
+**何时出现**：
+
+- ❌ 没有索引
+- ❌ 数据量小（优化器选择全表扫描）
+- ❌ 返回大部分数据
+
+---
+
+### 2. Index Scan（索引扫描）
+
+使用索引扫描，快。
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'user@example.com';
+
+-- 输出
+-- Index Scan using idx_users_email on users (cost=0.42..8.44 rows=1 width=200) (actual time=0.123..0.456 rows=1 loops=1)
+--   Index Cond: (email = 'user@example.com'::text)
+```
+
+**何时出现**：
+
+- ✅ 有索引
+- ✅ 返回少量数据（< 10%）
+
+---
+
+### 3. Index Only Scan（只读索引扫描）
+
+最快，只读索引，不读表。
+
+```sql
+EXPLAIN ANALYZE SELECT email FROM users WHERE email = 'user@example.com';
+
+-- 输出
+-- Index Only Scan using idx_users_email on users (cost=0.42..8.44 rows=1 width=32) (actual time=0.123..0.234 rows=1 loops=1)
+--   Heap Fetches: 0
+```
+
+**何时出现**：
+
+- ✅ 查询的列都在索引中
+- ✅ 覆盖索引
+
+---
+
+### 4. Bitmap Index Scan（位图索引扫描）
+
+结合索引和全表扫描，适合 OR 条件。
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'a@example.com' OR email = 'b@example.com';
+
+-- 输出
+-- Bitmap Heap Scan on users (cost=20.50..40.50 rows=100 width=200)
+--   Recheck Cond: ((email = 'a@example.com'::text) OR (email = 'b@example.com'::text))
+--   -> BitmapOr (cost=10.00..10.00 rows=200 width=0)
+--     -> Bitmap Index Scan on idx_users_email (cost=5.00..5.00 rows=100 width=0)
+--         Index Cond: (email = 'a@example.com'::text)
+--     -> Bitmap Index Scan on idx_users_email (cost=5.00..5.00 rows=100 width=0)
+--         Index Cond: (email = 'b@example.com'::text)
+```
+
+---
+
+## 连接方式
+
+### 1. Nested Loop（嵌套循环）
+
+适合小表。
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM users u
+INNER JOIN orders o ON u.id = o.user_id;
+
+-- 输出
+-- Nested Loop (cost=0.42..12345.67 rows=1000 width=400)
+--   -> Index Scan using users_pkey on users (cost=0.42..8.44 rows=100 width=200)
+--   -> Index Scan using idx_orders_user_id on orders (cost=0.42..12.34 rows=10 width=200)
+--       Index Cond: (user_id = u.id)
+```
+
+**何时出现**：
+
+- ✅ 小表连接
+- ✅ 有索引
+
+---
+
+### 2. Hash Join（哈希连接）
+
+适合大表。
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM users u
+INNER JOIN orders o ON u.id = o.user_id;
+
+-- 输出
+-- Hash Join (cost=123.45..23456.78 rows=10000 width=400)
+--   Hash Cond: (o.user_id = u.id)
+--   -> Seq Scan on orders (cost=0.00..12345.67 rows=100000 width=200)
+--   -> Hash (cost=22.00..22.00 rows=1000 width=200)
+--       -> Seq Scan on users (cost=0.00..22.00 rows=1000 width=200)
+```
+
+**何时出现**：
+
+- ✅ 大表连接
+- ✅ 等值连接
+- ❌ 不适合排序数据
+
+---
+
+### 3. Merge Join（合并连接）
+
+适合已排序的数据。
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+ORDER BY u.id;
+
+-- 输出
+-- Merge Join (cost=123.45..23456.78 rows=10000 width=400)
+--   Merge Cond: (u.id = o.user_id)
+--   -> Index Scan using users_pkey on users (cost=0.42..123.45 rows=1000 width=200)
+--   -> Sort (cost=123.45..126.78 rows=100000 width=200)
+--       Sort Key: o.user_id
+--       -> Seq Scan on orders (cost=0.00..12345.67 rows=100000 width=200)
+```
+
+**何时出现**：
+
+- ✅ 已排序的数据
+- ✅ 大表连接
+- ✅ 排序连接
+
+---
+
+## 聚合方式
+
+### 1. Hash Aggregate（哈希聚合）
+
+```sql
+EXPLAIN ANALYZE
+SELECT user_id, COUNT(*), SUM(total)
+FROM orders
+GROUP BY user_id;
+
+-- 输出
+-- HashAggregate (cost=12345.67..13456.78 rows=1000 width=40)
+--   Group Key: user_id
+--   -> Seq Scan on orders (cost=0.00..12345.67 rows=100000 width=20)
+```
+
+---
+
+### 2. GroupAggregate（分组聚合）
+
+```sql
+EXPLAIN ANALYZE
+SELECT DATE(created_at), COUNT(*)
+FROM orders
+GROUP BY DATE(created_at);
+
+-- 输出
+-- GroupAggregate (cost=12345.67..13456.78 rows=1000 width=40)
+--   Group Key: DATE(created_at)
+--   -> Sort (cost=12345.67..12678.90 rows=100000 width=20)
+--       Sort Key: DATE(created_at)
+--       -> Seq Scan on orders (cost=0.00..12345.67 rows=100000 width=20)
+```
+
+---
+
+## 执行计划解读
+
+### 完整示例
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
+SELECT
+  u.email,
+  o.order_number,
+  o.total
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+WHERE u.is_verified = TRUE
+  AND o.created_at >= '2024-01-01'
+ORDER BY o.created_at DESC
+LIMIT 20;
+```
+
+**输出解读**：
+
+```
+Limit  (cost=1234.56..1234.78 rows=20 width=200) (actual time=0.123..12.345 rows=20 loops=1)
+  Buffers: shared hit=1234 read=56
+  -> Sort  (cost=1234.56..1234.78 rows=20 width=200) (actual time=0.123..12.234 rows=20 loops=1)
+        Sort Key: o.created_at DESC
+        Sort Method: top-N heapsort  Memory: 25kB
+        Buffers: shared hit=1234 read=56
+        -> Hash Join  (cost=100.00..1234.56 rows=1000 width=200) (actual time=0.123..10.123 rows=1000 loops=1)
+              Hash Cond: (o.user_id = u.id)
+              Buffers: shared hit=1234 read=56
+              -> Index Scan using idx_orders_created on orders o  (cost=0.42..1000.00 rows=10000 width=100) (actual time=0.123..5.123 rows=10000 loops=1)
+                    Index Cond: (created_at >= '2024-01-01'::date)
+                    Buffers: shared hit=567 read=23
+              -> Hash  (cost=50.00..50.00 rows=1000 width=100) (actual time=0.123..0.234 rows=1000 loops=1)
+                    Buckets: 1024  Batches: 1  Memory Usage: 64kB
+                    Buffers: shared hit=12 read=3
+                    -> Index Scan using idx_users_verified on users u  (cost=0.42..50.00 rows=1000 width=100) (actual time=0.123..0.456 rows=1000 loops=1)
+                          Index Cond: (is_verified = true)
+                          Buffers: shared hit=12 read=3
+```
+
+**关键信息**：
+
+- `cost=123.45..234.56`：成本估算（启动成本..总成本）
+- `actual time=0.123..12.345`：实际执行时间（毫秒）
+- `rows=20`：实际返回行数
+- `loops=1`：循环次数
+- `Buffers`：缓冲区使用情况
+- `shared hit=1234`：共享缓冲命中
+- `read=56`：从磁盘读取
+
+---
+
+## 性能问题诊断
+
+### 1. 全表扫描
+
+```sql
+-- 问题：Seq Scan（应该用索引）
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 'user-1';
+
+-- 解决：创建索引
+CREATE INDEX idx_orders_user_id ON orders(user_id);
+```
+
+---
+
+### 2. 缺失索引
+
+```sql
+-- 问题：Filter 而不是 Index Scan
+EXPLAIN ANALYZE SELECT * FROM orders WHERE status = 'paid';
+
+-- 输出：Seq Scan on orders (cost=..)
+--       Filter: (status = 'paid'::text)
+
+-- 解决：创建索引
+CREATE INDEX idx_orders_status ON orders(status);
+```
+
+---
+
+### 3. 统计信息过时
+
+```sql
+-- 问题：优化器选择错误的计划
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 'user-1';
+
+-- 解决：更新统计信息
+ANALYZE orders;
+
+-- 或收集详细统计信息
+ALTER TABLE orders SET (statistics_target = 1000);
+ANALYZE orders;
+```
+
+---
+
+### 4. 不当的类型转换
+
+```sql
+-- 问题：隐式类型转换导致不使用索引
+EXPLAIN ANALYZE SELECT * FROM users WHERE id = 123;  -- id 是 UUID
+
+-- 输出：Seq Scan on users (cost=..)
+--       Filter: (id = '123'::uuid)
+
+-- 解决：使用正确类型
+SELECT * FROM users WHERE id = '123'::uuid;
+```
+
+---
+
+### 5. 锁等待
+
+```sql
+-- 查看锁等待
+SELECT
+  pid,
+  usename,
+  pg_blocking_pids(pid) as blocked_by,
+  query as blocked_query
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+```
+
+---
+
+## 监控工具
+
+### pg_stat_statements
+
+```sql
+-- 启用扩展
+CREATE EXTENSION pg_stat_statements;
+
+-- 查看最慢的查询
+SELECT
+  query,
+  calls,
+  total_exec_time / 1000 as total_seconds,
+  mean_exec_time / 1000 as avg_seconds,
+  stddev_exec_time / 1000 as stddev_seconds
+FROM pg_stat_statements
+ORDER BY mean_exec_time DESC
+LIMIT 10;
+```
+
+---
+
+### pg_stat_activity
+
+```sql
+-- 查看当前正在执行的查询
+SELECT
+  pid,
+  now() - query_start as duration,
+  state,
+  query
+FROM pg_stat_activity
+WHERE state != 'idle'
+ORDER BY duration DESC;
+```
+
+---
+
+## 最佳实践
+
+### 诊断流程
+
+1. 使用 EXPLAIN ANALYZE 分析查询
+2. 检查是否使用索引
+3. 查看扫描方式（Seq Scan vs Index Scan）
+4. 查看连接方式（Nested Loop vs Hash Join）
+5. 查看实际执行时间（actual time）
+6. 查看缓冲区使用（Buffers）
+7. 找出瓶颈并优化
+
+---
+
+## 常见问题
+
+### Q1: cost 高但实际快？
+
+**cost 是估算值，actual time 才是实际执行时间**。优化器可能估算不准确。
+
+---
+
+### Q2: 为什么不使用索引？
+
+**可能原因**：
+
+- 数据量小（全表扫描更快）
+- 索引列被函数包裹
+- 隐式类型转换
+- 统计信息过时
+
+---
+
+## 总结
+
+本文深入学习了执行计划分析：
+
+**扫描方式**：
+
+- Seq Scan：全表扫描
+- Index Scan：索引扫描
+- Index Only Scan：只读索引
+- Bitmap Index Scan：位图索引
+
+**连接方式**：
+
+- Nested Loop：嵌套循环
+- Hash Join：哈希连接
+- Merge Join：合并连接
+
+**性能诊断**：
+
+- 全表扫描
+- 缺失索引
+- 统计信息过时
+- 不当类型转换
+
+**监控工具**：
+
+- pg_stat_statements
+- pg_stat_activity
+
+---
+
+## 下一步
+
+掌握了执行计划分析后，下一步我们将学习：
+
+**《10. Prisma ORM 入门》**：学习现代化的 ORM 工具，提升开发效率。
+
+你将学习：
+
+- 🚀 Prisma 核心概念
+- 📊 Schema 定义
+- 🔄 数据库迁移
+- 💻 类型安全的 CRUD 操作
+
+继续关注，让我们一起学习现代化数据库开发！

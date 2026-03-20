@@ -1,0 +1,927 @@
+---
+title: "04. 表设计与数据类型：构建高性能数据库的基础"
+date: "2026-03-19"
+summary: "系统学习数据库表设计原则、PostgreSQL 数据类型选择和约束使用，避免常见设计陷阱"
+tags: ["PostgreSQL", "表设计", "数据类型", "数据库规范"]
+category: "数据库"
+cover: ""
+draft: false
+series: "数据库渐进式学习路线"
+seriesOrder: 4
+---
+
+## 前言
+
+数据库表设计是整个系统架构的基石。一个糟糕的表设计会导致性能问题、数据不一致、难以维护等各种隐患。
+
+VARCHAR(255) 还是 TEXT？用 UUID 还是自增 ID？金额用什么类型存储？这些问题看似简单，但选择不当会埋下巨大的隐患。
+
+本文将通过电商系统实战，系统讲解表设计原则、数据类型选择和约束使用，帮你构建高性能、可维护的数据库结构。
+
+---
+
+## 核心概念
+
+### 表设计原则
+
+**1. 命名规范**
+
+```sql
+-- ✅ 推荐：蛇形命名法（snake_case）
+user_profiles
+order_items
+created_at
+
+-- ❌ 避免：驼峰命名（camelCase）
+userProfiles  -- PostgreSQL 不推荐
+orderItems
+
+-- ✅ 表名使用复数（有争议，但这是国际惯例）
+users
+products
+orders
+
+-- ✅ 列名使用单数
+user_name
+product_name
+order_status
+
+-- ✅ 布尔类型使用 is_ 前缀
+is_active
+is_verified
+is_published
+
+-- ✅ 时间戳使用 _at 后缀
+created_at
+updated_at
+deleted_at
+```
+
+**2. 主键设计**
+
+```sql
+-- 方式 1：自增整型（SERIAL/BIGSERIAL）
+-- ✅ 优点：性能好、占用空间小
+-- ❌ 缺点：可被枚举、分布式场景不友好
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL
+);
+
+-- 方式 2：UUID
+-- ✅ 优点：全球唯一、适合分布式、安全性高
+-- ❌ 缺点：占用空间大、索引性能略低
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email VARCHAR(255) NOT NULL
+);
+
+-- 方式 3：组合主键（适用于特定场景）
+CREATE TABLE order_items (
+  order_id INTEGER NOT NULL,
+  product_id INTEGER NOT NULL,
+  PRIMARY KEY (order_id, product_id)
+);
+```
+
+**选择建议**：
+
+- 单体应用 → SERIAL
+- 分布式系统 → UUID
+- 联合主键 → 组合主键
+
+**3. 默认值与时间戳**
+
+```sql
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  is_verified BOOLEAN DEFAULT FALSE,           -- 默认值
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 自动更新 updated_at（需要触发器）
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = CURRENT_TIMESTAMP;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_users_updated_at
+  BEFORE UPDATE ON users
+  FOR EACH ROW
+  EXECUTE FUNCTION update_updated_at_column();
+```
+
+---
+
+### PostgreSQL 数据类型详解
+
+PostgreSQL 提供了丰富的数据类型，选择合适的类型对性能至关重要。
+
+#### **1. 数值类型**
+
+```sql
+-- 整数类型
+SMALLINT      -- 2 字节，-32768 到 +32767
+INTEGER        -- 4 字节，-2147483648 到 +2147483647
+BIGINT         -- 8 字节，超大整数
+
+-- 示例：根据业务选择
+CREATE TABLE products (
+  id SERIAL PRIMARY KEY,
+  quantity SMALLINT,           -- 数量不会超过 32767
+  price INTEGER,               -- 金额（单位：分）
+  views BIGINT                 -- 浏览量可能很大
+);
+
+-- 精确数值（金额必须用）
+NUMERIC(10, 2)  -- 10 位数字，2 位小数
+DECIMAL(10, 2)  -- NUMERIC 的别名
+
+-- ✅ 金额存储（推荐）
+CREATE TABLE orders (
+  id SERIAL PRIMARY KEY,
+  total NUMERIC(10, 2) NOT NULL  -- 最多 99999999.99
+);
+
+-- ❌ 不要用 FLOAT/DOUBLE 存储金额
+-- 因为存在浮点数精度问题
+CREATE TABLE orders_bad (
+  total DOUBLE PRECISION  -- ❌ 可能出现 0.1 + 0.2 = 0.30000000000000004
+);
+
+-- 序列类型（自增）
+SERIAL       -- 等同于 INTEGER + 自增
+BIGSERIAL    -- 等同于 BIGINT + 自增
+```
+
+**数值类型选择建议**：
+
+- 金额、货币 → NUMERIC/DECIMAL
+- 数量、计数 → INTEGER
+- ID、外键 → INTEGER/BIGINT
+- 百分比 → NUMERIC(5, 2)
+
+---
+
+#### **2. 字符类型**
+
+```sql
+-- 固定长度（不推荐，除非确定长度固定）
+CHAR(10)      -- 固定 10 字符，不足补空格
+
+-- 可变长度（推荐）
+VARCHAR(255)  -- 最多 255 字符
+VARCHAR(1000) -- 最多 1000 字符
+
+-- 无限制（性能略低）
+TEXT          -- 不限制长度（实际受 1GB 限制）
+
+-- 性能对比
+CHAR(100)     -- ❌ 浪费存储，查询时会补空格
+VARCHAR(100)  -- ✅ 灵活，性能好
+TEXT          -- ✅ 长文本用这个
+
+-- 示例
+CREATE TABLE users (
+  email VARCHAR(255) NOT NULL,     -- 邮箱长度有限
+  phone VARCHAR(20),               -- 电话号码
+  bio TEXT,                        -- 个人简介（长文本）
+  avatar_url TEXT                  -- URL 可能很长
+);
+```
+
+**VARCHAR 长度设置建议**：
+
+- 邮箱 → VARCHAR(255)
+- URL → TEXT 或 VARCHAR(2048)
+- 用户名 → VARCHAR(50)
+- 标题 → VARCHAR(255)
+- 内容 → TEXT
+
+---
+
+#### **3. 日期时间类型**
+
+```sql
+-- 日期（不含时间）
+DATE          -- YYYY-MM-DD
+
+-- 时间（不含日期）
+TIME          -- HH:MM:SS
+
+-- 时间戳（日期+时间）
+TIMESTAMP     -- 时区无关
+TIMESTAMPTZ   -- 带时区（推荐）
+
+-- 时间间隔
+INTERVAL      -- 时间差
+
+-- 示例
+CREATE TABLE orders (
+  id SERIAL PRIMARY KEY,
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,  -- 创建时间（带时区）
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,  -- 更新时间
+  shipped_at TIMESTAMPTZ,                            -- 发货时间
+  estimated_delivery INTERVAL DEFAULT INTERVAL '3 days'  -- 预计送达（3天后）
+);
+
+-- 日期计算
+SELECT
+  order_id,
+  created_at,
+  created_at + INTERVAL '7 days' AS delivery_due_date,
+  AGE(CURRENT_TIMESTAMP, created_at) AS days_since_order
+FROM orders;
+```
+
+**时区处理建议**：
+
+- ✅ 存储：使用 TIMESTAMPTZ（带时区）
+- ✅ 显示：根据用户时区转换
+- ❌ 避免：使用 TIMESTAMP（不带时区）
+
+---
+
+#### **4. 布尔类型**
+
+```sql
+-- 真假值
+BOOLEAN       -- TRUE/FALSE/NULL
+
+-- 示例
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  is_active BOOLEAN DEFAULT TRUE,
+  is_verified BOOLEAN DEFAULT FALSE,
+  is_deleted BOOLEAN DEFAULT FALSE
+);
+
+-- 查询布尔字段
+SELECT * FROM users WHERE is_verified = TRUE;
+SELECT * FROM users WHERE is_active;  -- 简写，等同于 IS TRUE
+```
+
+---
+
+#### **5. JSON 类型**
+
+PostgreSQL 提供两种 JSON 类型：
+
+```sql
+-- JSON：存储原始 JSON，查询时解析
+-- JSONB：存储二进制格式，查询性能更好（推荐）
+
+-- 示例 1：用户配置
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  preferences JSONB DEFAULT '{}',      -- 用户偏好设置
+  profile JSONB                       -- 用户档案
+);
+
+-- 插入 JSON 数据
+INSERT INTO users (email, preferences, profile)
+VALUES (
+  'user@example.com',
+  '{"language": "zh-CN", "theme": "dark", "notifications": true}'::jsonb,
+  '{"age": 25, "city": "北京", "hobbies": ["编程", "阅读"]}'::jsonb
+);
+
+-- 查询 JSON 字段
+SELECT
+  email,
+  preferences->>'language' AS language,
+  preferences->>'theme' AS theme,
+  profile->>'age' AS age,
+  profile->>'city' AS city
+FROM users;
+
+-- JSON 字段过滤
+SELECT * FROM users WHERE preferences->>'theme' = 'dark';
+
+-- JSON 数组查询
+SELECT * FROM users WHERE '编程' = ANY(SELECT jsonb_array_elements_text(profile->'hobbies'));
+
+-- 更新 JSON 字段
+UPDATE users
+SET preferences = preferences || '{"language": "en-US"}'
+WHERE id = 1;
+
+-- 示例 2：灵活的订单元数据
+CREATE TABLE orders (
+  id SERIAL PRIMARY KEY,
+  order_number VARCHAR(50) UNIQUE NOT NULL,
+  total NUMERIC(10, 2) NOT NULL,
+  metadata JSONB DEFAULT '{}'           -- 订单元数据（促销信息、备注等）
+);
+
+-- 查询使用特定优惠券的订单
+SELECT * FROM orders WHERE metadata->>'coupon_code' = 'SPRING2024';
+```
+
+**JSON vs JSONB**：
+
+| 特性          | JSON             | JSONB            |
+| ------------- | ---------------- | ---------------- |
+| 存储格式      | 原始文本         | 二进制           |
+| 插入速度      | 快               | 略慢（需要解析） |
+| 查询速度      | 慢（每次解析）   | 快（已解析）     |
+| 支持索引      | ❌               | ✅               |
+| 保留空格/顺序 | ✅               | ❌               |
+| 推荐场景      | 需要保留原始格式 | 大部分场景       |
+
+---
+
+#### **6. 数组类型**
+
+PostgreSQL 原生支持数组：
+
+```sql
+-- 整数数组
+CREATE TABLE posts (
+  id SERIAL PRIMARY KEY,
+  title VARCHAR(255) NOT NULL,
+  tags INTEGER[]                    -- 标签 ID 数组
+);
+
+-- 文本数组
+CREATE TABLE products (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  keywords TEXT[]                   -- 关键词数组
+);
+
+-- 插入数组数据
+INSERT INTO products (name, keywords)
+VALUES ('iPhone 15', ARRAY['手机', 'Apple', '5G']);
+
+-- 查询数组
+SELECT name, keywords FROM products WHERE 'Apple' = ANY(keywords);
+
+-- 数组包含
+SELECT * FROM products WHERE keywords @> ARRAY['Apple'];
+
+-- 添加数组元素
+UPDATE products
+SET keywords = array_append(keywords, '新品')
+WHERE id = 1;
+```
+
+---
+
+#### **7. 特殊类型**
+
+```sql
+-- UUID：全球唯一标识符
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";  -- 需要启用扩展
+
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email VARCHAR(255) NOT NULL
+);
+
+-- ENUM：枚举类型
+CREATE TYPE order_status AS ENUM (
+  'pending',
+  'paid',
+  'shipped',
+  'delivered',
+  'cancelled'
+);
+
+CREATE TABLE orders (
+  id SERIAL PRIMARY KEY,
+  status order_status DEFAULT 'pending'
+);
+
+-- CIDR：IP 地址
+CREATE TABLE access_logs (
+  id SERIAL PRIMARY KEY,
+  ip_address CIDR,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- BYTEA：二进制数据（不推荐直接存储文件）
+CREATE TABLE files (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(255) NOT NULL,
+  data BYTEA                          -- ❌ 不推荐，文件应存在对象存储
+);
+```
+
+---
+
+### 约束类型
+
+约束保证数据的完整性和一致性。
+
+#### **1. NOT NULL 非空约束**
+
+```sql
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,        -- 必填
+  full_name VARCHAR(100),             -- 可选
+  phone VARCHAR(20) NOT NULL DEFAULT '' -- 默认空字符串
+);
+
+-- 添加非空约束
+ALTER TABLE users ALTER COLUMN phone SET NOT NULL;
+
+-- 删除非空约束
+ALTER TABLE users ALTER COLUMN phone DROP NOT NULL;
+```
+
+---
+
+#### **2. UNIQUE 唯一约束**
+
+```sql
+-- 单列唯一
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) UNIQUE NOT NULL
+);
+
+-- 组合唯一（多列组合唯一）
+CREATE TABLE user_follows (
+  follower_id INTEGER NOT NULL,
+  followee_id INTEGER NOT NULL,
+  UNIQUE (follower_id, followee_id)  -- 不能重复关注
+);
+
+-- 添加唯一约束
+ALTER TABLE users ADD CONSTRAINT unique_phone UNIQUE (phone);
+```
+
+---
+
+#### **3. CHECK 检查约束**
+
+```sql
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  age INTEGER CHECK (age >= 18),           -- 年龄必须 >= 18
+  country VARCHAR(50) CHECK (country IN ('中国', '美国', '日本'))
+);
+
+-- 复杂检查约束
+CREATE TABLE orders (
+  id SERIAL PRIMARY KEY,
+  subtotal NUMERIC(10, 2) NOT NULL,
+  discount NUMERIC(10, 2) DEFAULT 0 CHECK (discount >= 0 AND discount <= subtotal),
+  total NUMERIC(10, 2) NOT NULL CHECK (total >= 0),
+  CHECK (subtotal + tax - discount = total)
+);
+
+-- 邮箱格式验证
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  CONSTRAINT email_format CHECK (email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+);
+```
+
+---
+
+#### **4. DEFAULT 默认值**
+
+```sql
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  is_verified BOOLEAN DEFAULT FALSE,
+  role VARCHAR(20) DEFAULT 'user',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 使用函数作为默认值
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email VARCHAR(255) NOT NULL,
+  token VARCHAR(255) DEFAULT md5(random()::text)
+);
+```
+
+---
+
+#### **5. EXCLUDE 排除约束**
+
+高级约束，用于排除冲突的数据：
+
+```sql
+-- 防止时间段重叠
+CREATE TABLE reservations (
+  id SERIAL PRIMARY KEY,
+  room_id INTEGER NOT NULL,
+  during TSRANGE NOT NULL,
+  EXCLUDE USING GIST (room_id WITH =, during WITH &&)  -- 同一房间时间段不能重叠
+);
+
+-- 使用
+INSERT INTO reservations (room_id, during)
+VALUES (1, '[2024-01-01 10:00, 2024-01-01 12:00)');
+
+-- 这个会失败（时间段重叠）
+INSERT INTO reservations (room_id, during)
+VALUES (1, '[2024-01-01 11:00, 2024-01-01 13:00)');
+```
+
+---
+
+## 实战演练：电商系统表设计
+
+让我们设计一个完整的电商系统数据库。
+
+### 一、用户模块
+
+```sql
+-- 用户表
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  full_name VARCHAR(100),
+  phone VARCHAR(20),
+  avatar_url TEXT,
+  is_verified BOOLEAN DEFAULT FALSE,
+  is_active BOOLEAN DEFAULT TRUE,
+  last_login_at TIMESTAMPTZ,
+  preferences JSONB DEFAULT '{}',
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT email_format CHECK (email ~* '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'),
+  CONSTRAINT phone_format CHECK (phone ~* '^\+?[\d\s\-()]+$')
+);
+
+-- 用户地址表
+CREATE TABLE user_addresses (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  recipient_name VARCHAR(100) NOT NULL,
+  phone VARCHAR(20) NOT NULL,
+  province VARCHAR(50) NOT NULL,
+  city VARCHAR(50) NOT NULL,
+  district VARCHAR(50),
+  address VARCHAR(255) NOT NULL,
+  postal_code VARCHAR(20),
+  is_default BOOLEAN DEFAULT FALSE,
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 自动更新 updated_at 的触发器
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = CURRENT_TIMESTAMP;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER update_users_updated_at
+  BEFORE UPDATE ON users
+  FOR EACH ROW
+  EXECUTE FUNCTION update_updated_at_column();
+```
+
+---
+
+### 二、商品模块
+
+```sql
+-- 商品分类表
+CREATE TABLE categories (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(100) NOT NULL,
+  slug VARCHAR(100) UNIQUE NOT NULL,
+  description TEXT,
+  parent_id UUID REFERENCES categories(id) ON DELETE SET NULL,
+  icon_url VARCHAR(255),
+  sort_order INTEGER DEFAULT 0,
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 商品表
+CREATE TABLE products (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(255) NOT NULL,
+  slug VARCHAR(255) UNIQUE NOT NULL,
+  description TEXT,
+  price NUMERIC(10, 2) NOT NULL CHECK (price >= 0),
+  compare_price NUMERIC(10, 2) CHECK (compare_price >= price),
+  cost_price NUMERIC(10, 2) CHECK (cost_price >= 0),
+  stock INTEGER DEFAULT 0 CHECK (stock >= 0),
+  category_id UUID REFERENCES categories(id) ON DELETE SET NULL,
+  images TEXT[],
+  attributes JSONB DEFAULT '{}',
+  is_active BOOLEAN DEFAULT TRUE,
+  is_featured BOOLEAN DEFAULT FALSE,
+  weight NUMERIC(10, 2),              -- 重量（克）
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 商品规格表（SKU）
+CREATE TABLE product_skus (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  product_id UUID NOT NULL REFERENCES products(id) ON DELETE CASCADE,
+  name VARCHAR(255) NOT NULL,          -- 如 "红色 / L 码"
+  price NUMERIC(10, 2) NOT NULL,
+  stock INTEGER DEFAULT 0 CHECK (stock >= 0),
+  attributes JSONB DEFAULT '{}',       -- {"color": "红色", "size": "L"}
+  is_active BOOLEAN DEFAULT TRUE,
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 创建索引
+CREATE INDEX idx_products_category ON products(category_id);
+CREATE INDEX idx_products_slug ON products(slug);
+CREATE INDEX idx_products_active ON products(is_active) WHERE is_active = TRUE;
+CREATE INDEX idx_products_featured ON products(is_featured) WHERE is_featured = TRUE;
+```
+
+---
+
+### 三、订单模块
+
+```sql
+-- 订单状态枚举
+CREATE TYPE order_status AS ENUM (
+  'pending',
+  'paid',
+  'processing',
+  'shipped',
+  'delivered',
+  'cancelled',
+  'refunded'
+);
+
+-- 订单表
+CREATE TABLE orders (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  order_number VARCHAR(50) UNIQUE NOT NULL,
+  status order_status DEFAULT 'pending',
+
+  -- 金额
+  subtotal NUMERIC(10, 2) NOT NULL CHECK (subtotal >= 0),
+  tax NUMERIC(10, 2) DEFAULT 0 CHECK (tax >= 0),
+  shipping_fee NUMERIC(10, 2) DEFAULT 0 CHECK (shipping_fee >= 0),
+  discount NUMERIC(10, 2) DEFAULT 0 CHECK (discount >= 0),
+  total NUMERIC(10, 2) NOT NULL CHECK (total >= 0),
+
+  -- 地址
+  recipient_name VARCHAR(100) NOT NULL,
+  recipient_phone VARCHAR(20) NOT NULL,
+  address TEXT NOT NULL,
+
+  -- 备注
+  customer_notes TEXT,
+  admin_notes TEXT,
+
+  -- 时间
+  paid_at TIMESTAMPTZ,
+  shipped_at TIMESTAMPTZ,
+  delivered_at TIMESTAMPTZ,
+
+  metadata JSONB DEFAULT '{}',         -- 促销信息、优惠券等
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+
+  CONSTRAINT amount_calculation CHECK (
+    subtotal + tax + shipping_fee - discount = total
+  )
+);
+
+-- 订单项表
+CREATE TABLE order_items (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+  sku_id UUID REFERENCES product_skus(id) ON DELETE SET NULL,
+  product_name VARCHAR(255) NOT NULL,  -- 冗余：防止商品删除后信息丢失
+  product_attributes JSONB,           -- 冗余：记录购买时的规格
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  unit_price NUMERIC(10, 2) NOT NULL CHECK (unit_price >= 0),
+  subtotal NUMERIC(10, 2) NOT NULL CHECK (subtotal >= 0),
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+
+  CONSTRAINT subtotal_calculation CHECK (subtotal = quantity * unit_price)
+);
+
+-- 创建索引
+CREATE INDEX idx_orders_user ON orders(user_id);
+CREATE INDEX idx_orders_status ON orders(status);
+CREATE INDEX idx_orders_created ON orders(created_at DESC);
+CREATE INDEX idx_order_items_order ON order_items(order_id);
+CREATE INDEX idx_order_items_product ON order_items(product_id);
+```
+
+---
+
+## 最佳实践
+
+### 1. 设计原则
+
+**范式化 vs 反范式化**：
+
+- ✅ 优先范式化（3NF）
+- ✅ 性能瓶颈时适度反范式
+- ✅ 冗余字段保持同步（触发器）
+
+**字段长度**：
+
+- ✅ VARCHAR 不要设置过长（影响索引）
+- ✅ URL、长文本使用 TEXT
+- ✅ 金额使用 NUMERIC，不要用 FLOAT
+
+**默认值**：
+
+- ✅ 布尔字段提供默认值
+- ✅ 时间戳自动设置
+- ✅ 数值字段默认 0
+
+---
+
+### 2. 索引设计
+
+```sql
+-- ✅ 外键创建索引
+CREATE INDEX idx_orders_user_id ON orders(user_id);
+
+-- ✅ 频繁查询的字段
+CREATE INDEX idx_users_email ON users(email);
+
+-- ✅ 组合索引（注意顺序）
+CREATE INDEX idx_orders_user_status ON orders(user_id, status);
+
+-- ✅ 部分索引（只索引活跃数据）
+CREATE INDEX idx_users_active ON users(email) WHERE is_active = TRUE;
+
+-- ❌ 避免过多索引（影响写入性能）
+```
+
+---
+
+### 3. 数据一致性
+
+```sql
+-- ✅ 使用外键约束
+-- ✅ 使用 CHECK 约束
+-- ✅ 使用触发器维护冗余字段
+-- ✅ 使用事务保证数据完整性
+```
+
+---
+
+## 常见问题
+
+### Q1: UUID vs 自增 ID，如何选择？
+
+**UUID 优点**：
+
+- ✅ 分布式友好
+- ✅ 安全性高（不可枚举）
+- ✅ 可在客户端生成
+
+**自增 ID 优点**：
+
+- ✅ 性能更好
+- ✅ 占用空间小
+- ✅ 有序，利于范围查询
+
+**选择建议**：
+
+- 单体应用 → 自增 ID
+- 分布式系统 → UUID
+- 内部表（小表） → 自增 ID
+
+---
+
+### Q2: 金额用什么类型？
+
+**必须使用 NUMERIC/DECIMAL**：
+
+```sql
+-- ✅ 正确
+CREATE TABLE orders (
+  total NUMERIC(10, 2) NOT NULL  -- 最多 99999999.99
+);
+
+-- ❌ 错误
+CREATE TABLE orders (
+  total DOUBLE PRECISION  -- ❌ 浮点数精度问题
+);
+
+-- 示例：0.1 + 0.2 的结果
+SELECT 0.1::DOUBLE PRECISION + 0.2::DOUBLE PRECISION;
+-- 结果：0.30000000000000004
+
+SELECT 0.1::NUMERIC + 0.2::NUMERIC;
+-- 结果：0.3
+```
+
+---
+
+### Q3: VARCHAR 长度设置多少合适？
+
+**建议**：
+
+- 邮箱：VARCHAR(255)（RFC 5321 标准）
+- URL：TEXT（可能很长）
+- 用户名：VARCHAR(50)
+- 标题：VARCHAR(255)
+- 内容：TEXT
+
+**注意**：PostgreSQL 的 VARCHAR 性能差异不大，主要是约束作用。
+
+---
+
+### Q4: 为什么 timestamp 有的要加时区？
+
+**推荐使用 TIMESTAMPTZ**：
+
+- ✅ 自动处理时区转换
+- ✅ 夏令时自动调整
+- ✅ 全球用户友好
+
+```sql
+-- ✅ 推荐
+created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+
+-- ❌ 不推荐
+created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+```
+
+---
+
+### Q5: JSONB vs 关联表，如何选择？
+
+**使用 JSONB**：
+
+- ✅ 数据结构灵活多变
+- ✅ 不需要查询/排序/关联
+- ✅ 配置、元数据
+
+**使用关联表**：
+
+- ✅ 需要复杂查询
+- ✅ 需要外键约束
+- ✅ 需要保证数据完整性
+
+---
+
+## 总结
+
+本文系统学习了数据库表设计的核心知识：
+
+**表设计原则**：
+
+- 蛇形命名法、复数表名
+- 主键设计（UUID vs 自增 ID）
+- 默认值与时间戳
+
+**数据类型选择**：
+
+- 数值：NUMERIC 存储金额
+- 字符：VARCHAR vs TEXT
+- 日期：TIMESTAMPTZ（带时区）
+- JSON：JSONB（性能更好）
+- 数组：原生支持
+
+**约束类型**：
+
+- NOT NULL、UNIQUE、CHECK
+- DEFAULT、EXCLUDE
+
+**实战设计**：
+
+- 用户模块
+- 商品模块
+- 订单模块
+
+---
+
+## 下一步
+
+掌握了表设计和数据类型后，下一步我们将学习：
+
+**《05. 关系设计：外键与关联》**：如何设计表之间的关系，处理一对一、一对多、多对多关系。
+
+你将学习：
+
+- 🔗 表关系类型（1:1、1:N、M:N）
+- 🔑 外键约束与级联操作
+- 📊 JOIN 查询技巧
+- 🎯 关系设计最佳实践
+
+继续关注，让我们一起深入理解数据库关系设计！

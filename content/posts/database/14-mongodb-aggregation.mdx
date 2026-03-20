@@ -1,0 +1,393 @@
+---
+title: "14. MongoDB 聚合管道：强大的数据处理能力"
+date: "2026-03-19"
+summary: "掌握 MongoDB 聚合管道的高级用法，实现复杂的数据统计和分析"
+tags: ["MongoDB", "聚合管道", "数据分析", "NoSQL"]
+category: "数据库"
+cover: ""
+draft: false
+series: "数据库渐进式学习路线"
+seriesOrder: 14
+---
+
+## 前言
+
+MongoDB 的聚合管道提供了强大的数据处理能力，类似于 SQL 的 GROUP BY、JOIN，但更加灵活。
+
+本文将深入讲解 MongoDB 聚合管道的各种阶段和操作符，帮你掌握复杂的数据统计和分析。
+
+---
+
+## 核心概念
+
+### 什么是聚合管道？
+
+**聚合管道**是一系列数据处理阶段的组合，每个阶段接收输入数据，处理后输出给下一阶段。
+
+**vs SQL**：
+
+- MongoDB：aggregate + pipeline
+- SQL：GROUP BY、JOIN、HAVING
+
+---
+
+## 聚合管道阶段
+
+### 1. $match（过滤）
+
+```javascript
+const results = await db
+  .collection("orders")
+  .aggregate([{ $match: { status: "paid" } }])
+  .toArray();
+```
+
+---
+
+### 2. $group（分组）
+
+```javascript
+const results = await db
+  .collection("orders")
+  .aggregate([
+    { $match: { status: "paid" } },
+    {
+      $group: {
+        _id: "$userId",
+        totalOrders: { $sum: 1 },
+        totalSpent: { $sum: "$total" },
+        avgOrderValue: { $avg: "$total" },
+      },
+    },
+  ])
+  .toArray();
+```
+
+---
+
+### 3. $project（投影）
+
+```javascript
+const results = await db
+  .collection("users")
+  .aggregate([
+    {
+      $project: {
+        _id: 0,
+        email: 1,
+        fullName: 1,
+        createdAt: 1,
+      },
+    },
+  ])
+  .toArray();
+```
+
+---
+
+### 4. $lookup（左连接）
+
+```javascript
+const results = await db
+  .collection("orders")
+  .aggregate([
+    {
+      $lookup: {
+        from: "users",
+        localField: "userId",
+        foreignField: "_id",
+        as: "user",
+      },
+    },
+    { $unwind: "$user" },
+  ])
+  .toArray();
+```
+
+---
+
+### 5. $unwind（展开数组）
+
+```javascript
+const results = await db
+  .collection("orders")
+  .aggregate([
+    { $unwind: "$items" },
+    {
+      $group: {
+        _id: "$items.productId",
+        totalSold: { $sum: "$items.quantity" },
+      },
+    },
+  ])
+  .toArray();
+```
+
+---
+
+## 实战案例
+
+### 案例 1：用户订单统计
+
+```javascript
+const stats = await db
+  .collection("orders")
+  .aggregate([
+    { $match: { status: "paid" } },
+    {
+      $group: {
+        _id: "$userId",
+        totalOrders: { $sum: 1 },
+        totalSpent: { $sum: "$total" },
+        avgOrderValue: { $avg: "$total" },
+        lastOrderDate: { $max: "$createdAt" },
+      },
+    },
+    { $sort: { totalSpent: -1 } },
+    { $limit: 10 },
+    {
+      $lookup: {
+        from: "users",
+        localField: "_id",
+        foreignField: "_id",
+        as: "user",
+      },
+    },
+    { $unwind: "$user" },
+    {
+      $project: {
+        _id: 0,
+        userId: "$_id",
+        email: "$user.email",
+        fullName: "$user.fullName",
+        totalOrders: 1,
+        totalSpent: 1,
+        avgOrderValue: { $round: ["$avgOrderValue", 2] },
+        lastOrderDate: 1,
+      },
+    },
+  ])
+  .toArray();
+```
+
+---
+
+### 案例 2：商品销售统计
+
+```javascript
+const sales = await db
+  .collection("orders")
+  .aggregate([
+    { $unwind: "$items" },
+    { $match: { status: "paid" } },
+    {
+      $group: {
+        _id: "$items.productId",
+        productName: { $first: "$items.name" },
+        totalSold: { $sum: "$items.quantity" },
+        revenue: { $sum: "$items.subtotal" },
+        ordersCount: { $sum: 1 },
+      },
+    },
+    {
+      $addFields: {
+        avgPrice: { $divide: ["$revenue", "$totalSold"] },
+      },
+    },
+    { $sort: { revenue: -1 } },
+  ])
+  .toArray();
+```
+
+---
+
+### 案例 3：时间序列分析
+
+```javascript
+const dailyRevenue = await db
+  .collection("orders")
+  .aggregate([
+    { $match: { status: "paid" } },
+    {
+      $project: {
+        date: {
+          $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+        },
+        total: 1,
+      },
+    },
+    {
+      $group: {
+        _id: "$date",
+        revenue: { $sum: "$total" },
+        ordersCount: { $sum: 1 },
+      },
+    },
+    { $sort: { _id: 1 } },
+  ])
+  .toArray();
+```
+
+---
+
+### 案例 4：多管道并行（$facet）
+
+```javascript
+const analytics = await db
+  .collection("orders")
+  .aggregate([
+    { $match: { status: "paid" } },
+    {
+      $facet: {
+        stats: [
+          {
+            $group: {
+              _id: null,
+              totalRevenue: { $sum: "$total" },
+              totalOrders: { $sum: 1 },
+              avgOrderValue: { $avg: "$total" },
+            },
+          },
+        ],
+        byStatus: [
+          {
+            $group: {
+              _id: "$status",
+              count: { $sum: 1 },
+              revenue: { $sum: "$total" },
+            },
+          },
+        ],
+        timeSeries: [
+          {
+            $group: {
+              _id: {
+                $dateToString: { format: "%Y-%m", date: "$createdAt" },
+              },
+              revenue: { $sum: "$total" },
+            },
+          },
+          { $sort: { _id: 1 } },
+        ],
+      },
+    },
+  ])
+  .toArray();
+```
+
+---
+
+## 性能优化
+
+### 1. 早期过滤
+
+```javascript
+// ✅ 早期过滤
+{ $match: { status: 'paid' } },
+{ $group: { ... } }
+
+// ❌ 后期过滤
+{ $group: { ... } },
+{ $match: { status: 'paid' } }
+```
+
+---
+
+### 2. 使用索引
+
+```javascript
+// 为 $match 阶段创建索引
+await db.collection("orders").createIndex({ status: 1, createdAt: -1 });
+```
+
+---
+
+### 3. 限制数据量
+
+```javascript
+// 使用 $limit 限制处理数据量
+{
+  $limit: 1000;
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 管道设计原则
+
+- ✅ $match 尽早过滤
+- ✅ $project 减少数据量
+- ✅ 合理使用索引
+- ✅ 分阶段优化
+
+---
+
+### 2. 性能监控
+
+```javascript
+// 使用 explain 分析
+const results = await db
+  .collection("orders")
+  .aggregate([{ $match: { status: "paid" } }], { explain: true });
+```
+
+---
+
+## 常见问题
+
+### Q1: 聚合管道 vs 查询？
+
+- 简单查询 → find()
+- 复杂统计 → aggregate()
+
+---
+
+### Q2: 如何优化聚合管道？
+
+- 早期过滤
+- 使用索引
+- 限制数据量
+- 分阶段优化
+
+---
+
+## 总结
+
+本文深入学习了 MongoDB 聚合管道：
+
+**核心阶段**：
+
+- $match、$group、$project
+- $lookup、$unwind、$facet
+
+**实战案例**：
+
+- 用户订单统计
+- 商品销售统计
+- 时间序列分析
+- 多管道并行
+
+**性能优化**：
+
+- 早期过滤
+- 使用索引
+- 限制数据量
+
+---
+
+## 下一步
+
+掌握了 MongoDB 聚合管道后，下一步我们将学习：
+
+**《15. Redis 数据结构与缓存》**：学习 Redis 的数据结构和缓存策略。
+
+你将学习：
+
+- 🚀 Redis 数据类型
+- 💾 缓存策略
+- ⚡ 性能优化
+- 🔐 分布式锁
+
+继续关注，让我们一起学习高性能缓存！

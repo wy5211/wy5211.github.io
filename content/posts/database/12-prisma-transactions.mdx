@@ -1,0 +1,406 @@
+---
+title: "12. 事务与并发控制：保证数据一致性的关键"
+date: "2026-03-19"
+summary: "深入理解事务的 ACID 特性，掌握并发控制和锁机制"
+tags: ["PostgreSQL", "事务", "并发控制", "锁"]
+category: "数据库"
+cover: ""
+draft: false
+series: "数据库渐进式学习路线"
+seriesOrder: 12
+---
+
+## 前言
+
+你有没有遇到过这样的问题：银行转账时，钱转出但没收到？库存超卖？数据不一致？
+
+这些都是**事务处理**不当导致的。本文将深入讲解事务的 ACID 特性、并发问题和锁机制，帮你掌握保证数据一致性的核心技能。
+
+---
+
+## 核心概念
+
+### 什么是事务？
+
+**事务**是一组数据库操作，要么全部成功，要么全部失败。
+
+**ACID 特性**：
+
+- **原子性**（Atomicity）：事务是不可分割的最小单位
+- **一致性**（Consistency）：事务前后数据保持一致
+- **隔离性**（Isolation）：并发事务互不干扰
+- **持久性**（Durability）：提交后数据永久保存
+
+---
+
+## 事务隔离级别
+
+### 1. Read Uncommitted（读未提交）
+
+```sql
+-- 可能读到未提交的数据（脏读）
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+```
+
+**问题**：脏读、不可重复读、幻读
+
+---
+
+### 2. Read Committed（读已提交，PostgreSQL 默认）
+
+```sql
+-- 只能读到已提交的数据
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+```
+
+**问题**：不可重复读、幻读
+
+---
+
+### 3. Repeatable Read（可重复读）
+
+```sql
+-- 保证同一事务中多次读取结果一致
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+```
+
+**问题**：幻读
+
+---
+
+### 4. Serializable（可序列化）
+
+```sql
+-- 最高隔离级别，完全隔离
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+```
+
+**问题**：性能最低，可能发生序列化失败
+
+---
+
+## 并发问题
+
+### 1. 脏读
+
+读到未提交的数据。
+
+```sql
+-- 事务 A
+BEGIN;
+UPDATE users SET balance = balance - 100 WHERE id = 1;
+-- 还未 COMMIT
+
+-- 事务 B（脏读）
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SELECT balance FROM users WHERE id = 1;  -- 读到了未提交的数据
+```
+
+---
+
+### 2. 不可重复读
+
+同一事务中多次读取结果不同。
+
+```sql
+-- 事务 A
+BEGIN;
+SELECT balance FROM users WHERE id = 1;  -- 第一次读取：1000
+
+-- 事务 B
+BEGIN;
+UPDATE users SET balance = 900 WHERE id = 1;
+COMMIT;
+
+-- 事务 A（不可重复读）
+SELECT balance FROM users WHERE id = 1;  -- 第二次读取：900
+```
+
+---
+
+### 3. 幻读
+
+同一事务中，同样的条件返回的行数不同。
+
+```sql
+-- 事务 A
+BEGIN;
+SELECT * FROM users WHERE age > 18;  -- 返回 10 行
+
+-- 事务 B
+BEGIN;
+INSERT INTO users (age) VALUES (20);
+COMMIT;
+
+-- 事务 A（幻读）
+SELECT * FROM users WHERE age > 18;  -- 返回 11 行
+```
+
+---
+
+## 锁机制
+
+### 1. 行锁（SELECT FOR UPDATE）
+
+```sql
+-- 悲观锁
+BEGIN;
+
+SELECT stock FROM products WHERE id = 'prod-1' FOR UPDATE;
+-- 其他事务会等待，直到当前事务提交
+
+UPDATE products SET stock = stock - 2 WHERE id = 'prod-1';
+
+COMMIT;
+```
+
+---
+
+### 2. 表锁
+
+```sql
+-- 锁定整个表
+LOCK TABLE users IN ACCESS EXCLUSIVE MODE;
+```
+
+---
+
+### 3. 乐观锁（版本号）
+
+```sql
+-- 添加版本号字段
+ALTER TABLE products ADD COLUMN version INTEGER DEFAULT 1;
+
+-- 更新时检查版本号
+UPDATE products
+SET stock = stock - 2, version = version + 1
+WHERE id = 'prod-1' AND version = 5;
+
+-- 检查是否更新成功
+SELECT ROW_COUNT();
+```
+
+---
+
+## Prisma 事务
+
+### 1. $transaction API
+
+```typescript
+await prisma.$transaction(async (tx) => {
+  const order = await tx.order.create({
+    data: {
+      userId,
+      orderNumber: `ORD-${Date.now()}`,
+      total: 100,
+    },
+  });
+
+  await tx.orderItem.create({
+    data: {
+      orderId: order.id,
+      productId,
+      quantity: 2,
+      unitPrice: 50,
+      subtotal: 100,
+    },
+  });
+
+  await tx.product.update({
+    where: { id: productId },
+    data: { stock: { decrement: 2 } },
+  });
+
+  return order;
+});
+```
+
+---
+
+### 2. 批量事务
+
+```typescript
+const [user, order] = await prisma.$transaction([
+  prisma.user.create({ data: userData }),
+  prisma.order.create({ data: orderData }),
+]);
+```
+
+---
+
+### 3. 设置隔离级别
+
+```typescript
+await prisma.$transaction(
+  async (tx) => {
+    // 事务操作
+  },
+  {
+    maxWait: 5000,
+    timeout: 10000,
+    isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+  }
+);
+```
+
+---
+
+## 并发控制实战
+
+### 1. 乐观锁实现
+
+```typescript
+try {
+  const product = await prisma.product.findUnique({ where: { id: productId } });
+
+  const updatedProduct = await prisma.product.updateMany({
+    where: {
+      id: productId,
+      version: product.version,
+    },
+    data: {
+      stock: product.stock - quantity,
+      version: product.version + 1,
+    },
+  });
+
+  if (updatedProduct.count === 0) {
+    throw new Error("并发冲突：数据已被其他事务修改");
+  }
+} catch (error) {
+  // 处理并发冲突
+}
+```
+
+---
+
+### 2. 悲观锁实现
+
+```typescript
+await prisma.$transaction(async (tx) => {
+  const product = await tx.$queryRaw<Array<{ stock: number }>>`
+    SELECT stock FROM products
+    WHERE id = ${productId}
+    FOR UPDATE
+  `;
+
+  if (product[0].stock < quantity) {
+    throw new Error("库存不足");
+  }
+
+  await tx.product.update({
+    where: { id: productId },
+    data: { stock: { decrement: quantity } },
+  });
+});
+```
+
+---
+
+### 3. 重试机制
+
+```typescript
+async function executeWithRetry<T>(
+  operation: () => Promise<T>,
+  maxRetries = 3
+): Promise<T> {
+  let lastError: Error;
+
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await operation();
+    } catch (error) {
+      lastError = error;
+      if (i < maxRetries - 1) {
+        await new Promise((resolve) => setTimeout(resolve, 100 * (i + 1)));
+      }
+    }
+  }
+
+  throw lastError;
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 事务设计原则
+
+- ✅ 事务尽可能短
+- ✅ 避免在事务中执行长时间操作
+- ✅ 合理选择隔离级别
+- ✅ 使用连接池
+
+---
+
+### 2. 并发控制选择
+
+- ✅ 冲突少：乐观锁
+- ✅ 冲突多：悲观锁
+- ✅ 高并发：重试机制
+
+---
+
+## 常见问题
+
+### Q1: 如何选择隔离级别？
+
+- 默认：Read Committed
+- 高一致性要求：Serializable
+- 高并发要求：Read Committed + 悲观锁
+
+---
+
+### Q2: 如何处理死锁？
+
+```sql
+-- 查看死锁
+SELECT * FROM pg_stat_activity WHERE wait_event_type = 'Lock';
+
+-- 解决方案
+- 设置锁超时
+- 优化事务顺序
+- 使用重试机制
+```
+
+---
+
+## 总结
+
+本文系统学习了事务与并发控制：
+
+**事务特性**：
+
+- ACID 特性
+- 四种隔离级别
+- 并发问题（脏读、不可重复读、幻读）
+
+**锁机制**：
+
+- 行锁、表锁
+- 乐观锁、悲观锁
+- 死锁检测
+
+**Prisma 事务**：
+
+- $transaction API
+- 隔离级别设置
+- 并发控制实战
+
+---
+
+## 下一步
+
+掌握了事务与并发后，下一步我们将学习 NoSQL 数据库：
+
+**《13. MongoDB 文档数据库》**：学习 MongoDB 的核心概念和基本操作。
+
+你将学习：
+
+- 📄 MongoDB 核心概念
+- 🔍 CRUD 操作
+- 📊 嵌入式文档设计
+- 🚀 与 PostgreSQL 的区别
+
+继续关注，让我们一起扩展数据库技能！

@@ -1,0 +1,414 @@
+---
+title: "08. SQL 查询优化：让查询速度提升 10 倍的实战技巧"
+date: "2026-03-19"
+summary: "掌握 SQL 查询优化的核心技巧，通过实际案例让查询速度大幅提升"
+tags: ["PostgreSQL", "SQL优化", "性能调优", "查询优化"]
+category: "数据库"
+cover: ""
+draft: false
+series: "数据库渐进式学习路线"
+seriesOrder: 8
+---
+
+## 前言
+
+你的 SQL 查询慢吗？一个简单的优化可能让速度提升 10 倍！
+
+查询优化是数据库性能提升最直接、最有效的方法。本文将通过实际案例，系统讲解 SQL 查询优化的技巧和最佳实践。
+
+---
+
+## 核心概念
+
+### 查询优化的重要性
+
+**优化前后对比**：
+
+- 慢查询：5 秒
+- 优化后：0.1 秒
+- 提升：50 倍
+
+**优化方向**：
+
+- ✅ 减少返回数据量
+- ✅ 使用索引
+- ✅ 优化 JOIN 顺序
+- ✅ 避免全表扫描
+
+---
+
+## 实战优化案例
+
+### 案例 1：避免 SELECT \*
+
+```sql
+-- ❌ 优化前（查询所有列）
+SELECT * FROM orders WHERE user_id = 'user-1';
+
+-- ✅ 优化后（只查询需要的列）
+SELECT id, order_number, total, status
+FROM orders
+WHERE user_id = 'user-1';
+
+-- 性能提升：2-5 倍
+```
+
+**原因**：
+
+- 减少网络传输
+- 减少内存占用
+- 可能使用覆盖索引
+
+---
+
+### 案例 2：使用 LIMIT
+
+```sql
+-- ❌ 优化前（返回所有数据）
+SELECT * FROM orders ORDER BY created_at DESC;
+
+-- ✅ 优化后（限制返回数量）
+SELECT * FROM orders
+ORDER BY created_at DESC
+LIMIT 20;
+
+-- 性能提升：10-100 倍
+```
+
+---
+
+### 案例 3：避免在 WHERE 中使用函数
+
+```sql
+-- ❌ 优化前（函数包裹索引列）
+SELECT * FROM users WHERE LOWER(email) = 'user@example.com';
+
+-- ✅ 优化后（直接比较）
+SELECT * FROM users WHERE email = 'user@example.com';
+
+-- 或者创建表达式索引
+CREATE INDEX idx_users_lower_email ON users(LOWER(email));
+```
+
+---
+
+### 案例 4：使用 EXISTS 替代 IN
+
+```sql
+-- ❌ 优化前（IN 子查询）
+SELECT * FROM orders
+WHERE user_id IN (SELECT id FROM users WHERE is_verified = TRUE);
+
+-- ✅ 优化后（EXISTS 子查询）
+SELECT * FROM orders o
+WHERE EXISTS (
+  SELECT 1 FROM users u
+  WHERE u.id = o.user_id AND u.is_verified = TRUE
+);
+
+-- 性能提升：2-10 倍
+```
+
+**原因**：
+
+- EXISTS 只要找到一条就停止
+- IN 需要扫描所有结果
+
+---
+
+### 案例 5：使用 UNION ALL 替代 UNION
+
+```sql
+-- ❌ 优化前（UNION 去重排序）
+SELECT email FROM users_a
+UNION
+SELECT email FROM users_b;
+
+-- ✅ 优化后（UNION ALL 不去重）
+SELECT email FROM users_a
+UNION ALL
+SELECT email FROM users_b;
+
+-- 性能提升：5-20 倍
+```
+
+**注意**：
+
+- UNION ALL 不去重，如果数据本身不重复可以用
+- 如果需要去重，必须用 UNION
+
+---
+
+### 案例 6：分页优化
+
+```sql
+-- ❌ 优化前（深分页慢）
+SELECT * FROM orders
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 10000;
+
+-- ✅ 优化后（游标分页）
+SELECT * FROM orders
+WHERE created_at < '2024-01-15 10:00:00'
+ORDER BY created_at DESC
+LIMIT 20;
+
+-- 性能提升：100-1000 倍（深分页场景）
+```
+
+**游标分页实现**：
+
+```typescript
+// 前端
+const [posts, setPosts] = useState([])
+const [cursor, setCursor] = useState(null)
+
+// 后端
+app.get('/posts', async (req, res) => {
+  const { cursor, limit = 20 } = req.query
+
+  const posts = await prisma.post.findMany({
+    take: limit,
+    ...(cursor && {
+      skip: 1, // 跳过游标本身
+      cursor: { id: cursor }
+    },
+    orderBy: { createdAt: 'desc' }
+  })
+
+  res.json({
+    posts,
+    nextCursor: posts[posts.length - 1]?.id
+  })
+})
+```
+
+---
+
+### 案例 7：批量插入优化
+
+```sql
+-- ❌ 优化前（逐条插入）
+INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)
+VALUES ('order-1', 'prod-1', 2, 100, 200);
+
+INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)
+VALUES ('order-1', 'prod-2', 1, 50, 50);
+
+-- ✅ 优化后（批量插入）
+INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal) VALUES
+  ('order-1', 'prod-1', 2, 100, 200),
+  ('order-1', 'prod-2', 1, 50, 50);
+
+-- 性能提升：10-50 倍
+```
+
+---
+
+### 案例 8：使用 CTE 优化复杂查询
+
+```sql
+-- ❌ 优化前（重复子查询）
+SELECT
+  u.id,
+  u.email,
+  (SELECT COUNT(*) FROM orders WHERE user_id = u.id) as order_count,
+  (SELECT SUM(total) FROM orders WHERE user_id = u.id) as total_spent
+FROM users u;
+
+-- ✅ 优化后（CTE）
+WITH user_stats AS (
+  SELECT
+    user_id,
+    COUNT(*) as order_count,
+    SUM(total) as total_spent
+  FROM orders
+  GROUP BY user_id
+)
+SELECT
+  u.id,
+  u.email,
+  COALESCE(us.order_count, 0) as order_count,
+  COALESCE(us.total_spent, 0) as total_spent
+FROM users u
+LEFT JOIN user_stats us ON u.id = us.user_id;
+
+-- 性能提升：2-10 倍
+```
+
+---
+
+## JOIN 优化
+
+### 1. 小表驱动大表
+
+```sql
+-- ❌ 优化前（大表驱动小表）
+SELECT * FROM orders o  -- 大表
+INNER JOIN users u ON o.user_id = u.id;
+
+-- ✅ 优化后（小表驱动大表）
+SELECT * FROM users u   -- 小表
+INNER JOIN orders o ON u.id = o.user_id;
+```
+
+---
+
+### 2. INNER JOIN vs LEFT JOIN
+
+```sql
+-- ❌ 不必要的 LEFT JOIN
+SELECT * FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+WHERE o.status = 'paid';  -- 实际上过滤掉了 NULL 值
+
+-- ✅ 使用 INNER JOIN
+SELECT * FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+WHERE o.status = 'paid';
+```
+
+---
+
+### 3. JOIN 顺序
+
+PostgreSQL 会自动优化 JOIN 顺序，但有时需要手动指定：
+
+```sql
+-- 使用 CTE 强制顺序
+WITH step1 AS (
+  SELECT * FROM users WHERE is_active = TRUE
+),
+step2 AS (
+  SELECT * FROM step1
+  INNER JOIN orders ON step1.id = orders.user_id
+)
+SELECT * FROM step2;
+```
+
+---
+
+## 分析查询性能
+
+### EXPLAIN ANALYZE
+
+```sql
+-- 分析查询执行计划
+EXPLAIN ANALYZE
+SELECT u.email, o.order_number, o.total
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+WHERE u.is_verified = TRUE;
+
+-- 输出示例
+-- Hash Join (cost=.. rows=..) (actual time=0.123..1.456 rows=100 loops=1)
+--   Hash Cond: (o.user_id = u.id)
+--   -> Seq Scan on orders o (cost=.. rows=..)
+--   -> Hash (cost=..)
+--     -> Seq Scan on users u (cost=..)
+```
+
+**关键信息**：
+
+- `Seq Scan`：全表扫描（慢）
+- `Index Scan`：索引扫描（快）
+- `Hash Join`：哈希连接
+- `Nested Loop`：嵌套循环
+- `actual time`：实际执行时间
+
+---
+
+## 最佳实践
+
+### 查询优化清单
+
+- [ ] 只查询需要的列
+- [ ] 使用 LIMIT 限制结果集
+- [ ] 避免 SELECT \*
+- [ ] 避免在 WHERE 中使用函数
+- [ ] 使用 EXISTS 替代 IN
+- [ ] 使用 UNION ALL 替代 UNION
+- [ ] 批量插入/更新
+- [ ] 使用 CTE 优化复杂查询
+- [ ] 使用 EXPLAIN ANALYZE 分析
+- [ ] 为查询创建索引
+
+---
+
+## 常见问题
+
+### Q1: 为什么加了索引还是慢？
+
+**可能原因**：
+
+- ❌ 索引列被函数包裹
+- ❌ 隐式类型转换
+- ❌ 数据量太小，优化器选择全表扫描
+- ❌ 统计信息过时
+
+**解决方案**：
+
+```sql
+-- 更新统计信息
+ANALYZE table_name;
+
+-- 检查是否使用索引
+EXPLAIN ANALYZE SELECT ...;
+```
+
+---
+
+### Q2: 如何优化慢查询？
+
+**步骤**：
+
+1. 使用 EXPLAIN ANALYZE 分析
+2. 检查是否使用索引
+3. 优化查询语句
+4. 添加合适的索引
+5. 更新统计信息
+
+---
+
+## 总结
+
+本文系统学习了 SQL 查询优化：
+
+**优化技巧**：
+
+- 避免 SELECT \*
+- 使用 LIMIT
+- 避免函数包裹索引列
+- 使用 EXISTS 替代 IN
+- 使用 UNION ALL 替代 UNION
+- 优化分页查询
+- 批量操作
+
+**JOIN 优化**：
+
+- 小表驱动大表
+- 选择合适的 JOIN 类型
+- 使用 CTE 优化复杂查询
+
+**性能分析**：
+
+- EXPLAIN ANALYZE
+- 查看执行计划
+- 识别性能瓶颈
+
+---
+
+## 下一步
+
+掌握了查询优化后，下一步我们将学习：
+
+**《09. 执行计划分析》**：深入理解 SQL 执行计划，诊断复杂性能问题。
+
+你将学习：
+
+- 📊 执行计划解读
+- 🔍 扫描方式（Seq Scan、Index Scan）
+- 🔗 连接方式（Hash Join、Nested Loop）
+- 🎯 性能问题诊断
+
+继续关注，让我们一起深入理解数据库性能优化！

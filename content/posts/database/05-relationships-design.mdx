@@ -1,0 +1,686 @@
+---
+title: "05. 关系设计：外键与关联（1:1、1:N、M:N）"
+date: "2026-03-19"
+summary: "系统学习数据库表关系设计，掌握一对一、一对多、多对多关系的外键设计和 JOIN 查询"
+tags: ["PostgreSQL", "表关系", "外键", "JOIN查询"]
+category: "数据库"
+cover: ""
+draft: false
+series: "数据库渐进式学习路线"
+seriesOrder: 5
+---
+
+## 前言
+
+在关系型数据库中，表之间的关系是核心概念。一个用户有多个订单，一个订单包含多个商品，商品属于分类...这些关系如何设计？如何查询关联数据？
+
+外键设置不当会导致数据不一致，JOIN 查询写不好会导致性能问题。本文将通过电商系统实战，系统讲解表关系设计的方方面面。
+
+---
+
+## 核心概念
+
+### 表关系类型
+
+数据库中的表关系主要有三种：
+
+**1. 一对一（1:1）**
+
+- 一个用户对应一个个人资料
+- 一个订单对应一个配送信息
+
+**2. 一对多（1:N）**
+
+- 一个用户有多个订单
+- 一个分类有多个商品
+
+**3. 多对多（M:N）**
+
+- 订单和商品（一个订单包含多个商品，一个商品属于多个订单）
+- 用户和角色（一个用户有多个角色，一个角色属于多个用户）
+
+---
+
+## 实战演练
+
+### 一、一对一关系（1:1）
+
+**场景**：用户表和用户资料表
+
+#### 方式 1：共享主键（推荐）
+
+```sql
+-- 用户表
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email VARCHAR(255) UNIQUE NOT NULL,
+  password_hash VARCHAR(255) NOT NULL,
+  full_name VARCHAR(100),
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 用户资料表（共享主键）
+CREATE TABLE user_profiles (
+  user_id UUID PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+  bio TEXT,
+  website VARCHAR(255),
+  location VARCHAR(100),
+  birth_date DATE,
+  gender VARCHAR(20),
+  avatar_url TEXT,
+  updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 插入数据
+INSERT INTO users (email, password_hash, full_name)
+VALUES ('user@example.com', 'hash', '张三');
+
+INSERT INTO user_profiles (user_id, bio, location)
+VALUES (
+  (SELECT id FROM users WHERE email = 'user@example.com'),
+  '全栈开发者',
+  '北京'
+);
+
+-- 查询用户及其资料
+SELECT
+  u.id,
+  u.email,
+  u.full_name,
+  p.bio,
+  p.location
+FROM users u
+LEFT JOIN user_profiles p ON u.id = p.user_id
+WHERE u.email = 'user@example.com';
+```
+
+**方式 1 优点**：
+
+- ✅ 天然 1:1 关系（主键唯一）
+- ✅ 查询性能好
+
+---
+
+#### 方式 2：唯一外键
+
+```sql
+-- 用户资料表（独立主键 + 唯一外键）
+CREATE TABLE user_profiles (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID UNIQUE NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  bio TEXT,
+  location VARCHAR(100)
+);
+
+-- 插入数据
+INSERT INTO user_profiles (user_id, bio, location)
+VALUES (
+  (SELECT id FROM users WHERE email = 'user@example.com'),
+  '全栈开发者',
+  '北京'
+);
+```
+
+**方式 2 优点**：
+
+- ✅ 可独立存在
+- ✅ 未来可扩展为 1:N
+
+---
+
+### 二、一对多关系（1:N）
+
+**场景 1**：用户 → 订单
+
+```sql
+-- 用户表
+CREATE TABLE users (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  email VARCHAR(255) UNIQUE NOT NULL,
+  full_name VARCHAR(100)
+);
+
+-- 订单表（外键指向用户）
+CREATE TABLE orders (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  order_number VARCHAR(50) UNIQUE NOT NULL,
+  total NUMERIC(10, 2) NOT NULL,
+  status VARCHAR(20) DEFAULT 'pending',
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 为外键创建索引（性能优化）
+CREATE INDEX idx_orders_user_id ON orders(user_id);
+
+-- 插入数据
+INSERT INTO users (email, full_name)
+VALUES ('user@example.com', '张三');
+
+INSERT INTO orders (user_id, order_number, total)
+VALUES
+  (
+    (SELECT id FROM users WHERE email = 'user@example.com'),
+    'ORD-001',
+    100
+  ),
+  (
+    (SELECT id FROM users WHERE email = 'user@example.com'),
+    'ORD-002',
+    200
+  );
+```
+
+---
+
+**场景 2**：分类 → 商品（自关联）
+
+```sql
+-- 商品分类表（支持多级分类）
+CREATE TABLE categories (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(100) NOT NULL,
+  parent_id UUID REFERENCES categories(id) ON DELETE SET NULL,
+  level INTEGER DEFAULT 0,
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 插入分类数据
+INSERT INTO categories (id, name, parent_id, level) VALUES
+  (gen_random_uuid(), '电子产品', NULL, 0),
+  (gen_random_uuid(), '手机', NULL, 1),
+  (gen_random_uuid(), '电脑', NULL, 1);
+
+-- 更新父级关系
+UPDATE categories SET parent_id = (
+  SELECT id FROM categories WHERE name = '电子产品'
+) WHERE name IN ('手机', '电脑');
+
+-- 查询分类树（递归查询）
+WITH RECURSIVE category_tree AS (
+  -- 基础查询（顶级分类）
+  SELECT id, name, parent_id, level, name AS path
+  FROM categories
+  WHERE parent_id IS NULL
+
+  UNION ALL
+
+  -- 递归查询（子分类）
+  SELECT c.id, c.name, c.parent_id, c.level, CONCAT(ct.path, ' > ', c.name)
+  FROM categories c
+  INNER JOIN category_tree ct ON c.parent_id = ct.id
+)
+SELECT * FROM category_tree ORDER BY level, name;
+```
+
+---
+
+### 三、多对多关系（M:N）
+
+**场景**：订单 ↔ 商品（需要中间表）
+
+```sql
+-- 订单表
+CREATE TABLE orders (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  order_number VARCHAR(50) UNIQUE NOT NULL,
+  total NUMERIC(10, 2) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 商品表
+CREATE TABLE products (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(255) NOT NULL,
+  price NUMERIC(10, 2) NOT NULL,
+  stock INTEGER DEFAULT 0
+);
+
+-- 订单项表（中间表）
+CREATE TABLE order_items (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+  product_id UUID NOT NULL REFERENCES products(id) ON DELETE RESTRICT,
+  quantity INTEGER NOT NULL CHECK (quantity > 0),
+  unit_price NUMERIC(10, 2) NOT NULL,
+  subtotal NUMERIC(10, 2) NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+
+  -- 防止同一订单重复添加同一商品
+  UNIQUE (order_id, product_id)
+);
+
+-- 创建索引
+CREATE INDEX idx_order_items_order ON order_items(order_id);
+CREATE INDEX idx_order_items_product ON order_items(product_id);
+
+-- 插入数据
+INSERT INTO orders (user_id, order_number, total)
+VALUES (
+  (SELECT id FROM users WHERE email = 'user@example.com'),
+  'ORD-001',
+  300
+);
+
+INSERT INTO products (name, price, stock) VALUES
+  ('iPhone 15', 7999, 100),
+  ('MacBook Pro', 15999, 50);
+
+-- 添加订单项
+INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)
+VALUES
+  (
+    (SELECT id FROM orders WHERE order_number = 'ORD-001'),
+    (SELECT id FROM products WHERE name = 'iPhone 15'),
+    1,
+    7999,
+    7999
+  ),
+  (
+    (SELECT id FROM orders WHERE order_number = 'ORD-001'),
+    (SELECT id FROM products WHERE name = 'MacBook Pro'),
+    1,
+    15999,
+    15999
+  );
+```
+
+---
+
+## JOIN 查询详解
+
+### 1. INNER JOIN（内连接）
+
+只返回匹配的行。
+
+```sql
+-- 查询有订单的用户
+SELECT
+  u.id,
+  u.email,
+  u.full_name,
+  o.order_number,
+  o.total
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+ORDER BY o.created_at DESC;
+
+-- 统计每个用户的订单数量
+SELECT
+  u.id,
+  u.email,
+  COUNT(o.id) as order_count
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+GROUP BY u.id
+HAVING COUNT(o.id) > 0;
+```
+
+---
+
+### 2. LEFT JOIN（左连接）
+
+返回左表所有行，右表不匹配的为 NULL。
+
+```sql
+-- 查询所有用户及其订单（包括没有订单的用户）
+SELECT
+  u.id,
+  u.email,
+  u.full_name,
+  o.order_number,
+  o.total
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+ORDER BY u.created_at DESC;
+
+-- 统计所有用户的订单数量（包括 0 单用户）
+SELECT
+  u.id,
+  u.email,
+  COALESCE(COUNT(o.id), 0) as order_count,
+  COALESCE(SUM(o.total), 0) as total_spent
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+GROUP BY u.id;
+```
+
+---
+
+### 3. RIGHT JOIN（右连接）
+
+返回右表所有行，左表不匹配的为 NULL（很少使用）。
+
+```sql
+-- 实际应用中很少使用，通常用 LEFT JOIN 替代
+SELECT
+  u.email,
+  o.order_number
+FROM users u
+RIGHT JOIN orders o ON u.id = o.user_id;
+
+-- 等价于
+SELECT
+  u.email,
+  o.order_number
+FROM orders o
+LEFT JOIN users u ON o.user_id = u.id;
+```
+
+---
+
+### 4. FULL JOIN（全连接）
+
+返回左右表所有行，不匹配的为 NULL。
+
+```sql
+-- 查询所有用户和所有订单（包括没有订单的用户和没有用户的订单）
+SELECT
+  u.email,
+  o.order_number
+FROM users u
+FULL JOIN orders o ON u.id = o.user_id;
+```
+
+---
+
+### 5. 多表 JOIN
+
+```sql
+-- 查询订单及其商品信息
+SELECT
+  o.order_number,
+  o.total as order_total,
+  p.name as product_name,
+  oi.quantity,
+  oi.unit_price,
+  oi.subtotal
+FROM orders o
+INNER JOIN order_items oi ON o.id = oi.order_id
+INNER JOIN products p ON oi.product_id = p.id
+WHERE o.order_number = 'ORD-001';
+
+-- 查询用户及其订单和商品
+SELECT
+  u.email,
+  o.order_number,
+  p.name as product_name,
+  oi.quantity
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+INNER JOIN order_items oi ON o.id = oi.order_id
+INNER JOIN products p ON oi.product_id = p.id
+WHERE u.email = 'user@example.com';
+```
+
+---
+
+### 6. 自连接（Self JOIN）
+
+```sql
+-- 查询员工的上级
+CREATE TABLE employees (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name VARCHAR(100) NOT NULL,
+  manager_id UUID REFERENCES employees(id),
+  department VARCHAR(50)
+);
+
+INSERT INTO employees (name, manager_id, department) VALUES
+  ('张三（CEO）', NULL, '管理层'),
+  ('李四（CTO）', (SELECT id FROM employees WHERE name = '张三（CEO）'), '技术部'),
+  ('王五（CFO）', (SELECT id FROM employees WHERE name = '张三（CEO）'), '财务部'),
+  ('赵六（开发）', (SELECT id FROM employees WHERE name = '李四（CTO）'), '技术部');
+
+-- 查询员工及其上级
+SELECT
+  e.name as employee,
+  e.department,
+  m.name as manager
+FROM employees e
+LEFT JOIN employees m ON e.manager_id = m.id;
+```
+
+---
+
+## 外键约束详解
+
+### 级联操作
+
+```sql
+-- ON DELETE 行为
+CASCADE      -- 删除父记录时，子记录也删除
+SET NULL     -- 删除父记录时，子记录的外键设为 NULL
+RESTRICT     -- 有子记录时，禁止删除父记录（默认）
+NO ACTION    -- 类似 RESTRICT，但延迟到事务结束时检查
+
+-- ON UPDATE 行为
+CASCADE      -- 更新父记录的主键时，子记录的外键也更新
+SET NULL     -- 更新父记录的主键时，子记录的外键设为 NULL
+RESTRICT     -- 有子记录时，禁止更新父记录的主键
+
+-- 示例
+CREATE TABLE orders (
+  id UUID PRIMARY KEY,
+  user_id UUID NOT NULL REFERENCES users(id)
+    ON DELETE CASCADE          -- 删除用户时，订单也删除
+    ON UPDATE CASCADE,         -- 更新用户 ID 时，订单的用户 ID 也更新
+  order_number VARCHAR(50) UNIQUE NOT NULL
+);
+
+CREATE TABLE order_items (
+  id UUID PRIMARY KEY,
+  order_id UUID NOT NULL REFERENCES orders(id)
+    ON DELETE CASCADE,         -- 删除订单时，订单项也删除
+  product_id UUID NOT NULL REFERENCES products(id)
+    ON DELETE RESTRICT,        -- 有订单项时，禁止删除商品
+  quantity INTEGER NOT NULL
+);
+```
+
+---
+
+## 最佳实践
+
+### 1. 外键设计
+
+```sql
+-- ✅ 为所有外键创建索引
+CREATE INDEX idx_orders_user_id ON orders(user_id);
+
+-- ✅ 使用合适的级联操作
+-- 用户数据 → CASCADE（删除用户时清理订单）
+-- 商品数据 → RESTRICT（有订单时禁止删除）
+
+-- ✅ 考虑使用软删除
+ALTER TABLE users ADD COLUMN is_deleted BOOLEAN DEFAULT FALSE;
+-- 查询时过滤：WHERE is_deleted = FALSE
+```
+
+---
+
+### 2. JOIN 优化
+
+```sql
+-- ✅ 小表驱动大表
+SELECT * FROM large_table l
+INNER JOIN small_table s ON l.id = s.id;
+
+-- ✅ 只查询需要的列
+SELECT u.email, o.order_number  -- ✅
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id;
+
+SELECT *  -- ❌ 避免查询所有列
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id;
+
+-- ✅ 使用 WHERE 过滤
+SELECT u.email, o.order_number
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+WHERE o.status = 'paid';
+```
+
+---
+
+### 3. 关系设计原则
+
+- ✅ 优先使用外键约束（保证数据一致性）
+- ✅ 为外键创建索引（提升查询性能）
+- ✅ 选择合适的级联操作
+- ✅ 多对多关系使用中间表
+- ✅ 考虑未来扩展性
+
+---
+
+## 常见问题
+
+### Q1: 什么时候用 1:1，什么时候合并到一张表？
+
+**使用 1:1 的场景**：
+
+- ✅ 字段较多，可以分组
+- ✅ 经常单独查询
+- ✅ 访问权限不同
+
+**合并到一张表**：
+
+- ✅ 字段不多
+- ✅ 总是一起查询
+- ✅ 简化设计
+
+---
+
+### Q2: 多对多关系一定要中间表吗？
+
+**是的**，关系型数据库必须使用中间表。
+
+```sql
+-- 订单和商品的多对多关系
+CREATE TABLE order_items (
+  order_id UUID REFERENCES orders(id) ON DELETE CASCADE,
+  product_id UUID REFERENCES products(id) ON DELETE RESTRICT,
+  quantity INTEGER NOT NULL,
+  PRIMARY KEY (order_id, product_id)
+);
+```
+
+---
+
+### Q3: 自关联查询性能如何？
+
+**递归查询（CTE）性能可以接受**：
+
+```sql
+-- 查询分类树（递归）
+WITH RECURSIVE category_tree AS (
+  SELECT id, name, parent_id, 1 as level
+  FROM categories
+  WHERE parent_id IS NULL
+
+  UNION ALL
+
+  SELECT c.id, c.name, c.parent_id, ct.level + 1
+  FROM categories c
+  INNER JOIN category_tree ct ON c.parent_id = ct.id
+)
+SELECT * FROM category_tree;
+```
+
+---
+
+### Q4: LEFT JOIN 后如何过滤 NULL？
+
+```sql
+-- 查询没有订单的用户
+SELECT u.email
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+WHERE o.id IS NULL;
+
+-- 查询有资料的用户
+SELECT u.email
+FROM users u
+INNER JOIN user_profiles p ON u.id = p.user_id;
+```
+
+---
+
+### Q5: 如何优化多表 JOIN 查询？
+
+```sql
+-- ✅ 为外键创建索引
+-- ✅ 使用 EXPLAIN ANALYZE 分析查询
+-- ✅ 小表驱动大表
+-- ✅ 只查询需要的列
+-- ✅ 使用 WHERE 过滤
+-- ✅ 避免过深的 JOIN（超过 5 个）
+
+-- 示例：优化前
+SELECT * FROM users
+INNER JOIN orders ON users.id = orders.user_id
+INNER JOIN order_items ON orders.id = order_items.order_id
+INNER JOIN products ON order_items.product_id = products.id
+INNER JOIN categories ON products.category_id = categories.id;
+
+-- 优化后（分步查询）
+WITH order_summary AS (
+  SELECT
+    order_id,
+    SUM(quantity) as total_quantity
+  FROM order_items
+  GROUP BY order_id
+)
+SELECT * FROM order_summary;
+```
+
+---
+
+## 总结
+
+本文系统学习了数据库表关系设计：
+
+**表关系类型**：
+
+- 一对一（1:1）：共享主键 / 唯一外键
+- 一对多（1:N）：外键 + 级联操作
+- 多对多（M:N）：中间表
+- 自关联：分类树、组织架构
+
+**JOIN 查询**：
+
+- INNER JOIN：只返回匹配的行
+- LEFT JOIN：返回左表所有行
+- RIGHT JOIN：返回右表所有行
+- FULL JOIN：返回所有行
+- 多表 JOIN、自连接
+
+**外键约束**：
+
+- ON DELETE：CASCADE、SET NULL、RESTRICT
+- ON UPDATE：CASCADE、SET NULL、RESTRICT
+
+**最佳实践**：
+
+- 为外键创建索引
+- 选择合适的级联操作
+- 优化 JOIN 查询
+
+---
+
+## 下一步
+
+掌握了关系设计后，下一步我们将学习：
+
+**《06. 范式理论与反范式》**：如何平衡规范化和性能，何时使用反范式设计。
+
+你将学习：
+
+- 📊 第一、二、三范式（1NF、2NF、3NF）
+- 🔄 反范式设计策略
+- ⚖️ 规范化 vs 性能权衡
+- 🎯 物化视图与冗余字段
+
+继续关注，让我们一起深入理解数据库设计理论！

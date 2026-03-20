@@ -1,0 +1,442 @@
+---
+title: "11. Prisma 高级查询：掌握复杂查询与性能优化"
+date: "2026-03-19"
+summary: "深入学习 Prisma 的高级查询技巧，掌握复杂场景的最佳实践"
+tags: ["Prisma", "高级查询", "性能优化", "TypeScript"]
+category: "数据库"
+cover: ""
+draft: false
+series: "数据库渐进式学习路线"
+seriesOrder: 11
+---
+
+## 前言
+
+掌握了 Prisma 基础用法后，如何处理复杂查询？如何优化性能？避免 N+1 问题？
+
+本文将深入讲解 Prisma 的高级查询技巧，帮助你应对各种复杂场景，写出高性能的代码。
+
+---
+
+## 核心概念
+
+### 关系查询
+
+Prisma 提供了强大的关系查询能力。
+
+**include vs select**：
+
+- `include`：包含关联数据
+- `select`：精确控制返回字段
+
+---
+
+## 实战演练
+
+### 1. 关系查询（避免 N+1）
+
+```typescript
+// ❌ N+1 问题
+const users = await prisma.user.findMany();
+for (const user of users) {
+  const orders = await prisma.order.findMany({
+    where: { userId: user.id },
+  });
+}
+
+// ✅ 使用 include
+const usersWithOrders = await prisma.user.findMany({
+  include: {
+    orders: {
+      select: {
+        id: true,
+        orderNumber: true,
+        total: true,
+        createdAt: true,
+      },
+      where: { status: "PAID" },
+      orderBy: { createdAt: "desc" },
+      take: 5,
+    },
+  },
+});
+```
+
+---
+
+### 2. 复杂过滤
+
+```typescript
+// AND 条件
+const orders = await prisma.order.findMany({
+  where: {
+    AND: [
+      { status: { in: ["PAID", "SHIPPED"] } },
+      { createdAt: { gte: startDate } },
+      { total: { gte: 100 } },
+    ],
+  },
+});
+
+// OR 条件
+const users = await prisma.user.findMany({
+  where: {
+    OR: [{ email: { contains: query } }, { fullName: { contains: query } }],
+  },
+});
+
+// NOT 条件
+const users = await prisma.user.findMany({
+  where: {
+    NOT: {
+      isVerified: true,
+    },
+  },
+});
+```
+
+---
+
+### 3. 全文搜索
+
+```typescript
+// PostgreSQL 全文搜索
+const users = await prisma.user.findMany({
+  where: {
+    OR: [
+      { email: { contains: query, mode: "insensitive" } },
+      { fullName: { contains: query, mode: "insensitive" } },
+    ],
+  },
+});
+
+// 使用原生 SQL（更强大的全文搜索）
+const users = await prisma.$queryRaw`
+  SELECT * FROM users
+  WHERE to_tsvector('chinese', email || ' ' || full_name) @@ to_tsquery('chinese', ${query})
+`;
+```
+
+---
+
+### 4. 聚合查询
+
+```typescript
+// 统计订单
+const stats = await prisma.order.aggregate({
+  where: { status: "PAID" },
+  _count: { id: true },
+  _sum: { total: true },
+  _avg: { total: true },
+  _min: { total: true },
+  _max: { total: true },
+});
+
+// 分组查询
+const orderStatsByUser = await prisma.order.groupBy({
+  by: ["userId"],
+  where: { status: "PAID" },
+  _count: { id: true },
+  _sum: { total: true },
+  orderBy: { _sum: { total: "desc" } },
+});
+```
+
+---
+
+### 5. Cursor 分页
+
+```typescript
+// 第一页
+const firstPage = await prisma.order.findMany({
+  orderBy: { createdAt: "desc" },
+  take: 20,
+});
+
+// 下一页
+const lastItem = firstPage[firstPage.length - 1];
+const nextPage = await prisma.order.findMany({
+  cursor: { id: lastItem.id },
+  orderBy: { createdAt: "desc" },
+  take: 20,
+  skip: 1,
+});
+
+// API 实现
+app.get("/orders", async (req, res) => {
+  const { cursor, limit = 20 } = req.query;
+
+  const orders = await prisma.order.findMany({
+    take: Number(limit),
+    ...(cursor && {
+      skip: 1,
+      cursor: { id: String(cursor) },
+    }),
+    orderBy: { createdAt: "desc" },
+  });
+
+  res.json({
+    orders,
+    nextCursor: orders[orders.length - 1]?.id,
+  });
+});
+```
+
+---
+
+### 6. 原生 SQL
+
+```typescript
+// $queryRaw（查询）
+const result = await prisma.$queryRaw`
+  SELECT
+    u.email,
+    COUNT(o.id) as order_count,
+    COALESCE(SUM(o.total), 0) as total_spent
+  FROM users u
+  LEFT JOIN orders o ON u.id = o.user_id
+  WHERE u.is_verified = true
+  GROUP BY u.id, u.email
+  ORDER BY total_spent DESC
+  LIMIT 10
+`;
+
+// $executeRaw（执行）
+await prisma.$executeRaw`UPDATE users SET last_login_at = NOW() WHERE id = ${userId}`;
+```
+
+---
+
+### 7. 批量操作
+
+```typescript
+// 批量创建
+const users = await prisma.user.createMany({
+  data: [
+    { email: "user1@example.com", passwordHash: "hash1" },
+    { email: "user2@example.com", passwordHash: "hash2" },
+    { email: "user3@example.com", passwordHash: "hash3" },
+  ],
+  skipDuplicates: true,
+});
+
+// 批量更新
+await prisma.order.updateMany({
+  where: { status: "PENDING", createdAt: { lt: cutoffDate } },
+  data: { status: "CANCELLED" },
+});
+```
+
+---
+
+### 8. JSON 字段查询
+
+```typescript
+// 查询 JSON 字段
+const users = await prisma.user.findMany({
+  where: {
+    preferences: {
+      path: ["notifications", "email"],
+      equals: true,
+    },
+  },
+});
+
+// 更新 JSON 字段
+await prisma.user.update({
+  where: { id: userId },
+  data: {
+    preferences: {
+      ...existingPreferences,
+      theme: "dark",
+    },
+  },
+});
+```
+
+---
+
+### 9. 原子操作
+
+```typescript
+await prisma.product.update({
+  where: { id: productId },
+  data: {
+    stock: { increment: 1 },
+    views: { decrement: 1 },
+    version: { set: 2 },
+  },
+});
+```
+
+---
+
+### 10. Upsert
+
+```typescript
+const user = await prisma.user.upsert({
+  where: { email: "user@example.com" },
+  create: {
+    email: "user@example.com",
+    passwordHash: "hash",
+  },
+  update: {
+    lastLoginAt: new Date(),
+  },
+});
+```
+
+---
+
+## 性能优化
+
+### 1. select 只查询需要的字段
+
+```typescript
+// ❌ 查询所有字段
+const users = await prisma.user.findMany();
+
+// ✅ 只查询需要的字段
+const users = await prisma.user.findMany({
+  select: {
+    id: true,
+    email: true,
+    fullName: true,
+  },
+});
+```
+
+---
+
+### 2. 避免 N+1 查询
+
+```typescript
+// ❌ N+1 问题
+const users = await prisma.user.findMany();
+for (const user of users) {
+  const orders = await prisma.order.findMany({
+    where: { userId: user.id },
+  });
+}
+
+// ✅ 使用 include
+const users = await prisma.user.findMany({
+  include: { orders: true },
+});
+```
+
+---
+
+### 3. 使用 take 限制结果
+
+```typescript
+const users = await prisma.user.findMany({
+  take: 20,
+  orderBy: { createdAt: "desc" },
+});
+```
+
+---
+
+## 最佳实践
+
+### 1. 事务处理
+
+```typescript
+await prisma.$transaction(async (tx) => {
+  const order = await tx.order.create({ ... })
+  await tx.orderItem.create({ ... })
+  await tx.product.update({ ... })
+})
+```
+
+---
+
+### 2. 错误处理
+
+```typescript
+try {
+  const user = await prisma.user.create({ ... })
+} catch (error) {
+  if (error.code === 'P2002') {
+    // 唯一约束冲突
+    console.log('Email already exists')
+  }
+}
+```
+
+---
+
+### 3. 日志配置
+
+```typescript
+const prisma = new PrismaClient({
+  log: [
+    { level: "query", emit: "event" },
+    { level: "error", emit: "stdout" },
+    { level: "warn", emit: "stdout" },
+  ],
+});
+
+prisma.$on("query", (e) => {
+  console.log("Query: " + e.query);
+  console.log("Params: " + e.params);
+  console.log("Duration: " + e.duration + "ms");
+});
+```
+
+---
+
+## 常见问题
+
+### Q1: 如何处理循环依赖？
+
+使用 `select` 而不是 `include`，精确控制返回字段。
+
+---
+
+### Q2: 如何优化大数据量查询？
+
+使用 cursor 分页，而不是 offset 分页。
+
+---
+
+## 总结
+
+本文深入学习了 Prisma 高级查询：
+
+**高级查询**：
+
+- 关系查询（避免 N+1）
+- 复杂过滤（AND、OR、NOT）
+- 聚合查询、分组查询
+- Cursor 分页
+
+**性能优化**：
+
+- select 精确控制字段
+- 避免 N+1 查询
+- 使用 take 限制结果
+
+**最佳实践**：
+
+- 事务处理
+- 错误处理
+- 日志配置
+
+---
+
+## 下一步
+
+掌握了 Prisma 高级查询后，下一步我们将学习：
+
+**《12. 事务与并发控制》**：掌握事务处理和并发控制机制。
+
+你将学习：
+
+- 🔒 事务 ACID 特性
+- 🔐 并发问题与锁机制
+- 🚀 乐观锁 vs 悲观锁
+- 💡 Prisma 事务最佳实践
+
+继续关注，让我们一起深入理解事务与并发！
