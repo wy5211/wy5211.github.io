@@ -1,0 +1,1349 @@
+---
+title: "05. 数据验证与 Zod"
+date: "2026-03-20"
+summary: "掌握使用 Zod 实现强大的数据验证，学习如何定义类型安全的 Schema、验证请求数据、处理复杂验证场景，并提供友好的错误提示。"
+tags: ["Hono", "Zod", "Validation", "TypeScript", "Schema"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 5
+---
+
+## 前言
+
+在构建 Web API 时，数据验证是不可或缺的一环。无效或恶意的数据可能导致应用程序崩溃、数据不一致，甚至安全漏洞。传统的验证方式往往冗长、难以维护，而且与 TypeScript 类型系统脱节。
+
+**Zod** 是一个 TypeScript-first 的数据验证库，它让你能够用简洁的语法定义 Schema，同时自动推断 TypeScript 类型。这意味着你只需要写一次验证规则，就能同时获得运行时验证和编译时类型检查。
+
+Hono 与 Zod 的结合更是天衣无缝，通过 `@hono/zod-validator` 中间件，你可以轻松实现请求数据验证，让 API 更加健壮和安全。
+
+本篇文章将带你：
+
+- 🎯 理解数据验证的重要性和 Zod 的优势
+- 📝 定义各种类型的 Zod Schema
+- ✨ 在 Hono 中集成 Zod 验证中间件
+- 🔍 处理复杂的验证场景
+- 💡 提供友好的错误提示
+- 🚀 掌握验证最佳实践
+
+---
+
+## 为什么需要数据验证
+
+### 数据验证的重要性
+
+```typescript
+// ❌ 没有验证的危险代码
+app.post("/users", async (c) => {
+  const body = await c.req.json();
+
+  // 直接使用用户数据，没有任何验证
+  await db.insert(users).values(body);
+
+  return c.json({ message: "User created" });
+});
+
+// 问题：
+// 1. 缺少必填字段怎么办？
+// 2. email 格式不正确怎么办？
+// 3. password 太简单怎么办？
+// 4. 恶意用户传入多余字段怎么办？
+```
+
+```typescript
+// ✅ 带验证的安全代码
+app.post("/users", zValidator("json", userSchema), async (c) => {
+  const user = c.req.valid("json"); // 已验证的数据
+  await db.insert(users).values(user);
+
+  return c.json({ message: "User created" });
+});
+```
+
+### 传统验证 vs Zod
+
+```typescript
+// ❌ 传统验证方式（冗长、重复）
+app.post("/users", async (c) => {
+  const body = await c.req.json();
+
+  // 手动验证
+  if (!body.name || typeof body.name !== "string") {
+    return c.json({ error: "Name is required" }, 400);
+  }
+
+  if (!body.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(body.email)) {
+    return c.json({ error: "Invalid email" }, 400);
+  }
+
+  if (!body.password || body.password.length < 8) {
+    return c.json({ error: "Password too short" }, 400);
+  }
+
+  // 验证通过后，body 的类型还是 any
+  await createUser(body);
+});
+
+// ✅ Zod 验证（简洁、类型安全）
+const userSchema = z.object({
+  name: z.string().min(1),
+  email: z.string().email(),
+  password: z.string().min(8),
+});
+
+app.post("/users", zValidator("json", userSchema), async (c) => {
+  const user = c.req.valid("json");
+  // user 类型自动推断为 { name: string; email: string; password: string }
+
+  await createUser(user);
+});
+```
+
+---
+
+## Zod 基础
+
+### 安装依赖
+
+```bash
+# 安装 Zod 和 Hono 的 Zod 验证器
+npm install zod @hono/zod-validator
+# 或
+pnpm add zod @hono/zod-validator
+# 或
+bun add zod @hono/zod-validator
+```
+
+### 基本类型验证
+
+```typescript
+import { z } from "zod";
+
+// 字符串验证
+const nameSchema = z.string();
+nameSchema.parse("John"); // ✅ 通过
+nameSchema.parse(123); // ❌ 抛出 ZodError
+
+// 带验证规则的字符串
+const usernameSchema = z
+  .string()
+  .min(3, "Username too short") // 最小长度
+  .max(20, "Username too long") // 最大长度
+  .regex(/^[a-zA-Z0-9_]+$/, "Invalid characters");
+
+// 数字验证
+const ageSchema = z
+  .number()
+  .min(18, "Must be 18 or older")
+  .max(120, "Invalid age");
+
+// 布尔值
+const isActiveSchema = z.boolean();
+
+// 枚举
+const roleSchema = z.enum(["user", "admin", "moderator"]);
+roleSchema.parse("user"); // ✅
+roleSchema.parse("superadmin"); // ❌
+
+// 可选类型
+const phoneSchema = z.string().optional(); // 可以是 undefined
+const emailSchema = z.string().nullable(); // 可以是 null
+
+// 带默认值
+const limitSchema = z.number().default(10);
+const sortSchema = z.enum(["asc", "desc"]).default("desc");
+```
+
+### 对象验证
+
+```typescript
+// 定义对象 Schema
+const userSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string().min(1).max(50),
+  email: z.string().email(),
+  age: z.number().min(18).optional(),
+  role: z.enum(["user", "admin"]).default("user"),
+  isActive: z.boolean().default(true),
+});
+
+// 验证数据
+const validUser = userSchema.parse({
+  id: "123e4567-e89b-12d3-a456-426614174000",
+  name: "John Doe",
+  email: "john@example.com",
+});
+// ✅ 返回验证后的数据，age 会是 undefined，role 是 'user'，isActive 是 true
+
+const invalidUser = userSchema.parse({
+  id: "invalid-uuid",
+  name: "",
+  email: "not-an-email",
+});
+// ❌ 抛出 ZodError，包含详细错误信息
+```
+
+### 数组验证
+
+```typescript
+// 简单数组
+const tagsSchema = z.array(z.string());
+tagsSchema.parse(["js", "ts", "react"]); // ✅
+tagsSchema.parse(["js", 123]); // ❌
+
+// 带验证的数组
+const scoresSchema = z.array(z.number().min(0).max(100));
+
+// 限制数组长度
+const limitedTagsSchema = z
+  .array(z.string())
+  .min(1, "At least one tag required")
+  .max(5, "Maximum 5 tags allowed");
+
+// 非空数组
+const nonEmptySchema = z.array(z.string()).nonempty();
+```
+
+---
+
+## 在 Hono 中使用 Zod
+
+### 基本集成
+
+```typescript
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+
+const app = new Hono();
+
+// 定义 Schema
+const userSchema = z.object({
+  name: z.string().min(2).max(50),
+  email: z.string().email(),
+  age: z.number().min(18).optional(),
+});
+
+// 使用 zValidator 中间件
+app.post("/users", zValidator("json", userSchema), async (c) => {
+  const user = c.req.valid("json");
+  // user 类型是 { name: string; email: string; age?: number }
+
+  // 创建用户...
+  return c.json({ message: "User created" }, 201);
+});
+```
+
+### 验证查询参数
+
+```typescript
+// 查询参数 Schema
+const querySchema = z.object({
+  keyword: z.string().optional(),
+  page: z.string().transform(Number).default("1"),
+  limit: z.string().transform(Number).default("10"),
+  sort: z.enum(["asc", "desc"]).default("desc"),
+});
+
+app.get("/users", zValidator("query", querySchema), (c) => {
+  const { keyword, page, limit, sort } = c.req.valid("query");
+  // keyword?: string
+  // page: number (已转换)
+  // limit: number (已转换)
+  // sort: 'asc' | 'desc'
+
+  return c.json({ keyword, page, limit, sort });
+});
+```
+
+### 验证路径参数
+
+```typescript
+// 路径参数 Schema
+const paramsSchema = z.object({
+  id: z.string().uuid("Invalid ID format"),
+});
+
+app.get("/users/:id", zValidator("param", paramsSchema), (c) => {
+  const { id } = c.req.valid("param");
+  // id: string (UUID 格式)
+
+  return c.json({ userId: id });
+});
+```
+
+### 同时验证多个位置
+
+```typescript
+// 定义多个 Schema
+const paramsSchema = z.object({
+  userId: z.string().uuid(),
+});
+
+const querySchema = z.object({
+  includePosts: z.enum(["true", "false"]).transform((v) => v === "true"),
+});
+
+const bodySchema = z.object({
+  name: z.string().min(1),
+});
+
+// 组合使用
+app.put(
+  "/users/:userId",
+  zValidator("param", paramsSchema),
+  zValidator("query", querySchema),
+  zValidator("json", bodySchema),
+  async (c) => {
+    const { userId } = c.req.valid("param");
+    const { includePosts } = c.req.valid("query");
+    const { name } = c.req.valid("json");
+
+    return c.json({ userId, name, includePosts });
+  }
+);
+```
+
+---
+
+## 高级验证场景
+
+### 嵌套对象验证
+
+```typescript
+// 嵌套对象
+const postSchema = z.object({
+  title: z.string().min(1).max(200),
+  content: z.string().min(1),
+  author: z.object({
+    id: z.string().uuid(),
+    name: z.string(),
+    email: z.string().email(),
+  }),
+  tags: z.array(z.string()).min(1).max(5),
+});
+
+app.post("/posts", zValidator("json", postSchema), async (c) => {
+  const post = c.req.valid("json");
+
+  // post.author.id 是 string
+  // post.author.name 是 string
+  // post.tags 是 string[]
+
+  return c.json({ message: "Post created" }, 201);
+});
+
+// 深层嵌套
+const configSchema = z.object({
+  database: z.object({
+    host: z.string(),
+    port: z.number(),
+    credentials: z.object({
+      username: z.string(),
+      password: z.string(),
+    }),
+  }),
+});
+```
+
+### 条件验证
+
+```typescript
+// 根据其他字段的条件验证
+const registrationSchema = z
+  .object({
+    accountType: z.enum(["individual", "company"]),
+    firstName: z.string().optional(),
+    lastName: z.string().optional(),
+    companyName: z.string().optional(),
+    taxId: z.string().optional(),
+  })
+  .refine(
+    (data) => {
+      if (data.accountType === "individual") {
+        return data.firstName && data.lastName;
+      }
+      return true;
+    },
+    {
+      message: "First and last name required for individual accounts",
+      path: ["firstName"],
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.accountType === "company") {
+        return data.companyName && data.taxId;
+      }
+      return true;
+    },
+    {
+      message: "Company name and tax ID required for company accounts",
+      path: ["companyName"],
+    }
+  );
+
+app.post("/register", zValidator("json", registrationSchema), async (c) => {
+  const data = c.req.valid("json");
+  // ...
+});
+```
+
+### 自定义验证器
+
+```typescript
+// 使用 refine 添加自定义验证
+const passwordSchema = z
+  .string()
+  .min(8, "Password must be at least 8 characters")
+  .refine(
+    (password) => /[A-Z]/.test(password),
+    "Password must contain at least one uppercase letter"
+  )
+  .refine(
+    (password) => /[a-z]/.test(password),
+    "Password must contain at least one lowercase letter"
+  )
+  .refine(
+    (password) => /\d/.test(password),
+    "Password must contain at least one number"
+  )
+  .refine(
+    (password) => /[!@#$%^&*]/.test(password),
+    "Password must contain at least one special character"
+  );
+
+// 使用 superRefine 进行复杂验证
+const orderSchema = z
+  .object({
+    items: z.array(
+      z.object({
+        productId: z.string().uuid(),
+        quantity: z.number().min(1),
+      })
+    ),
+    shippingAddress: z.object({
+      country: z.string(),
+      city: z.string(),
+      address: z.string(),
+    }),
+  })
+  .superRefine((data, ctx) => {
+    // 检查是否支持该国配送
+    if (!isShippingAvailable(data.shippingAddress.country)) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Shipping not available for this country",
+        path: ["shippingAddress", "country"],
+      });
+    }
+
+    // 检查库存
+    for (const item of data.items) {
+      if (!checkStock(item.productId, item.quantity)) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Insufficient stock for product ${item.productId}`,
+          path: ["items", data.items.indexOf(item)],
+        });
+      }
+    }
+  });
+```
+
+### 数据转换
+
+```typescript
+// transform 在验证后转换数据
+const querySchema = z.object({
+  page: z.string().transform((val) => parseInt(val, 10)),
+  limit: z.string().transform((val) => parseInt(val, 10)),
+  startDate: z.string().transform((val) => new Date(val)),
+  endDate: z.string().transform((val) => new Date(val)),
+});
+
+app.get("/posts", zValidator("query", querySchema), (c) => {
+  const { page, limit, startDate, endDate } = c.req.valid("query");
+  // page, limit 是 number
+  // startDate, endDate 是 Date
+
+  return c.json({ page, limit, startDate, endDate });
+});
+
+// 条件转换
+const userInputSchema = z
+  .object({
+    birthYear: z.string().transform((val) => parseInt(val, 10)),
+    birthMonth: z.string().transform((val) => parseInt(val, 10)),
+    birthDay: z.string().transform((val) => parseInt(val, 10)),
+  })
+  .transform((data) => ({
+    ...data,
+    birthDate: new Date(data.birthYear, data.birthMonth - 1, data.birthDay),
+  }));
+```
+
+---
+
+## 错误处理
+
+### 自定义错误响应
+
+```typescript
+// 自定义错误格式
+app.post(
+  "/users",
+  zValidator("json", userSchema, (result, c) => {
+    if (!result.success) {
+      return c.json(
+        {
+          success: false,
+          errors: result.error.errors.map((err) => ({
+            field: err.path.join("."),
+            message: err.message,
+          })),
+        },
+        400
+      );
+    }
+  }),
+  async (c) => {
+    const user = c.req.valid("json");
+    // ...
+  }
+);
+```
+
+### 全局错误处理中间件
+
+```typescript
+// 创建统一的验证错误处理器
+const validationErrorHandler = (result: z.ZodValidationResult, c: Context) => {
+  if (!result.success) {
+    return c.json(
+      {
+        success: false,
+        error: "Validation failed",
+        details: result.error.errors.map((err) => ({
+          field: err.path.join("."),
+          message: err.message,
+          code: err.code,
+        })),
+      },
+      400
+    );
+  }
+};
+
+// 使用
+app.post(
+  "/users",
+  zValidator("json", userSchema, validationErrorHandler),
+  async (c) => {
+    const user = c.req.valid("json");
+    // ...
+  }
+);
+```
+
+### 友好的错误消息
+
+```typescript
+// 定义自定义错误消息
+const formSchema = z.object({
+  username: z
+    .string({
+      required_error: "用户名必填",
+      invalid_type_error: "用户名必须是字符串",
+    })
+    .min(3, "用户名至少3个字符")
+    .max(20, "用户名最多20个字符"),
+
+  email: z
+    .string({
+      required_error: "邮箱必填",
+    })
+    .email("请输入有效的邮箱地址"),
+
+  password: z
+    .string({
+      required_error: "密码必填",
+    })
+    .min(8, "密码至少8个字符"),
+
+  age: z
+    .number({
+      required_error: "年龄必填",
+      invalid_type_error: "年龄必须是数字",
+    })
+    .min(18, "年龄必须满18岁")
+    .max(120, "年龄不能超过120岁"),
+});
+
+app.post(
+  "/register",
+  zValidator("json", formSchema, (result, c) => {
+    if (!result.success) {
+      return c.json(
+        {
+          success: false,
+          message: "表单验证失败",
+          errors: result.error.errors.reduce(
+            (acc, err) => {
+              const field = err.path.join(".");
+              if (!acc[field]) acc[field] = [];
+              acc[field].push(err.message);
+              return acc;
+            },
+            {} as Record<string, string[]>
+          ),
+        },
+        400
+      );
+    }
+  }),
+  async (c) => {
+    const data = c.req.valid("json");
+    // ...
+  }
+);
+
+// 错误响应示例：
+// {
+//   "success": false,
+//   "message": "表单验证失败",
+//   "errors": {
+//     "username": ["用户名至少3个字符"],
+//     "email": ["请输入有效的邮箱地址"]
+//   }
+// }
+```
+
+---
+
+## 实战示例
+
+### 完整的 CRUD API 验证
+
+```typescript
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+import { HTTPException } from "hono/http-exception";
+
+const app = new Hono();
+
+// ==================== Schema 定义 ====================
+
+// 创建文章的 Schema
+const createPostSchema = z.object({
+  title: z.string().min(1, "标题不能为空").max(200, "标题最多200个字符"),
+  content: z.string().min(1, "内容不能为空").max(10000, "内容最多10000个字符"),
+  excerpt: z.string().max(500, "摘要最多500个字符").optional(),
+  published: z.boolean().default(false),
+  tags: z
+    .array(z.string())
+    .min(1, "至少需要一个标签")
+    .max(5, "最多5个标签")
+    .optional(),
+  categoryId: z.string().uuid("Invalid category ID"),
+  coverImage: z.string().url("Invalid cover image URL").optional(),
+});
+
+// 更新文章的 Schema（所有字段可选）
+const updatePostSchema = createPostSchema.partial();
+
+// 查询参数 Schema
+const postQuerySchema = z.object({
+  page: z.string().transform(Number).default("1"),
+  limit: z.string().transform(Number).default("10"),
+  keyword: z.string().optional(),
+  categoryId: z.string().uuid().optional(),
+  published: z.enum(["true", "false", "all"]).default("all"),
+  sortBy: z.enum(["createdAt", "updatedAt", "title"]).default("createdAt"),
+  sortOrder: z.enum(["asc", "desc"]).default("desc"),
+});
+
+// 路径参数 Schema
+const postParamSchema = z.object({
+  id: z.string().uuid("Invalid post ID format"),
+});
+
+// ==================== 验证错误处理 ====================
+
+const handleValidationError = (result: z.ZodValidationResult, c: any) => {
+  if (!result.success) {
+    return c.json(
+      {
+        success: false,
+        message: "Validation failed",
+        errors: result.error.errors.map((err) => ({
+          field: err.path.join("."),
+          message: err.message,
+        })),
+      },
+      400
+    );
+  }
+};
+
+// ==================== 路由定义 ====================
+
+// GET /posts - 获取文章列表
+app.get(
+  "/posts",
+  zValidator("query", postQuerySchema, handleValidationError),
+  async (c) => {
+    const { page, limit, keyword, categoryId, published, sortBy, sortOrder } =
+      c.req.valid("query");
+
+    // 构建查询条件
+    const conditions: any[] = [];
+
+    if (keyword) {
+      conditions.push(like(posts.title, `%${keyword}%`));
+    }
+
+    if (categoryId) {
+      conditions.push(eq(posts.categoryId, categoryId));
+    }
+
+    if (published !== "all") {
+      conditions.push(eq(posts.published, published === "true"));
+    }
+
+    // 查询数据
+    const [postList, totalCount] = await Promise.all([
+      db.query.posts.findMany({
+        where: conditions.length > 0 ? and(...conditions) : undefined,
+        limit,
+        offset: (page - 1) * limit,
+        orderBy: sortOrder === "asc" ? asc(posts[sortBy]) : desc(posts[sortBy]),
+        with: {
+          category: true,
+          author: {
+            columns: { id: true, name: true, avatar: true },
+          },
+        },
+      }),
+      db
+        .select({ count: sql<number>`count(*)` })
+        .from(posts)
+        .where(conditions.length > 0 ? and(...conditions) : undefined),
+    ]);
+
+    return c.json({
+      success: true,
+      data: postList,
+      meta: {
+        page,
+        limit,
+        total: totalCount[0].count,
+        totalPages: Math.ceil(totalCount[0].count / limit),
+      },
+    });
+  }
+);
+
+// GET /posts/:id - 获取文章详情
+app.get(
+  "/posts/:id",
+  zValidator("param", postParamSchema, handleValidationError),
+  async (c) => {
+    const { id } = c.req.valid("param");
+
+    const post = await db.query.posts.findFirst({
+      where: eq(posts.id, id),
+      with: {
+        category: true,
+        author: true,
+        tags: true,
+        comments: {
+          where: eq(comments.approved, true),
+          with: {
+            author: {
+              columns: { id: true, name: true, avatar: true },
+            },
+          },
+        },
+      },
+    });
+
+    if (!post) {
+      throw new HTTPException(404, { message: "Post not found" });
+    }
+
+    // 增加浏览量
+    await db
+      .update(posts)
+      .set({ views: sql`${posts.views} + 1` })
+      .where(eq(posts.id, id));
+
+    return c.json({
+      success: true,
+      data: post,
+    });
+  }
+);
+
+// POST /posts - 创建文章
+app.post(
+  "/posts",
+  zValidator("json", createPostSchema, handleValidationError),
+  async (c) => {
+    const data = c.req.valid("json");
+    const currentUser = c.get("user");
+
+    // 检查分类是否存在
+    const category = await db.query.categories.findFirst({
+      where: eq(categories.id, data.categoryId),
+    });
+
+    if (!category) {
+      return c.json(
+        {
+          success: false,
+          message: "Category not found",
+        },
+        404
+      );
+    }
+
+    // 创建文章
+    const post = await db
+      .insert(posts)
+      .values({
+        id: crypto.randomUUID(),
+        ...data,
+        authorId: currentUser.id,
+        views: 0,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning();
+
+    // 处理标签
+    if (data.tags && data.tags.length > 0) {
+      const tagRelations = data.tags.map((tagId) => ({
+        postId: post[0].id,
+        tagId,
+      }));
+      await db.insert(postTags).values(tagRelations);
+    }
+
+    return c.json(
+      {
+        success: true,
+        data: post[0],
+        message: "Post created successfully",
+      },
+      201
+    );
+  }
+);
+
+// PATCH /posts/:id - 更新文章
+app.patch(
+  "/posts/:id",
+  zValidator("param", postParamSchema, handleValidationError),
+  zValidator("json", updatePostSchema, handleValidationError),
+  async (c) => {
+    const { id } = c.req.valid("param");
+    const data = c.req.valid("json");
+    const currentUser = c.get("user");
+
+    // 检查文章是否存在
+    const post = await db.query.posts.findFirst({
+      where: eq(posts.id, id),
+    });
+
+    if (!post) {
+      throw new HTTPException(404, { message: "Post not found" });
+    }
+
+    // 检查权限
+    if (post.authorId !== currentUser.id && currentUser.role !== "admin") {
+      throw new HTTPException(403, { message: "Forbidden" });
+    }
+
+    // 更新文章
+    const updated = await db
+      .update(posts)
+      .set({ ...data, updatedAt: new Date() })
+      .where(eq(posts.id, id))
+      .returning();
+
+    // 更新标签
+    if (data.tags) {
+      await db.delete(postTags).where(eq(postTags.postId, id));
+
+      if (data.tags.length > 0) {
+        const tagRelations = data.tags.map((tagId) => ({
+          postId: id,
+          tagId,
+        }));
+        await db.insert(postTags).values(tagRelations);
+      }
+    }
+
+    return c.json({
+      success: true,
+      data: updated[0],
+      message: "Post updated successfully",
+    });
+  }
+);
+
+// DELETE /posts/:id - 删除文章
+app.delete(
+  "/posts/:id",
+  zValidator("param", postParamSchema, handleValidationError),
+  async (c) => {
+    const { id } = c.req.valid("param");
+    const currentUser = c.get("user");
+
+    const post = await db.query.posts.findFirst({
+      where: eq(posts.id, id),
+    });
+
+    if (!post) {
+      throw new HTTPException(404, { message: "Post not found" });
+    }
+
+    if (post.authorId !== currentUser.id && currentUser.role !== "admin") {
+      throw new HTTPException(403, { message: "Forbidden" });
+    }
+
+    await db.delete(posts).where(eq(posts.id, id));
+
+    return c.json({
+      success: true,
+      message: "Post deleted successfully",
+    });
+  }
+);
+
+export default app;
+```
+
+### 用户注册验证
+
+```typescript
+// 注册 Schema
+const registerSchema = z
+  .object({
+    email: z.string().min(1, "Email is required").email("Invalid email format"),
+
+    username: z
+      .string()
+      .min(3, "Username must be at least 3 characters")
+      .max(20, "Username must be at most 20 characters")
+      .regex(
+        /^[a-zA-Z0-9_]+$/,
+        "Username can only contain letters, numbers, and underscores"
+      ),
+
+    password: z
+      .string()
+      .min(8, "Password must be at least 8 characters")
+      .regex(/[A-Z]/, "Password must contain at least one uppercase letter")
+      .regex(/[a-z]/, "Password must contain at least one lowercase letter")
+      .regex(/\d/, "Password must contain at least one number")
+      .regex(
+        /[!@#$%^&*]/,
+        "Password must contain at least one special character"
+      ),
+
+    confirmPassword: z.string(),
+  })
+  .refine((data) => data.password === data.confirmPassword, {
+    message: "Passwords don't match",
+    path: ["confirmPassword"],
+  });
+
+app.post(
+  "/auth/register",
+  zValidator("json", registerSchema, (result, c) => {
+    if (!result.success) {
+      return c.json(
+        {
+          success: false,
+          message: "Registration failed",
+          errors: result.error.errors.reduce(
+            (acc, err) => {
+              const field = err.path.join(".");
+              acc[field] = err.message;
+              return acc;
+            },
+            {} as Record<string, string>
+          ),
+        },
+        400
+      );
+    }
+  }),
+  async (c) => {
+    const { email, username, password } = c.req.valid("json");
+
+    // 检查邮箱是否已注册
+    const existingUser = await db.query.users.findFirst({
+      where: eq(users.email, email),
+    });
+
+    if (existingUser) {
+      return c.json(
+        {
+          success: false,
+          message: "Email already registered",
+        },
+        409
+      );
+    }
+
+    // 检查用户名是否已被占用
+    const existingUsername = await db.query.users.findFirst({
+      where: eq(users.username, username),
+    });
+
+    if (existingUsername) {
+      return c.json(
+        {
+          success: false,
+          message: "Username already taken",
+        },
+        409
+      );
+    }
+
+    // 创建用户
+    const hashedPassword = await hash(password, 10);
+
+    const user = await db
+      .insert(users)
+      .values({
+        id: crypto.randomUUID(),
+        email,
+        username,
+        password: hashedPassword,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning();
+
+    return c.json(
+      {
+        success: true,
+        data: {
+          id: user[0].id,
+          email: user[0].email,
+          username: user[0].username,
+        },
+        message: "Registration successful",
+      },
+      201
+    );
+  }
+);
+```
+
+---
+
+## 最佳实践
+
+### 1. Schema 组织
+
+```typescript
+// validators/schemas.ts
+export const userSchemas = {
+  register: z.object({
+    email: z.string().email(),
+    username: z.string().min(3).max(20),
+    password: z.string().min(8),
+  }),
+
+  login: z.object({
+    email: z.string().email(),
+    password: z.string(),
+  }),
+
+  update: z
+    .object({
+      name: z.string().min(1).max(50).optional(),
+      bio: z.string().max(500).optional(),
+      avatar: z.string().url().optional(),
+    })
+    .partial(),
+};
+
+export const postSchemas = {
+  create: z.object({
+    title: z.string().min(1).max(200),
+    content: z.string().min(1),
+    published: z.boolean().default(false),
+  }),
+
+  update: z
+    .object({
+      title: z.string().min(1).max(200).optional(),
+      content: z.string().min(1).optional(),
+      published: z.boolean().optional(),
+    })
+    .partial(),
+};
+
+// routes/users.ts
+import { userSchemas } from "../validators/schemas";
+
+app.post("/users", zValidator("json", userSchemas.register), async (c) => {
+  // ...
+});
+```
+
+### 2. 重用验证逻辑
+
+```typescript
+// validators/common.ts
+import { z } from "zod";
+
+// 通用的 UUID 验证
+export const uuidSchema = z.string().uuid();
+
+// 通用的分页参数
+export const paginationSchema = z.object({
+  page: z.string().transform(Number).default("1"),
+  limit: z.string().transform(Number).default("10"),
+});
+
+// 通用的排序参数
+export const sortingSchema = z.object({
+  sortBy: z.string().default("createdAt"),
+  sortOrder: z.enum(["asc", "desc"]).default("desc"),
+});
+
+// 使用
+app.get("/users", zValidator("query", paginationSchema), async (c) => {
+  const { page, limit } = c.req.valid("query");
+  // ...
+});
+```
+
+### 3. 类型推断
+
+```typescript
+// 从 Schema 推断类型
+const userSchema = z.object({
+  id: z.string().uuid(),
+  name: z.string(),
+  email: z.string().email(),
+});
+
+type User = z.infer<typeof userSchema>;
+// User = { id: string; name: string; email: string }
+
+// 使用类型
+const getUser = async (id: string): Promise<User> => {
+  // ...
+};
+
+// 输入类型（排除某些字段）
+type UserCreateInput = z.infer<typeof userSchema>["id"];
+// 或
+type UserCreate = Omit<User, "id">;
+```
+
+### 4. 测试验证
+
+```typescript
+import { describe, it, expect } from "vitest";
+import { userSchema } from "./schemas";
+
+describe("User Schema Validation", () => {
+  const validUser = {
+    id: "123e4567-e89b-12d3-a456-426614174000",
+    name: "John Doe",
+    email: "john@example.com",
+  };
+
+  it("should validate valid user", () => {
+    const result = userSchema.safeParse(validUser);
+    expect(result.success).toBe(true);
+  });
+
+  it("should reject invalid email", () => {
+    const result = userSchema.safeParse({
+      ...validUser,
+      email: "invalid-email",
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it("should reject missing required fields", () => {
+    const result = userSchema.safeParse({
+      id: validUser.id,
+      // missing name and email
+    });
+    expect(result.success).toBe(false);
+  });
+});
+```
+
+---
+
+## 性能优化
+
+### 1. 避免重复验证
+
+```typescript
+// ❌ 每次请求都创建新的 Schema
+app.post(
+  "/users",
+  zValidator(
+    "json",
+    z.object({
+      name: z.string(),
+      email: z.string().email(),
+    })
+  ),
+  async (c) => {
+    // ...
+  }
+);
+
+// ✅ 复用 Schema
+const userSchema = z.object({
+  name: z.string(),
+  email: z.string().email(),
+});
+
+app.post("/users", zValidator("json", userSchema), async (c) => {
+  // ...
+});
+```
+
+### 2. 使用 safeParse 而非 parse
+
+```typescript
+// safeParse 不会抛出异常，更适合性能敏感场景
+const result = schema.safeParse(data);
+
+if (!result.success) {
+  return c.json({ errors: result.error.errors }, 400);
+}
+
+// 使用验证后的数据
+processData(result.data);
+```
+
+---
+
+## 常见问题
+
+### Q1: 如何处理文件上传的验证？
+
+```typescript
+app.post(
+  "/upload",
+  zValidator(
+    "form",
+    z.object({
+      file: z.any(), // 文件验证需要特殊处理
+      title: z.string(),
+    })
+  ),
+  async (c) => {
+    const { file, title } = c.req.valid("form");
+
+    // 手动验证文件
+    if (!(file instanceof File)) {
+      return c.json({ error: "Invalid file" }, 400);
+    }
+
+    if (!file.type.startsWith("image/")) {
+      return c.json({ error: "Only images allowed" }, 400);
+    }
+
+    // ...
+  }
+);
+```
+
+### Q2: 如何实现条件必填字段？
+
+```typescript
+const schema = z
+  .object({
+    hasAddress: z.boolean(),
+    street: z.string().optional(),
+    city: z.string().optional(),
+  })
+  .refine((data) => !data.hasAddress || (data.street && data.city), {
+    message: "Address fields required when hasAddress is true",
+  });
+```
+
+### Q3: 如何验证嵌套数组中的对象？
+
+```typescript
+const schema = z.object({
+  items: z
+    .array(
+      z.object({
+        productId: z.string().uuid(),
+        quantity: z.number().min(1),
+        price: z.number().min(0),
+      })
+    )
+    .min(1, "At least one item required"),
+});
+```
+
+---
+
+## 总结
+
+本文深入介绍了使用 Zod 进行数据验证的各个方面：
+
+**核心概念**：
+
+- ✅ 理解数据验证的重要性
+- ✅ Zod 的 TypeScript-first 设计理念
+- ✅ Schema 定义与类型推断
+
+**验证场景**：
+
+- ✅ 基本类型验证（字符串、数字、布尔值等）
+- ✅ 对象和数组验证
+- ✅ 嵌套对象验证
+- ✅ 条件验证和自定义验证器
+- ✅ 数据转换
+
+**Hono 集成**：
+
+- ✅ 使用 zValidator 中间件
+- ✅ 验证 JSON、查询参数、路径参数
+- ✅ 自定义错误处理
+- ✅ 友好的错误消息
+
+**实战应用**：
+
+- ✅ 完整的 CRUD API 验证
+- ✅ 用户注册验证
+- ✅ Schema 组织和重用
+- ✅ 性能优化建议
+
+通过使用 Zod，你的 API 将更加健壮、安全和易于维护。类型安全的验证机制让开发更加高效，同时减少了运行时错误。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将学习 **「06. 错误处理与异常过滤器」**，了解如何：
+
+- 🛡️ 实现全局错误处理机制
+- 🎯 使用 HTTPException 和自定义异常
+- 📝 记录和监控错误
+- 🔒 处理环境差异（开发 vs 生产）
+- 💡 提供友好的错误响应
+
+让我们一起构建更加健壮的应用！

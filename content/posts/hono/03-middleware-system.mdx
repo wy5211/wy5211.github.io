@@ -1,0 +1,1227 @@
+---
+title: "03. 中间件机制深入"
+date: "2026-03-20"
+summary: "深入理解 Hono 中间件系统的洋葱模型，掌握内置中间件的使用，学习自定义中间件开发，构建可复用的中间件生态。"
+tags: ["Hono", "Middleware", "洋葱模型", "TypeScript"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 3
+---
+
+## 前言
+
+在 Web 开发中，我们经常需要在请求处理的不同阶段执行各种操作：身份验证、日志记录、错误处理、CORS 配置等等。**中间件（Middleware）** 就是解决这类问题的优雅方案。
+
+Hono 的中间件系统采用经典的**洋葱模型（Onion Model）**，让请求和响应流经多层处理，既灵活又强大。理解中间件机制是掌握 Hono 的关键一步。
+
+本篇文章将带你：
+
+- 🧅 理解洋葱模型的执行流程
+- 🔧 掌握内置中间件的使用
+- 🎨 学会开发自定义中间件
+- 🛡️ 实现认证、日志、限流等常见功能
+- 🚀 构建可复用的中间件模块
+
+---
+
+## 什么是中间件？
+
+中间件是一个函数，它在请求到达路由处理器之前和响应返回客户端之前执行。它可以：
+
+- ✅ 修改请求对象（添加上下文、验证参数）
+- ✅ 修改响应对象（添加头部、转换数据）
+- ✅ 结束请求响应循环（返回错误、重定向）
+- ✅ 调用 `next()` 将控制权传递给下一个中间件
+
+### 中间件的作用
+
+```
+Request → Middleware 1 → Middleware 2 → Route Handler
+         ← Middleware 1 ← Middleware 2 ← Response
+```
+
+每个中间件都可以：
+
+1. 在请求处理前执行逻辑
+2. 调用 `next()` 传递控制
+3. 在响应返回后执行逻辑
+
+---
+
+## 洋葱模型
+
+Hono 的中间件采用洋葱模型，这是一个非常直观的概念。
+
+### 可视化理解
+
+```
+        ┌─────────────────────────────────────────┐
+        │           Middleware 1                  │
+        │  ┌───────────────────────────────────┐  │
+        │  │       Middleware 2               │  │
+        │  │  ┌─────────────────────────────┐  │  │
+        │  │  │    Middleware 3             │  │  │
+        │  │  │  ┌───────────────────────┐  │  │  │
+        │  │  │  │   Route Handler       │  │  │  │
+        │  │  │  └───────────────────────┘  │  │  │
+        │  │  └─────────────────────────────┘  │  │
+        │  └───────────────────────────────────┘  │
+        └─────────────────────────────────────────┘
+
+执行顺序：
+1. Middleware 1 (前) ↓
+2. Middleware 2 (前) ↓
+3. Middleware 3 (前) ↓
+4. Route Handler
+5. Middleware 3 (后) ↑
+6. Middleware 2 (后) ↑
+7. Middleware 1 (后) ↑
+```
+
+### 代码示例
+
+```typescript
+import { Hono } from "hono";
+
+const app = new Hono();
+
+// 中间件 1
+app.use("*", async (c, next) => {
+  console.log("📥 Middleware 1: 请求进入");
+  await next(); // 调用下一个中间件
+  console.log("📤 Middleware 1: 响应返回");
+});
+
+// 中间件 2
+app.use("*", async (c, next) => {
+  console.log("📥 Middleware 2: 请求进入");
+  await next();
+  console.log("📤 Middleware 2: 响应返回");
+});
+
+// 路由处理器
+app.get("/", (c) => {
+  console.log("🎯 路由处理器执行");
+  return c.text("Hello");
+});
+```
+
+**访问 `/` 的输出**：
+
+```
+📥 Middleware 1: 请求进入
+📥 Middleware 2: 请求进入
+🎯 路由处理器执行
+📤 Middleware 2: 响应返回
+📤 Middleware 1: 响应返回
+```
+
+---
+
+## 基础中间件开发
+
+### 中间件函数签名
+
+```typescript
+type Middleware = (
+  c: Context,
+  next: Next
+) => Promise<Response | void> | Response | void;
+```
+
+### 第一个自定义中间件
+
+```typescript
+import { Hono } from "hono";
+
+// 请求计时中间件
+const timerMiddleware = async (c, next) => {
+  const start = Date.now();
+
+  // 等待下一个中间件/路由处理器执行
+  await next();
+
+  // 计算执行时间
+  const duration = Date.now() - start;
+
+  // 添加响应头
+  c.header("X-Response-Time", `${duration}ms`);
+
+  console.log(`⏱️  ${c.req.method} ${c.req.path} - ${duration}ms`);
+};
+
+const app = new Hono();
+
+// 应用中间件
+app.use("*", timerMiddleware);
+
+app.get("/", (c) => c.text("Hello"));
+```
+
+**测试**：
+
+```bash
+curl -i http://localhost:3000/
+```
+
+**响应**：
+
+```
+HTTP/1.1 200 OK
+X-Response-Time: 5ms
+Content-Type: text/plain; charset=UTF-8
+
+Hello
+```
+
+### 中间件修改上下文
+
+中间件可以向 Context 添加数据：
+
+```typescript
+// 认证中间件
+const authMiddleware = async (c, next) => {
+  const token = c.req.header("Authorization");
+
+  if (!token) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  // 验证 token
+  const user = await verifyToken(token);
+
+  // 将用户信息存储到 context
+  c.set("user", user);
+
+  await next();
+};
+
+// 在路由中使用
+app.get("/api/me", authMiddleware, (c) => {
+  const user = c.get("user"); // 从 context 获取
+  return c.json({ user });
+});
+```
+
+---
+
+## 内置中间件
+
+Hono 提供了丰富的内置中间件，开箱即用。
+
+### 1. Logger - 请求日志
+
+```typescript
+import { logger } from "hono/logger";
+
+app.use("*", logger());
+```
+
+**输出**：
+
+```
+  --> GET /hello
+  <-- GET /hello 200 3ms
+```
+
+**自定义格式**：
+
+```typescript
+app.use(
+  "*",
+  logger((message) => {
+    console.log(`[${new Date().toISOString()}] ${message}`);
+  })
+);
+```
+
+### 2. CORS - 跨域资源共享
+
+```typescript
+import { cors } from "hono/cors";
+
+// 基础配置
+app.use("*", cors());
+
+// 详细配置
+app.use(
+  "*",
+  cors({
+    origin: ["http://localhost:3000", "https://example.com"],
+    credentials: true,
+    maxAge: 86400,
+    allowMethods: ["GET", "POST", "PUT", "DELETE"],
+    allowHeaders: ["Content-Type", "Authorization"],
+    exposeHeaders: ["Content-Length"],
+  })
+);
+```
+
+### 3. Powered By - 响应头
+
+```typescript
+import { poweredBy } from "hono/powered-by";
+
+app.use("*", poweredBy());
+// 添加 X-Powered-By: Hono
+```
+
+**自定义**：
+
+```typescript
+app.use("*", poweredBy("My App v1.0"));
+```
+
+### 4. Pretty JSON - 美化 JSON
+
+```typescript
+import { prettyJSON } from "hono/pretty-json";
+
+app.use("*", prettyJSON());
+
+// JSON 响应会自动格式化（2 空格缩进）
+```
+
+**自定义**：
+
+```typescript
+app.use("*", prettyJSON({ space: 4 }));
+```
+
+### 5. ETag - 缓存标签
+
+```typescript
+import { etag } from "hono/etag";
+
+app.use("*", etag());
+
+// 自动生成 ETag
+app.get("/data", (c) => {
+  return c.json({ message: "Hello" });
+});
+
+// 第二次请求会返回 304 Not Modified
+```
+
+### 6. Basic Auth - 基础认证
+
+```typescript
+import { basicAuth } from "hono/basic-auth";
+
+// 保护管理路由
+app.use(
+  "/admin/*",
+  basicAuth({
+    username: "admin",
+    password: "secret123",
+  })
+);
+
+app.get("/admin/dashboard", (c) => {
+  return c.text("Admin Dashboard");
+});
+```
+
+**浏览器会弹出认证对话框**。
+
+### 7. Request ID - 请求 ID
+
+```typescript
+import { requestId } from "hono/request-id";
+
+app.use("*", requestId());
+
+app.get("/", (c) => {
+  const id = c.get("requestId");
+  return c.json({ requestId: id });
+});
+```
+
+---
+
+## 常见自定义中间件
+
+### 1. 请求验证中间件
+
+```typescript
+// 验证 Content-Type
+const requireJson = async (c, next) => {
+  const contentType = c.req.header("Content-Type");
+
+  if (!contentType?.includes("application/json")) {
+    return c.json(
+      {
+        error: "Content-Type must be application/json",
+      },
+      415
+    );
+  }
+
+  await next();
+};
+
+app.post("/api/users", requireJson, async (c) => {
+  const body = await c.req.json();
+  // ...
+});
+```
+
+### 2. 错误处理中间件
+
+```typescript
+const catchErrors = async (c, next) => {
+  try {
+    await next();
+  } catch (error) {
+    console.error("Error:", error);
+
+    // 处理不同类型的错误
+    if (error instanceof ValidationError) {
+      return c.json(
+        {
+          error: "Validation Error",
+          details: error.messages,
+        },
+        400
+      );
+    }
+
+    if (error instanceof AuthError) {
+      return c.json(
+        {
+          error: "Authentication Failed",
+        },
+        401
+      );
+    }
+
+    // 默认错误
+    return c.json(
+      {
+        error: "Internal Server Error",
+      },
+      500
+    );
+  }
+};
+
+app.use("*", catchErrors);
+```
+
+### 3. Rate Limiter - 限流
+
+```typescript
+// 简单的内存限流
+const rateLimiter = (options: { max: number; windowMs: number }) => {
+  const requests = new Map<string, number[]>();
+
+  return async (c, next) => {
+    const ip =
+      c.req.header("CF-Connecting-IP") ||
+      c.req.header("X-Forwarded-For") ||
+      "unknown";
+    const now = Date.now();
+
+    // 获取该 IP 的请求记录
+    let userRequests = requests.get(ip) || [];
+
+    // 清理过期记录
+    userRequests = userRequests.filter((time) => now - time < options.windowMs);
+
+    // 检查是否超过限制
+    if (userRequests.length >= options.max) {
+      return c.json(
+        {
+          error: "Too many requests",
+        },
+        429
+      );
+    }
+
+    // 记录本次请求
+    userRequests.push(now);
+    requests.set(ip, userRequests);
+
+    await next();
+  };
+};
+
+// 使用：每分钟最多 100 个请求
+app.use("*", rateLimiter({ max: 100, windowMs: 60000 }));
+```
+
+### 4. 缓存中间件
+
+```typescript
+// 内存缓存
+const cache = new Map<string, { data: any; expires: number }>();
+
+const cacheMiddleware = (ttl: number = 60000) => {
+  return async (c, next) => {
+    const key = c.req.url;
+
+    // 检查缓存
+    const cached = cache.get(key);
+    if (cached && cached.expires > Date.now()) {
+      console.log("✅ Cache hit");
+      return c.json(cached.data);
+    }
+
+    console.log("❌ Cache miss");
+
+    // 执行后续中间件
+    await next();
+
+    // 缓存响应
+    const response = await c.req.json(); // 获取响应数据
+    cache.set(key, {
+      data: response,
+      expires: Date.now() + ttl,
+    });
+  };
+};
+
+// 使用：缓存 1 分钟
+app.get("/api/data", cacheMiddleware(60000), async (c) => {
+  // 耗时操作
+  const data = await fetchExpensiveData();
+  return c.json(data);
+});
+```
+
+### 5. 请求体大小限制
+
+```typescript
+const limitBodySize = (maxSize: number = 1024 * 1024) => {
+  // 默认 1MB
+  return async (c, next) => {
+    const contentLength = c.req.header("Content-Length");
+
+    if (contentLength && parseInt(contentLength) > maxSize) {
+      return c.json(
+        {
+          error: "Request body too large",
+          maxSize: `${maxSize / 1024}KB`,
+        },
+        413
+      );
+    }
+
+    await next();
+  };
+};
+
+app.post("/upload", limitBodySize(5 * 1024 * 1024), (c) => {
+  // 处理文件上传
+});
+```
+
+### 6. 安全头中间件
+
+```typescript
+const securityHeaders = async (c, next) => {
+  await next();
+
+  // 设置安全头
+  c.header("X-Content-Type-Options", "nosniff");
+  c.header("X-Frame-Options", "DENY");
+  c.header("X-XSS-Protection", "1; mode=block");
+  c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  c.header("Referrer-Policy", "strict-origin-when-cross-origin");
+};
+
+app.use("*", securityHeaders);
+```
+
+### 7. 请求日志详细版
+
+```typescript
+const detailedLogger = async (c, next) => {
+  const start = Date.now();
+
+  // 请求信息
+  const requestData = {
+    method: c.req.method,
+    path: c.req.path,
+    query: c.req.query(),
+    headers: Object.fromEntries(c.req.header()),
+  };
+
+  console.log("📥 Request:", requestData);
+
+  await next();
+
+  // 响应信息
+  const duration = Date.now() - start;
+  console.log("📤 Response:", {
+    status: c.res.status,
+    duration: `${duration}ms`,
+  });
+};
+
+app.use("*", detailedLogger);
+```
+
+---
+
+## 中间件配置选项
+
+### 条件中间件
+
+只在特定条件下执行：
+
+```typescript
+const conditionalMiddleware = (condition: (c: Context) => boolean) => {
+  return async (c, next) => {
+    if (condition(c)) {
+      console.log("条件满足，执行中间件");
+      await next();
+    } else {
+      console.log("条件不满足，跳过中间件");
+      await next();
+    }
+  };
+};
+
+// 示例：只在生产环境启用缓存
+app.use(
+  "*",
+  conditionalMiddleware(() => process.env.NODE_ENV === "production"),
+  cacheMiddleware()
+);
+```
+
+### 中间件工厂
+
+创建可配置的中间件：
+
+```typescript
+const createTimerMiddleware = (options: { headerName?: string } = {}) => {
+  const headerName = options.headerName || "X-Response-Time";
+
+  return async (c, next) => {
+    const start = Date.now();
+    await next();
+    const duration = Date.now() - start;
+    c.header(headerName, `${duration}ms`);
+  };
+};
+
+// 使用
+app.use("*", createTimerMiddleware({ headerName: "X-Timer" }));
+```
+
+### 中间件组合
+
+组合多个中间件：
+
+```typescript
+import { compose } from "hono/adapter";
+
+const middleware1 = async (c, next) => {
+  console.log("Middleware 1");
+  await next();
+};
+
+const middleware2 = async (c, next) => {
+  console.log("Middleware 2");
+  await next();
+};
+
+const combined = compose(middleware1, middleware2);
+
+// 使用
+app.use("*", combined);
+```
+
+---
+
+## 路由级中间件
+
+中间件可以应用到特定路由或路由组。
+
+### 单路由中间件
+
+```typescript
+const authMiddleware = async (c, next) => {
+  const token = c.req.header("Authorization");
+  if (!token) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  await next();
+};
+
+// 只应用到单个路由
+app.get("/protected", authMiddleware, (c) => {
+  return c.json({ message: "Protected data" });
+});
+
+// 公开路由
+app.get("/public", (c) => {
+  return c.json({ message: "Public data" });
+});
+```
+
+### 路由组中间件
+
+```typescript
+const api = new Hono();
+
+// 应用到整个路由组
+api.use("*", authMiddleware);
+
+api.get("/users", (c) => c.json([])); // 需要认证
+api.get("/posts", (c) => c.json([])); // 需要认证
+```
+
+### 部分路由应用
+
+```typescript
+const api = new Hono();
+
+// 前缀匹配
+api.use("/api/protected/*", authMiddleware);
+
+api.get("/api/protected/data", (c) => c.json({ data: [] })); // 需要认证
+api.get("/api/public/info", (c) => c.json({ info: [] })); // 不需要认证
+```
+
+### 排除中间件
+
+```typescript
+// 全局中间件
+app.use("*", logger());
+
+// 公开路由（跳过认证）
+app.get("/health", (c) => c.json({ status: "ok" }));
+app.get("/docs", (c) => c.json({ docs: [] }));
+
+// 受保护的路由
+app.use("/api/*", authMiddleware);
+app.get("/api/users", (c) => c.json([]));
+```
+
+---
+
+## 完整示例：构建认证系统
+
+让我们使用中间件构建一个完整的认证系统。
+
+```typescript
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { logger } from "hono/logger";
+import { verify, sign } from "hono/jwt";
+
+// 类型定义
+type User = {
+  id: string;
+  email: string;
+  password: string;
+  name: string;
+};
+
+// 模拟用户数据库
+const users: User[] = [
+  {
+    id: "1",
+    email: "user@example.com",
+    password: "hashed_password_here",
+    name: "Test User",
+  },
+];
+
+// JWT 密钥
+const JWT_SECRET = "your-secret-key";
+
+const app = new Hono();
+
+// ==================== 全局中间件 ====================
+app.use("*", logger());
+app.use(
+  "*",
+  cors({
+    origin: ["http://localhost:3000"],
+    credentials: true,
+  })
+);
+
+// ==================== 安全头中间件 ====================
+const securityHeaders = async (c, next) => {
+  await next();
+
+  c.header("X-Content-Type-Options", "nosniff");
+  c.header("X-Frame-Options", "DENY");
+  c.header("X-XSS-Protection", "1; mode=block");
+};
+
+app.use("*", securityHeaders);
+
+// ==================== 错误处理中间件 ====================
+app.onError((err, c) => {
+  console.error("Error:", err);
+
+  if (err.message.includes("JWT")) {
+    return c.json(
+      {
+        error: "Invalid token",
+      },
+      401
+    );
+  }
+
+  return c.json(
+    {
+      error: "Internal Server Error",
+    },
+    500
+  );
+});
+
+// ==================== 认证中间件 ====================
+const authMiddleware = async (c, next) => {
+  const authorization = c.req.header("Authorization");
+
+  if (!authorization) {
+    return c.json(
+      {
+        error: "Authorization header required",
+      },
+      401
+    );
+  }
+
+  const token = authorization.replace("Bearer ", "");
+
+  try {
+    const payload = await verify(token, JWT_SECRET);
+
+    // 将用户信息存储到 context
+    c.set("userId", payload.sub);
+    c.set("email", payload.email);
+
+    await next();
+  } catch (error) {
+    return c.json(
+      {
+        error: "Invalid token",
+      },
+      401
+    );
+  }
+};
+
+// ==================== 公开路由 ====================
+// 健康检查
+app.get("/health", (c) => {
+  return c.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// 用户注册
+app.post("/auth/register", async (c) => {
+  const body = await c.req.json();
+  const { email, password, name } = body;
+
+  // 验证输入
+  if (!email || !password || !name) {
+    return c.json(
+      {
+        error: "Email, password, and name are required",
+      },
+      400
+    );
+  }
+
+  // 检查邮箱是否已存在
+  const emailExists = users.some((u) => u.email === email);
+  if (emailExists) {
+    return c.json(
+      {
+        error: "Email already exists",
+      },
+      409
+    );
+  }
+
+  // 创建用户（实际应用中应该哈希密码）
+  const newUser: User = {
+    id: String(users.length + 1),
+    email,
+    password, // 应该使用 bcrypt 哈希
+    name,
+  };
+  users.push(newUser);
+
+  return c.json(
+    {
+      message: "User created successfully",
+      user: {
+        id: newUser.id,
+        email: newUser.email,
+        name: newUser.name,
+      },
+    },
+    201
+  );
+});
+
+// 用户登录
+app.post("/auth/login", async (c) => {
+  const body = await c.req.json();
+  const { email, password } = body;
+
+  // 查找用户
+  const user = users.find((u) => u.email === email);
+
+  if (!user || user.password !== password) {
+    return c.json(
+      {
+        error: "Invalid credentials",
+      },
+      401
+    );
+  }
+
+  // 生成 JWT
+  const token = await sign(
+    {
+      sub: user.id,
+      email: user.email,
+      exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7, // 7 天
+    },
+    JWT_SECRET
+  );
+
+  return c.json({
+    token,
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+    },
+  });
+});
+
+// ==================== 受保护路由 ====================
+const protectedRoutes = new Hono();
+
+// 应用认证中间件到所有受保护路由
+protectedRoutes.use("*", authMiddleware);
+
+// 获取当前用户信息
+protectedRoutes.get("/me", (c) => {
+  const userId = c.get("userId");
+  const email = c.get("email");
+
+  const user = users.find((u) => u.id === userId);
+
+  return c.json({
+    user: {
+      id: user?.id,
+      email: user?.email,
+      name: user?.name,
+    },
+  });
+});
+
+// 更新用户信息
+protectedRoutes.put("/me", async (c) => {
+  const userId = c.get("userId");
+  const body = await c.req.json();
+  const { name } = body;
+
+  const userIndex = users.findIndex((u) => u.id === userId);
+
+  if (userIndex === -1) {
+    return c.json({ error: "User not found" }, 404);
+  }
+
+  users[userIndex].name = name;
+
+  return c.json({
+    message: "Profile updated",
+    user: {
+      id: users[userIndex].id,
+      email: users[userIndex].email,
+      name: users[userIndex].name,
+    },
+  });
+});
+
+// 挂载受保护路由
+app.route("/api", protectedRoutes);
+
+// ==================== 启动服务器 ====================
+export default app;
+```
+
+### 测试认证系统
+
+```bash
+# 1. 注册用户
+curl -X POST http://localhost:3000/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"password123","name":"Test User"}'
+
+# 2. 登录
+curl -X POST http://localhost:3000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"test@example.com","password":"password123"}'
+
+# 保存返回的 token
+
+# 3. 访问受保护路由（带 token）
+curl http://localhost:3000/api/me \
+  -H "Authorization: Bearer YOUR_TOKEN"
+
+# 4. 更新用户信息
+curl -X PUT http://localhost:3000/api/me \
+  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Updated Name"}'
+```
+
+---
+
+## 最佳实践
+
+### 1. 中间件顺序很重要
+
+```typescript
+// ✅ 正确的顺序
+app.use("*", logger()); // 1. 日志（最先记录）
+app.use("*", cors()); // 2. CORS
+app.use("*", securityHeaders); // 3. 安全头
+app.use("*", authMiddleware); // 4. 认证（最后）
+
+// ❌ 错误：认证在日志之前，无法记录认证失败
+app.use("*", authMiddleware);
+app.use("*", logger());
+```
+
+### 2. 保持中间件简洁
+
+```typescript
+// ✅ 好的做法：单一职责
+const authMiddleware = async (c, next) => {
+  const token = c.req.header("Authorization");
+  if (!token) return c.json({ error: "Unauthorized" }, 401);
+  await next();
+};
+
+const logMiddleware = async (c, next) => {
+  console.log(`${c.req.method} ${c.req.path}`);
+  await next();
+};
+
+// ❌ 不好的做法：混合职责
+const authAndLogMiddleware = async (c, next) => {
+  console.log(`${c.req.method} ${c.req.path}`);
+  const token = c.req.header("Authorization");
+  if (!token) return c.json({ error: "Unauthorized" }, 401);
+  await next();
+};
+```
+
+### 3. 使用 TypeScript 类型
+
+```typescript
+import type { Context, Next } from "hono";
+
+// 明确类型
+const myMiddleware = async (c: Context, next: Next) => {
+  await next();
+};
+
+// 自定义 Context 类型
+type Env = {
+  Variables: {
+    userId: string;
+    userEmail: string;
+  };
+};
+
+const app = new Hono<Env>();
+
+const authMiddleware = async (
+  c: Context<{ Variables: Env["Variables"] }>,
+  next: Next
+) => {
+  c.set("userId", "123");
+  c.set("userEmail", "user@example.com");
+  await next();
+};
+```
+
+### 4. 中间件应该可配置
+
+```typescript
+// ✅ 可配置的中间件
+const createRateLimiter = (options: { max: number; windowMs: number }) => {
+  return async (c, next) => {
+    // 使用 options
+    await next();
+  };
+};
+
+app.use("*", createRateLimiter({ max: 100, windowMs: 60000 }));
+
+// ❌ 硬编码的中间件
+const rateLimiter = async (c, next) => {
+  const max = 100; // 硬编码
+  const windowMs = 60000;
+  // ...
+};
+```
+
+### 5. 错误处理要健壮
+
+```typescript
+const safeMiddleware = async (c, next) => {
+  try {
+    await next();
+  } catch (error) {
+    // 统一错误处理
+    console.error("Middleware error:", error);
+
+    // 不暴露敏感信息
+    return c.json(
+      {
+        error:
+          process.env.NODE_ENV === "production"
+            ? "Internal Server Error"
+            : error.message,
+      },
+      500
+    );
+  }
+};
+```
+
+---
+
+## 常见问题
+
+### Q1: 中间件和路由处理器的区别？
+
+**A**:
+
+- **中间件**：可以处理多个路由，通常执行通用逻辑（认证、日志等）
+- **路由处理器**：处理特定路由的业务逻辑
+
+```typescript
+// 中间件
+app.use("*", authMiddleware);
+
+// 路由处理器
+app.get("/users", (c) => c.json([]));
+```
+
+### Q2: 如何在中间件中访问路由参数？
+
+**A**:
+
+```typescript
+const myMiddleware = async (c, next) => {
+  const id = c.req.param("id"); // 访问路径参数
+  const query = c.req.query("search"); // 访问查询参数
+  await next();
+};
+
+app.get("/users/:id", myMiddleware, (c) => {
+  return c.json({ id: c.req.param("id") });
+});
+```
+
+### Q3: 中间件可以修改请求体吗？
+
+**A**:
+
+```typescript
+const bodyTransformMiddleware = async (c, next) => {
+  const body = await c.req.json();
+
+  // 修改请求体
+  const transformedBody = {
+    ...body,
+    timestamp: new Date().toISOString(),
+  };
+
+  // 存储到 context
+  c.set("body", transformedBody);
+
+  await next();
+};
+
+app.post("/data", bodyTransformMiddleware, (c) => {
+  const body = c.get("body"); // 获取修改后的请求体
+  return c.json({ received: body });
+});
+```
+
+---
+
+## 总结
+
+本文我们深入学习了 Hono 的中间件系统：
+
+✅ **洋葱模型**
+
+- 理解中间件的执行流程
+- 请求和响应的生命周期
+- 中间件的堆叠与解包
+
+✅ **内置中间件**
+
+- Logger、CORS、Powered By
+- Pretty JSON、ETag、Basic Auth
+- Request ID
+
+✅ **自定义中间件开发**
+
+- 请求验证
+- 错误处理
+- 限流保护
+- 缓存策略
+- 安全头配置
+
+✅ **中间件应用范围**
+
+- 全局中间件
+- 路由级中间件
+- 条件中间件
+- 中间件组合
+
+✅ **完整认证系统示例**
+
+- JWT 认证中间件
+- 公开路由与受保护路由
+- Context 数据传递
+
+✅ **最佳实践**
+
+- 中间件顺序
+- 单一职责
+- 类型安全
+- 可配置性
+- 错误处理
+
+---
+
+## 下一步
+
+掌握了中间件系统后，下一篇文章我们将探索 **请求与响应处理**，包括：
+
+- 📨 读取请求头、查询参数、路径参数
+- 📦 解析请求体（JSON、FormData、文本）
+- 🍪 Cookie 操作
+- 📤 构建各种类型的响应
+- 📄 文件下载与流式响应
+- 🌐 HTML 响应（SSR）
+
+准备好深入处理 HTTP 请求和响应了吗？让我们继续！ 🚀

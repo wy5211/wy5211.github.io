@@ -1,0 +1,542 @@
+---
+title: "13. 边缘缓存策略"
+date: "2026-03-20"
+summary: "掌握边缘缓存技术，学习 HTTP 缓存头、CDN 缓存策略、KV 存储缓存，以及实现智能缓存失效机制。"
+tags: ["Hono", "Caching", "CDN", "Cloudflare KV", "Performance"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 13
+---
+
+## 前言
+
+在边缘计算时代，缓存是提升应用性能的关键。通过在边缘节点缓存数据，可以大幅降低延迟、减轻源服务器压力、提高用户体验。
+
+Hono 作为边缘优先的框架，与 Cloudflare Workers、KV、R2 等边缘服务无缝集成，让你可以轻松实现多层缓存策略。
+
+本篇文章将带你：
+
+- ⚡ 理解 HTTP 缓存机制
+- 🌐 配置 CDN 缓存策略
+- 💾 使用 Cloudflare KV 缓存数据
+- 🎯 实现智能缓存失效
+- 📊 监控缓存性能
+
+---
+
+## HTTP 缓存基础
+
+### Cache-Control 头
+
+```typescript
+// 强缓存：资源在有效期内不会请求服务器
+app.get('/static/*', (c) => {
+  c.header('Cache-Control', 'public, max-age=31536000, immutable')
+  // public: 可被 CDN 和浏览器缓存
+  // max-age=31536000: 缓存 1 年
+  // immutable: 资源永不改变
+  return c.file(...)
+})
+
+// API 响应短期缓存
+app.get('/api/posts', (c) => {
+  c.header('Cache-Control', 'public, max-age=60, s-maxage=300')
+  // max-age: 浏览器缓存 60 秒
+  // s-maxage: CDN 缓存 300 秒（5 分钟）
+  return c.json(posts)
+})
+
+// 动态内容不缓存
+app.get('/api/user/profile',
+  authMiddleware,
+  (c) => {
+    const user = c.get('user')
+    c.header('Cache-Control', 'no-store, no-cache, must-revalidate')
+    // no-store: 不缓存
+    // no-cache: 每次都验证
+    // must-revalidate: 必须验证过期缓存
+    return c.json(user)
+  }
+)
+```
+
+### ETag 和 Last-Modified
+
+```typescript
+// ETag：内容哈希
+app.get("/api/posts/:id", async (c) => {
+  const post = await getPost(c.req.param("id"));
+
+  // 生成 ETag
+  const etag = generateETag(post); // 例如：md5(JSON.stringify(post))
+
+  // 检查 If-None-Match
+  const ifNoneMatch = c.req.header("if-none-match");
+
+  if (ifNoneMatch === etag) {
+    return c.body(null, 304); // Not Modified
+  }
+
+  c.header("ETag", etag);
+  c.header("Cache-Control", "public, max-age=3600");
+
+  return c.json(post);
+});
+
+// Last-Modified：最后修改时间
+app.get("/api/posts/:id", async (c) => {
+  const post = await getPost(c.req.param("id"));
+
+  const lastModified = post.updatedAt.toUTCString();
+  const ifModifiedSince = c.req.header("if-modified-since");
+
+  if (ifModifiedSince === lastModified) {
+    return c.body(null, 304);
+  }
+
+  c.header("Last-Modified", lastModified);
+  c.header("Cache-Control", "public, max-age=3600");
+
+  return c.json(post);
+});
+```
+
+---
+
+## CDN 缓存策略
+
+### 静态资源缓存
+
+```typescript
+// 图片、CSS、JS 长期缓存
+app.get("/static/*", (c) => {
+  const filepath = c.req.path;
+
+  // 根据文件扩展名设置缓存策略
+  const ext = filepath.split(".").pop();
+  const cacheRules: Record<string, string> = {
+    jpg: "public, max-age=31536000, immutable",
+    png: "public, max-age=31536000, immutable",
+    css: "public, max-age=31536000, immutable",
+    js: "public, max-age=31536000, immutable",
+    woff2: "public, max-age=31536000, immutable",
+  };
+
+  c.header("Cache-Control", cacheRules[ext || ""] || "public, max-age=3600");
+
+  return c.file(filepath);
+});
+```
+
+### API 响应缓存
+
+```typescript
+// 列表 API 缓存
+app.get("/api/posts", async (c) => {
+  const { page, limit } = c.req.query();
+
+  // 缓存键
+  const cacheKey = `posts:page:${page}:limit:${limit}`;
+
+  // 尝试从缓存获取
+  const cached = await cache.get(cacheKey);
+  if (cached) {
+    c.header("X-Cache", "HIT");
+    c.header("Cache-Control", "public, max-age=300");
+    return c.json(JSON.parse(cached));
+  }
+
+  // 缓存未命中，查询数据库
+  const posts = await db.query.posts.findMany({
+    where: eq(posts.published, true),
+    limit: parseInt(limit),
+    offset: (parseInt(page) - 1) * parseInt(limit),
+  });
+
+  // 写入缓存（5 分钟）
+  await cache.set(cacheKey, JSON.stringify(posts), {
+    expirationTtl: 300,
+  });
+
+  c.header("X-Cache", "MISS");
+  c.header("Cache-Control", "public, max-age=300");
+
+  return c.json(posts);
+});
+```
+
+---
+
+## Cloudflare KV 缓存
+
+### KV 基础操作
+
+```typescript
+// 读取数据
+app.get("/api/users/:id", async (c) => {
+  const { id } = c.req.param();
+  const cache = c.env.CACHE; // KV 绑定
+
+  // 尝试从缓存获取
+  const cached = await cache.get(`user:${id}`, "json");
+
+  if (cached) {
+    c.header("X-Cache", "HIT");
+    return c.json(cached);
+  }
+
+  // 从数据库获取
+  const user = await db.query.users.findFirst({
+    where: eq(users.id, id),
+  });
+
+  if (!user) {
+    return c.json({ error: "User not found" }, 404);
+  }
+
+  // 写入缓存（1 小时）
+  await cache.put(`user:${id}`, JSON.stringify(user), {
+    expirationTtl: 3600,
+  });
+
+  c.header("X-Cache", "MISS");
+  return c.json(user);
+});
+
+// 批量获取
+app.get("/api/users", async (c) => {
+  const ids = c.req.query("ids").split(",");
+  const cache = c.env.CACHE;
+
+  // 批量获取缓存
+  const cached = await Promise.all(
+    ids.map((id) => cache.get(`user:${id}`, "json"))
+  );
+
+  const missingIds = ids.filter((_, i) => !cached[i]);
+
+  // 只查询缺失的用户
+  if (missingIds.length > 0) {
+    const users = await db.query.users.findMany({
+      where: sql`${users.id} IN ${sql.raw(`('${missingIds.join("','")}')`)}`,
+    });
+
+    // 批量写入缓存
+    await Promise.all(
+      users.map((user) =>
+        cache.put(`user:${user.id}`, JSON.stringify(user), {
+          expirationTtl: 3600,
+        })
+      )
+    );
+  }
+
+  return c.json({ users: cached.filter(Boolean) });
+});
+```
+
+### 缓存失效
+
+```typescript
+// 更新数据时失效缓存
+app.put("/api/users/:id", authMiddleware, async (c) => {
+  const { id } = c.req.param();
+  const data = await c.req.json();
+
+  // 更新数据库
+  const [user] = await db
+    .update(users)
+    .set({ ...data, updatedAt: new Date() })
+    .where(eq(users.id, id))
+    .returning();
+
+  // 删除相关缓存
+  const cache = c.env.CACHE;
+  await cache.delete(`user:${id}`);
+
+  // 如果有关联数据，也删除
+  await cache.delete(`user:${id}:posts`);
+
+  return c.json(user);
+});
+
+// 标签失效（批量删除）
+const invalidateCacheByTag = async (cache: KVNamespace, tag: string) => {
+  const keys = await cache.list({ prefix: `tag:${tag}:` });
+
+  await Promise.all(keys.keys.map((key) => cache.delete(key.name)));
+};
+
+// 使用
+app.put("/api/posts/:id", authMiddleware, async (c) => {
+  const { id } = c.req.param();
+
+  // 更新文章
+  await updatePost(id, await c.req.json());
+
+  // 失效相关缓存
+  const cache = c.env.CACHE;
+
+  await cache.delete(`post:${id}`);
+  await invalidateCacheByTag(cache, "posts");
+  await invalidateCacheByTag(cache, `posts:author:${c.get("user").id}`);
+
+  return c.json({ success: true });
+});
+```
+
+---
+
+## 智能缓存策略
+
+### 分层缓存
+
+```typescript
+// L1：内存缓存（最快）
+// L2：KV 缓存（快速）
+// L3：数据库（慢）
+
+class CacheManager {
+  private memoryCache = new Map<string, { data: any; expires: number }>();
+
+  async get(key: string, env: any): Promise<any> {
+    // L1: 检查内存缓存
+    const memData = this.memoryCache.get(key);
+    if (memData && memData.expires > Date.now()) {
+      return memData.data;
+    }
+
+    // L2: 检查 KV 缓存
+    const kvData = await env.CACHE.get(key, "json");
+    if (kvData) {
+      // 写入内存缓存
+      this.memoryCache.set(key, {
+        data: kvData,
+        expires: Date.now() + 60000, // 1 分钟
+      });
+      return kvData;
+    }
+
+    // L3: 缓存未命中
+    return null;
+  }
+
+  async set(key: string, value: any, env: any, ttl: number): Promise<void> {
+    // 写入内存缓存
+    this.memoryCache.set(key, {
+      data: value,
+      expires: Date.now() + 60000,
+    });
+
+    // 写入 KV 缓存
+    await env.CACHE.put(key, JSON.stringify(value), {
+      expirationTtl: ttl,
+    });
+  }
+
+  async delete(key: string, env: any): Promise<void> {
+    // 删除所有层级缓存
+    this.memoryCache.delete(key);
+    await env.CACHE.delete(key);
+  }
+}
+
+const cacheManager = new CacheManager();
+
+// 使用
+app.get("/api/posts/:id", async (c) => {
+  const { id } = c.req.param();
+
+  // 尝试从缓存获取
+  const cached = await cacheManager.get(`post:${id}`, c.env);
+
+  if (cached) {
+    return c.json(cached);
+  }
+
+  // 从数据库获取
+  const post = await db.query.posts.findFirst({
+    where: eq(posts.id, id),
+  });
+
+  // 写入缓存（10 分钟）
+  await cacheManager.set(`post:${id}`, post, c.env, 600);
+
+  return c.json(post);
+});
+```
+
+### 缓存预热
+
+```typescript
+// 预热热门内容
+async function warmupCache(env: any) {
+  const popularPosts = await db.query.posts.findMany({
+    where: eq(posts.featured, true),
+    limit: 100,
+  });
+
+  // 批量写入缓存
+  await Promise.all(
+    popularPosts.map((post) =>
+      env.CACHE.put(`post:${post.id}`, JSON.stringify(post), {
+        expirationTtl: 3600,
+      })
+    )
+  );
+}
+
+// 定时任务（Cloudflare Cron）
+export default {
+  async scheduled(event: any, env: any, ctx: any) {
+    // 每小时预热缓存
+    await warmupCache(env);
+  },
+};
+```
+
+---
+
+## 缓存性能监控
+
+### 缓存命中率
+
+```typescript
+class CacheMetrics {
+  private hits = 0;
+  private misses = 0;
+
+  hit() {
+    this.hits++;
+  }
+  miss() {
+    this.misses++;
+  }
+
+  getHitRate(): number {
+    const total = this.hits + this.misses;
+    return total > 0 ? this.hits / total : 0;
+  }
+
+  getStats() {
+    return {
+      hits: this.hits,
+      misses: this.misses,
+      hitRate: this.getHitRate(),
+    };
+  }
+}
+
+const cacheMetrics = new CacheMetrics();
+
+// 使用
+app.get("/api/data", async (c) => {
+  const cached = await cache.get("key");
+
+  if (cached) {
+    cacheMetrics.hit();
+    c.header("X-Cache-Status", "HIT");
+    return c.json(cached);
+  }
+
+  cacheMetrics.miss();
+  c.header("X-Cache-Status", "MISS");
+
+  const data = await fetchData();
+  await cache.set("key", data);
+
+  return c.json(data);
+});
+
+// 监控端点
+app.get("/api/cache/stats", (c) => {
+  return c.json(cacheMetrics.getStats());
+});
+```
+
+---
+
+## 最佳实践
+
+### 1. 缓存键设计
+
+```typescript
+// 使用清晰的层级结构
+const cacheKeys = {
+  user: (id: string) => `user:${id}`,
+  userPosts: (userId: string) => `user:${userId}:posts`,
+  post: (id: string) => `post:${id}`,
+  postComments: (postId: string) => `post:${postId}:comments`,
+  tagPosts: (tagId: string) => `tag:${tagId}:posts`,
+};
+```
+
+### 2. 缓存时长策略
+
+```typescript
+// 根据数据更新频率设置 TTL
+const cacheTTL = {
+  // 静态数据：长期缓存
+  static: 86400, // 1 天
+
+  // 不常变化：中期缓存
+  user: 3600, // 1 小时
+  posts: 600, // 10 分钟
+
+  // 实时数据：短期缓存
+  comments: 60, // 1 分钟
+
+  // 动态数据：不缓存
+  realtime: 0,
+};
+```
+
+### 3. 缓存雪崩防护
+
+```typescript
+// 添加随机 TTL 偏移
+function getTTLWithJitter(baseTTL: number): number {
+  const jitter = Math.random() * 60; // 0-60 秒随机
+  return baseTTL + jitter;
+}
+
+await cache.set(key, value, getTTLWithJitter(3600));
+```
+
+---
+
+## 总结
+
+本文介绍了边缘缓存的各种策略：
+
+**HTTP 缓存**：
+
+- ✅ Cache-Control 配置
+- ✅ ETag 和 Last-Modified
+
+**CDN 缓存**：
+
+- ✅ 静态资源缓存
+- ✅ API 响应缓存
+
+**KV 缓存**：
+
+- ✅ 读写操作
+- ✅ 批量操作
+- ✅ 缓存失效
+
+**高级策略**：
+
+- ✅ 分层缓存
+- ✅ 缓存预热
+- ✅ 性能监控
+
+通过合理的缓存策略，可以大幅提升应用性能和用户体验。
+
+---
+
+## 系列文章进度
+
+已完成 13/18 篇文章。下一篇将介绍测试策略。

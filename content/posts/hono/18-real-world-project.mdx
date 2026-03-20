@@ -1,0 +1,614 @@
+---
+title: "18. 完整实战项目"
+date: "2026-03-20"
+summary: "整合所学知识，从零开始构建一个生产级的博客 API，包括认证、CRUD、评论、标签、文件上传、缓存、测试和部署等完整功能。"
+tags: ["Hono", "Full Project", "Blog API", "Production", "Best Practices"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 18
+---
+
+## 前言
+
+恭喜你来到本系列的最后一篇文章！在前面的 17 篇文章中，我们已经学习了 Hono 的方方面面。现在是时候将这些知识整合起来，构建一个真正生产级的完整应用了。
+
+本篇文章将带领你从零开始，构建一个功能完善的博客系统 API，涵盖从开发到部署的完整流程。
+
+**项目功能**：
+
+- ✅ JWT 用户认证
+- ✅ 完整的 CRUD 操作
+- ✅ 评论系统
+- ✅ 标签和分类
+- ✅ 文件上传
+- ✅ 全文搜索
+- ✅ 缓存优化
+- ✅ 单元测试
+- ✅ Cloudflare Workers 部署
+
+---
+
+## 项目架构
+
+### 技术栈
+
+```
+框架: Hono 4.x
+运行时: Cloudflare Workers
+数据库: D1 (SQLite)
+存储: R2
+缓存: KV
+认证: JWT
+验证: Zod
+测试: Vitest
+部署: Wrangler
+```
+
+### 项目结构
+
+```
+blog-api/
+├── src/
+│   ├── db/
+│   │   ├── schema.ts           # 数据库 Schema
+│   │   └── index.ts            # 数据库连接
+│   ├── middleware/
+│   │   ├── auth.ts             # 认证中间件
+│   │   ├── cache.ts            # 缓存中间件
+│   │   └── error.ts            # 错误处理
+│   ├── routes/
+│   │   ├── index.ts            # 路由聚合
+│   │   ├── auth.ts             # 认证路由
+│   │   ├── posts.ts            # 文章路由
+│   │   ├── comments.ts         # 评论路由
+│   │   └── upload.ts           # 上传路由
+│   ├── services/
+│   │   ├── post.service.ts     # 文章服务
+│   │   ├── cache.service.ts    # 缓存服务
+│   │   └── search.service.ts   # 搜索服务
+│   ├── validators/
+│   │   └── schemas.ts          # Zod Schema
+│   ├── types/
+│   │   └── index.ts            # TypeScript 类型
+│   └── index.ts                # 应用入口
+├── tests/
+│   ├── auth.test.ts
+│   ├── posts.test.ts
+│   └── helpers.ts              # 测试辅助函数
+├── migrations/                 # D1 迁移文件
+├── wrangler.toml               # Cloudflare 配置
+├── package.json
+├── vitest.config.ts            # Vitest 配置
+└── tsconfig.json
+```
+
+---
+
+## 数据库设计
+
+### Schema 定义
+
+```typescript
+// src/db/schema.ts
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { sql, relations } from "drizzle-orm";
+
+export const users = sqliteTable("users", {
+  id: text("id").primaryKey(),
+  email: text("email").notNull().unique(),
+  username: text("username").notNull().unique(),
+  password: text("password").notNull(),
+  name: text("name"),
+  bio: text("bio"),
+  avatar: text("avatar"),
+  role: text("role", { enum: ["user", "admin"] })
+    .notNull()
+    .default("user"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+});
+
+export const posts = sqliteTable("posts", {
+  id: text("id").primaryKey(),
+  title: text("title").notNull(),
+  slug: text("slug").notNull().unique(),
+  content: text("content").notNull(),
+  excerpt: text("excerpt"),
+  coverImage: text("cover_image"),
+  published: integer("published", { mode: "boolean" }).notNull().default(false),
+  authorId: text("author_id")
+    .notNull()
+    .references(() => users.id),
+  views: integer("views").notNull().default(0),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+  publishedAt: integer("published_at", { mode: "timestamp" }),
+});
+
+export const comments = sqliteTable("comments", {
+  id: text("id").primaryKey(),
+  content: text("content").notNull(),
+  postId: text("post_id")
+    .notNull()
+    .references(() => posts.id),
+  authorId: text("author_id")
+    .notNull()
+    .references(() => users.id),
+  parentId: text("parent_id").references(() => comments.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+});
+
+export const tags = sqliteTable("tags", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  slug: text("slug").notNull().unique(),
+});
+
+export const postTags = sqliteTable("post_tags", {
+  postId: text("post_id")
+    .notNull()
+    .references(() => posts.id),
+  tagId: text("tag_id")
+    .notNull()
+    .references(() => tags.id),
+});
+
+// 关系定义
+export const usersRelations = relations(users, ({ many }) => ({
+  posts: many(posts),
+  comments: many(comments),
+}));
+
+export const postsRelations = relations(posts, ({ one, many }) => ({
+  author: one(users, {
+    fields: [posts.authorId],
+    references: [users.id],
+  }),
+  comments: many(comments),
+  tags: many(postTags),
+}));
+```
+
+---
+
+## 认证系统
+
+### JWT 认证
+
+```typescript
+// src/routes/auth.ts
+import { Hono } from "hono";
+import { sign, verify } from "hono/jwt";
+import { hash, compare } from "bcrypt";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+
+const auth = new Hono<{ Bindings: Env }>();
+
+// 注册
+auth.post(
+  "/register",
+  zValidator(
+    "json",
+    z.object({
+      email: z.string().email(),
+      username: z.string().min(3),
+      password: z.string().min(8),
+      name: z.string(),
+    })
+  ),
+  async (c) => {
+    const data = c.req.valid("json");
+
+    const hashedPassword = await hash(data.password, 10);
+
+    const [user] = await c.env.DB.prepare(
+      "INSERT INTO users (id, email, username, password, name) VALUES (?, ?, ?, ?, ?)"
+    )
+      .bind(
+        crypto.randomUUID(),
+        data.email,
+        data.username,
+        hashedPassword,
+        data.name
+      )
+      .run();
+
+    return c.json({ success: true, data: { id: user.meta.last_row_id } }, 201);
+  }
+);
+
+// 登录
+auth.post(
+  "/login",
+  zValidator(
+    "json",
+    z.object({
+      email: z.string().email(),
+      password: z.string(),
+    })
+  ),
+  async (c) => {
+    const { email, password } = c.req.valid("json");
+
+    const result = await c.env.DB.prepare("SELECT * FROM users WHERE email = ?")
+      .bind(email)
+      .first();
+
+    if (!result || !(await compare(password, result.password as string))) {
+      return c.json({ success: false, message: "Invalid credentials" }, 401);
+    }
+
+    const token = await sign(
+      { sub: result.id, role: result.role },
+      c.env.JWT_SECRET
+    );
+
+    return c.json({ success: true, data: { token } });
+  }
+);
+
+export default auth;
+```
+
+---
+
+## 文章 CRUD
+
+### 完整实现
+
+```typescript
+// src/routes/posts.ts
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+import { authMiddleware } from "../middleware/auth";
+
+const posts = new Hono<{ Bindings: Env }>();
+
+// Schema
+const postSchema = z.object({
+  title: z.string().min(1),
+  content: z.string().min(1),
+  excerpt: z.string().optional(),
+  published: z.boolean().default(false),
+  tags: z.array(z.string()).optional(),
+});
+
+// GET /posts - 列表
+posts.get("/", async (c) => {
+  const { page = "1", limit = "10" } = c.req.query();
+
+  const result = await c.env.DB.prepare(
+    `
+    SELECT * FROM posts
+    WHERE published = 1
+    ORDER BY created_at DESC
+    LIMIT ? OFFSET ?
+  `
+  )
+    .bind(limit, (parseInt(page) - 1) * parseInt(limit))
+    .all();
+
+  return c.json({ success: true, data: result.results });
+});
+
+// GET /posts/:id - 详情
+posts.get("/:id", async (c) => {
+  const { id } = c.req.param();
+
+  // 增加浏览量
+  await c.env.DB.prepare("UPDATE posts SET views = views + 1 WHERE id = ?")
+    .bind(id)
+    .run();
+
+  const post = await c.env.DB.prepare("SELECT * FROM posts WHERE id = ?")
+    .bind(id)
+    .first();
+
+  if (!post) {
+    return c.json({ success: false, message: "Not found" }, 404);
+  }
+
+  return c.json({ success: true, data: post });
+});
+
+// POST /posts - 创建
+posts.post("/", authMiddleware, zValidator("json", postSchema), async (c) => {
+  const data = c.req.valid("json");
+  const user = c.get("user");
+
+  const slug = data.title.toLowerCase().replace(/[^a-z0-9]+/g, "-");
+
+  const [post] = await c.env.DB.prepare(
+    `
+      INSERT INTO posts (id, title, slug, content, excerpt, published, author_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `
+  )
+    .bind(
+      crypto.randomUUID(),
+      data.title,
+      slug,
+      data.content,
+      data.excerpt,
+      data.published ? 1 : 0,
+      user.id
+    )
+    .run();
+
+  return c.json({ success: true, data: post }, 201);
+});
+
+// PUT /posts/:id - 更新
+posts.put(
+  "/:id",
+  authMiddleware,
+  zValidator("json", postSchema.partial()),
+  async (c) => {
+    const { id } = c.req.param();
+    const data = c.req.valid("json");
+    const user = c.get("user");
+
+    // 检查权限
+    const post = await c.env.DB.prepare("SELECT * FROM posts WHERE id = ?")
+      .bind(id)
+      .first();
+
+    if (!post || post.authorId !== user.id) {
+      return c.json({ success: false, message: "Forbidden" }, 403);
+    }
+
+    await c.env.DB.prepare(
+      `
+      UPDATE posts SET title = ?, content = ?, excerpt = ?, updated_at = ?
+      WHERE id = ?
+    `
+    )
+      .bind(
+        data.title,
+        data.content,
+        data.excerpt,
+        new Date().toISOString(),
+        id
+      )
+      .run();
+
+    return c.json({ success: true });
+  }
+);
+
+// DELETE /posts/:id - 删除
+posts.delete("/:id", authMiddleware, async (c) => {
+  const { id } = c.req.param();
+  const user = c.get("user");
+
+  const post = await c.env.DB.prepare("SELECT * FROM posts WHERE id = ?")
+    .bind(id)
+    .first();
+
+  if (!post || post.authorId !== user.id) {
+    return c.json({ success: false, message: "Forbidden" }, 403);
+  }
+
+  await c.env.DB.prepare("DELETE FROM posts WHERE id = ?").bind(id).run();
+
+  return c.json({ success: true });
+});
+
+export default posts;
+```
+
+---
+
+## 缓存优化
+
+### KV 缓存
+
+```typescript
+// src/services/cache.service.ts
+export class CacheService {
+  constructor(private kv: KVNamespace) {}
+
+  async get<T>(key: string): Promise<T | null> {
+    const value = await this.kv.get(key, "json");
+    return value as T;
+  }
+
+  async set(key: string, value: any, ttl: number): Promise<void> {
+    await this.kv.put(key, JSON.stringify(value), { expirationTtl: ttl });
+  }
+
+  async delete(key: string): Promise<void> {
+    await this.kv.delete(key);
+  }
+
+  async invalidatePattern(prefix: string): Promise<void> {
+    const keys = await this.kv.list({ prefix });
+    await Promise.all(keys.keys.map((key) => this.kv.delete(key.name)));
+  }
+}
+
+// 使用
+const cache = new CacheService(c.env.CACHE);
+
+const cached = await cache.get(`post:${id}`);
+if (cached) {
+  return c.json(cached);
+}
+
+const post = await fetchPost(id);
+await cache.set(`post:${id}`, post, 600);
+```
+
+---
+
+## 文件上传
+
+### R2 存储
+
+```typescript
+// src/routes/upload.ts
+app.post("/upload", authMiddleware, async (c) => {
+  const formData = await c.req.formData();
+  const file = formData.get("file") as File;
+
+  if (!file) {
+    return c.json({ success: false, message: "No file" }, 400);
+  }
+
+  const key = `uploads/${Date.now()}-${file.name}`;
+  await c.env.STORAGE.put(key, file.stream());
+
+  const url = `https://cdn.example.com/${key}`;
+
+  return c.json({ success: true, data: { url } });
+});
+```
+
+---
+
+## 测试
+
+### API 测试
+
+```typescript
+// tests/posts.test.ts
+import { describe, it, expect, beforeEach } from "vitest";
+import { app } from "../src/index";
+
+describe("Posts API", () => {
+  let authToken: string;
+
+  beforeEach(async () => {
+    // 登录获取 token
+    const response = await app.request("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email: "test@example.com", password: "password" }),
+    });
+
+    const { data } = await response.json();
+    authToken = data.token;
+  });
+
+  it("should create post", async () => {
+    const response = await app.request("/posts", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${authToken}`,
+      },
+      body: JSON.stringify({
+        title: "Test Post",
+        content: "Test Content",
+      }),
+    });
+
+    expect(response.status).toBe(201);
+  });
+
+  it("should list posts", async () => {
+    const response = await app.request("/posts");
+
+    expect(response.status).toBe(200);
+    const json = await response.json();
+    expect(json.success).toBe(true);
+  });
+});
+```
+
+---
+
+## 部署配置
+
+### wrangler.toml
+
+```toml
+name = "blog-api"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[vars]
+ENVIRONMENT = "production"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "blog-db"
+database_id = "xxx"
+
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "blog-uploads"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "xxx"
+```
+
+### 部署命令
+
+```bash
+# 创建 D1 数据库
+wrangler d1 create blog-db
+
+# 运行迁移
+wrangler d1 migrations apply blog-db --remote
+
+# 部署
+wrangler deploy
+```
+
+---
+
+## 项目总结
+
+通过这个完整项目，你学会了：
+
+**后端开发**：
+
+- ✅ RESTful API 设计
+- ✅ JWT 认证
+- ✅ CRUD 操作
+- ✅ 数据库关系
+
+**性能优化**：
+
+- ✅ KV 缓存
+- ✅ 数据库索引
+- ✅ 查询优化
+
+**安全实践**：
+
+- ✅ 密码哈希
+- ✅ JWT 认证
+- ✅ 权限控制
+
+**部署运维**：
+
+- ✅ Cloudflare Workers
+- ✅ D1 数据库
+- ✅ CI/CD
+
+---
+
+## 系列总结
+
+恭喜你完成了「Hono 渐进式学习」系列的全部 18 篇文章！
+
+你现在应该能够：
+
+- ✅ 独立构建 Hono 应用
+- ✅ 设计 RESTful API
+- ✅ 实现完整的认证系统
+- ✅ 优化应用性能
+- ✅ 部署到边缘环境
+
+继续探索 Hono 的强大功能，构建出色的边缘应用吧！
+
+---
+
+**相关资源**：
+
+- Hono 文档: https://hono.dev
+- Cloudflare Workers: https://workers.cloudflare.com
+- Deno Deploy: https://deno.com/deploy

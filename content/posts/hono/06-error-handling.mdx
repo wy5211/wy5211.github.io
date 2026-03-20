@@ -1,0 +1,1160 @@
+---
+title: "06. 错误处理与异常过滤器"
+date: "2026-03-20"
+summary: "构建优雅的错误处理机制，学习使用 HTTPException、自定义异常、全局错误处理器，实现统一的错误响应格式和日志记录。"
+tags: ["Hono", "Error Handling", "Exception", "Best Practices"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 6
+---
+
+## 前言
+
+在任何应用程序中，错误处理都是至关重要的部分。一个良好的错误处理机制不仅能提升用户体验，还能大大简化开发和调试过程。想象一下，当用户提交表单时，服务器返回 500 错误却不提供任何有用信息，或者在生产环境中暴露了敏感的堆栈跟踪——这些都是糟糕的错误处理示例。
+
+Hono 提供了强大而灵活的错误处理机制，包括内置的 `HTTPException`、全局错误处理器、自定义异常类等。通过这些工具，你可以构建统一、友好且安全的错误处理系统。
+
+本篇文章将带你：
+
+- 🎯 理解错误处理的重要性和最佳实践
+- 🛡️ 使用 HTTPException 处理 HTTP 错误
+- 🔧 创建自定义业务异常类
+- 🌐 实现全局错误处理器
+- 📝 记录和监控错误
+- 🔒 根据环境提供不同的错误响应
+
+---
+
+## 错误处理基础
+
+### 为什么需要良好的错误处理
+
+```typescript
+// ❌ 糟糕的错误处理
+app.get("/users/:id", async (c) => {
+  const user = await db.query.users.findFirst({
+    where: eq(users.id, c.req.param("id")),
+  });
+
+  // 没有检查 user 是否存在
+  return c.json(user);
+  // 如果 user 是 null，返回 null 给客户端
+  // 客户端不知道发生了什么
+});
+
+// ❌ 糟糕的错误处理 - 暴露敏感信息
+app.get("/users/:id", async (c) => {
+  try {
+    const user = await findUser(c.req.param("id"));
+    return c.json(user);
+  } catch (error) {
+    // 直接返回错误对象，可能暴露敏感信息
+    return c.json({ error: error.message }, 500);
+    // 可能暴露数据库结构、文件路径等
+  }
+});
+
+// ✅ 良好的错误处理
+app.get("/users/:id", async (c) => {
+  const user = await findUser(c.req.param("id"));
+
+  if (!user) {
+    throw new HTTPException(404, {
+      message: "User not found",
+      res: c.json(
+        {
+          success: false,
+          error: "USER_NOT_FOUND",
+          message: "The requested user does not exist",
+        },
+        404
+      ),
+    });
+  }
+
+  return c.json({ success: true, data: user });
+});
+```
+
+### 错误处理的原则
+
+1. **统一性**：所有错误使用统一的响应格式
+2. **安全性**：不在生产环境暴露敏感信息
+3. **友好性**：提供清晰、可操作的错误消息
+4. **可追踪性**：记录足够的日志用于调试
+5. **HTTP 语义**：使用正确的 HTTP 状态码
+
+---
+
+## HTTPException
+
+Hono 提供了内置的 `HTTPException` 类用于处理 HTTP 错误。
+
+### 基本使用
+
+```typescript
+import { HTTPException } from "hono/http-exception";
+
+app.get("/users/:id", async (c) => {
+  const user = await findUser(c.req.param("id"));
+
+  if (!user) {
+    // 抛出 HTTPException
+    throw new HTTPException(404, {
+      message: "User not found",
+    });
+  }
+
+  return c.json(user);
+});
+
+// Hono 会自动捕获 HTTPException 并返回响应
+// {
+//   "message": "User not found"
+// }
+```
+
+### 自定义响应
+
+```typescript
+app.get("/users/:id", async (c) => {
+  const user = await findUser(c.req.param("id"));
+
+  if (!user) {
+    throw new HTTPException(404, {
+      res: c.json(
+        {
+          success: false,
+          error: "USER_NOT_FOUND",
+          message: "The requested user does not exist",
+          documentation: "https://api.example.com/docs/errors#user-not-found",
+        },
+        404
+      ),
+    });
+  }
+
+  return c.json({ success: true, data: user });
+});
+```
+
+### 常见 HTTP 状态码
+
+```typescript
+// 400 Bad Request - 请求参数错误
+throw new HTTPException(400, {
+  message: "Invalid request parameters",
+});
+
+// 401 Unauthorized - 未认证
+throw new HTTPException(401, {
+  message: "Authentication required",
+});
+
+// 403 Forbidden - 无权限
+throw new HTTPException(403, {
+  message: "You do not have permission to access this resource",
+});
+
+// 404 Not Found - 资源不存在
+throw new HTTPException(404, {
+  message: "Resource not found",
+});
+
+// 409 Conflict - 资源冲突
+throw new HTTPException(409, {
+  message: "Resource already exists",
+});
+
+// 422 Unprocessable Entity - 验证失败
+throw new HTTPException(422, {
+  message: "Validation failed",
+});
+
+// 429 Too Many Requests - 请求过多
+throw new HTTPException(429, {
+  message: "Rate limit exceeded",
+});
+
+// 500 Internal Server Error - 服务器错误
+throw new HTTPException(500, {
+  message: "Internal server error",
+});
+
+// 503 Service Unavailable - 服务不可用
+throw new HTTPException(503, {
+  message: "Service temporarily unavailable",
+});
+```
+
+---
+
+## 自定义异常类
+
+对于业务逻辑中的特定错误，创建自定义异常类可以让代码更加清晰和易于维护。
+
+### 基础自定义异常
+
+```typescript
+// 自定义业务异常基类
+export class BusinessException extends Error {
+  constructor(
+    public code: string,
+    public message: string,
+    public statusCode: number = 400
+  ) {
+    super(message);
+    this.name = "BusinessException";
+  }
+}
+
+// 使用自定义异常
+app.post("/users", async (c) => {
+  const { email } = await c.req.json();
+
+  const existingUser = await findUserByEmail(email);
+
+  if (existingUser) {
+    throw new BusinessException(
+      "EMAIL_ALREADY_EXISTS",
+      "Email already registered",
+      409
+    );
+  }
+
+  // 创建用户...
+});
+
+// 在全局错误处理器中处理
+app.onError((err, c) => {
+  if (err instanceof BusinessException) {
+    return c.json(
+      {
+        success: false,
+        code: err.code,
+        message: err.message,
+      },
+      err.statusCode
+    );
+  }
+
+  // 其他错误...
+});
+```
+
+### 完整的异常体系
+
+```typescript
+// exceptions/index.ts
+import { HTTPException } from "hono/http-exception";
+
+// 基础业务异常
+export class BaseException extends Error {
+  constructor(
+    public code: string,
+    public message: string,
+    public statusCode: number = 500,
+    public details?: any
+  ) {
+    super(message);
+    this.name = this.constructor.name;
+    Error.captureStackTrace(this, this.constructor);
+  }
+
+  toResponse() {
+    return {
+      success: false,
+      code: this.code,
+      message: this.message,
+      ...(this.details && { details: this.details }),
+    };
+  }
+}
+
+// 认证异常
+export class AuthenticationException extends BaseException {
+  constructor(message: string = "Authentication failed") {
+    super("AUTHENTICATION_FAILED", message, 401);
+  }
+}
+
+export class TokenExpiredException extends BaseException {
+  constructor() {
+    super("TOKEN_EXPIRED", "Token has expired", 401);
+  }
+}
+
+export class InvalidTokenException extends BaseException {
+  constructor() {
+    super("INVALID_TOKEN", "Invalid token", 401);
+  }
+}
+
+// 授权异常
+export class AuthorizationException extends BaseException {
+  constructor(message: string = "Insufficient permissions") {
+    super("AUTHORIZATION_FAILED", message, 403);
+  }
+}
+
+// 资源异常
+export class NotFoundException extends BaseException {
+  constructor(resource: string = "Resource") {
+    super("NOT_FOUND", `${resource} not found`, 404);
+  }
+}
+
+export class AlreadyExistsException extends BaseException {
+  constructor(resource: string = "Resource") {
+    super("ALREADY_EXISTS", `${resource} already exists`, 409);
+  }
+}
+
+// 验证异常
+export class ValidationException extends BaseException {
+  constructor(errors: any[]) {
+    super("VALIDATION_FAILED", "Validation failed", 422, { errors });
+  }
+}
+
+// 速率限制异常
+export class RateLimitException extends BaseException {
+  constructor(retryAfter?: number) {
+    super("RATE_LIMIT_EXCEEDED", "Rate limit exceeded", 429, { retryAfter });
+  }
+}
+
+// 使用示例
+app.post("/auth/login", async (c) => {
+  const { email, password } = await c.req.json();
+
+  const user = await findUserByEmail(email);
+
+  if (!user) {
+    throw new AuthenticationException("Invalid credentials");
+  }
+
+  const isValid = await verifyPassword(password, user.password);
+
+  if (!isValid) {
+    throw new AuthenticationException("Invalid credentials");
+  }
+
+  // 生成 token...
+});
+
+app.delete("/posts/:id", async (c) => {
+  const post = await findPost(c.req.param("id"));
+
+  if (!post) {
+    throw new NotFoundException("Post");
+  }
+
+  if (post.authorId !== c.get("user").id) {
+    throw new AuthorizationException("You can only delete your own posts");
+  }
+
+  // 删除文章...
+});
+```
+
+---
+
+## 全局错误处理器
+
+全局错误处理器是统一处理所有错误的最佳方式。
+
+### 基础全局错误处理器
+
+```typescript
+import { Hono } from "hono";
+import { HTTPException } from "hono/http-exception";
+import { BaseException } from "./exceptions";
+
+const app = new Hono();
+
+app.onError((err, c) => {
+  // 处理自定义业务异常
+  if (err instanceof BaseException) {
+    return c.json(err.toResponse(), err.statusCode);
+  }
+
+  // 处理 HTTPException
+  if (err instanceof HTTPException) {
+    return c.json(
+      {
+        success: false,
+        message: err.message,
+      },
+      err.status
+    );
+  }
+
+  // 处理其他未知错误
+  console.error("Unhandled error:", err);
+
+  return c.json(
+    {
+      success: false,
+      message: "Internal server error",
+    },
+    500
+  );
+});
+```
+
+### 完整的全局错误处理器
+
+```typescript
+interface ErrorResponse {
+  success: false;
+  code: string;
+  message: string;
+  details?: any;
+  stack?: string;
+  requestId?: string;
+}
+
+app.onError((err, c) => {
+  const requestId = crypto.randomUUID();
+  const isDevelopment = c.env?.ENV === "development";
+
+  // 记录错误
+  console.error({
+    requestId,
+    error: err.message,
+    stack: err.stack,
+    url: c.req.url,
+    method: c.req.method,
+    headers: Object.fromEntries(c.req.raw.headers),
+    body: err.body,
+  });
+
+  // 自定义业务异常
+  if (err instanceof BaseException) {
+    const response: ErrorResponse = {
+      success: false,
+      ...err.toResponse(),
+      requestId,
+    };
+
+    // 开发环境添加堆栈跟踪
+    if (isDevelopment) {
+      response.stack = err.stack;
+    }
+
+    return c.json(response, err.statusCode);
+  }
+
+  // HTTPException
+  if (err instanceof HTTPException) {
+    const response: ErrorResponse = {
+      success: false,
+      code: "HTTP_ERROR",
+      message: err.message,
+      requestId,
+    };
+
+    if (isDevelopment) {
+      response.stack = err.stack;
+    }
+
+    return c.json(response, err.status);
+  }
+
+  // Zod 验证错误
+  if (err.name === "ZodError") {
+    const response: ErrorResponse = {
+      success: false,
+      code: "VALIDATION_ERROR",
+      message: "Validation failed",
+      details: err.errors,
+      requestId,
+    };
+
+    return c.json(response, 400);
+  }
+
+  // 数据库错误
+  if (err.name === "DatabaseError") {
+    const response: ErrorResponse = {
+      success: false,
+      code: "DATABASE_ERROR",
+      message: isDevelopment ? err.message : "Database operation failed",
+      requestId,
+    };
+
+    if (isDevelopment) {
+      response.stack = err.stack;
+    }
+
+    return c.json(response, 500);
+  }
+
+  // 未知错误
+  const response: ErrorResponse = {
+    success: false,
+    code: "INTERNAL_ERROR",
+    message: isDevelopment ? err.message : "An unexpected error occurred",
+    requestId,
+  };
+
+  if (isDevelopment) {
+    response.stack = err.stack;
+  }
+
+  return c.json(response, 500);
+});
+
+// 404 处理
+app.notFound((c) => {
+  return c.json(
+    {
+      success: false,
+      code: "NOT_FOUND",
+      message: "Route not found",
+      requestId: crypto.randomUUID(),
+    },
+    404
+  );
+});
+```
+
+---
+
+## 错误日志记录
+
+### 集成日志服务
+
+```typescript
+// logger/error-logger.ts
+import pino from "pino";
+
+const logger = pino({
+  level: process.env.LOG_LEVEL || "info",
+  formatters: {
+    level: (label) => {
+      return { level: label };
+    },
+  },
+  serializers: {
+    err: pino.stdSerializers.err,
+  },
+  // 生产环境可以添加日志传输
+  ...(process.env.NODE_ENV === "production" && {
+    transport: {
+      target: "pino/file",
+      options: {
+        destination: "./logs/error.log",
+      },
+    },
+  }),
+});
+
+export const logError = (
+  error: Error,
+  context: {
+    requestId: string;
+    url: string;
+    method: string;
+    headers?: Record<string, string>;
+    userId?: string;
+    body?: any;
+  }
+) => {
+  logger.error({
+    err: error,
+    ...context,
+  });
+};
+
+// 在全局错误处理器中使用
+app.onError((err, c) => {
+  const requestId = crypto.randomUUID();
+
+  logError(err, {
+    requestId,
+    url: c.req.url,
+    method: c.req.method,
+    headers: Object.fromEntries(c.req.raw.headers),
+    userId: c.get("user")?.id,
+  });
+
+  // 返回错误响应...
+});
+```
+
+### Sentry 集成
+
+```typescript
+import * as Sentry from "@sentry/node";
+
+Sentry.init({
+  dsn: process.env.SENTRY_DSN,
+  environment: process.env.NODE_ENV,
+  tracesSampleRate: 1.0,
+});
+
+app.onError((err, c) => {
+  // 发送到 Sentry
+  Sentry.captureException(err, {
+    tags: {
+      requestId: crypto.randomUUID(),
+      userId: c.get("user")?.id,
+    },
+    user: c.get("user")
+      ? {
+          id: c.get("user").id,
+          email: c.get("user").email,
+        }
+      : undefined,
+  });
+
+  // 返回错误响应...
+});
+```
+
+---
+
+## 实战示例
+
+### 完整的错误处理系统
+
+```typescript
+import { Hono } from "hono";
+import { HTTPException } from "hono/http-exception";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+
+// ==================== 异常定义 ====================
+
+export class BaseException extends Error {
+  constructor(
+    public code: string,
+    public message: string,
+    public statusCode: number = 500,
+    public details?: any
+  ) {
+    super(message);
+    this.name = this.constructor.name;
+  }
+
+  toResponse() {
+    return {
+      success: false,
+      code: this.code,
+      message: this.message,
+      ...(this.details && { details: this.details }),
+    };
+  }
+}
+
+export class AuthenticationException extends BaseException {
+  constructor(message: string = "Authentication failed") {
+    super("AUTHENTICATION_FAILED", message, 401);
+  }
+}
+
+export class AuthorizationException extends BaseException {
+  constructor(message: string = "Insufficient permissions") {
+    super("AUTHORIZATION_FAILED", message, 403);
+  }
+}
+
+export class NotFoundException extends BaseException {
+  constructor(resource: string = "Resource") {
+    super("NOT_FOUND", `${resource} not found`, 404);
+  }
+}
+
+export class ValidationException extends BaseException {
+  constructor(errors: any[]) {
+    super("VALIDATION_FAILED", "Validation failed", 422, { errors });
+  }
+}
+
+// ==================== 中间件 ====================
+
+// 认证中间件
+export const authMiddleware = async (c: any, next: any) => {
+  const token = c.req.header("Authorization")?.replace("Bearer ", "");
+
+  if (!token) {
+    throw new AuthenticationException("Token required");
+  }
+
+  try {
+    const payload = await verifyToken(token);
+    const user = await findUserById(payload.sub);
+
+    if (!user) {
+      throw new AuthenticationException("User not found");
+    }
+
+    c.set("user", user);
+    await next();
+  } catch (error) {
+    throw new AuthenticationException("Invalid token");
+  }
+};
+
+// 授权中间件
+export const requireRole = (...roles: string[]) => {
+  return async (c: any, next: any) => {
+    const user = c.get("user");
+
+    if (!roles.includes(user.role)) {
+      throw new AuthorizationException(
+        `Requires one of these roles: ${roles.join(", ")}`
+      );
+    }
+
+    await next();
+  };
+};
+
+// ==================== 应用配置 ====================
+
+const app = new Hono();
+
+// 全局错误处理器
+app.onError((err, c) => {
+  const requestId = crypto.randomUUID();
+  const isDevelopment = c.env?.ENV === "development";
+
+  // 记录错误
+  console.error({
+    requestId,
+    error: {
+      name: err.name,
+      message: err.message,
+      stack: err.stack,
+    },
+    context: {
+      url: c.req.url,
+      method: c.req.method,
+      userId: c.get("user")?.id,
+    },
+  });
+
+  // 自定义异常
+  if (err instanceof BaseException) {
+    const response = {
+      ...err.toResponse(),
+      requestId,
+    };
+
+    if (isDevelopment) {
+      (response as any).stack = err.stack;
+    }
+
+    return c.json(response, err.statusCode);
+  }
+
+  // HTTPException
+  if (err instanceof HTTPException) {
+    return c.json(
+      {
+        success: false,
+        code: "HTTP_ERROR",
+        message: err.message,
+        requestId,
+      },
+      err.status
+    );
+  }
+
+  // Zod 验证错误
+  if (err.name === "ZodError") {
+    return c.json(
+      {
+        success: false,
+        code: "VALIDATION_ERROR",
+        message: "Validation failed",
+        details: err.errors,
+        requestId,
+      },
+      400
+    );
+  }
+
+  // 未知错误
+  return c.json(
+    {
+      success: false,
+      code: "INTERNAL_ERROR",
+      message: isDevelopment ? err.message : "Internal server error",
+      requestId,
+    },
+    500
+  );
+});
+
+// 404 处理
+app.notFound((c) => {
+  return c.json(
+    {
+      success: false,
+      code: "NOT_FOUND",
+      message: "Route not found",
+      requestId: crypto.randomUUID(),
+    },
+    404
+  );
+});
+
+// ==================== 路由示例 ====================
+
+// 认证路由
+app.post("/auth/login", async (c) => {
+  const { email, password } = await c.req.json();
+
+  const user = await findUserByEmail(email);
+
+  if (!user) {
+    throw new AuthenticationException("Invalid credentials");
+  }
+
+  const isValid = await verifyPassword(password, user.password);
+
+  if (!isValid) {
+    throw new AuthenticationException("Invalid credentials");
+  }
+
+  const token = await generateToken(user);
+
+  return c.json({
+    success: true,
+    data: { token, user: sanitizeUser(user) },
+  });
+});
+
+// 受保护的路由
+app.get("/api/users", authMiddleware, requireRole("admin"), async (c) => {
+  const users = await getAllUsers();
+  return c.json({ success: true, data: users });
+});
+
+app.get("/api/users/:id", authMiddleware, async (c) => {
+  const user = await findUser(c.req.param("id"));
+
+  if (!user) {
+    throw new NotFoundException("User");
+  }
+
+  return c.json({ success: true, data: user });
+});
+
+app.patch(
+  "/api/users/:id",
+  authMiddleware,
+  zValidator(
+    "json",
+    z.object({
+      name: z.string().min(1).max(50).optional(),
+      email: z.string().email().optional(),
+    })
+  ),
+  async (c) => {
+    const { id } = c.req.param();
+    const data = c.req.valid("json");
+    const currentUser = c.get("user");
+
+    // 检查权限
+    if (id !== currentUser.id && currentUser.role !== "admin") {
+      throw new AuthorizationException("You can only update your own profile");
+    }
+
+    const updated = await updateUser(id, data);
+
+    return c.json({ success: true, data: updated });
+  }
+);
+
+export default app;
+```
+
+---
+
+## 最佳实践
+
+### 1. 统一错误响应格式
+
+```typescript
+// 定义统一的错误响应接口
+interface ErrorResponse {
+  success: false;
+  code: string;
+  message: string;
+  details?: any;
+  requestId?: string;
+  documentation?: string;
+}
+
+// 所有错误都使用这个格式
+const createErrorResponse = (
+  code: string,
+  message: string,
+  details?: any
+): ErrorResponse => ({
+  success: false,
+  code,
+  message,
+  ...(details && { details }),
+});
+```
+
+### 2. 错误代码规范
+
+```typescript
+// 定义错误代码常量
+export const ErrorCodes = {
+  // 认证相关 (1xxx)
+  AUTHENTICATION_FAILED: "AUTHENTICATION_FAILED",
+  TOKEN_EXPIRED: "TOKEN_EXPIRED",
+  INVALID_TOKEN: "INVALID_TOKEN",
+
+  // 授权相关 (2xxx)
+  AUTHORIZATION_FAILED: "AUTHORIZATION_FAILED",
+  INSUFFICIENT_PERMISSIONS: "INSUFFICIENT_PERMISSIONS",
+
+  // 资源相关 (3xxx)
+  NOT_FOUND: "NOT_FOUND",
+  ALREADY_EXISTS: "ALREADY_EXISTS",
+
+  // 验证相关 (4xxx)
+  VALIDATION_FAILED: "VALIDATION_FAILED",
+  INVALID_INPUT: "INVALID_INPUT",
+
+  // 业务逻辑 (5xxx)
+  OPERATION_FAILED: "OPERATION_FAILED",
+  RESOURCE_LOCKED: "RESOURCE_LOCKED",
+
+  // 服务器错误 (9xxx)
+  INTERNAL_ERROR: "INTERNAL_ERROR",
+  DATABASE_ERROR: "DATABASE_ERROR",
+  EXTERNAL_SERVICE_ERROR: "EXTERNAL_SERVICE_ERROR",
+} as const;
+
+// 使用
+throw new BaseException(ErrorCodes.NOT_FOUND, "User not found", 404);
+```
+
+### 3. 环境感知的错误消息
+
+```typescript
+const getErrorMessage = (err: Error, env: string = "production"): string => {
+  // 开发环境：返回详细错误信息
+  if (env === "development") {
+    return err.message;
+  }
+
+  // 生产环境：返回通用错误信息
+  const genericMessages: Record<string, string> = {
+    DatabaseError: "Database operation failed",
+    ExternalServiceError: "External service unavailable",
+    InternalError: "An unexpected error occurred",
+  };
+
+  return genericMessages[err.name] || "An unexpected error occurred";
+};
+```
+
+### 4. 错误监控和告警
+
+```typescript
+// 发送错误到监控系统
+const notifyError = (error: Error, context: Record<string, any>) => {
+  // 发送到 Sentry
+  Sentry.captureException(error, { extra: context });
+
+  // 发送到 Slack（生产环境关键错误）
+  if (process.env.NODE_ENV === "production" && error.statusCode >= 500) {
+    fetch(process.env.SLACK_WEBHOOK_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: `🚨 ${error.code}: ${error.message}`,
+        attachments: [
+          {
+            color: "danger",
+            fields: [
+              { title: "Request ID", value: context.requestId, short: true },
+              { title: "URL", value: context.url, short: true },
+              { title: "Method", value: context.method, short: true },
+              { title: "User ID", value: context.userId || "N/A", short: true },
+            ],
+          },
+        ],
+      }),
+    });
+  }
+};
+```
+
+### 5. 客户端错误处理
+
+```typescript
+// 为客户端提供详细的错误信息
+const createValidationErrorResponse = (errors: any[]): ErrorResponse => ({
+  success: false,
+  code: ErrorCodes.VALIDATION_FAILED,
+  message: "Validation failed",
+  details: {
+    fields: errors.reduce(
+      (acc, err) => {
+        const field = err.path.join(".");
+        if (!acc[field]) acc[field] = [];
+        acc[field].push(err.message);
+        return acc;
+      },
+      {} as Record<string, string[]>
+    ),
+    documentation: "https://api.example.com/docs/validation",
+  },
+});
+
+// 返回示例：
+// {
+//   "success": false,
+//   "code": "VALIDATION_FAILED",
+//   "message": "Validation failed",
+//   "details": {
+//     "fields": {
+//       "email": ["Invalid email format"],
+//       "password": ["Password too short"]
+//     },
+//     "documentation": "https://api.example.com/docs/validation"
+//   }
+// }
+```
+
+---
+
+## 常见问题
+
+### Q1: 如何处理异步错误？
+
+```typescript
+// ✅ 自动处理：在 async 函数中抛出的错误会被全局错误处理器捕获
+app.get("/users/:id", async (c) => {
+  const user = await findUser(c.req.param("id"));
+
+  if (!user) {
+    throw new NotFoundException("User");
+  }
+
+  // 如果 findUser 抛出错误，也会被全局错误处理器捕获
+  return c.json({ success: true, data: user });
+});
+
+// ❌ 不要手动捕获所有错误
+app.get("/users/:id", async (c) => {
+  try {
+    const user = await findUser(c.req.param("id"));
+    return c.json({ success: true, data: user });
+  } catch (error) {
+    // 这样会绕过全局错误处理器
+    return c.json({ error: "Something went wrong" }, 500);
+  }
+});
+```
+
+### Q2: 如何区分不同的错误类型？
+
+```typescript
+app.onError((err, c) => {
+  // 使用 instanceof 检查
+  if (err instanceof NotFoundException) {
+    // 处理 404
+  }
+
+  if (err instanceof AuthenticationException) {
+    // 处理 401
+  }
+
+  // 检查 err.name
+  if (err.name === "DatabaseError") {
+    // 处理数据库错误
+  }
+
+  // 检查 err.statusCode
+  if (err.statusCode >= 500) {
+    // 服务器错误，发送告警
+    notifyError(err);
+  }
+
+  // ...
+});
+```
+
+### Q3: 如何在错误发生时回滚事务？
+
+```typescript
+app.post("/transfer", async (c) => {
+  try {
+    await db.transaction(async (tx) => {
+      // 执行转账操作
+      await transferMoney(tx, fromId, toId, amount);
+    });
+
+    return c.json({ success: true });
+  } catch (error) {
+    // 事务会自动回滚
+    throw new BaseException(
+      "TRANSFER_FAILED",
+      "Transfer operation failed",
+      500
+    );
+  }
+});
+```
+
+---
+
+## 总结
+
+本文详细介绍了 Hono 的错误处理机制：
+
+**核心概念**：
+
+- ✅ 错误处理的重要性和原则
+- ✅ HTTPException 的使用
+- ✅ 自定义异常类的设计
+
+**全局处理**：
+
+- ✅ 实现全局错误处理器
+- ✅ 404 错误处理
+- ✅ 环境感知的错误响应
+
+**实战应用**：
+
+- ✅ 完整的异常体系
+- ✅ 错误日志记录
+- ✅ 监控和告警
+- ✅ 统一错误响应格式
+
+**最佳实践**：
+
+- ✅ 错误代码规范
+- ✅ 安全性考虑
+- ✅ 用户体验优化
+
+通过完善的错误处理机制，你的应用将更加健壮、安全和易于维护。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将进入 **「07. SQLite + Drizzle ORM」**，学习如何：
+
+- 🗄️ 使用 Drizzle ORM 设计数据库 Schema
+- 🔄 执行 CRUD 操作
+- 🔗 处理表关系和查询
+- 💾 管理数据库迁移
+- 🚀 在边缘环境中使用数据库
+
+准备好让你的应用支持数据持久化了吗？让我们继续前进！

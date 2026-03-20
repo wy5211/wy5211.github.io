@@ -1,0 +1,1246 @@
+---
+title: "09. JWT 认证实现"
+date: "2026-03-20"
+summary: "实现完整的用户认证系统，学习 JWT 原理、Access Token 和 Refresh Token 机制，构建安全的注册、登录、登出流程。"
+tags: ["Hono", "JWT", "Authentication", "Security", "Authorization"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 9
+---
+
+## 前言
+
+用户认证是现代 Web 应用的核心功能。无论是社交媒体、电商平台还是企业应用，都需要安全可靠的身份验证机制来保护用户数据和系统资源。
+
+**JWT (JSON Web Token)** 是一种轻量级、无状态的认证方案，非常适合边缘环境和微服务架构。与传统 Session 认证相比，JWT 不需要在服务器存储状态，可以轻松实现跨服务器认证，并且天然支持水平扩展。
+
+Hono 提供了内置的 JWT 支持，配合 bcrypt 等密码哈希库，可以快速构建安全可靠的认证系统。
+
+本篇文章将带你：
+
+- 🔐 理解 JWT 的工作原理和结构
+- 🎫 区分 Access Token 和 Refresh Token
+- 👤 实现用户注册和登录
+- 🔄 实现 Token 刷新机制
+- 🛡️ 保护路由和实现权限控制
+- 💡 遵循安全最佳实践
+
+---
+
+## JWT 基础
+
+### 什么是 JWT
+
+JWT (JSON Web Token) 是一种开放标准 (RFC 7519)，用于在各方之间安全地传输信息。它由三部分组成，用点 (.) 分隔：
+
+```
+Header.Payload.Signature
+```
+
+**示例 JWT**：
+
+```
+eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c
+```
+
+### JWT 结构解析
+
+#### 1. Header（头部）
+
+```json
+{
+  "alg": "HS256",
+  "typ": "JWT"
+}
+```
+
+- `alg`：签名算法（如 HS256、RS256）
+- `typ`：令牌类型（通常为 "JWT"）
+
+#### 2. Payload（负载）
+
+```json
+{
+  "sub": "1234567890",
+  "name": "John Doe",
+  "iat": 1516239022,
+  "exp": 1516242622
+}
+```
+
+标准声明（Claims）：
+
+- `iss` (issuer)：签发者
+- `sub` (subject)：主题（通常是用户 ID）
+- `aud` (audience)：接收方
+- `exp` (expiration)：过期时间
+- `nbf` (not before)：生效时间
+- `iat` (issued at)：签发时间
+- `jti` (JWT ID)：唯一标识符
+
+#### 3. Signature（签名）
+
+```
+HMACSHA256(
+  base64UrlEncode(header) + "." +
+  base64UrlEncode(payload),
+  secret
+)
+```
+
+签名用于验证消息在传输过程中未被篡改。
+
+### JWT vs Session
+
+| 特性         | JWT         | Session         |
+| ------------ | ----------- | --------------- |
+| **存储**     | 客户端      | 服务器          |
+| **扩展性**   | ✅ 优秀     | ⚠️ 需要共享存储 |
+| **状态**     | ✅ 无状态   | ❌ 有状态       |
+| **撤销**     | ⚠️ 困难     | ✅ 容易         |
+| **大小**     | 🔴 较大     | 🟢 小（仅 ID）  |
+| **跨域**     | ✅ 容易     | ⚠️ 需要 CORS    |
+| **适用场景** | API、微服务 | 传统 Web 应用   |
+
+---
+
+## 项目设置
+
+### 安装依赖
+
+```bash
+# Hono JWT
+npm install @hono/jwt
+
+# 密码哈希
+npm install bcrypt
+
+# TypeScript 类型
+npm install -D @types/bcrypt
+```
+
+### 环境变量
+
+```bash
+# .env
+JWT_SECRET=your-super-secret-key-change-this-in-production
+JWT_REFRESH_SECRET=another-secret-key-for-refresh-tokens
+JWT_ACCESS_EXPIRY=15m
+JWT_REFRESH_EXPIRY=7d
+BCRYPT_ROUNDS=10
+```
+
+---
+
+## 用户注册
+
+### 注册 Schema
+
+```typescript
+// src/validators/auth.ts
+import { z } from "zod";
+
+export const registerSchema = z.object({
+  email: z.string().min(1, "Email is required").email("Invalid email format"),
+  username: z
+    .string()
+    .min(3, "Username must be at least 3 characters")
+    .max(20, "Username must be at most 20 characters")
+    .regex(
+      /^[a-zA-Z0-9_]+$/,
+      "Username can only contain letters, numbers, and underscores"
+    ),
+  password: z
+    .string()
+    .min(8, "Password must be at least 8 characters")
+    .regex(/[A-Z]/, "Password must contain at least one uppercase letter")
+    .regex(/[a-z]/, "Password must contain at least one lowercase letter")
+    .regex(/\d/, "Password must contain at least one number"),
+  name: z
+    .string()
+    .min(1, "Name is required")
+    .max(50, "Name must be at most 50 characters"),
+});
+```
+
+### 注册接口实现
+
+```typescript
+// src/routes/auth.ts
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { hash, compare } from "bcrypt";
+import { sign, verify } from "hono/jwt";
+import { eq } from "drizzle-orm";
+import { HTTPException } from "hono/http-exception";
+import * as schema from "../db/schema";
+import { db } from "../db";
+import { registerSchema, loginSchema } from "../validators/auth";
+import { generateUsername } from "../utils/user";
+
+const auth = new Hono();
+
+// POST /auth/register - 用户注册
+auth.post("/register", zValidator("json", registerSchema), async (c) => {
+  const { email, username, password, name } = c.req.valid("json");
+
+  // 检查邮箱是否已注册
+  const existingUser = await db.query.users.findFirst({
+    where: eq(schema.users.email, email),
+  });
+
+  if (existingUser) {
+    return c.json(
+      {
+        success: false,
+        code: "EMAIL_EXISTS",
+        message: "Email already registered",
+      },
+      409
+    );
+  }
+
+  // 检查用户名是否已被占用
+  const existingUsername = await db.query.users.findFirst({
+    where: eq(schema.users.username, username),
+  });
+
+  if (existingUsername) {
+    return c.json(
+      {
+        success: false,
+        code: "USERNAME_EXISTS",
+        message: "Username already taken",
+      },
+      409
+    );
+  }
+
+  // 哈希密码
+  const hashedPassword = await hash(
+    password,
+    parseInt(process.env.BCRYPT_ROUNDS || "10")
+  );
+
+  // 创建用户
+  const [user] = await db
+    .insert(schema.users)
+    .values({
+      id: crypto.randomUUID(),
+      email,
+      username,
+      password: hashedPassword,
+      name,
+      role: "user",
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .returning();
+
+  // 移除密码字段
+  const { password: _, ...userWithoutPassword } = user;
+
+  return c.json(
+    {
+      success: true,
+      data: userWithoutPassword,
+      message: "Registration successful",
+    },
+    201
+  );
+});
+```
+
+---
+
+## 用户登录
+
+### 登录 Schema
+
+```typescript
+export const loginSchema = z.object({
+  email: z.string().min(1, "Email is required").email("Invalid email format"),
+  password: z.string().min(1, "Password is required"),
+});
+
+export const refreshTokenSchema = z.object({
+  refreshToken: z.string().min(1, "Refresh token is required"),
+});
+```
+
+### 登录接口实现
+
+```typescript
+// POST /auth/login - 用户登录
+auth.post("/login", zValidator("json", loginSchema), async (c) => {
+  const { email, password } = c.req.valid("json");
+
+  // 查找用户
+  const user = await db.query.users.findFirst({
+    where: eq(schema.users.email, email),
+  });
+
+  if (!user) {
+    return c.json(
+      {
+        success: false,
+        code: "INVALID_CREDENTIALS",
+        message: "Invalid email or password",
+      },
+      401
+    );
+  }
+
+  // 验证密码
+  const isValidPassword = await compare(password, user.password);
+
+  if (!isValidPassword) {
+    return c.json(
+      {
+        success: false,
+        code: "INVALID_CREDENTIALS",
+        message: "Invalid email or password",
+      },
+      401
+    );
+  }
+
+  // 检查账户是否激活
+  if (!user.isActive) {
+    return c.json(
+      {
+        success: false,
+        code: "ACCOUNT_DISABLED",
+        message: "Account has been disabled",
+      },
+      403
+    );
+  }
+
+  // 生成 Access Token
+  const accessToken = await sign(
+    {
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+      type: "access",
+      exp: Math.floor(Date.now() / 1000) + 60 * 15, // 15 分钟
+    },
+    process.env.JWT_SECRET!
+  );
+
+  // 生成 Refresh Token
+  const refreshToken = await sign(
+    {
+      sub: user.id,
+      type: "refresh",
+      exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7, // 7 天
+    },
+    process.env.JWT_REFRESH_SECRET!
+  );
+
+  // 存储 Refresh Token（可选：存入数据库或 Redis）
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
+
+  await db.insert(schema.refreshTokens).values({
+    id: crypto.randomUUID(),
+    token: refreshToken,
+    userId: user.id,
+    expiresAt,
+    createdAt: new Date(),
+  });
+
+  // 移除密码字段
+  const { password: _, ...userWithoutPassword } = user;
+
+  return c.json({
+    success: true,
+    data: {
+      user: userWithoutPassword,
+      accessToken,
+      refreshToken,
+      expiresIn: 15 * 60, // 秒
+    },
+    message: "Login successful",
+  });
+});
+```
+
+---
+
+## Token 刷新
+
+### Refresh Token 实现
+
+```typescript
+// POST /auth/refresh - 刷新 Access Token
+auth.post("/refresh", zValidator("json", refreshTokenSchema), async (c) => {
+  const { refreshToken } = c.req.valid("json");
+
+  try {
+    // 验证 Refresh Token
+    const payload = await verify(refreshToken, process.env.JWT_REFRESH_SECRET!);
+
+    // 检查 token 类型
+    if (payload.type !== "refresh") {
+      return c.json(
+        {
+          success: false,
+          code: "INVALID_TOKEN",
+          message: "Invalid token type",
+        },
+        401
+      );
+    }
+
+    // 检查 Refresh Token 是否在数据库中
+    const storedToken = await db.query.refreshTokens.findFirst({
+      where: eq(schema.refreshTokens.token, refreshToken),
+    });
+
+    if (!storedToken) {
+      return c.json(
+        {
+          success: false,
+          code: "INVALID_TOKEN",
+          message: "Refresh token not found",
+        },
+        401
+      );
+    }
+
+    // 检查是否过期
+    if (storedToken.expiresAt < new Date()) {
+      // 删除过期的 token
+      await db
+        .delete(schema.refreshTokens)
+        .where(eq(schema.refreshTokens.token, refreshToken));
+
+      return c.json(
+        {
+          success: false,
+          code: "TOKEN_EXPIRED",
+          message: "Refresh token has expired",
+        },
+        401
+      );
+    }
+
+    // 获取用户信息
+    const user = await db.query.users.findFirst({
+      where: eq(schema.users.id, payload.sub as string),
+    });
+
+    if (!user || !user.isActive) {
+      return c.json(
+        {
+          success: false,
+          code: "USER_NOT_FOUND",
+          message: "User not found or account disabled",
+        },
+        401
+      );
+    }
+
+    // 生成新的 Access Token
+    const newAccessToken = await sign(
+      {
+        sub: user.id,
+        email: user.email,
+        role: user.role,
+        type: "access",
+        exp: Math.floor(Date.now() / 1000) + 60 * 15,
+      },
+      process.env.JWT_SECRET!
+    );
+
+    return c.json({
+      success: true,
+      data: {
+        accessToken: newAccessToken,
+        expiresIn: 15 * 60,
+      },
+      message: "Token refreshed successfully",
+    });
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        code: "INVALID_TOKEN",
+        message: "Invalid refresh token",
+      },
+      401
+    );
+  }
+});
+```
+
+---
+
+## 用户登出
+
+### 登出实现
+
+```typescript
+// POST /auth/logout - 用户登出
+auth.post("/logout", zValidator("json", refreshTokenSchema), async (c) => {
+  const { refreshToken } = c.req.valid("json");
+
+  // 从数据库删除 Refresh Token
+  await db
+    .delete(schema.refreshTokens)
+    .where(eq(schema.refreshTokens.token, refreshToken));
+
+  return c.json({
+    success: true,
+    message: "Logout successful",
+  });
+});
+
+// POST /auth/logout-all - 从所有设备登出
+auth.post("/logout-all", async (c) => {
+  const user = c.get("user");
+
+  if (!user) {
+    return c.json(
+      {
+        success: false,
+        message: "Not authenticated",
+      },
+      401
+    );
+  }
+
+  // 删除用户的所有 Refresh Token
+  await db
+    .delete(schema.refreshTokens)
+    .where(eq(schema.refreshTokens.userId, user.id));
+
+  return c.json({
+    success: true,
+    message: "Logged out from all devices",
+  });
+});
+```
+
+---
+
+## 认证中间件
+
+### JWT 验证中间件
+
+```typescript
+// src/middleware/auth.ts
+import { Context, Next } from "hono";
+import { verify } from "hono/jwt";
+import { HTTPException } from "hono/http-exception";
+import * as schema from "../db/schema";
+import { db } from "../db";
+import { AuthenticationException } from "../exceptions";
+
+// 认证中间件
+export const authMiddleware = async (c: Context, next: Next) => {
+  const authorization = c.req.header("Authorization");
+
+  if (!authorization) {
+    throw new AuthenticationException("Authorization header required");
+  }
+
+  // 检查格式
+  if (!authorization.startsWith("Bearer ")) {
+    throw new AuthenticationException("Invalid authorization format");
+  }
+
+  const token = authorization.replace("Bearer ", "");
+
+  try {
+    // 验证 token
+    const payload = await verify(token, process.env.JWT_SECRET!);
+
+    // 检查 token 类型
+    if (payload.type !== "access") {
+      throw new AuthenticationException("Invalid token type");
+    }
+
+    // 获取用户信息
+    const user = await db.query.users.findFirst({
+      where: eq(schema.users.id, payload.sub as string),
+    });
+
+    if (!user) {
+      throw new AuthenticationException("User not found");
+    }
+
+    if (!user.isActive) {
+      throw new AuthenticationException("Account has been disabled");
+    }
+
+    // 将用户信息存储到 context
+    c.set("user", user);
+
+    await next();
+  } catch (error) {
+    if (error instanceof AuthenticationException) {
+      throw error;
+    }
+
+    throw new AuthenticationException("Invalid or expired token");
+  }
+};
+
+// 可选的认证中间件（不强制要求登录）
+export const optionalAuthMiddleware = async (c: Context, next: Next) => {
+  const authorization = c.req.header("Authorization");
+
+  if (!authorization || !authorization.startsWith("Bearer ")) {
+    await next();
+    return;
+  }
+
+  const token = authorization.replace("Bearer ", "");
+
+  try {
+    const payload = await verify(token, process.env.JWT_SECRET!);
+
+    if (payload.type === "access") {
+      const user = await db.query.users.findFirst({
+        where: eq(schema.users.id, payload.sub as string),
+      });
+
+      if (user && user.isActive) {
+        c.set("user", user);
+      }
+    }
+  } catch (error) {
+    // 忽略错误，继续处理请求
+  }
+
+  await next();
+};
+```
+
+### 权限检查中间件
+
+```typescript
+// 角色检查中间件
+export const requireRole = (...roles: string[]) => {
+  return async (c: Context, next: Next) => {
+    const user = c.get("user");
+
+    if (!user) {
+      throw new AuthenticationException("Authentication required");
+    }
+
+    if (!roles.includes(user.role)) {
+      throw new AuthorizationException(
+        `Requires one of these roles: ${roles.join(", ")}`
+      );
+    }
+
+    await next();
+  };
+};
+
+// 资源所有权检查
+export const requireOwnership = (
+  getResourceOwnerId: (c: Context) => Promise<string>
+) => {
+  return async (c: Context, next: Next) => {
+    const user = c.get("user");
+
+    if (!user) {
+      throw new AuthenticationException("Authentication required");
+    }
+
+    const resourceOwnerId = await getResourceOwnerId(c);
+
+    // 管理员可以访问所有资源
+    if (user.role === "admin") {
+      await next();
+      return;
+    }
+
+    // 检查所有权
+    if (user.id !== resourceOwnerId) {
+      throw new AuthorizationException(
+        "You do not have permission to access this resource"
+      );
+    }
+
+    await next();
+  };
+};
+```
+
+---
+
+## 使用认证中间件
+
+### 保护路由
+
+```typescript
+import { Hono } from "hono";
+import { authMiddleware, requireRole } from "../middleware/auth";
+
+const app = new Hono();
+
+// 公开路由（无需认证）
+app.get("/", (c) => c.text("Public route"));
+
+// 受保护路由（需要认证）
+app.get("/api/profile", authMiddleware, (c) => {
+  const user = c.get("user");
+  return c.json({
+    success: true,
+    data: {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+    },
+  });
+});
+
+// 管理员路由
+app.get("/api/admin/dashboard", authMiddleware, requireRole("admin"), (c) => {
+  return c.json({
+    success: true,
+    data: {
+      userCount: 1234,
+      postCount: 5678,
+    },
+  });
+});
+
+// 资源所有权检查
+app.delete(
+  "/api/posts/:id",
+  authMiddleware,
+  async (c, next) => {
+    const user = c.get("user");
+    const post = await db.query.posts.findFirst({
+      where: eq(schema.posts.id, c.req.param("id")),
+    });
+
+    if (!post) {
+      return c.json(
+        {
+          success: false,
+          message: "Post not found",
+        },
+        404
+      );
+    }
+
+    // 检查所有权或管理员权限
+    if (post.authorId !== user.id && user.role !== "admin") {
+      throw new AuthorizationException("Forbidden");
+    }
+
+    await next();
+  },
+  async (c) => {
+    // 删除文章
+    await db.delete(schema.posts).where(eq(schema.posts.id, c.req.param("id")));
+
+    return c.json({
+      success: true,
+      message: "Post deleted",
+    });
+  }
+);
+
+export default app;
+```
+
+---
+
+## 完整的认证路由
+
+### 汇总所有认证功能
+
+```typescript
+// src/routes/auth.ts (完整版)
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { hash, compare } from "bcrypt";
+import { sign, verify } from "hono/jwt";
+import { eq } from "drizzle-orm";
+import { HTTPException } from "hono/http-exception";
+import * as schema from "../db/schema";
+import { db } from "../db";
+import {
+  registerSchema,
+  loginSchema,
+  refreshTokenSchema,
+} from "../validators/auth";
+import { authMiddleware, optionalAuthMiddleware } from "../middleware/auth";
+
+const auth = new Hono();
+
+// POST /auth/register - 注册
+auth.post("/register", zValidator("json", registerSchema), async (c) => {
+  const { email, username, password, name } = c.req.valid("json");
+
+  // 检查邮箱是否存在
+  const existingUser = await db.query.users.findFirst({
+    where: eq(schema.users.email, email),
+  });
+
+  if (existingUser) {
+    return c.json(
+      {
+        success: false,
+        code: "EMAIL_EXISTS",
+        message: "Email already registered",
+      },
+      409
+    );
+  }
+
+  // 检查用户名是否存在
+  const existingUsername = await db.query.users.findFirst({
+    where: eq(schema.users.username, username),
+  });
+
+  if (existingUsername) {
+    return c.json(
+      {
+        success: false,
+        code: "USERNAME_EXISTS",
+        message: "Username already taken",
+      },
+      409
+    );
+  }
+
+  // 哈希密码
+  const hashedPassword = await hash(password, 10);
+
+  // 创建用户
+  const [user] = await db
+    .insert(schema.users)
+    .values({
+      id: crypto.randomUUID(),
+      email,
+      username,
+      password: hashedPassword,
+      name,
+      role: "user",
+      isActive: true,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .returning();
+
+  const { password: _, ...userWithoutPassword } = user;
+
+  return c.json(
+    {
+      success: true,
+      data: userWithoutPassword,
+      message: "Registration successful",
+    },
+    201
+  );
+});
+
+// POST /auth/login - 登录
+auth.post("/login", zValidator("json", loginSchema), async (c) => {
+  const { email, password } = c.req.valid("json");
+
+  const user = await db.query.users.findFirst({
+    where: eq(schema.users.email, email),
+  });
+
+  if (!user) {
+    return c.json(
+      {
+        success: false,
+        code: "INVALID_CREDENTIALS",
+        message: "Invalid email or password",
+      },
+      401
+    );
+  }
+
+  const isValidPassword = await compare(password, user.password);
+
+  if (!isValidPassword) {
+    return c.json(
+      {
+        success: false,
+        code: "INVALID_CREDENTIALS",
+        message: "Invalid email or password",
+      },
+      401
+    );
+  }
+
+  if (!user.isActive) {
+    return c.json(
+      {
+        success: false,
+        code: "ACCOUNT_DISABLED",
+        message: "Account has been disabled",
+      },
+      403
+    );
+  }
+
+  // 生成 tokens
+  const accessToken = await sign(
+    {
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+      type: "access",
+      exp: Math.floor(Date.now() / 1000) + 60 * 15,
+    },
+    process.env.JWT_SECRET!
+  );
+
+  const refreshToken = await sign(
+    {
+      sub: user.id,
+      type: "refresh",
+      exp: Math.floor(Date.now() / 1000) + 60 * 60 * 24 * 7,
+    },
+    process.env.JWT_REFRESH_SECRET!
+  );
+
+  // 存储 refresh token
+  await db.insert(schema.refreshTokens).values({
+    id: crypto.randomUUID(),
+    token: refreshToken,
+    userId: user.id,
+    expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    createdAt: new Date(),
+  });
+
+  const { password: _, ...userWithoutPassword } = user;
+
+  return c.json({
+    success: true,
+    data: {
+      user: userWithoutPassword,
+      accessToken,
+      refreshToken,
+      expiresIn: 15 * 60,
+    },
+  });
+});
+
+// POST /auth/refresh - 刷新 token
+auth.post("/refresh", zValidator("json", refreshTokenSchema), async (c) => {
+  const { refreshToken } = c.req.valid("json");
+
+  try {
+    const payload = await verify(refreshToken, process.env.JWT_REFRESH_SECRET!);
+
+    if (payload.type !== "refresh") {
+      return c.json(
+        {
+          success: false,
+          code: "INVALID_TOKEN",
+          message: "Invalid token type",
+        },
+        401
+      );
+    }
+
+    const storedToken = await db.query.refreshTokens.findFirst({
+      where: eq(schema.refreshTokens.token, refreshToken),
+    });
+
+    if (!storedToken || storedToken.expiresAt < new Date()) {
+      return c.json(
+        {
+          success: false,
+          code: "TOKEN_EXPIRED",
+          message: "Refresh token has expired",
+        },
+        401
+      );
+    }
+
+    const user = await db.query.users.findFirst({
+      where: eq(schema.users.id, payload.sub as string),
+    });
+
+    if (!user || !user.isActive) {
+      return c.json(
+        {
+          success: false,
+          code: "USER_NOT_FOUND",
+          message: "User not found or account disabled",
+        },
+        401
+      );
+    }
+
+    const newAccessToken = await sign(
+      {
+        sub: user.id,
+        email: user.email,
+        role: user.role,
+        type: "access",
+        exp: Math.floor(Date.now() / 1000) + 60 * 15,
+      },
+      process.env.JWT_SECRET!
+    );
+
+    return c.json({
+      success: true,
+      data: {
+        accessToken: newAccessToken,
+        expiresIn: 15 * 60,
+      },
+    });
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        code: "INVALID_TOKEN",
+        message: "Invalid refresh token",
+      },
+      401
+    );
+  }
+});
+
+// POST /auth/logout - 登出
+auth.post("/logout", zValidator("json", refreshTokenSchema), async (c) => {
+  const { refreshToken } = c.req.valid("json");
+
+  await db
+    .delete(schema.refreshTokens)
+    .where(eq(schema.refreshTokens.token, refreshToken));
+
+  return c.json({
+    success: true,
+    message: "Logout successful",
+  });
+});
+
+// GET /auth/me - 获取当前用户信息
+auth.get("/me", authMiddleware, (c) => {
+  const user = c.get("user");
+
+  const { password: _, ...userWithoutPassword } = user;
+
+  return c.json({
+    success: true,
+    data: userWithoutPassword,
+  });
+});
+
+// PUT /auth/password - 修改密码
+auth.put(
+  "/password",
+  authMiddleware,
+  zValidator(
+    "json",
+    z.object({
+      currentPassword: z.string().min(1),
+      newPassword: z.string().min(8),
+    })
+  ),
+  async (c) => {
+    const user = c.get("user");
+    const { currentPassword, newPassword } = c.req.valid("json");
+
+    // 验证当前密码
+    const isValidPassword = await compare(currentPassword, user.password);
+
+    if (!isValidPassword) {
+      return c.json(
+        {
+          success: false,
+          message: "Current password is incorrect",
+        },
+        401
+      );
+    }
+
+    // 哈希新密码
+    const hashedPassword = await hash(newPassword, 10);
+
+    // 更新密码
+    await db
+      .update(schema.users)
+      .set({
+        password: hashedPassword,
+        updatedAt: new Date(),
+      })
+      .where(eq(schema.users.id, user.id));
+
+    return c.json({
+      success: true,
+      message: "Password updated successfully",
+    });
+  }
+);
+
+export default auth;
+```
+
+---
+
+## 最佳实践
+
+### 1. Token 安全
+
+```typescript
+// 使用强密钥
+const JWT_SECRET = process.env.JWT_SECRET!;
+if (JWT_SECRET.length < 32) {
+  throw new Error("JWT_SECRET must be at least 32 characters");
+}
+
+// 设置合理的过期时间
+const ACCESS_TOKEN_EXPIRY = "15m"; // 短期
+const REFRESH_TOKEN_EXPIRY = "7d"; // 长期
+
+// 使用 HTTPS（生产环境）
+if (process.env.NODE_ENV === "production") {
+  // 确保 Token 只通过 HTTPS 传输
+}
+```
+
+### 2. 密码策略
+
+```typescript
+// 强密码要求
+const passwordSchema = z
+  .string()
+  .min(8, "Password must be at least 8 characters")
+  .regex(/[A-Z]/, "Must contain at least one uppercase letter")
+  .regex(/[a-z]/, "Must contain at least one lowercase letter")
+  .regex(/\d/, "Must contain at least one number")
+  .regex(/[!@#$%^&*]/, "Must contain at least one special character");
+
+// 使用 bcrypt 哈希（ rounds >= 10）
+const hashedPassword = await hash(password, 10);
+
+// 禁止常见密码
+const commonPasswords = ["password123", "12345678", "qwerty123"];
+if (commonPasswords.includes(password.toLowerCase())) {
+  throw new Error("Password is too common");
+}
+```
+
+### 3. 速率限制
+
+```typescript
+import { rateLimiter } from "hono/rate-limiter";
+
+// 登录速率限制
+const loginLimiter = rateLimiter({
+  windowMs: 15 * 60 * 1000, // 15 分钟
+  max: 5, // 最多 5 次尝试
+  skipSuccessfulRequests: true,
+});
+
+auth.post(
+  "/login",
+  loginLimiter,
+  zValidator("json", loginSchema),
+  async (c) => {
+    // 登录逻辑
+  }
+);
+
+// 注册速率限制
+const registerLimiter = rateLimiter({
+  windowMs: 60 * 60 * 1000, // 1 小时
+  max: 3, // 最多 3 次注册
+});
+
+auth.post(
+  "/register",
+  registerLimiter,
+  zValidator("json", registerSchema),
+  async (c) => {
+    // 注册逻辑
+  }
+);
+```
+
+### 4. Token 轮换
+
+```typescript
+// 刷新 token 时生成新的 refresh token
+auth.post('/refresh',
+  zValidator('json', refreshTokenSchema),
+  async (c) => {
+    const { refreshToken } = c.req.valid('json')
+
+    // 验证旧 token
+    const payload = await verify(refreshToken, process.env.JWT_REFRESH_SECRET!)
+
+    // 删除旧 token
+    await db.delete(schema.refreshTokens)
+      .where(eq(schema.refreshTokens.token, refreshToken))
+
+    // 生成新的 access token 和 refresh token
+    const newAccessToken = await sign({...}, process.env.JWT_SECRET!)
+    const newRefreshToken = await sign({...}, process.env.JWT_REFRESH_SECRET!)
+
+    // 存储新的 refresh token
+    await db.insert(schema.refreshTokens).values({...})
+
+    return c.json({
+      success: true,
+      data: {
+        accessToken: newAccessToken,
+        refreshToken: newRefreshToken,
+      },
+    })
+  }
+)
+```
+
+---
+
+## 总结
+
+本文详细介绍了使用 JWT 实现用户认证系统的各个方面：
+
+**JWT 基础**：
+
+- ✅ JWT 的结构和原理
+- ✅ Access Token vs Refresh Token
+- ✅ JWT vs Session 的对比
+
+**核心功能**：
+
+- ✅ 用户注册（密码哈希、验证）
+- ✅ 用户登录（Token 生成）
+- ✅ Token 刷新机制
+- ✅ 用户登出
+
+**安全措施**：
+
+- ✅ 认证中间件
+- ✅ 权限控制（角色、所有权）
+- ✅ 速率限制
+- ✅ Token 安全最佳实践
+
+通过这些知识，你可以构建一个安全可靠的用户认证系统。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将学习 **「10. 文件上传处理」**，了解如何：
+
+- 📁 处理 multipart/form-data 请求
+- 🔍 验证文件类型和大小
+- ☁️ 存储到本地或云服务（R2、S3）
+- 🖼️ 图片处理和优化
+- 🔒 文件上传安全最佳实践
+
+继续学习更多实用功能！

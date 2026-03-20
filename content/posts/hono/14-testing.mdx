@@ -1,0 +1,639 @@
+---
+title: "14. 测试策略"
+date: "2026-03-20"
+summary: "构建可靠的测试体系，学习单元测试、集成测试、API 测试，以及使用 Vitest 和 Hono 的测试工具编写高质量测试。"
+tags: ["Hono", "Testing", "Vitest", "TDD", "Quality Assurance"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 14
+---
+
+## 前言
+
+测试是保证代码质量和应用稳定性的关键。良好的测试体系可以及早发现 bug、防止回归、简化重构，并提高开发效率。
+
+Hono 的测试体验非常出色，配合 Vitest 可以轻松编写各种类型的测试。
+
+本篇文章将带你：
+
+- 🧪 理解测试类型和策略
+- ✍️ 编写单元测试
+- 🔗 实现集成测试
+- 🌐 测试 RESTful API
+- 🎭 使用 Mock 和 Stub
+- 📊 实现测试覆盖率
+
+---
+
+## 测试基础
+
+### 测试类型
+
+**单元测试**：测试单个函数或组件
+
+```typescript
+// 测试工具函数
+test("sanitizeFilename removes dangerous characters", () => {
+  expect(sanitizeFilename("../../../etc/passwd")).toBe("______etc_passwd");
+});
+```
+
+**集成测试**：测试多个组件协作
+
+```typescript
+// 测试路由 + 中间件 + 数据库
+test("POST /users creates user and returns 201", async () => {
+  const response = await app.request("/users", {
+    method: "POST",
+    body: JSON.stringify({ name: "John", email: "john@example.com" }),
+  });
+
+  expect(response.status).toBe(201);
+});
+```
+
+**端到端测试**：测试完整用户流程
+
+```typescript
+// 测试用户注册、登录、访问受保护资源
+test("user can register, login, and access profile", async () => {
+  // 注册
+  await register("john@example.com", "password");
+  // 登录
+  const token = await login("john@example.com", "password");
+  // 访问受保护资源
+  const profile = await getProfile(token);
+  expect(profile).toBeDefined();
+});
+```
+
+---
+
+## 项目设置
+
+### 安装依赖
+
+```bash
+# Vitest
+npm install -D vitest
+
+# 测试工具
+npm install -D @vitest/ui
+
+# 覆盖率
+npm install -D @vitest/coverage-v8
+
+# Mock 工具
+npm install -D sinon
+```
+
+### 配置 Vitest
+
+```typescript
+// vitest.config.ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    globals: true,
+    environment: "node",
+    setupFiles: ["./tests/setup.ts"],
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "html", "lcov"],
+      exclude: ["node_modules/", "tests/", "**/*.test.ts", "**/*.config.ts"],
+    },
+  },
+});
+```
+
+### 测试设置文件
+
+```typescript
+// tests/setup.ts
+import { beforeEach } from "vitest";
+
+// 每个测试前重置数据库
+beforeEach(async () => {
+  await resetTestDatabase();
+});
+
+// 全局 Mock
+vi.mock("./lib/email", () => ({
+  sendEmail: vi.fn(),
+}));
+```
+
+---
+
+## 单元测试
+
+### 测试工具函数
+
+```typescript
+// src/utils/validation.ts
+export const validateEmail = (email: string): boolean => {
+  const regex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return regex.test(email);
+};
+
+export const generateSlug = (text: string): string => {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+};
+
+// tests/utils/validation.test.ts
+import { describe, it, expect } from "vitest";
+import { validateEmail, generateSlug } from "../../src/utils/validation";
+
+describe("validateEmail", () => {
+  it("should return true for valid emails", () => {
+    expect(validateEmail("test@example.com")).toBe(true);
+    expect(validateEmail("user+tag@domain.co.uk")).toBe(true);
+  });
+
+  it("should return false for invalid emails", () => {
+    expect(validateEmail("invalid")).toBe(false);
+    expect(validateEmail("@example.com")).toBe(false);
+    expect(validateEmail("test@")).toBe(false);
+  });
+});
+
+describe("generateSlug", () => {
+  it("should convert text to slug", () => {
+    expect(generateSlug("Hello World")).toBe("hello-world");
+    expect(generateSlug("Hello   World")).toBe("hello-world");
+    expect(generateSlug("Hello! World?")).toBe("hello-world");
+  });
+
+  it("should handle edge cases", () => {
+    expect(generateSlug("")).toBe("");
+    expect(generateSlug("---")).toBe("");
+    expect(generateSlug("你好")).toBe("");
+  });
+});
+```
+
+### 测试服务层
+
+```typescript
+// src/services/user.service.ts
+export class UserService {
+  constructor(private db: Database) {}
+
+  async findById(id: string) {
+    return this.db.query.users.findFirst({
+      where: eq(users.id, id),
+    });
+  }
+
+  async create(data: CreateUserDto) {
+    const [user] = await this.db
+      .insert(users)
+      .values({
+        id: crypto.randomUUID(),
+        ...data,
+        createdAt: new Date(),
+      })
+      .returning();
+
+    return user;
+  }
+}
+
+// tests/services/user.service.test.ts
+import { describe, it, expect, beforeEach } from "vitest";
+import { UserService } from "../../src/services/user.service";
+import { mockDatabase } from "../helpers";
+
+describe("UserService", () => {
+  let service: UserService;
+
+  beforeEach(() => {
+    service = new UserService(mockDatabase);
+  });
+
+  describe("findById", () => {
+    it("should return user when found", async () => {
+      const user = await service.findById("123");
+
+      expect(user).toEqual({
+        id: "123",
+        name: "John",
+        email: "john@example.com",
+      });
+    });
+
+    it("should return null when not found", async () => {
+      const user = await service.findById("999");
+
+      expect(user).toBeNull();
+    });
+  });
+
+  describe("create", () => {
+    it("should create user with generated ID", async () => {
+      const user = await service.create({
+        name: "Jane",
+        email: "jane@example.com",
+      });
+
+      expect(user.id).toBeDefined();
+      expect(user.name).toBe("Jane");
+      expect(user.email).toBe("jane@example.com");
+    });
+  });
+});
+```
+
+---
+
+## API 测试
+
+### 测试 CRUD 操作
+
+```typescript
+// tests/api/posts.test.ts
+import { describe, it, expect, beforeEach } from "vitest";
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+import * as schema from "../../src/db/schema";
+import { db } from "../../src/db";
+import { eq } from "drizzle-orm";
+
+describe("Posts API", () => {
+  const app = new Hono();
+
+  // 测试前清空表
+  beforeEach(async () => {
+    await db.delete(schema.posts);
+  });
+
+  // GET /posts - 获取列表
+  describe("GET /posts", () => {
+    it("should return empty array initially", async () => {
+      const response = await app.request("/posts");
+
+      expect(response.status).toBe(200);
+
+      const json = await response.json();
+
+      expect(json).toEqual({ success: true, data: [] });
+    });
+
+    it("should return list of posts", async () => {
+      // 创建测试数据
+      await db.insert(schema.posts).values([
+        { id: "1", title: "Post 1", content: "Content 1", authorId: "user1" },
+        { id: "2", title: "Post 2", content: "Content 2", authorId: "user1" },
+      ]);
+
+      const response = await app.request("/posts");
+      const json = await response.json();
+
+      expect(json.data).toHaveLength(2);
+      expect(json.data[0].title).toBe("Post 1");
+    });
+  });
+
+  // GET /posts/:id - 获取详情
+  describe("GET /posts/:id", () => {
+    it("should return post when found", async () => {
+      await db.insert(schema.posts).values({
+        id: "1",
+        title: "Test Post",
+        content: "Test Content",
+        authorId: "user1",
+      });
+
+      const response = await app.request("/posts/1");
+      const json = await response.json();
+
+      expect(response.status).toBe(200);
+      expect(json.data.title).toBe("Test Post");
+    });
+
+    it("should return 404 when not found", async () => {
+      const response = await app.request("/posts/999");
+
+      expect(response.status).toBe(404);
+
+      const json = await response.json();
+
+      expect(json.success).toBe(false);
+      expect(json.message).toBe("Post not found");
+    });
+  });
+
+  // POST /posts - 创建
+  describe("POST /posts", () => {
+    it("should create post with valid data", async () => {
+      const postData = {
+        title: "New Post",
+        content: "New Content",
+        authorId: "user1",
+      };
+
+      const response = await app.request("/posts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(postData),
+      });
+
+      expect(response.status).toBe(201);
+
+      const json = await response.json();
+
+      expect(json.data.title).toBe("New Post");
+
+      // 验证数据库
+      const posts = await db.select().from(schema.posts);
+      expect(posts).toHaveLength(1);
+    });
+
+    it("should return 400 with invalid data", async () => {
+      const response = await app.request("/posts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ title: "" }), // 缺少必填字段
+      });
+
+      expect(response.status).toBe(400);
+    });
+  });
+});
+```
+
+### 测试认证
+
+```typescript
+// tests/api/auth.test.ts
+import { describe, it, expect } from "vitest";
+import { sign } from "hono/jwt";
+import { authMiddleware } from "../../src/middleware/auth";
+
+describe("Auth Middleware", () => {
+  it("should allow access with valid token", async () => {
+    const token = await sign(
+      { sub: "user1", role: "user" },
+      process.env.JWT_SECRET!
+    );
+
+    const response = await app.request("/api/protected", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    expect(response.status).toBe(200);
+  });
+
+  it("should deny access without token", async () => {
+    const response = await app.request("/api/protected");
+
+    expect(response.status).toBe(401);
+  });
+
+  it("should deny access with invalid token", async () => {
+    const response = await app.request("/api/protected", {
+      headers: {
+        Authorization: "Bearer invalid-token",
+      },
+    });
+
+    expect(response.status).toBe(401);
+  });
+});
+```
+
+---
+
+## Mock 和 Stub
+
+### Mock 外部依赖
+
+```typescript
+// Mock 数据库查询
+vi.mock("../../src/db", () => ({
+  db: {
+    query: {
+      users: {
+        findFirst: vi.fn(),
+      },
+    },
+  },
+}));
+
+import { db } from "../../src/db";
+
+test("returns user from database", async () => {
+  const mockUser = { id: "1", name: "John" };
+
+  vi.mocked(db.query.users.findFirst).mockResolvedValue(mockUser);
+
+  const user = await getUserById("1");
+
+  expect(user).toEqual(mockUser);
+  expect(db.query.users.findFirst).toHaveBeenCalledWith({
+    where: eq(users.id, "1"),
+  });
+});
+```
+
+### Mock HTTP 请求
+
+```typescript
+import { fetch } from "undici";
+
+// Mock fetch
+global.fetch = vi.fn();
+
+test("calls external API", async () => {
+  const mockResponse = { data: "test" };
+
+  vi.mocked(fetch).mockResolvedValue({
+    ok: true,
+    json: async () => mockResponse,
+  } as Response);
+
+  const result = await fetchExternalData();
+
+  expect(result).toEqual(mockResponse);
+  expect(fetch).toHaveBeenCalledWith("https://api.example.com/data");
+});
+```
+
+---
+
+## 测试数据库
+
+### 使用内存数据库
+
+```typescript
+// tests/setup.ts
+import { drizzle } from "drizzle-orm/better-sqlite3";
+import Database from "better-sqlite3";
+import * as schema from "../src/db/schema";
+
+export const testDb = drizzle(new Database(":memory:"), { schema });
+
+beforeAll(async () => {
+  // 运行迁移
+  await runMigrations(testDb);
+});
+
+afterEach(async () => {
+  // 每个测试后清空数据
+  await resetDatabase(testDb);
+});
+
+afterAll(async () => {
+  await testDb.close();
+});
+```
+
+### 测试事务
+
+```typescript
+test("creates user and post in transaction", async () => {
+  await db.transaction(async (tx) => {
+    const [user] = await tx
+      .insert(users)
+      .values({
+        id: "1",
+        name: "John",
+        email: "john@example.com",
+      })
+      .returning();
+
+    await tx.insert(posts).values({
+      id: "p1",
+      title: "Test",
+      content: "Content",
+      authorId: user.id,
+    });
+
+    // 验证
+    const posts = await tx.query.posts.findMany();
+    expect(posts).toHaveLength(1);
+  });
+});
+```
+
+---
+
+## 测试覆盖率
+
+### 运行覆盖率测试
+
+```bash
+# 运行测试并生成覆盖率报告
+npm run test:coverage
+
+# 查看覆盖率报告
+open coverage/index.html
+```
+
+### 覆盖率配置
+
+```typescript
+// vitest.config.ts
+export default defineConfig({
+  test: {
+    coverage: {
+      thresholds: {
+        lines: 80,
+        functions: 80,
+        branches: 80,
+        statements: 80,
+      },
+    },
+  },
+});
+```
+
+---
+
+## 最佳实践
+
+### 1. 测试命名
+
+```typescript
+// ✅ 好的命名
+describe("UserService", () => {
+  it("should return user when found by ID");
+  it("should throw error when user not found");
+  it("should create user with generated ID");
+});
+
+// ❌ 不好的命名
+describe("UserService", () => {
+  it("test 1");
+  it("works");
+});
+```
+
+### 2. AAA 模式
+
+```typescript
+test("creates post", async () => {
+  // Arrange（准备）
+  const postData = { title: "Test", content: "Content" };
+
+  // Act（执行）
+  const response = await createPost(postData);
+
+  // Assert（断言）
+  expect(response.title).toBe("Test");
+  expect(response.id).toBeDefined();
+});
+```
+
+### 3. 独立性
+
+```typescript
+// 每个测试应该独立运行
+beforeEach(async () => {
+  // 重置状态
+  await resetDatabase();
+  await resetCache();
+});
+```
+
+---
+
+## 总结
+
+本文介绍了完整的测试策略：
+
+**测试类型**：
+
+- ✅ 单元测试
+- ✅ 集成测试
+- ✅ API 测试
+
+**测试工具**：
+
+- ✅ Vitest 配置
+- ✅ Mock 和 Stub
+- ✅ 数据库测试
+
+**最佳实践**：
+
+- ✅ 测试命名
+- ✅ AAA 模式
+- ✅ 独立性
+- ✅ 覆盖率目标
+
+通过良好的测试体系，你可以构建更可靠的应用。
+
+---
+
+## 下一步
+
+下一篇：Cloudflare Workers 部署

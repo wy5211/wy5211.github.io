@@ -1,0 +1,623 @@
+---
+title: "12. 安全与限流"
+date: "2026-03-20"
+summary: "构建安全的 API，学习速率限制、CORS 配置、安全头设置，以及防范 XSS、CSRF、SQL 注入等常见安全威胁。"
+tags: ["Hono", "Security", "Rate Limiting", "CORS", "OWASP"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 12
+---
+
+## 前言
+
+在构建 Web 应用时，安全性是不可忽视的重要方面。API 面临着各种安全威胁：DDoS 攻击、恶意请求、数据泄露、注入攻击等。一个疏忽可能导致严重的安全事故。
+
+Hono 提供了丰富的安全中间件和工具，帮助你轻松实现速率限制、CORS 配置、安全头设置等关键安全功能。
+
+本篇文章将带你：
+
+- 🚀 实现多种速率限制策略
+- 🌐 正确配置 CORS
+- 🛡️ 设置安全 HTTP 头
+- 🔒 防范 XSS、CSRF、SQL 注入等攻击
+- 💡 遵循 OWASP 安全最佳实践
+
+---
+
+## 速率限制
+
+### 为什么需要速率限制
+
+速率限制（Rate Limiting）可以防止：
+
+- DDoS 攻击
+- 暴力破解
+- API 滥用
+- 资源耗尽
+
+### 基础速率限制
+
+```typescript
+import { rateLimiter } from "hono/rate-limiter";
+
+// 全局限速：每 15 分钟最多 100 个请求
+app.use(
+  "*",
+  rateLimiter({
+    windowMs: 15 * 60 * 1000, // 15 分钟
+    max: 100, // 最多 100 个请求
+    standardHeaders: true,
+    legendHeaders: false,
+  })
+);
+
+// API 严格限速：每分钟 20 个请求
+app.use(
+  "/api/*",
+  rateLimiter({
+    windowMs: 60 * 1000, // 1 分钟
+    max: 20,
+    message: "Too many requests from this IP",
+  })
+);
+
+// 登录限速：防止暴力破解
+const loginLimiter = rateLimiter({
+  windowMs: 15 * 60 * 1000, // 15 分钟
+  max: 5, // 最多 5 次尝试
+  skipFailedRequests: false,
+});
+
+app.post("/auth/login", loginLimiter, async (c) => {
+  // 登录逻辑
+});
+```
+
+### 自定义速率限制器
+
+```typescript
+// 基于用户的速率限制
+import { redis } from "./redis";
+
+const createUserRateLimiter = (maxRequests: number, windowMs: number) => {
+  return async (c: Context, next: Next) => {
+    const user = c.get("user");
+
+    if (!user) {
+      return await next();
+    }
+
+    const key = `ratelimit:${user.id}`;
+    const current = await redis.incr(key);
+
+    if (current === 1) {
+      await redis.expire(key, Math.ceil(windowMs / 1000));
+    }
+
+    if (current > maxRequests) {
+      return c.json(
+        {
+          success: false,
+          message: "Rate limit exceeded",
+        },
+        429
+      );
+    }
+
+    await next();
+  };
+};
+
+// 使用
+app.use(
+  "/api/premium",
+  authMiddleware,
+  createUserRateLimiter(1000, 60 * 1000), // 付费用户更高限额
+  async (c) => {
+    // ...
+  }
+);
+```
+
+### 分级速率限制
+
+```typescript
+// 根据用户角色设置不同限制
+const createRoleBasedLimiter = () => {
+  return async (c: Context, next: Next) => {
+    const user = c.get("user");
+
+    let limits = { max: 100, windowMs: 15 * 60 * 1000 }; // 默认
+
+    if (user.role === "premium") {
+      limits = { max: 1000, windowMs: 15 * 60 * 1000 };
+    } else if (user.role === "admin") {
+      limits = { max: 10000, windowMs: 15 * 60 * 1000 };
+    }
+
+    // 应用限制逻辑...
+    await next();
+  };
+};
+```
+
+---
+
+## CORS 配置
+
+### 什么是 CORS
+
+CORS（跨源资源共享）是一种基于 HTTP 头的机制，允许服务器标示除了它自己以外的其他源（域、协议或端口）。
+
+### 基础 CORS 配置
+
+```typescript
+import { cors } from "hono/cors";
+
+// 允许所有来源（开发环境）
+app.use(
+  "*",
+  cors({
+    origin: "*",
+    credentials: true,
+  })
+);
+
+// 生产环境配置
+app.use(
+  "*",
+  cors({
+    origin: (origin) => {
+      const allowedOrigins = [
+        "https://example.com",
+        "https://www.example.com",
+        "https://app.example.com",
+      ];
+
+      // 允许列表中的来源
+      if (allowedOrigins.includes(origin)) {
+        return origin;
+      }
+
+      // 允许本地开发
+      if (origin?.startsWith("http://localhost:")) {
+        return origin;
+      }
+
+      return ""; // 不允许其他来源
+    },
+    credentials: true, // 允许携带 Cookie
+    maxAge: 86400, // 预检请求缓存 24 小时
+    allowMethods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    allowHeaders: ["Content-Type", "Authorization"],
+    exposeHeaders: ["Content-Length", "Content-Type"],
+  })
+);
+```
+
+### 针对路由的 CORS
+
+```typescript
+// API 路由允许跨域
+app.use(
+  "/api/*",
+  cors({
+    origin: "https://app.example.com",
+    credentials: true,
+  })
+);
+
+// 公开 API 允许所有来源
+app.use(
+  "/public/*",
+  cors({
+    origin: "*",
+    credentials: false,
+  })
+);
+```
+
+---
+
+## 安全头设置
+
+### Helmet 中间件
+
+```typescript
+import { helmet } from "hono/helmet";
+
+// 应用所有安全头
+app.use("*", helmet());
+
+// 自定义配置
+app.use(
+  "*",
+  helmet({
+    contentSecurityPolicy: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdn.example.com"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      imgSrc: ["'self'", "data:", "https:"],
+      connectSrc: ["'self'", "https://api.example.com"],
+      frameSrc: ["'none'"],
+      objectSrc: ["'none'"],
+      baseUri: ["'self'"],
+      formAction: ["'self'"],
+      frameAncestors: ["'none'"],
+    },
+    hsts: {
+      maxAge: 31536000,
+      includeSubDomains: true,
+      preload: true,
+    },
+    noSniff: true,
+    referrerPolicy: {
+      policy: "strict-origin-when-cross-origin",
+    },
+    xssFilter: true,
+  })
+);
+```
+
+### 手动设置安全头
+
+```typescript
+// 自定义安全头中间件
+app.use("*", async (c, next) => {
+  // 防止点击劫持
+  c.header("X-Frame-Options", "DENY");
+
+  // 防止 MIME 类型嗅探
+  c.header("X-Content-Type-Options", "nosniff");
+
+  // XSS 保护
+  c.header("X-XSS-Protection", "1; mode=block");
+
+  // 引用策略
+  c.header("Referrer-Policy", "strict-origin-when-cross-origin");
+
+  // 权限策略
+  c.header("Permissions-Policy", "geolocation=(), microphone=(), camera=()");
+
+  // HSTS
+  if (process.env.NODE_ENV === "production") {
+    c.header(
+      "Strict-Transport-Security",
+      "max-age=31536000; includeSubDomains; preload"
+    );
+  }
+
+  await next();
+});
+```
+
+---
+
+## 防范 XSS 攻击
+
+### 什么是 XSS
+
+跨站脚本攻击（XSS）允许攻击者在受害者的浏览器中执行恶意脚本。
+
+### 防御措施
+
+**1. 输入验证**
+
+```typescript
+import { z } from "zod";
+
+// 严格验证输入
+const commentSchema = z.object({
+  content: z
+    .string()
+    .max(1000)
+    .transform((val) =>
+      val
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "") // 移除 script 标签
+        .trim()
+    ),
+});
+```
+
+**2. 输出编码**
+
+```typescript
+// HTML 转义
+const escapeHtml = (unsafe: string): string => {
+  return unsafe
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+};
+
+// 使用
+app.get("/posts/:id", async (c) => {
+  const post = await getPost(c.req.param("id"));
+
+  // 渲染时转义
+  const safeContent = escapeHtml(post.content);
+
+  return c.html(`
+    <div>
+      <h1>${escapeHtml(post.title)}</h1>
+      <p>${safeContent}</p>
+    </div>
+  `);
+});
+```
+
+**3. Content-Security-Policy**
+
+```typescript
+app.use(
+  "*",
+  helmet({
+    contentSecurityPolicy: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"], // 禁止内联脚本
+      styleSrc: ["'self'", "'unsafe-inline'"],
+    },
+  })
+);
+```
+
+---
+
+## 防范 CSRF 攻击
+
+### 什么是 CSRF
+
+跨站请求伪造（CSRF）欺骗用户在已认证的状态下执行非预期操作。
+
+### 防御措施
+
+**1. CSRF Token**
+
+```typescript
+import { randomBytes } from "crypto";
+
+// 生成 CSRF Token
+const generateCsrfToken = (): string => {
+  return randomBytes(32).toString("hex");
+};
+
+// 存储 Token
+app.use("*", async (c, next) => {
+  const token = generateCsrfToken();
+
+  // 存储 Session
+  c.set("csrfToken", token);
+
+  // 设置 Cookie
+  setCookie(c, "csrf_token", token, {
+    httpOnly: true,
+    secure: true,
+    sameSite: "Strict",
+  });
+
+  await next();
+});
+
+// 验证 Token
+const validateCsrfToken = (c: Context): boolean => {
+  const headerToken = c.req.header("X-CSRF-Token");
+  const cookieToken = getCookie(c, "csrf_token");
+
+  return headerToken && headerToken === cookieToken;
+};
+
+// 在状态修改操作中验证
+app.post(
+  "/posts",
+  authMiddleware,
+  async (c, next) => {
+    if (!validateCsrfToken(c)) {
+      return c.json(
+        {
+          success: false,
+          message: "Invalid CSRF token",
+        },
+        403
+      );
+    }
+
+    await next();
+  },
+  async (c) => {
+    // 创建文章逻辑
+  }
+);
+
+// 获取 Token 供前端使用
+app.get("/api/csrf-token", (c) => {
+  return c.json({
+    token: c.get("csrfToken"),
+  });
+});
+```
+
+**2. SameSite Cookie**
+
+```typescript
+setCookie(c, "session", token, {
+  httpOnly: true,
+  secure: true,
+  sameSite: "Strict", // 或 'Lax'
+});
+```
+
+---
+
+## 防范 SQL 注入
+
+### 使用参数化查询
+
+```typescript
+// ❌ 危险：直接拼接 SQL
+const unsafeQuery = `SELECT * FROM users WHERE id = '${userId}'`;
+
+// ✅ 安全：使用参数化查询
+const safeQuery = db.select().from(users).where(eq(users.id, userId));
+
+// Drizzle ORM 自动参数化，防止 SQL 注入
+app.get("/users/:id", authMiddleware, async (c) => {
+  const userId = c.req.param("id");
+
+  // 完全安全
+  const user = await db.query.users.findFirst({
+    where: eq(users.id, userId),
+  });
+
+  return c.json({ success: true, data: user });
+});
+```
+
+---
+
+## 输入验证
+
+### Zod 验证
+
+```typescript
+import { z } from "zod";
+
+// 定义严格的验证规则
+const userSchema = z.object({
+  email: z.string().email(),
+  username: z
+    .string()
+    .min(3)
+    .max(20)
+    .regex(/^[a-zA-Z0-9_]+$/, "Only letters, numbers, and underscores"),
+  age: z.number().min(18).max(120).optional(),
+  website: z.string().url().optional(),
+});
+
+app.post("/users", zValidator("json", userSchema), async (c) => {
+  const data = c.req.valid("json"); // 已验证和类型化的数据
+  // 安全使用
+});
+```
+
+---
+
+## 请求体大小限制
+
+```typescript
+app.use("*", async (c, next) => {
+  const contentLength = c.req.header("content-length");
+  const maxSize = 10 * 1024 * 1024; // 10MB
+
+  if (contentLength && parseInt(contentLength) > maxSize) {
+    return c.json(
+      {
+        success: false,
+        message: "Request body too large",
+      },
+      413
+    );
+  }
+
+  await next();
+});
+```
+
+---
+
+## 安全最佳实践清单
+
+### ✅ 必做事项
+
+1. **使用 HTTPS**（生产环境）
+2. **验证所有输入**
+3. **参数化所有数据库查询**
+4. **设置安全 HTTP 头**
+5. **实施速率限制**
+6. **正确配置 CORS**
+7. **使用 CSRF Token**
+8. **敏感数据加密存储**
+9. **定期更新依赖**
+10. **记录安全事件**
+
+### 📋 安全检查清单
+
+```markdown
+## 认证和授权
+
+- [ ] 密码强度要求
+- [ ] 密码哈希（bcrypt）
+- [ ] JWT 密钥足够长
+- [ ] Token 过期时间合理
+- [ ] 多因素认证（敏感操作）
+
+## 数据保护
+
+- [ ] 敏感数据加密
+- [ ] SQL 参数化查询
+- [ ] XSS 防护
+- [ ] CSRF 防护
+- [ ] 文件上传验证
+
+## API 安全
+
+- [ ] 速率限制
+- [ ] CORS 正确配置
+- [ ] 安全头设置
+- [ ] 输入验证
+- [ ] 错误消息不泄露信息
+
+## 日志和监控
+
+- [ ] 记录失败登录
+- [ ] 记录可疑活动
+- [ ] 异常监控
+- [ ] 定期安全审计
+```
+
+---
+
+## 总结
+
+本文介绍了构建安全 API 的关键措施：
+
+**速率限制**：
+
+- ✅ 防止 DDoS 和暴力破解
+- ✅ 分级限制策略
+- ✅ 用户级别限制
+
+**CORS 配置**：
+
+- ✅ 正确配置允许的来源
+- ✅ 凭证处理
+- ✅ 预检请求缓存
+
+**安全头**：
+
+- ✅ Helmet 中间件
+- ✅ CSP、HSTS、X-Frame-Options
+
+**攻击防范**：
+
+- ✅ XSS 防护（输入验证、输出编码）
+- ✅ CSRF 防护（Token、SameSite）
+- ✅ SQL 注入防护（参数化查询）
+
+通过实施这些安全措施，你的 API 将更加安全可靠。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将学习 **「13. 边缘缓存策略」**，了解如何：
+
+- ⚡ 利用缓存提升性能
+- 🌐 配置 CDN 缓存
+- 💾 使用 Cloudflare KV 缓存
+- 🎯 实现智能缓存策略
+
+让我们的应用更快更高效！

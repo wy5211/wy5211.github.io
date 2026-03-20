@@ -1,0 +1,1309 @@
+---
+title: "08. CRUD 实战：博客文章 API"
+date: "2026-03-20"
+summary: "整合前面所学知识，构建一个完整的博客文章 API，包括 CRUD 操作、搜索过滤、分页、标签管理、评论系统等核心功能。"
+tags: ["Hono", "CRUD", "API", "Drizzle ORM", "实战"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 8
+---
+
+## 前言
+
+前面我们已经学习了路由、中间件、验证、错误处理和数据库操作。现在是时候将这些知识整合起来，构建一个完整的、生产级的博客文章 API 了。
+
+在本篇文章中，我们将从零开始构建一个功能完善的博客系统，包括文章的增删改查、搜索过滤、标签管理、评论系统、用户权限控制等。这将是一个综合性的实战项目，帮助你巩固前面所学的知识，并理解如何在实际项目中组织代码。
+
+本篇文章将带你：
+
+- 🏗️ 设计合理的 API 项目结构
+- 📝 实现完整的文章 CRUD 功能
+- 🔍 添加搜索、过滤和分页功能
+- 👤 实现用户认证和权限控制
+- 💬 构建评论系统
+- 🏷️ 管理标签和分类
+- 📊 添加统计分析功能
+
+---
+
+## 项目结构
+
+### 推荐的项目组织方式
+
+```
+project/
+├── src/
+│   ├── db/
+│   │   ├── schema.ts              # 数据库 Schema
+│   │   └── index.ts               # 数据库连接
+│   ├── middleware/
+│   │   ├── auth.ts                # 认证中间件
+│   │   ├── error.ts               # 错误处理
+│   │   └── validation.ts          # 验证错误处理
+│   ├── routes/
+│   │   ├── index.ts               # 路由聚合
+│   │   ├── posts.ts               # 文章路由
+│   │   ├── comments.ts            # 评论路由
+│   │   ├── tags.ts                # 标签路由
+│   │   └── categories.ts          # 分类路由
+│   ├── services/
+│   │   ├── post.service.ts        # 文章业务逻辑
+│   │   ├── comment.service.ts     # 评论业务逻辑
+│   │   └── cache.service.ts       # 缓存服务
+│   ├── validators/
+│   │   └── schemas.ts             # Zod 验证 Schema
+│   ├── types/
+│   │   └── index.ts               # TypeScript 类型定义
+│   └── index.ts                   # 应用入口
+├── tests/
+│   ├── posts.test.ts
+│   └── comments.test.ts
+├── drizzle.config.ts
+└── package.json
+```
+
+---
+
+## 数据库 Schema
+
+### 完整的 Schema 定义
+
+```typescript
+// src/db/schema.ts
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { sql, relations } from "drizzle-orm";
+
+// 用户表
+export const users = sqliteTable("users", {
+  id: text("id").primaryKey(),
+  email: text("email").notNull().unique(),
+  username: text("username").notNull().unique(),
+  password: text("password").notNull(),
+  name: text("name"),
+  bio: text("bio"),
+  avatar: text("avatar"),
+  role: text("role", { enum: ["user", "admin", "moderator"] })
+    .notNull()
+    .default("user"),
+  isActive: integer("is_active", { mode: "boolean" }).notNull().default(true),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+});
+
+// 分类表
+export const categories = sqliteTable("categories", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull(),
+  slug: text("slug").notNull().unique(),
+  description: text("description"),
+  parentId: text("parent_id").references(() => categories.id),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+});
+
+// 标签表
+export const tags = sqliteTable("tags", {
+  id: text("id").primaryKey(),
+  name: text("name").notNull().unique(),
+  slug: text("slug").notNull().unique(),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+});
+
+// 文章表
+export const posts = sqliteTable("posts", {
+  id: text("id").primaryKey(),
+  title: text("title").notNull(),
+  slug: text("slug").notNull().unique(),
+  content: text("content").notNull(),
+  excerpt: text("excerpt"),
+  coverImage: text("cover_image"),
+  published: integer("published", { mode: "boolean" }).notNull().default(false),
+  featured: integer("featured", { mode: "boolean" }).notNull().default(false),
+  authorId: text("author_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  categoryId: text("category_id").references(() => categories.id, {
+    onDelete: "set null",
+  }),
+  views: integer("views").notNull().default(0),
+  likes: integer("likes").notNull().default(0),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+  publishedAt: integer("published_at", { mode: "timestamp" }),
+});
+
+// 文章-标签关联表
+export const postTags = sqliteTable("post_tags", {
+  postId: text("post_id")
+    .notNull()
+    .references(() => posts.id, { onDelete: "cascade" }),
+  tagId: text("tag_id")
+    .notNull()
+    .references(() => tags.id, { onDelete: "cascade" }),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+});
+
+// 评论表
+export const comments = sqliteTable("comments", {
+  id: text("id").primaryKey(),
+  content: text("content").notNull(),
+  postId: text("post_id")
+    .notNull()
+    .references(() => posts.id, { onDelete: "cascade" }),
+  authorId: text("author_id")
+    .notNull()
+    .references(() => users.id, { onDelete: "cascade" }),
+  parentId: text("parent_id").references(() => comments.id),
+  approved: integer("approved", { mode: "boolean" }).notNull().default(false),
+  likes: integer("likes").notNull().default(0),
+  createdAt: integer("created_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+  updatedAt: integer("updated_at", { mode: "timestamp" })
+    .notNull()
+    .default(sql`CURRENT_TIMESTAMP`),
+});
+
+// 关系定义
+export const usersRelations = relations(users, ({ many }) => ({
+  posts: many(posts),
+  comments: many(comments),
+}));
+
+export const postsRelations = relations(posts, ({ one, many }) => ({
+  author: one(users, {
+    fields: [posts.authorId],
+    references: [users.id],
+  }),
+  category: one(categories, {
+    fields: [posts.categoryId],
+    references: [categories.id],
+  }),
+  comments: many(comments),
+  tags: many(postTags),
+}));
+
+export const commentsRelations = relations(comments, ({ one, many }) => ({
+  post: one(posts, {
+    fields: [comments.postId],
+    references: [posts.id],
+  }),
+  author: one(users, {
+    fields: [comments.authorId],
+    references: [users.id],
+  }),
+  parent: one(comments, {
+    fields: [comments.parentId],
+    references: [comments.id],
+  }),
+  replies: many(comments),
+}));
+
+export const tagsRelations = relations(tags, ({ many }) => ({
+  posts: many(postTags),
+}));
+
+export const categoriesRelations = relations(categories, ({ one, many }) => ({
+  parent: one(categories, {
+    fields: [categories.parentId],
+    references: [categories.id],
+  }),
+  children: many(categories),
+}));
+
+export const postTagsRelations = relations(postTags, ({ one }) => ({
+  post: one(posts, {
+    fields: [postTags.postId],
+    references: [posts.id],
+  }),
+  tag: one(tags, {
+    fields: [postTags.tagId],
+    references: [tags.id],
+  }),
+}));
+```
+
+---
+
+## 验证 Schema
+
+### Zod 验证定义
+
+```typescript
+// src/validators/schemas.ts
+import { z } from "zod";
+
+// 文章相关 Schema
+export const createPostSchema = z.object({
+  title: z.string().min(1, "标题不能为空").max(200, "标题最多200个字符"),
+  content: z.string().min(1, "内容不能为空").max(50000, "内容最多50000个字符"),
+  excerpt: z.string().max(500, "摘要最多500个字符").optional(),
+  coverImage: z.string().url("封面图片必须是有效的URL").optional(),
+  published: z.boolean().default(false),
+  featured: z.boolean().default(false),
+  categoryId: z.string().uuid("Invalid category ID").optional(),
+  tags: z
+    .array(z.string().uuid())
+    .min(1, "至少需要一个标签")
+    .max(5, "最多5个标签")
+    .optional(),
+});
+
+export const updatePostSchema = createPostSchema.partial();
+
+export const postQuerySchema = z.object({
+  page: z.string().transform(Number).default("1"),
+  limit: z.string().transform(Number).default("10"),
+  keyword: z.string().optional(),
+  categoryId: z.string().uuid().optional(),
+  tagId: z.string().uuid().optional(),
+  authorId: z.string().uuid().optional(),
+  published: z.enum(["true", "false", "all"]).default("all"),
+  featured: z.enum(["true", "false"]).optional(),
+  sortBy: z
+    .enum(["createdAt", "updatedAt", "views", "likes"])
+    .default("createdAt"),
+  sortOrder: z.enum(["asc", "desc"]).default("desc"),
+});
+
+// 评论相关 Schema
+export const createCommentSchema = z.object({
+  content: z
+    .string()
+    .min(1, "评论内容不能为空")
+    .max(1000, "评论最多1000个字符"),
+  parentId: z.string().uuid().optional(),
+});
+
+// 标签相关 Schema
+export const createTagSchema = z.object({
+  name: z.string().min(1, "标签名不能为空").max(50, "标签名最多50个字符"),
+  slug: z
+    .string()
+    .min(1, "Slug不能为空")
+    .max(50, "Slug最多50个字符")
+    .regex(/^[a-z0-9-]+$/, "Slug只能包含小写字母、数字和连字符"),
+});
+
+// 分类相关 Schema
+export const createCategorySchema = z.object({
+  name: z.string().min(1, "分类名不能为空").max(100, "分类名最多100个字符"),
+  slug: z
+    .string()
+    .min(1, "Slug不能为空")
+    .max(100, "Slug最多100个字符")
+    .regex(/^[a-z0-9-]+$/, "Slug只能包含小写字母、数字和连字符"),
+  description: z.string().max(500, "描述最多500个字符").optional(),
+  parentId: z.string().uuid().optional(),
+});
+```
+
+---
+
+## 文章 CRUD
+
+### 完整的文章路由
+
+```typescript
+// src/routes/posts.ts
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { eq, and, like, sql, desc, asc, or } from "drizzle-orm";
+import { HTTPException } from "hono/http-exception";
+import * as schema from "../db/schema";
+import { db } from "../db";
+import {
+  createPostSchema,
+  updatePostSchema,
+  postQuerySchema,
+} from "../validators/schemas";
+import { authMiddleware } from "../middleware/auth";
+import { generateSlug } from "../utils/slug";
+
+const posts = new Hono();
+
+// 辅助函数：生成唯一 slug
+const ensureUniqueSlug = async (slug: string, excludeId?: string) => {
+  let finalSlug = slug;
+  let counter = 1;
+
+  while (true) {
+    const existing = await db.query.posts.findFirst({
+      where: and(
+        eq(schema.posts.slug, finalSlug),
+        excludeId ? sql`${schema.posts.id} != ${excludeId}` : undefined
+      ),
+    });
+
+    if (!existing) break;
+
+    finalSlug = `${slug}-${counter}`;
+    counter++;
+  }
+
+  return finalSlug;
+};
+
+// GET /posts - 获取文章列表
+posts.get("/", zValidator("query", postQuerySchema), async (c) => {
+  const {
+    page,
+    limit,
+    keyword,
+    categoryId,
+    tagId,
+    authorId,
+    published,
+    featured,
+    sortBy,
+    sortOrder,
+  } = c.req.valid("query");
+
+  const conditions: any[] = [];
+
+  // 关键词搜索
+  if (keyword) {
+    conditions.push(
+      or(
+        like(schema.posts.title, `%${keyword}%`),
+        like(schema.posts.content, `%${keyword}%`),
+        like(schema.posts.excerpt, `%${keyword}%`)
+      )
+    );
+  }
+
+  // 分类过滤
+  if (categoryId) {
+    conditions.push(eq(schema.posts.categoryId, categoryId));
+  }
+
+  // 标签过滤
+  if (tagId) {
+    const postIds = await db
+      .select({
+        postId: schema.postTags.postId,
+      })
+      .from(schema.postTags)
+      .where(eq(schema.postTags.tagId, tagId));
+
+    conditions.push(
+      sql`${schema.posts.id} IN ${sql.raw(`('${postIds.map((p) => p.postId).join("','")}')`)}`
+    );
+  }
+
+  // 作者过滤
+  if (authorId) {
+    conditions.push(eq(schema.posts.authorId, authorId));
+  }
+
+  // 发布状态过滤
+  if (published !== "all") {
+    conditions.push(eq(schema.posts.published, published === "true"));
+  }
+
+  // 精选文章过滤
+  if (featured !== undefined) {
+    conditions.push(eq(schema.posts.featured, featured === "true"));
+  }
+
+  const where = conditions.length > 0 ? and(...conditions) : undefined;
+
+  // 查询文章和总数
+  const [postsList, totalCount] = await Promise.all([
+    db.query.posts.findMany({
+      where,
+      limit,
+      offset: (page - 1) * limit,
+      orderBy:
+        sortOrder === "asc"
+          ? asc(schema.posts[sortBy])
+          : desc(schema.posts[sortBy]),
+      with: {
+        author: {
+          columns: {
+            id: true,
+            name: true,
+            username: true,
+            avatar: true,
+          },
+        },
+        category: true,
+        tags: {
+          with: {
+            tag: true,
+          },
+        },
+      },
+    }),
+    db
+      .select({ count: sql<number>`count(*)` })
+      .from(schema.posts)
+      .where(where),
+  ]);
+
+  // 格式化标签
+  const formattedPosts = postsList.map((post) => ({
+    ...post,
+    tags: post.tags.map((pt) => pt.tag),
+  }));
+
+  return c.json({
+    success: true,
+    data: formattedPosts,
+    meta: {
+      page,
+      limit,
+      total: totalCount[0].count,
+      totalPages: Math.ceil(totalCount[0].count / limit),
+    },
+  });
+});
+
+// GET /posts/:id - 获取文章详情
+posts.get("/:id", async (c) => {
+  const { id } = c.req.param();
+
+  const post = await db.query.posts.findFirst({
+    where: eq(schema.posts.id, id),
+    with: {
+      author: {
+        columns: {
+          id: true,
+          name: true,
+          username: true,
+          bio: true,
+          avatar: true,
+        },
+      },
+      category: true,
+      tags: {
+        with: {
+          tag: true,
+        },
+      },
+    },
+  });
+
+  if (!post) {
+    throw new HTTPException(404, { message: "Post not found" });
+  }
+
+  // 增加浏览量
+  await db
+    .update(schema.posts)
+    .set({ views: sql`${schema.posts.views} + 1` })
+    .where(eq(schema.posts.id, id));
+
+  // 格式化标签
+  const formattedPost = {
+    ...post,
+    tags: post.tags.map((pt) => pt.tag),
+  };
+
+  return c.json({
+    success: true,
+    data: formattedPost,
+  });
+});
+
+// GET /posts/slug/:slug - 通过 slug 获取文章
+posts.get("/slug/:slug", async (c) => {
+  const { slug } = c.req.param();
+
+  const post = await db.query.posts.findFirst({
+    where: eq(schema.posts.slug, slug),
+    with: {
+      author: {
+        columns: {
+          id: true,
+          name: true,
+          username: true,
+          avatar: true,
+        },
+      },
+      category: true,
+      tags: {
+        with: {
+          tag: true,
+        },
+      },
+    },
+  });
+
+  if (!post) {
+    throw new HTTPException(404, { message: "Post not found" });
+  }
+
+  return c.json({
+    success: true,
+    data: post,
+  });
+});
+
+// POST /posts - 创建文章
+posts.post(
+  "/",
+  authMiddleware,
+  zValidator("json", createPostSchema),
+  async (c) => {
+    const data = c.req.valid("json");
+    const user = c.get("user");
+
+    // 生成 slug
+    const slug = await ensureUniqueSlug(generateSlug(data.title));
+
+    // 创建文章
+    const [post] = await db
+      .insert(schema.posts)
+      .values({
+        id: crypto.randomUUID(),
+        title: data.title,
+        slug,
+        content: data.content,
+        excerpt: data.excerpt,
+        coverImage: data.coverImage,
+        published: data.published,
+        featured: data.featured,
+        authorId: user.id,
+        categoryId: data.categoryId,
+        publishedAt: data.published ? new Date() : null,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning();
+
+    // 关联标签
+    if (data.tags && data.tags.length > 0) {
+      await db.insert(schema.postTags).values(
+        data.tags.map((tagId) => ({
+          postId: post.id,
+          tagId,
+          createdAt: new Date(),
+        }))
+      );
+    }
+
+    return c.json(
+      {
+        success: true,
+        data: post,
+        message: "Post created successfully",
+      },
+      201
+    );
+  }
+);
+
+// PATCH /posts/:id - 更新文章
+posts.patch(
+  "/:id",
+  authMiddleware,
+  zValidator("json", updatePostSchema),
+  async (c) => {
+    const { id } = c.req.param();
+    const data = c.req.valid("json");
+    const user = c.get("user");
+
+    // 检查文章是否存在
+    const post = await db.query.posts.findFirst({
+      where: eq(schema.posts.id, id),
+    });
+
+    if (!post) {
+      throw new HTTPException(404, { message: "Post not found" });
+    }
+
+    // 检查权限
+    if (post.authorId !== user.id && user.role !== "admin") {
+      throw new HTTPException(403, { message: "Forbidden" });
+    }
+
+    // 如果标题改变，更新 slug
+    let slug = post.slug;
+    if (data.title && data.title !== post.title) {
+      slug = await ensureUniqueSlug(generateSlug(data.title), id);
+    }
+
+    // 更新文章
+    const [updated] = await db
+      .update(schema.posts)
+      .set({
+        ...data,
+        slug,
+        updatedAt: new Date(),
+        publishedAt:
+          data.published && !post.published ? new Date() : post.publishedAt,
+      })
+      .where(eq(schema.posts.id, id))
+      .returning();
+
+    // 更新标签
+    if (data.tags !== undefined) {
+      // 删除旧标签
+      await db.delete(schema.postTags).where(eq(schema.postTags.postId, id));
+
+      // 添加新标签
+      if (data.tags.length > 0) {
+        await db.insert(schema.postTags).values(
+          data.tags.map((tagId) => ({
+            postId: id,
+            tagId,
+            createdAt: new Date(),
+          }))
+        );
+      }
+    }
+
+    return c.json({
+      success: true,
+      data: updated,
+      message: "Post updated successfully",
+    });
+  }
+);
+
+// DELETE /posts/:id - 删除文章
+posts.delete("/:id", authMiddleware, async (c) => {
+  const { id } = c.req.param();
+  const user = c.get("user");
+
+  const post = await db.query.posts.findFirst({
+    where: eq(schema.posts.id, id),
+  });
+
+  if (!post) {
+    throw new HTTPException(404, { message: "Post not found" });
+  }
+
+  if (post.authorId !== user.id && user.role !== "admin") {
+    throw new HTTPException(403, { message: "Forbidden" });
+  }
+
+  await db.delete(schema.posts).where(eq(schema.posts.id, id));
+
+  return c.json({
+    success: true,
+    message: "Post deleted successfully",
+  });
+});
+
+// POST /posts/:id/like - 点赞文章
+posts.post("/:id/like", async (c) => {
+  const { id } = c.req.param();
+
+  await db
+    .update(schema.posts)
+    .set({ likes: sql`${schema.posts.likes} + 1` })
+    .where(eq(schema.posts.id, id));
+
+  return c.json({
+    success: true,
+    message: "Post liked",
+  });
+});
+
+export default posts;
+```
+
+---
+
+## 评论系统
+
+### 评论路由实现
+
+```typescript
+// src/routes/comments.ts
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { eq, and, desc } from "drizzle-orm";
+import { HTTPException } from "hono/http-exception";
+import * as schema from "../db/schema";
+import { db } from "../db";
+import { createCommentSchema } from "../validators/schemas";
+import { authMiddleware } from "../middleware/auth";
+
+const comments = new Hono();
+
+// GET /comments - 获取评论列表
+comments.get("/", async (c) => {
+  const postId = c.req.query("postId");
+  const page = parseInt(c.req.query("page") || "1");
+  const limit = parseInt(c.req.query("limit") || "10");
+
+  if (!postId) {
+    return c.json(
+      {
+        success: false,
+        message: "Post ID is required",
+      },
+      400
+    );
+  }
+
+  const comments = await db.query.comments.findMany({
+    where: and(
+      eq(schema.comments.postId, postId),
+      eq(schema.comments.approved, true)
+    ),
+    with: {
+      author: {
+        columns: {
+          id: true,
+          name: true,
+          username: true,
+          avatar: true,
+        },
+      },
+      replies: {
+        with: {
+          author: {
+            columns: {
+              id: true,
+              name: true,
+              username: true,
+              avatar: true,
+            },
+          },
+        },
+      },
+    },
+    orderBy: [desc(schema.comments.createdAt)],
+    limit,
+    offset: (page - 1) * limit,
+  });
+
+  // 只返回顶级评论（没有 parentId 的）
+  const topLevelComments = comments.filter((c) => !c.parentId);
+
+  return c.json({
+    success: true,
+    data: topLevelComments,
+    meta: { page, limit },
+  });
+});
+
+// GET /comments/:id - 获取评论详情
+comments.get("/:id", async (c) => {
+  const { id } = c.req.param();
+
+  const comment = await db.query.comments.findFirst({
+    where: eq(schema.comments.id, id),
+    with: {
+      post: {
+        columns: {
+          id: true,
+          title: true,
+          slug: true,
+        },
+      },
+      author: {
+        columns: {
+          id: true,
+          name: true,
+          username: true,
+          avatar: true,
+        },
+      },
+      parent: {
+        with: {
+          author: {
+            columns: {
+              id: true,
+              name: true,
+              username: true,
+            },
+          },
+        },
+      },
+      replies: {
+        with: {
+          author: {
+            columns: {
+              id: true,
+              name: true,
+              username: true,
+              avatar: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!comment) {
+    throw new HTTPException(404, { message: "Comment not found" });
+  }
+
+  return c.json({
+    success: true,
+    data: comment,
+  });
+});
+
+// POST /comments - 创建评论
+comments.post(
+  "/",
+  authMiddleware,
+  zValidator("json", createCommentSchema),
+  async (c) => {
+    const { content, postId, parentId } = await c.req.json();
+    const user = c.get("user");
+
+    // 检查文章是否存在
+    const post = await db.query.posts.findFirst({
+      where: eq(schema.posts.id, postId),
+    });
+
+    if (!post) {
+      throw new HTTPException(404, { message: "Post not found" });
+    }
+
+    // 如果是回复评论，检查评论是否存在
+    if (parentId) {
+      const parentComment = await db.query.comments.findFirst({
+        where: eq(schema.comments.id, parentId),
+      });
+
+      if (!parentComment) {
+        throw new HTTPException(404, { message: "Parent comment not found" });
+      }
+    }
+
+    // 创建评论
+    const [comment] = await db
+      .insert(schema.comments)
+      .values({
+        id: crypto.randomUUID(),
+        content,
+        postId,
+        authorId: user.id,
+        parentId,
+        approved: user.role === "admin" || user.role === "moderator",
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      })
+      .returning();
+
+    return c.json(
+      {
+        success: true,
+        data: comment,
+        message: "Comment created successfully",
+      },
+      201
+    );
+  }
+);
+
+// PATCH /comments/:id - 更新评论
+comments.patch("/:id", authMiddleware, async (c) => {
+  const { id } = c.req.param();
+  const { content } = await c.req.json();
+  const user = c.get("user");
+
+  const comment = await db.query.comments.findFirst({
+    where: eq(schema.comments.id, id),
+  });
+
+  if (!comment) {
+    throw new HTTPException(404, { message: "Comment not found" });
+  }
+
+  // 检查权限
+  if (comment.authorId !== user.id && user.role !== "admin") {
+    throw new HTTPException(403, { message: "Forbidden" });
+  }
+
+  const [updated] = await db
+    .update(schema.comments)
+    .set({
+      content,
+      updatedAt: new Date(),
+    })
+    .where(eq(schema.comments.id, id))
+    .returning();
+
+  return c.json({
+    success: true,
+    data: updated,
+    message: "Comment updated successfully",
+  });
+});
+
+// DELETE /comments/:id - 删除评论
+comments.delete("/:id", authMiddleware, async (c) => {
+  const { id } = c.req.param();
+  const user = c.get("user");
+
+  const comment = await db.query.comments.findFirst({
+    where: eq(schema.comments.id, id),
+  });
+
+  if (!comment) {
+    throw new HTTPException(404, { message: "Comment not found" });
+  }
+
+  if (comment.authorId !== user.id && user.role !== "admin") {
+    throw new HTTPException(403, { message: "Forbidden" });
+  }
+
+  await db.delete(schema.comments).where(eq(schema.comments.id, id));
+
+  return c.json({
+    success: true,
+    message: "Comment deleted successfully",
+  });
+});
+
+// POST /comments/:id/approve - 审批评论
+comments.post("/:id/approve", authMiddleware, async (c) => {
+  const { id } = c.req.param();
+  const user = c.get("user");
+
+  if (user.role !== "admin" && user.role !== "moderator") {
+    throw new HTTPException(403, { message: "Forbidden" });
+  }
+
+  const [comment] = await db
+    .update(schema.comments)
+    .set({ approved: true })
+    .where(eq(schema.comments.id, id))
+    .returning();
+
+  return c.json({
+    success: true,
+    data: comment,
+    message: "Comment approved",
+  });
+});
+
+export default comments;
+```
+
+---
+
+## 统计分析
+
+### 统计路由实现
+
+```typescript
+// src/routes/stats.ts
+import { Hono } from "hono";
+import { eq, and, sql, desc } from "drizzle-orm";
+import * as schema from "../db/schema";
+import { db } from "../db";
+
+const stats = new Hono();
+
+// GET /stats/overview - 获取概览统计
+stats.get("/overview", async (c) => {
+  const [totalPosts, publishedPosts, totalComments, totalUsers] =
+    await Promise.all([
+      db
+        .select({ count: sql<number>`count(*)` })
+        .from(schema.posts)
+        .then((r) => r[0].count),
+      db
+        .select({ count: sql<number>`count(*)` })
+        .from(schema.posts)
+        .where(eq(schema.posts.published, true))
+        .then((r) => r[0].count),
+      db
+        .select({ count: sql<number>`count(*)` })
+        .from(schema.comments)
+        .where(eq(schema.comments.approved, true))
+        .then((r) => r[0].count),
+      db
+        .select({ count: sql<number>`count(*)` })
+        .from(schema.users)
+        .then((r) => r[0].count),
+    ]);
+
+  return c.json({
+    success: true,
+    data: {
+      totalPosts,
+      publishedPosts,
+      draftPosts: totalPosts - publishedPosts,
+      totalComments,
+      totalUsers,
+    },
+  });
+});
+
+// GET /stats/popular-posts - 热门文章
+stats.get("/popular-posts", async (c) => {
+  const limit = parseInt(c.req.query("limit") || "10");
+
+  const posts = await db.query.posts.findMany({
+    where: eq(schema.posts.published, true),
+    orderBy: [desc(schema.posts.views)],
+    limit,
+    with: {
+      author: {
+        columns: {
+          id: true,
+          name: true,
+          username: true,
+        },
+      },
+    },
+  });
+
+  return c.json({
+    success: true,
+    data: posts,
+  });
+});
+
+// GET /stats/recent-activity - 最近活动
+stats.get("/recent-activity", async (c) => {
+  const limit = parseInt(c.req.query("limit") || "20");
+
+  const recentPosts = await db.query.posts.findMany({
+    orderBy: [desc(schema.posts.createdAt)],
+    limit: limit / 2,
+    with: {
+      author: {
+        columns: {
+          id: true,
+          name: true,
+          username: true,
+        },
+      },
+    },
+  });
+
+  const recentComments = await db.query.comments.findMany({
+    orderBy: [desc(schema.comments.createdAt)],
+    limit: limit / 2,
+    with: {
+      author: {
+        columns: {
+          id: true,
+          name: true,
+          username: true,
+        },
+      },
+      post: {
+        columns: {
+          id: true,
+          title: true,
+          slug: true,
+        },
+      },
+    },
+  });
+
+  return c.json({
+    success: true,
+    data: {
+      recentPosts,
+      recentComments,
+    },
+  });
+});
+
+export default stats;
+```
+
+---
+
+## 应用集成
+
+### 主应用文件
+
+```typescript
+// src/index.ts
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { logger } from "hono/logger";
+import { prettyJSON } from "hono/pretty-json";
+import { compress } from "hono/compress";
+import posts from "./routes/posts";
+import comments from "./routes/comments";
+import stats from "./routes/stats";
+
+const app = new Hono();
+
+// 中间件
+app.use("*", cors());
+app.use("*", logger());
+app.use("*", prettyJSON());
+app.use("*", compress());
+
+// 健康检查
+app.get("/", (c) => {
+  return c.json({
+    name: "Blog API",
+    version: "1.0.0",
+    status: "healthy",
+  });
+});
+
+app.get("/health", (c) => {
+  return c.json({ status: "ok" });
+});
+
+// 路由
+app.route("/api/posts", posts);
+app.route("/api/comments", comments);
+app.route("/api/stats", stats);
+
+export default app;
+```
+
+---
+
+## 最佳实践
+
+### 1. 服务层分离
+
+```typescript
+// src/services/post.service.ts
+export class PostService {
+  constructor(private db: Database) {}
+
+  async findAll(options: FindManyOptions) {
+    // 业务逻辑
+  }
+
+  async findById(id: string) {
+    // 业务逻辑
+  }
+
+  async create(data: CreatePostDto, authorId: string) {
+    // 业务逻辑
+  }
+
+  async update(id: string, data: UpdatePostDto) {
+    // 业务逻辑
+  }
+
+  async delete(id: string) {
+    // 业务逻辑
+  }
+}
+
+// 在路由中使用
+const postService = new PostService(db);
+
+app.get("/posts", async (c) => {
+  const posts = await postService.findAll(/* options */);
+  return c.json({ success: true, data: posts });
+});
+```
+
+### 2. 缓存策略
+
+```typescript
+// 使用 Redis 或 KV 缓存热门文章
+app.get("/posts/popular", async (c) => {
+  const cache = c.env.CACHE;
+
+  // 尝试从缓存获取
+  const cached = await cache.get("popular_posts");
+  if (cached) {
+    return c.json(JSON.parse(cached));
+  }
+
+  // 缓存未命中，查询数据库
+  const posts = await getPopularPosts();
+
+  // 写入缓存（TTL 10 分钟）
+  await cache.put("popular_posts", JSON.stringify(posts), {
+    expirationTtl: 600,
+  });
+
+  return c.json({ success: true, data: posts });
+});
+```
+
+### 3. 性能优化
+
+```typescript
+// 使用 select 减少数据传输
+app.get("/posts", async (c) => {
+  const posts = await db
+    .select({
+      id: schema.posts.id,
+      title: schema.posts.title,
+      excerpt: schema.posts.excerpt,
+      createdAt: schema.posts.createdAt,
+    })
+    .from(schema.posts);
+
+  return c.json({ success: true, data: posts });
+});
+
+// 使用数据库索引
+// 在 schema.ts 中定义
+export const posts = sqliteTable(
+  "posts",
+  {
+    // ...
+  },
+  (table) => ({
+    authorIdIdx: index("author_id_idx").on(table.authorId),
+    publishedIdx: index("published_idx").on(table.published),
+    createdAtIdx: index("created_at_idx").on(table.createdAt),
+  })
+);
+```
+
+---
+
+## 总结
+
+本文通过构建一个完整的博客文章 API，综合运用了前面学到的所有知识：
+
+**项目结构**：
+
+- ✅ 合理的目录组织
+- ✅ 服务层分离
+- ✅ 模块化路由
+
+**核心功能**：
+
+- ✅ 文章 CRUD（创建、读取、更新、删除）
+- ✅ 评论系统（支持嵌套回复）
+- ✅ 标签和分类管理
+- ✅ 搜索、过滤和分页
+- ✅ 用户权限控制
+
+**高级特性**：
+
+- ✅ 统计分析功能
+- ✅ 缓存策略
+- ✅ 性能优化
+
+通过这个实战项目，你应该能够独立构建功能完善的 RESTful API 了。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将学习 **「09. JWT 认证实现」**，深入了解：
+
+- 🔐 JWT 的原理和结构
+- 🎫 Access Token 和 Refresh Token
+- 👤 用户注册、登录、登出流程
+- 🔄 Token 刷新机制
+- 🛡️ 保护路由和权限控制
+
+让我们的 API 更加安全可靠！

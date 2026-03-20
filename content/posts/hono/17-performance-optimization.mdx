@@ -1,0 +1,436 @@
+---
+title: "17. 性能优化"
+date: "2026-03-20"
+summary: "提升应用性能，学习性能分析、优化数据库查询、实现缓存策略、使用流式响应，以及边缘环境最佳实践。"
+tags: ["Hono", "Performance", "Optimization", "Caching", "Best Practices"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+pins: "Hono 渐进式学习"
+seriesOrder: 17
+---
+
+## 前言
+
+在边缘计算时代，性能优化变得尤为重要。用户期望毫秒级的响应时间，而边缘环境资源有限，需要精心优化才能获得最佳性能。
+
+Hono 本身已经非常轻量和快速，但通过一些优化技巧，可以让你的应用性能更上一层楼。
+
+本篇文章将带你：
+
+- 📊 性能分析和基准测试
+- 🗄️ 优化数据库查询
+- ⚡ 实现高效缓存
+- 🌊 使用流式响应
+- 🧠 减少内存占用
+- 🚀 边缘环境优化技巧
+
+---
+
+## 性能分析
+
+### 基准测试
+
+```typescript
+// tests/bench.ts
+import { bench, describe } from "vitest";
+
+describe("Response Performance", () => {
+  bench("JSON response", async () => {
+    const app = new Hono();
+    app.get("/", (c) => c.json({ message: "Hello" }));
+
+    await app.request("/");
+  });
+
+  bench("Text response", async () => {
+    const app = new Hono();
+    app.get("/", (c) => c.text("Hello"));
+
+    await app.request("/");
+  });
+});
+```
+
+### 响应时间日志
+
+```typescript
+// 性能日志中间件
+app.use("*", async (c, next) => {
+  const start = performance.now();
+
+  await next();
+
+  const duration = performance.now() - start;
+
+  c.header("X-Response-Time", `${duration.toFixed(2)}ms`);
+
+  // 记录慢请求
+  if (duration > 1000) {
+    console.warn(
+      `Slow request: ${c.req.method} ${c.req.path} - ${duration.toFixed(2)}ms`
+    );
+  }
+});
+```
+
+---
+
+## 数据库优化
+
+### 查询优化
+
+```typescript
+// ❌ N+1 查询问题
+const posts = await db.query.posts.findMany();
+for (const post of posts) {
+  post.author = await db.query.users.findFirst({
+    where: eq(users.id, post.authorId),
+  });
+}
+
+// ✅ 使用 JOIN 或关系查询
+const posts = await db.query.posts.findMany({
+  with: {
+    author: true,
+  },
+});
+
+// ✅ 只查询需要的字段
+const posts = await db
+  .select({
+    id: posts.id,
+    title: posts.title,
+    createdAt: posts.createdAt,
+  })
+  .from(posts);
+```
+
+### 索引优化
+
+```typescript
+// 在 Schema 中定义索引
+export const posts = sqliteTable(
+  "posts",
+  {
+    id: text("id").primaryKey(),
+    title: text("title").notNull(),
+    authorId: text("author_id").notNull(),
+    published: integer("published", { mode: "boolean" }).notNull(),
+    createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  },
+  (table) => ({
+    authorIdIdx: index("posts_author_id_idx").on(table.authorId),
+    publishedIdx: index("posts_published_idx").on(table.published),
+    createdAtIdx: index("posts_created_at_idx").on(table.createdAt),
+  })
+);
+```
+
+### 批量操作
+
+```typescript
+// ❌ 逐个插入
+for (const tag of tags) {
+  await db.insert(postTags).values({
+    postId,
+    tagId: tag.id,
+  });
+}
+
+// ✅ 批量插入
+await db.insert(postTags).values(
+  tags.map((tag) => ({
+    postId,
+    tagId: tag.id,
+  }))
+);
+```
+
+---
+
+## 缓存策略
+
+### 分层缓存
+
+```typescript
+class CacheManager {
+  private memoryCache = new Map<string, { data: any; expires: number }>();
+
+  async get(key: string, kv: KVNamespace): Promise<any> {
+    // L1: 内存缓存（最快，10秒）
+    const memData = this.memoryCache.get(key);
+    if (memData && memData.expires > Date.now()) {
+      return memData.data;
+    }
+
+    // L2: KV 缓存（快，1分钟）
+    const kvData = await kv.get(key, "json");
+    if (kvData) {
+      this.memoryCache.set(key, {
+        data: kvData,
+        expires: Date.now() + 10000,
+      });
+      return kvData;
+    }
+
+    return null;
+  }
+}
+```
+
+### 缓存预热
+
+```typescript
+// 定时预热热门内容
+export async function warmupCache(env: any) {
+  const popularPosts = await db.query.posts.findMany({
+    where: eq(posts.featured, true),
+    limit: 100,
+  });
+
+  await Promise.all(
+    popularPosts.map((post) =>
+      env.CACHE.put(`post:${post.id}`, JSON.stringify(post), {
+        expirationTtl: 3600,
+      })
+    )
+  );
+}
+```
+
+---
+
+## 响应优化
+
+### 响应压缩
+
+```typescript
+import { compress } from "hono/compress";
+
+app.use(
+  "*",
+  compress({
+    threshold: 1024, // 只压缩大于 1KB 的响应
+  })
+);
+```
+
+### 流式响应
+
+```typescript
+// 大数据集流式输出
+app.get("/large-data", (c) => {
+  return c.stream(async (stream) => {
+    const data = await fetchLargeDataset();
+
+    stream.write("[");
+
+    for (let i = 0; i < data.length; i++) {
+      if (i > 0) stream.write(",");
+      stream.write(JSON.stringify(data[i]));
+    }
+
+    stream.write("]");
+  });
+});
+```
+
+### 选择响应类型
+
+```typescript
+// 优先使用 JSON（比 HTML 快）
+app.get("/api/data", (c) => {
+  return c.json(data); // 快
+});
+
+// 需要时才使用 HTML
+app.get("/page", (c) => {
+  return c.html(html); // 慢
+});
+```
+
+---
+
+## 内存优化
+
+### 避免内存泄漏
+
+```typescript
+// ❌ 错误：未清理事件监听器
+app.get("/stream", (c) => {
+  const interval = setInterval(() => {
+    // 发送数据
+  }, 1000);
+
+  // 忘记清理
+});
+
+// ✅ 正确：清理资源
+app.get("/stream", (c) => {
+  return c.stream(async (stream) => {
+    const interval = setInterval(() => {
+      stream.write("data\n");
+    }, 1000);
+
+    // 清理
+    stream.close();
+    clearInterval(interval);
+  });
+});
+```
+
+### 限制并发
+
+```typescript
+// 限制数据库并发连接
+const MAX_CONCURRENT = 10;
+let activeQueries = 0;
+const queue: Array<() => void> = [];
+
+async function query<T>(fn: () => Promise<T>): Promise<T> {
+  while (activeQueries >= MAX_CONCURRENT) {
+    await new Promise((resolve) => queue.push(resolve));
+  }
+
+  activeQueries++;
+  try {
+    return await fn();
+  } finally {
+    activeQueries--;
+    const next = queue.shift();
+    if (next) next();
+  }
+}
+```
+
+---
+
+## 边缘优化
+
+### 减少冷启动
+
+```typescript
+// ✅ 使用顶层导入（更快初始化）
+import { Hono } from "hono";
+
+const app = new Hono();
+
+// ❌ 避免顶层异步操作
+const data = await fetchSlowData(); // 阻塞冷启动
+
+// ✅ 延迟加载
+app.use("*", async (c, next) => {
+  if (!global.data) {
+    global.data = await fetchSlowData();
+  }
+  await next();
+});
+```
+
+### 最小化依赖
+
+```typescript
+// ✅ 使用轻量级替代
+import { Hono } from "hono"; // 13KB
+// 而不是 Express (200KB+)
+
+// ✅ 按需导入
+// import heavyLibrary from 'heavy-library'
+
+export default app;
+```
+
+### 使用 Web 标准 API
+
+```typescript
+// ✅ 使用 Web 标准（边缘友好）
+const url = new URL(c.req.url);
+const params = new URLSearchParams(url.search);
+
+// ❌ 避免依赖 Node.js 特定 API
+// const url = require('url').parse(c.req.url)
+```
+
+---
+
+## 监控和调优
+
+### 性能监控
+
+```typescript
+// 收集性能指标
+const metrics = {
+  requestCount: 0,
+  totalDuration: 0,
+  errors: 0,
+};
+
+app.use("*", async (c, next) => {
+  const start = Date.now();
+
+  try {
+    await next();
+    metrics.requestCount++;
+  } catch (error) {
+    metrics.errors++;
+    throw error;
+  } finally {
+    const duration = Date.now() - start;
+    metrics.totalDuration += duration;
+
+    // 定期报告
+    if (metrics.requestCount % 100 === 0) {
+      console.log({
+        avgDuration: metrics.totalDuration / metrics.requestCount,
+        errorRate: metrics.errors / metrics.requestCount,
+      });
+    }
+  }
+});
+```
+
+### Analytics 集成
+
+```typescript
+// Cloudflare Web Analytics
+app.use("*", async (c, next) => {
+  c.header("CF-Ray", c.req.header("CF-Ray"));
+  await next();
+});
+```
+
+---
+
+## 最佳实践清单
+
+- ✅ 使用数据库索引
+- ✅ 避免 N+1 查询
+- ✅ 实现多层缓存
+- ✅ 使用流式响应
+- ✅ 启用压缩
+- ✅ 最小化依赖
+- ✅ 监控性能指标
+- ✅ 定期优化热点代码
+
+---
+
+## 总结
+
+性能优化是持续的过程：
+
+- 📊 测量和分析
+- 🗄️ 优化数据库
+- ⚡ 实现缓存
+- 🌊 流式响应
+- 🧠 减少内存
+- 🚀 边缘优化
+
+通过这些技巧，你的 Hono 应用可以实现毫秒级响应。
+
+---
+
+## 下一步
+
+最终篇：完整实战项目

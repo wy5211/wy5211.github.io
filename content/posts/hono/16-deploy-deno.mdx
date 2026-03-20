@@ -1,0 +1,341 @@
+---
+title: "16. Deno Deploy 部署"
+date: "2026-03-20"
+summary: "将 Hono 应用部署到 Deno Deploy，学习 Deno 运行时配置、环境变量、Deno KV 使用，以及实现零配置持续部署。"
+tags: ["Hono", "Deno Deploy", "Deployment", "Deno KV", "Edge Computing"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 16
+---
+
+## 前言
+
+Deno Deploy 是 Deno 官方的无服务器边缘计算平台，以其出色的性能和简洁的开发体验而闻名。与 Cloudflare Workers 类似，Deno Deploy 也在全球边缘网络运行代码，但使用 Deno 运行时。
+
+Hono 对 Deno 有原生支持，可以轻松部署到 Deno Deploy。
+
+本篇文章将带你：
+
+- 🦕 理解 Deno Deploy 的特点
+- ⚙️ 配置 Deno 项目
+- 🔧 设置环境变量
+- 💾 使用 Deno KV
+- 🚀 实现持续部署
+- 📊 监控应用性能
+
+---
+
+## Deno Deploy 简介
+
+### 核心优势
+
+**原生 TypeScript**
+
+- 无需配置
+- 无需构建步骤
+- 直接运行
+
+**Deno KV**
+
+- 全球分布式键值存储
+- 强一致性
+- 边缘优化
+
+**零冷启动**
+
+- V8 Isolates
+- 毫秒级响应
+- 自动扩展
+
+**免费额度**
+
+- 每天 100,000 次请求
+- 1GB 存储
+- 100GB 传输
+
+---
+
+## 项目设置
+
+### Deno 配置
+
+```json
+// deno.json
+{
+  "tasks": {
+    "dev": "deno run --allow-net --allow-env --watch src/main.ts",
+    "start": "deno run --allow-net --allow-env src/main.ts",
+    "test": "deno test --allow-net --allow-env",
+    "check": "deno check **/*.ts"
+  },
+  "imports": {
+    "hono": "npm:hono",
+    "hono/": "npm:hono/"
+  },
+  "compilerOptions": {
+    "strict": true
+  }
+}
+```
+
+### 导入映射
+
+```typescript
+// 使用 npm 导入
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+
+// Deno 标准库
+import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
+```
+
+---
+
+## 应用代码
+
+### 基础设置
+
+```typescript
+// src/main.ts
+import { Hono } from "hono";
+import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
+
+const app = new Hono();
+
+app.get("/", (c) => {
+  return c.json({
+    message: "Hello from Deno Deploy!",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// Deno Deploy
+export default app;
+
+// 本地开发
+if (import.meta.main) {
+  await serve(app.fetch, {
+    port: 8000,
+    onListen: ({ port, hostname }) => {
+      console.log(`Server running on http://${hostname}:${port}`);
+    },
+  });
+}
+```
+
+### 环境变量
+
+```typescript
+// 类型安全的 Bindings
+type Bindings = {
+  KV: Deno.Kv;
+  DATABASE_URL: string;
+  API_KEY: string;
+  ENVIRONMENT: "development" | "production";
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+app.get("/", (c) => {
+  return c.json({
+    environment: c.env.ENVIRONMENT,
+  });
+});
+
+app.get("/kv/:key", async (c) => {
+  const { key } = c.req.param();
+  const value = await c.env.KV.get(["cache", key]);
+
+  return c.json({ key, value });
+});
+```
+
+---
+
+## Deno KV
+
+### 创建 KV 数据库
+
+```bash
+# 本地开发
+deno kv --allow-net --allow-read
+
+# 初始化数据库
+deno kv init
+```
+
+### KV 基本操作
+
+```typescript
+// 使用 KV
+app.get("/kv", async (c) => {
+  const kv = await Deno.openKv();
+
+  // 设置值
+  await kv.set(["users", "123"], {
+    name: "John",
+    email: "john@example.com",
+  });
+
+  // 获取值
+  const user = await kv.get(["users", "123"]);
+
+  // 删除值
+  await kv.delete(["users", "123"]);
+
+  // 列出所有键
+  const entries = kv.list({ prefix: ["users"] });
+
+  return c.json({ user: user.value });
+});
+```
+
+### 原子操作
+
+```typescript
+// 原子递增
+app.post("/posts/:id/like", async (c) => {
+  const { id } = c.req.param();
+  const kv = await Deno.openKv();
+
+  const result = await kv
+    .atomic()
+    .mutate({
+      type: "increment",
+      key: ["posts", id, "likes"],
+      value: new BigInt(1),
+    })
+    .commit();
+
+  return c.json({ success: result.ok });
+});
+```
+
+---
+
+## 部署配置
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/deploy-deno.yml
+name: Deploy to Deno Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Deploy to Deno Deploy
+        uses: denoland/deployctl@v1
+        with:
+          project: my-hono-app
+          entrypoint: src/main.ts
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+### 手动部署
+
+```bash
+# 安装 deployctl
+deno install --allow-net --allow-read https://deno.land/x/deployctl/deployctl.ts
+
+# 登录
+deployctl login
+
+# 部署
+deployctl deploy --project=my-hono-app src/main.ts
+```
+
+---
+
+## 环境变量
+
+### Deno Deploy 设置
+
+在 Deno Deploy Dashboard 中设置：
+
+- `KV`: KV 数据库绑定
+- `DATABASE_URL`: 数据库连接字符串
+- `API_KEY`: API 密钥
+- `ENVIRONMENT`: 环境标识
+
+### 代码中使用
+
+```typescript
+app.get("/env", (c) => {
+  return c.json({
+    kv: !!c.env.KV,
+    databaseUrl: c.env.DATABASE_URL?.substring(0, 10) + "...",
+    environment: c.env.ENVIRONMENT,
+  });
+});
+```
+
+---
+
+## 监控
+
+### Deno Deploy Analytics
+
+- 实时请求图表
+- 响应时间分布
+- 错误率监控
+- 地理位置分布
+
+### 日志
+
+```typescript
+app.use("*", async (c, next) => {
+  const start = Date.now();
+
+  await next();
+
+  const duration = Date.now() - start;
+
+  console.log(
+    JSON.stringify({
+      method: c.req.method,
+      path: c.req.path,
+      status: c.res.status,
+      duration,
+    })
+  );
+});
+```
+
+---
+
+## 最佳实践
+
+1. 使用类型定义确保环境变量类型安全
+2. 利用 Deno KV 的原子操作
+3. 设置合理的缓存策略
+4. 监控性能和错误率
+5. 使用 GitHub Actions 自动部署
+
+---
+
+## 总结
+
+Deno Deploy 提供了简单高效的边缘部署方案：
+
+- ✅ 原生 TypeScript 支持
+- ✅ Deno KV 存储
+- ✅ 零配置部署
+- ✅ 全球边缘网络
+
+---
+
+## 下一步
+
+下一篇：性能优化
