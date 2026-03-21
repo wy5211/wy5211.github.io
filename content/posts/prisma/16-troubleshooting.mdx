@@ -1,0 +1,742 @@
+---
+title: "Prisma 常见问题与调试完全指南"
+date: "2026-04-05"
+summary: "深入掌握 Prisma 开发中的常见问题及解决方案，学习查询调试、性能诊断、错误处理等技巧，快速定位和解决问题。"
+tags:
+  ["Prisma", "Troubleshooting", "Debugging", "Performance", "Best Practices"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 16
+---
+
+## 前言
+
+在使用 Prisma 开发应用的过程中，我们难免会遇到各种问题：连接错误、查询慢、迁移冲突等等。了解这些问题产生的原因和解决方法，可以大大提高开发效率。
+
+本文收集了 Prisma 开发中最常见的问题，并提供详细的解决方案和调试技巧。
+
+**本文将涵盖**：
+
+- 连接问题
+- 查询问题
+- 迁移问题
+- 性能问题
+- 类型错误
+- 部署问题
+- 调试工具
+- 最佳实践
+
+---
+
+## 连接问题
+
+### 问题 1：数据库连接失败
+
+**错误信息**：
+
+```
+Error: Can't reach database server at `localhost:5432`
+```
+
+**原因**：
+
+- 数据库未启动
+- 连接字符串错误
+- 端口被占用
+- 防火墙阻止
+
+**解决方案**：
+
+```bash
+# 1. 检查数据库是否运行
+# PostgreSQL
+pg_isready -h localhost -p 5432
+
+# MySQL
+mysqladmin -u root -p ping
+
+# 2. 检查连接字符串
+echo $DATABASE_URL
+
+# 3. 测试连接
+psql $DATABASE_URL
+
+# 4. 检查端口
+lsof -i :5432
+```
+
+### 问题 2：连接池耗尽
+
+**错误信息**：
+
+```
+Error: Connection pool exhausted
+```
+
+**原因**：
+
+- 连接未正确关闭
+- 连接池大小过小
+- 并发请求过多
+
+**解决方案**：
+
+```typescript
+// ✅ 好：使用单例模式
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+export const prisma =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    datasources: {
+      db: {
+        url: process.env.DATABASE_URL,
+      },
+    },
+  });
+
+// ❌ 差：每次创建新实例
+export function getPrisma() {
+  return new PrismaClient();
+}
+
+// 增加连接池大小
+// DATABASE_URL="postgresql://user:pass@host:5432/db?connection_limit=20"
+```
+
+### 问题 3：SSL 连接错误
+
+**错误信息**：
+
+```
+Error: SSL SYSCALL error: EOF detected
+```
+
+**解决方案**：
+
+```bash
+# 添加 SSL 参数
+DATABASE_URL="postgresql://user:pass@host:5432/db?sslmode=require"
+
+# 或者禁用 SSL（仅开发环境）
+DATABASE_URL="postgresql://user:pass@host:5432/db?sslmode=disable"
+```
+
+---
+
+## 查询问题
+
+### 问题 4：N+1 查询问题
+
+**症状**：
+
+- 查询次数过多
+- 页面加载慢
+
+**诊断**：
+
+```typescript
+const prisma = new PrismaClient({
+  log: ["query"],
+});
+
+// 查看日志中的查询数量
+```
+
+**解决方案**：
+
+```typescript
+// ❌ 问题代码
+const users = await prisma.user.findMany();
+for (const user of users) {
+  const posts = await prisma.post.findMany({
+    where: { authorId: user.id },
+  });
+}
+
+// ✅ 解决方案 1：使用 Include
+const users = await prisma.user.findMany({
+  include: {
+    posts: true,
+  },
+});
+
+// ✅ 解决方案 2：批量查询
+const users = await prisma.user.findMany();
+const userIds = users.map((u) => u.id);
+const posts = await prisma.post.findMany({
+  where: {
+    authorId: { in: userIds },
+  },
+});
+```
+
+### 问题 5：查询结果为 null
+
+**原因**：
+
+- 记录不存在
+- 过滤条件过严
+- 软删除
+
+**解决方案**：
+
+```typescript
+// ✅ 使用 findFirstOrThrow
+const user = await prisma.user.findFirstOrThrow({
+  where: { id: userId },
+});
+
+// ✅ 处理 null
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+});
+
+if (!user) {
+  throw new Error("User not found");
+}
+
+// ✅ 检查软删除
+const user = await prisma.user.findUnique({
+  where: {
+    id: userId,
+    deletedAt: null, // 排除已删除
+  },
+});
+```
+
+### 问题 6：关系查询为空
+
+**原因**：
+
+- 外键值无效
+- 关系配置错误
+- 数据不一致
+
+**解决方案**：
+
+```typescript
+// 检查外键
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+});
+
+if (!post?.authorId) {
+  console.log("No authorId found");
+}
+
+// 使用 findFirst 调试
+const post = await prisma.post.findFirst({
+  where: { id: postId },
+  include: { author: true },
+});
+
+console.log("Post:", post);
+```
+
+---
+
+## 迁移问题
+
+### 问题 7：迁移历史不一致
+
+**错误信息**：
+
+```
+Error: Migration failed. The migration XXX was not applied yet.
+```
+
+**解决方案**：
+
+```bash
+# 1. 查看迁移状态
+npx prisma migrate status
+
+# 2. 如果迁移已手动应用，标记为已应用
+npx prisma migrate resolve --applied "migration_name"
+
+# 3. 如果迁移失败，回滚
+npx prisma migrate resolve --rolled-back "migration_name"
+
+# 4. 重置数据库（开发环境）
+npx prisma migrate reset
+```
+
+### 问题 8：Schema 与数据库不一致
+
+**错误信息**：
+
+```
+Error: The database schema is not empty.
+```
+
+**解决方案**：
+
+```bash
+# 方案 1：从数据库拉取 Schema
+npx prisma db pull
+
+# 方案 2：推送 Schema 到数据库（开发环境）
+npx prisma db push
+
+# 方案 3：创建初始迁移
+npx prisma migrate dev --name init
+```
+
+### 问题 9：迁移冲突
+
+**场景**：多人同时创建迁移
+
+**解决方案**：
+
+```bash
+# 1. 每个开发者使用不同的迁移名称前缀
+npx prisma migrate dev --name feature_x_add_user_field
+
+# 2. 合并代码前，运行迁移
+npx prisma migrate deploy
+
+# 3. 如果有冲突，手动编辑迁移文件
+```
+
+---
+
+## 性能问题
+
+### 问题 10：查询慢
+
+**诊断步骤**：
+
+```typescript
+// 1. 启用查询日志
+const prisma = new PrismaClient({
+  log: [{ level: "query", emit: "event" }],
+});
+
+prisma.$on("query" as any, (e: any) => {
+  if (e.duration > 1000) {
+    console.warn("Slow query:", e.query, e.duration);
+  }
+});
+
+// 2. 分析查询计划
+const result = await prisma.$queryRaw`
+  EXPLAIN ANALYZE SELECT * FROM posts WHERE author_id = ${userId}
+`;
+
+// 3. 检查是否使用了索引
+const result = await prisma.$queryRaw`
+  SELECT
+    schemaname,
+    tablename,
+    indexname,
+    idx_scan
+  FROM pg_stat_user_indexes
+  WHERE tablename = 'posts'
+`;
+```
+
+**优化方案**：
+
+```typescript
+// ✅ 添加索引
+// prisma/schema.prisma
+model Post {
+  authorId String
+  status   String
+
+  @@index([authorId, status])
+}
+
+// ✅ 只查询需要的字段
+const posts = await prisma.post.findMany({
+  select: {
+    id: true,
+    title: true,
+    // 不查询 content
+  },
+})
+
+// ✅ 使用分页
+const posts = await prisma.post.findMany({
+  take: 20,
+  skip: (page - 1) * 20,
+})
+```
+
+### 问题 11：内存占用高
+
+**原因**：
+
+- 查询结果过大
+- 缓存过多数据
+- 连接池过大
+
+**解决方案**：
+
+```typescript
+// ✅ 使用流式处理
+const userStream = prisma.user.findMany({
+  cursor: { id: lastId },
+  take: 1000,
+});
+
+for await (const users of userStream) {
+  await processUsers(users);
+}
+
+// ✅ 限制查询数量
+const users = await prisma.user.findMany({
+  take: 1000,
+});
+
+// ✅ 清理缓存
+const cache = new Map();
+cache.clear();
+```
+
+---
+
+## 类型错误
+
+### 问题 12：类型不匹配
+
+**错误信息**：
+
+```
+Type 'string' is not assignable to type 'UserWhereUniqueInput'
+```
+
+**解决方案**：
+
+```typescript
+// ❌ 错误
+const user = await prisma.user.findUnique({
+  where: { id: userId }, // userId 可能不是 string
+});
+
+// ✅ 正确
+const user = await prisma.user.findUnique({
+  where: {
+    id: userId as string, // 类型断言
+  },
+});
+
+// ✅ 更好：运行时验证
+function isString(value: unknown): value is string {
+  return typeof value === "string";
+}
+
+if (isString(userId)) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+  });
+}
+```
+
+### 问题 13：类型推断失败
+
+**错误信息**：
+
+```
+Property 'author' does not exist on type 'Post'
+```
+
+**解决方案**：
+
+```typescript
+// ❌ 错误
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+});
+console.log(post.author); // 类型错误
+
+// ✅ 正确：使用 Include
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  include: {
+    author: true,
+  },
+});
+
+// ✅ 或者使用类型断言
+const post = (await prisma.post.findUnique({
+  where: { id: postId },
+  include: {
+    author: {
+      select: {
+        username: true,
+      },
+    },
+  },
+})) as any; // 最后的手段
+```
+
+---
+
+## 部署问题
+
+### 问题 14：Prisma Client 未生成
+
+**错误信息**：
+
+```
+Error: @prisma/client did not initialize yet.
+```
+
+**解决方案**：
+
+```bash
+# 1. 生成 Client
+npx prisma generate
+
+# 2. 检查 package.json scripts
+"scripts": {
+  "postinstall": "prisma generate"
+}
+
+# 3. 确保 .prisma 目录被包含
+// .gitignore
+node_modules
+// 不包含 .prisma
+```
+
+### 问题 15：生产环境迁移失败
+
+**错误信息**：
+
+```
+Error: Migration failed with code 255
+```
+
+**解决方案**：
+
+```bash
+# 1. 在本地测试迁移
+npx prisma migrate deploy --dry-run
+
+# 2. 检查迁移文件
+cat prisma/migrations/xxx/migration.sql
+
+# 3. 手动在测试环境应用迁移
+npx prisma migrate deploy
+
+# 4. 检查数据库权限
+# 确保用户有 CREATE TABLE 权限
+```
+
+---
+
+## 调试工具
+
+### Prisma Studio
+
+```bash
+# 启动 Studio
+npx prisma studio
+
+# 指定端口
+npx prisma studio --port 5556
+```
+
+### 查询日志
+
+```typescript
+const prisma = new PrismaClient({
+  log: [
+    {
+      emit: "event",
+      level: "query",
+    },
+    {
+      emit: "stdout",
+      level: "error",
+    },
+  ],
+});
+
+prisma.$on("query" as any, (e: any) => {
+  console.log("Query: " + e.query);
+  console.log("Params: " + e.params);
+  console.log("Duration: " + e.duration + "ms");
+});
+```
+
+### 开发工具集成
+
+```typescript
+// 使用 VS Code Debugger
+debugger;
+
+// 或使用 console.log
+console.log("Prisma Client:", prisma);
+console.log("Query args:", args);
+```
+
+---
+
+## 常见错误代码
+
+### P2002：唯一约束冲突
+
+```typescript
+try {
+  await prisma.user.create({
+    data: {
+      email: "user@example.com",
+    },
+  });
+} catch (error) {
+  if (error.code === "P2002") {
+    console.log("Email already exists");
+    // 处理冲突
+  }
+}
+```
+
+### P2025：记录不存在
+
+```typescript
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+});
+
+if (!user) {
+  throw new Error("User not found", { code: "P2025" });
+}
+```
+
+### P2034：写入冲突
+
+```typescript
+try {
+  await prisma.user.update({
+    where: { id: userId },
+    data: { version: { increment: 1 } },
+  });
+} catch (error) {
+  if (error.code === "P2034") {
+    console.log("Version conflict");
+    // 重试逻辑
+  }
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 错误处理
+
+```typescript
+// ✅ 好：完善的错误处理
+async function getUser(id: string) {
+  try {
+    const user = await prisma.user.findUnique({
+      where: { id },
+    });
+
+    if (!user) {
+      throw new Error("User not found");
+    }
+
+    return user;
+  } catch (error) {
+    console.error("Failed to get user:", error);
+    throw error;
+  }
+}
+```
+
+### 2. 类型安全
+
+```typescript
+// ✅ 好：使用类型推断
+type UserCreateInput = Prisma.UserCreateInput;
+
+function createUser(data: UserCreateInput) {
+  return prisma.user.create({ data });
+}
+
+// ❌ 差：使用 any
+function createUser(data: any) {
+  return prisma.user.create({ data });
+}
+```
+
+### 3. 查询优化
+
+```typescript
+// ✅ 好：只查询需要的字段
+const users = await prisma.user.findMany({
+  select: {
+    id: true,
+    username: true,
+  },
+});
+
+// ❌ 差：查询所有字段
+const users = await prisma.user.findMany();
+```
+
+---
+
+## 资源和工具
+
+### 官方资源
+
+- **Prisma Docs**：https://www.prisma.io/docs
+- **Prisma Blog**：https://www.prisma.io/blog
+- **GitHub Issues**：https://github.com/prisma/prisma/issues
+
+### 社区资源
+
+- **Discord**：https://discord.prisma.io
+- **Stack Overflow**：https://stackoverflow.com/questions/tagged/prisma
+- **Reddit**：https://reddit.com/r/prisma
+
+### 开发工具
+
+- **Prisma Studio**：可视化数据库管理
+- **Prisma VS Code Extension**：语法高亮和自动补全
+- **Datagrip**：数据库 IDE
+
+---
+
+## 总结
+
+通过本文，我们系统学习了：
+
+✅ 连接问题的诊断和解决
+✅ 查询问题的排查方法
+✅ 迁移冲突的处理
+✅ 性能问题的优化
+✅ 类型错误的修复
+✅ 部署问题的处理
+✅ 调试工具的使用
+✅ 最佳实践的总结
+
+掌握这些调试技巧后，你可以更从容地应对开发中的各种问题。下一步，我们将通过**完整实战项目**来综合运用所学知识。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将构建：
+
+- 完整的博客系统 API
+- 用户认证和授权
+- 文章 CRUD 实现
+- 评论系统
+- 搜索功能
+- 文件上传
+- 数据验证
+- 错误处理
+- 测试覆盖
+- Docker 部署
+
+继续阅读：[完整实战项目](./17-real-world-project.mdx)

@@ -1,0 +1,991 @@
+---
+title: "Prisma 测试策略完全指南：构建可靠的测试体系"
+date: "2026-04-02"
+summary: "深入掌握 Prisma 应用的测试方法，学习单元测试、集成测试、Mock 策略、测试工厂等技巧，构建完整的测试体系。"
+tags: ["Prisma", "Testing", "Vitest", "Jest", "TDD", "Quality Assurance"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 13
+---
+
+## 前言
+
+测试是保证应用质量的关键。一个好的测试体系不仅能捕获 Bug，还能作为文档，帮助新开发者理解代码行为。
+
+Prisma 提供了多种测试策略，从快速的单元测试到完整的集成测试，你可以根据需要选择合适的方法。
+
+**本文将涵盖**：
+
+- 测试类型和选择
+- 测试环境配置
+- 单元测试
+- 集成测试
+- Mock Prisma Client
+- 测试工厂模式
+- 测试数据管理
+- CI/CD 测试集成
+
+---
+
+## 测试类型和选择
+
+### 单元测试
+
+测试单个函数或类的行为。
+
+```typescript
+// 示例：测试用户验证函数
+test("validateEmail should return true for valid email", () => {
+  expect(validateEmail("user@example.com")).toBe(true);
+});
+
+test("validateEmail should return false for invalid email", () => {
+  expect(validateEmail("invalid")).toBe(false);
+});
+```
+
+**特点**：
+
+- ✅ 快速执行
+- ✅ 隔离性好
+- ❌ 可能无法发现集成问题
+
+### 集成测试
+
+测试多个组件协同工作。
+
+```typescript
+// 示例：测试用户注册流程
+test("should register user and send welcome email", async () => {
+  const response = await app.request("/auth/register", {
+    method: "POST",
+    body: JSON.stringify({
+      email: "user@example.com",
+      password: "Secret123",
+    }),
+  });
+
+  expect(response.status).toBe(201);
+
+  // 验证数据库中创建了用户
+  const user = await prisma.user.findUnique({
+    where: { email: "user@example.com" },
+  });
+
+  expect(user).toBeTruthy();
+});
+```
+
+**特点**：
+
+- ✅ 测试真实交互
+- ✅ 发现集成问题
+- ❌ 执行较慢
+- ❌ 可能需要数据库
+
+---
+
+## 测试环境配置
+
+### 使用 Vitest
+
+```bash
+# 安装依赖
+npm install -D vitest @vitest/ui
+
+# 配置
+```
+
+```typescript
+// vitest.config.ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    environment: "node",
+    globals: true,
+    setupFiles: ["./tests/setup.ts"],
+  },
+});
+```
+
+### 测试设置文件
+
+```typescript
+// tests/setup.ts
+import { PrismaClient } from "@prisma/client";
+
+const prisma = new PrismaClient();
+
+beforeEach(async () => {
+  // 清理数据库
+  await prisma.comment.deleteMany();
+  await prisma.post.deleteMany();
+  await prisma.user.deleteMany();
+});
+
+afterAll(async () => {
+  await prisma.$disconnect();
+});
+```
+
+### 使用测试数据库
+
+```bash
+# .env.test
+DATABASE_URL="file:./test.db"
+```
+
+```typescript
+// tests/setup.ts
+import { PrismaClient } from "@prisma/client";
+
+export const prisma = new PrismaClient({
+  datasources: {
+    db: {
+      url: process.env.DATABASE_URL,
+    },
+  },
+});
+```
+
+---
+
+## 单元测试
+
+### 测试纯函数
+
+```typescript
+// lib/utils/user.ts
+export function validateEmail(email: string): boolean {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
+}
+
+export function hashPassword(password: string): string {
+  // 简化版本
+  return Buffer.from(password).toString("base64");
+}
+
+// tests/unit/user.test.ts
+import { describe, it, expect } from "vitest";
+import { validateEmail, hashPassword } from "../../lib/utils/user";
+
+describe("validateEmail", () => {
+  it("应该接受有效的邮箱地址", () => {
+    expect(validateEmail("user@example.com")).toBe(true);
+    expect(validateEmail("test.user+tag@domain.co.uk")).toBe(true);
+  });
+
+  it("应该拒绝无效的邮箱地址", () => {
+    expect(validateEmail("invalid")).toBe(false);
+    expect(validateEmail("user@")).toBe(false);
+    expect(validateEmail("@example.com")).toBe(false);
+    expect(validateEmail("user example.com")).toBe(false);
+  });
+});
+
+describe("hashPassword", () => {
+  it("应该返回哈希后的密码", () => {
+    const password = "Secret123";
+    const hashed = hashPassword(password);
+
+    expect(hashed).not.toBe(password);
+    expect(typeof hashed).toBe("string");
+  });
+
+  it("相同密码应该产生不同哈希", () => {
+    const password = "Secret123";
+    const hash1 = hashPassword(password);
+    const hash2 = hashPassword(password);
+
+    expect(hash1).not.toBe(hash2);
+  });
+});
+```
+
+### 测试业务逻辑
+
+```typescript
+// lib/services/user.service.ts
+import { prisma } from '../db'
+
+export class UserService {
+  async createUser(data: { email: string; username: string }) {
+    // 检查邮箱是否已存在
+    const existing = await prisma.user.findUnique({
+      where: { email: data.email },
+    })
+
+    if (existing) {
+      throw new Error('EMAIL_EXISTS')
+    }
+
+    return await prisma.user.create({
+      data,
+    })
+  }
+
+  async getUserById(id: string) {
+    const user = await prisma.user.findUnique({
+      where: { id },
+    })
+
+    if (!user) {
+      throw new Error('USER_NOT_FOUND')
+    }
+
+    return user
+  }
+}
+
+// tests/unit/user.service.test.ts
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { UserService } from '../../lib/services/user.service'
+import { prisma } from '../../lib/db'
+
+vi.mock('../../lib/db', () => ({
+  prisma: {
+    user: {
+      findUnique: vi.fn(),
+      create: vi.fn(),
+    },
+  },
+}))
+
+describe('UserService', () => {
+  let userService: UserService
+
+  beforeEach(() => {
+    userService = new UserService()
+    vi.clearAllMocks()
+  })
+
+  describe('createUser', () => {
+    it('应该成功创建新用户', async () => {
+      const userData = {
+        email: 'user@example.com',
+        username: 'john',
+      }
+
+      vi.mocked(prisma.user.findUnique).mockResolvedValue(null)
+      vi.mocked(prisma.user.create).mockResolvedValue({
+        id: '1',
+        ...userData,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      } as any)
+
+      const result = await userService.createUser(userData)
+
+      expect(result).toHaveProperty('id')
+      expect(prisma.user.create).toHaveBeenCalledWith({
+        data: userData,
+      })
+    })
+
+    it('邮箱已存在时应该抛出错误', async () => {
+      const userData = {
+        email: 'existing@example.com',
+        username: 'john',
+      }
+
+      vi.mocked(prisma.user.findUnique).mockResolvedValue({
+        id: '1',
+        ...userData,
+      } as any)
+
+      await expect(userService.createUser(userData)).rejects.toThrow(
+        'EMAIL_EXISTS'
+      )
+    })
+  })
+
+  describe('getUserById', () => {
+    it('应该返回用户', async () => {
+      const user = {
+        id: '1',
+        email: 'user@example.com',
+        username: 'john',
+      }
+
+      vi.mocked(prisma.user.findUnique).mockResolvedValue(user as any)
+
+      const result = await userService.getUserById('1')
+
+      expect(result).toEqual(user)
+    })
+
+    it('用户不存在时应该抛出错误', async () => {
+      vi.mocked(prisma.user.findUnique).mockResolvedValue(null)
+
+      await expect(userService.getUserById('1')).rejects.toThrow(
+        'USER_NOT_FOUND'
+      )
+    })
+  }
+})
+```
+
+---
+
+## 集成测试
+
+### API 测试
+
+```typescript
+// tests/integration/auth.test.ts
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { Hono } from "hono";
+import { prisma } from "../lib/db";
+import authRoutes from "../routes/auth";
+
+describe("Auth API", () => {
+  let app: Hono;
+
+  beforeEach(async () => {
+    app = new Hono();
+    app.route("/auth", authRoutes);
+
+    // 清理数据库
+    await prisma.user.deleteMany();
+  });
+
+  afterEach(async () => {
+    await prisma.$disconnect();
+  });
+
+  describe("POST /auth/register", () => {
+    it("应该成功注册新用户", async () => {
+      const response = await app.request("/auth/register", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          email: "user@example.com",
+          username: "john",
+          password: "Secret123",
+        }),
+      });
+
+      expect(response.status).toBe(201);
+
+      const json = await response.json();
+      expect(json).toHaveProperty("data");
+      expect(json.data).toHaveProperty("id");
+      expect(json.data).toHaveProperty("email", "user@example.com");
+
+      // 验证数据库
+      const user = await prisma.user.findUnique({
+        where: { email: "user@example.com" },
+      });
+
+      expect(user).toBeTruthy();
+    });
+
+    it("邮箱已存在时应该返回错误", async () => {
+      // 先创建用户
+      await prisma.user.create({
+        data: {
+          email: "user@example.com",
+          username: "john",
+          password: "hash",
+        },
+      });
+
+      const response = await app.request("/auth/register", {
+        method: "POST",
+        body: JSON.stringify({
+          email: "user@example.com",
+          username: "jane",
+          password: "Secret123",
+        }),
+      });
+
+      expect(response.status).toBe(409);
+
+      const json = await response.json();
+      expect(json).toHaveProperty("error");
+    });
+  });
+});
+```
+
+### 数据库测试
+
+```typescript
+// tests/integration/post.test.ts
+import { describe, it, expect, beforeEach } from "vitest";
+import { prisma } from "../lib/db";
+
+describe("Post Model", () => {
+  beforeEach(async () => {
+    await prisma.post.deleteMany();
+    await prisma.user.deleteMany();
+  });
+
+  it("应该创建文章并关联作者", async () => {
+    const author = await prisma.user.create({
+      data: {
+        email: "author@example.com",
+        username: "author",
+        password: "hash",
+      },
+    });
+
+    const post = await prisma.post.create({
+      data: {
+        title: "Test Post",
+        slug: "test-post",
+        content: "Content",
+        authorId: author.id,
+      },
+    });
+
+    expect(post).toHaveProperty("id");
+    expect(post.authorId).toBe(author.id);
+
+    // 验证关系
+    const postWithAuthor = await prisma.post.findUnique({
+      where: { id: post.id },
+      include: { author: true },
+    });
+
+    expect(postWithAuthor?.author).toHaveProperty("username", "author");
+  });
+
+  it("应该支持级联删除", async () => {
+    const author = await prisma.user.create({
+      data: {
+        email: "author@example.com",
+        username: "author",
+        password: "hash",
+        posts: {
+          create: {
+            title: "Test Post",
+            slug: "test-post",
+            content: "Content",
+          },
+        },
+      },
+    });
+
+    // 删除作者
+    await prisma.user.delete({
+      where: { id: author.id },
+    });
+
+    // 验证文章也被删除
+    const posts = await prisma.post.findMany();
+    expect(posts).toHaveLength(0);
+  });
+});
+```
+
+---
+
+## Mock Prisma Client
+
+### 使用 Vitest Mock
+
+```typescript
+// tests/mocks/prisma.ts
+import { vi } from "vitest";
+import { PrismaClient } from "@prisma/client";
+
+export const mockPrismaClient = {
+  user: {
+    findUnique: vi.fn(),
+    findMany: vi.fn(),
+    create: vi.fn(),
+    update: vi.fn(),
+    delete: vi.fn(),
+    findFirst: vi.fn(),
+    count: vi.fn(),
+  },
+  post: {
+    findUnique: vi.fn(),
+    findMany: vi.fn(),
+    create: vi.fn(),
+    update: vi.fn(),
+    delete: vi.fn(),
+  },
+};
+
+vi.mock("../lib/db", () => ({
+  prisma: mockPrismaClient,
+}));
+
+export const prisma = mockPrismaClient as unknown as PrismaClient;
+```
+
+### 使用 Mock 的测试
+
+```typescript
+// tests/unit/auth.service.test.ts
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { AuthService } from "../../lib/services/auth.service";
+import { prisma } from "./mocks/prisma";
+
+describe("AuthService", () => {
+  let authService: AuthService;
+
+  beforeEach(() => {
+    authService = new AuthService(prisma);
+    vi.clearAllMocks();
+  });
+
+  it("应该成功注册用户", async () => {
+    const userData = {
+      email: "user@example.com",
+      username: "john",
+      password: "Secret123",
+    };
+
+    vi.mocked(prisma.user.findUnique).mockResolvedValue(null);
+    vi.mocked(prisma.user.create).mockResolvedValue({
+      id: "1",
+      email: userData.email,
+      username: userData.username,
+      password: "hash",
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const result = await authService.register(userData);
+
+    expect(result).toHaveProperty("id");
+    expect(prisma.user.create).toHaveBeenCalledTimes(1);
+  });
+});
+```
+
+---
+
+## 测试工厂模式
+
+### 创建测试工厂
+
+```typescript
+// tests/factories/index.ts
+import { PrismaClient } from "@prisma/client";
+import * as bcrypt from "bcrypt";
+
+export function createTestPrisma() {
+  return new PrismaClient({
+    datasources: {
+      db: {
+        url: process.env.TEST_DATABASE_URL || "file:./test.db",
+      },
+    },
+  });
+}
+
+// 用户工厂
+export async function createTestUser(
+  prisma: PrismaClient,
+  overrides: Partial<any> = {}
+) {
+  const hashedPassword = await bcrypt.hash("password123", 10);
+
+  return await prisma.user.create({
+    data: {
+      email: "user@example.com",
+      username: "testuser",
+      password: hashedPassword,
+      role: "USER",
+      ...overrides,
+    },
+  });
+}
+
+// 文章工厂
+export async function createTestPost(
+  prisma: PrismaClient,
+  authorId: string,
+  overrides: Partial<any> = {}
+) {
+  return await prisma.post.create({
+    data: {
+      title: "Test Post",
+      slug: "test-post",
+      content: "Test content",
+      status: "PUBLISHED",
+      authorId,
+      publishedAt: new Date(),
+      ...overrides,
+    },
+  });
+}
+
+// 评论工厂
+export async function createTestComment(
+  prisma: PrismaClient,
+  data: {
+    postId: string;
+    authorId: string;
+  }
+) {
+  return await prisma.comment.create({
+    data: {
+      content: "Test comment",
+      ...data,
+    },
+  });
+}
+```
+
+### 使用测试工厂
+
+```typescript
+// tests/integration/post.service.test.ts
+import { describe, it, expect, beforeEach } from "vitest";
+import { createTestPrisma, createTestUser, createTestPost } from "../factories";
+import { PostService } from "../../lib/services/post.service";
+
+describe("PostService", () => {
+  let prisma: ReturnType<typeof createTestPrisma>;
+  let postService: PostService;
+
+  beforeEach(async () => {
+    prisma = createTestPrisma();
+    postService = new PostService(prisma);
+
+    await prisma.comment.deleteMany();
+    await prisma.post.deleteMany();
+    await prisma.user.deleteMany();
+  });
+
+  it("应该获取用户的所有文章", async () => {
+    const user = await createTestUser(prisma);
+    await createTestPost(prisma, user.id);
+    await createTestPost(prisma, user.id, {
+      title: "Second Post",
+      slug: "second-post",
+    });
+
+    const posts = await postService.getUserPosts(user.id);
+
+    expect(posts).toHaveLength(2);
+    expect(posts[0]).toHaveProperty("title");
+  });
+});
+```
+
+---
+
+## 测试数据管理
+
+### 使用 Fixtures
+
+```typescript
+// tests/fixtures/index.ts
+import { PrismaClient } from "@prisma/client";
+
+export async function loadFixtures(prisma: PrismaClient) {
+  // 创建测试用户
+  const admin = await prisma.user.create({
+    data: {
+      email: "admin@example.com",
+      username: "admin",
+      password: "hash",
+      role: "ADMIN",
+    },
+  });
+
+  const user = await prisma.user.create({
+    data: {
+      email: "user@example.com",
+      username: "user",
+      password: "hash",
+      role: "USER",
+    },
+  });
+
+  // 创建测试文章
+  await prisma.post.create({
+    data: {
+      title: "Published Post",
+      slug: "published-post",
+      content: "Content",
+      status: "PUBLISHED",
+      authorId: admin.id,
+      publishedAt: new Date(),
+    },
+  });
+
+  await prisma.post.create({
+    data: {
+      title: "Draft Post",
+      slug: "draft-post",
+      content: "Content",
+      status: "DRAFT",
+      authorId: user.id,
+    },
+  });
+
+  return { admin, user };
+}
+
+// 使用
+beforeEach(async () => {
+  await loadFixtures(prisma);
+});
+```
+
+### 数据库事务回滚
+
+```typescript
+// tests/setup.ts
+import { PrismaClient } from "@prisma/client";
+
+export const prisma = new PrismaClient();
+
+let transaction: Prisma.TransactionClient;
+
+beforeEach(async () => {
+  transaction = await prisma.$begin();
+});
+
+afterEach(async () => {
+  await transaction.$rollback();
+});
+
+// 在测试中使用 transaction
+test("should create user", async () => {
+  const user = await transaction.user.create({
+    data: {
+      email: "test@example.com",
+      username: "test",
+      password: "hash",
+    },
+  });
+
+  expect(user).toHaveProperty("id");
+});
+```
+
+---
+
+## CI/CD 测试集成
+
+### GitHub Actions 配置
+
+```yaml
+# .github/workflows/test.yml
+name: Test
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: test
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test_db
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "20"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Generate Prisma Client
+        run: pnpm prisma generate
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+
+      - name: Run migrations
+        run: pnpm prisma migrate deploy
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+
+      - name: Run tests
+        run: pnpm test
+        env:
+          DATABASE_URL: postgresql://test:test@localhost:5432/test_db
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage/lcov.info
+```
+
+### 本地预览 CI
+
+```bash
+# 安装 act
+brew install act
+
+# 运行 CI 测试
+act push
+```
+
+---
+
+## 测试最佳实践
+
+### 1. 测试命名
+
+```typescript
+// ✅ 好：清晰的测试名称
+test("should return 404 when user does not exist", async () => {
+  // ...
+});
+
+// ❌ 差：模糊的测试名称
+test("test user", async () => {
+  // ...
+});
+```
+
+### 2. AAA 模式
+
+```typescript
+test("should create user", async () => {
+  // Arrange（准备）
+  const userData = {
+    email: "user@example.com",
+    username: "john",
+  };
+
+  // Act（执行）
+  const user = await createUser(userData);
+
+  // Assert（断言）
+  expect(user).toHaveProperty("id");
+  expect(user.email).toBe(userData.email);
+});
+```
+
+### 3. 测试隔离
+
+```typescript
+// ✅ 好：每个测试独立
+test("test 1", async () => {
+  const user = await createTestUser();
+  // ...
+});
+
+test("test 2", async () => {
+  const user = await createTestUser();
+  // ...
+});
+
+// ❌ 差：测试之间有依赖
+let userId: string;
+
+test("test 1", async () => {
+  const user = await createTestUser();
+  userId = user.id;
+});
+
+test("test 2", async () => {
+  const user = await getUserById(userId); // 依赖 test 1
+});
+```
+
+### 4. 避免测试实现细节
+
+```typescript
+// ✅ 好：测试行为
+test("should create user with email", async () => {
+  const user = await createUser({
+    email: "user@example.com",
+  });
+
+  expect(user.email).toBe("user@example.com");
+});
+
+// ❌ 差：测试实现细节
+test("should call prisma.user.create", async () => {
+  await createUser({
+    email: "user@example.com",
+  });
+
+  expect(prisma.user.create).toHaveBeenCalled();
+});
+```
+
+---
+
+## 常见问题
+
+**Q: 应该使用单元测试还是集成测试？**
+
+A: 两者结合：核心业务逻辑用单元测试，API 和数据库交互用集成测试。
+
+**Q: 如何加快测试速度？**
+
+A：
+
+1. 使用 SQLite 作为测试数据库
+2. 并行运行测试
+3. 使用事务回滚而非清理
+
+**Q: 需要测试所有代码吗？**
+
+A：优先测试核心业务逻辑和边界情况，工具函数和简单逻辑可以不测。
+
+---
+
+## 总结
+
+通过本文，我们全面掌握了：
+
+✅ 测试类型和选择策略
+✅ 测试环境配置方法
+✅ 单元测试和集成测试
+✅ Mock Prisma Client 的技巧
+✅ 测试工厂模式的应用
+✅ 测试数据管理策略
+✅ CI/CD 测试集成
+✅ 测试最佳实践
+
+掌握测试策略后，你可以构建出可靠且易于维护的应用。下一步，我们将学习**与 Next.js 的集成**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- Next.js 中集成 Prisma
+- Server Actions 和 Prisma
+- Route Handlers 最佳实践
+- 客户端组件模式
+- 数据缓存策略
+- 实时更新功能
+- 部署配置
+- 性能优化技巧
+
+继续阅读：[与 Next.js 集成](./14-nextjs-integration.mdx)

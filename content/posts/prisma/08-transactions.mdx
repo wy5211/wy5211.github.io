@@ -1,0 +1,893 @@
+---
+title: "Prisma 事务与并发控制：掌握数据一致性保障"
+date: "2026-03-28"
+summary: "深入理解 Prisma 事务的工作机制，掌握嵌套写入、并发控制、锁机制等高级特性，学会构建可靠且一致的数据操作。"
+tags: ["Prisma", "Transactions", "Concurrency", "Data Consistency", "Locking"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 8
+---
+
+## 前言
+
+在现实应用中，许多操作需要多个步骤才能完成，而这些步骤必须作为一个整体执行——要么全部成功，要么全部失败。
+
+比如银行转账：从账户 A 扣款，然后向账户 B 存款。如果扣款成功但存款失败，就会导致数据不一致。
+
+这就是事务要解决的问题。事务确保了一组数据库操作的原子性、一致性、隔离性和持久性（ACID）。
+
+**本文将涵盖**：
+
+- 事务的基本概念和 ACID
+- Prisma 事务 API
+- 嵌套写入
+- 并发问题及解决方案
+- 乐观锁和悲观锁
+- 隔离级别配置
+- 事务最佳实践
+- 实战案例
+
+---
+
+## 事务基础概念
+
+### 什么是事务？
+
+事务是作为单一逻辑工作单元执行的一系列操作。这些操作要么全部成功，要么全部失败。
+
+### ACID 特性
+
+- **原子性（Atomicity）**：事务中的所有操作要么全部完成，要么全部不完成
+- **一致性（Consistency）**：事务必须使数据库从一个一致性状态变换到另一个一致性状态
+- **隔离性（Isolation）**：并发事务之间互不干扰
+- **持久性（Durability）**：一旦事务提交，其结果就永久保存
+
+### 事务示例
+
+```typescript
+// 银行转账（需要事务）
+await prisma.$transaction(async (tx) => {
+  // 1. 扣除发送者余额
+  await tx.account.update({
+    where: { id: fromAccountId },
+    data: { balance: { decrement: amount } },
+  });
+
+  // 2. 增加接收者余额
+  await tx.account.update({
+    where: { id: toAccountId },
+    data: { balance: { increment: amount } },
+  });
+
+  // 3. 记录交易
+  await tx.transaction.create({
+    data: {
+      fromAccountId,
+      toAccountId,
+      amount,
+    },
+  });
+});
+```
+
+---
+
+## Prisma 事务 API
+
+Prisma 提供了三种事务方式：
+
+### 1. 顺序事务（Sequential）
+
+将多个操作按顺序执行：
+
+```typescript
+const [user, post, comment] = await prisma.$transaction([
+  prisma.user.create({
+    data: {
+      email: "user@example.com",
+      username: "john",
+    },
+  }),
+  prisma.post.create({
+    data: {
+      title: "First Post",
+      content: "Hello World",
+      authorId: "user-1",
+    },
+  }),
+  prisma.comment.create({
+    data: {
+      content: "Great post!",
+      postId: "post-1",
+      authorId: "user-1",
+    },
+  }),
+]);
+```
+
+**特点**：
+
+- ✅ 简单直观
+- ✅ 适合独立操作
+- ❌ 操作之间不能相互依赖
+
+### 2. 交互式事务（Interactive）
+
+使用回调函数，操作之间可以相互依赖：
+
+```typescript
+const result = await prisma.$transaction(async (tx) => {
+  // 1. 创建用户
+  const user = await tx.user.create({
+    data: {
+      email: "user@example.com",
+      username: "john",
+    },
+  });
+
+  // 2. 使用用户 ID 创建文章
+  const post = await tx.post.create({
+    data: {
+      title: "First Post",
+      content: "Hello World",
+      authorId: user.id, // 使用第一步的结果
+    },
+  });
+
+  // 3. 使用文章 ID 创建评论
+  const comment = await tx.comment.create({
+    data: {
+      content: "Great post!",
+      postId: post.id, // 使用第二步的结果
+      authorId: user.id,
+    },
+  });
+
+  return { user, post, comment };
+});
+```
+
+**特点**：
+
+- ✅ 操作之间可以依赖
+- ✅ 可以进行条件判断
+- ✅ 可以使用 try-catch
+- ⚠️ 性能稍低于顺序事务
+
+### 3. 嵌套写入（Nested Writes）
+
+在创建/更新操作中包含关联数据：
+
+```typescript
+const user = await prisma.user.create({
+  data: {
+    email: "user@example.com",
+    username: "john",
+    posts: {
+      create: [
+        {
+          title: "First Post",
+          content: "Hello World",
+          comments: {
+            create: {
+              content: "Great post!",
+              author: {
+                connect: { id: anotherUserId },
+              },
+            },
+          },
+        },
+      ],
+    },
+  },
+});
+```
+
+**特点**：
+
+- ✅ 最简洁的语法
+- ✅ 自动事务处理
+- ❌ 只适用于关联数据
+
+---
+
+## 事务配置选项
+
+### 超时设置
+
+```typescript
+await prisma.$transaction(
+  async (tx) => {
+    // 长时间运行的操作
+    await longRunningOperation(tx);
+  },
+  {
+    maxWait: 5000, // 最大等待时间（毫秒）
+    timeout: 10000, // 事务超时时间（毫秒）
+  }
+);
+```
+
+### 隔离级别
+
+```typescript
+import { Prisma } from "@prisma/client";
+
+await prisma.$transaction(
+  async (tx) => {
+    // 事务操作
+  },
+  {
+    isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+  }
+);
+```
+
+**隔离级别**：
+
+- `ReadUncommitted`：读未提交（最低隔离）
+- `ReadCommitted`：读已提交（默认）
+- `RepeatableRead`：可重复读
+- `Serializable`：可序列化（最高隔离）
+
+---
+
+## 并发问题及解决方案
+
+### 1. 脏读（Dirty Read）
+
+读取了未提交的数据。
+
+**问题示例**：
+
+```typescript
+// 事务 A
+await prisma.$transaction(async (tx) => {
+  await tx.account.update({
+    where: { id: 1 },
+    data: { balance: 100 },
+  });
+  // 还未提交...
+});
+
+// 事务 B
+const account = await prisma.account.findUnique({
+  where: { id: 1 },
+});
+// 读取到了未提交的数据
+```
+
+**解决方案**：使用适当的隔离级别
+
+```typescript
+await prisma.$transaction(
+  async (tx) => {
+    // 操作
+  },
+  {
+    isolationLevel: Prisma.TransactionIsolationLevel.ReadCommitted,
+  }
+);
+```
+
+### 2. 不可重复读（Non-repeatable Read）
+
+同一事务中两次读取同一数据，结果不同。
+
+**解决方案**：使用 RepeatableRead 隔离级别
+
+```typescript
+await prisma.$transaction(
+  async (tx) => {
+    const account1 = await tx.account.findUnique({
+      where: { id: 1 },
+    });
+
+    // 其他事务可能修改了数据
+
+    const account2 = await tx.account.findUnique({
+      where: { id: 1 },
+    });
+
+    // account1 !== account2
+  },
+  {
+    isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
+  }
+);
+```
+
+### 3. 幻读（Phantom Read）
+
+同一事务中，相同条件查询返回不同数量的记录。
+
+**解决方案**：使用 Serializable 隔离级别
+
+```typescript
+await prisma.$transaction(
+  async (tx) => {
+    const accounts1 = await tx.account.findMany({
+      where: { balance: { gt: 1000 } },
+    });
+
+    // 其他事务插入了新记录
+
+    const accounts2 = await tx.account.findMany({
+      where: { balance: { gt: 1000 } },
+    });
+
+    // accounts1.length !== accounts2.length
+  },
+  {
+    isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+  }
+);
+```
+
+---
+
+## 乐观锁（Optimistic Locking）
+
+### 概念
+
+乐观锁假设冲突不常发生，只在提交时检查版本号。
+
+### 实现
+
+```prisma
+// schema.prisma
+model Post {
+  id        Int      @id @default(autoincrement())
+  title     String
+  content   String
+  version   Int      @default(1)
+  updatedAt DateTime @updatedAt
+}
+```
+
+```typescript
+async function updatePostWithOptimisticLock(
+  postId: number,
+  expectedVersion: number,
+  data: { title?: string; content?: string }
+) {
+  try {
+    const post = await prisma.post.update({
+      where: {
+        id: postId,
+        version: expectedVersion, // 版本检查
+      },
+      data: {
+        ...data,
+        version: { increment: 1 }, // 版本递增
+      },
+    });
+
+    return { success: true, post };
+  } catch (error) {
+    if (error.code === "P2025") {
+      // 记录不存在或版本不匹配
+      return { success: false, error: "Version conflict" };
+    }
+    throw error;
+  }
+}
+
+// 使用
+const result = await updatePostWithOptimisticLock(1, 5, {
+  title: "Updated Title",
+});
+
+if (!result.success) {
+  console.log("更新失败，数据已被其他人修改");
+  // 重新获取数据，让用户确认
+}
+```
+
+### 优点
+
+- ✅ 无需数据库锁
+- ✅ 高并发性能
+- ✅ 适合冲突少的场景
+
+### 缺点
+
+- ❌ 需要额外的版本字段
+- ❌ 冲突时需要重试
+
+---
+
+## 悲观锁（Pessimistic Locking）
+
+### 概念
+
+悲观锁假设冲突经常发生，直接锁定记录。
+
+### PostgreSQL 实现
+
+```typescript
+// 使用 FOR UPDATE 锁定记录
+const [account] = await prisma.$queryRaw<
+  Array<{ id: number; balance: number }>
+>`
+  SELECT id, balance
+  FROM accounts
+  WHERE id = ${accountId}
+  FOR UPDATE
+`;
+
+// 现在可以安全地更新
+await prisma.account.update({
+  where: { id: accountId },
+  data: { balance: { decrement: amount } },
+});
+```
+
+### 完整示例
+
+```typescript
+async function transferWithPessimisticLock(
+  fromAccountId: number,
+  toAccountId: number,
+  amount: number
+) {
+  await prisma.$transaction(async (tx) => {
+    // 锁定源账户
+    const [fromAccount] = await tx.$queryRaw<
+      Array<{ id: number; balance: number }>
+    >`
+      SELECT id, balance
+      FROM accounts
+      WHERE id = ${fromAccountId}
+      FOR UPDATE
+    `;
+
+    // 检查余额
+    if (fromAccount.balance < amount) {
+      throw new Error("余额不足");
+    }
+
+    // 锁定目标账户
+    const [toAccount] = await tx.$queryRaw<
+      Array<{ id: number; balance: number }>
+    >`
+      SELECT id, balance
+      FROM accounts
+      WHERE id = ${toAccountId}
+      FOR UPDATE
+    `;
+
+    // 执行转账
+    await tx.account.update({
+      where: { id: fromAccountId },
+      data: { balance: { decrement: amount } },
+    });
+
+    await tx.account.update({
+      where: { id: toAccountId },
+      data: { balance: { increment: amount } },
+    });
+
+    // 记录交易
+    await tx.transaction.create({
+      data: {
+        fromAccountId,
+        toAccountId,
+        amount,
+      },
+    });
+  });
+}
+```
+
+---
+
+## 事务实战案例
+
+### 案例 1：电商订单
+
+```typescript
+async function createOrder(
+  userId: string,
+  items: Array<{ productId: string; quantity: number }>
+) {
+  return await prisma.$transaction(async (tx) => {
+    // 1. 计算总价
+    let total = 0;
+    const orderItems = [];
+
+    for (const item of items) {
+      const product = await tx.product.findUnique({
+        where: { id: item.productId },
+      });
+
+      if (!product) {
+        throw new Error(`产品 ${item.productId} 不存在`);
+      }
+
+      if (product.stock < item.quantity) {
+        throw new Error(`产品 ${product.name} 库存不足`);
+      }
+
+      total += Number(product.price) * item.quantity;
+      orderItems.push({
+        productId: item.productId,
+        quantity: item.quantity,
+        price: product.price,
+      });
+    }
+
+    // 2. 扣减库存
+    for (const item of items) {
+      await tx.product.update({
+        where: { id: item.productId },
+        data: {
+          stock: { decrement: item.quantity },
+        },
+      });
+    }
+
+    // 3. 创建订单
+    const order = await tx.order.create({
+      data: {
+        userId,
+        total,
+        items: {
+          create: orderItems,
+        },
+      },
+    });
+
+    // 4. 扣除用户余额（或创建支付记录）
+    await tx.user.update({
+      where: { id: userId },
+      data: {
+        balance: { decrement: total },
+      },
+    });
+
+    return order;
+  });
+}
+```
+
+### 案例 2：社交网络关注
+
+```typescript
+async function followUser(followerId: string, followingId: string) {
+  return await prisma.$transaction(async (tx) => {
+    // 1. 检查是否已关注
+    const existing = await tx.follow.findUnique({
+      where: {
+        followerId_followingId: {
+          followerId,
+          followingId,
+        },
+      },
+    });
+
+    if (existing) {
+      throw new Error("已经关注过该用户");
+    }
+
+    // 2. 不能关注自己
+    if (followerId === followingId) {
+      throw new Error("不能关注自己");
+    }
+
+    // 3. 创建关注关系
+    await tx.follow.create({
+      data: {
+        followerId,
+        followingId,
+      },
+    });
+
+    // 4. 更新统计数据
+    await tx.user.update({
+      where: { id: followerId },
+      data: {
+        followingCount: { increment: 1 },
+      },
+    });
+
+    await tx.user.update({
+      where: { id: followingId },
+      data: {
+        followerCount: { increment: 1 },
+      },
+    });
+
+    // 5. 创建通知
+    await tx.notification.create({
+      data: {
+        userId: followingId,
+        type: "FOLLOW",
+        actorId: followerId,
+      },
+    });
+  });
+}
+```
+
+### 案例 3：博客文章发布
+
+```typescript
+async function publishPost(postId: string) {
+  return await prisma.$transaction(async (tx) => {
+    // 1. 获取文章
+    const post = await tx.post.findUnique({
+      where: { id: postId },
+      include: {
+        author: true,
+        tags: true,
+      },
+    });
+
+    if (!post) {
+      throw new Error("文章不存在");
+    }
+
+    if (post.status === "PUBLISHED") {
+      throw new Error("文章已发布");
+    }
+
+    // 2. 更新文章状态
+    const updated = await tx.post.update({
+      where: { id: postId },
+      data: {
+        status: "PUBLISHED",
+        publishedAt: new Date(),
+      },
+    });
+
+    // 3. 更新作者统计数据
+    await tx.user.update({
+      where: { id: post.authorId },
+      data: {
+        postsCount: { increment: 1 },
+      },
+    });
+
+    // 4. 更新标签使用次数
+    for (const tag of post.tags) {
+      await tx.tag.update({
+        where: { id: tag.id },
+        data: {
+          postsCount: { increment: 1 },
+        },
+      });
+    }
+
+    // 5. 创建时间线事件
+    await tx.timelineEvent.create({
+      data: {
+        type: "POST_PUBLISHED",
+        userId: post.authorId,
+        postId: post.id,
+        metadata: {
+          title: post.title,
+          slug: post.slug,
+        },
+      },
+    });
+
+    // 6. 通知订阅者
+    const subscribers = await tx.subscription.findMany({
+      where: { followingId: post.authorId },
+      select: { followerId: true },
+    });
+
+    await tx.notification.createMany({
+      data: subscribers.map((sub) => ({
+        userId: sub.followerId,
+        type: "NEW_POST",
+        actorId: post.authorId,
+        postId: post.id,
+      })),
+    });
+
+    return updated;
+  });
+}
+```
+
+---
+
+## 事务最佳实践
+
+### 1. 保持事务简短
+
+```typescript
+// ✅ 好：事务只包含必要的数据库操作
+await prisma.$transaction(async (tx) => {
+  await tx.account.update({
+    where: { id: 1 },
+    data: { balance: { decrement: 100 } },
+  })
+
+  await tx.account.update({
+    where: { id: 2 },
+    data: { balance: { increment: 100 } },
+  })
+})
+
+// ❌ 差：事务包含耗时的非数据库操作
+await prisma.$transaction(async (tx) => {
+  await tx.account.update({ ... })
+
+  // 发送邮件（耗时操作，不应在事务中）
+  await sendEmail(...)
+
+  await tx.account.update({ ... })
+})
+```
+
+### 2. 适当的错误处理
+
+```typescript
+try {
+  await prisma.$transaction(async (tx) => {
+    // 操作
+  });
+} catch (error) {
+  if (error.code === "P2034") {
+    // 写入冲突
+    console.log("并发冲突，请重试");
+  } else if (error.code === "P2002") {
+    // 唯一约束冲突
+    console.log("记录已存在");
+  } else {
+    // 其他错误
+    console.error("事务失败:", error);
+  }
+}
+```
+
+### 3. 避免在事务中调用外部服务
+
+```typescript
+// ✅ 好：先获取数据，再在事务中处理
+const user = await fetchExternalUserData();
+
+await prisma.$transaction(async (tx) => {
+  await tx.user.create({
+    data: user,
+  });
+});
+
+// ❌ 差：在事务中调用外部服务
+await prisma.$transaction(async (tx) => {
+  const user = await fetchExternalUserData(); // 阻塞事务
+
+  await tx.user.create({
+    data: user,
+  });
+});
+```
+
+### 4. 使用适当的隔离级别
+
+```typescript
+// 默认级别（ReadCommitted）
+await prisma.$transaction(async (tx) => {
+  // 一般操作
+});
+
+// 高隔离级别（Serializable）
+await prisma.$transaction(
+  async (tx) => {
+    // 关键操作
+  },
+  {
+    isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+  }
+);
+```
+
+---
+
+## 事务重试策略
+
+### 指数退避重试
+
+```typescript
+async function transactionWithRetry<T>(
+  callback: (tx: PrismaTransaction) => Promise<T>,
+  maxRetries = 3
+): Promise<T> {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await prisma.$transaction(callback);
+    } catch (error) {
+      if (error.code === "P2034" && attempt < maxRetries - 1) {
+        // 写入冲突，等待后重试
+        const delay = Math.pow(2, attempt) * 100; // 100ms, 200ms, 400ms
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error("Max retries reached");
+}
+
+// 使用
+await transactionWithRetry(async (tx) => {
+  // 事务操作
+});
+```
+
+---
+
+## 常见问题
+
+**Q: 事务和嵌套写入有什么区别？**
+
+A: 嵌套写入是 Prisma 提供的语法糖，自动在事务中执行关联数据的操作。事务提供了更细粒度的控制。
+
+**Q: 如何在事务中执行原始 SQL？**
+
+A: 使用 `tx.$queryRaw` 或 `tx.$executeRaw`：
+
+```typescript
+await prisma.$transaction(async (tx) => {
+  await tx.$queryRaw`SELECT * FROM users FOR UPDATE`
+  await tx.user.update({ ... })
+})
+```
+
+**Q: 事务超时怎么办？**
+
+A: 增加超时时间或优化事务操作：
+
+```typescript
+await prisma.$transaction(
+  async (tx) => { ... },
+  { timeout: 30000 } // 30 秒
+)
+```
+
+**Q: 如何调试事务？**
+
+A: 启用查询日志：
+
+```typescript
+const prisma = new PrismaClient({
+  log: ["query", "error", "warn"],
+});
+```
+
+---
+
+## 总结
+
+通过本文，我们深入掌握了：
+
+✅ 事务的基本概念和 ACID 特性
+✅ Prisma 的三种事务 API
+✅ 并发问题及隔离级别
+✅ 乐观锁和悲观锁的实现
+✅ 事务实战案例
+✅ 事务最佳实践
+✅ 重试策略和错误处理
+
+掌握事务后，你可以构建可靠且一致的数据操作。下一步，我们将学习**数据验证与类型安全**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- Prisma 类型生成机制
+- 类型导出和使用
+- Zod 集成验证
+- 自定义验证规则
+- 输入验证中间件
+- 类型安全查询
+- 泛型类型技巧
+
+继续阅读：[数据验证与类型安全](./09-validation-types.mdx)

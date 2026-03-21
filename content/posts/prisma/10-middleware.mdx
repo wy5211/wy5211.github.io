@@ -1,0 +1,917 @@
+---
+title: "Prisma Middleware 完全指南：掌握生命周期钩子"
+date: "2026-03-30"
+summary: "深入理解 Prisma Middleware 的工作机制，掌握查询日志、缓存、软删除、数据加密等中间件的开发，实现横切关注点的统一处理。"
+tags: ["Prisma", "Middleware", "Logging", "Caching", "Encryption"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 10
+---
+
+## 前言
+
+在开发应用时，我们经常需要在多个地方实现相同的功能：查询日志、数据验证、缓存管理、审计追踪等等。这些横切关注点如果散落在代码各处，会导致代码重复和难以维护。
+
+Prisma Middleware 提供了一种优雅的解决方案——在查询执行前后注入自定义逻辑，实现统一的处理。
+
+**本文将涵盖**：
+
+- Middleware 工作原理
+- 生命周期钩子
+- 查询日志中间件
+- 缓存中间件
+- 软删除中间件
+- 数据加密中间件
+- 性能监控中间件
+- 中间件最佳实践
+
+---
+
+## Middleware 工作原理
+
+### 什么是 Middleware？
+
+Middleware 是一个函数，它拦截 Prisma 查询，在查询执行前后添加自定义逻辑。
+
+### 执行流程
+
+```
+用户查询
+    ↓
+Middleware 1
+    ↓
+Middleware 2
+    ↓
+...
+    ↓
+Middleware N
+    ↓
+Prisma Engine
+    ↓
+返回结果
+```
+
+### 基本语法
+
+```typescript
+prisma.$use(async (params, next) => {
+  // 查询前执行
+  console.log("Query:", params.model, params.action);
+
+  // 执行查询
+  const result = await next(params);
+
+  // 查询后执行
+  console.log("Result:", result);
+
+  return result;
+});
+```
+
+---
+
+## 参数详解
+
+### Params 对象
+
+```typescript
+interface MiddlewareParams {
+  // 模型名称
+  model: string;
+
+  // 操作名称
+  action: string;
+
+  // 参数
+  args: any;
+
+  // 数据模型（仅在特定情况下）
+  dataPath: string[];
+
+  // 查询时间
+  runInTransaction: boolean;
+}
+```
+
+### Action 类型
+
+```typescript
+type Action =
+  | "findUnique"
+  | "findMany"
+  | "findFirst"
+  | "create"
+  | "createMany"
+  | "update"
+  | "updateMany"
+  | "upsert"
+  | "delete"
+  | "deleteMany"
+  | "executeRaw"
+  | "queryRaw"
+  | "aggregate"
+  | "count"
+  | "groupBy";
+```
+
+---
+
+## 查询日志中间件
+
+### 基础日志
+
+```typescript
+prisma.$use(async (params, next) => {
+  const before = Date.now();
+
+  console.log(`Query: ${params.model}.${params.action}`);
+  console.log("Args:", JSON.stringify(params.args, null, 2));
+
+  const result = await next(params);
+
+  const after = Date.now();
+  console.log(`Duration: ${after - before}ms`);
+
+  return result;
+});
+```
+
+### 彩色日志
+
+```typescript
+const colors = {
+  reset: "\x1b[0m",
+  bright: "\x1b[1m",
+  red: "\x1b[31m",
+  green: "\x1b[32m",
+  yellow: "\x1b[33m",
+  blue: "\x1b[34m",
+};
+
+prisma.$use(async (params, next) => {
+  const before = Date.now();
+
+  const result = await next(params);
+
+  const duration = Date.now() - before;
+
+  const color =
+    duration < 100 ? colors.green : duration < 500 ? colors.yellow : colors.red;
+
+  console.log(
+    `${colors.bright}${params.model}.${params.action}${colors.reset} ` +
+      `${color}${duration}ms${colors.reset}`
+  );
+
+  return result;
+});
+```
+
+### 结构化日志
+
+```typescript
+import { createLogger } from "winston";
+
+const logger = createLogger({
+  level: "info",
+  format: winston.format.json(),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: "queries.log" }),
+  ],
+});
+
+prisma.$use(async (params, next) => {
+  const start = Date.now();
+
+  const result = await next(params);
+
+  logger.info({
+    model: params.model,
+    action: params.action,
+    duration: Date.now() - start,
+    timestamp: new Date().toISOString(),
+  });
+
+  return result;
+});
+```
+
+### 慢查询监控
+
+```typescript
+const SLOW_QUERY_THRESHOLD = 1000; // 1秒
+
+prisma.$use(async (params, next) => {
+  const start = Date.now();
+
+  const result = await next(params);
+
+  const duration = Date.now() - start;
+
+  if (duration > SLOW_QUERY_THRESHOLD) {
+    console.warn(`Slow query detected: ${params.model}.${params.action}`);
+    console.warn(`Duration: ${duration}ms`);
+    console.warn("Args:", params.args);
+  }
+
+  return result;
+});
+```
+
+---
+
+## 缓存中间件
+
+### 内存缓存
+
+```typescript
+const cache = new Map<string, { data: any; expiry: number }>();
+const DEFAULT_TTL = 60000; // 1分钟
+
+prisma.$use(async (params, next) => {
+  // 只缓存查询操作
+  if (params.action !== "findUnique" && params.action !== "findFirst") {
+    return next(params);
+  }
+
+  const cacheKey = JSON.stringify({
+    model: params.model,
+    action: params.action,
+    args: params.args,
+  });
+
+  // 检查缓存
+  const cached = cache.get(cacheKey);
+  if (cached && cached.expiry > Date.now()) {
+    console.log("Cache hit:", cacheKey);
+    return cached.data;
+  }
+
+  // 执行查询
+  const result = await next(params);
+
+  // 写入缓存
+  cache.set(cacheKey, {
+    data: result,
+    expiry: Date.now() + DEFAULT_TTL,
+  });
+
+  console.log("Cache miss:", cacheKey);
+
+  return result;
+});
+```
+
+### Redis 缓存
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis({
+  host: process.env.REDIS_HOST,
+  port: Number(process.env.REDIS_PORT),
+});
+
+prisma.$use(async (params, next) => {
+  if (params.action !== "findUnique" && params.action !== "findFirst") {
+    return next(params);
+  }
+
+  const cacheKey = `prisma:${params.model}:${JSON.stringify(params.args)}`;
+
+  // 尝试从缓存读取
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    console.log("Redis cache hit:", cacheKey);
+    return JSON.parse(cached);
+  }
+
+  // 执行查询
+  const result = await next(params);
+
+  // 写入缓存（1分钟）
+  await redis.setex(cacheKey, 60, JSON.stringify(result));
+
+  return result;
+});
+```
+
+### 缓存失效
+
+```typescript
+prisma.$use(async (params, next) => {
+  // 写操作时清除相关缓存
+  if (
+    params.action === "create" ||
+    params.action === "update" ||
+    params.action === "delete" ||
+    params.action === "updateMany" ||
+    params.action === "deleteMany"
+  ) {
+    console.log("Clearing cache for", params.model);
+
+    if (cache) {
+      // 清除 Redis 缓存
+      const keys = await redis.keys(`prisma:${params.model}:*`);
+      if (keys.length > 0) {
+        await redis.del(...keys);
+      }
+    }
+  }
+
+  return next(params);
+});
+```
+
+---
+
+## 软删除中间件
+
+### 自动过滤已删除记录
+
+```typescript
+prisma.$use(async (params, next) => {
+  // 查询操作时自动过滤
+  if (
+    params.action === "findUnique" ||
+    params.action === "findFirst" ||
+    params.action === "findMany"
+  ) {
+    // 检查模型是否有 deletedAt 字段
+    if (params.model === "User" || params.model === "Post") {
+      params.args.where = params.args.where || {};
+
+      // 只查询未删除的记录
+      if (params.args.where.deletedAt === undefined) {
+        params.args.where.deletedAt = null;
+      }
+    }
+  }
+
+  // 删除操作改为软删除
+  if (params.action === "delete") {
+    params.action = "update";
+    params.args.data = { deletedAt: new Date() };
+  }
+
+  // 批量删除也改为软删除
+  if (params.action === "deleteMany") {
+    params.action = "updateMany";
+    params.args.data = { deletedAt: new Date() };
+  }
+
+  return next(params);
+});
+```
+
+### 使用示例
+
+```typescript
+// 正常查询，自动过滤已删除记录
+const users = await prisma.user.findMany();
+// 不会返回 deletedAt 不为 null 的用户
+
+// 软删除
+await prisma.user.delete({
+  where: { id: userId },
+});
+// 实际上设置 deletedAt = new Date()
+
+// 查询包括已删除的记录
+const allUsers = await prisma.user.findMany({
+  where: {
+    deletedAt: { not: null }, // 显式查询已删除的
+  },
+});
+```
+
+---
+
+## 数据加密中间件
+
+### 敏感字段加密
+
+```typescript
+import crypto from "crypto";
+
+const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY!; // 32 bytes
+const ALGORITHM = "aes-256-gcm";
+
+function encrypt(text: string): string {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(ALGORITHM, ENCRYPTION_KEY, iv);
+
+  let encrypted = cipher.update(text, "utf8", "hex");
+  encrypted += cipher.final("hex");
+
+  const authTag = cipher.getAuthTag();
+
+  return `${iv.toString("hex")}:${authTag.toString("hex")}:${encrypted}`;
+}
+
+function decrypt(encrypted: string): string {
+  const [ivHex, authTagHex, encryptedText] = encrypted.split(":");
+
+  const iv = Buffer.from(ivHex, "hex");
+  const authTag = Buffer.from(authTagHex, "hex");
+
+  const decipher = crypto.createDecipheriv(ALGORITHM, ENCRYPTION_KEY, iv);
+  decipher.setAuthTag(authTag);
+
+  let decrypted = decipher.update(encryptedText, "hex", "utf8");
+  decrypted += decipher.final("utf8");
+
+  return decrypted;
+}
+
+prisma.$use(async (params, next) => {
+  // 写入时加密
+  if (params.action === "create" || params.action === "update") {
+    if (params.model === "User") {
+      if (params.args.data.email) {
+        params.args.data.email = encrypt(params.args.data.email);
+      }
+      if (params.args.data.phone) {
+        params.args.data.phone = encrypt(params.args.data.phone);
+      }
+    }
+  }
+
+  const result = await next(params);
+
+  // 读取时解密
+  if (
+    params.action === "findUnique" ||
+    params.action === "findFirst" ||
+    params.action === "findMany"
+  ) {
+    if (params.model === "User" && result) {
+      const decryptUser = (user: any) => {
+        if (user.email) user.email = decrypt(user.email);
+        if (user.phone) user.phone = decrypt(user.phone);
+        return user;
+      };
+
+      if (Array.isArray(result)) {
+        return result.map(decryptUser);
+      } else {
+        return decryptUser(result);
+      }
+    }
+  }
+
+  return result;
+});
+```
+
+---
+
+## 性能监控中间件
+
+### 详细的性能指标
+
+```typescript
+interface QueryMetrics {
+  model: string;
+  action: string;
+  duration: number;
+  timestamp: Date;
+}
+
+const metrics: QueryMetrics[] = [];
+
+prisma.$use(async (params, next) => {
+  const start = performance.now();
+
+  const result = await next(params);
+
+  const duration = performance.now() - start;
+
+  metrics.push({
+    model: params.model,
+    action: params.action,
+    duration,
+    timestamp: new Date(),
+  });
+
+  // 保留最近1000条记录
+  if (metrics.length > 1000) {
+    metrics.shift();
+  }
+
+  return result;
+});
+
+// 获取性能统计
+function getPerformanceStats() {
+  const byModel = metrics.reduce((acc, m) => {
+    const key = `${m.model}.${m.action}`;
+    if (!acc[key]) {
+      acc[key] = {
+        count: 0,
+        totalDuration: 0,
+        avgDuration: 0,
+        maxDuration: 0,
+      };
+    }
+    acc[key].count++;
+    acc[key].totalDuration += m.duration;
+    acc[key].avgDuration = acc[key].totalDuration / acc[key].count;
+    acc[key].maxDuration = Math.max(acc[key].maxDuration, m.duration);
+    return acc;
+  }, {} as any);
+
+  return byModel;
+}
+```
+
+### 外部监控集成
+
+```typescript
+import { StatsD } from "node-dogstatsd";
+
+const dogstatsd = new StatsD();
+
+prisma.$use(async (params, next) => {
+  const start = Date.now();
+
+  try {
+    const result = await next(params);
+
+    const duration = Date.now() - start;
+
+    // 发送到 Datadog
+    dogstatsd.histogram(`prisma.query.duration`, duration, [
+      `model:${params.model}`,
+      `action:${params.action}`,
+    ]);
+
+    dogstatsd.increment(`prisma.query.count`, 1, [
+      `model:${params.model}`,
+      `action:${params.action}`,
+    ]);
+
+    return result;
+  } catch (error) {
+    dogstatsd.increment(`prisma.query.error`, 1, [
+      `model:${params.model}`,
+      `action:${params.action}`,
+    ]);
+    throw error;
+  }
+});
+```
+
+---
+
+## 审计日志中间件
+
+### 记录数据变更
+
+```typescript
+prisma.$use(async (params, next) => {
+  // 记录写操作
+  if (
+    params.action === "create" ||
+    params.action === "update" ||
+    params.action === "delete"
+  ) {
+    const before =
+      params.action !== "create"
+        ? await prisma[params.model.toLowerCase()].findUnique({
+            where: params.args.where,
+          })
+        : null;
+
+    const result = await next(params);
+
+    // 保存审计日志
+    await prisma.auditLog.create({
+      data: {
+        model: params.model,
+        action: params.action,
+        recordId: result.id,
+        before: before ? JSON.stringify(before) : null,
+        after: JSON.stringify(result),
+        timestamp: new Date(),
+      },
+    });
+
+    return result;
+  }
+
+  return next(params);
+});
+```
+
+---
+
+## 中间件链管理
+
+### 条件中间件
+
+```typescript
+// 只在开发环境启用
+if (process.env.NODE_ENV === "development") {
+  prisma.$use(async (params, next) => {
+    console.log("Query:", params.model, params.action);
+    return next(params);
+  });
+}
+
+// 只对特定模型启用
+prisma.$use(async (params, next) => {
+  if (params.model === "Post") {
+    console.log("Post query:", params.action);
+  }
+  return next(params);
+});
+```
+
+### 中间件顺序
+
+```typescript
+// 注意：中间件按添加顺序执行
+// 先添加的先执行
+
+// 1. 查询日志（最先执行）
+prisma.$use(async (params, next) => {
+  console.log("1. Before:", params.model);
+  const result = await next(params);
+  console.log("1. After:", params.model);
+  return result;
+});
+
+// 2. 缓存（第二个执行）
+prisma.$use(async (params, next) => {
+  console.log("2. Checking cache...");
+  const result = await next(params);
+  console.log("2. Cache updated");
+  return result;
+});
+
+// 3. 软删除（最后执行，最接近查询）
+prisma.$use(async (params, next) => {
+  console.log("3. Applying soft delete");
+  return next(params);
+});
+```
+
+---
+
+## 完整示例：生产级中间件
+
+```typescript
+// lib/prisma-middleware.ts
+import { Prisma } from '@prisma/client'
+import { createLogger } from 'winston'
+import Redis from 'ioredis'
+
+const logger = createLogger({ ... })
+const redis = new Redis({ ... })
+
+const SLOW_QUERY_THRESHOLD = 1000
+
+export function setupMiddleware(prisma: PrismaClient) {
+  // 1. 查询日志
+  prisma.$use(async (params, next) => {
+    const start = Date.now()
+
+    logger.info({
+      type: 'query',
+      model: params.model,
+      action: params.action,
+    })
+
+    try {
+      const result = await next(params)
+
+      const duration = Date.now() - start
+
+      logger.info({
+        type: 'query_result',
+        model: params.model,
+        action: params.action,
+        duration,
+      })
+
+      // 慢查询告警
+      if (duration > SLOW_QUERY_THRESHOLD) {
+        logger.warn('Slow query detected', {
+          model: params.model,
+          action: params.action,
+          duration,
+        })
+      }
+
+      return result
+    } catch (error) {
+      logger.error('Query error', {
+        model: params.model,
+        action: params.action,
+        error: error.message,
+      })
+      throw error
+    }
+  })
+
+  // 2. 缓存层
+  prisma.$use(async (params, next) => {
+    if (params.action !== 'findUnique' && params.action !== 'findFirst') {
+      return next(params)
+    }
+
+    const cacheKey = `prisma:${params.model}:${JSON.stringify(params.args)}`
+
+    try {
+      const cached = await redis.get(cacheKey)
+      if (cached) {
+        logger.debug('Cache hit', { cacheKey })
+        return JSON.parse(cached)
+      }
+    } catch (error) {
+      logger.error('Cache read error', { error })
+    }
+
+    const result = await next(params)
+
+    try {
+      await redis.setex(cacheKey, 60, JSON.stringify(result))
+    } catch (error) {
+      logger.error('Cache write error', { error })
+    }
+
+    return result
+  })
+
+  // 3. 软删除
+  prisma.$use(async (params, next) => {
+    const hasDeletedAt =
+      params.model === 'User' ||
+      params.model === 'Post' ||
+      params.model === 'Comment'
+
+    if (!hasDeletedAt) {
+      return next(params)
+    }
+
+    if (
+      params.action === 'findUnique' ||
+      params.action === 'findFirst' ||
+      params.action === 'findMany'
+    ) {
+      params.args.where = params.args.where || {}
+      if (params.args.where.deletedAt === undefined) {
+        params.args.where.deletedAt = null
+      }
+    }
+
+    if (params.action === 'delete') {
+      params.action = 'update'
+      params.args.data = { deletedAt: new Date() }
+    }
+
+    if (params.action === 'deleteMany') {
+      params.action = 'updateMany'
+      params.args.data = { deletedAt: new Date() }
+    }
+
+    return next(params)
+  })
+
+  return prisma
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 保持中间件简单
+
+```typescript
+// ✅ 好：每个中间件只做一件事
+prisma.$use(loggingMiddleware);
+prisma.$use(cachingMiddleware);
+prisma.$use(softDeleteMiddleware);
+
+// ❌ 差：一个中间件做所有事情
+prisma.$use(async (params, next) => {
+  // 日志
+  // 缓存
+  // 软删除
+  // 加密
+  // ...
+});
+```
+
+### 2. 注意性能影响
+
+```typescript
+// ✅ 好：异步操作不影响主流程
+prisma.$use(async (params, next) => {
+  const result = await next(params);
+
+  // 异步记录日志，不阻塞返回
+  logToService(params, result).catch(console.error);
+
+  return result;
+});
+
+// ❌ 差：同步操作阻塞查询
+prisma.$use(async (params, next) => {
+  // 同步写入日志文件，阻塞查询
+  fs.appendFileSync("log.txt", JSON.stringify(params));
+
+  return next(params);
+});
+```
+
+### 3. 处理异常
+
+```typescript
+// ✅ 好：捕获中间件中的异常
+prisma.$use(async (params, next) => {
+  try {
+    return await next(params);
+  } catch (error) {
+    // 记录错误但继续传播
+    logError(error);
+    throw error;
+  }
+});
+```
+
+---
+
+## 常见问题
+
+**Q: 中间件会影响性能吗？**
+
+A: 会有轻微影响，但通常可以忽略。如果中间件执行大量同步操作，可能会有明显影响。
+
+**Q: 如何在中间件中跳过某些查询？**
+
+A: 添加条件判断：
+
+```typescript
+prisma.$use(async (params, next) => {
+  if (params.model === "InternalModel") {
+    return next(params); // 不处理
+  }
+  // 处理逻辑
+});
+```
+
+**Q: 中间件可以访问上下文吗？**
+
+A: 可以使用 AsyncLocalStorage：
+
+```typescript
+import { AsyncLocalStorage } from "async_hooks";
+
+const storage = new AsyncLocalStorage<{ userId: string }>();
+
+prisma.$use(async (params, next) => {
+  const context = storage.getStore();
+  console.log("User ID:", context?.userId);
+  return next(params);
+});
+```
+
+---
+
+## 总结
+
+通过本文，我们深入掌握了：
+
+✅ Middleware 的工作原理和生命周期
+✅ 查询日志和性能监控
+✅ 缓存中间件的实现
+✅ 软删除中间件
+✅ 数据加密中间件
+✅ 审计日志中间件
+✅ 中间件链的管理
+✅ 生产级中间件的最佳实践
+
+掌握 Middleware 后，你可以优雅地处理各种横切关注点。下一步，我们将学习**性能优化技巧**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- 查询优化策略
+- 连接池配置
+- 批量操作优化
+- 索引优化
+- 数据库优化
+- N+1 问题解决
+- 查询计划分析
+- 性能监控工具
+
+继续阅读：[性能优化技巧](./11-performance.mdx)

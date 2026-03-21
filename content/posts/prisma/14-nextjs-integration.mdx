@@ -1,0 +1,1047 @@
+---
+title: "Prisma 与 Next.js 集成完全指南：构建全栈应用"
+date: "2026-04-03"
+summary: "深入掌握 Prisma 在 Next.js App Router 中的使用，学习 Server Actions、Route Handlers、数据缓存等最佳实践，构建现代化的全栈应用。"
+tags: ["Prisma", "Next.js", "App Router", "Server Actions", "Full Stack"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 14
+---
+
+## 前言
+
+Next.js 和 Prisma 是全栈 TypeScript 应用的黄金组合。Next.js 的服务器组件和 Prisma 的类型安全相结合，可以构建出性能优异且开发体验出色的应用。
+
+在 Next.js 13+ 的 App Router 中，我们有了更多的选择：Server Components、Server Actions、Route Handlers 等。每种方式都有其适用场景。
+
+**本文将涵盖**：
+
+- 项目初始化和配置
+- Prisma 单例模式
+- Server Components 中使用
+- Server Actions 集成
+- Route Handlers 最佳实践
+- 数据缓存策略
+- 客户端组件模式
+- 部署配置
+
+---
+
+## 项目初始化
+
+### 创建 Next.js 项目
+
+```bash
+# 创建 Next.js 项目
+npx create-next-app@latest my-app --typescript --tailwind --app
+
+cd my-app
+
+# 安装 Prisma
+npm install prisma @prisma/client
+
+# 初始化 Prisma
+npx prisma init
+```
+
+### 配置 Prisma
+
+```prisma
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Post {
+  id        String   @id @default(uuid())
+  title     String
+  slug      String   @unique
+  content   String   @db.Text
+  excerpt   String?
+  cover     String?
+  status    String   @default("DRAFT")
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([authorId])
+  @@index([status])
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  username  String   @unique
+  password  String
+  bio       String?
+  avatar    String?
+  posts     Post[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+```
+
+### 环境变量
+
+```bash
+# .env.local
+DATABASE_URL="postgresql://user:password@localhost:5432/mydb"
+
+# .env.production
+DATABASE_URL="postgresql://user:password@prod-host:5432/mydb?sslmode=require"
+```
+
+---
+
+## Prisma 单例模式
+
+在开发环境中，为了避免创建多个数据库连接，我们需要使用单例模式。
+
+### 创建 Prisma 实例
+
+```typescript
+// lib/prisma.ts
+import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+export const prisma =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    log:
+      process.env.NODE_ENV === "development"
+        ? ["query", "error", "warn"]
+        : ["error"],
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+```
+
+---
+
+## Server Components 中使用
+
+### 基础用法
+
+Server Components 是 Next.js 的默认组件类型，可以直接在其中使用 Prisma。
+
+```typescript
+// app/posts/page.tsx
+import { prisma } from '@/lib/prisma'
+import Link from 'next/link'
+
+export default async function PostsPage() {
+  const posts = await prisma.post.findMany({
+    where: {
+      status: 'PUBLISHED',
+    },
+    include: {
+      author: {
+        select: {
+          id: true,
+          username: true,
+          avatar: true,
+        },
+      },
+    },
+    orderBy: {
+      createdAt: 'desc',
+    },
+  })
+
+  return (
+    <div className="container mx-auto px-4 py-8">
+      <h1 className="text-3xl font-bold mb-8">最新文章</h1>
+
+      <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
+        {posts.map((post) => (
+          <article
+            key={post.id}
+            className="border rounded-lg p-6 hover:shadow-lg transition"
+          >
+            <Link href={`/posts/${post.slug}`}>
+              <h2 className="text-xl font-semibold mb-2">{post.title}</h2>
+            </Link>
+
+            {post.excerpt && (
+              <p className="text-gray-600 mb-4">{post.excerpt}</p>
+            )}
+
+            <div className="flex items-center gap-2">
+              {post.author.avatar && (
+                <img
+                  src={post.author.avatar}
+                  alt={post.author.username}
+                  className="w-8 h-8 rounded-full"
+                />
+              )}
+              <span className="text-sm text-gray-500">
+                {post.author.username}
+              </span>
+            </div>
+          </article>
+        ))}
+      </div>
+    </div>
+  )
+}
+```
+
+### 动态路由
+
+```typescript
+// app/posts/[slug]/page.tsx
+import { prisma } from '@/lib/prisma'
+import { notFound } from 'next/navigation'
+
+interface Props {
+  params: {
+    slug: string
+  }
+}
+
+export default async function PostPage({ params }: Props) {
+  const post = await prisma.post.findUnique({
+    where: {
+      slug: params.slug,
+      status: 'PUBLISHED',
+    },
+    include: {
+      author: {
+        select: {
+          id: true,
+          username: true,
+          avatar: true,
+          bio: true,
+        },
+      },
+    },
+  })
+
+  if (!post) {
+    notFound()
+  }
+
+  return (
+    <article className="container mx-auto px-4 py-8 max-w-3xl">
+      <header className="mb-8">
+        <h1 className="text-4xl font-bold mb-4">{post.title}</h1>
+
+        <div className="flex items-center gap-4">
+          {post.author.avatar && (
+            <img
+              src={post.author.avatar}
+              alt={post.author.username}
+              className="w-12 h-12 rounded-full"
+            />
+          )}
+          <div>
+            <p className="font-semibold">{post.author.username}</p>
+            <p className="text-sm text-gray-500">
+              {new Date(post.createdAt).toLocaleDateString()}
+            </p>
+          </div>
+        </div>
+      </header>
+
+      <div className="prose prose-lg max-w-none">
+        {post.content}
+      </div>
+    </article>
+  )
+}
+```
+
+### 生成静态参数
+
+```typescript
+// app/posts/[slug]/page.tsx
+
+// 生成静态路径
+export async function generateStaticParams() {
+  const posts = await prisma.post.findMany({
+    where: {
+      status: "PUBLISHED",
+    },
+    select: {
+      slug: true,
+    },
+  });
+
+  return posts.map((post) => ({
+    slug: post.slug,
+  }));
+}
+
+// 设置为 ISR（增量静态再生成）
+export const revalidate = 3600; // 1小时
+```
+
+---
+
+## Server Actions
+
+### 创建文章
+
+```typescript
+// app/actions/posts.ts
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+import { prisma } from "@/lib/prisma";
+import { z } from "zod";
+
+const createPostSchema = z.object({
+  title: z.string().min(1).max(200),
+  slug: z.string().min(1).max(200),
+  content: z.string().min(1),
+  excerpt: z.string().optional(),
+  status: z.enum(["DRAFT", "PUBLISHED"]).default("DRAFT"),
+});
+
+export async function createPost(formData: FormData) {
+  "use server";
+
+  const validated = createPostSchema.safeParse({
+    title: formData.get("title"),
+    slug: formData.get("slug"),
+    content: formData.get("content"),
+    excerpt: formData.get("excerpt"),
+    status: formData.get("status"),
+  });
+
+  if (!validated.success) {
+    return {
+      success: false,
+      errors: validated.error.errors,
+    };
+  }
+
+  try {
+    const post = await prisma.post.create({
+      data: {
+        ...validated.data,
+        authorId: "user-id", // 从会话获取
+        publishedAt: validated.data.status === "PUBLISHED" ? new Date() : null,
+      },
+    });
+
+    revalidatePath("/posts");
+    revalidatePath("/admin/posts");
+
+    return {
+      success: true,
+      data: post,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: "Failed to create post",
+    };
+  }
+}
+
+export async function updatePost(id: string, formData: FormData) {
+  "use server";
+
+  const validated = createPostSchema.safeParse({
+    title: formData.get("title"),
+    slug: formData.get("slug"),
+    content: formData.get("content"),
+    excerpt: formData.get("excerpt"),
+    status: formData.get("status"),
+  });
+
+  if (!validated.success) {
+    return {
+      success: false,
+      errors: validated.error.errors,
+    };
+  }
+
+  try {
+    const post = await prisma.post.update({
+      where: { id },
+      data: {
+        ...validated.data,
+        publishedAt:
+          validated.data.status === "PUBLISHED" && !post.publishedAt
+            ? new Date()
+            : post.publishedAt,
+      },
+    });
+
+    revalidatePath("/posts");
+    revalidatePath(`/posts/${post.slug}`);
+    revalidatePath("/admin/posts");
+
+    return {
+      success: true,
+      data: post,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: "Failed to update post",
+    };
+  }
+}
+
+export async function deletePost(id: string) {
+  "use server";
+
+  try {
+    await prisma.post.delete({
+      where: { id },
+    });
+
+    revalidatePath("/posts");
+    revalidatePath("/admin/posts");
+
+    redirect("/admin/posts");
+  } catch (error) {
+    return {
+      success: false,
+      error: "Failed to delete post",
+    };
+  }
+}
+```
+
+### 使用 Server Actions
+
+```typescript
+// app/admin/posts/new/page.tsx
+import { createPost } from '@/app/actions/posts'
+
+export default function NewPostPage() {
+  async function handleSubmit(formData: FormData) {
+    'use server'
+
+    const result = await createPost(formData)
+
+    if (!result.success) {
+      // 处理错误
+      return
+    }
+
+    redirect(`/admin/posts/${result.data.id}`)
+  }
+
+  return (
+    <form action={handleSubmit}>
+      <input name="title" placeholder="标题" required />
+      <input name="slug" placeholder="Slug" required />
+      <textarea name="content" placeholder="内容" required />
+      <select name="status">
+        <option value="DRAFT">草稿</option>
+        <option value="PUBLISHED">发布</option>
+      </select>
+      <button type="submit">创建</button>
+    </form>
+  )
+}
+```
+
+---
+
+## Route Handlers
+
+### GET 请求
+
+```typescript
+// app/api/posts/route.ts
+import { prisma } from "@/lib/prisma";
+import { NextResponse } from "next/server";
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const page = parseInt(searchParams.get("page") || "1");
+  const limit = parseInt(searchParams.get("limit") || "10");
+  const status = searchParams.get("status");
+
+  const where: any = {};
+  if (status) {
+    where.status = status;
+  }
+
+  const [posts, total] = await Promise.all([
+    prisma.post.findMany({
+      where,
+      skip: (page - 1) * limit,
+      take: limit,
+      orderBy: { createdAt: "desc" },
+      include: {
+        author: {
+          select: {
+            id: true,
+            username: true,
+            avatar: true,
+          },
+        },
+      },
+    }),
+    prisma.post.count({ where }),
+  ]);
+
+  return NextResponse.json({
+    data: posts,
+    meta: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  });
+}
+```
+
+### POST 请求
+
+```typescript
+// app/api/posts/route.ts
+import { prisma } from "@/lib/prisma";
+import { NextResponse } from "next/server";
+import { z } from "zod";
+
+const createPostSchema = z.object({
+  title: z.string().min(1).max(200),
+  slug: z.string().min(1).max(200),
+  content: z.string().min(1),
+  status: z.enum(["DRAFT", "PUBLISHED"]).default("DRAFT"),
+});
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+
+    const validated = createPostSchema.safeParse(body);
+
+    if (!validated.success) {
+      return NextResponse.json(
+        {
+          success: false,
+          errors: validated.error.errors,
+        },
+        { status: 400 }
+      );
+    }
+
+    const post = await prisma.post.create({
+      data: {
+        ...validated.data,
+        authorId: "user-id", // 从会话获取
+        publishedAt: validated.data.status === "PUBLISHED" ? new Date() : null,
+      },
+    });
+
+    return NextResponse.json(
+      {
+        success: true,
+        data: post,
+      },
+      { status: 201 }
+    );
+  } catch (error) {
+    return NextResponse.json(
+      {
+        success: false,
+        error: "Failed to create post",
+      },
+      { status: 500 }
+    );
+  }
+}
+```
+
+### PUT 和 DELETE
+
+```typescript
+// app/api/posts/[id]/route.ts
+import { prisma } from "@/lib/prisma";
+import { NextResponse } from "next/server";
+
+interface Params {
+  params: {
+    id: string;
+  };
+}
+
+export async function PUT(request: Request, { params }: Params) {
+  try {
+    const body = await request.json();
+
+    const post = await prisma.post.update({
+      where: { id: params.id },
+      data: body,
+    });
+
+    return NextResponse.json({
+      success: true,
+      data: post,
+    });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        success: false,
+        error: "Failed to update post",
+      },
+      { status: 500 }
+    );
+  }
+}
+
+export async function DELETE(request: Request, { params }: Params) {
+  try {
+    await prisma.post.delete({
+      where: { id: params.id },
+    });
+
+    return NextResponse.json({
+      success: true,
+    });
+  } catch (error) {
+    return NextResponse.json(
+      {
+        success: false,
+        error: "Failed to delete post",
+      },
+      { status: 500 }
+    );
+  }
+}
+```
+
+---
+
+## 数据缓存策略
+
+### 使用 Next.js 缓存
+
+```typescript
+// app/posts/page.tsx
+import { prisma } from '@/lib/prisma'
+import { unstable_cache } from 'next/cache'
+
+export const revalidate = 60 // 60秒
+
+async function getPosts() {
+  return await unstable_cache(
+    async () => {
+      return await prisma.post.findMany({
+        where: { status: 'PUBLISHED' },
+        include: { author: true },
+        orderBy: { createdAt: 'desc' },
+      })
+    },
+    ['posts'],
+    {
+      revalidate: 60,
+      tags: ['posts'],
+    }
+  )()
+}
+
+export default async function PostsPage() {
+  const posts = await getPosts()
+
+  return (
+    <div>
+      {posts.map((post) => (
+        <div key={post.id}>{post.title}</div>
+      ))}
+    </div>
+  )
+}
+```
+
+### 按需重新验证
+
+```typescript
+// app/actions/posts.ts
+import { revalidatePath, revalidateTag } from "next/cache";
+
+export async function createPost(data: any) {
+  "use server";
+
+  const post = await prisma.post.create({
+    data,
+  });
+
+  // 重新验证路径
+  revalidatePath("/posts");
+  revalidatePath("/admin/posts");
+
+  // 重新验证标签
+  revalidateTag("posts");
+
+  return post;
+}
+```
+
+### 使用 React Cache
+
+```typescript
+// lib/cache.ts
+'use client'
+
+import { cache } from 'react'
+
+export const fetchPosts = cache(async (prisma: PrismaClient) => {
+  return await prisma.post.findMany({
+    where: { status: 'PUBLISHED' },
+    include: { author: true },
+  })
+})
+
+// 在组件中使用
+// app/posts/page.tsx
+import { prisma } from '@/lib/prisma'
+import { fetchPosts } from '@/lib/cache'
+
+export default async function PostsPage() {
+  const posts = await fetchPosts(prisma)
+
+  return (
+    <div>
+      {posts.map((post) => (
+        <div key={post.id}>{post.title}</div>
+      ))}
+    </div>
+  )
+}
+```
+
+---
+
+## 客户端组件模式
+
+### 使用 API Routes
+
+```typescript
+// lib/hooks/usePosts.ts
+"use client";
+
+import { useState, useEffect } from "react";
+
+interface Post {
+  id: string;
+  title: string;
+  slug: string;
+}
+
+export function usePosts() {
+  const [posts, setPosts] = useState<Post[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    async function fetchPosts() {
+      try {
+        const response = await fetch("/api/posts");
+        const data = await response.json();
+
+        if (data.success) {
+          setPosts(data.data);
+        } else {
+          setError(data.error);
+        }
+      } catch (err) {
+        setError("Failed to fetch posts");
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchPosts();
+  }, []);
+
+  return { posts, loading, error };
+}
+```
+
+### 使用 Server Actions
+
+```typescript
+// components/PostList.tsx
+'use client'
+
+import { useTransition } from 'react'
+import { deletePost } from '@/app/actions/posts'
+
+export function PostList({ posts }: { posts: any[] }) {
+  const [isPending, startTransition] = useTransition()
+
+  const handleDelete = (id: string) => {
+    startTransition(async () => {
+      await deletePost(id)
+    })
+  }
+
+  return (
+    <ul>
+      {posts.map((post) => (
+        <li key={post.id}>
+          {post.title}
+          <button
+            onClick={() => handleDelete(post.id)}
+            disabled={isPending}
+          >
+            删除
+          </button>
+        </li>
+      ))}
+    </ul>
+  )
+}
+```
+
+---
+
+## 认证集成
+
+### 使用 NextAuth.js
+
+```bash
+npm install next-auth @auth/prisma-adapter
+```
+
+```typescript
+// app/api/auth/[...nextauth]/route.ts
+import NextAuth from "next-auth";
+import { PrismaAdapter } from "@auth/prisma-adapter";
+import { prisma } from "@/lib/prisma";
+
+export const { handlers, auth } = NextAuth({
+  adapter: PrismaAdapter(prisma),
+  session: {
+    strategy: "jwt",
+  },
+  providers: [
+    // 配置 providers
+  ],
+});
+```
+
+### 获取当前用户
+
+```typescript
+// lib/auth.ts
+import { auth } from '@/app/api/auth/[...nextauth]/route'
+
+export async function getCurrentUser() {
+  const session = await auth()
+
+  if (!session?.user?.email) {
+    return null
+  }
+
+  const user = await prisma.user.findUnique({
+    where: { email: session.user.email },
+  })
+
+  return user
+}
+
+// 在组件中使用
+// app/admin/page.tsx
+import { getCurrentUser } from '@/lib/auth'
+import { redirect } from 'next/navigation'
+
+export default async function AdminPage() {
+  const user = await getCurrentUser()
+
+  if (!user || user.role !== 'ADMIN') {
+    redirect('/')
+  }
+
+  return <div>Admin Dashboard</div>
+}
+```
+
+---
+
+## 部署配置
+
+### Vercel 部署
+
+```bash
+# 1. 安装 Prisma 适配器
+npm install @prisma/adapter-pg
+
+# 2. 配置环境变量
+# DATABASE_URL
+# DIRECT_URL
+
+# 3. 部署
+git push vercel main
+```
+
+### Docker 部署
+
+```dockerfile
+# Dockerfile
+FROM node:20-alpine AS base
+
+# 安装依赖
+FROM base AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+
+# 生成 Prisma Client
+FROM base AS prisma-generate
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY prisma ./prisma
+RUN npx prisma generate
+
+# 构建应用
+FROM base AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=prisma-generate /app/node_modules/.prisma ./node_modules/.prisma
+COPY . .
+RUN npm run build
+
+# 生产镜像
+FROM base AS runner
+WORKDIR /app
+ENV NODE_ENV production
+
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
+
+COPY --from=build /app/public ./public
+COPY --from=build /app/package*.json ./
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/.next/standalone ./
+COPY --from=build /app/.next/static ./.next/static
+
+USER nextjs
+
+EXPOSE 3000
+
+ENV PORT 3000
+ENV HOSTNAME "0.0.0.0"
+
+CMD ["node", "server.js"]
+```
+
+---
+
+## 最佳实践
+
+### 1. 使用 Server Components
+
+```typescript
+// ✅ 好：默认使用 Server Components
+export default async function PostsPage() {
+  const posts = await prisma.post.findMany()
+  return <div>{/* ... */}</div>
+}
+
+// ❌ 避免：不必要的客户端组件
+'use client'
+export default function PostsPage() {
+  const [posts, setPosts] = useState([])
+  useEffect(() => {
+    fetchPosts().then(setPosts)
+  }, [])
+  return <div>{/* ... */}</div>
+}
+```
+
+### 2. 合理使用缓存
+
+```typescript
+// ✅ 好：使用适当的缓存策略
+export const revalidate = 3600; // 1小时
+
+// ✅ 好：按需重新验证
+revalidatePath("/posts");
+revalidateTag("posts");
+```
+
+### 3. 错误处理
+
+```typescript
+// ✅ 好：完善的错误处理
+export async function GET() {
+  try {
+    const posts = await prisma.post.findMany();
+    return NextResponse.json({ success: true, data: posts });
+  } catch (error) {
+    console.error("Failed to fetch posts:", error);
+    return NextResponse.json(
+      { success: false, error: "Failed to fetch posts" },
+      { status: 500 }
+    );
+  }
+}
+```
+
+---
+
+## 常见问题
+
+**Q: Server Components 和 Client Components 如何选择？**
+
+A：默认使用 Server Components，只在需要交互（如 onClick）时使用 `'use client'`。
+
+**Q: 如何处理文件上传？**
+
+A：使用 Server Actions 或 API Routes 处理文件上传，存储到云服务后保存 URL 到数据库。
+
+**Q: 如何实现实时更新？**
+
+A：使用 Server-Sent Events (SSE) 或 WebSocket，结合 Prisma 的查询实现。
+
+---
+
+## 总结
+
+通过本文，我们深入掌握了：
+
+✅ Next.js 项目初始化和配置
+✅ Prisma 单例模式实现
+✅ Server Components 中使用 Prisma
+✅ Server Actions 集成方法
+✅ Route Handlers 最佳实践
+✅ 数据缓存和重新验证策略
+✅ 客户端组件模式
+✅ 认证集成和部署配置
+
+掌握 Next.js 集成后，你可以构建出现代化的全栈应用。下一步，我们将学习**与 Hono 的集成**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- Hono 中集成 Prisma
+- 中间件配置
+- Context 注入
+- 路由组织
+- 错误处理
+- 边缘运行时支持
+- 测试策略
+- 性能优化
+
+继续阅读：[与 Hono 集成](./15-hono-integration.mdx)

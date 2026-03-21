@@ -1,0 +1,1198 @@
+---
+title: "Prisma 关系查询与数据加载：掌握 Include、Select 和懒加载"
+date: "2026-03-26"
+summary: "深入理解 Prisma 的关系数据加载机制，掌握 Include、Select、懒加载等策略，学会避免 N+1 查询问题，优化关系查询性能。"
+tags: ["Prisma", "Relations", "Data Loading", "Performance", "N+1"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 6
+---
+
+## 前言
+
+在实际应用中，我们很少只查询单一的数据实体。更多时候，我们需要同时获取相关的数据：查询文章时需要作者信息，查询用户时需要其文章列表，查询评论时需要回复关系。
+
+这就是关系查询的场景。Prisma 提供了多种加载关系数据的方式，每种方式都有其适用场景。选择正确的加载策略，不仅能简化代码，还能显著提升性能。
+
+**本文将涵盖**：
+
+- Include 与 Select 的区别
+- 嵌套关系查询
+- 关系筛选和排序
+- 懒加载策略
+- 避免 N+1 查询问题
+- 关系计数和聚合
+- Flatten 关系数据
+- 关系查询性能优化
+
+---
+
+## Include 与 Select
+
+### Include：加载完整关系
+
+`include` 用于加载完整的关联对象：
+
+```typescript
+// 加载文章的作者
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  include: {
+    author: true, // 加载完整的 author 对象
+  },
+});
+
+// 返回：
+// {
+//   id: 'post-1',
+//   title: '文章标题',
+//   author: {
+//     id: 'user-1',
+//     email: 'author@example.com',
+//     username: 'author',
+//     password: 'hashed', // 包含所有字段
+//     ...
+//   }
+// }
+```
+
+### Select：精确控制字段
+
+`select` 用于精确控制查询的字段：
+
+```typescript
+// 只查询作者的部分字段
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  include: {
+    author: {
+      select: {
+        id: true,
+        username: true,
+        avatar: true,
+        password: false, // 不查询密码
+      },
+    },
+  },
+});
+
+// 返回：
+// {
+//   id: 'post-1',
+//   title: '文章标题',
+//   author: {
+//     id: 'user-1',
+//     username: 'author',
+//     avatar: 'https://...',
+//   }
+// }
+```
+
+### 顶层 Select 也可以加载关系
+
+```typescript
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  select: {
+    id: true,
+    title: true,
+    content: true,
+    author: {
+      select: {
+        id: true,
+        username: true,
+      },
+    },
+    tags: {
+      select: {
+        id: true,
+        name: true,
+      },
+    },
+  },
+});
+```
+
+### Include vs Select 选择指南
+
+```typescript
+// ✅ 使用 Include：需要关联对象的大部分字段
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  include: {
+    author: true,
+    tags: true,
+  },
+});
+
+// ✅ 使用 Select：只需要特定字段
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  select: {
+    id: true,
+    title: true,
+    author: {
+      select: {
+        username: true,
+      },
+    },
+  },
+});
+
+// ✅ 使用 Select + Include：混合使用
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  select: {
+    id: true,
+    title: true,
+    content: false, // 不查询内容（可能很大）
+    author: true, // 但需要完整的 author
+  },
+});
+```
+
+---
+
+## 嵌套关系查询
+
+### 多层嵌套查询
+
+```typescript
+// 查询用户及其文章，以及文章的评论
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  include: {
+    posts: {
+      where: {
+        status: "PUBLISHED",
+      },
+      include: {
+        comments: {
+          where: {
+            status: "APPROVED",
+          },
+          include: {
+            author: {
+              select: {
+                username: true,
+                avatar: true,
+              },
+            },
+          },
+          orderBy: {
+            createdAt: "desc",
+          },
+        },
+        tags: true,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    },
+  },
+});
+```
+
+### 深层嵌套示例
+
+```typescript
+// 查询评论树（嵌套回复）
+const comment = await prisma.comment.findUnique({
+  where: { id: commentId },
+  include: {
+    author: {
+      select: {
+        username: true,
+        avatar: true,
+      },
+    },
+    parent: {
+      include: {
+        author: {
+          select: {
+            username: true,
+          },
+        },
+      },
+    },
+    replies: {
+      include: {
+        author: {
+          select: {
+            username: true,
+            avatar: true,
+          },
+        },
+        replies: {
+          // 继续嵌套
+          include: {
+            author: true,
+          },
+        },
+      },
+    },
+  },
+});
+```
+
+### 嵌套查询的最佳实践
+
+```typescript
+// ❌ 避免：过深的嵌套影响性能
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  include: {
+    posts: {
+      include: {
+        comments: {
+          include: {
+            author: {
+              include: {
+                posts: {
+                  include: {
+                    comments: true,
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+});
+
+// ✅ 推荐：分步查询，每层独立
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  include: {
+    posts: {
+      include: {
+        comments: {
+          include: {
+            author: {
+              select: {
+                id: true,
+                username: true,
+              },
+            },
+          },
+        },
+      },
+    },
+  },
+});
+```
+
+---
+
+## 关系筛选和排序
+
+### 筛选关联数据
+
+```typescript
+// 查询用户，但只加载已发布的文章
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  include: {
+    posts: {
+      where: {
+        status: "PUBLISHED",
+        publishedAt: {
+          lte: new Date(),
+        },
+      },
+    },
+  },
+});
+
+// 查询文章，但只加载顶级评论
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  include: {
+    comments: {
+      where: {
+        parentId: null, // 只查询顶级评论
+        status: "APPROVED",
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+    },
+  },
+});
+```
+
+### 排序关联数据
+
+```typescript
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  include: {
+    posts: {
+      orderBy: [{ featured: "desc" }, { createdAt: "desc" }],
+      take: 10,
+    },
+  },
+});
+```
+
+### 关系筛选实战
+
+```typescript
+// 查询有未读消息的用户
+const users = await prisma.user.findMany({
+  include: {
+    notifications: {
+      where: {
+        read: false,
+      },
+      select: {
+        id: true,
+      },
+    },
+  },
+});
+
+// 筛选出有未读消息的用户
+const usersWithUnread = users.filter((user) => user.notifications.length > 0);
+
+// 或者使用关系数量查询
+const users = await prisma.user.findMany({
+  where: {
+    notifications: {
+      some: {
+        read: false,
+      },
+    },
+  },
+});
+```
+
+---
+
+## 懒加载策略
+
+### 什么是懒加载？
+
+懒加载是指只在真正需要时才查询关联数据。
+
+### 手动懒加载
+
+```typescript
+// 先查询文章
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  select: {
+    id: true,
+    title: true,
+    authorId: true,
+  },
+});
+
+// 条件判断：是否需要加载作者
+if (needsAuthor) {
+  const author = await prisma.user.findUnique({
+    where: { id: post.authorId },
+    select: {
+      id: true,
+      username: true,
+    },
+  });
+
+  return {
+    ...post,
+    author,
+  };
+}
+
+return post;
+```
+
+### 动态加载关系
+
+```typescript
+// 根据查询参数动态决定加载哪些关系
+async function getPost(id: string, include?: string[]) {
+  const includeOptions: any = {};
+
+  if (include?.includes("author")) {
+    includeOptions.author = {
+      select: {
+        id: true,
+        username: true,
+        avatar: true,
+      },
+    };
+  }
+
+  if (include?.includes("comments")) {
+    includeOptions.comments = {
+      where: {
+        parentId: null,
+      },
+      take: 10,
+    };
+  }
+
+  if (include?.includes("tags")) {
+    includeOptions.tags = true;
+  }
+
+  return await prisma.post.findUnique({
+    where: { id },
+    include:
+      Object.keys(includeOptions).length > 0 ? includeOptions : undefined,
+  });
+}
+
+// 使用
+const post = await getPost(postId, ["author", "comments"]);
+```
+
+---
+
+## 避免 N+1 查询问题
+
+### 什么是 N+1 问题？
+
+N+1 问题是指在循环中执行数据库查询，导致 1 次初始查询 + N 次循环查询。
+
+### 问题示例
+
+```typescript
+// ❌ N+1 问题
+const posts = await prisma.post.findMany({
+  take: 100,
+});
+
+// 每次循环都查询数据库
+for (const post of posts) {
+  const author = await prisma.user.findUnique({
+    where: { id: post.authorId },
+  });
+
+  post.author = author;
+}
+
+// 结果：1 次查询 posts + 100 次查询 authors = 101 次查询
+```
+
+### 解决方案：预加载
+
+```typescript
+// ✅ 使用 Include 一次性加载
+const posts = await prisma.post.findMany({
+  take: 100,
+  include: {
+    author: {
+      select: {
+        id: true,
+        username: true,
+        avatar: true,
+      },
+    },
+  },
+});
+
+// 结果：1 次查询（使用 JOIN）
+```
+
+### 解决方案：分离查询
+
+```typescript
+// ✅ 先查询所有文章
+const posts = await prisma.post.findMany({
+  take: 100,
+  select: {
+    id: true,
+    title: true,
+    authorId: true,
+  },
+});
+
+// 收集所有作者 ID
+const authorIds = [...new Set(posts.map((p) => p.authorId))];
+
+// 一次性查询所有作者
+const authors = await prisma.user.findMany({
+  where: {
+    id: { in: authorIds },
+  },
+  select: {
+    id: true,
+    username: true,
+    avatar: true,
+  },
+});
+
+// 构建 author map
+const authorMap = new Map(authors.map((a) => [a.id, a]));
+
+// 组合数据
+const postsWithAuthors = posts.map((post) => ({
+  ...post,
+  author: authorMap.get(post.authorId),
+}));
+
+// 结果：2 次查询（而非 101 次）
+```
+
+### 实战案例：多层关系避免 N+1
+
+```typescript
+// ❌ N+1 问题
+const users = await prisma.user.findMany();
+for (const user of users) {
+  const posts = await prisma.post.findMany({
+    where: { authorId: user.id },
+  });
+  for (const post of posts) {
+    const comments = await prisma.comment.findMany({
+      where: { postId: post.id },
+    });
+    post.comments = comments;
+  }
+  user.posts = posts;
+}
+
+// ✅ 一次性加载
+const users = await prisma.user.findMany({
+  include: {
+    posts: {
+      include: {
+        comments: true,
+      },
+    },
+  },
+});
+```
+
+---
+
+## 关系计数和聚合
+
+### \_count：关系计数
+
+```typescript
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  include: {
+    _count: {
+      select: {
+        posts: true,
+        comments: true,
+        likes: true,
+      },
+    },
+  },
+});
+
+// 返回：
+// {
+//   id: 'user-1',
+//   username: 'john',
+//   _count: {
+//     posts: 15,
+//     comments: 42,
+//     likes: 128,
+//   }
+// }
+```
+
+### 条件计数
+
+```typescript
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  include: {
+    _count: {
+      select: {
+        posts: {
+          where: {
+            status: "PUBLISHED",
+          },
+        },
+        comments: {
+          where: {
+            status: "APPROVED",
+          },
+        },
+      },
+    },
+  },
+});
+```
+
+### 聚合关系数据
+
+```typescript
+const author = await prisma.user.findUnique({
+  where: { id: authorId },
+  include: {
+    posts: {
+      select: {
+        _count: {
+          select: {
+            comments: true,
+            likes: true,
+          },
+        },
+        views: true,
+      },
+    },
+  },
+});
+
+// 计算总数
+const totalStats = author.posts.reduce(
+  (acc, post) => ({
+    comments: acc.comments + post._count.comments,
+    likes: acc.likes + post._count.likes,
+    views: acc.views + post.views,
+  }),
+  { comments: 0, likes: 0, views: 0 }
+);
+```
+
+### 使用 GroupBy 进行聚合
+
+```typescript
+// 统计每个作者的文章数
+const authorStats = await prisma.post.groupBy({
+  by: ["authorId"],
+  _count: {
+    id: true,
+  },
+  _avg: {
+    views: true,
+  },
+});
+
+// 获取作者详细信息
+const authorIds = authorStats.map((stat) => stat.authorId);
+const authors = await prisma.user.findMany({
+  where: {
+    id: { in: authorIds },
+  },
+});
+
+// 组合数据
+const result = authorStats.map((stat) => ({
+  author: authors.find((a) => a.id === stat.authorId),
+  postCount: stat._count.id,
+  avgViews: stat._avg.views,
+}));
+```
+
+---
+
+## Flatten 关系数据
+
+### 什么是 Flatten？
+
+Flatten 是将嵌套的关系数据"扁平化"，减少嵌套层级。
+
+### 使用 Select 进行 Flatten
+
+```typescript
+// ❌ 嵌套结构
+const posts = await prisma.post.findMany({
+  include: {
+    author: {
+      select: {
+        id: true,
+        username: true,
+        email: true,
+      },
+    },
+  },
+});
+
+// 返回：
+// [
+//   {
+//     id: 'post-1',
+//     title: '文章',
+//     author: {
+//       id: 'user-1',
+//       username: 'john',
+//       email: 'john@example.com',
+//     }
+//   }
+// ]
+
+// ✅ Flatten 结构
+const posts = await prisma.post.findMany({
+  select: {
+    id: true,
+    title: true,
+    authorId: true,
+    authorUsername: true, // 不存在，需要其他方式
+  },
+});
+```
+
+### 使用原始 SQL 进行 Flatten
+
+```typescript
+const posts = await prisma.$queryRaw<
+  Array<{
+    id: string;
+    title: string;
+    author_id: string;
+    author_username: string;
+    author_email: string;
+  }>
+>`
+  SELECT
+    p.id,
+    p.title,
+    p.author_id,
+    u.username as author_username,
+    u.email as author_email
+  FROM posts p
+  JOIN users u ON p.author_id = u.id
+`;
+
+// 返回扁平化结构
+// [
+//   {
+//     id: 'post-1',
+//     title: '文章',
+//     author_id: 'user-1',
+//     author_username: 'john',
+//     author_email: 'john@example.com'
+//   }
+// ]
+```
+
+### 应用层 Flatten
+
+```typescript
+const posts = await prisma.post.findMany({
+  include: {
+    author: {
+      select: {
+        id: true,
+        username: true,
+        email: true,
+      },
+    },
+  },
+});
+
+// 应用层 Flatten
+const flattenedPosts = posts.map((post) => ({
+  id: post.id,
+  title: post.title,
+  authorId: post.author.id,
+  authorUsername: post.author.username,
+  authorEmail: post.author.email,
+}));
+```
+
+---
+
+## 关系查询性能优化
+
+### 1. 只查询需要的字段
+
+```typescript
+// ✅ 只查询需要的字段
+const posts = await prisma.post.findMany({
+  include: {
+    author: {
+      select: {
+        id: true,
+        username: true,
+        avatar: true,
+        // 不查询 email, password 等字段
+      },
+    },
+  },
+});
+```
+
+### 2. 限制关联数据数量
+
+```typescript
+// ✅ 限制评论数量
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  include: {
+    comments: {
+      take: 10, // 只查询前 10 条评论
+      orderBy: {
+        createdAt: "desc",
+      },
+    },
+  },
+});
+```
+
+### 3. 使用游标分页
+
+```typescript
+// ✅ 使用游标分页加载大量关系数据
+async function getPostComments(postId: string, cursor: string | null) {
+  return await prisma.comment.findMany({
+    where: {
+      postId,
+      parentId: null, // 顶级评论
+    },
+    take: 20,
+    skip: cursor ? 1 : 0,
+    cursor: cursor ? { id: cursor } : undefined,
+    orderBy: { createdAt: "desc" },
+    include: {
+      author: {
+        select: {
+          id: true,
+          username: true,
+          avatar: true,
+        },
+      },
+    },
+  });
+}
+```
+
+### 4. 批量加载优化
+
+```typescript
+// ✅ 批量查询避免 N+1
+async function getPostsWithAuthors(postIds: string[]) {
+  const posts = await prisma.post.findMany({
+    where: {
+      id: { in: postIds },
+    },
+    select: {
+      id: true,
+      title: true,
+      authorId: true,
+    },
+  });
+
+  const authorIds = [...new Set(posts.map((p) => p.authorId))];
+
+  const [authors, commentCounts] = await Promise.all([
+    prisma.user.findMany({
+      where: { id: { in: authorIds } },
+      select: {
+        id: true,
+        username: true,
+        avatar: true,
+      },
+    }),
+    prisma.comment.groupBy({
+      by: ["postId"],
+      where: {
+        postId: { in: postIds },
+      },
+      _count: { id: true },
+    }),
+  ]);
+
+  const authorMap = new Map(authors.map((a) => [a.id, a]));
+  const commentCountMap = new Map(
+    commentCounts.map((c) => [c.postId, c._count.id])
+  );
+
+  return posts.map((post) => ({
+    ...post,
+    author: authorMap.get(post.authorId),
+    commentCount: commentCountMap.get(post.id) || 0,
+  }));
+}
+```
+
+---
+
+## 完整示例：博客 API
+
+```typescript
+import { PrismaClient } from "@prisma/client";
+
+const prisma = new PrismaClient();
+
+interface PostQueryParams {
+  include?: string[];
+  cursor?: string;
+  limit?: number;
+}
+
+export async function getPosts(params: PostQueryParams) {
+  const { include = [], cursor, limit = 20 } = params;
+
+  // 构建 include 选项
+  const includeOptions: any = {};
+
+  if (include.includes("author")) {
+    includeOptions.author = {
+      select: {
+        id: true,
+        username: true,
+        avatar: true,
+      },
+    };
+  }
+
+  if (include.includes("stats")) {
+    includeOptions._count = {
+      select: {
+        comments: true,
+        likes: true,
+      },
+    };
+  }
+
+  if (include.includes("tags")) {
+    includeOptions.tags = {
+      select: {
+        id: true,
+        name: true,
+        slug: true,
+      },
+    };
+  }
+
+  // 查询文章
+  const posts = await prisma.post.findMany({
+    where: {
+      status: "PUBLISHED",
+    },
+    take: limit,
+    skip: cursor ? 1 : 0,
+    cursor: cursor ? { id: cursor } : undefined,
+    orderBy: { publishedAt: "desc" },
+    include:
+      Object.keys(includeOptions).length > 0 ? includeOptions : undefined,
+  });
+
+  // 返回游标
+  return {
+    data: posts,
+    nextCursor: posts.length === limit ? posts[posts.length - 1].id : null,
+  };
+}
+
+export async function getPostWithFullRelations(id: string) {
+  return await prisma.post.findUnique({
+    where: { id },
+    include: {
+      author: {
+        select: {
+          id: true,
+          username: true,
+          avatar: true,
+          bio: true,
+        },
+      },
+      tags: {
+        select: {
+          id: true,
+          name: true,
+          slug: true,
+        },
+      },
+      comments: {
+        where: {
+          parentId: null, // 顶级评论
+        },
+        include: {
+          author: {
+            select: {
+              id: true,
+              username: true,
+              avatar: true,
+            },
+          },
+          replies: {
+            include: {
+              author: {
+                select: {
+                  id: true,
+                  username: true,
+                  avatar: true,
+                },
+              },
+            },
+          },
+        },
+        orderBy: { createdAt: "desc" },
+      },
+      _count: {
+        select: {
+          comments: true,
+          likes: true,
+        },
+      },
+    },
+  });
+}
+
+// 使用示例
+const posts = await getPosts({
+  include: ["author", "stats", "tags"],
+  limit: 20,
+});
+
+const post = await getPostWithFullRelations(postId);
+```
+
+---
+
+## 最佳实践
+
+### 1. 合理使用 Include
+
+```typescript
+// ✅ 只包含必要的关系
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  include: {
+    author: true,
+  },
+});
+
+// ❌ 避免加载所有可能的关系
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  include: {
+    author: true,
+    comments: true,
+    tags: true,
+    likes: true,
+    // ... 更多关系
+  },
+});
+```
+
+### 2. 优先使用 Select
+
+```typescript
+// ✅ 使用 Select 只查询需要的字段
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  select: {
+    id: true,
+    username: true,
+    avatar: true,
+  },
+});
+
+// ❌ 避免查询所有字段
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+});
+```
+
+### 3. 批量操作代替循环
+
+```typescript
+// ✅ 批量查询
+const posts = await prisma.post.findMany({
+  include: {
+    author: true,
+  },
+});
+
+// ❌ 避免循环查询
+for (const post of posts) {
+  post.author = await prisma.user.findUnique({
+    where: { id: post.authorId },
+  });
+}
+```
+
+---
+
+## 常见问题
+
+**Q: Include 和 Select 可以同时使用吗？**
+
+A: 可以！Select 可以包含 Include，Include 可以包含 Select：
+
+```typescript
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  select: {
+    id: true,
+    title: true,
+    author: {
+      select: {
+        username: true,
+      },
+    },
+  },
+});
+```
+
+**Q: 如何查询深层嵌套关系？**
+
+A: 使用嵌套的 Include：
+
+```typescript
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  include: {
+    posts: {
+      include: {
+        comments: {
+          include: {
+            author: true,
+          },
+        },
+      },
+    },
+  },
+});
+```
+
+**Q: N+1 问题如何检测？**
+
+A: 启用 Prisma 查询日志：
+
+```typescript
+const prisma = new PrismaClient({
+  log: ["query"],
+});
+```
+
+查看日志中的查询数量。
+
+---
+
+## 总结
+
+通过本文，我们深入掌握了：
+
+✅ Include 与 Select 的区别和选择
+✅ 嵌套关系查询的技巧
+✅ 关系筛选和排序
+✅ 懒加载策略的实现
+✅ N+1 问题的原因和解决方案
+✅ 关系计数和聚合查询
+✅ Flatten 关系数据的方法
+✅ 关系查询性能优化
+
+掌握关系查询和数据加载后，你可以构建出高效且易于维护的数据访问层。下一步，我们将学习**数据迁移与版本管理**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- Migration 工作原理
+- 创建和应用迁移
+- 迁移版本管理
+- 回滚策略
+- 种子数据管理
+- 生产环境迁移
+- 迁移最佳实践
+
+继续阅读：[数据迁移与版本管理](./07-migrations.mdx)

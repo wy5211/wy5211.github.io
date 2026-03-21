@@ -1,0 +1,936 @@
+---
+title: "Prisma 多数据库支持与部署：从开发到生产"
+date: "2026-04-01"
+summary: "掌握 Prisma 在不同数据库和运行时环境中的配置，学习从开发到生产的完整部署流程，以及云数据库的集成。"
+tags:
+  ["Prisma", "Deployment", "PostgreSQL", "MySQL", "SQLite", "Cloud Database"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 12
+---
+
+## 前言
+
+现代应用需要在不同的环境中运行：本地开发、测试环境、预生产环境、生产环境。每个环境可能使用不同的数据库，甚至不同类型的数据库。
+
+Prisma 的强大之处在于，它支持多种数据库，并且可以在不同环境之间平滑切换。掌握这些配置和部署技巧，是构建生产级应用的关键。
+
+**本文将涵盖**：
+
+- 支持的数据库类型
+- 数据库切换策略
+- 环境变量管理
+- 开发环境配置
+- 测试环境配置
+- 生产环境部署
+- 云数据库集成
+- 数据库备份和恢复
+
+---
+
+## 支持的数据库类型
+
+### PostgreSQL
+
+```prisma
+// schema.prisma
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+```
+
+**特点**：
+
+- ✅ 功能最丰富
+- ✅ 最好的 Prisma 支持
+- ✅ 支持复杂查询和索引
+- ✅ 支持 JSON、数组等高级类型
+
+**适用场景**：生产环境、复杂应用
+
+### MySQL
+
+```prisma
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+```
+
+**特点**：
+
+- ✅ 广泛使用
+- ✅ 良好的 Prisma 支持
+- ✅ 性能优秀
+
+**适用场景**：传统应用、已有 MySQL 基础设施
+
+### SQLite
+
+```prisma
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+```
+
+**特点**：
+
+- ✅ 无需服务器
+- ✅ 零配置
+- ✅ 适合开发和测试
+
+**适用场景**：本地开发、小型应用、边缘计算
+
+### SQL Server
+
+```prisma
+datasource db {
+  provider = "sqlserver"
+  url      = env("DATABASE_URL")
+}
+```
+
+**特点**：
+
+- ✅ 企业级功能
+- ✅ 良好的 Windows 集成
+
+**适用场景**：企业环境、.NET 应用
+
+### MongoDB (Preview)
+
+```prisma
+datasource db {
+  provider = "mongodb"
+  url      = env("DATABASE_URL")
+}
+```
+
+**特点**：
+
+- ✅ 文档数据库
+- ⚠️ Preview 功能
+
+**适用场景**：灵活数据模型、原型开发
+
+---
+
+## 环境变量管理
+
+### 基础配置
+
+```bash
+# .env
+DATABASE_URL="postgresql://user:password@localhost:5432/mydb?schema=public"
+
+# .env.development
+DATABASE_URL="postgresql://user:password@localhost:5432/mydb_dev?schema=public"
+
+# .env.test
+DATABASE_URL="file:./test.db"
+
+# .env.production
+DATABASE_URL="postgresql://user:password@prod-host:5432/mydb_prod?sslmode=require&schema=public"
+```
+
+### 连接字符串参数
+
+```bash
+# PostgreSQL 连接字符串格式
+postgresql://[user[:password]@][host][:port][/dbname][?param1=value1&param2=value2]
+
+# 常用参数
+?schema=public              # Schema 名称
+&sslmode=require            # 强制 SSL
+&connection_limit=10        # 连接池大小
+&pool_timeout=20            # 连接池超时（秒）
+&connect_timeout=10         # 连接超时（秒）
+
+# 示例
+DATABASE_URL="postgresql://user:password@host:5432/dbname?schema=public&sslmode=require&connection_limit=10"
+```
+
+### 环境变量最佳实践
+
+```typescript
+// lib/db.ts
+import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+export const prisma =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    log:
+      process.env.NODE_ENV === "development"
+        ? ["query", "error", "warn"]
+        : ["error"],
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+```
+
+---
+
+## 开发环境配置
+
+### 使用 SQLite（推荐新手）
+
+```bash
+# .env
+DATABASE_URL="file:./dev.db"
+
+# 部署命令
+npx prisma migrate dev --name init
+npx prisma studio
+```
+
+### 使用 Docker PostgreSQL
+
+```yaml
+# docker-compose.yml
+version: "3.8"
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: prisma_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: prisma
+      POSTGRES_PASSWORD: prisma
+      POSTGRES_DB: myapp
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
+```
+
+```bash
+# 启动数据库
+docker-compose up -d
+
+# .env
+DATABASE_URL="postgresql://prisma:prisma@localhost:5432/myapp?schema=public"
+```
+
+### 多环境配置
+
+```typescript
+// prisma/schema.prisma
+
+// 开发环境
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// 或者使用环境特定的配置
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL") // 用于迁移
+}
+```
+
+---
+
+## 测试环境配置
+
+### 使用 SQLite
+
+```bash
+# .env.test
+DATABASE_URL="file:./test.db"
+
+# vitest.config.ts
+import { defineConfig } from 'vitest/config'
+
+export default defineConfig({
+  test: {
+    environment: 'node',
+    setupFiles: ['./tests/setup.ts'],
+  },
+})
+
+// tests/setup.ts
+import { PrismaClient } from '@prisma/client'
+
+const prisma = new PrismaClient()
+
+beforeEach(async () => {
+  // 清理数据库
+  await prisma.comment.deleteMany()
+  await prisma.post.deleteMany()
+  await prisma.user.deleteMany()
+})
+
+afterAll(async () => {
+  await prisma.$disconnect()
+})
+```
+
+### 使用事务回滚
+
+```typescript
+// tests/setup.ts
+import { PrismaClient } from "@prisma/client";
+
+const prisma = new PrismaClient();
+
+let transaction: Prisma.TransactionClient;
+
+beforeEach(async () => {
+  transaction = await prisma.$begin();
+});
+
+afterEach(async () => {
+  await transaction.$rollback();
+});
+
+// 在测试中使用 transaction 而不是 prisma
+test("should create user", async () => {
+  const user = await transaction.user.create({
+    data: {
+      email: "test@example.com",
+      username: "test",
+    },
+  });
+
+  expect(user).toHaveProperty("id");
+});
+```
+
+---
+
+## 生产环境部署
+
+### Vercel 部署
+
+```bash
+# 1. 安装 Prisma 适配器
+npm install @prisma/adapter-pg
+
+# 2. 更新 schema.prisma
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  directUrl  = env("DIRECT_URL")
+}
+
+# 3. 配置 Vercel 环境变量
+# DATABASE_URL: postgresql://...
+# DIRECT_URL: postgresql://...
+
+# 4. 部署
+git push vercel main
+```
+
+```typescript
+// lib/db.ts
+import { PrismaClient } from "@prisma/client";
+import { Pool } from "pg";
+import { PrismaPg } from "@prisma/adapter-pg";
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+});
+
+const adapter = new PrismaPg(pool);
+
+export const prisma = new PrismaClient({
+  adapter,
+});
+```
+
+### Docker 部署
+
+```dockerfile
+# Dockerfile
+FROM node:20-alpine AS base
+
+# 安装依赖
+FROM base AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+
+# 生成 Prisma Client
+FROM base AS prisma-generate
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY prisma ./prisma
+RUN npx prisma generate
+
+# 构建应用
+FROM base AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=prisma-generate /app/node_modules/.prisma ./node_modules/.prisma
+COPY . .
+RUN npm run build
+
+# 生产镜像
+FROM base AS runner
+WORKDIR /app
+
+ENV NODE_ENV production
+
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 prisma
+
+COPY --from=build /app/public ./public
+COPY --from=build /app/package*.json ./
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/prisma ./prisma
+COPY --from=prisma-generate /app/node_modules/.prisma ./node_modules/.prisma
+
+USER prisma
+
+EXPOSE 3000
+
+CMD ["npm", "start"]
+```
+
+```yaml
+# docker-compose.prod.yml
+version: "3.8"
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+    depends_on:
+      - postgres
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
+```
+
+---
+
+## 云数据库集成
+
+### Supabase
+
+```bash
+# 1. 创建 Supabase 项目
+# 访问 https://supabase.com
+
+# 2. 获取数据库连接字符串
+# Settings → Database → Connection string → URI
+
+# 3. 配置环境变量
+DATABASE_URL="postgresql://postgres:[YOUR-PASSWORD]@db.[YOUR-PROJECT-REF].supabase.co:5432/postgres"
+
+# 4. 部署迁移
+npx prisma migrate deploy
+
+# 5. 生成 Client
+npx prisma generate
+```
+
+### Neon
+
+```bash
+# 1. 创建 Neon 项目
+# 访问 https://neon.tech
+
+# 2. 获取连接字符串
+# DATABASE_URL="postgresql://[user]:[password]@[neon-host]/[dbname]?sslmode=require"
+
+# 3. 使用 Neon Serverless Driver
+npm install @neondatabase/serverless
+
+# 4. 配置应用
+import { Pool, neonConfig } from '@neondatabase/serverless'
+import { PrismaNeon } from '@prisma/adapter-neon'
+import { PrismaClient } from '@prisma/client'
+import ws from 'ws'
+
+neonConfig.webSocketConstructor = ws
+const pool = new Pool({ connectionString: process.env.DATABASE_URL })
+const adapter = new PrismaNeon(pool)
+const prisma = new PrismaClient({ adapter })
+```
+
+### PlanetScale (MySQL)
+
+```bash
+# 1. 创建 PlanetScale 数据库
+# 访问 https://planetscale.com
+
+# 2. 获取连接字符串
+# DATABASE_URL="mysql://[user]:[password]@aws.connect.psdb.cloud/[dbname]?sslaccept=strict"
+
+# 3. 使用 PlanetScale Serverless Driver
+npm install @planetscale/database
+
+# 4. 配置应用
+import { Client } from '@planetscale/database'
+import { PrismaPlanetScale } from '@prisma/adapter-planetscale'
+import { PrismaClient } from '@prisma/client'
+
+const client = new Client({
+  url: process.env.DATABASE_URL,
+})
+
+const adapter = new PrismaPlanetScale(client)
+const prisma = new PrismaClient({ adapter })
+```
+
+### Turso (SQLite)
+
+```bash
+# 1. 创建 Turso 数据库
+# 访问 https://turso.tech
+
+# 2. 安装 CLI
+npm install -g turso
+
+# 3. 获取数据库 URL
+turso db create mydb
+turso db tokens create mydb
+
+# 4. 配置环境变量
+DATABASE_URL="file:./local.db"
+TURSO_DATABASE_URL="libsql://[dbname]-[org].turso.io"
+TURSO_AUTH_TOKEN="[your-token]"
+
+# 5. 配置应用
+import { PrismaClient } from '@prisma/client'
+
+const prisma = new PrismaClient({
+  datasources: {
+    db: {
+      url: process.env.TURSO_DATABASE_URL,
+    },
+  },
+})
+```
+
+---
+
+## 数据库迁移部署
+
+### 开发环境
+
+```bash
+# 创建并应用迁移
+npx prisma migrate dev --name init
+
+# 重置数据库
+npx prisma migrate reset
+
+# 查看迁移状态
+npx prisma migrate status
+```
+
+### 生产环境
+
+```bash
+# 只应用现有迁移
+npx prisma migrate deploy
+
+# 查看迁移历史
+npx prisma migrate status
+
+# 标记迁移为已应用
+npx prisma migrate resolve --applied "migration_name"
+```
+
+### CI/CD 集成
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      - name: Run migrations
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Build application
+        run: npm run build
+
+      - name: Deploy to production
+        run: # 部署命令
+```
+
+---
+
+## 数据库备份和恢复
+
+### PostgreSQL 备份
+
+```bash
+# 备份
+pg_dump $DATABASE_URL > backup_$(date +%Y%m%d).sql
+
+# 恢复
+psql $DATABASE_URL < backup_20240401.sql
+
+# 使用 Docker
+docker exec postgres_container pg_dump -U user dbname > backup.sql
+docker exec -i postgres_container psql -U user dbname < backup.sql
+```
+
+### 自动备份脚本
+
+```typescript
+// scripts/backup.ts
+import { execSync } from "child_process";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+
+const s3 = new S3Client({
+  region: process.env.AWS_REGION,
+});
+
+async function backupDatabase() {
+  const timestamp = new Date().toISOString().split("T")[0];
+  const filename = `backup_${timestamp}.sql`;
+
+  // 备份数据库
+  const backup = execSync(`pg_dump $DATABASE_URL`).toString();
+
+  // 上传到 S3
+  await s3.send(
+    new PutObjectCommand({
+      Bucket: "my-backups",
+      Key: `postgres/${filename}`,
+      Body: backup,
+    })
+  );
+
+  console.log(`Backup uploaded: ${filename}`);
+}
+
+backupDatabase().catch(console.error);
+```
+
+### 定时备份
+
+```typescript
+// 使用 Vercel Cron
+// api/cron/backup.ts
+import { PrismaClient } from "@prisma/client";
+import { execSync } from "child_process";
+
+const prisma = new PrismaClient();
+
+export async function GET(request: Request) {
+  // 验证 Cron 密钥
+  const authHeader = request.headers.get("authorization");
+  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  // 执行备份
+  const backup = execSync("pg_dump $DATABASE_URL").toString();
+
+  // 保存到存储服务
+  // ...
+
+  return new Response("Backup completed", { status: 200 });
+}
+```
+
+```json
+// vercel.json
+{
+  "crons": [
+    {
+      "path": "/api/cron/backup",
+      "schedule": "0 2 * * *"
+    }
+  ]
+}
+```
+
+---
+
+## 监控和告警
+
+### 查询性能监控
+
+```typescript
+// lib/monitoring.ts
+import { PrismaClient } from "@prisma/client";
+
+const prisma = new PrismaClient({
+  log: [
+    { level: "query", emit: "event" },
+    { level: "error", emit: "event" },
+    { level: "warn", emit: "event" },
+  ],
+});
+
+prisma.$on("query" as any, (e: any) => {
+  if (e.duration > 1000) {
+    // 发送到监控服务
+    sendToMonitoring({
+      type: "slow_query",
+      query: e.query,
+      duration: e.duration,
+      timestamp: new Date(),
+    });
+  }
+});
+
+prisma.$on("error" as any, (e: any) => {
+  sendToMonitoring({
+    type: "query_error",
+    error: e.message,
+    timestamp: new Date(),
+  });
+});
+```
+
+### 数据库连接监控
+
+```typescript
+import { PrismaClient } from "@prisma/client";
+
+const prisma = new PrismaClient();
+
+async function checkDatabaseHealth() {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    return { status: "healthy" };
+  } catch (error) {
+    return { status: "unhealthy", error };
+  }
+}
+```
+
+---
+
+## 完整部署示例
+
+### Docker Compose 生产配置
+
+```yaml
+# docker-compose.prod.yml
+version: "3.8"
+
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/mydb?schema=public
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: mydb
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+```
+
+### 部署脚本
+
+```bash
+#!/bin/bash
+# deploy.sh
+
+set -e
+
+echo "🚀 Starting deployment..."
+
+# 拉取最新代码
+git pull origin main
+
+# 安装依赖
+npm ci
+
+# 生成 Prisma Client
+npx prisma generate
+
+# 应用迁移
+npx prisma migrate deploy
+
+# 构建应用
+npm run build
+
+# 重启服务
+pm2 restart myapp
+
+echo "✅ Deployment completed!"
+```
+
+---
+
+## 最佳实践
+
+### 1. 环境分离
+
+```bash
+# ✅ 好的做法
+.env.development
+.env.test
+.env.production
+
+# ❌ 避免使用单一 .env 文件
+.env
+```
+
+### 2. 使用环境变量
+
+```typescript
+// ✅ 好：使用环境变量
+const prisma = new PrismaClient({
+  datasources: {
+    db: {
+      url: process.env.DATABASE_URL,
+    },
+  },
+});
+
+// ❌ 差：硬编码连接字符串
+const prisma = new PrismaClient({
+  datasources: {
+    db: {
+      url: "postgresql://...",
+    },
+  },
+});
+```
+
+### 3. 生产环境 SSL
+
+```bash
+# ✅ 好的做法：生产环境强制 SSL
+DATABASE_URL="postgresql://user:pass@host/db?sslmode=require"
+```
+
+### 4. 定期备份
+
+```typescript
+// ✅ 设置定期备份
+setInterval(
+  () => {
+    backupDatabase();
+  },
+  24 * 60 * 60 * 1000
+); // 每天备份
+```
+
+---
+
+## 常见问题
+
+**Q: 如何在不同环境使用不同的数据库？**
+
+A: 使用环境特定的 `.env` 文件：
+
+```bash
+# .env.development
+DATABASE_URL="postgresql://localhost:5432/dev"
+
+# .env.production
+DATABASE_URL="postgresql://prod-host/db"
+```
+
+**Q: Prisma 支持多数据库吗？**
+
+A: 一个 Prisma Client 实例只能连接一个数据库。如需多数据库，创建多个 Client 实例。
+
+**Q: 如何在容器化环境中使用 Prisma？**
+
+A: 确保数据库服务就绪后再启动应用，使用 `depends_on` 和健康检查。
+
+---
+
+## 总结
+
+通过本文，我们全面掌握了：
+
+✅ 支持的数据库类型及其特点
+✅ 环境变量管理和配置
+✅ 开发、测试、生产环境配置
+✅ 多种云数据库集成
+✅ 数据库迁移部署策略
+✅ 备份和恢复方案
+✅ 监控和告警配置
+✅ 完整的部署示例
+
+掌握多数据库支持和部署后，你的应用可以在任何环境中运行。下一步，我们将学习**测试策略**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- 单元测试和集成测试
+- 测试数据库配置
+- Mock Prisma Client
+- 测试工厂模式
+- 测试数据管理
+- 测试最佳实践
+- CI/CD 测试集成
+- 覆盖率报告
+
+继续阅读：[测试策略](./13-testing.mdx)

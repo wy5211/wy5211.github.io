@@ -1,0 +1,1144 @@
+---
+title: "Prisma 与 Hono 集成完全指南：构建高性能 API"
+date: "2026-04-04"
+summary: "深入掌握 Prisma 在 Hono 框架中的使用，学习中间件配置、Context 注入、路由组织等技巧，构建轻量级、高性能的后端 API。"
+tags: ["Prisma", "Hono", "API", "Edge Runtime", "TypeScript"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 15
+---
+
+## 前言
+
+Hono 是一个轻量级、快速的 Web 框架，特别适合构建 API 和边缘应用。结合 Prisma 的类型安全，可以构建出性能优异且开发体验出色的后端服务。
+
+与 Next.js 不同，Hono 更专注于 API 层，它的体积更小、启动更快，非常适合部署在边缘运行时。
+
+**本文将涵盖**：
+
+- 项目初始化和配置
+- Prisma 中间件
+- Context 注入
+- 路由组织
+- 错误处理
+- 边缘运行时支持
+- 测试策略
+- 部署配置
+
+---
+
+## 项目初始化
+
+### 创建 Hono 项目
+
+```bash
+# 创建项目目录
+mkdir hono-prisma-api
+cd hono-prisma-api
+
+# 初始化项目
+npm init -y
+
+# 安装依赖
+npm install hono
+npm install @hono/zod-validator
+npm install prisma @prisma/client
+
+# 安装开发依赖
+npm install -D @types/node ts-node typescript
+npm install -D wrangler
+
+# 初始化 TypeScript
+npx tsc --init
+
+# 初始化 Prisma
+npx prisma init
+```
+
+### TypeScript 配置
+
+```json
+// tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ES2022",
+    "lib": ["ES2022"],
+    "moduleResolution": "node",
+    "esModuleInterop": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+    "types": ["node"]
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules"]
+}
+```
+
+---
+
+## Prisma 单例模式
+
+### 创建 Prisma 实例
+
+```typescript
+// src/lib/db.ts
+import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+export const prisma =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    log:
+      process.env.NODE_ENV === "development"
+        ? ["query", "error", "warn"]
+        : ["error"],
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+```
+
+---
+
+## Prisma 中间件
+
+### 创建数据库中间件
+
+```typescript
+// src/middleware/db.ts
+import { prisma } from "../lib/db";
+import { Context, Next } from "hono";
+
+export const dbMiddleware = async (c: Context, next: Next) => {
+  // 将 Prisma 实例注入到 Context
+  c.set("db", prisma);
+  await next();
+};
+```
+
+### 使用中间件
+
+```typescript
+// src/index.ts
+import { Hono } from "hono";
+import { dbMiddleware } from "./middleware/db";
+
+const app = new Hono();
+
+// 应用数据库中间件
+app.use("*", dbMiddleware);
+
+app.get("/", (c) => {
+  const db = c.get("db");
+  return c.json({ message: "API is running" });
+});
+
+export default app;
+```
+
+---
+
+## 路由组织
+
+### 基础路由结构
+
+```typescript
+// src/index.ts
+import { Hono } from "hono";
+import { dbMiddleware } from "./middleware/db";
+import posts from "./routes/posts";
+import users from "./routes/users";
+
+const app = new Hono();
+
+// 全局中间件
+app.use("*", dbMiddleware);
+
+// 路由
+app.route("/posts", posts);
+app.route("/users", users);
+
+// 健康检查
+app.get("/health", (c) => {
+  return c.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+export default app;
+```
+
+### Posts 路由
+
+```typescript
+// src/routes/posts.ts
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+
+const posts = new Hono();
+
+// 验证 Schema
+const createPostSchema = z.object({
+  title: z.string().min(1).max(200),
+  slug: z.string().min(1).max(200),
+  content: z.string().min(1),
+  excerpt: z.string().optional(),
+  status: z.enum(["DRAFT", "PUBLISHED"]).default("DRAFT"),
+  authorId: z.string().uuid(),
+});
+
+const updatePostSchema = createPostSchema.partial();
+
+const querySchema = z.object({
+  page: z.string().transform(Number).default("1"),
+  limit: z.string().transform(Number).default("10"),
+  status: z.enum(["DRAFT", "PUBLISHED"]).optional(),
+});
+
+// GET /posts - 获取文章列表
+posts.get("/", zValidator("query", querySchema), async (c) => {
+  const db = c.get("db");
+  const { page, limit, status } = c.req.valid("query");
+
+  const where: any = {};
+  if (status) {
+    where.status = status;
+  }
+
+  const [posts, total] = await Promise.all([
+    db.post.findMany({
+      where,
+      skip: (page - 1) * limit,
+      take: limit,
+      orderBy: { createdAt: "desc" },
+      include: {
+        author: {
+          select: {
+            id: true,
+            username: true,
+            avatar: true,
+          },
+        },
+      },
+    }),
+    db.post.count({ where }),
+  ]);
+
+  return c.json({
+    data: posts,
+    meta: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  });
+});
+
+// GET /posts/:id - 获取单篇文章
+posts.get(
+  "/:id",
+  zValidator(
+    "param",
+    z.object({
+      id: z.string().uuid(),
+    })
+  ),
+  async (c) => {
+    const db = c.get("db");
+    const { id } = c.req.valid("param");
+
+    const post = await db.post.findUnique({
+      where: { id },
+      include: {
+        author: {
+          select: {
+            id: true,
+            username: true,
+            email: true,
+          },
+        },
+      },
+    });
+
+    if (!post) {
+      return c.json(
+        {
+          success: false,
+          error: "Post not found",
+        },
+        404
+      );
+    }
+
+    return c.json({
+      success: true,
+      data: post,
+    });
+  }
+);
+
+// POST /posts - 创建文章
+posts.post("/", zValidator("json", createPostSchema), async (c) => {
+  const db = c.get("db");
+  const data = c.req.valid("json");
+
+  try {
+    const post = await db.post.create({
+      data: {
+        ...data,
+        publishedAt: data.status === "PUBLISHED" ? new Date() : null,
+      },
+    });
+
+    return c.json(
+      {
+        success: true,
+        data: post,
+      },
+      201
+    );
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        error: "Failed to create post",
+      },
+      500
+    );
+  }
+});
+
+// PUT /posts/:id - 更新文章
+posts.put(
+  "/:id",
+  zValidator(
+    "param",
+    z.object({
+      id: z.string().uuid(),
+    })
+  ),
+  zValidator("json", updatePostSchema),
+  async (c) => {
+    const db = c.get("db");
+    const { id } = c.req.valid("param");
+    const data = c.req.valid("json");
+
+    try {
+      const post = await db.post.update({
+        where: { id },
+        data: {
+          ...data,
+          updatedAt: new Date(),
+        },
+      });
+
+      return c.json({
+        success: true,
+        data: post,
+      });
+    } catch (error) {
+      return c.json(
+        {
+          success: false,
+          error: "Post not found",
+        },
+        404
+      );
+    }
+  }
+);
+
+// DELETE /posts/:id - 删除文章
+posts.delete(
+  "/:id",
+  zValidator(
+    "param",
+    z.object({
+      id: z.string().uuid(),
+    })
+  ),
+  async (c) => {
+    const db = c.get("db");
+    const { id } = c.req.valid("param");
+
+    try {
+      await db.post.delete({
+        where: { id },
+      });
+
+      return c.json({
+        success: true,
+        message: "Post deleted",
+      });
+    } catch (error) {
+      return c.json(
+        {
+          success: false,
+          error: "Post not found",
+        },
+        404
+      );
+    }
+  }
+);
+
+export default posts;
+```
+
+### Users 路由
+
+```typescript
+// src/routes/users.ts
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+
+const users = new Hono();
+
+const createUserSchema = z.object({
+  email: z.string().email(),
+  username: z.string().min(3).max(20),
+  password: z.string().min(8),
+  bio: z.string().optional(),
+});
+
+// GET /users - 获取用户列表
+users.get("/", async (c) => {
+  const db = c.get("db");
+
+  const page = parseInt(c.req.query("page") || "1");
+  const limit = parseInt(c.req.query("limit") || "10");
+
+  const [users, total] = await Promise.all([
+    db.user.findMany({
+      skip: (page - 1) * limit,
+      take: limit,
+      select: {
+        id: true,
+        email: true,
+        username: true,
+        bio: true,
+        avatar: true,
+        createdAt: true,
+      },
+      orderBy: { createdAt: "desc" },
+    }),
+    db.user.count(),
+  ]);
+
+  return c.json({
+    data: users,
+    meta: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  });
+});
+
+// GET /users/:id - 获取用户详情
+users.get(
+  "/:id",
+  zValidator(
+    "param",
+    z.object({
+      id: z.string().uuid(),
+    })
+  ),
+  async (c) => {
+    const db = c.get("db");
+    const { id } = c.req.valid("param");
+
+    const user = await db.user.findUnique({
+      where: { id },
+      select: {
+        id: true,
+        email: true,
+        username: true,
+        bio: true,
+        avatar: true,
+        createdAt: true,
+        posts: {
+          select: {
+            id: true,
+            title: true,
+            slug: true,
+            createdAt: true,
+          },
+          take: 10,
+          orderBy: { createdAt: "desc" },
+        },
+      },
+    });
+
+    if (!user) {
+      return c.json(
+        {
+          success: false,
+          error: "User not found",
+        },
+        404
+      );
+    }
+
+    return c.json({
+      success: true,
+      data: user,
+    });
+  }
+);
+
+// POST /users - 创建用户
+users.post("/", zValidator("json", createUserSchema), async (c) => {
+  const db = c.get("db");
+  const data = c.req.valid("json");
+
+  try {
+    // 检查邮箱是否已存在
+    const existingUser = await db.user.findUnique({
+      where: { email: data.email },
+    });
+
+    if (existingUser) {
+      return c.json(
+        {
+          success: false,
+          error: "Email already exists",
+        },
+        409
+      );
+    }
+
+    // 哈希密码
+    const hashedPassword = await hash(data.password);
+
+    const user = await db.user.create({
+      data: {
+        email: data.email,
+        username: data.username,
+        password: hashedPassword,
+        bio: data.bio,
+      },
+      select: {
+        id: true,
+        email: true,
+        username: true,
+        bio: true,
+        avatar: true,
+        createdAt: true,
+      },
+    });
+
+    return c.json(
+      {
+        success: true,
+        data: user,
+      },
+      201
+    );
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        error: "Failed to create user",
+      },
+      500
+    );
+  }
+});
+
+export default users;
+```
+
+---
+
+## 认证中间件
+
+### JWT 认证
+
+```typescript
+// src/middleware/auth.ts
+import { Context, Next } from "hono";
+import { verify } from "hono/jwt";
+
+export const authMiddleware = async (c: Context, next: Next) => {
+  const authorization = c.req.header("Authorization");
+
+  if (!authorization) {
+    return c.json(
+      {
+        success: false,
+        error: "Unauthorized",
+      },
+      401
+    );
+  }
+
+  const token = authorization.replace("Bearer ", "");
+
+  try {
+    const payload = await verify(token, c.env.JWT_SECRET);
+
+    // 将用户信息注入到 Context
+    c.set("user", payload);
+    await next();
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        error: "Invalid token",
+      },
+      401
+    );
+  }
+};
+
+// 保护路由
+const protected = new Hono();
+protected.use("*", authMiddleware);
+
+protected.get("/me", async (c) => {
+  const user = c.get("user");
+  return c.json({ user });
+});
+```
+
+---
+
+## 错误处理
+
+### 全局错误处理
+
+```typescript
+// src/middleware/error.ts
+import { Context, Next } from "hono";
+
+export const errorHandler = async (c: Context, next: Next) => {
+  try {
+    await next();
+  } catch (error) {
+    console.error("Error:", error);
+
+    // Prisma 错误处理
+    if (error.code === "P2002") {
+      return c.json(
+        {
+          success: false,
+          error: "Unique constraint violation",
+        },
+        409
+      );
+    }
+
+    if (error.code === "P2025") {
+      return c.json(
+        {
+          success: false,
+          error: "Record not found",
+        },
+        404
+      );
+    }
+
+    // 默认错误响应
+    return c.json(
+      {
+        success: false,
+        error: "Internal server error",
+      },
+      500
+    );
+  }
+};
+
+// 使用
+app.use("*", errorHandler);
+```
+
+---
+
+## 事务处理
+
+### 使用事务 API
+
+```typescript
+// src/routes/transfer.ts
+import { Hono } from "hono";
+
+const transfer = new Hono();
+
+transfer.post("/", async (c) => {
+  const db = c.get("db");
+  const { fromId, toId, amount } = await c.req.json();
+
+  try {
+    const result = await db.$transaction(async (tx) => {
+      // 检查发送者余额
+      const fromAccount = await tx.account.findUnique({
+        where: { id: fromId },
+      });
+
+      if (!fromAccount || fromAccount.balance < amount) {
+        throw new Error("Insufficient balance");
+      }
+
+      // 扣除发送者余额
+      await tx.account.update({
+        where: { id: fromId },
+        data: {
+          balance: {
+            decrement: amount,
+          },
+        },
+      });
+
+      // 增加接收者余额
+      await tx.account.update({
+        where: { id: toId },
+        data: {
+          balance: {
+            increment: amount,
+          },
+        },
+      });
+
+      // 创建交易记录
+      const transaction = await tx.transaction.create({
+        data: {
+          fromId,
+          toId,
+          amount,
+        },
+      });
+
+      return transaction;
+    });
+
+    return c.json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        error: error.message,
+      },
+      400
+    );
+  }
+});
+
+export default transfer;
+```
+
+---
+
+## 边缘运行时支持
+
+### 使用适配器
+
+```typescript
+// src/index.ts
+import { Hono } from "hono";
+import { PrismaClient } from "@prisma/client";
+import { PrismaPlanetScale } from "@prisma/adapter-planetscale";
+import { Client } from "@planetscale/database";
+
+const app = new Hono();
+
+// 检查是否在边缘环境
+if (process.env.EDGE_RUNTIME) {
+  const client = new Client({
+    url: process.env.DATABASE_URL,
+  });
+
+  const adapter = new PrismaPlanetScale(client);
+
+  app.use("*", async (c, next) => {
+    c.set("db", new PrismaClient({ adapter }));
+    await next();
+  });
+} else {
+  // 传统 Node.js 环境
+  const globalForPrisma = globalThis as unknown as {
+    prisma: PrismaClient | undefined;
+  };
+
+  const prisma = globalForPrisma.prisma ?? new PrismaClient();
+
+  if (process.env.NODE_ENV !== "production") {
+    globalForPrisma.prisma = prisma;
+  }
+
+  app.use("*", async (c, next) => {
+    c.set("db", prisma);
+    await next();
+  });
+}
+
+export default app;
+```
+
+### Cloudflare Workers
+
+```typescript
+// wrangler.toml
+name = "hono-prisma-api"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# D1 数据库
+[[d1_databases]]
+binding = "DB"
+database_name = "mydb"
+database_id = "your-database-id"
+```
+
+```typescript
+// src/index.ts
+import { Hono } from 'hono'
+import { PrismaClient } from '@prisma/client'
+
+type Bindings = {
+  DB: D1Database
+}
+
+const app = new Hono<{ Bindings: Bindings }>()
+
+// 注意：Prisma 不完全支持 Cloudflare D1
+// 需要使用其他 ORM 或直接使用 D1 API
+
+app.get('/posts', async (c) => {
+  const { results } = await c.env.DB.prepare(
+    'SELECT * FROM posts'
+  ).all()
+
+  return c.json(results
+})
+
+export default app
+```
+
+---
+
+## 服务器启动
+
+### 开发环境
+
+```typescript
+// src/server.ts
+import { serve } from "@hono/node-server";
+import app from "./index";
+
+const port = parseInt(process.env.PORT || "3000");
+
+console.log(`Server is running on port ${port}`);
+
+serve({
+  fetch: app.fetch,
+  port,
+});
+```
+
+### 生产环境
+
+```typescript
+// src/index.ts
+import { Hono } from "hono";
+import { serve } from "@hono/node-server";
+import { compress } from "hono/compress";
+import { logger } from "hono/logger";
+import { cors } from "hono/cors";
+
+const app = new Hono();
+
+// 生产环境中间件
+app.use("*", compress());
+app.use("*", logger());
+app.use(
+  "*",
+  cors({
+    origin: ["http://localhost:3000", "https://example.com"],
+    credentials: true,
+  })
+);
+
+// 路由
+app.route("/api", apiRouter);
+
+// 启动服务器
+serve({
+  fetch: app.fetch,
+  port: 3000,
+});
+```
+
+---
+
+## 测试
+
+### 集成测试
+
+```typescript
+// tests/posts.test.ts
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { PrismaClient } from "@prisma/client";
+import { buildApp } from "../src/app";
+
+describe("Posts API", () => {
+  let prisma: PrismaClient;
+  let app: ReturnType<typeof buildApp>;
+
+  beforeEach(async () => {
+    prisma = new PrismaClient({
+      datasources: {
+        db: {
+          url: process.env.TEST_DATABASE_URL,
+        },
+      },
+    });
+
+    app = buildApp(prisma);
+
+    await prisma.post.deleteMany();
+    await prisma.user.deleteMany();
+  });
+
+  afterEach(async () => {
+    await prisma.$disconnect();
+  });
+
+  it("should create a post", async () => {
+    const user = await prisma.user.create({
+      data: {
+        email: "user@example.com",
+        username: "testuser",
+        password: "hash",
+      },
+    });
+
+    const response = await app.request("/posts", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        title: "Test Post",
+        slug: "test-post",
+        content: "Test content",
+        authorId: user.id,
+      }),
+    });
+
+    expect(response.status).toBe(201);
+
+    const json = await response.json();
+    expect(json.success).toBe(true);
+    expect(json.data).toHaveProperty("id");
+  });
+
+  it("should get posts list", async () => {
+    const response = await app.request("/posts");
+
+    expect(response.status).toBe(200);
+
+    const json = await response.json();
+    expect(json.data).toBeInstanceOf(Array);
+  });
+});
+```
+
+---
+
+## 部署
+
+### Docker 部署
+
+```dockerfile
+# Dockerfile
+FROM node:20-alpine AS base
+
+# 安装依赖
+FROM base AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+
+# 生成 Prisma Client
+FROM base AS prisma-generate
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY prisma ./prisma
+RUN npx prisma generate
+
+# 构建应用
+FROM base AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=prisma-generate /app/node_modules/.prisma ./node_modules/.prisma
+COPY . .
+RUN npm run build
+
+# 生产镜像
+FROM base AS runner
+WORKDIR /app
+ENV NODE_ENV production
+
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 hono
+
+COPY --from=build /app/package*.json ./
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=prisma-generate /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=build /app/prisma ./prisma
+
+USER hono
+
+EXPOSE 3000
+
+CMD ["node", "dist/index.js"]
+```
+
+### Railway 部署
+
+```bash
+# 1. 安装 Railway CLI
+npm install -g @railway/cli
+
+# 2. 登录
+railway login
+
+# 3. 初始化项目
+railway init
+
+# 4. 添加 PostgreSQL 插件
+railway add postgresql
+
+# 5. 部署
+railway up
+```
+
+---
+
+## 最佳实践
+
+### 1. 路由模块化
+
+```typescript
+// ✅ 好：路由模块化
+app.route('/posts', posts)
+app.route('/users', users)
+app.route('/comments', comments)
+
+// ❌ 差：所有路由在一个文件
+app.get('/posts', ...)
+app.post('/posts', ...)
+app.get('/posts/:id', ...)
+```
+
+### 2. 使用验证中间件
+
+```typescript
+// ✅ 好：使用 zValidator
+posts.post("/", zValidator("json", schema), async (c) => {
+  const data = c.req.valid("json"); // 类型安全
+});
+
+// ❌ 差：手动验证
+posts.post("/", async (c) => {
+  const body = await c.req.json();
+  // 手动验证...
+});
+```
+
+### 3. 错误处理
+
+```typescript
+// ✅ 好：统一错误处理
+app.use("*", errorHandler);
+
+// ❌ 差：每个路由单独处理
+app.get("/", async (c) => {
+  try {
+    // ...
+  } catch (error) {
+    return c.json({ error }, 500);
+  }
+});
+```
+
+---
+
+## 常见问题
+
+**Q: Hono 和 Express 相比如何？**
+
+A：Hono 更轻量、更快、TypeScript 原生支持。适合新项目和 API 开发。
+
+**Q: 如何处理文件上传？**
+
+A：使用 `@hono/node-server` 的 multipart 支持：
+
+```typescript
+import { multipart } from "@hono/node-server";
+
+app.post(
+  "/upload",
+  multipart(async (c) => {
+    const body = await c.req.parseBody();
+    // 处理文件...
+  })
+);
+```
+
+**Q: 支持边缘部署吗？**
+
+A：是的！Hono 天生支持边缘运行时，但 Prisma 的边缘支持有限，需要使用特定适配器。
+
+---
+
+## 总结
+
+通过本文，我们深入掌握了：
+
+✅ Hono 项目初始化和配置
+✅ Prisma 中间件实现
+✅ Context 注入和使用
+✅ 路由组织和模块化
+✅ 认证和错误处理
+✅ 事务处理方法
+✅ 边缘运行时支持
+✅ 测试和部署策略
+
+掌握 Hono 集成后，你可以构建出轻量、高性能的 API 服务。下一步，我们将学习**常见问题与调试**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- 常见错误和解决方案
+- 查询调试技巧
+- 性能问题诊断
+- 连接问题处理
+- 迁移冲突解决
+- 开发工具推荐
+- 最佳实践总结
+
+继续阅读：[常见问题与调试](./16-troubleshooting.mdx)

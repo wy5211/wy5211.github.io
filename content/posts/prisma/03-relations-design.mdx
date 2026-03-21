@@ -1,0 +1,1001 @@
+---
+title: "Prisma 关系设计完全指南：一对一、一对多、多对多"
+date: "2026-03-23"
+summary: "深入理解数据库关系设计，掌握 Prisma 中一对一、一对多、多对多关系的定义和查询，学会处理复杂的业务关系模型。"
+tags: ["Prisma", "Relations", "Database Design", "ERD", "Foreign Keys"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 3
+---
+
+## 前言
+
+现实世界的数据很少是孤立的，它们之间存在着各种关系。用户有文章，文章有评论，评论有作者——这些关系构成了我们应用的核心。
+
+在关系型数据库中，我们通过外键来定义这些关系。Prisma 让关系定义变得直观且类型安全，让你能够专注于业务逻辑而不是 SQL JOIN 的复杂性。
+
+**本文将涵盖**：
+
+- 关系的基本概念
+- 一对一关系（One-to-One）
+- 一对多关系（One-to-Many）
+- 多对多关系（Many-to-Many）
+- 自引用关系
+- 多态关系
+- 关系约束和级联
+- 关系设计最佳实践
+
+---
+
+## 关系基础概念
+
+### 什么是关系？
+
+在数据库中，关系是指两个表之间的关联。通过这种关联，我们可以在查询一个实体时，同时获取相关的数据。
+
+**关系类型**：
+
+- **一对一**：A 中的一个记录对应 B 中的一个记录
+- **一对多**：A 中的一个记录对应 B 中的多个记录
+- **多对多**：A 中的多个记录可以对应 B 中的多个记录
+
+### 关系的组成
+
+在 Prisma 中，关系由以下部分组成：
+
+```prisma
+model User {
+  id    String @id
+  posts Post[]  // 关系列
+}
+
+model Post {
+  id       String @id
+  authorId String  // 外键
+  author   User   @relation(fields: [authorId], references: [id])  // 关系定义
+}
+```
+
+**关键要素**：
+
+1. **外键字段**：存储关联实体的 ID
+2. **关系字段**：在代码中访问关联数据
+3. **@relation**：定义关系的详细配置
+
+---
+
+## 一对一关系（One-to-One）
+
+### 使用场景
+
+一对一关系用于两个实体之间严格的一对一匹配，例如：
+
+- 用户 ↔ 个人资料
+- 订单 ↔ 发票
+- 国家 ↔ 首都
+
+### 基本语法
+
+```prisma
+model User {
+  id      String    @id
+  email   String    @unique
+  profile Profile?  // 可选关系（不是所有用户都有资料）
+
+  @@map("users")
+}
+
+model Profile {
+  id     String @id
+  bio    String @db.Text
+  userId String @unique  // 唯一约束确保一对一
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("profiles")
+}
+```
+
+**关键点**：
+
+- `Profile?`：可选关系，用户可能没有资料
+- `@unique`：外键上的唯一约束确保一对一
+- `onDelete: Cascade`：删除用户时自动删除资料
+
+### 查询示例
+
+```typescript
+// 创建用户和资料（嵌套）
+const user = await prisma.user.create({
+  data: {
+    email: "user@example.com",
+    profile: {
+      create: {
+        bio: "全栈开发者",
+      },
+    },
+  },
+  include: {
+    profile: true,
+  },
+});
+
+// 查询用户及其资料
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  include: {
+    profile: true,
+  },
+});
+
+// 连接到现有用户
+await prisma.profile.create({
+  data: {
+    bio: "我的简介",
+    user: {
+      connect: { id: userId },
+    },
+  },
+});
+
+// 断开关系
+await prisma.profile.update({
+  where: { id: profileId },
+  data: {
+    user: {
+      disconnect: true,
+    },
+  },
+});
+```
+
+### 实战案例：用户认证信息
+
+```prisma
+model User {
+  id             String   @id @default(uuid())
+  email          String   @unique
+  password       String
+  authInfo       AuthInfo?
+
+  @@map("users")
+}
+
+model AuthInfo {
+  id              String   @id @default(uuid())
+  userId          String   @unique
+  twoFactorEnabled Boolean @default(false)
+  lastLoginAt     DateTime?
+  loginAttempts   Int      @default(0)
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("auth_info")
+}
+```
+
+---
+
+## 一对多关系（One-to-Many）
+
+### 使用场景
+
+一对多是最常见的关系类型，例如：
+
+- 作者 ↔ 文章
+- 用户 ↔ 订单
+- 分类 ↔ 产品
+
+### 基本语法
+
+```prisma
+model Author {
+  id    String @id
+  name  String
+  email String @unique
+  posts Post[]  // 一个作者有多篇文章
+
+  @@map("authors")
+}
+
+model Post {
+  id       String  @id
+  title    String
+  content  String  @db.Text
+  authorId String  // 外键
+  author   Author  @relation(fields: [authorId], references: [id], onDelete: Cascade)  // 反向关系
+
+  @@map("posts")
+}
+```
+
+**关键点**：
+
+- `Post[]`：数组表示一对多
+- `authorId`：外键字段（存储作者的 ID）
+- `@relation`：定义关系链接
+
+### 查询示例
+
+```typescript
+// 创建文章并关联作者
+const post = await prisma.post.create({
+  data: {
+    title: "Prisma 入门",
+    content: "...",
+    author: {
+      connect: { id: authorId }, // 连接到现有作者
+    },
+  },
+});
+
+// 创建作者时同时创建文章
+const author = await prisma.author.create({
+  data: {
+    name: "John",
+    email: "john@example.com",
+    posts: {
+      create: [
+        { title: "文章 1", content: "..." },
+        { title: "文章 2", content: "..." },
+      ],
+    },
+  },
+  include: {
+    posts: true,
+  },
+});
+
+// 查询作者及其所有文章
+const author = await prisma.author.findUnique({
+  where: { id: authorId },
+  include: {
+    posts: {
+      orderBy: { createdAt: "desc" },
+      take: 10,
+    },
+  },
+});
+
+// 查询文章及其作者
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  include: {
+    author: {
+      select: {
+        id: true,
+        name: true,
+        email: true,
+      },
+    },
+  },
+});
+
+// 更新文章的作者（重新分配）
+const post = await prisma.post.update({
+  where: { id: postId },
+  data: {
+    author: {
+      connect: { id: newAuthorId }, // 连接到新作者
+    },
+  },
+});
+
+// 批量查询
+const [authors, postsCount] = await Promise.all([
+  prisma.author.findMany(),
+  prisma.post.count(),
+]);
+```
+
+### 级联删除
+
+```prisma
+model Post {
+  id       String  @id
+  authorId String
+  author   Author  @relation(fields: [authorId], references: [id], onDelete: Cascade)
+}
+
+// 删除作者时，所有文章也会被删除
+await prisma.author.delete({
+  where: { id: authorId },
+})
+```
+
+**级联选项**：
+
+- `Cascade`：删除关联记录
+- `Restrict`：阻止删除（默认）
+- `SetNull`：将外键设为 null
+
+### 实战案例：博客文章系统
+
+```prisma
+model Category {
+  id      String  @id @default(uuid())
+  name    String  @unique
+  slug    String  @unique
+  posts   Post[]
+
+  createdAt DateTime @default(now())
+
+  @@map("categories")
+}
+
+model Post {
+  id          String    @id @default(uuid())
+  title       String
+  slug        String    @unique
+  content     String    @db.Text
+  status      PostStatus @default(DRAFT)
+
+  categoryId  String
+  category    Category  @relation(fields: [categoryId], references: [id])
+
+  // 作者
+  authorId    String
+  author      User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  // 评论（一对多）
+  comments    Comment[]
+
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@index([categoryId])
+  @@index([authorId])
+  @@index([status])
+  @@map("posts")
+}
+
+model Comment {
+  id        String   @id @default(uuid())
+  content   String   @db.Text
+
+  postId    String
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([postId])
+  @@index([authorId])
+  @@map("comments")
+}
+```
+
+---
+
+## 多对多关系（Many-to-Many）
+
+### 使用场景
+
+多对多关系允许双方都有多个关联，例如：
+
+- 文章 ↔ 标签
+- 学生 ↔ 课程
+- 产品 ↔ 订单
+
+### 隐式多对多（简单场景）
+
+Prisma 可以自动创建关联表：
+
+```prisma
+model Post {
+  id    String @id
+  title String
+  tags  Tag[]  // 关系字段
+
+  @@map("posts")
+}
+
+model Tag {
+  id    String @id
+  name  String  @unique
+  posts Post[]
+
+  @@map("tags")
+}
+```
+
+**自动生成的关联表**：
+
+```prisma
+// Prisma 自动创建
+model _PostToTag (PostTag) {
+  postId String
+  postIdTag String
+  tag    Tag @relation(..., fields: [postIdTag], references: [id])
+  post   Post @relation(..., fields: [postId], references: [id])
+
+  @@id([postId, postIdTag])
+}
+```
+
+### 查询示例（隐式）
+
+```typescript
+// 创建文章并添加标签
+const post = await prisma.post.create({
+  data: {
+    title: "Prisma 教程",
+    tags: {
+      create: [{ name: "Prisma" }, { name: "TypeScript" }, { name: "ORM" }],
+    },
+  },
+  include: {
+    tags: true,
+  },
+});
+
+// 连接到现有标签
+const post = await prisma.post.create({
+  data: {
+    title: "新文章",
+    tags: {
+      connect: [{ id: tagId1 }, { id: tagId2 }],
+    },
+  },
+});
+
+// 查询文章及其标签
+const post = await prisma.post.findUnique({
+  where: { id: postId },
+  include: {
+    tags: true,
+  },
+});
+
+// 查询标签及其所有文章
+const tag = await prisma.tag.findUnique({
+  where: { id: tagId },
+  include: {
+    posts: {
+      where: { status: "PUBLISHED" },
+    },
+  },
+});
+
+// 断开特定标签
+const post = await prisma.post.update({
+  where: { id: postId },
+  data: {
+    tags: {
+      disconnect: [{ id: tagId }],
+    },
+  },
+});
+
+// 设置标签（替换所有）
+const post = await prisma.post.update({
+  where: { id: postId },
+  data: {
+    tags: {
+      set: [{ id: tagId1 }, { id: tagId2 }],
+    },
+  },
+});
+```
+
+### 显式多对多（复杂场景）
+
+当你需要在关联表中存储额外信息时，使用显式关系：
+
+```prisma
+model Student {
+  id        String          @id
+  name      String
+  email     String         @unique
+  enrollments Enrollment[]
+
+  @@map("students")
+}
+
+model Course {
+  id          String          @id
+  title       String
+  code        String         @unique
+  enrollments Enrollment[]
+
+  @@map("courses")
+}
+
+model Enrollment {
+  id        String   @id @default(uuid())
+  studentId String
+  student   Student  @relation(fields: [studentId], references: [id], onDelete: Cascade)
+  courseId  String
+  course    Course   @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  // 额外字段
+  enrolledAt DateTime @default(now())
+  grade      String?  // A, B, C, etc.
+  status     String   @default("ACTIVE")
+
+  @@unique([studentId, courseId])
+  @@map("enrollments")
+}
+```
+
+**查询示例（显式）**：
+
+```typescript
+// 学生选课
+const enrollment = await prisma.enrollment.create({
+  data: {
+    student: {
+      connect: { id: studentId },
+    },
+    course: {
+      connect: { id: courseId },
+    },
+    status: "ACTIVE",
+  },
+});
+
+// 查询学生的所有选课记录
+const enrollments = await prisma.enrollment.findMany({
+  where: {
+    studentId: studentId,
+  },
+  include: {
+    course: true,
+  },
+});
+
+// 查询课程的所有学生
+const enrollments = await prisma.enrollment.findMany({
+  where: {
+    courseId: courseId,
+  },
+  include: {
+    student: {
+      select: {
+        id: true,
+        name: true,
+        email: true,
+      },
+    },
+  },
+});
+
+// 更新成绩
+const enrollment = await prisma.enrollment.update({
+  where: {
+    id: enrollmentId,
+  },
+  data: {
+    grade: "A",
+  },
+});
+```
+
+### 实战案例：电商系统
+
+```prisma
+model Product {
+  id       String       @id
+  name     String
+  price    Decimal      @db.Decimal(10, 2)
+  orders   OrderItem[]
+
+  @@map("products")
+}
+
+model Order {
+  id          String      @id
+  orderNumber String      @unique
+  status      OrderStatus @default(PENDING)
+  total       Decimal     @db.Decimal(10, 2)
+
+  items       OrderItem[]
+
+  createdAt   DateTime    @default(now())
+
+  @@map("orders")
+}
+
+model OrderItem {
+  id        String   @id @default(uuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId String
+  product   Product  @relation(fields: [productId], references: [id])
+  quantity  Int
+  price     Decimal  @db.Decimal(10, 2) // 下单时的价格
+
+  @@map("order_items")
+}
+```
+
+---
+
+## 自引用关系
+
+### 使用场景
+
+实体与自身的关系，例如：
+
+- 评论的嵌套回复
+- 员工的上下级关系
+- 分类的层级结构
+
+### 嵌套评论
+
+```prisma
+model Comment {
+  id        String    @id @default(uuid())
+  content   String    @db.Text
+
+  // 自引用关系
+  parentId  String?
+  parent    Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies   Comment[] @relation("CommentReplies")
+
+  createdAt DateTime  @default(now())
+
+  @@map("comments")
+}
+```
+
+**查询示例**：
+
+```typescript
+// 创建顶级评论
+const comment = await prisma.comment.create({
+  data: {
+    content: "这是一条评论",
+  },
+});
+
+// 创建回复
+const reply = await prisma.comment.create({
+  data: {
+    content: "这是一条回复",
+    parent: {
+      connect: { id: comment.id },
+    },
+  },
+});
+
+// 查询评论及其所有回复
+const comment = await prisma.comment.findUnique({
+  where: { id: commentId },
+  include: {
+    replies: {
+      include: {
+        replies: true, // 嵌套层级
+      },
+    },
+  },
+});
+```
+
+### 组织架构
+
+```prisma
+model Employee {
+  id          String     @id
+  name        String
+  email       String     @unique
+  position    String
+
+  // 自引用（上下级关系）
+  managerId   String?
+  manager     Employee?  @relation("EmployeeHierarchy", fields: [managerId], references: [id])
+  subordinates Employee[] @relation("EmployeeHierarchy")
+
+  @@map("employees")
+}
+```
+
+**查询示例**：
+
+```typescript
+// 查询经理及其下属
+const manager = await prisma.employee.findUnique({
+  where: { id: managerId },
+  include: {
+    subordinates: true,
+  },
+});
+
+// 查询员工的经理
+const employee = await prisma.employee.findUnique({
+  where: { id: employeeId },
+  include: {
+    manager: true,
+  },
+});
+```
+
+---
+
+## 多态关系
+
+### 概念
+
+多态关系允许一个模型关联到多种不同类型的模型。
+
+### 实现方式
+
+Prisma 不直接支持多态关系，但可以通过额外字段实现：
+
+```prisma
+model Image {
+  id             String @id
+  url            String
+  imageableId    String // 关联的 ID
+  imageableType  String // 关联的类型：Post, User, Comment
+  alt            String?
+
+  @@index([imageableId, imageableType])
+  @@map("images")
+}
+
+model Post {
+  id      String  @id
+  title   String
+  content String  @db.Text
+
+  @@map("posts")
+}
+
+model User {
+  id    String @id
+  name  String
+  email String @unique
+
+  @@map("users")
+}
+```
+
+**查询示例**：
+
+```typescript
+// 查询文章的图片
+const postImages = await prisma.image.findMany({
+  where: {
+    imageableId: postId,
+    imageableType: "Post",
+  },
+});
+
+// 查询用户的图片
+const userImages = await prisma.image.findMany({
+  where: {
+    imageableId: userId,
+    imageableType: "User",
+  },
+});
+```
+
+---
+
+## 关系约束和级联
+
+### 外键约束
+
+```prisma
+model Post {
+  id       String @id
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id], onDelete: Cascade, onUpdate: Cascade)
+
+  @@map("posts")
+}
+```
+
+**级联选项**：
+
+- `CASCADE`：删除/更新父记录时，自动处理子记录
+- `RESTRICT`：阻止删除/更新（如果有子记录）
+- `SET NULL`：将外键设为 null
+- `NO ACTION`：不采取任何行动
+
+### 实践建议
+
+```prisma
+// ✅ 推荐：明确指定级级行为
+model Post {
+  id       String @id
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@map("posts")
+}
+
+// ✅ 对于重要数据，使用 Restrict 防止误删
+model User {
+  id    String  @id
+  posts Post[]
+
+  @@map("users")
+}
+
+model Post {
+  id       String @id
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  @@map("posts")
+}
+```
+
+---
+
+## 关系设计最佳实践
+
+### 1. 明确关系方向
+
+```prisma
+// ✅ 清晰的关系定义
+model Author {
+  id    String @id
+  posts Post[]
+}
+
+model Post {
+  id       String @id
+  authorId String
+  author   Author @relation(fields: [authorId], references: [id])
+}
+```
+
+### 2. 使用索引优化查询
+
+```prisma
+model Post {
+  id       String @id
+  authorId String
+
+  @@index([authorId]) // 为外键创建索引
+}
+```
+
+### 3. 合理使用级联
+
+```prisma
+// ✅ 对子数据使用级联
+model Post {
+  id        String    @id
+  comments  Comment[] // 删除文章时删除评论
+}
+
+model Comment {
+  id      String @id
+  postId  String
+  post    Post   @relation(fields: [postId], references: [id], onDelete: Cascade)
+}
+
+// ✅ 对重要数据限制级联
+model User {
+  id      String @id
+  orders  Order[]
+}
+
+model Order {
+  id      String @id
+  userId  String
+  user    User   @relation(fields: [userId], references: [id], onDelete: Restrict)
+}
+```
+
+### 4. 考虑查询性能
+
+```typescript
+// ✅ 使用 include 预加载关系，避免 N+1 问题
+const posts = await prisma.post.findMany({
+  include: {
+    author: {
+      select: {
+        id: true,
+        name: true,
+      },
+    },
+  },
+});
+
+// ❌ 避免在循环中查询
+for (const post of posts) {
+  const author = await prisma.user.findUnique({
+    // N+1 问题
+    where: { id: post.authorId },
+  });
+}
+```
+
+---
+
+## 常见问题
+
+**Q: 一对多和多对一有什么区别？**
+
+A: 它们是同一关系的不同视角。从"一"看是"一对多"，从"多"看是"多对一"。
+
+**Q: 如何删除所有关联关系？**
+
+A: 使用 `disconnect` 或 `delete`：
+
+```typescript
+await prisma.post.update({
+  where: { id: postId },
+  data: {
+    tags: {
+      deleteMany: {}, // 删除所有标签关联
+    },
+  },
+});
+```
+
+**Q: 自引用关系可以有多层吗？**
+
+A: 可以！但查询时要注意深度限制：
+
+```typescript
+const comment = await prisma.comment.findUnique({
+  where: { id: commentId },
+  include: {
+    replies: {
+      include: {
+        replies: {
+          include: {
+            replies: true, // 注意：不要无限嵌套
+          },
+        },
+      },
+    },
+  },
+});
+```
+
+**Q: 如何处理多对多的排序？**
+
+A: 使用显式关系表并在其中添加排序字段：
+
+```prisma
+model PostTag {
+  postId   String
+  tagId    String
+  order    Int // 排序字段
+
+  @@id([postId, tagId])
+}
+```
+
+---
+
+## 总结
+
+通过本文，我们深入学习了：
+
+✅ 关系的基本概念和组成
+✅ 一对一关系的定义和查询
+✅ 一对多关系的定义和查询
+✅ 多对多关系的隐式和显式实现
+✅ 自引用关系的处理
+✅ 多态关系的实现方式
+✅ 关系约束和级联操作
+✅ 关系设计的最佳实践
+
+掌握关系设计后，你可以构建复杂且高效的数据模型。下一步，我们将学习**CRUD 操作的完整指南**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- Create（创建）操作详解
+- Read（读取）操作详解
+- Update（更新）操作详解
+- Delete（删除）操作详解
+- 批量操作优化
+- Upsert 操作
+- 计数和聚合查询
+
+继续阅读：[基础 CRUD 操作完全指南](./04-crud-operations.mdx)

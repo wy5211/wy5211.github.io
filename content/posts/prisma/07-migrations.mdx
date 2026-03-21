@@ -1,0 +1,835 @@
+---
+title: "Prisma 数据迁移完全指南：掌握数据库版本管理"
+date: "2026-03-27"
+summary: "深入理解 Prisma Migrate 的工作原理，掌握数据库迁移的创建、应用、回滚等操作，学会在生产环境安全地管理数据库变更。"
+tags: ["Prisma", "Migrations", "Database", "Version Control", "DevOps"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 7
+---
+
+## 前言
+
+在软件开发过程中，数据库结构是不断演进的。新功能的添加、业务需求的变更、性能优化的需要，都会导致数据库结构的变化。
+
+如何安全、可追溯地管理这些变化？这就是数据迁移要解决的问题。
+
+Prisma Migrate 提供了一套完整的数据库版本管理方案，让你能够以声明式的方式管理数据库变更，并确保开发、测试、生产环境的一致性。
+
+**本文将涵盖**：
+
+- Migration 工作原理
+- 创建迁移文件
+- 应用和回滚迁移
+- 迁移文件结构
+- 种子数据管理
+- 生产环境迁移
+- 迁移最佳实践
+- 常见问题处理
+
+---
+
+## Migration 工作原理
+
+### 声明式 vs 命令式
+
+Prisma Migrate 采用**声明式**的方法：
+
+```prisma
+// schema.prisma（声明式）
+model User {
+  id    String @id
+  email String @unique
+  name  String
+}
+```
+
+Prisma 自动将其转换为 SQL：
+
+```sql
+-- 迁移文件（命令式）
+CREATE TABLE "users" (
+  "id" TEXT NOT NULL,
+  "email" TEXT NOT NULL,
+  "name" TEXT NOT NULL,
+  PRIMARY KEY ("id")
+);
+
+CREATE UNIQUE INDEX "users_email_key" ON "users"("email");
+```
+
+### 迁移工作流
+
+```
+┌─────────────────┐
+│  Schema 变更     │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│ prisma migrate  │
+│     dev         │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  生成迁移文件    │
+│  .sql           │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  应用到数据库    │
+│  更新 _migration │
+│  表             │
+└─────────────────┘
+```
+
+### 迁移历史表
+
+Prisma 使用 `_prisma_migrations` 表追踪迁移状态：
+
+```sql
+CREATE TABLE "_prisma_migrations" (
+  "id" TEXT NOT NULL,
+  "checksum" TEXT NOT NULL,
+  "finished_at" TIMESTAMP(3),
+  "migration_name" TEXT NOT NULL,
+  "logs" TEXT,
+  "rolled_back_at" TIMESTAMP(3),
+  "started_at" TIMESTAMP(3) NOT NULL,
+  "applied_steps_count" INTEGER NOT NULL,
+  PRIMARY KEY ("id")
+);
+```
+
+---
+
+## 创建迁移
+
+### 初始化迁移
+
+第一次创建迁移：
+
+```bash
+npx prisma migrate dev --name init
+```
+
+**执行过程**：
+
+1. 读取 `schema.prisma`
+2. 比较当前数据库结构
+3. 生成迁移 SQL 文件
+4. 应用迁移到数据库
+5. 生成 Prisma Client
+
+**输出示例**：
+
+```
+Environment variables loaded from .env
+Prisma schema loaded from prisma/schema.prisma
+
+Datasource "db": PostgreSQL database "mydb" at "localhost:5432"
+
+The following migration(s) have been created and applied from new schema changes:
+
+migrations/
+  └─ 20240327000000_init/
+    └─ migration.sql
+
+Applying migration `20240327000000_init`
+
+The following migration(s) have been applied:
+
+migrations/
+  └─ 20240327000000_init/
+    └─ migration.sql
+
+Database schema is up to date!
+Generated Prisma Client (5.0.0) to ./node_modules/.prisma/client in 1s
+```
+
+### 添加新迁移
+
+修改 Schema 后创建新迁移：
+
+```prisma
+// prisma/schema.prisma
+model User {
+  id    String @id
+  email String @unique
+  name  String
+  age   Int    // 新增字段
+}
+```
+
+```bash
+npx prisma migrate dev --name add_user_age
+```
+
+### 只创建不应用
+
+预览迁移而不应用：
+
+```bash
+npx prisma migrate dev --create-only --name add_user_age
+```
+
+这会创建迁移文件但不应用，适合审查迁移内容。
+
+---
+
+## 迁移文件结构
+
+### 迁移目录
+
+```
+prisma/
+├── schema.prisma
+└── migrations/
+    └── 20240327000000_init/
+        │── migration.sql
+        └── README.md
+    └── 20240327000001_add_user_age/
+        │── migration.sql
+        └── README.md
+```
+
+### 迁移 SQL 文件
+
+```sql
+-- migrations/20240327000000_init/migration.sql
+
+-- CreateEnum
+CREATE TYPE "UserRole" AS ENUM ('USER', 'ADMIN');
+
+-- CreateTable
+CREATE TABLE "users" (
+  "id" TEXT NOT NULL,
+  "email" TEXT NOT NULL,
+  "username" TEXT NOT NULL,
+  "password" TEXT NOT NULL,
+  "role" "UserRole" NOT NULL DEFAULT 'USER',
+
+  CONSTRAINT "users_pkey" PRIMARY KEY ("id")
+);
+
+-- CreateIndex
+CREATE UNIQUE INDEX "users_email_key" ON "users"("email");
+CREATE UNIQUE INDEX "users_username_key" ON "users"("username");
+```
+
+### 迁移 README
+
+每个迁移都包含一个 README 文件，记录迁移信息：
+
+```markdown
+# This is an empty migration.
+
+This migration doesn't do anything, and it might have been created because you
+ran `prisma migrate dev` without changing the schema.
+
+Learn more about the workflow:
+https://pris.ly/d/migrate-workflow
+
+`
+```
+
+---
+
+## 应用迁移
+
+### 开发环境
+
+在开发环境应用迁移：
+
+```bash
+npx prisma migrate dev
+```
+
+这会：
+
+1. 检查待应用的迁移
+2. 应用到开发数据库
+3. 生成 Prisma Client
+
+### 生产环境
+
+在生产环境应用迁移：
+
+```bash
+npx prisma migrate deploy
+```
+
+**关键区别**：
+
+- `migrate dev`：可以创建和应用新迁移
+- `migrate deploy`：只应用现有迁移，不创建新迁移
+
+### 生产环境最佳实践
+
+```bash
+# 1. 在开发环境创建并测试迁移
+npx prisma migrate dev --name add_new_field
+
+# 2. 审查迁移文件
+cat prisma/migrations/xxxxx_add_new_field/migration.sql
+
+# 3. 提交迁移文件到 Git
+git add prisma/migrations
+git commit -m "Add new field to User model"
+
+# 4. 部署到生产环境
+git push production main
+
+# 5. 在生产服务器应用迁移
+npx prisma migrate deploy
+```
+
+---
+
+## 查看迁移状态
+
+### 检查迁移状态
+
+```bash
+npx prisma migrate status
+```
+
+**输出示例**：
+
+```
+Environment variables loaded from .env
+Prisma schema loaded from prisma/schema.prisma
+
+Datasource "db": PostgreSQL database "mydb" at "localhost:5432"
+
+待应用的迁移:
+  20240327000001_add_user_age
+
+已应用的迁移:
+  20240327000000_init
+```
+
+### 查看迁移历史
+
+```bash
+# 查看数据库中的迁移表
+npx prisma db execute --sql "SELECT * FROM _prisma_migrations ORDER BY started_at DESC"
+```
+
+---
+
+## 回滚迁移
+
+### 理解回滚
+
+Prisma **不推荐**回滚迁移。相反，应该创建一个新的迁移来撤销之前的更改。
+
+### 推荐做法：创建新迁移
+
+假设你想撤销 `add_user_age` 迁移：
+
+```prisma
+// prisma/schema.prisma
+model User {
+  id    String @id
+  email String @unique
+  name  String
+  // age Int  // 删除这个字段
+}
+```
+
+```bash
+# 创建新迁移来移除 age 字段
+npx prisma migrate dev --name remove_user_age
+```
+
+### 手动回滚（不推荐）
+
+如果确实需要回滚：
+
+```bash
+# 1. 手动执行撤销 SQL
+npx prisma db execute --sql "ALTER TABLE users DROP COLUMN age"
+
+# 2. 标记迁移为已回滚
+npx prisma migrate resolve --rolled-back "20240327000001_add_user_age"
+```
+
+---
+
+## 重置数据库
+
+### 开发环境重置
+
+**警告**：这会删除所有数据！
+
+```bash
+npx prisma migrate reset
+```
+
+**执行过程**：
+
+1. 删除所有数据库表
+2. 重新应用所有迁移
+3. 运行种子数据
+
+### 使用 Seed 重置
+
+```bash
+# 重置并运行种子数据
+npx prisma migrate reset
+
+# 单独运行种子数据
+npx prisma db seed
+```
+
+---
+
+## 种子数据
+
+### 配置种子脚本
+
+在 `package.json` 中配置：
+
+```json
+{
+  "prisma": {
+    "seed": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed.ts"
+  }
+}
+```
+
+### 编写种子文件
+
+```typescript
+// prisma/seed.ts
+import { PrismaClient } from "@prisma/client";
+import * as bcrypt from "bcrypt";
+
+const prisma = new PrismaClient();
+
+async function main() {
+  console.log("开始播种数据...");
+
+  // 创建管理员用户
+  const hashedPassword = await bcrypt.hash("admin123", 10);
+
+  const admin = await prisma.user.upsert({
+    where: { email: "admin@example.com" },
+    create: {
+      email: "admin@example.com",
+      username: "admin",
+      password: hashedPassword,
+      role: "ADMIN",
+    },
+    update: {},
+  });
+
+  console.log("创建管理员:", admin.email);
+
+  // 创建示例标签
+  const tags = ["JavaScript", "TypeScript", "Prisma", "React", "Node.js"];
+
+  for (const tagName of tags) {
+    await prisma.tag.upsert({
+      where: { name: tagName },
+      create: {
+        name: tagName,
+        slug: tagName.toLowerCase(),
+      },
+      update: {},
+    });
+  }
+
+  console.log("创建标签完成");
+
+  // 创建示例文章
+  const user = await prisma.user.findUnique({
+    where: { email: "admin@example.com" },
+  });
+
+  if (user) {
+    await prisma.post.create({
+      data: {
+        title: "欢迎使用 Prisma",
+        slug: "welcome-to-prisma",
+        content: "这是第一篇文章...",
+        status: "PUBLISHED",
+        authorId: user.id,
+        publishedAt: new Date(),
+      },
+    });
+
+    console.log("创建示例文章");
+  }
+
+  console.log("播种完成!");
+}
+
+main()
+  .catch((e) => {
+    console.error(e);
+    process.exit(1);
+  })
+  .finally(async () => {
+    await prisma.$disconnect();
+  });
+```
+
+### 运行种子数据
+
+```bash
+# 手动运行
+npx prisma db seed
+
+# 或使用 npm
+npm run seed
+```
+
+### 在迁移后自动运行
+
+```bash
+# reset 会自动运行种子数据
+npx prisma migrate reset
+```
+
+---
+
+## 生产环境迁移
+
+### 迁移策略
+
+#### 1. 零停机迁移
+
+```bash
+# 1. 在新服务器上应用迁移
+npx prisma migrate deploy
+
+# 2. 验证新数据库
+npx prisma studio
+
+# 3. 切换流量到新服务器
+```
+
+#### 2. 蓝绿部署
+
+```bash
+# 蓝环境（当前生产）
+npx prisma migrate deploy --schema=./prisma/blue.prisma
+
+# 绿环境（新版本）
+npx prisma migrate deploy --schema=./prisma/green.prisma
+
+# 切换到绿环境
+```
+
+### 环境变量配置
+
+```bash
+# .env.production
+DATABASE_URL="postgresql://user:password@prod-host:5432/dbname?sslmode=require"
+
+# 直接 URL（推荐生产环境）
+DATABASE_URL="postgresql://user:password@prod-host:5432/dbname?schema=public&connection_limit=10&pool_timeout=20"
+```
+
+### CI/CD 集成
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client
+        run: npx prisma generate
+
+      - name: Run migrations
+        run: npx prisma migrate deploy
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+```
+
+---
+
+## 迁移最佳实践
+
+### 1. 小步快跑
+
+```prisma
+// ✅ 推荐：每次只做小的变更
+// 迁移 1：添加字段
+model User {
+  age Int
+}
+
+// 迁移 2：添加索引
+@@index([age])
+
+// ❌ 避免：一次做大量变更
+// 迁移 1：添加多个字段、索引、关系
+```
+
+### 2. 向后兼容
+
+```sql
+-- ✅ 添加可选字段
+ALTER TABLE users ADD COLUMN age INTEGER;
+
+-- ❌ 添加必填字段（可能失败）
+ALTER TABLE users ADD COLUMN age INTEGER NOT NULL;
+
+-- ✅ 分两步：先添加可选，再填充数据，最后设为必填
+-- 步骤 1
+ALTER TABLE users ADD COLUMN age INTEGER;
+
+-- 步骤 2（手动填充数据）
+UPDATE users SET age = 18;
+
+-- 步骤 3
+ALTER TABLE ALTER COLUMN age SET NOT NULL;
+```
+
+### 3. 使用事务
+
+```sql
+-- ✅ 大迁移使用事务
+BEGIN;
+
+ALTER TABLE users ADD COLUMN age INTEGER;
+CREATE INDEX idx_users_age ON users(age);
+
+COMMIT;
+```
+
+### 4. 备份数据库
+
+```bash
+# 迁移前备份
+pg_dump mydb > backup_$(date +%Y%m%d).sql
+
+# 应用迁移
+npx prisma migrate deploy
+
+# 如果失败，恢复备份
+psql mydb < backup_20240327.sql
+```
+
+### 5. 测试迁移
+
+```bash
+# 1. 在开发环境测试
+npx prisma migrate dev
+
+# 2. 在测试环境测试
+DATABASE_URL="test-db-url" npx prisma migrate deploy
+
+# 3. 在预生产环境测试
+DATABASE_URL="staging-db-url" npx prisma migrate deploy
+
+# 4. 最后在生产环境应用
+DATABASE_URL="prod-db-url" npx prisma migrate deploy
+```
+
+---
+
+## 处理迁移冲突
+
+### Schema 与数据库不一致
+
+```bash
+# 检查差异
+npx prisma db pull
+
+# 对比 Schema
+npx prisma db pull --print
+
+# 同步 Schema
+npx prisma db push  # 开发环境慎用
+```
+
+### 迁移解决
+
+```bash
+# 标记迁移为已应用
+npx prisma migrate resolve --applied "20240327000001_add_user_age"
+
+# 标记迁移为已回滚
+npx prisma migrate resolve --rolled-back "20240327000001_add_user_age"
+```
+
+---
+
+## 常见场景
+
+### 场景 1：重命名表
+
+```prisma
+// ❌ 错误方式：直接修改
+model Post {}  // 改为 Article
+
+// ✅ 正确方式：创建新表，迁移数据
+model Post {}
+model Article {}
+
+// 迁移数据后，删除 Post
+```
+
+### 场景 2：修改字段类型
+
+```prisma
+// ⚠️ 风险操作：可能丢失数据
+model User {
+  age String  // 从 Int 改为 String
+}
+```
+
+**安全做法**：
+
+```sql
+-- 1. 添加新字段
+ALTER TABLE users ADD COLUMN age_text TEXT;
+
+-- 2. 迁移数据
+UPDATE users SET age_text = age::TEXT;
+
+-- 3. 删除旧字段
+ALTER TABLE users DROP COLUMN age;
+
+-- 4. 重命名新字段
+ALTER TABLE users RENAME COLUMN age_text TO age;
+```
+
+### 场景 3：添加外键
+
+```prisma
+model Post {
+  authorId String
+  author   User   @relation(fields: [authorId], references: [id])
+}
+```
+
+**生成的 SQL**：
+
+```sql
+ALTER TABLE "posts" ADD COLUMN "authorId" TEXT;
+ALTER TABLE "posts" ADD CONSTRAINT "posts_authorId_fkey" FOREIGN KEY ("authorId") REFERENCES "users"("id") ON DELETE CASCADE ON UPDATE CASCADE;
+```
+
+---
+
+## 完整示例：迁移工作流
+
+```bash
+# 1. 修改 Schema
+# prisma/schema.prisma
+
+# 2. 创建迁移
+npx prisma migrate dev --name add_user_profile
+
+# 3. 审查迁移文件
+cat prisma/migrations/xxxxx_add_user_profile/migration.sql
+
+# 4. 测试迁移
+npx prisma migrate reset
+
+# 5. 提交到 Git
+git add prisma/migrations
+git commit -m "Add user profile"
+
+# 6. 部署到测试环境
+git push test main
+# CI 自动运行：npx prisma migrate deploy
+
+# 7. 验证测试环境
+# 手动测试功能
+
+# 8. 合并到主分支
+git push production main
+
+# 9. 在生产环境应用
+npx prisma migrate deploy
+```
+
+---
+
+## 常见问题
+
+**Q: 如何在已有数据库上使用 Prisma？**
+
+A: 使用 `db pull` 从现有数据库生成 Schema：
+
+```bash
+npx prisma db pull
+npx prisma migrate dev --name init
+```
+
+**Q: 迁移失败怎么办？**
+
+A: 检查错误日志，手动修复数据库，然后使用 `resolve`：
+
+```bash
+npx prisma migrate resolve --applied "failed_migration"
+```
+
+**Q: 如何删除迁移？**
+
+A: 不要删除迁移文件！创建新迁移来撤销更改。
+
+**Q: migrate deploy 和 migrate dev 有什么区别？**
+
+A: `dev` 创建和应用新迁移，`deploy` 只应用现有迁移。
+
+---
+
+## 总结
+
+通过本文，我们全面掌握了：
+
+✅ Prisma Migrate 的工作原理
+✅ 创建和应用迁移的完整流程
+✅ 迁移文件的结构和管理
+✅ 种子数据的配置和使用
+✅ 生产环境迁移的策略
+✅ 迁移回滚和冲突处理
+✅ 迁移的最佳实践
+✅ 常见场景的解决方案
+
+掌握数据迁移后，你可以安全地管理数据库演进。下一步，我们将学习**事务与并发控制**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- 事务的基本概念
+- Prisma 事务 API
+- 嵌套写入
+- 并发问题处理
+- 乐观锁和悲观锁
+- 隔离级别配置
+- 事务最佳实践
+
+继续阅读：[事务与并发控制](./08-transactions.mdx)

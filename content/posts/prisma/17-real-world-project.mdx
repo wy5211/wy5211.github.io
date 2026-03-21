@@ -1,0 +1,1296 @@
+---
+title: "Prisma 完整实战项目：构建生产级博客系统 API"
+date: "2026-04-06"
+summary: "综合运用所学知识，从零开始构建一个完整的生产级博客系统 API，包含用户认证、文章管理、评论系统、搜索功能等完整功能。"
+tags: ["Prisma", "Full Stack", "API", "Production", "Real World"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 17
+---
+
+## 前言
+
+在前面的16篇文章中，我们学习了 Prisma 的方方面面。现在，是时候将这些知识整合起来，构建一个完整的生产级应用了。
+
+本文将带你从零开始，构建一个功能完整的博客系统 API。这个项目将涵盖：用户认证、文章管理、评论系统、搜索功能、文件上传、数据验证、错误处理、测试和部署。
+
+**项目功能**：
+
+- ✅ 用户注册、登录、JWT 认证
+- ✅ 文章 CRUD（创建、读取、更新、删除）
+- ✅ 评论系统（嵌套回复）
+- ✅ 标签分类管理
+- ✅ 全文搜索
+- ✅ 文件上传（头像、封面图）
+- ✅ 分页和筛选
+- ✅ 数据验证
+- ✅ 错误处理
+- ✅ 测试覆盖
+- ✅ Docker 部署
+
+---
+
+## 项目初始化
+
+### 创建项目
+
+```bash
+# 创建项目目录
+mkdir blog-api
+cd blog-api
+
+# 初始化项目
+npm init -y
+
+# 安装依赖
+npm install hono
+npm install @hono/zod-validator
+npm install @hono/jwt
+npm install bcrypt
+npm install prisma @prisma/client
+npm install zod
+
+# 安装开发依赖
+npm install -D @types/node
+npm install -D @types/bcrypt
+npm install -D typescript
+npm install -D ts-node
+npm install -D vitest
+npm install -D wrangler
+
+# 初始化 TypeScript
+npx tsc --init
+
+# 初始化 Prisma
+npx prisma init
+```
+
+### 项目结构
+
+```
+blog-api/
+├── prisma/
+│   ├── schema.prisma
+│   ├── migrations/
+│   └── seed.ts
+├── src/
+│   ├── lib/
+│   │   ├── db.ts
+│   │   ├── jwt.ts
+│   │   └── validators.ts
+│   ├── middleware/
+│   │   ├── auth.ts
+│   │   ├── error.ts
+│   │   └── db.ts
+│   ├── routes/
+│   │   ├── auth.ts
+│   │   ├── users.ts
+│   │   ├── posts.ts
+│   │   ├── comments.ts
+│   │   └── tags.ts
+│   ├── services/
+│   │   ├── auth.service.ts
+│   │   ├── post.service.ts
+│   │   └── upload.service.ts
+│   ├── types/
+│   │   └── index.ts
+│   └── index.ts
+├── tests/
+│   ├── setup.ts
+│   ├── auth.test.ts
+│   ├── posts.test.ts
+│   └── helpers.ts
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
+├── package.json
+└── tsconfig.json
+```
+
+---
+
+## 数据库设计
+
+### Prisma Schema
+
+```prisma
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  USER
+  ADMIN
+}
+
+enum PostStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  username  String   @unique
+  password  String
+  role      UserRole @default(USER)
+  avatar    String?
+  bio       String?  @db.Text
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  posts     Post[]
+  comments  Comment[]
+
+  @@index([email])
+  @@index([username])
+  @@map("users")
+}
+
+model Post {
+  id          String     @id @default(uuid())
+  title       String
+  slug        String     @unique
+  content     String     @db.Text
+  excerpt     String?    @db.Text
+  cover       String?
+  status      PostStatus @default(DRAFT)
+  viewCount   Int        @default(0)
+
+  authorId    String
+  author      User       @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  comments    Comment[]
+  tags        PostTag[]
+
+  publishedAt DateTime?
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+
+  @@index([authorId])
+  @@index([status, publishedAt])
+  @@index([slug])
+  @@fulltext([title, content])
+  @@map("posts")
+}
+
+model Comment {
+  id        String   @id @default(uuid())
+  content   String   @db.Text
+
+  postId    String
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  authorId  String
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  parentId  String?
+  parent    Comment? @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies   Comment[] @relation("CommentReplies")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([postId])
+  @@index([authorId])
+  @@index([parentId])
+  @@map("comments")
+}
+
+model Tag {
+  id    String     @id @default(uuid())
+  name  String     @unique
+  slug  String     @unique
+  color String?
+
+  posts PostTag[]
+
+  createdAt DateTime @default(now())
+
+  @@index([slug])
+  @@map("tags")
+}
+
+model PostTag {
+  postId   String
+  tagId    String
+
+  post     Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  tag      Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([postId, tagId])
+  @@map("post_tags")
+}
+```
+
+### 初始化迁移
+
+```bash
+npx prisma migrate dev --name init
+```
+
+---
+
+## 核心功能实现
+
+### 数据库单例
+
+```typescript
+// src/lib/db.ts
+import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+export const prisma =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    log:
+      process.env.NODE_ENV === "development"
+        ? ["query", "error", "warn"]
+        : ["error"],
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+```
+
+### JWT 工具
+
+```typescript
+// src/lib/jwt.ts
+import { sign, verify } from "hono/jwt";
+import * as bcrypt from "bcrypt";
+
+const JWT_SECRET = process.env.JWT_SECRET || "secret";
+
+export async function hashPassword(password: string): Promise<string> {
+  return await bcrypt.hash(password, 10);
+}
+
+export async function comparePassword(
+  password: string,
+  hash: string
+): Promise<boolean> {
+  return await bcrypt.compare(password, hash);
+}
+
+export function generateToken(payload: any): string {
+  return sign(payload, JWT_SECRET);
+}
+
+export function verifyToken(token: string) {
+  return verify(token, JWT_SECRET);
+}
+```
+
+### 数据验证
+
+```typescript
+// src/lib/validators.ts
+import { z } from "zod";
+
+// 用户验证
+export const registerSchema = z.object({
+  email: z.string().email("Invalid email"),
+  username: z
+    .string()
+    .min(3, "Username must be at least 3 characters")
+    .max(20, "Username must be at most 20 characters")
+    .regex(
+      /^[a-zA-Z0-9_]+$/,
+      "Username can only contain letters, numbers, and underscores"
+    ),
+  password: z
+    .string()
+    .min(8, "Password must be at least 8 characters")
+    .regex(
+      /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/,
+      "Password must contain uppercase, lowercase, and number"
+    ),
+});
+
+export const loginSchema = z.object({
+  email: z.string().email(),
+  password: z.string(),
+});
+
+// 文章验证
+export const createPostSchema = z.object({
+  title: z.string().min(1).max(200),
+  slug: z.string().min(1).max(200),
+  content: z.string().min(1),
+  excerpt: z.string().optional(),
+  cover: z.string().url().optional(),
+  status: z.enum(["DRAFT", "PUBLISHED"]).default("DRAFT"),
+  tags: z.array(z.string()).optional(),
+});
+
+export const updatePostSchema = createPostSchema.partial();
+
+// 评论验证
+export const createCommentSchema = z.object({
+  content: z.string().min(1).max(1000),
+  parentId: z.string().optional(),
+});
+```
+
+---
+
+## 认证功能
+
+### 认证路由
+
+```typescript
+// src/routes/auth.ts
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+import { prisma } from "../lib/db";
+import {
+  hashPassword,
+  comparePassword,
+  generateToken,
+  verifyToken,
+} from "../lib/jwt";
+import { registerSchema, loginSchema } from "../lib/validators";
+
+const auth = new Hono();
+
+// POST /auth/register - 注册
+auth.post("/register", zValidator("json", registerSchema), async (c) => {
+  const data = c.req.valid("json");
+
+  try {
+    // 检查邮箱是否已存在
+    const existingUser = await prisma.user.findUnique({
+      where: { email: data.email },
+    });
+
+    if (existingUser) {
+      return c.json(
+        {
+          success: false,
+          error: "Email already exists",
+        },
+        409
+      );
+    }
+
+    // 检查用户名是否已存在
+    const existingUsername = await prisma.user.findUnique({
+      where: { username: data.username },
+    });
+
+    if (existingUsername) {
+      return c.json(
+        {
+          success: false,
+          error: "Username already exists",
+        },
+        409
+      );
+    }
+
+    // 哈希密码
+    const hashedPassword = await hashPassword(data.password);
+
+    // 创建用户
+    const user = await prisma.user.create({
+      data: {
+        email: data.email,
+        username: data.username,
+        password: hashedPassword,
+      },
+      select: {
+        id: true,
+        email: true,
+        username: true,
+        role: true,
+        createdAt: true,
+      },
+    });
+
+    return c.json(
+      {
+        success: true,
+        data: user,
+      },
+      201
+    );
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        error: "Failed to create user",
+      },
+      500
+    );
+  }
+});
+
+// POST /auth/login - 登录
+auth.post("/login", zValidator("json", loginSchema), async (c) => {
+  const { email, password } = c.req.valid("json");
+
+  try {
+    // 查找用户
+    const user = await prisma.user.findUnique({
+      where: { email },
+    });
+
+    if (!user) {
+      return c.json(
+        {
+          success: false,
+          error: "Invalid credentials",
+        },
+        401
+      );
+    }
+
+    // 验证密码
+    const isValid = await comparePassword(password, user.password);
+
+    if (!isValid) {
+      return c.json(
+        {
+          success: false,
+          error: "Invalid credentials",
+        },
+        401
+      );
+    }
+
+    // 生成 Token
+    const token = generateToken({
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+    });
+
+    return c.json({
+      success: true,
+      data: {
+        token,
+        user: {
+          id: user.id,
+          email: user.email,
+          username: user.username,
+          role: user.role,
+        },
+      },
+    });
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        error: "Login failed",
+      },
+      500
+    );
+  }
+});
+
+export default auth;
+```
+
+### 认证中间件
+
+```typescript
+// src/middleware/auth.ts
+import { Context, Next } from "hono";
+import { verifyToken } from "../lib/jwt";
+
+export const authMiddleware = async (c: Context, next: Next) => {
+  const authorization = c.req.header("Authorization");
+
+  if (!authorization) {
+    return c.json(
+      {
+        success: false,
+        error: "Unauthorized",
+      },
+      401
+    );
+  }
+
+  const token = authorization.replace("Bearer ", "");
+
+  try {
+    const payload = verifyToken(token);
+
+    // 将用户信息注入到 Context
+    c.set("user", payload);
+    await next();
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        error: "Invalid token",
+      },
+      401
+    );
+  }
+};
+
+// 角色检查中间件
+export function roleMiddleware(allowedRoles: string[]) {
+  return async (c: Context, next: Next) => {
+    const user = c.get("user");
+
+    if (!user || !allowedRoles.includes(user.role)) {
+      return c.json(
+        {
+          success: false,
+          error: "Forbidden",
+        },
+        403
+      );
+    }
+
+    await next();
+  };
+}
+```
+
+---
+
+## 文章功能
+
+### 文章路由
+
+```typescript
+// src/routes/posts.ts
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+import { prisma } from "../lib/db";
+import { createPostSchema, updatePostSchema } from "../lib/validators";
+import { authMiddleware } from "../middleware/auth";
+
+const posts = new Hono();
+
+// 应用认证中间件（除列表外）
+posts.use("/*", authMiddleware);
+
+// GET /posts - 获取文章列表（公开）
+posts.get("/", async (c) => {
+  const page = parseInt(c.req.query("page") || "1");
+  const limit = parseInt(c.req.query("limit") || "10");
+  const status = c.req.query("status");
+  const keyword = c.req.query("keyword");
+
+  const where: any = {
+    status: status || "PUBLISHED",
+  };
+
+  if (keyword) {
+    where.OR = [
+      { title: { contains: keyword, mode: "insensitive" } },
+      { content: { contains: keyword, mode: "insensitive" } },
+    ];
+  }
+
+  const [posts, total] = await Promise.all([
+    prisma.post.findMany({
+      where,
+      skip: (page - 1) * limit,
+      take: limit,
+      orderBy: { createdAt: "desc" },
+      include: {
+        author: {
+          select: {
+            id: true,
+            username: true,
+            avatar: true,
+          },
+        },
+        tags: {
+          select: {
+            id: true,
+            name: true,
+            slug: true,
+          },
+        },
+      },
+    }),
+    prisma.post.count({ where }),
+  ]);
+
+  return c.json({
+    data: posts,
+    meta: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  });
+});
+
+// GET /posts/:id - 获取文章详情（公开）
+posts.get("/:id", async (c) => {
+  const id = c.req.param("id");
+
+  const post = await prisma.post.findUnique({
+    where: { id },
+    include: {
+      author: {
+        select: {
+          id: true,
+          username: true,
+          avatar: true,
+          bio: true,
+        },
+      },
+      comments: {
+        where: { parentId: null },
+        include: {
+          author: {
+            select: {
+              id: true,
+              username: true,
+              avatar: true,
+            },
+          },
+          replies: {
+            include: {
+              author: {
+                select: {
+                  id: true,
+                  username: true,
+                  avatar: true,
+                },
+              },
+            },
+          },
+        },
+        orderBy: { createdAt: "desc" },
+      },
+      tags: {
+        select: {
+          id: true,
+          name: true,
+          slug: true,
+        },
+      },
+    },
+  });
+
+  if (!post) {
+    return c.json(
+      {
+        success: false,
+        error: "Post not found",
+      },
+      404
+    );
+  }
+
+  // 增加浏览量
+  await prisma.post.update({
+    where: { id },
+    data: { viewCount: { increment: 1 } },
+  });
+
+  return c.json({
+    success: true,
+    data: post,
+  });
+});
+
+// POST /posts - 创建文章
+posts.post("/", zValidator("json", createPostSchema), async (c) => {
+  const db = c.get("db");
+  const data = c.req.valid("json");
+  const user = c.get("user");
+
+  try {
+    const post = await db.post.create({
+      data: {
+        ...data,
+        authorId: user.sub,
+        publishedAt: data.status === "PUBLISHED" ? new Date() : null,
+        tags: data.tags
+          ? {
+              connectOrCreate: data.tags.map((tagId) => ({
+                where: { id: tagId },
+                create: { id: tagId }, // 假设标签已存在
+              })),
+            }
+          : undefined,
+      },
+      include: {
+        author: {
+          select: {
+            id: true,
+            username: true,
+          },
+        },
+        tags: true,
+      },
+    });
+
+    return c.json(
+      {
+        success: true,
+        data: post,
+      },
+      201
+    );
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        error: "Failed to create post",
+      },
+      500
+    );
+  }
+});
+
+// PUT /posts/:id - 更新文章
+posts.put("/:id", zValidator("json", updatePostSchema), async (c) => {
+  const db = c.get("db");
+  const { id } = c.req.param();
+  const data = c.req.valid("json");
+  const user = c.get("user");
+
+  try {
+    // 检查权限
+    const post = await db.post.findUnique({
+      where: { id },
+    });
+
+    if (!post) {
+      return c.json(
+        {
+          success: false,
+          error: "Post not found",
+        },
+        404
+      );
+    }
+
+    if (post.authorId !== user.sub && user.role !== "ADMIN") {
+      return c.json(
+        {
+          success: false,
+          error: "Forbidden",
+        },
+        403
+      );
+    }
+
+    const updated = await db.post.update({
+      where: { id },
+      data: {
+        ...data,
+        publishedAt:
+          data.status === "PUBLISHED" && !post.publishedAt
+            ? new Date()
+            : post.publishedAt,
+      },
+      include: {
+        author: {
+          select: {
+            id: true,
+            username: true,
+          },
+        },
+        tags: true,
+      },
+    });
+
+    return c.json({
+      success: true,
+      data: updated,
+    });
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        error: "Failed to update post",
+      },
+      500
+    );
+  }
+});
+
+// DELETE /posts/:id - 删除文章
+posts.delete("/:id", async (c) => {
+  const db = c.get("db");
+  const { id } = c.req.param();
+  const user = c.get("user");
+
+  try {
+    // 检查权限
+    const post = await db.post.findUnique({
+      where: { id },
+    });
+
+    if (!post) {
+      return c.json(
+        {
+          success: false,
+          error: "Post not found",
+        },
+        404
+      );
+    }
+
+    if (post.authorId !== user.sub && user.role !== "ADMIN") {
+      return c.json(
+        {
+          success: false,
+          error: "Forbidden",
+        },
+        403
+      );
+    }
+
+    await db.post.delete({
+      where: { id },
+    });
+
+    return c.json({
+      success: true,
+      message: "Post deleted",
+    });
+  } catch (error) {
+    return c.json(
+      {
+        success: false,
+        error: "Failed to delete post",
+      },
+      500
+    );
+  }
+});
+
+export default posts;
+```
+
+---
+
+## 主应用入口
+
+```typescript
+// src/index.ts
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { compress } from "hono/compress";
+import { logger } from "hono/logger";
+import { prisma } from "./lib/db";
+import { dbMiddleware } from "./middleware/db";
+import { errorHandler } from "./middleware/error";
+import auth from "./routes/auth";
+import users from "./routes/users";
+import posts from "./routes/posts";
+import comments from "./routes/comments";
+import tags from "./routes/tags";
+
+const app = new Hono();
+
+// 全局中间件
+app.use("*", logger());
+app.use("*", compress());
+app.use(
+  "*",
+  cors({
+    origin: ["http://localhost:3000", "https://example.com"],
+    credentials: true,
+  })
+);
+app.use("*", dbMiddleware);
+app.use("*", errorHandler);
+
+// 健康检查
+app.get("/health", async (c) => {
+  try {
+    await prisma.$queryRaw`SELECT 1`;
+    return c.json({
+      status: "healthy",
+      database: "connected",
+      timestamp: new Date().toISOString(),
+    });
+  } catch (error) {
+    return c.json(
+      {
+        status: "unhealthy",
+        database: "disconnected",
+      },
+      503
+    );
+  }
+});
+
+// API 版本
+const api = new Hono();
+api.route("/auth", auth);
+api.route("/users", users);
+api.route("/posts", posts);
+api.route("/comments", comments);
+api.route("/tags", tags);
+
+app.route("/api", api);
+
+export default app;
+```
+
+---
+
+## 错误处理中间件
+
+```typescript
+// src/middleware/error.ts
+import { Context, Next } from "hono";
+
+export const errorHandler = async (c: Context, next: Next) => {
+  try {
+    await next();
+  } catch (error: any) {
+    console.error("Error:", error);
+
+    // Prisma 错误
+    if (error.code === "P2002") {
+      return c.json(
+        {
+          success: false,
+          error: "Unique constraint violation",
+        },
+        409
+      );
+    }
+
+    if (error.code === "P2025") {
+      return c.json(
+        {
+          success: false,
+          error: "Record not found",
+        },
+        404
+      );
+    }
+
+    // JWT 错误
+    if (error.message === "Unauthorized") {
+      return c.json(
+        {
+          success: false,
+          error: error.message,
+        },
+        401
+      );
+    }
+
+    // 默认错误
+    return c.json(
+      {
+        success: false,
+        error:
+          process.env.NODE_ENV === "production"
+            ? "Internal server error"
+            : error.message,
+      },
+      500
+    );
+  }
+};
+```
+
+---
+
+## Docker 配置
+
+### Dockerfile
+
+```dockerfile
+FROM node:20-alpine AS base
+
+# 安装依赖
+FROM base AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+
+# 生成 Prisma Client
+FROM base AS prisma-generate
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY prisma ./prisma
+RUN npx prisma generate
+
+# 构建应用
+FROM base AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY --from=prisma-generate /app/node_modules/.prisma ./node_modules/.prisma
+COPY tsconfig.json ./
+COPY src ./src
+RUN npm run build
+
+# 生产镜像
+FROM base AS runner
+WORKDIR /app
+ENV NODE_ENV production
+
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 hono
+
+COPY --from=build /app/package*.json ./
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=prisma-generate /app/node_modules/.prisma ./node_modules/.prisma
+COPY --from=build /app/prisma ./prisma
+
+USER hono
+
+EXPOSE 3000
+
+CMD ["node", "dist/index.js"]
+```
+
+### Docker Compose
+
+```yaml
+version: "3.8"
+
+services:
+  app:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:password@postgres:5432/blog_db
+      - JWT_SECRET=your-secret-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: blog_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+```
+
+---
+
+## 测试
+
+### 集成测试
+
+```typescript
+// tests/posts.test.ts
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { PrismaClient } from "@prisma/client";
+import { buildApp } from "./helpers";
+import { hashPassword } from "../src/lib/jwt";
+
+describe("Posts API", () => {
+  let prisma: PrismaClient;
+  let app: ReturnType<typeof buildApp>;
+  let token: string;
+
+  beforeEach(async () => {
+    prisma = new PrismaClient({
+      datasources: {
+        db: {
+          url: process.env.TEST_DATABASE_URL || "file:./test.db",
+        },
+      },
+    });
+
+    app = buildApp(prisma);
+
+    // 清理数据库
+    await prisma.comment.deleteMany();
+    await prisma.post.deleteMany();
+    await prisma.user.deleteMany();
+
+    // 创建测试用户
+    const hashedPassword = await hashPassword("Password123");
+    const user = await prisma.user.create({
+      data: {
+        email: "user@example.com",
+        username: "testuser",
+        password: hashedPassword,
+      },
+    });
+
+    // 生成 Token
+    token = generateToken({
+      sub: user.id,
+      email: user.email,
+      role: user.role,
+    });
+  });
+
+  afterEach(async () => {
+    await prisma.$disconnect();
+  });
+
+  it("should create a post", async () => {
+    const response = await app.request("/api/posts", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({
+        title: "Test Post",
+        slug: "test-post",
+        content: "Test content",
+        status: "PUBLISHED",
+      }),
+    });
+
+    expect(response.status).toBe(201);
+
+    const json = await response.json();
+    expect(json.success).toBe(true);
+    expect(json.data).toHaveProperty("id");
+  });
+
+  it("should get posts list", async () => {
+    const response = await app.request("/api/posts");
+
+    expect(response.status).toBe(200);
+
+    const json = await response.json();
+    expect(json.data).toBeInstanceOf(Array);
+  });
+});
+```
+
+---
+
+## 部署
+
+### 启动应用
+
+```bash
+# 开发环境
+npm run dev
+
+# 生产环境
+npm run build
+npm start
+
+# 使用 Docker
+docker-compose up -d
+
+# 运行迁移
+docker-compose exec app npx prisma migrate deploy
+```
+
+### 环境变量
+
+```bash
+# .env.example
+DATABASE_URL="postgresql://user:password@localhost:5432/blog_db"
+JWT_SECRET="your-secret-key"
+NODE_ENV="development"
+PORT=3000
+```
+
+---
+
+## 项目总结
+
+通过这个完整的项目，我们综合运用了：
+
+✅ **数据模型设计**：用户、文章、评论、标签
+✅ **认证授权**：JWT + 角色权限
+✅ **CRUD 操作**：完整的增删改查
+✅ **关系查询**：一对多、自引用
+✅ **数据验证**：Zod Schema 验证
+✅ **错误处理**：统一错误处理
+✅ **中间件**：认证、数据库、错误处理
+✅ **测试**：集成测试覆盖
+✅ **部署**：Docker 容器化
+
+这是一个生产级的项目结构，可以作为你自己的项目起点。
+
+---
+
+## 扩展建议
+
+可以考虑添加以下功能：
+
+- 🔍 **更多搜索功能**：标签搜索、日期范围搜索
+- 📧 **邮件通知**：评论通知、点赞通知
+- 📝 **Markdown 支持**：使用 MDX 或 Markdown-it
+- 📊 **统计功能**：阅读量、点赞统计
+- 🔄 **自动保存**：文章草稿自动保存
+- 📤 **更多文件上传**：多图上传、图片压缩
+- 🌍 **国际化**：多语言支持
+- 📱 **API 版本控制**：v1、v2 API
+
+---
+
+## 学习回顾
+
+完成这个系列后，你已经：
+
+1. ✅ 掌握了 Prisma 的核心概念
+2. ✅ 理解了数据模型和关系设计
+3. ✅ 学会了复杂的查询和筛选
+4. ✅ 掌握了迁移和版本管理
+5. ✅ 理解了事务和并发控制
+6. ✅ 学会了数据验证和类型安全
+7. ✅ 掌握了性能优化技巧
+8. ✅ 能够部署到生产环境
+
+现在，你已经具备了使用 Prisma 构建生产级应用的能力！
+
+---
+
+## 下一步
+
+继续探索：
+
+- 阅读 [Prisma 官方文档](https://www.prisma.io/docs)
+- 加入 [Prisma Discord](https://discord.prisma.io)
+- 查看 [Prisma 示例项目](https://github.com/prisma/prisma-examples)
+- 学习更多高级特性：Prisma Pulse、Prisma Accelerate
+
+感谢阅读本系列教程！如果你有任何问题或建议，欢迎交流。
+
+---
+
+## 相关资源
+
+- **GitHub 仓库**：[项目源码](https://github.com/your-repo/blog-api)
+- **在线演示**：[Demo URL](https://blog-api.example.com)
+- **API 文档**：[Swagger UI](https://blog-api.example.com/docs)
+
+**Happy Coding! 🚀**
