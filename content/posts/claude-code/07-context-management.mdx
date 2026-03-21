@@ -1,0 +1,665 @@
+---
+title: "07 上下文管理与优化：充分利用 200K Token 窗口"
+date: "2026-03-21"
+summary: "掌握上下文管理的艺术，学会有效引用文件、清理无关信息、优化 Token 使用，让 AI 交互更高效。"
+tags: ["Claude Code", "上下文管理", "Token优化", "性能优化"]
+category: "claude-code"
+cover: ""
+draft: false
+series: "Claude Code 进阶技巧完全指南"
+seriesOrder: 7
+---
+
+# 上下文管理与优化
+
+Claude Code 拥有 200K Token 的超长上下文窗口，这相当于约 15 万个单词或 10 万行代码。但即使是这样的容量，也需要合理管理才能发挥最大效用。本文将教你如何像管理内存一样管理上下文，确保每一次交互都精准高效。
+
+## 一、理解上下文窗口
+
+### 1.1 什么是上下文窗口
+
+```
+上下文窗口 = Claude 能"记住"的对话历史
+
+┌─────────────────────────────────────┐
+│         上下文窗口 (200K tokens)    │
+│                                     │
+│  ┌──────────┐  ┌──────────┐        │
+│  │最早的对话│  │最近的对话│        │
+│  │  10%     │  │  90%     │        │
+│  └──────────┘  └──────────┘        │
+│                                     │
+│  ⚠️ 超出部分会被"遗忘"             │
+└─────────────────────────────────────┘
+
+实际影响:
+- 最早的对话可能被遗忘
+- 重要信息需要重复提及
+- 长对话需要定期总结
+```
+
+### 1.2 Token 计算方式
+
+```typescript
+// Token 计算示例
+
+// 1. 英文文本
+"Hello, world!"; // ≈ 3 tokens
+
+// 2. 代码
+function hello() {
+  console.log("Hello");
+}
+// ≈ 15 tokens
+
+// 3. 中文
+("你好，世界"); // ≈ 5 tokens (中文通常更高效)
+
+// 4. 混合内容
+const message = "用户数: ${users.length}";
+// ≈ 10 tokens
+
+// 计算工具
+// https://token-calculator.anthropic.com/
+```
+
+### 1.3 实际容量示例
+
+```
+200K Tokens 大约相当于:
+
+📄 文本内容:
+  - 英文: 150,000 单词
+  - 中文: 100,000 字符
+
+💻 代码文件:
+  - TypeScript: 8,000-10,000 行
+  - JSON: 15,000 行
+  - Markdown: 12,000 行
+
+📦 典型项目:
+  - 小型项目 (50 文件): 完全可以放入
+  - 中型项目 (200 文件): 核心部分可以放入
+  - 大型项目 (1000+ 文件): 需要选择性加载
+
+💡 实际建议:
+  - 一次性加载 < 100K tokens (留空间给响应)
+  - 重点关注相关文件
+  - 定期清理无关上下文
+```
+
+## 二、文件引用技巧
+
+### 2.1 使用 @ 符号引用
+
+```bash
+# 单个文件引用
+> "参考 @src/utils/api.ts 中的 fetchData 函数"
+
+✅ 优势:
+   - 精确指定文件
+   - 自动加载最新内容
+   - 不会占用过多上下文
+
+# 多个文件引用
+> "分析 @src/auth/login.ts 和 @src/auth/register.ts 的差异"
+
+✅ 技巧:
+   - 使用空格分隔多个文件
+   - Claude 会自动对比分析
+```
+
+### 2.2 Glob 模式匹配
+
+```bash
+# 匹配特定类型文件
+> "检查 @src/components/**/*.tsx 的 PropTypes 用法"
+
+✅ 匹配结果:
+   src/components/Button/Button.tsx
+   src/components/Form/Form.tsx
+   src/components/Card/Card.tsx
+   ... (45 个文件)
+
+# 排除模式
+> "查看 @src/**/*.ts 但不包括 @src/**/*.test.ts"
+
+✅ 技巧:
+   - 使用 ! 排除
+   - 精确控制加载范围
+```
+
+### 2.3 目录引用
+
+```bash
+# 引用整个目录
+> "重构 @src/modules/user/ 目录下的所有服务"
+
+✅ 注意:
+   - 会加载目录下所有文件
+   - 适合小目录 (< 10 文件)
+   - 大目录建议用 Glob 模式
+
+# 递归引用
+> "分析 @tests/ 目录的测试覆盖率"
+
+✅ 自动包含:
+   tests/unit/
+   tests/integration/
+   tests/e2e/
+```
+
+### 2.4 行范围引用
+
+```bash
+# 引用特定行
+> "解释 @src/utils/helpers.ts:10-30 的算法"
+
+✅ 精确加载:
+   - 只加载指定行
+   - 节省 Token
+   - 聚焦关键代码
+
+# 多个范围
+> "查看 @src/components/Button.tsx:1-50 和 :100-150"
+
+✅ 适用场景:
+   - 跳过配置部分
+   - 只看核心逻辑
+   - 对比不同部分
+```
+
+## 三、上下文优化策略
+
+### 3.1 选择性加载
+
+```bash
+# ❌ 不好：加载整个项目
+> /read src/**/*.ts
+
+结果:
+- 加载 500+ 文件
+- 消耗 180K tokens
+- 响应变慢
+- 包含大量无关代码
+
+# ✅ 好：只加载相关文件
+> /read src/auth/*.ts
+> /read src/middleware/auth.ts
+
+结果:
+- 加载 15 个文件
+- 消耗 8K tokens
+- 响应快速
+- 全部相关
+```
+
+### 3.2 渐进式加载
+
+```bash
+# 第一轮：高层了解
+> "列出 @src/modules/ 的所有模块"
+
+✅ 获得概览:
+   - auth (认证)
+   - user (用户)
+   - order (订单)
+   - product (产品)
+
+# 第二轮：深入特定模块
+> "详细分析 @src/modules/auth/ 的实现"
+
+✅ 聚焦相关:
+   - 只加载 auth 模块
+   - 深入理解细节
+   - 节省 Token
+
+# 第三轮：解决问题
+> "参考 @src/modules/auth/auth.service.ts:45-80，
+   修复 JWT 验证逻辑"
+
+✅ 精准定位:
+   - 只引用问题代码
+   - 快速定位和修复
+```
+
+### 3.3 分阶段清理
+
+```bash
+# 阶段 1：探索
+> /read src/auth/**/*.ts
+> "分析认证模块架构"
+
+# 阶段 2：设计
+> /clear --keep-auth-context
+> "基于刚才的分析，设计改进方案"
+
+# 阶段 3：实现
+> /clear --keep-plan
+> "实施方案的第一步"
+
+# 技巧：
+# - 每个阶段后清理
+# - 保留关键信息
+# - 节省 Token 使用
+```
+
+## 四、Memory 功能使用
+
+### 4.1 基础用法
+
+```bash
+# 保存关键信息
+> /remember "项目使用 PostgreSQL 16"
+> /remember "API 基础路径: https://api.example.com/v1"
+> /remember "团队约定：所有 API 调用都要有错误处理"
+
+# 查看所有记忆
+> /memory list
+
+Memory items:
+1. PostgreSQL version: 16
+2. API base URL: https://api.example.com/v1
+3. Team convention: API error handling required
+
+# 使用记忆
+> "创建一个 API 调用"
+
+✅ 自动应用:
+   - 使用 PostgreSQL 16 语法
+   - 基础路径设为 https://api.example.com/v1
+   - 包含错误处理逻辑
+```
+
+### 4.2 结构化记忆
+
+```bash
+# 项目配置
+> /remember "
+   项目配置:
+   - 框架: NestJS 10.x
+   - 数据库: PostgreSQL 16
+   - ORM: Prisma 5.x
+   - 测试: Jest
+   - 文档: Swagger
+"
+
+# 代码规范
+> /remember "
+   前端规范:
+   - 组件: PascalCase
+   - 文件: kebab-case
+   - 样式: CSS Modules
+   - 状态: Zustand
+   - 测试: Testing Library
+"
+
+# 业务规则
+> /remember "
+   业务规则:
+   - 用户年龄必须 >= 18
+   - 订单金额必须 > 0
+   - 库存不能为负数
+   - 所有金额保留 2 位小数
+"
+```
+
+### 4.3 记忆管理
+
+```bash
+# 删除特定记忆
+> /memory forget "项目使用 PostgreSQL 16"
+
+# 更新记忆
+> /memory update "API 基础路径" "https://new-api.example.com/v2"
+
+# 导出记忆
+> /memory export project-memory.json
+
+# 导入记忆
+> /memory import project-memory.json
+
+# 清空所有记忆
+> /memory clear
+```
+
+## 五、Token 优化技巧
+
+### 5.1 代码压缩
+
+```typescript
+// ❌ 冗长版本 (150 tokens)
+/**
+ * This is a function that takes a user object as input
+ * and returns the user's email address. If the user is
+ * null or undefined, it returns null. If the user object
+ * doesn't have an email property, it also returns null.
+ */
+function getUserEmail(user: User | null): string | null {
+  if (user === null || user === undefined) {
+    return null;
+  }
+  if (user.email === null || user.email === undefined) {
+    return null;
+  }
+  return user.email;
+}
+
+// ✅ 简洁版本 (40 tokens)
+// Get user email or null
+const getUserEmail = (user: User | null): string | null => user?.email ?? null;
+
+// 结果：保留 110 tokens，功能相同
+```
+
+### 5.2 删除无关内容
+
+```bash
+# ❌ 包含注释和空行
+> /read src/utils/helpers.ts
+
+/**
+ * Helper utilities
+ *
+ * @module utils/helpers
+ * @author John Doe
+ * @license MIT
+ */
+
+// TODO: Add error handling
+// FIXME: This is temporary
+export function helper1() {
+  // implementation
+}
+
+
+// ✅ 使用 --strip 选项
+> /read src/utils/helpers.ts --strip
+
+export function helper1() {
+  // implementation
+}
+
+// 节省约 30% tokens
+```
+
+### 5.3 选择性包含
+
+```bash
+# ❌ 加载整个文件
+> /read src/components/UserProfile.tsx
+
+// 2000 tokens
+
+# ✅ 只加载需要的部分
+> /read src/components/UserProfile.tsx:1-50
+
+// 50 tokens (只读头部)
+```
+
+### 5.4 使用摘要
+
+```bash
+# 对于大文件，先生成摘要
+> "总结 @src/services/AuthService.ts 的功能"
+
+✅ 摘要:
+   AuthService 提供:
+   - 用户认证 (login, register)
+   - Token 管理 (generate, verify)
+   - 密码重置 (reset, forgot)
+   - Session 管理 (create, destroy)
+
+# 然后针对特定部分深入
+> "详细说明 @src/services/AuthService.ts:50-100 的 login 实现"
+```
+
+## 六、上下文维护
+
+### 6.1 定期清理
+
+```bash
+# 查看当前上下文大小
+> /context stats
+
+Current context: 145,234 tokens / 200,000
+Usage: 72.6%
+
+# 清理旧对话
+> /context clean --older-than 1h
+
+✅ 清理了 45,000 tokens
+New usage: 100,234 tokens (50.1%)
+
+# 清理特定会话
+> /context remove session_20250320_153045
+
+# 保留重要信息
+> /context clean --keep-summaries
+```
+
+### 6.2 对话总结
+
+```bash
+# 生成对话摘要
+> /summarize
+
+✅ 摘要:
+我们讨论了以下内容:
+1. 分析了认证模块的架构
+2. 识别了 3 个性能问题
+3. 设计了优化方案
+4. 实施了 Redis 缓存
+
+# 清理并保留摘要
+> /clear --save-summary
+
+✅ 对话已清理，摘要已保存
+下次对话会自动加载摘要
+```
+
+### 6.3 上下文切换
+
+```bash
+# 保存当前上下文
+> /context save auth-refactoring
+
+✅ 上下文已保存到: auth-refactoring
+
+# 切换到新任务
+> /context new
+> "分析订单模块性能"
+
+[完成订单分析]
+
+# 切换回之前的上下文
+> /context load auth-refactoring
+
+✅ 已加载上下文: auth-refactoring
+包含之前讨论的所有内容
+```
+
+## 七、高级技巧
+
+### 7.1 上下文模板
+
+```bash
+# 创建常用上下文模板
+~/.claude/templates/api-development.json
+
+{
+  "name": "api-development",
+  "files": [
+    "src/controllers/**/*.ts",
+    "src/services/**/*.ts",
+    "src/dto/**/*.ts"
+  ],
+  "memory": [
+    "使用 NestJS 框架",
+    "所有 API 都需要验证",
+    "返回统一的响应格式"
+  ]
+}
+
+# 使用模板
+> /context load api-development
+```
+
+### 7.2 智能缓存
+
+```bash
+# 启用缓存
+> /cache enable
+
+# 缓存策略
+> /cache strategy lru
+> /cache size 50000
+
+# 查看缓存
+> /cache stats
+
+Cache statistics:
+  Hits: 45
+  Misses: 12
+  Hit rate: 79%
+  Size: 32,456 tokens
+
+# 清除缓存
+> /cache clear
+```
+
+### 7.3 并行上下文
+
+```bash
+# 创建并行上下文
+> /context create backend
+> /context create frontend
+
+# 在不同上下文中工作
+> /context use backend
+> "实现 API 端点"
+
+> /context use frontend
+> "调用 API 端点"
+
+# 合并上下文
+> /context merge backend frontend --name fullstack
+```
+
+## 八、性能监控
+
+### 8.1 Token 使用分析
+
+```bash
+# 查看详细统计
+> /stats --detailed
+
+Session statistics:
+  Total tokens: 245,678
+  Average per request: 12,283
+  Peak usage: 187,234
+
+Top files by usage:
+  1. src/services/AuthService.ts (23,456 tokens)
+  2. src/controllers/UserController.ts (15,234 tokens)
+  3. src/entities/User.entity.ts (12,345 tokens)
+
+Recommendations:
+  - Consider caching AuthService
+  - UserController loaded frequently, optimize
+```
+
+### 8.2 成本估算
+
+```bash
+# 计算使用成本
+> /cost estimate
+
+Estimated costs:
+  Current session: $2.45
+  Daily average: $8.50
+  Monthly projection: $255
+
+Breakdown:
+  - Input tokens: 180,234 ($1.80)
+  - Output tokens: 65,444 ($0.65)
+
+Tips to reduce cost:
+  1. Use /read with line ranges
+  2. Clear context regularly
+  3. Use memory for repeated info
+```
+
+## 九、常见问题
+
+### Q1: 上下文不足怎么办？
+
+```bash
+# 方案 1: 清理无关内容
+> /clear
+
+# 方案 2: 使用摘要
+> /summarize > summary.txt
+> /clear
+> /read summary.txt
+
+# 方案 3: 分批处理
+> "先处理第一部分..."
+[完成]
+> /clear --keep-results
+> "再处理第二部分..."
+```
+
+### Q2: 重要信息被遗忘？
+
+```bash
+# 使用 /remember
+> /remember "关键信息"
+
+# 或保存到文件
+> /save-context important-info.json
+
+# 下次对话加载
+> /load-context important-info.json
+```
+
+### Q3: Token 使用过多？
+
+```bash
+# 检查使用情况
+> /stats --top-files
+
+# 优化策略
+1. 使用行范围引用
+2. 删除注释和空行
+3. 使用 Glob 精确匹配
+4. 定期清理上下文
+```
+
+## 总结
+
+有效的上下文管理能让你：
+
+1. ✅ **节省成本**：减少不必要的 Token 消耗
+2. ✅ **提升速度**：更小的上下文 = 更快的响应
+3. ✅ **提高准确度**：聚焦相关信息
+4. ✅ **延长对话**：合理清理可以持续更久
+5. ✅ **避免遗忘**：关键信息永久保存
+
+**核心原则**：
+
+- 只引用需要的文件
+- 定期清理无关上下文
+- 使用 Memory 保存关键信息
+- 监控 Token 使用情况
+
+掌握上下文管理，就能让 200K Token 发挥最大价值。
+
+## 下一步
+
+现在你已经掌握了上下文管理，下一篇我们将学习**代码重构实战技巧**，看看如何在实际项目中应用这些知识。
+
+---
+
+- **上一篇**：[06 自定义 Skills 开发](../06-custom-skills.mdx)
+- **下一篇**：[08 代码重构实战技巧](../08-refactoring-tips.mdx)
