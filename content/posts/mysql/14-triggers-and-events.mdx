@@ -1,0 +1,501 @@
+---
+title: "14 触发器与事件"
+date: "2026-03-23"
+summary: "掌握触发器和事件调度器的使用，实现数据库操作的自动化。"
+tags: ["MySQL", "触发器", "事件调度器", "自动化", "定时任务"]
+category: "mysql"
+cover: ""
+draft: false
+series: "MySQL 渐进式学习指南"
+seriesOrder: 14
+---
+
+## 前言
+
+触发器和事件调度器是 MySQL 的自动化工具，让我们能够在特定条件发生时自动执行操作。
+
+本文将深入讲解触发器和事件的使用方法。
+
+## 触发器（TRIGGER）
+
+触发器是自动执行的存储程序，当特定事件发生时被触发。
+
+### 基本语法
+
+```sql
+-- 语法
+CREATE TRIGGER trigger_name
+{BEFORE | AFTER} {INSERT | UPDATE | DELETE}
+ON table_name
+FOR EACH ROW
+trigger_body;
+```
+
+### BEFORE INSERT 触发器
+
+```sql
+-- 在插入数据前自动更新时间戳
+DELIMITER //
+
+CREATE TRIGGER trg_users_before_insert
+BEFORE INSERT ON users
+FOR EACH ROW
+BEGIN
+  IF NEW.created_at IS NULL THEN
+    SET NEW.created_at = NOW();
+  END IF;
+END //
+
+DELIMITER ;
+
+-- NEW 关键字代表即将插入的新行
+```
+
+### AFTER INSERT 触发器
+
+```sql
+-- 插入后记录日志
+DELIMITER //
+
+CREATE TRIGGER trg_orders_after_insert
+AFTER INSERT ON orders
+FOR EACH ROW
+BEGIN
+  INSERT INTO order_logs (order_id, action, created_at)
+  VALUES (NEW.order_id, 'created', NOW());
+END //
+
+DELIMITER ;
+```
+
+### BEFORE UPDATE 触发器
+
+```sql
+-- 更新前自动更新修改时间
+DELIMITER //
+
+CREATE TRIGGER trg_users_before_update
+BEFORE UPDATE ON users
+FOR EACH ROW
+BEGIN
+  SET NEW.updated_at = NOW();
+END //
+
+DELIMITER ;
+
+-- 数据验证
+DELIMITER //
+
+CREATE TRIGGER trg_products_before_update
+BEFORE UPDATE ON products
+FOR EACH ROW
+BEGIN
+  IF NEW.price < 0 THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '价格不能为负数';
+  END IF;
+
+  IF NEW.stock < 0 THEN
+    SET NEW.stock = 0;
+  END IF;
+END //
+
+DELIMITER ;
+```
+
+### AFTER UPDATE 触发器
+
+```sql
+-- 记录状态变更
+DELIMITER //
+
+CREATE TRIGGER trg_orders_after_update
+AFTER UPDATE ON orders
+FOR EACH ROW
+BEGIN
+  IF OLD.status != NEW.status THEN
+    INSERT INTO status_logs (order_id, old_status, new_status, changed_at)
+    VALUES (NEW.order_id, OLD.status, NEW.status, NOW());
+  END IF;
+END //
+
+DELIMITER ;
+
+-- OLD 关键字代表更新前的旧值
+-- NEW 关键字代表更新后的新值
+```
+
+### BEFORE DELETE 触发器
+
+```sql
+-- 删除前检查
+DELIMITER //
+
+CREATE TRIGGER trg_orders_before_delete
+BEFORE DELETE ON orders
+FOR EACH ROW
+BEGIN
+  IF OLD.status = 'completed' THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '已完成的订单不能删除';
+  END IF;
+END //
+
+DELIMITER ;
+```
+
+### AFTER DELETE 触发器
+
+```sql
+-- 删除后记录日志
+DELIMITER //
+
+CREATE TRIGGER trg_users_after_delete
+AFTER DELETE ON users
+FOR EACH ROW
+BEGIN
+  INSERT INTO user_logs (user_id, username, action, created_at)
+  VALUES (OLD.user_id, OLD.username, 'deleted', NOW());
+END //
+
+DELIMITER ;
+```
+
+### OLD 和 NEW 关键字
+
+| 触发时机 | OLD     | NEW     |
+| -------- | ------- | ------- |
+| INSERT   | ❌ 无   | ✅ 新值 |
+| UPDATE   | ✅ 旧值 | ✅ 新值 |
+| DELETE   | ✅ 旧值 | ❌ 无   |
+
+```sql
+-- 示例：库存更新
+DELIMITER //
+
+CREATE TRIGGER trg_order_items_after_insert
+AFTER INSERT ON order_items
+FOR EACH ROW
+BEGIN
+  UPDATE products
+  SET stock = stock - NEW.quantity
+  WHERE product_id = NEW.product_id;
+END //
+
+-- 退货时恢复库存
+CREATE TRIGGER trg_order_items_after_delete
+AFTER DELETE ON order_items
+FOR EACH ROW
+BEGIN
+  UPDATE products
+  SET stock = stock + OLD.quantity
+  WHERE product_id = OLD.product_id;
+END //
+
+DELIMITER ;
+```
+
+### 管理触发器
+
+```sql
+-- 查看触发器
+SHOW TRIGGERS;
+SHOW TRIGGERS LIKE 'users';
+
+-- 查看触发器创建语句
+SHOW CREATE TRIGGER trg_users_before_insert;
+
+-- 删除触发器
+DROP TRIGGER IF EXISTS trg_users_before_insert;
+```
+
+## 事件调度器（EVENT）
+
+事件是定时执行的任务。
+
+### 开启事件调度器
+
+```sql
+-- 查看事件调度器状态
+SHOW VARIABLES LIKE 'event_scheduler';
+
+-- 开启事件调度器
+SET GLOBAL event_scheduler = ON;
+
+-- 或在配置文件中设置
+-- [mysqld]
+-- event_scheduler=ON
+```
+
+### 创建事件
+
+```sql
+-- 基本语法
+CREATE EVENT event_name
+ON SCHEDULE schedule
+DO
+  event_body;
+
+-- 每天 00:00 执行
+DELIMITER //
+
+CREATE EVENT evn_daily_stats
+ON SCHEDULE EVERY 1 DAY
+STARTS '2024-01-01 00:00:00'
+DO
+BEGIN
+  INSERT INTO daily_stats (stat_date, user_count, order_count)
+  SELECT
+    CURDATE() - INTERVAL 1 DAY,
+    (SELECT COUNT(*) FROM users WHERE DATE(created_at) = CURDATE() - INTERVAL 1 DAY),
+    (SELECT COUNT(*) FROM orders WHERE DATE(created_at) = CURDATE() - INTERVAL 1 DAY);
+END //
+
+DELIMITER ;
+```
+
+### 事件调度选项
+
+```sql
+-- 1. 固定时间执行一次
+CREATE EVENT evn_once
+ON SCHEDULE AT '2024-12-31 23:59:59'
+DO
+  INSERT INTO logs (message) VALUES ('Year end backup');
+
+-- 2. 间隔执行
+CREATE EVENT evn_hourly
+ON SCHEDULE EVERY 1 HOUR
+DO
+  DELETE FROM logs WHERE created_at < DATE_SUB(NOW(), INTERVAL 7 DAY);
+
+-- 3. 从指定时间开始间隔执行
+CREATE EVENT evn_daily_cleanup
+ON SCHEDULE EVERY 1 DAY
+STARTS '2024-01-01 02:00:00'
+DO
+  CALL cleanup_old_data();
+
+-- 4. 在指定时间范围内执行
+CREATE EVENT evn_weekly_report
+ON SCHEDULE EVERY 1 WEEK
+STARTS '2024-01-01 00:00:00'
+ENDS '2024-12-31 23:59:59'
+DO
+  CALL generate_weekly_report();
+```
+
+### 管理事件
+
+```sql
+-- 查看所有事件
+SHOW EVENTS;
+SHOW EVENTS FROM shop;
+
+-- 查看事件创建语句
+SHOW CREATE EVENT evn_daily_cleanup;
+
+-- 启用/禁用事件
+ALTER EVENT evn_daily_cleanup ENABLE;
+ALTER EVENT evn_daily_cleanup DISABLE;
+
+-- 删除事件
+DROP EVENT IF EXISTS evn_daily_cleanup;
+```
+
+## 实战应用
+
+### 自动维护订单金额
+
+```sql
+-- 订单表
+CREATE TABLE orders (
+  order_id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  user_id BIGINT NOT NULL,
+  total_amount DECIMAL(10, 2) DEFAULT 0,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 订单明细表
+CREATE TABLE order_items (
+  item_id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  order_id BIGINT NOT NULL,
+  price DECIMAL(10, 2),
+  quantity INT NOT NULL,
+  subtotal DECIMAL(10, 2)
+);
+
+-- 触发器：插入明细时更新订单总额
+DELIMITER //
+
+CREATE TRIGGER trg_order_items_after_insert
+AFTER INSERT ON order_items
+FOR EACH ROW
+BEGIN
+  UPDATE orders
+  SET total_amount = (
+    SELECT SUM(subtotal) FROM order_items WHERE order_id = NEW.order_id
+  )
+  WHERE order_id = NEW.order_id;
+END //
+
+CREATE TRIGGER trg_order_items_after_delete
+AFTER DELETE ON order_items
+FOR EACH ROW
+BEGIN
+  UPDATE orders
+  SET total_amount = (
+    SELECT SUM(subtotal) FROM order_items WHERE order_id = OLD.order_id
+  )
+  WHERE order_id = OLD.order_id;
+END //
+
+CREATE TRIGGER trg_order_items_after_update
+AFTER UPDATE ON order_items
+FOR EACH ROW
+BEGIN
+  UPDATE orders
+  SET total_amount = (
+    SELECT SUM(subtotal) FROM order_items WHERE order_id = NEW.order_id
+  )
+  WHERE order_id = NEW.order_id;
+END //
+
+DELIMITER ;
+```
+
+### 定时清理数据
+
+```sql
+-- 清理 30 天前的日志
+DELIMITER //
+
+CREATE EVENT evn_cleanup_logs
+ON SCHEDULE EVERY 1 DAY
+STARTS '2024-01-01 02:00:00'
+DO
+BEGIN
+  DELETE FROM api_logs WHERE created_at < DATE_SUB(NOW(), INTERVAL 30 DAY);
+
+  -- 记录清理日志
+  INSERT INTO system_logs (message, created_at)
+  VALUES (CONCAT('Cleaned logs: ', ROW_COUNT()), NOW());
+END //
+
+DELIMITER ;
+```
+
+### 自动归档订单
+
+```sql
+-- 订单表
+CREATE TABLE orders (
+  order_id BIGINT PRIMARY KEY,
+  status VARCHAR(20),
+  created_at TIMESTAMP
+);
+
+-- 归档表
+CREATE TABLE orders_archive (
+  order_id BIGINT PRIMARY KEY,
+  status VARCHAR(20),
+  created_at TIMESTAMP,
+  archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 归档完成订单
+DELIMITER //
+
+CREATE PROCEDURE archive_completed_orders()
+BEGIN
+  -- 插入到归档表
+  INSERT INTO orders_archive (order_id, status, created_at)
+  SELECT order_id, status, created_at
+  FROM orders
+  WHERE status = 'completed'
+    AND created_at < DATE_SUB(NOW(), INTERVAL 6 MONTH);
+
+  -- 删除原表数据
+  DELETE FROM orders
+  WHERE status = 'completed'
+    AND created_at < DATE_SUB(NOW(), INTERVAL 6 MONTH);
+END //
+
+-- 每月 1 号执行
+CREATE EVENT evn_monthly_archive
+ON SCHEDULE EVERY 1 MONTH
+STARTS '2024-01-01 02:00:00'
+DO
+  CALL archive_completed_orders();
+
+DELIMITER ;
+```
+
+## 最佳实践
+
+### 1. 触发器使用建议
+
+```sql
+-- ✅ 触发器适用场景：
+-- 1. 数据验证
+-- 2. 自动计算（如 total_amount）
+-- 3. 审计日志
+-- 4. 级联操作
+
+-- ❌ 避免：
+-- 1. 复杂业务逻辑
+-- 2. 外部调用
+-- 3. 可能导致死锁的操作
+```
+
+### 2. 事件使用建议
+
+```sql
+-- ✅ 事件适用场景：
+-- 1. 定期清理数据
+-- 2. 定期统计
+-- 3. 定期备份
+-- 4. 数据归档
+
+-- ⚠️ 注意：
+-- 1. 确保 event_scheduler 开启
+-- 2. 添加错误处理
+-- 3. 避免长时间运行
+```
+
+## 总结
+
+本文介绍了触发器和事件，主要内容：
+
+**触发器**：
+
+- ✅ BEFORE/AFTER INSERT/UPDATE/DELETE
+- ✅ OLD 和 NEW 关键字
+- ✅ 数据验证和自动计算
+
+**事件调度器**：
+
+- ✅ 定时执行任务
+- ✅ 间隔执行
+- ✅ 数据维护和归档
+
+**实战应用**：
+
+- ✅ 自动维护订单金额
+- ✅ 定时清理数据
+- ✅ 自动归档
+
+掌握触发器和事件后，可以实现很多自动化任务。接下来我们将学习用户管理与安全。
+
+## 下一步
+
+在下一篇文章《15 用户管理与安全》中，我们将学习：
+
+- 用户管理（CREATE/ALTER/DROP USER）
+- 权限管理（GRANT/REVOKE）
+- 角色管理（MySQL 8.0+）
+- 密码策略
+- 安全最佳实践
+
+---
+
+- **上一篇**：[13 视图与存储过程](./13-views-and-stored-procedures.mdx)
+- **下一篇**：[15 用户管理与安全](./15-user-management-and-security.mdx)

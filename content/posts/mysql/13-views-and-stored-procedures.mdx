@@ -1,0 +1,550 @@
+---
+title: "13 视图与存储过程"
+date: "2026-03-23"
+summary: "掌握视图、存储过程和存储函数的使用，学会在数据库层面实现业务逻辑。"
+tags: ["MySQL", "视图", "存储过程", "存储函数", "业务逻辑"]
+category: "mysql"
+cover: ""
+draft: false
+series: "MySQL 渐进式学习指南"
+seriesOrder: 13
+---
+
+## 前言
+
+视图和存储过程是 MySQL 的高级特性，让我们能够在数据库层面实现复杂的业务逻辑，简化应用层代码。
+
+本文将深入讲解视图、存储过程和存储函数的使用。
+
+## 视图（VIEW）
+
+视图是虚拟表，基于查询结果创建。
+
+### 创建视图
+
+```sql
+-- 基本语法
+CREATE VIEW view_name AS
+SELECT ...;
+
+-- 示例：用户订单汇总视图
+CREATE VIEW user_order_summary AS
+SELECT
+  u.user_id,
+  u.username,
+  u.email,
+  COUNT(o.order_id) AS order_count,
+  COALESCE(SUM(o.total_amount), 0) AS total_spent,
+  MAX(o.created_at) AS last_order_date
+FROM users u
+LEFT JOIN orders o ON u.user_id = o.user_id
+GROUP BY u.user_id, u.username, u.email;
+
+-- 使用视图
+SELECT * FROM user_order_summary WHERE total_spent > 1000;
+```
+
+### 视图优点
+
+```sql
+-- 1. 简化复杂查询
+CREATE VIEW active_users AS
+SELECT u.user_id, u.username, COUNT(o.order_id) AS order_count
+FROM users u
+INNER JOIN orders o ON u.user_id = o.user_id
+GROUP BY u.user_id, u.username;
+
+-- 2. 数据安全（隐藏敏感字段）
+CREATE VIEW user_public_info AS
+SELECT user_id, username, created_at
+FROM users;
+-- 不暴露 email、password 等敏感信息
+
+-- 3. 逻辑封装
+-- 复杂业务逻辑封装在视图中，应用层简化查询
+```
+
+### 修改视图
+
+```sql
+-- 方式 1：删除重建
+DROP VIEW IF EXISTS user_order_summary;
+CREATE VIEW user_order_summary AS ...;
+
+-- 方式 2：ALTER VIEW
+ALTER VIEW user_order_summary AS
+SELECT
+  u.user_id,
+  u.username,
+  COUNT(o.order_id) AS order_count
+FROM users u
+LEFT JOIN orders o ON u.user_id = o.user_id
+GROUP BY u.user_id, u.username;
+```
+
+### 删除视图
+
+```sql
+DROP VIEW IF EXISTS user_order_summary;
+```
+
+### 视图限制
+
+```sql
+-- ⚠️ 视图限制：
+-- 1. 不能使用参数
+-- 2. 不能使用临时表
+-- 3. 某些视图不能更新（包含 GROUP BY、UNION、聚合函数等）
+-- 4. 性能可能不如直接查询
+
+-- 更新视图（简单视图可以）
+UPDATE user_public_info SET username = 'new_name' WHERE user_id = 1;
+
+-- ❌ 复杂视图不能更新
+UPDATE user_order_summary SET order_count = 0;  -- 错误！
+```
+
+## 存储过程（PROCEDURE）
+
+存储过程是预编译的 SQL 语句集合。
+
+### 基本语法
+
+```sql
+DELIMITER //
+
+CREATE PROCEDURE procedure_name ([参数])
+BEGIN
+  -- SQL 语句
+END //
+
+DELIMITER ;
+```
+
+### 无参数存储过程
+
+```sql
+DELIMITER //
+
+CREATE PROCEDURE get_active_users()
+BEGIN
+  SELECT
+    u.user_id,
+    u.username,
+    COUNT(o.order_id) AS order_count
+  FROM users u
+  INNER JOIN orders o ON u.user_id = o.user_id
+  GROUP BY u.user_id, u.username
+  HAVING order_count > 5;
+END //
+
+DELIMITER ;
+
+-- 调用
+CALL get_active_users();
+```
+
+### 带参数的存储过程
+
+```sql
+DELIMITER //
+
+-- IN 参数（输入）
+CREATE PROCEDURE get_user_orders(IN p_user_id BIGINT)
+BEGIN
+  SELECT * FROM orders WHERE user_id = p_user_id;
+END //
+
+-- OUT 参数（输出）
+CREATE PROCEDURE get_user_count(OUT p_count INT)
+BEGIN
+  SELECT COUNT(*) INTO p_count FROM users;
+END //
+
+-- INOUT 参数（输入输出）
+CREATE PROCEDURE increment(INOUT p_value INT)
+BEGIN
+  SET p_value = p_value + 1;
+END //
+
+DELIMITER ;
+
+-- 调用
+CALL get_user_orders(1);
+
+CALL get_user_count(@count);
+SELECT @count;
+
+SET @value = 10;
+CALL increment(@value);
+SELECT @value;  -- 11
+```
+
+### 变量声明
+
+```sql
+DELIMITER //
+
+CREATE PROCEDURE test_variables()
+BEGIN
+  -- 局部变量（DECLARE）
+  DECLARE v_user_id BIGINT DEFAULT 1;
+  DECLARE v_username VARCHAR(50);
+
+  -- 赋值
+  SELECT username INTO v_username
+  FROM users
+  WHERE user_id = v_user_id;
+
+  -- 用户变量（@）
+  SET @total = 0;
+
+  SELECT v_username, @total;
+END //
+
+DELIMITER ;
+```
+
+### 流程控制
+
+```sql
+DELIMITER //
+
+CREATE PROCEDURE process_order(IN p_order_id BIGINT)
+BEGIN
+  DECLARE v_status VARCHAR(20);
+  DECLARE v_total DECIMAL(10, 2);
+
+  -- 获取订单信息
+  SELECT status, total_amount INTO v_status, v_total
+  FROM orders
+  WHERE order_id = p_order_id;
+
+  -- IF 语句
+  IF v_status = 'pending' THEN
+    UPDATE orders SET status = 'paid' WHERE order_id = p_order_id;
+  ELSEIF v_status = 'paid' THEN
+    UPDATE orders SET status = 'shipped' WHERE order_id = p_order_id;
+  ELSE
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单状态错误';
+  END IF;
+
+  -- CASE 语句
+  CASE v_status
+    WHEN 'pending' THEN UPDATE orders SET status = 'paid' WHERE order_id = p_order_id;
+    WHEN 'paid' THEN UPDATE orders SET status = 'shipped' WHERE order_id = p_order_id;
+    ELSE SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '订单状态错误';
+  END CASE;
+
+  -- 循环（WHILE）
+  WHILE @counter < 10 DO
+    SET @counter = @counter + 1;
+  END WHILE;
+
+  -- 循环（REPEAT）
+  REPEAT
+    SET @counter = @counter + 1;
+  UNTIL @counter >= 10 END REPEAT;
+
+  -- 循环（LOOP）
+  label: LOOP
+    SET @counter = @counter + 1;
+    IF @counter >= 10 THEN
+      LEAVE label;
+    END IF;
+  END LOOP;
+
+END //
+
+DELIMITER ;
+```
+
+### 错误处理
+
+```sql
+DELIMITER //
+
+CREATE PROCEDURE transfer_money(
+  IN p_from_account BIGINT,
+  IN p_to_account BIGINT,
+  IN p_amount DECIMAL(10, 2)
+)
+BEGIN
+  -- 声明异常处理器
+  DECLARE EXIT HANDLER FOR SQLEXCEPTION
+  BEGIN
+    ROLLBACK;
+    SELECT '转账失败' AS result;
+  END;
+
+  START TRANSACTION;
+
+  -- 检查余额
+  SELECT balance INTO @balance FROM accounts WHERE id = p_from_account FOR UPDATE;
+
+  IF @balance < p_amount THEN
+    SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '余额不足';
+  END IF;
+
+  -- 执行转账
+  UPDATE accounts SET balance = balance - p_amount WHERE id = p_from_account;
+  UPDATE accounts SET balance = balance + p_amount WHERE id = p_to_account;
+
+  COMMIT;
+  SELECT '转账成功' AS result;
+END //
+
+DELIMITER ;
+```
+
+### 实际应用：创建订单
+
+```sql
+DELIMITER //
+
+CREATE PROCEDURE create_order(
+  IN p_user_id BIGINT,
+  IN p_items JSON,
+  OUT p_order_id BIGINT
+)
+BEGIN
+  DECLARE v_total DECIMAL(10, 2) DEFAULT 0;
+  DECLARE v_exit_handler BOOLEAN DEFAULT FALSE;
+
+  -- 异常处理
+  DECLARE CONTINUE HANDLER FOR SQLEXCEPTION
+  BEGIN
+    SET v_exit_handler = TRUE;
+    ROLLBACK;
+  END;
+
+  START TRANSACTION;
+
+  -- 计算总金额
+  SELECT SUM(price * quantity)
+  INTO v_total
+  FROM JSON_TABLE(
+    p_items,
+    '$[*]' COLUMNS(
+      product_id BIGINT PATH '$.product_id',
+      quantity INT PATH '$.quantity',
+      price DECIMAL(10, 2) PATH '$.price'
+    )
+  ) AS items;
+
+  -- 创建订单
+  INSERT INTO orders (user_id, order_no, total_amount, status)
+  VALUES (p_user_id, UUID(), v_total, 'pending');
+
+  SET p_order_id = LAST_INSERT_ID();
+
+  -- 插入订单明细
+  INSERT INTO order_items (order_id, product_id, quantity, price, subtotal)
+  SELECT
+    p_order_id,
+    product_id,
+    quantity,
+    price,
+    price * quantity
+  FROM JSON_TABLE(
+    p_items,
+    '$[*]' COLUMNS(
+      product_id BIGINT PATH '$.product_id',
+      quantity INT PATH '$.quantity',
+      price DECIMAL(10, 2) PATH '$.price'
+    )
+  ) AS items;
+
+  -- 更新库存
+  UPDATE products p
+  INNER JOIN JSON_TABLE(
+    p_items,
+    '$[*]' COLUMNS(
+      product_id BIGINT PATH '$.product_id',
+      quantity INT PATH '$.quantity'
+    )
+  ) AS items ON p.product_id = items.product_id
+  SET p.stock = p.stock - items.quantity;
+
+  COMMIT;
+END //
+
+DELIMITER ;
+
+-- 调用
+CALL create_order(1, '[{"product_id": 1, "quantity": 2, "price": 100.00}]', @order_id);
+SELECT @order_id;
+```
+
+### 删除存储过程
+
+```sql
+DROP PROCEDURE IF EXISTS get_active_users;
+```
+
+## 存储函数（FUNCTION）
+
+存储函数有返回值，可以在 SQL 语句中使用。
+
+### 基本语法
+
+```sql
+DELIMITER //
+
+CREATE FUNCTION function_name([参数])
+RETURNS 返回类型
+DETERMINISTIC
+BEGIN
+  -- 函数体
+  RETURN 返回值;
+END //
+
+DELIMITER ;
+```
+
+### 示例
+
+```sql
+DELIMITER //
+
+-- 计算折扣
+CREATE FUNCTION calculate_discount(
+  p_total DECIMAL(10, 2),
+  p_user_level INT
+)
+RETURNS DECIMAL(10, 2)
+DETERMINISTIC
+READS SQL DATA
+BEGIN
+  DECLARE v_discount_rate DECIMAL(3, 2) DEFAULT 0;
+
+  IF p_total >= 1000 THEN
+    SET v_discount_rate = 0.1;
+  ELSEIF p_total >= 500 THEN
+    SET v_discount_rate = 0.05;
+  END IF;
+
+  IF p_user_level >= 3 THEN
+    SET v_discount_rate = v_discount_rate + 0.05;
+  END IF;
+
+  RETURN p_total * (1 - v_discount_rate);
+END //
+
+-- 格式化手机号
+CREATE FUNCTION format_phone(p_phone VARCHAR(20))
+RETURNS VARCHAR(20)
+DETERMINISTIC
+NO SQL
+BEGIN
+  IF p_phone IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  RETURN CONCAT(
+    LEFT(p_phone, 3),
+    '-',
+    SUBSTRING(p_phone, 4, 4),
+    '-',
+    RIGHT(p_phone, 4)
+  );
+END //
+
+DELIMITER ;
+
+-- 使用
+SELECT
+  order_id,
+  total_amount,
+  calculate_discount(total_amount, 2) AS discounted_amount
+FROM orders;
+
+SELECT
+  username,
+  phone,
+  format_phone(phone) AS formatted_phone
+FROM users;
+```
+
+### 删除存储函数
+
+```sql
+DROP FUNCTION IF EXISTS calculate_discount;
+```
+
+## 最佳实践
+
+### 1. 存储过程的优缺点
+
+```sql
+-- ✅ 优点：
+-- 1. 减少网络流量
+-- 2. 预编译，性能较好
+-- 3. 业务逻辑封装
+-- 4. 安全性（控制权限）
+
+-- ❌ 缺点：
+-- 1. 调试困难
+-- 2. 版本控制不便
+-- 3. 可移植性差
+-- 4. 业务逻辑复杂时不推荐
+
+-- 建议：
+-- - 简单业务 → 存储过程
+-- - 复杂业务 → 应用层
+```
+
+### 2. 视图使用建议
+
+```sql
+-- ✅ 适合使用视图的场景：
+-- 1. 简化复杂查询
+-- 2. 数据安全（隐藏敏感字段）
+-- 3. 报表查询
+
+-- ❌ 不适合使用视图的场景：
+-- 1. 大数据量（性能问题）
+-- 2. 需要频繁更新的场景
+```
+
+## 总结
+
+本文介绍了视图和存储过程，主要内容：
+
+**视图**：
+
+- ✅ 虚拟表，基于查询
+- ✅ 简化复杂查询
+- ✅ 数据安全封装
+- ✅ 某些视图不可更新
+
+**存储过程**：
+
+- ✅ 预编译 SQL 集合
+- ✅ 参数：IN、OUT、INOUT
+- ✅ 变量和流程控制
+- ✅ 错误处理
+
+**存储函数**：
+
+- ✅ 有返回值
+- ✅ 可以在 SQL 中使用
+
+**实战应用**：
+
+- ✅ 业务逻辑封装
+- ✅ 复杂操作简化
+
+掌握视图和存储过程后，可以编写更强大的数据库程序。接下来我们将学习触发器和事件。
+
+## 下一步
+
+在下一篇文章《14 触发器与事件》中，我们将学习：
+
+- 触发器的创建和使用
+- BEFORE/AFTER 触发时机
+- 事件调度器
+- 自动化任务
+- 实际应用案例
+
+---

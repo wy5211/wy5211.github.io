@@ -1,0 +1,509 @@
+---
+title: "07 子查询与派生表"
+date: "2026-03-23"
+summary: "掌握子查询的各种用法，学会使用 CTE 公用表表达式编写复杂的查询逻辑。"
+tags: ["MySQL", "子查询", "CTE", "派生表", "递归查询"]
+category: "mysql"
+cover: ""
+draft: false
+series: "MySQL 渐进式学习指南"
+seriesOrder: 7
+---
+
+## 前言
+
+子查询是嵌套在另一个查询中的查询，让我们能够分步骤解决复杂问题。合理使用子查询可以让 SQL 更清晰、更易维护。
+
+MySQL 8.0 还引入了 CTE（公用表表达式），让复杂查询更加优雅。
+
+## 子查询类型
+
+根据返回结果分类：
+
+| 类型       | 返回值   | 示例场景             |
+| ---------- | -------- | -------------------- |
+| 标量子查询 | 单个值   | 比较价格、查找最大值 |
+| 列子查询   | 单列多行 | IN、NOT IN           |
+| 行子查询   | 单行多列 | 比较多个字段         |
+| 表子查询   | 多行多列 | FROM 中的派生表      |
+
+## 标量子查询
+
+返回单个值的子查询，可用于 =、>、< 等比较。
+
+```sql
+-- 查找价格高于平均价的商品
+SELECT id, name, price
+FROM products
+WHERE price > (SELECT AVG(price) FROM products);
+
+-- 查找销量最高的商品
+SELECT * FROM products
+WHERE id = (
+  SELECT product_id
+  FROM order_items
+  GROUP BY product_id
+  ORDER BY SUM(quantity) DESC
+  LIMIT 1
+);
+
+-- 比较子查询
+SELECT
+  id,
+  total_amount,
+  (SELECT AVG(total_amount) FROM orders) AS avg_amount
+FROM orders
+WHERE total_amount > (SELECT AVG(total_amount) FROM orders);
+```
+
+## 列子查询
+
+返回单列多行，通常与 IN、ANY、ALL 一起使用。
+
+```sql
+-- IN：查找有订单的用户
+SELECT * FROM users
+WHERE id IN (SELECT DISTINCT user_id FROM orders);
+
+-- NOT IN：查找没有订单的用户
+SELECT * FROM users
+WHERE id NOT IN (SELECT user_id FROM orders);
+
+-- ANY：比任意一个值都大
+SELECT * FROM products
+WHERE price > ANY (SELECT price FROM products WHERE category_id = 1);
+
+-- ALL：比所有值都大
+SELECT * FROM products
+WHERE price > ALL (SELECT price FROM products WHERE category_id = 1);
+```
+
+## 行子查询
+
+返回单行多列，用于比较多个字段。
+
+```sql
+-- 查找与用户 1 在同一城市的用户
+SELECT * FROM users
+WHERE (city) = (SELECT city FROM users WHERE id = 1);
+
+-- 多列比较
+SELECT * FROM orders
+WHERE (user_id, total_amount) = (
+  SELECT user_id, MAX(total_amount)
+  FROM orders
+  GROUP BY user_id
+  ORDER BY MAX(total_amount) DESC
+  LIMIT 1
+);
+```
+
+## 表子查询（派生表）
+
+返回多行多列，用于 FROM 子句。
+
+```sql
+-- FROM 子句中的子查询
+SELECT
+  u.username,
+  u.email,
+  o.order_count,
+  o.total_spent
+FROM users u
+INNER JOIN (
+  SELECT
+    user_id,
+    COUNT(*) AS order_count,
+    SUM(total_amount) AS total_spent
+  FROM orders
+  WHERE status = 'completed'
+  GROUP BY user_id
+) o ON u.id = o.user_id
+ORDER BY o.total_spent DESC;
+
+-- 必须使用别名
+SELECT * FROM (
+  SELECT id, username FROM users
+) AS u;  -- 必须有别名
+```
+
+## EXISTS 和 NOT EXISTS
+
+检查子查询是否返回结果（通常比 IN 快）。
+
+```sql
+-- EXISTS：存在即返回
+SELECT * FROM users u
+WHERE EXISTS (
+  SELECT 1 FROM orders o
+  WHERE o.user_id = u.id
+);
+
+-- NOT EXISTS：不存在则返回
+SELECT * FROM users u
+WHERE NOT EXISTS (
+  SELECT 1 FROM orders o
+  WHERE o.user_id = u.id
+);
+
+-- 实际应用：查找有订单的用户
+SELECT u.username
+FROM users u
+WHERE EXISTS (
+  SELECT 1 FROM orders o
+  WHERE o.user_id = u.id
+);
+```
+
+**EXISTS vs IN**：
+
+```sql
+-- EXISTS（通常更快）
+SELECT * FROM users u
+WHERE EXISTS (
+  SELECT 1 FROM orders o
+  WHERE o.user_id = u.id AND o.total_amount > 1000
+);
+
+-- IN（可以写更简洁）
+SELECT * FROM users
+WHERE id IN (SELECT user_id FROM orders WHERE total_amount > 1000);
+
+-- 建议：
+-- - 子查询结果集大 → EXISTS
+-- - 子查询结果集小 → IN
+-- - 需要关注是否使用索引
+```
+
+## 相关子查询 vs 非相关子查询
+
+### 非相关子查询
+
+子查询独立执行，只执行一次。
+
+```sql
+-- 先执行子查询，再执行外查询
+SELECT * FROM products
+WHERE price > (SELECT AVG(price) FROM products);
+
+-- 执行顺序：
+-- 1. SELECT AVG(price) FROM products
+-- 2. SELECT * FROM products WHERE price > 结果
+```
+
+### 相关子查询
+
+子查询引用外查询的字段，每行执行一次。
+
+```sql
+-- 每个商品都要执行子查询
+SELECT
+  id,
+  name,
+  price,
+  (SELECT AVG(price) FROM products) AS avg_price,
+  price - (SELECT AVG(price) FROM products) AS diff
+FROM products;
+
+-- 更复杂的相关子查询
+SELECT
+  u.username,
+  u.email
+FROM users u
+WHERE u.id IN (
+  SELECT o.user_id
+  FROM orders o
+  WHERE o.user_id = u.id  -- 引用外查询
+  GROUP BY o.user_id
+  HAVING SUM(o.total_amount) > 10000
+);
+```
+
+**性能建议**：相关子查询通常较慢，尽量改写为 JOIN。
+
+## CTE 公用表表达式（MySQL 8.0+）
+
+CTE 让复杂查询更清晰易读。
+
+### 基本 CTE
+
+```sql
+-- 语法
+WITH cte_name AS (
+  查询语句
+)
+主查询;
+
+-- 示例：用户订单汇总
+WITH user_order_summary AS (
+  SELECT
+    user_id,
+    COUNT(*) AS order_count,
+    SUM(total_amount) AS total_spent
+  FROM orders
+  WHERE status = 'completed'
+  GROUP BY user_id
+)
+SELECT
+  u.username,
+  COALESCE(o.order_count, 0) AS order_count,
+  COALESCE(o.total_spent, 0) AS total_spent
+FROM users u
+LEFT JOIN user_order_summary o ON u.id = o.user_id
+ORDER BY total_spent DESC;
+```
+
+### 多个 CTE
+
+```sql
+WITH
+-- 销售统计
+sales_stats AS (
+  SELECT
+    DATE(created_at) AS sale_date,
+    SUM(total_amount) AS daily_sales
+  FROM orders
+  WHERE status = 'completed'
+  GROUP BY DATE(created_at)
+),
+-- 移动平均
+moving_avg AS (
+  SELECT
+    sale_date,
+    daily_sales,
+    AVG(daily_sales) OVER (
+      ORDER BY sale_date
+      ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    ) AS avg_3_days
+  FROM sales_stats
+)
+SELECT * FROM moving_avg
+ORDER BY sale_date DESC;
+```
+
+### 递归 CTE
+
+用于处理层次结构数据。
+
+```sql
+-- 组织架构树
+WITH RECURSIVE org_tree AS (
+  -- 锚点：顶级部门
+  SELECT
+    id,
+    name,
+    parent_id,
+    1 AS level
+  FROM departments
+  WHERE parent_id IS NULL
+
+  UNION ALL
+
+  -- 递归：子部门
+  SELECT
+    d.id,
+    d.name,
+    d.parent_id,
+    ot.level + 1
+  FROM departments d
+  INNER JOIN org_tree ot ON d.parent_id = ot.id
+)
+SELECT
+  id,
+  name,
+  parent_id,
+  level
+FROM org_tree
+ORDER BY level, name;
+```
+
+## 性能优化
+
+### 改写子查询为 JOIN
+
+```sql
+-- ❌ 子查询（可能较慢）
+SELECT u.*, (
+  SELECT COUNT(*) FROM orders o
+  WHERE o.user_id = u.id
+) AS order_count
+FROM users u;
+
+-- ✅ 改写为 JOIN（通常更快）
+SELECT
+  u.*,
+  COUNT(o.id) AS order_count
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+GROUP BY u.id;
+```
+
+### 使用 CTE 提高可读性
+
+```sql
+-- ❌ 嵌套子查询（难以理解）
+SELECT
+  u.username,
+  o_stats.order_count,
+  o_stats.total_spent
+FROM users u
+INNER JOIN (
+  SELECT
+    user_id,
+    COUNT(*) AS order_count,
+    SUM(total_amount) AS total_spent
+  FROM (
+    SELECT user_id, total_amount
+    FROM orders
+    WHERE status = 'completed'
+  ) completed_orders
+  GROUP BY user_id
+) o_stats ON u.id = o_stats.user_id;
+
+-- ✅ 使用 CTE（清晰易读）
+WITH
+completed_orders AS (
+  SELECT user_id, total_amount
+  FROM orders
+  WHERE status = 'completed'
+),
+order_stats AS (
+  SELECT
+    user_id,
+    COUNT(*) AS order_count,
+    SUM(total_amount) AS total_spent
+  FROM completed_orders
+  GROUP BY user_id
+)
+SELECT
+  u.username,
+  o.order_count,
+  o.total_spent
+FROM users u
+INNER JOIN order_stats o ON u.id = o.user_id;
+```
+
+## 实战案例
+
+### 同比增长分析
+
+```sql
+WITH
+-- 当前月数据
+current_month AS (
+  SELECT
+    DATE_FORMAT(created_at, '%Y-%m') AS month,
+    SUM(total_amount) AS sales_amount
+  FROM orders
+  WHERE status = 'completed'
+    AND created_at >= DATE_SUB(NOW(), INTERVAL 2 MONTH)
+  GROUP BY DATE_FORMAT(created_at, '%Y-%m')
+),
+-- 上期数据（使用 LAG）
+with_lag AS (
+  SELECT
+    month,
+    sales_amount,
+    LAG(sales_amount, 1) OVER (ORDER BY month) AS prev_amount
+  FROM current_month
+)
+SELECT
+  month,
+  sales_amount,
+  prev_amount,
+  CASE
+    WHEN prev_amount > 0 THEN
+      ROUND((sales_amount - prev_amount) / prev_amount * 100, 2)
+    ELSE NULL
+  END AS growth_rate
+FROM with_lag;
+```
+
+## 最佳实践
+
+### 1. 优先使用 JOIN 而非子查询
+
+```sql
+-- ✅ 推荐：JOIN
+SELECT u.*, COUNT(o.id) AS order_count
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+GROUP BY u.id;
+
+-- ❌ 避免：相关子查询
+SELECT u.*, (
+  SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id
+) AS order_count
+FROM users u;
+```
+
+### 2. CTE 提升可读性
+
+```sql
+-- ✅ 复杂查询使用 CTE 分步实现
+WITH step1 AS (...),
+     step2 AS (...),
+     step3 AS (...)
+SELECT * FROM step3;
+```
+
+### 3. EXISTS 替代 IN
+
+```sql
+-- ✅ 推荐：EXISTS（通常更快）
+SELECT * FROM users u
+WHERE EXISTS (
+  SELECT 1 FROM orders o
+  WHERE o.user_id = u.id
+);
+
+-- ❌ 避免：IN（子查询结果集大时慢）
+SELECT * FROM users
+WHERE id IN (SELECT user_id FROM orders);
+```
+
+## 总结
+
+本文介绍了子查询和 CTE，主要内容：
+
+**子查询类型**：
+
+- ✅ 标量子查询：返回单值
+- ✅ 列子查询：返回单列
+- ✅ 行子查询：返回单行
+- ✅ 表子查询：返回表
+
+**EXISTS**：
+
+- ✅ EXISTS：检查存在
+- ✅ NOT EXISTS：检查不存在
+- ✅ 通常比 IN 快
+
+**CTE（MySQL 8.0+）**：
+
+- ✅ 基本语法
+- ✅ 多个 CTE
+- ✅ 递归 CTE
+
+**最佳实践**：
+
+- ✅ 优先使用 JOIN
+- ✅ CTE 提升可读性
+- ✅ EXISTS 替代 IN
+
+掌握子查询后，你就能编写更复杂的查询了。接下来我们将学习索引基础知识。
+
+## 下一步
+
+在下一篇文章《08 索引基础》中，我们将学习：
+
+- 索引的原理和类型
+- B+Tree 索引结构
+- 主键索引、唯一索引、普通索引
+- 索引的创建和管理
+- 索引设计原则
+
+---
+
+- **上一篇**：[06 聚合函数与分组](./06-aggregation-and-grouping.mdx)
+- **下一篇**：[08 索引基础](./08-indexing-fundamentals.mdx)

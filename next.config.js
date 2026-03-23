@@ -9,7 +9,8 @@ const basePath =
     : "";
 
 const nextConfig = {
-  output: "export",
+  // 只在生产构建时使用静态导出
+  ...(process.env.NODE_ENV === "production" ? { output: "export" } : {}),
   trailingSlash: true,
   ...(basePath
     ? {

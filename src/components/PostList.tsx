@@ -4,6 +4,7 @@ import { useMemo } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { PostMeta } from "@/lib/posts";
+import { categoryToDirMap, dirToCategoryMap } from "@/lib/category-map";
 
 interface PostListProps {
   posts: PostMeta[];
@@ -14,6 +15,15 @@ export default function PostList({ posts }: PostListProps) {
   const searchParams = useSearchParams();
   const categoryParam = searchParams.get("category");
   const selectedCategory = categoryParam || "";
+
+  // 将英文目录名转换为中文分类名（用于筛选）
+  const normalizedCategory =
+    dirToCategoryMap[selectedCategory] || selectedCategory;
+
+  // 获取 URL 中使用的英文目录名
+  const getUrlCategory = (category: string) => {
+    return categoryToDirMap[category] || category;
+  };
 
   // 更新 URL 参数的函数
   const updateCategory = (category: string) => {
@@ -29,7 +39,7 @@ export default function PostList({ posts }: PostListProps) {
       "全栈",
       "测试",
       "运维",
-      "大模型/AI",
+      "大模型",
       "提效工具",
       "数据库",
     ];
@@ -52,11 +62,11 @@ export default function PostList({ posts }: PostListProps) {
 
   // 根据选中的分类过滤文章
   const filteredPosts = useMemo(() => {
-    if (!selectedCategory) {
+    if (!normalizedCategory) {
       return posts;
     }
-    return posts.filter((post) => post.category === selectedCategory);
-  }, [posts, selectedCategory]);
+    return posts.filter((post) => post.category === normalizedCategory);
+  }, [posts, normalizedCategory]);
 
   // 获取分类对应的颜色
   const getCategoryColor = (category: string) => {
@@ -67,7 +77,7 @@ export default function PostList({ posts }: PostListProps) {
       全栈: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400",
       测试: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400",
       运维: "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400",
-      "大模型/AI":
+      大模型:
         "bg-pink-100 text-pink-700 dark:bg-pink-900/30 dark:text-pink-400",
       提效工具:
         "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
@@ -88,9 +98,9 @@ export default function PostList({ posts }: PostListProps) {
           {categories.map((category) => (
             <button
               key={category}
-              onClick={() => updateCategory(category)}
+              onClick={() => updateCategory(getUrlCategory(category))}
               className={`px-5 py-2 rounded-lg font-medium text-sm transition-all ${
-                selectedCategory === category
+                normalizedCategory === category
                   ? "bg-gradient-to-r from-blue-500 to-purple-600 text-white shadow-md scale-105"
                   : "bg-white dark:bg-neutral-800 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-neutral-700 hover:scale-102"
               }`}
@@ -120,7 +130,7 @@ export default function PostList({ posts }: PostListProps) {
             className="group glass rounded-xl p-6 border border-gray-200 dark:border-neutral-700 hover:shadow-xl hover:border-blue-300 dark:hover:border-blue-600 transition-all duration-300 hover:-translate-y-1 animate-fade-in"
             style={{ animationDelay: `${index * 50}ms` }}
           >
-            <Link href={`/posts/${post.category}/${post.slug}`}>
+            <Link href={`/posts/${getUrlCategory(post.category)}/${post.slug}`}>
               <h2 className="text-xl font-bold mb-3 text-gray-900 dark:text-gray-100 group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors line-clamp-2">
                 {post.title}
               </h2>
@@ -161,7 +171,7 @@ export default function PostList({ posts }: PostListProps) {
 
             <div className="mt-4 pt-4 border-t border-gray-200 dark:border-neutral-700">
               <Link
-                href={`/posts/${post.category}/${post.slug}`}
+                href={`/posts/${getUrlCategory(post.category)}/${post.slug}`}
                 className="inline-flex items-center text-sm font-medium text-blue-600 dark:text-blue-400 hover:text-blue-700 dark:hover:text-blue-300 group/link"
               >
                 阅读更多

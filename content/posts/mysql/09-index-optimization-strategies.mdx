@@ -1,0 +1,353 @@
+---
+title: "09 索引优化策略"
+date: "2026-03-23"
+summary: "掌握索引优化的高级技巧，学会使用覆盖索引、前缀索引等策略提升查询性能。"
+tags: ["MySQL", "索引优化", "性能调优", "覆盖索引"]
+category: "mysql"
+cover: ""
+draft: false
+series: "MySQL 渐进式学习指南"
+seriesOrder: 9
+---
+
+## 前言
+
+创建索引只是第一步，真正发挥索引威力需要优化策略。合理的索引优化可以让查询性能再提升10倍以上。
+
+本文将深入讲解索引优化的高级技巧和实战策略。
+
+## 覆盖索引
+
+查询只需要访问索引，无需回表查询数据。
+
+### 原理
+
+```sql
+-- 普通索引查询
+CREATE INDEX idx_user_id ON orders(user_id);
+SELECT * FROM orders WHERE user_id = 1;
+-- 1. 通过索引找到 user_id=1 的位置
+-- 2. 回表查询所有字段（二次I/O）
+
+-- 覆盖索引查询
+CREATE INDEX idx_user_id_status_total ON orders(user_id, status, total_amount);
+SELECT user_id, status, total_amount
+FROM orders
+WHERE user_id = 1 AND status = 'completed';
+-- 所有字段都在索引中，无需回表！
+```
+
+### 实战应用
+
+```sql
+-- 订单表索引优化
+CREATE INDEX idx_status_created_total ON orders(status, created_at, total_amount);
+
+-- ✅ 使用覆盖索引
+SELECT
+  status,
+  created_at,
+  total_amount
+FROM orders
+WHERE status = 'completed'
+ORDER BY created_at DESC
+LIMIT 10;
+
+-- ✅ 使用覆盖索引
+SELECT
+  status,
+  COUNT(*) AS order_count,
+  SUM(total_amount) AS total_amount
+FROM orders
+WHERE status = 'completed';
+
+-- ❌ 无法使用覆盖索引（SELECT *）
+SELECT * FROM orders WHERE status = 'completed';
+```
+
+## 前缀索引
+
+对长字符串字段的前N个字符建立索引。
+
+### 使用场景
+
+```sql
+-- URL、邮箱、长文本字段
+CREATE TABLE users (
+  id BIGINT PRIMARY KEY,
+  email VARCHAR(100),
+  url VARCHAR(500),
+  description TEXT
+);
+
+-- 前缀索引语法
+CREATE INDEX idx_email_prefix ON users(email(10));
+CREATE INDEX idx_url_prefix ON users(url(20));
+
+-- 计算合适的前缀长度
+SELECT
+  COUNT(DISTINCT LEFT(email, 5)) / COUNT(*) AS sel5,
+  COUNT(DISTINCT LEFT(email, 10)) / COUNT(*) AS sel10,
+  COUNT(DISTINCT LEFT(email, 15)) / COUNT(*) AS sel15
+FROM users;
+-- 选择区分度接近 0.9-1.0 的最短长度
+```
+
+### 限制
+
+```sql
+-- ❌ 前缀索引不支持 ORDER BY / GROUP BY
+SELECT * FROM users ORDER BY email;  -- 无法使用前缀索引
+
+-- ❌ 前缀索引不支持覆盖索引
+SELECT email FROM users WHERE email LIKE 'user%';  -- 无法使用覆盖索引
+
+-- ✅ 解决方案：使用 Hash 字段
+ALTER TABLE users ADD COLUMN email_hash CHAR(32);
+CREATE INDEX idx_email_hash ON users(email_hash);
+UPDATE users SET email_hash = MD5(email);
+```
+
+## 函数索引（MySQL 8.0+）
+
+对函数表达式建立索引。
+
+```sql
+-- 基本语法
+CREATE INDEX idx_func_email ON users((LOWER(email)));
+
+-- 使用场景
+SELECT * FROM users WHERE LOWER(email) = 'USER@EXAMPLE.COM';
+
+-- 更多示例
+CREATE INDEX idx_date ON orders((DATE(created_at)));
+CREATE INDEX idx_year ON orders((YEAR(created_at)));
+
+-- 函数索引支持覆盖索引
+SELECT
+  id,
+  LOWER(email) AS email_lower
+FROM users
+WHERE LOWER(email) = 'user@example.com';
+```
+
+## 降序索引（MySQL 8.0+）
+
+支持降序扫描索引。
+
+```sql
+-- MySQL 8.0+ 语法
+CREATE INDEX idx_price_desc ON products(price DESC);
+
+-- 优化降序查询
+SELECT * FROM products ORDER BY price DESC;
+
+-- 复合降序索引
+CREATE INDEX idx_status_desc_created_desc ON orders(status DESC, created_at DESC);
+
+-- 对应查询
+SELECT * FROM orders
+WHERE status = 'completed'
+ORDER BY status DESC, created_at DESC;
+```
+
+## 不可见索引（MySQL 8.0+）
+
+索引不可见，优化器不会使用，但会维护。
+
+```sql
+-- 创建不可见索引
+CREATE INDEX idx_test ON users(age) INVISIBLE;
+
+-- 修改索引可见性
+ALTER INDEX idx_age ON users INVISIBLE;
+ALTER INDEX idx_age ON users VISIBLE;
+
+-- 使用场景：测试删除索引的影响
+-- 1. 将索引设为不可见
+ALTER INDEX idx_age ON users INVISIBLE;
+-- 2. 观察性能影响
+-- 3. 决定是否真正删除
+```
+
+## 索引下推（ICP）
+
+MySQL 5.6+ 优化特性，减少回表次数。
+
+```sql
+-- 复合索引：(name, age)
+CREATE INDEX idx_name_age ON users(name, age);
+
+-- 查询
+SELECT * FROM users
+WHERE name LIKE 'Zhang%' AND age = 25;
+
+-- 无ICP：存储引擎返回所有 name LIKE 'Zhang%' 的行，服务器过滤 age
+-- 有ICP：存储引擎直接过滤 age=25 的行，只返回符合条件的数据
+
+-- 查看是否使用 ICP
+EXPLAIN SELECT * FROM users WHERE name LIKE 'Zhang%' AND age = 25;
+-- Extra: Using index condition
+```
+
+## 索引监控
+
+### 慢查询日志
+
+```sql
+-- 开启慢查询日志
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 1;  -- 超过1秒的查询
+
+-- 查看慢查询
+SELECT * FROM mysql.slow_log
+ORDER BY query_time DESC
+LIMIT 10;
+
+-- 分析慢查询
+-- 使用 pt-query-digest 工具
+```
+
+### 索引使用统计（MySQL 8.0+）
+
+```sql
+-- 查看索引统计
+SELECT
+  OBJECT_SCHEMA,
+  OBJECT_NAME,
+  INDEX_NAME,
+  COUNT_FETCH,
+  COUNT_INSERT,
+  COUNT_UPDATE,
+  COUNT_DELETE
+FROM performance_schema.table_io_waits_summary_by_index_usage
+WHERE OBJECT_SCHEMA = 'shop'
+ORDER BY COUNT_FETCH DESC;
+```
+
+## 索引优化实战
+
+### 案例1：订单查询优化
+
+```sql
+-- 原始查询
+SELECT * FROM orders
+WHERE user_id = 1 AND status = 'completed'
+ORDER BY created_at DESC
+LIMIT 20;
+
+-- 优化方案：复合索引
+CREATE INDEX idx_user_status_created ON orders(user_id, status, created_at DESC);
+
+-- 验证
+EXPLAIN SELECT * FROM orders
+WHERE user_id = 1 AND status = 'completed'
+ORDER BY created_at DESC;
+-- type: ref
+-- key: idx_user_status_created
+-- Extra: Using where; Using filesort（如果仍有文件排序，调整索引顺序）
+```
+
+### 案例2：LIKE 优化
+
+```sql
+-- ❌ 无法使用索引
+SELECT * FROM users WHERE username LIKE '%user%';
+
+-- ✅ 使用索引
+SELECT * FROM users WHERE username LIKE 'user%';
+
+-- ✅ 全文索引
+ALTER TABLE articles ADD FULLTEXT INDEX ft_content (content);
+SELECT * FROM articles
+WHERE MATCH(content) AGAINST('MySQL 教程' IN NATURAL LANGUAGE MODE);
+```
+
+## 最佳实践
+
+### 1. 避免 SELECT \*
+
+```sql
+-- ✅ 只查询需要的字段
+SELECT id, username, email FROM users WHERE age > 25;
+
+-- ❌ 避免 SELECT *
+SELECT * FROM users WHERE age > 25;
+```
+
+### 2. 合理使用复合索引
+
+```sql
+-- ✅ 最左前缀原则
+CREATE INDEX idx_age_status_created ON orders(user_id, status, created_at);
+
+-- ✅ 能使用索引的查询
+WHERE user_id = 1
+WHERE user_id = 1 AND status = 'completed'
+WHERE user_id = 1 AND status = 'completed' AND created_at > '2024-01-01'
+
+-- ❌ 不能使用索引的查询
+WHERE status = 'completed'  -- user_id 缺失
+WHERE created_at > '2024-01-01'  -- user_id、status 缺失
+```
+
+### 3. 定期维护索引
+
+```sql
+-- 分析表
+ANALYZE TABLE users;
+
+-- 优化表
+OPTIMIZE TABLE users;
+
+-- 检查表
+CHECK TABLE users;
+```
+
+## 总结
+
+本文介绍了索引优化策略，主要内容：
+
+**覆盖索引**：
+
+- ✅ 避免回表查询
+- ✅ 查询字段都在索引中
+
+**前缀索引**：
+
+- ✅ 长字符串字段
+- ✅ 选择合适的前缀长度
+
+**高级索引**：
+
+- ✅ 函数索引（MySQL 8.0+）
+- ✅ 降序索引（MySQL 8.0+）
+- ✅ 不可见索引（MySQL 8.0+）
+
+**索引下推**：
+
+- ✅ 减少回表次数
+
+**实战优化**：
+
+- ✅ 避免 SELECT \*
+- ✅ 合理使用复合索引
+- ✅ 定期维护索引
+
+掌握索引优化后，查询性能可以再提升10倍以上。接下来我们将学习查询优化。
+
+## 下一步
+
+在下一篇文章《10 查询性能优化》中，我们将学习：
+
+- EXPLAIN 执行计划详解
+- 查询优化技巧
+- 分区表使用
+- SQL 重写方法
+- 配置参数优化
+- 性能优化案例
+
+---
+
+- **上一篇**：[08 索引基础](./08-indexing-fundamentals.mdx)
+- **下一篇**：[10 查询性能优化](./10-query-optimization.mdx)

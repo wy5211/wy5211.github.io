@@ -1,0 +1,401 @@
+---
+title: "17 主从复制与高可用"
+date: "2026-03-23"
+summary: "掌握 MySQL 主从复制原理和搭建方法，学会构建高可用的数据库架构。"
+tags: ["MySQL", "主从复制", "高可用", "读写分离", "GTID"]
+category: "mysql"
+cover: ""
+draft: false
+series: "MySQL 渐进式学习指南"
+seriesOrder: 17
+---
+
+## 前言
+
+主从复制是 MySQL 高可用的核心技术，可以实现读写分离、数据备份和故障恢复。
+
+本文将深入讲解主从复制的原理和实战方法。
+
+## 复制原理
+
+### 复制过程
+
+```
+主库 (Master)
+  ↓
+1. 写操作修改数据
+2. 记录到 Binlog
+  ↓
+从库 IO 线程
+  ↓
+3. 读取主库 Binlog
+4. 写入 Relay Log
+  ↓
+从库 SQL 线程
+  ↓
+5. 读取 Relay Log
+6. 重放 SQL 语句
+```
+
+### 复制类型
+
+| 类型       | 说明             | 优缺点             |
+| ---------- | ---------------- | ------------------ |
+| 异步复制   | 主库不等待从库   | 性能好，可能丢数据 |
+| 半同步复制 | 至少一个从库确认 | 平衡性能和安全     |
+| 全同步复制 | 所有从库确认     | 安全，性能差       |
+
+## 主从复制搭建
+
+### 主库配置
+
+```ini
+# /etc/mysql/my.cnf (Master)
+
+[mysqld]
+server-id=1                    # 唯一 ID
+log-bin=mysql-bin             # 启用 binlog
+binlog_format=ROW             # ROW 格式
+expire_logs_days=7            # binlog 保留天数
+max_binlog_size=100M          # binlog 大小
+binlog_do_db=shop            # 复制哪些数据库（可选）
+```
+
+```sql
+-- 创建复制用户
+CREATE USER 'replication_user'@'%' IDENTIFIED BY 'ReplicaPass123!';
+GRANT REPLICATION SLAVE ON *.* TO 'replication_user'@'%';
+FLUSH PRIVILEGES;
+
+-- 查看主库状态
+SHOW MASTER STATUS;
+-- 记录 File 和 Position
+```
+
+### 从库配置
+
+```ini
+# /etc/mysql/my.cnf (Slave)
+
+[mysqld]
+server-id=2                    # 唯一 ID（不能与主库相同）
+relay-log=relay-bin           # 中继日志
+read_only=1                    # 只读
+```
+
+```sql
+-- 配置复制
+CHANGE MASTER TO
+  MASTER_HOST='master_host_ip',
+  MASTER_USER='replication_user',
+  MASTER_PASSWORD='ReplicaPass123!',
+  MASTER_LOG_FILE='mysql-bin.000001',    # 主库 File
+  MASTER_LOG_POS=154;                     # 主库 Position
+
+-- 启动复制
+START SLAVE;
+
+-- 查看复制状态
+SHOW SLAVE STATUS\G
+
+-- 关键指标：
+-- Slave_IO_Running: Yes
+-- Slave_SQL_Running: Yes
+-- Seconds_Behind_Master: 延迟秒数（0 表示同步）
+```
+
+## GTID 复制（推荐）
+
+GTID（全局事务ID）简化了复制管理。
+
+### 主库配置
+
+```ini
+[mysqld]
+server-id=1
+log-bin=mysql-bin
+binlog_format=ROW
+gtid-mode=ON                      # 启用 GTID
+enforce-gtid-consistency=ON       # 强制 GTID 一致性
+```
+
+### 从库配置
+
+```ini
+[mysqld]
+server-id=2
+relay-log=relay-bin
+gtid-mode=ON
+enforce-gtid-consistency=ON
+```
+
+```sql
+-- 配置 GTID 复制
+CHANGE MASTER TO
+  MASTER_HOST='master_host_ip',
+  MASTER_USER='replication_user',
+  MASTER_PASSWORD='ReplicaPass123!',
+  MASTER_AUTO_POSITION=1;         # 自动使用 GTID
+
+-- 启动复制
+START SLAVE;
+```
+
+## 复制监控
+
+### 监控命令
+
+```sql
+-- 主库：查看 binlog 信息
+SHOW MASTER STATUS;
+SHOW BINARY LOGS;
+
+-- 从库：查看复制状态
+SHOW SLAVE STATUS\G
+
+-- 关键指标：
+-- Slave_IO_Running: Yes
+-- Slave_SQL_Running: Yes
+-- Last_Error: 错误信息
+-- Seconds_Behind_Master: 延迟时间
+-- Retrieved_Gtid_Set: 已接收的 GTID
+-- Executed_Gtid_Set: 已执行的 GTID
+```
+
+### 常见问题
+
+```sql
+-- 1. 复制延迟
+SHOW SLAVE STATUS\G
+-- Seconds_Behind_Master 很大
+
+-- 解决方案：
+-- - 优化从库性能
+-- - 升级从库硬件
+-- - 并行复制
+
+-- 2. 复制中断
+-- Last_Error 有错误信息
+
+-- 跳过错误（谨慎使用）
+STOP SLAVE;
+SET GLOBAL sql_slave_skip_counter = 1;
+START SLAVE;
+
+-- 或使用 GTID 跳过
+SET GTID_NEXT='xxx';
+BEGIN; COMMIT;
+SET GTID_NEXT='AUTOMATIC';
+START SLAVE;
+```
+
+## 读写分离
+
+应用层实现读写分离。
+
+### 原理
+
+```
+应用
+  ↓
+读写分离代理（或应用代码）
+  ↓           ↓
+主库（写）  从库（读）
+```
+
+### 实现方式
+
+```sql
+-- 1. 应用层实现
+// 伪代码
+write_db = "master_host"
+read_db = "slave_host"
+
+function query(sql) {
+  if (sql.startsWith("SELECT")) {
+    return execute(read_db, sql);
+  } else {
+    return execute(write_db, sql);
+  }
+}
+
+-- 2. 中间件实现
+-- MySQL Router
+-- ProxySQL
+-- MaxScale
+```
+
+## 高可用方案
+
+### 主主复制
+
+```ini
+# Master 1
+[mysqld]
+server-id=1
+log-bin=mysql-bin
+binlog_format=ROW
+gtid-mode=ON
+enforce-gtid-consistency=ON
+auto-increment-offset=1
+auto-increment-increment=2
+
+# Master 2
+[mysqld]
+server-id=2
+log-bin=mysql-bin
+binlog-format=ROW
+gtid-mode=ON
+enforce-gtid-consistency=ON
+auto-increment-offset=2
+auto-increment-increment=2
+```
+
+```sql
+-- Master 1
+CHANGE MASTER TO
+  MASTER_HOST='master2_ip',
+  MASTER_USER='replication_user',
+  MASTER_PASSWORD='password',
+  MASTER_AUTO_POSITION=1;
+START SLAVE;
+
+-- Master 2
+CHANGE MASTER TO
+  MASTER_HOST='master1_ip',
+  MASTER_USER='replication_user',
+  MASTER_PASSWORD='password',
+  MASTER_AUTO_POSITION=1;
+START SLAVE;
+```
+
+### 故障切换
+
+```sql
+-- 手动切换
+-- 1. 停止应用写入
+-- 2. 等待从库同步完成
+-- 3. 提升从库为主库
+STOP SLAVE;
+RESET MASTER;
+
+-- 4. 切换应用到新主库
+-- 5. 将旧主库设为从库
+
+-- 自动切换工具：
+-- - MHA (Master HA)
+-- - Orchestrator
+-- - MySQL Router
+```
+
+## Docker 主从搭建
+
+```yaml
+version: "3"
+services:
+  mysql-master:
+    image: mysql:8.0
+    container_name: mysql-master
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+    ports:
+      - "3306:3306"
+    volumes:
+      - ./master.cnf:/etc/mysql/conf.d/custom.cnf
+      - master-data:/var/lib/mysql
+
+  mysql-slave:
+    image: mysql:8.0
+    container_name: mysql-slave
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+    ports:
+      - "3307:3306"
+    volumes:
+      - ./slave.cnf:/etc/mysql/conf.d/custom.cnf
+      - slave-data:/var/lib/mysql
+
+volumes:
+  master-data:
+  slave-data:
+```
+
+## 最佳实践
+
+### 1. 从库只读
+
+```sql
+-- ✅ 从库设置为只读
+SET GLOBAL read_only = 1;
+-- super_read_only = 1;  -- 包括 super 用户
+
+-- 配置文件
+read_only=1
+```
+
+### 2. 定期检查复制状态
+
+```sql
+-- ✅ 监控脚本
+-- 检查复制状态
+SHOW SLAVE STATUS\G
+
+-- 监控关键指标
+SELECT
+  Slave_IO_Running,
+  Slave_SQL_Running,
+  Seconds_Behind_Master
+FROM performance_schema.replication_connection_status;
+```
+
+### 3. 并行复制
+
+```ini
+# MySQL 5.7+ 并行复制
+[mysqld]
+slave_parallel_type=LOGICAL_CLOCK
+slave_parallel_workers=4
+```
+
+## 总结
+
+本文介绍了主从复制与高可用，主要内容：
+
+**复制原理**：
+
+- ✅ Binlog + Relay Log
+- ✅ IO 线程 + SQL 线程
+- ✅ 异步、半同步、全同步
+
+**复制搭建**：
+
+- ✅ 传统复制
+- ✅ GTID 复制（推荐）
+
+**读写分离**：
+
+- ✅ 应用层实现
+- ✅ 中间件实现
+
+**高可用**：
+
+- ✅ 主主复制
+- ✅ 故障切换
+
+掌握主从复制后，就能构建高可用的数据库架构了。最后一篇文章我们将综合讲解性能调优。
+
+## 下一步
+
+在下一篇文章《18 性能调优实战》中，我们将学习：
+
+- 性能监控工具
+- 配置参数优化
+- SQL 优化实战
+- 索引优化策略
+- 系统级优化
+- 性能测试方法
+
+---
+
+- **上一篇**：[16 备份与恢复](./16-backup-and-recovery.mdx)
+- **下一篇**：[18 性能调优实战](./18-performance-tuning.mdx)

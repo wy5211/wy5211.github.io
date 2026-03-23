@@ -1,0 +1,431 @@
+---
+title: "11 事务与锁机制"
+date: "2026-03-23"
+summary: "深入理解事务的 ACID 特性和锁机制，掌握并发控制的核心知识。"
+tags: ["MySQL", "事务", "锁", "ACID", "并发控制"]
+category: "mysql"
+cover: ""
+draft: false
+series: "MySQL 渐进式学习指南"
+seriesOrder: 11
+---
+
+## 前言
+
+事务和锁是数据库并发控制的核心。理解事务的 ACID 特性和锁机制，对于保证数据一致性和提升并发性能至关重要。
+
+本文将系统讲解 MySQL 的事务机制和锁策略。
+
+## 事务 ACID 特性
+
+### Atomicity - 原子性
+
+事务中的操作要么全部成功，要么全部失败。
+
+```sql
+-- 转账示例
+START TRANSACTION;
+
+UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
+UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
+
+COMMIT;
+-- 如果任何一条失败，全部回滚
+```
+
+### Consistency - 一致性
+
+事务前后数据库状态一致。
+
+```sql
+-- 转账前后总金额不变
+SELECT SUM(balance) FROM accounts;
+-- 事务前：10000
+START TRANSACTION;
+UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
+UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
+COMMIT;
+SELECT SUM(balance) FROM accounts;
+-- 事务后：10000（一致）
+```
+
+### Isolation - 隔离性
+
+事务之间相互隔离，互不干扰。
+
+### Durability - 持久性
+
+事务一旦提交，数据永久保存。
+
+## 事务控制语句
+
+```sql
+-- 开始事务
+START TRANSACTION;
+-- 或
+BEGIN;
+
+-- 提交事务
+COMMIT;
+
+-- 回滚事务
+ROLLBACK;
+
+-- 保存点
+SAVEPOINT sp1;
+ROLLBACK TO sp1;
+RELEASE SAVEPOINT sp1;
+```
+
+## 事务隔离级别
+
+### 四种隔离级别
+
+```sql
+-- 查看当前隔离级别
+SELECT @@transaction_isolation;
+
+-- 设置隔离级别
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+```
+
+### 隔离级别对比
+
+| 隔离级别         | 脏读 | 不可重复读 | 幻读 | 性能 |
+| ---------------- | ---- | ---------- | ---- | ---- |
+| READ UNCOMMITTED | ✓    | ✓          | ✓    | 高   |
+| READ COMMITTED   | ✗    | ✓          | ✓    | 中   |
+| REPEATABLE READ  | ✗    | ✗          | ✓    | 中   |
+| SERIALIZABLE     | ✗    | ✗          | ✗    | 低   |
+
+### 默认级别：REPEATABLE READ
+
+```sql
+-- MySQL 默认隔离级别
+SELECT @@transaction_isolation;
+-- REPEATABLE READ
+
+-- 特点：
+-- - 防止脏读
+-- - 防止不可重复读
+-- - 可能发生幻读（MySQL InnoDB 通过 MVCC 已解决）
+```
+
+## 锁机制
+
+### 锁类型
+
+```sql
+-- 全局锁：锁定整个数据库
+FLUSH TABLES WITH READ LOCK;
+UNLOCK TABLES;
+
+-- 表级锁
+LOCK TABLES users READ;
+LOCK TABLES users WRITE;
+UNLOCK TABLES;
+
+-- 行级锁（自动）
+-- InnoDB 自动管理，无需手动控制
+```
+
+### 共享锁（S锁）
+
+```sql
+-- 共享锁：允许其他事务也加共享锁
+START TRANSACTION;
+SELECT * FROM users WHERE id = 1 LOCK IN SHARE MODE;
+COMMIT;
+
+-- 特点：
+-- - 多个事务可以同时持有共享锁
+-- - 阻止其他事务获取排他锁
+```
+
+### 排他锁（X锁）
+
+```sql
+-- 排他锁：独占锁
+START TRANSACTION;
+SELECT * FROM users WHERE id = 1 FOR UPDATE;
+COMMIT;
+
+-- 特点：
+-- - 只有一个事务能持有排他锁
+-- - 阻止其他事务获取共享锁或排他锁
+```
+
+## 意向锁
+
+表级锁，用于快速判断是否可以对表加锁。
+
+```sql
+-- 意向共享锁（IS）
+-- 事务准备给某些行加共享锁
+
+-- 意向排他锁（IX）
+-- 事务准备给某些行加排他锁
+
+-- 自动管理，无需手动控制
+```
+
+## 行锁算法
+
+### Record Lock - 记录锁
+
+```sql
+-- 锁定单行记录
+SELECT * FROM users WHERE id = 1 FOR UPDATE;
+-- 只锁定 id = 1 的记录
+```
+
+### Gap Lock - 间隙锁
+
+```sql
+-- 锁定索引记录之间的间隙
+SELECT * FROM users WHERE id BETWEEN 1 AND 10 FOR UPDATE;
+-- 锁定 (1, 10) 之间的间隙，防止幻读
+```
+
+### Next-Key Lock - 临键锁
+
+```sql
+-- Record Lock + Gap Lock
+-- MySQL 默认的行锁算法
+SELECT * FROM users WHERE id > 1 FOR UPDATE;
+-- 锁定 (1, +∞) 的范围
+```
+
+## 死锁
+
+### 死锁示例
+
+```sql
+-- 事务 A
+START TRANSACTION;
+UPDATE users SET balance = balance - 100 WHERE id = 1;
+-- 等待 B 释放 id = 2 的锁
+UPDATE users SET balance = balance + 100 WHERE id = 2;
+
+-- 事务 B
+START TRANSACTION;
+UPDATE users SET balance = balance - 100 WHERE id = 2;
+-- 等待 A 释放 id = 1 的锁
+UPDATE users SET balance = balance + 100 WHERE id = 1;
+
+-- 死锁！A 等 B，B 等 A
+-- MySQL 自动检测并回滚其中一个事务
+```
+
+### 死锁预防
+
+```sql
+-- 1. 统一访问顺序
+-- ✅ 好：按 id 顺序
+UPDATE users SET balance = balance - 100 WHERE id = 1;
+UPDATE users SET balance = balance + 100 WHERE id = 2;
+
+-- ❌ 差：不同顺序
+UPDATE users SET balance = balance - 100 WHERE id = 2;
+UPDATE users SET balance = balance + 100 WHERE id = 1;
+
+-- 2. 减小事务范围
+-- ✅ 好：小事务
+START TRANSACTION;
+UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
+UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
+COMMIT;
+
+-- ❌ 差：大事务
+START TRANSACTION;
+UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
+-- 大量其他操作
+UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
+COMMIT;
+
+-- 3. 添加索引
+-- 减少锁定的行数
+CREATE INDEX idx_id ON accounts(id);
+```
+
+## 乐观锁 vs 悲观锁
+
+### 悲观锁
+
+```sql
+-- 假设会发生冲突，先加锁
+START TRANSACTION;
+SELECT * FROM products WHERE id = 1 FOR UPDATE;
+-- 检查库存
+UPDATE products SET stock = stock - 1 WHERE id = 1;
+COMMIT;
+```
+
+### 乐观锁
+
+```sql
+-- 假设不会发生冲突，使用版本号
+CREATE TABLE products (
+  id INT PRIMARY KEY,
+  name VARCHAR(100),
+  stock INT,
+  version INT DEFAULT 1  -- 版本号
+);
+
+-- 更新时检查版本
+UPDATE products
+SET stock = stock - 1,
+    version = version + 1
+WHERE id = 1 AND version = 5;
+
+-- 检查 affected_rows
+-- 如果为 0，说明版本冲突，需要重试
+```
+
+## 实战案例
+
+### 转账事务
+
+```sql
+-- 完整的转账事务
+START TRANSACTION;
+
+-- 1. 检查账户余额
+SELECT balance INTO @balance1 FROM accounts WHERE id = 1 FOR UPDATE;
+SELECT balance INTO @balance2 FROM accounts WHERE id = 2 FOR UPDATE;
+
+-- 2. 验证余额
+IF @balance1 < 1000 THEN
+  ROLLBACK;
+  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '余额不足';
+END IF;
+
+-- 3. 执行转账
+UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
+UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
+
+-- 4. 记录日志
+INSERT INTO transaction_logs (from_account, to_account, amount)
+VALUES (1, 2, 1000);
+
+COMMIT;
+```
+
+### 库存扣减
+
+```sql
+-- 防止超卖
+START TRANSACTION;
+
+-- 方式 1：悲观锁
+SELECT stock INTO @stock FROM products WHERE id = 1 FOR UPDATE;
+
+IF @stock < 1 THEN
+  ROLLBACK;
+  SELECT '库存不足' AS result;
+ELSE
+  UPDATE products SET stock = stock - 1 WHERE id = 1;
+  INSERT INTO orders (product_id, quantity) VALUES (1, 1);
+  COMMIT;
+  SELECT '购买成功' AS result;
+END IF;
+
+-- 方式 2：乐观锁（推荐）
+UPDATE products
+SET stock = stock - 1
+WHERE id = 1 AND stock > 0;
+
+-- 检查 affected_rows
+-- 如果为 1，成功；如果为 0，库存不足
+```
+
+## 最佳实践
+
+### 1. 事务尽量小
+
+```sql
+-- ✅ 好：小事务
+START TRANSACTION;
+UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
+UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
+COMMIT;
+
+-- ❌ 差：大事务
+START TRANSACTION;
+UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
+-- 大量其他操作
+UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
+COMMIT;
+```
+
+### 2. 避免长事务
+
+```sql
+-- ❌ 避免：事务中有耗时操作
+START TRANSACTION;
+UPDATE users SET status = 1 WHERE id = 1;
+-- 调用外部 API（可能很慢）
+-- 发送邮件
+-- 其他耗时操作
+COMMIT;
+
+-- ✅ 推荐：事务只做数据库操作
+START TRANSACTION;
+UPDATE users SET status = 1 WHERE id = 1;
+COMMIT;
+-- 再执行耗时操作
+```
+
+### 3. 合理选择隔离级别
+
+```sql
+-- 默认 REPEATABLE READ 适用于大多数场景
+
+-- 读多写少：可以考虑 READ COMMITTED
+SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
+
+-- 强一致性：SERIALIZABLE
+SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;
+```
+
+## 总结
+
+本文介绍了事务与锁机制，主要内容：
+
+**事务特性**：
+
+- ✅ ACID：原子性、一致性、隔离性、持久性
+- ✅ 四种隔离级别
+- ✅ 默认 REPEATABLE READ
+
+**锁机制**：
+
+- ✅ 共享锁、排他锁
+- ✅ 行锁算法
+- ✅ 死锁处理
+
+**并发控制**：
+
+- ✅ 悲观锁、乐观锁
+- ✅ 死锁预防
+- ✅ 事务设计原则
+
+掌握事务和锁后，就能正确处理并发问题了。接下来我们将学习数据库设计原则。
+
+## 下一步
+
+在下一篇文章《12 数据库设计原则》中，我们将学习：
+
+- 数据库设计三范式
+- 表关系设计（1:1、1:N、M:N）
+- 反规范化技巧
+- ER 图设计
+- 电商数据库设计案例
+
+---
+
+- **上一篇**：[10 查询性能优化](./10-query-optimization.mdx)
+- **下一篇**：[12 数据库设计原则](./12-database-design-principles.mdx)

@@ -1,0 +1,395 @@
+---
+title: "10 查询性能优化"
+date: "2026-03-23"
+summary: "全面掌握查询优化技巧，通过 EXPLAIN 分析执行计划，学会重写低效 SQL。"
+tags: ["MySQL", "性能优化", "EXPLAIN", "SQL优化"]
+category: "mysql"
+cover: ""
+draft: false
+series: "MySQL 渐进式学习指南"
+seriesOrder: 10
+---
+
+## 前言
+
+查询优化是数据库性能调优的核心环节。一个优化良好的查询可以比原始查询快几十倍甚至上百倍。
+
+本文将系统介绍查询优化的各种技巧和实战方法。
+
+## EXPLAIN 详解
+
+### 基本用法
+
+```sql
+-- 分析查询执行计划
+EXPLAIN SELECT * FROM users WHERE id = 1;
+
+-- 关键列说明：
+-- id          - 查询序列号
+-- select_type - 查询类型
+-- table       - 访问的表
+-- type        - 访问类型（最重要）
+-- possible_keys - 可能使用的索引
+-- key         - 实际使用的索引
+-- key_len     - 使用的索引长度
+-- ref         - 索引比较的列
+-- rows        - 预计扫描的行数
+-- Extra       - 额外信息
+```
+
+### type 字段（访问类型）
+
+性能从差到好排序：
+
+```sql
+-- ALL：全表扫描（最差）
+EXPLAIN SELECT * FROM users WHERE username LIKE '%user%';
+
+-- index：索引扫描（全索引）
+EXPLAIN SELECT id FROM users;
+
+-- range：范围扫描
+EXPLAIN SELECT * FROM users WHERE id BETWEEN 1 AND 100;
+
+-- ref：非唯一索引查找
+EXPLAIN SELECT * FROM users WHERE email = 'user@example.com';
+
+-- eq_ref：唯一索引查找
+EXPLAIN SELECT * FROM users u JOIN orders o ON u.id = o.user_id;
+
+-- const：主键或唯一索引（最好）
+EXPLAIN SELECT * FROM users WHERE id = 1;
+```
+
+### Extra 字段
+
+```sql
+-- Using index：使用了覆盖索引（好）
+EXPLAIN SELECT user_id FROM orders WHERE user_id = 1;
+
+-- Using where：使用了 WHERE 过滤
+EXPLAIN SELECT * FROM users WHERE age > 25;
+
+-- Using filesort：需要文件排序（避免）
+EXPLAIN SELECT * FROM users ORDER BY age;
+
+-- Using temporary：使用临时表（避免）
+EXPLAIN SELECT status, COUNT(*) FROM orders GROUP BY status ORDER BY COUNT(*);
+```
+
+## 查询优化技巧
+
+### 1. 避免 SELECT \*
+
+```sql
+-- ❌ 避免
+SELECT * FROM users WHERE id = 1;
+
+-- ✅ 推荐
+SELECT id, username, email FROM users WHERE id = 1;
+-- 原因：
+-- 1. 减少网络传输
+-- 2. 减少内存占用
+-- 3. 可以使用覆盖索引
+```
+
+### 2. 避免 SELECT DISTINCT
+
+```sql
+-- ❌ 避免
+SELECT DISTINCT user_id FROM orders;
+
+-- ✅ 改写
+SELECT user_id FROM orders GROUP BY user_id;
+```
+
+### 3. 优化 JOIN
+
+```sql
+-- ❌ 避免 JOIN 太多表
+SELECT * FROM a
+JOIN b ON ...
+JOIN c ON ...
+JOIN d ON ...
+JOIN e ON ...
+
+-- ✅ 建议：
+-- 1. JOIN 不超过 5 个
+-- 2. 小表驱动大表
+-- 3. 确保 JOIN 字段有索引
+
+-- ✅ 优化：先过滤再 JOIN
+SELECT u.*, o.*
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+WHERE o.status = 'completed';
+
+-- ✅ 更好：先过滤再 JOIN
+SELECT u.*, o.*
+FROM users u
+INNER JOIN (SELECT * FROM orders WHERE status = 'completed') o ON u.id = o.user_id;
+```
+
+### 4. 优化子查询
+
+```sql
+-- ❌ 避免：相关子查询
+SELECT u.*, (
+  SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id
+) AS order_count
+FROM users u;
+
+-- ✅ 改写：JOIN
+SELECT
+  u.*,
+  COUNT(o.id) AS order_count
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+GROUP BY u.id;
+```
+
+### 5. 优化 ORDER BY
+
+```sql
+-- ❌ filesort
+SELECT * FROM orders ORDER BY user_id;
+
+-- ✅ 使用索引
+CREATE INDEX idx_user_id_created ON orders(user_id, created_at);
+SELECT * FROM orders WHERE user_id = 1 ORDER BY created_at;
+
+-- ✅ 限制排序数据量
+SELECT * FROM orders ORDER BY created_at DESC LIMIT 20;
+```
+
+### 6. 优化 GROUP BY
+
+```sql
+-- ❌ Using filesort
+SELECT user_id, COUNT(*) FROM orders GROUP BY user_id ORDER BY COUNT(*);
+
+-- ✅ 使用索引
+CREATE INDEX idx_user_id ON orders(user_id);
+SELECT user_id, COUNT(*) FROM orders GROUP BY user_id;
+
+-- ✅ 减少分组数据
+SELECT user_id, COUNT(*) FROM orders
+WHERE status = 'completed'
+GROUP BY user_id;
+```
+
+## 分区表
+
+对大表进行水平分割。
+
+### 分区类型
+
+```sql
+-- RANGE 分区
+CREATE TABLE orders (
+  id BIGINT,
+  user_id BIGINT,
+  created_at DATE,
+  PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (YEAR(created_at)) (
+  PARTITION p2023 VALUES LESS THAN (2024),
+  PARTITION p2024 VALUES LESS THAN (2025),
+  PARTITION p2025 VALUES LESS THAN (2026)
+);
+
+-- 查询只扫描相关分区
+SELECT * FROM orders WHERE created_at >= '2024-01-01';
+
+-- 分区管理
+ALTER TABLE orders DROP PARTITION p2023;  -- 删除分区
+ALTER TABLE orders ADD PARTITION (
+  PARTITION p2026 VALUES LESS THAN (2027)
+);
+```
+
+### 分区表限制
+
+```sql
+-- ⚠️ 分区表限制：
+-- 1. 主键必须包含分区键
+-- 2. 外键不支持
+-- 3. 所有分区必须使用相同存储引擎
+-- 4. 分区键必须是整数类型或函数
+```
+
+## 配置优化
+
+### 重要参数
+
+```sql
+-- InnoDB Buffer Pool（最重要的参数）
+SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
+-- 建议：物理内存的 50-70%
+SET GLOBAL innodb_buffer_pool_size = 4294967296;  -- 4GB
+
+-- 连接数
+SHOW VARIABLES LIKE 'max_connections';
+SET GLOBAL max_connections = 500;
+
+-- 查询缓存（MySQL 8.0 已移除）
+-- MySQL 5.7 及以下可以设置
+-- SET GLOBAL query_cache_size = 268435456;
+
+-- 临时表大小
+SHOW VARIABLES LIKE 'tmp_table_size';
+SET GLOBAL tmp_table_size = 268435456;
+
+-- my.cnf 配置示例
+[mysqld]
+innodb_buffer_pool_size = 4G
+max_connections = 500
+tmp_table_size = 256M
+max_heap_table_size = 256M
+```
+
+## 优化案例
+
+### 案例1：慢查询优化
+
+```sql
+-- 原始查询（3秒）
+SELECT
+  u.username,
+  o.order_no,
+  oi.product_id,
+  p.name AS product_name
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+INNER JOIN order_items oi ON o.id = oi.order_id
+INNER JOIN products p ON oi.product_id = p.id
+WHERE u.city = '北京'
+  AND o.status = 'completed'
+  AND o.created_at >= '2024-01-01';
+
+-- EXPLAIN 分析
+-- type: ALL（全表扫描）
+-- rows: 1000000
+
+-- 优化方案：
+-- 1. 添加索引
+CREATE INDEX idx_city ON users(city);
+CREATE INDEX idx_status_created ON orders(status, created_at);
+CREATE INDEX idx_order_id ON order_items(order_id);
+CREATE INDEX idx_product_id ON order_items(product_id);
+
+-- 2. 优化查询
+SELECT
+  u.username,
+  o.order_no,
+  oi.product_id,
+  p.name AS product_name
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+  AND o.status = 'completed'
+  AND o.created_at >= '2024-01-01'
+INNER JOIN order_items oi ON o.id = oi.order_id
+INNER JOIN products p ON oi.product_id = p.id
+WHERE u.city = '北京';
+
+-- 结果：0.05秒（提升60倍）
+```
+
+### 案例2：分页优化
+
+```sql
+-- 深分页问题
+SELECT * FROM orders ORDER BY created_at DESC LIMIT 1000000, 20;
+-- 耗时：10秒
+
+-- 优化方案1：使用上一次的最大ID
+SELECT * FROM orders
+WHERE id > 1000000
+ORDER BY id ASC
+LIMIT 20;
+
+-- 优化方案2：延迟关联
+SELECT o.* FROM orders o
+INNER JOIN (
+  SELECT id FROM orders ORDER BY created_at DESC LIMIT 1000000, 20
+) tmp ON o.id = tmp.id;
+
+-- 结果：0.1秒（提升100倍）
+```
+
+## 最佳实践
+
+### 1. 使用 EXPLAIN 分析
+
+```sql
+-- ✅ 执行前先分析
+EXPLAIN SELECT * FROM users WHERE email = 'user@example.com';
+
+-- ✅ 关注 type、key、rows、Extra
+```
+
+### 2. 定期分析慢查询
+
+```sql
+-- 开启慢查询日志
+SET GLOBAL slow_query_log = 'ON';
+SET GLOBAL long_query_time = 1;
+
+-- 使用 pt-query-digest 分析
+-- shell
+pt-query-digest slow-query.log > report.txt
+```
+
+### 3. 使用 SHOW PROFILE
+
+```sql
+-- 启用 profiling
+SET profiling = 1;
+
+-- 执行查询
+SELECT * FROM users WHERE email = 'user@example.com';
+
+-- 查看性能分析
+SHOW PROFILES;
+SHOW PROFILE FOR QUERY 1;
+```
+
+## 总结
+
+本文介绍了查询性能优化，主要内容：
+
+**EXPLAIN 分析**：
+
+- ✅ type 字段：访问类型
+- ✅ key 字段：使用的索引
+- ✅ rows 字段：扫描行数
+- ✅ Extra 字段：额外信息
+
+**优化技巧**：
+
+- ✅ 避免 SELECT \*
+- ✅ 优化 JOIN
+- ✅ 优化子查询
+- ✅ 优化 ORDER BY / GROUP BY
+
+**高级技术**：
+
+- ✅ 分区表
+- ✅ 配置参数优化
+- ✅ 慢查询分析
+
+掌握查询优化后，任何慢查询都能找到优化方案。接下来我们将学习事务与锁机制。
+
+## 下一步
+
+在下一篇文章《11 事务与锁机制》中，我们将学习：
+
+- 事务 ACID 特性
+- 事务隔离级别
+- 锁类型与机制
+- 死锁处理
+- 并发控制最佳实践
+
+---
+
+- **上一篇**：[09 索引优化策略](./09-index-optimization-strategies.mdx)
+- **下一篇**：[11 事务与锁机制](./11-transactions-and-locking.mdx)

@@ -1,0 +1,880 @@
+---
+title: "05 高级查询与连接"
+date: "2026-03-23"
+summary: "掌握多表关联查询和各种 JOIN 类型，学会在实际业务中处理复杂的数据关系。"
+tags: ["MySQL", "JOIN", "多表查询", "关联查询"]
+category: "mysql"
+cover: ""
+draft: false
+series: "MySQL 渐进式学习指南"
+seriesOrder: 5
+---
+
+## 前言
+
+在实际应用中，数据通常分散在多个表中。要获取完整信息，就需要使用 JOIN 将多个表的数据关联起来。
+
+本文将深入讲解各种 JOIN 类型的使用场景，以及多表查询的最佳实践。
+
+## 数据准备
+
+```sql
+-- 创建测试数据库
+CREATE DATABASE shop;
+USE shop;
+
+-- 用户表
+CREATE TABLE users (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  username VARCHAR(50) NOT NULL,
+  email VARCHAR(100) NOT NULL,
+  city VARCHAR(50)
+) ENGINE=InnoDB;
+
+-- 订单表
+CREATE TABLE orders (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL,
+  order_no VARCHAR(50) NOT NULL UNIQUE,
+  total_amount DECIMAL(10, 2) NOT NULL,
+  status VARCHAR(20) DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id)
+) ENGINE=InnoDB;
+
+-- 商品表
+CREATE TABLE products (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  name VARCHAR(200) NOT NULL,
+  price DECIMAL(10, 2) NOT NULL,
+  stock INT UNSIGNED DEFAULT 0
+) ENGINE=InnoDB;
+
+-- 订单明细表
+CREATE TABLE order_items (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  order_id BIGINT UNSIGNED NOT NULL,
+  product_id BIGINT UNSIGNED NOT NULL,
+  quantity INT UNSIGNED NOT NULL,
+  price DECIMAL(10, 2) NOT NULL,
+  FOREIGN KEY (order_id) REFERENCES orders(id),
+  FOREIGN KEY (product_id) REFERENCES products(id)
+) ENGINE=InnoDB;
+
+-- 插入测试数据
+INSERT INTO users (id, username, email, city) VALUES
+  (1, '张三', 'zhangsan@example.com', '北京'),
+  (2, '李四', 'lisi@example.com', '上海'),
+  (3, '王五', 'wangwu@example.com', '深圳'),
+  (4, '赵六', 'zhaoliu@example.com', '广州');
+
+INSERT INTO orders (id, user_id, order_no, total_amount, status) VALUES
+  (1, 1, 'ORD001', 299.00, 'completed'),
+  (2, 1, 'ORD002', 599.00, 'completed'),
+  (3, 2, 'ORD003', 399.00, 'pending'),
+  (4, 2, 'ORD004', 799.00, 'shipped');
+
+INSERT INTO products (id, name, price, stock) VALUES
+  (1, 'iPhone 15 Pro', 7999.00, 100),
+  (2, 'MacBook Pro', 15999.00, 50),
+  (3, 'AirPods Pro', 1999.00, 200);
+
+INSERT INTO order_items (order_id, product_id, quantity, price) VALUES
+  (1, 3, 1, 1999.00),
+  (2, 1, 1, 7999.00),
+  (3, 3, 1, 1999.00),
+  (4, 1, 1, 7999.00);
+```
+
+## INNER JOIN - 内连接
+
+只返回两个表中匹配的行。
+
+```sql
+-- 基本语法
+SELECT 字段 FROM 表1 INNER JOIN 表2 ON 匹配条件;
+
+-- 查询有订单的用户
+SELECT
+  u.id,
+  u.username,
+  u.email,
+  o.id AS order_id,
+  o.order_no,
+  o.total_amount
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id;
+
+-- 结果：只显示有订单的用户（张三、李四）
+-- 赵六没有订单，不会出现在结果中
+```
+
+**使用场景**：只关心两边都有的数据。
+
+```sql
+-- 查询已完成的订单及用户信息
+SELECT
+  o.order_no,
+  o.total_amount,
+  u.username,
+  u.city
+FROM orders o
+INNER JOIN users u ON o.user_id = u.id
+WHERE o.status = 'completed';
+
+-- 三表关联：订单、用户、商品
+SELECT
+  o.order_no,
+  u.username,
+  p.name AS product_name,
+  oi.quantity,
+  oi.price
+FROM orders o
+INNER JOIN users u ON o.user_id = u.id
+INNER JOIN order_items oi ON o.id = oi.order_id
+INNER JOIN products p ON oi.product_id = p.id;
+```
+
+## LEFT JOIN - 左连接
+
+返回左表所有行，右表没有匹配的则显示 NULL。
+
+```sql
+-- 基本语法
+SELECT 字段 FROM 表1 LEFT JOIN 表2 ON 匹配条件;
+
+-- 查询所有用户及其订单（包括没有订单的用户）
+SELECT
+  u.id,
+  u.username,
+  u.email,
+  o.id AS order_id,
+  o.order_no,
+  o.total_amount
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id;
+
+-- 结果：所有用户都会显示
+-- 赵六没有订单，order_id 和 order_no 为 NULL
+```
+
+**使用场景**：必须显示左表所有数据，即使右表没有匹配。
+
+```sql
+-- 查询没有订单的用户
+SELECT
+  u.id,
+  u.username,
+  u.email
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+WHERE o.id IS NULL;
+
+-- 统计每个用户的订单数（包括 0 单）
+SELECT
+  u.id,
+  u.username,
+  COUNT(o.id) AS order_count,
+  COALESCE(SUM(o.total_amount), 0) AS total_spent
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+GROUP BY u.id, u.username;
+```
+
+## RIGHT JOIN - 右连接
+
+返回右表所有行，左表没有匹配的则显示 NULL。
+
+```sql
+-- 基本语法
+SELECT 字段 FROM 表1 RIGHT JOIN 表2 ON 匹配条件;
+
+-- 查询所有订单及其用户
+SELECT
+  u.id,
+  u.username,
+  o.id AS order_id,
+  o.order_no
+FROM users u
+RIGHT JOIN orders o ON u.id = o.user_id;
+
+-- 结果：所有订单都会显示
+-- 即使订单的 user_id 在 users 表中不存在（虽然 FOREIGN KEY 约束不允许）
+```
+
+**使用场景**：必须显示右表所有数据。
+
+**注意**：RIGHT JOIN 很少使用，通常改用 LEFT JOIN 更直观。
+
+```sql
+-- 等价写法（推荐 LEFT JOIN）
+SELECT
+  o.id AS order_id,
+  o.order_no,
+  u.username
+FROM orders o
+LEFT JOIN users u ON o.id = o.user_id;
+```
+
+## CROSS JOIN - 交叉连接
+
+返回两个表的笛卡尔积（每行与每行组合）。
+
+```sql
+-- 基本语法
+SELECT 字段 FROM 表1 CROSS JOIN 表2;
+
+-- 示例：生成所有可能的组合
+SELECT
+  u.username,
+  p.name AS product_name
+FROM users u
+CROSS JOIN products p;
+
+-- 结果：4 个用户 × 3 个商品 = 12 行
+```
+
+**使用场景**：生成所有可能的组合，通常用于数据分析。
+
+## JOIN 对比图解
+
+```
+表 A (users)           表 B (orders)
++------+          +------+
+|  1   |          |  1   |
+|  2   |          |  2   |
+|  3   |          |  4   |
+|  4   |          +------+
++------+
+
+INNER JOIN:           LEFT JOIN:            RIGHT JOIN:
++------+              +------+              +------+
+|  1   |              |  1   |              |  1   |
+|  2   |              |  2   |              |  2   |
++------+              |  3   |              |  4   |
+                      |  4   |              +------+
+                      +------+
+
+INNER JOIN：只返回匹配的
+LEFT JOIN：返回左表所有，右表无匹配则 NULL
+RIGHT JOIN：返回右表所有，左表无匹配则 NULL
+```
+
+## 表别名
+
+简化表名，提高可读性。
+
+```sql
+-- 不使用别名（冗长）
+SELECT
+  users.username,
+  users.email,
+  orders.order_no,
+  orders.total_amount
+FROM users
+INNER JOIN orders ON users.id = orders.user_id;
+
+-- 使用别名（推荐）
+SELECT
+  u.username,
+  u.email,
+  o.order_no,
+  o.total_amount
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id;
+
+-- 多表关联时别名更重要
+SELECT
+  u.username,
+  o.order_no,
+  p.name AS product_name,
+  oi.quantity
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+INNER JOIN order_items oi ON o.id = oi.order_id
+INNER JOIN products p ON oi.product_id = p.id;
+```
+
+## 多表关联
+
+### 三表关联
+
+```sql
+-- 订单 - 用户 - 商品
+SELECT
+  o.order_no,
+  o.total_amount,
+  u.username,
+  u.city,
+  p.name AS product_name,
+  oi.quantity
+FROM orders o
+INNER JOIN users u ON o.user_id = u.id
+INNER JOIN order_items oi ON o.id = oi.order_id
+INNER JOIN products p ON oi.product_id = p.id
+WHERE o.status = 'completed';
+```
+
+### 多个 JOIN 条件
+
+```sql
+-- 一个 JOIN 有多个匹配条件
+SELECT
+  o.order_no,
+  u.username
+FROM orders o
+INNER JOIN users u
+  ON o.user_id = u.id
+  AND u.city = '北京';  -- 额外条件
+```
+
+### JOIN 与 WHERE
+
+```sql
+-- 方式 1：WHERE 子句
+SELECT
+  u.username,
+  o.order_no
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+WHERE o.status = 'completed';
+
+-- 方式 2：JOIN 条件（效果相同）
+SELECT
+  u.username,
+  o.order_no
+FROM users u
+INNER JOIN orders o
+  ON u.id = o.user_id
+  AND o.status = 'completed';
+
+-- 建议：
+-- - 关联条件放在 ON
+-- - 过滤条件放在 WHERE
+```
+
+## SELF JOIN - 自连接
+
+表与自身连接。
+
+```sql
+-- 添加 manager_id 字段
+ALTER TABLE users ADD COLUMN manager_id BIGINT UNSIGNED;
+UPDATE users SET manager_id = 1 WHERE id IN (2, 3);
+
+-- 查询员工及其管理者
+SELECT
+  employee.username AS employee,
+  manager.username AS manager
+FROM users employee
+INNER JOIN users manager ON employee.manager_id = manager.id;
+
+-- 查找没有管理者的员工
+SELECT
+  u.id,
+  u.username
+FROM users u
+LEFT JOIN users manager ON u.manager_id = manager.id
+WHERE manager.id IS NULL;
+```
+
+## UNION - 合并查询
+
+合并多个查询结果。
+
+```sql
+-- UNION：去重
+SELECT username FROM users
+UNION
+SELECT username FROM admins;
+
+-- UNION ALL：不去重（更快）
+SELECT username FROM users
+UNION ALL
+SELECT username FROM admins;
+
+-- 使用场景：合并相似表的数据
+SELECT
+  id,
+  username,
+  'user' AS type
+FROM users
+WHERE created_at >= '2024-01-01'
+
+UNION ALL
+
+SELECT
+  id,
+  username,
+  'admin' AS type
+FROM admins
+WHERE created_at >= '2024-01-01'
+
+ORDER BY username;
+```
+
+**UNION vs UNION ALL**：
+
+| 特性 | UNION              | UNION ALL      |
+| ---- | ------------------ | -------------- |
+| 去重 | ✅ 去除重复行      | ❌ 保留所有行  |
+| 性能 | 慢（需要排序去重） | 快（直接合并） |
+| 使用 | 需要唯一结果       | 不需要去重     |
+
+## CASE 表达式
+
+条件逻辑处理。
+
+```sql
+-- 语法 1：简单 CASE
+CASE column_name
+  WHEN value1 THEN result1
+  WHEN value2 THEN result2
+  ELSE default_result
+END
+
+-- 语法 2：搜索 CASE
+CASE
+  WHEN condition1 THEN result1
+  WHEN condition2 THEN result2
+  ELSE default_result
+END
+
+-- 实例：订单状态转换
+SELECT
+  order_no,
+  total_amount,
+  CASE status
+    WHEN 'pending' THEN '待支付'
+    WHEN 'paid' THEN '已支付'
+    WHEN 'shipped' THEN '已发货'
+    WHEN 'completed' THEN '已完成'
+    WHEN 'cancelled' THEN '已取消'
+    ELSE '未知状态'
+  END AS status_text
+FROM orders;
+
+-- 实例：价格区间分类
+SELECT
+  name,
+  price,
+  CASE
+    WHEN price < 100 THEN '低价'
+    WHEN price BETWEEN 100 AND 1000 THEN '中价'
+    WHEN price > 1000 THEN '高价'
+    ELSE '待定价'
+  END AS price_level
+FROM products;
+
+-- 实例：条件聚合
+SELECT
+  u.username,
+  COUNT(CASE WHEN o.status = 'completed' THEN 1 END) AS completed_orders,
+  COUNT(CASE WHEN o.status = 'pending' THEN 1 END) AS pending_orders,
+  SUM(CASE WHEN o.status = 'completed' THEN o.total_amount ELSE 0 END) AS total_spent
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+GROUP BY u.id, u.username;
+```
+
+## 常用函数
+
+### 字符串函数
+
+```sql
+-- CONCAT：拼接字符串
+SELECT
+  CONCAT(u.username, ' <', u.email, '>') AS user_info
+FROM users u;
+
+-- CONCAT_WS：用分隔符拼接
+SELECT
+  CONCAT_WS(', ', u.username, u.email, u.city) AS user_info
+FROM users u;
+
+-- SUBSTRING：截取字符串
+SELECT
+  username,
+  SUBSTRING(email, 1, 5) AS email_prefix  -- 前 5 个字符
+FROM users;
+
+-- UPPER/LOWER：大小写转换
+SELECT UPPER(username), LOWER(email) FROM users;
+
+-- TRIM：去除空格
+SELECT TRIM('  hello  ');  -- 'hello'
+
+-- LENGTH：字符串长度
+SELECT username, LENGTH(username) FROM users;
+```
+
+### 日期函数
+
+```sql
+-- NOW/CURRENT_TIMESTAMP：当前时间
+SELECT NOW();
+SELECT CURRENT_TIMESTAMP;
+
+-- DATE：提取日期
+SELECT DATE(created_at) FROM orders;
+
+-- YEAR/MONTH/DAY：提取年月日
+SELECT
+  YEAR(created_at) AS year,
+  MONTH(created_at) AS month,
+  DAY(created_at) AS day
+FROM orders;
+
+-- DATE_FORMAT：格式化日期
+SELECT
+  order_no,
+  DATE_FORMAT(created_at, '%Y-%m-%d %H:%i') AS formatted_time
+FROM orders;
+
+-- DATEDIFF：日期差（天数）
+SELECT
+  username,
+  DATEDIFF(NOW(), created_at) AS days_since_register
+FROM users;
+
+-- DATE_ADD/DATE_SUB：日期加减
+SELECT
+  DATE_ADD(NOW(), INTERVAL 7 DAY) AS next_week,
+  DATE_SUB(NOW(), INTERVAL 1 MONTH) AS last_month;
+```
+
+### 数值函数
+
+```sql
+-- ROUND：四舍五入
+SELECT ROUND(3.14159, 2);  -- 3.14
+
+-- CEIL/FLOOR：向上/向下取整
+SELECT CEIL(3.1);   -- 4
+SELECT FLOOR(3.9);  -- 3
+
+-- ABS：绝对值
+SELECT ABS(-10);  -- 10
+
+-- MOD：取余
+SELECT MOD(10, 3);  -- 1
+```
+
+## NULL 处理
+
+### COALESCE - 返回第一个非 NULL 值
+
+```sql
+-- 基本用法
+SELECT COALESCE(NULL, NULL, 'default', 'value');  -- 'default'
+
+-- 实际应用：处理 NULL 值
+SELECT
+  u.username,
+  COALESCE(u.nickname, u.username) AS display_name,
+  COALESCE(u.city, '未知') AS city
+FROM users u;
+
+-- 统计时处理 NULL
+SELECT
+  u.username,
+  COALESCE(SUM(o.total_amount), 0) AS total_spent
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+GROUP BY u.id, u.username;
+```
+
+### IFNULL - NULL 替换
+
+```sql
+-- 类似 COALESCE，但只有两个参数
+SELECT IFNULL(NULL, 'default');  -- 'default'
+SELECT IFNULL('value', 'default');  -- 'value'
+
+-- 实际应用
+SELECT
+  username,
+  IFNULL(nickname, '未设置昵称') AS nickname
+FROM users;
+```
+
+### IF - 条件表达式
+
+```sql
+-- 语法：IF(condition, true_value, false_value)
+SELECT
+  username,
+  IF(status = 1, '正常', '禁用') AS status_text
+FROM users;
+
+-- 嵌套使用
+SELECT
+  order_no,
+  total_amount,
+  IF(total_amount > 1000,
+     '高价值订单',
+     IF(total_amount > 500, '中价值订单', '普通订单')
+  ) AS order_level
+FROM orders;
+```
+
+## 实战案例
+
+### 电商订单查询
+
+```sql
+-- 1. 查询用户订单汇总
+SELECT
+  u.id AS user_id,
+  u.username,
+  u.city,
+  COUNT(o.id) AS order_count,
+  SUM(o.total_amount) AS total_amount,
+  MAX(o.created_at) AS last_order_at
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+GROUP BY u.id, u.username, u.city
+ORDER BY total_amount DESC;
+
+-- 2. 查询订单详情（包含商品信息）
+SELECT
+  o.order_no,
+  o.status,
+  u.username,
+  u.email,
+  p.name AS product_name,
+  oi.quantity,
+  oi.price,
+  oi.quantity * oi.price AS subtotal
+FROM orders o
+INNER JOIN users u ON o.user_id = u.id
+INNER JOIN order_items oi ON o.id = oi.order_id
+INNER JOIN products p ON oi.product_id = p.id
+WHERE o.status = 'completed'
+ORDER BY o.created_at DESC;
+
+-- 3. 查询未购买的用户
+SELECT
+  u.id,
+  u.username,
+  u.email,
+  u.created_at
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+WHERE o.id IS NULL
+ORDER BY u.created_at DESC;
+```
+
+### 销售统计
+
+```sql
+-- 1. 按城市统计销售额
+SELECT
+  u.city,
+  COUNT(DISTINCT o.user_id) AS customer_count,
+  COUNT(o.id) AS order_count,
+  SUM(o.total_amount) AS total_sales,
+  AVG(o.total_amount) AS avg_order_value
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+GROUP BY u.city
+ORDER BY total_sales DESC;
+
+-- 2. 按月统计订单
+SELECT
+  DATE_FORMAT(o.created_at, '%Y-%m') AS month,
+  COUNT(*) AS order_count,
+  SUM(o.total_amount) AS total_amount
+FROM orders o
+WHERE o.status = 'completed'
+GROUP BY DATE_FORMAT(o.created_at, '%Y-%m')
+ORDER BY month DESC;
+
+-- 3. 热销商品 Top 10
+SELECT
+  p.id,
+  p.name,
+  p.price,
+  SUM(oi.quantity) AS total_sold,
+  COUNT(DISTINCT oi.order_id) AS order_count
+FROM products p
+INNER JOIN order_items oi ON p.id = oi.product_id
+INNER JOIN orders o ON oi.order_id = o.id
+WHERE o.status = 'completed'
+GROUP BY p.id, p.name, p.price
+ORDER BY total_sold DESC
+LIMIT 10;
+```
+
+## 最佳实践
+
+### 1. 优先使用 INNER JOIN
+
+```sql
+-- ✅ 推荐：明确知道两边都有数据时用 INNER JOIN
+SELECT * FROM orders o
+INNER JOIN users u ON o.user_id = u.id;
+
+-- 性能更好，结果集更小
+```
+
+### 2. 为关联字段创建索引
+
+```sql
+-- ✅ 推荐：外键必须有索引
+CREATE INDEX idx_user_id ON orders(user_id);
+CREATE INDEX idx_order_id ON order_items(order_id);
+CREATE INDEX idx_product_id ON order_items(product_id);
+
+-- 大幅提升 JOIN 性能
+```
+
+### 3. 避免过多 JOIN
+
+```sql
+-- ✅ 推荐：不超过 5 个 JOIN
+SELECT ... FROM a
+JOIN b ON ...
+JOIN c ON ...
+JOIN d ON ...;
+
+-- ❌ 避免：过多 JOIN
+SELECT ... FROM a
+JOIN b ON ...
+JOIN c ON ...
+JOIN d ON ...
+JOIN e ON ...
+JOIN f ON ...
+JOIN g ON ...;
+
+-- 考虑分步查询或使用视图
+```
+
+### 4. 使用表别名
+
+```sql
+-- ✅ 推荐：使用简洁的别名
+SELECT u.username, o.order_no
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id;
+
+-- ❌ 不推荐：重复表名
+SELECT users.username, orders.order_no
+FROM users
+INNER JOIN orders ON users.id = orders.user_id;
+```
+
+### 5. UNION ALL 代替 UNION
+
+```sql
+-- ✅ 推荐：不需要去重时用 UNION ALL
+SELECT ... FROM users
+UNION ALL
+SELECT ... FROM admins;
+
+-- ❌ 避免：不需要去重却用 UNION
+SELECT ... FROM users
+UNION
+SELECT ... FROM admins;
+```
+
+## 常见问题
+
+### Q1: LEFT JOIN 后 WHERE 条件过滤 NULL 失效？
+
+**A:** 需要注意 AND 和 WHERE 的区别。
+
+```sql
+-- ❌ 错误：用 WHERE 过滤左表
+SELECT u.*, o.*
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+WHERE o.status = 'completed';  -- 变成 INNER JOIN！
+
+-- ✅ 正确：用 AND 过滤右表
+SELECT u.*, o.*
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id AND o.status = 'completed';
+```
+
+### Q2: 如何优化多表 JOIN 性能？
+
+**A:** 确保关联字段有索引。
+
+```sql
+-- 创建索引
+CREATE INDEX idx_user_id ON orders(user_id);
+CREATE INDEX idx_order_id ON order_items(order_id);
+
+-- 查看执行计划
+EXPLAIN SELECT * FROM orders o
+INNER JOIN users u ON o.user_id = u.id;
+-- 确认使用了索引（type: ref, eq_ref）
+```
+
+### Q3: JOIN 和子查询如何选择？
+
+**A:** 优先使用 JOIN。
+
+```sql
+-- ✅ 推荐：JOIN（通常更快）
+SELECT u.*, o.*
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id;
+
+-- ❌ 避免：子查询（通常较慢）
+SELECT u.*, (
+  SELECT * FROM orders o WHERE o.user_id = u.id LIMIT 1
+) FROM users u;
+```
+
+## 总结
+
+本文深入讲解了多表查询和 JOIN 操作，主要内容：
+
+**JOIN 类型**：
+
+- ✅ INNER JOIN：只返回匹配的行
+- ✅ LEFT JOIN：返回左表所有行
+- ✅ RIGHT JOIN：返回右表所有行
+- ✅ CROSS JOIN：笛卡尔积
+- ✅ SELF JOIN：自连接
+
+**关联技巧**：
+
+- ✅ 表别名简化查询
+- ✅ 多表关联
+- ✅ UNION 合并结果
+- ✅ ON vs WHERE 区别
+
+**函数使用**：
+
+- ✅ CASE 表达式
+- ✅ 字符串函数
+- ✅ 日期函数
+- ✅ NULL 处理函数
+
+**最佳实践**：
+
+- ✅ 优先使用 INNER JOIN
+- ✅ 关联字段创建索引
+- ✅ 避免过多 JOIN
+- ✅ UNION ALL 代替 UNION
+
+掌握多表查询后，你就能处理复杂的业务场景了。接下来我们将学习聚合函数和分组查询。
+
+## 下一步
+
+在下一篇文章《06 聚合函数与分组》中，我们将学习：
+
+- COUNT、SUM、AVG、MAX、MIN 聚合函数
+- GROUP BY 分组查询
+- HAVING 过滤分组
+- ROLLUP 生成超级聚合
+- 窗口函数（MySQL 8.0+）
+- 实际业务统计案例
+
+---
+
+- **上一篇**：[04 增删改查实战](./04-crud-operations.mdx)
+- **下一篇**：[06 聚合函数与分组](./06-aggregation-and-grouping.mdx)

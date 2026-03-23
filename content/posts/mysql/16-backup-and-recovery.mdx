@@ -1,0 +1,360 @@
+---
+title: "16 备份与恢复"
+date: "2026-03-23"
+summary: "掌握 MySQL 数据备份和恢复的各种方法，学会设计可靠的备份策略。"
+tags: ["MySQL", "备份", "恢复", "mysqldump", "数据安全"]
+category: "mysql"
+cover: ""
+draft: false
+series: "MySQL 渐进式学习指南"
+seriesOrder: 16
+---
+
+## 前言
+
+数据备份是数据库管理的最后一道防线。没有备份的数据是随时可能丢失的数据。
+
+本文将系统讲解 MySQL 备份和恢复的各种方法。
+
+## 备份类型
+
+### 逻辑备份 vs 物理备份
+
+```sql
+-- 逻辑备份：保存 SQL 语句
+-- 优点：跨平台、可编辑、文本格式
+-- 缺点：速度慢、恢复慢
+-- 工具：mysqldump, mydumper
+
+-- 物理备份：复制数据文件
+-- 优点：速度快、恢复快
+-- 缺点：不可跨平台、不可编辑
+-- 工具：MySQL Enterprise Backup, Percona XtraBackup
+```
+
+### 完全备份、增量备份、差异备份
+
+```
+完全备份：备份所有数据
+增量备份：备份自上次备份后的变化
+差异备份：备份自完全备份后的变化
+
+示例：
+Day 1: 完全备份 (10GB)
+Day 2: 增量备份 (100MB)
+Day 3: 增量备份 (150MB)
+Day 4: 差异备份 (250MB)
+```
+
+## mysqldump 工具
+
+### 基本用法
+
+```bash
+# 备份单个数据库
+mysqldump -uroot -p shop > shop_backup.sql
+
+# 备份所有数据库
+mysqldump -uroot -p --all-databases > all_backup.sql
+
+# 备份特定表
+mysqldump -uroot -p shop users orders > shop_tables_backup.sql
+
+# 压缩备份
+mysqldump -uroot -p shop | gzip > shop_backup.sql.gz
+```
+
+### 重要参数
+
+```bash
+# --single-transaction：InnoDB 表不锁表（推荐）
+mysqldump -uroot -p --single-transaction shop > shop_backup.sql
+
+# --routines：包含存储过程和函数
+mysqldump -uroot -p --routines shop > shop_backup.sql
+
+# --triggers：包含触发器
+mysqldump -uroot -p --triggers shop > shop_backup.sql
+
+# --events：包含事件
+mysqldump -uroot -p --events shop > shop_backup.sql
+
+# --quick：大批数据导出（不缓存）
+mysqldump -uroot -p --quick shop > shop_backup.sql
+
+# --lock-tables：MyISAM 表锁定
+mysqldump -uroot -p --lock-tables shop > shop_backup.sql
+
+# 完整参数
+mysqldump -uroot -p \
+  --single-transaction \
+  --routines \
+  --triggers \
+  --events \
+  --quick \
+  shop > shop_backup.sql
+```
+
+### 恢复数据
+
+```bash
+# 恢复数据库
+mysql -uroot -p shop < shop_backup.sql
+
+# 恢复所有数据库
+mysql -uroot -p < all_backup.sql
+
+# 从压缩文件恢复
+gunzip < shop_backup.sql.gz | mysql -uroot -p shop
+
+# 恢复时使用 source 命令
+mysql -uroot -p
+mysql> USE shop;
+mysql> source /path/to/shop_backup.sql;
+```
+
+## Binlog 备份
+
+二进制日志记录所有数据修改操作，可用于增量备份和恢复。
+
+### 启用 Binlog
+
+```ini
+# my.cnf 配置
+[mysqld]
+log-bin=mysql-bin
+binlog_format=ROW        # ROW, STATEMENT, MIXED
+expire_logs_days=7       # 保留 7 天
+max_binlog_size=100M     # 单个文件最大 100M
+```
+
+### 查看 Binlog
+
+```sql
+-- 查看当前 binlog 文件
+SHOW MASTER STATUS;
+
+-- 查看 binlog 文件列表
+SHOW BINARY LOGS;
+
+-- 查看 binlog 事件
+SHOW BINLOG EVENTS IN 'mysql-bin.000001' LIMIT 10;
+
+-- 使用 mysqlbinlog 工具
+mysqlbinlog mysql-bin.000001
+```
+
+### 基于 Binlog 恢复
+
+```bash
+# 查看指定时间段的 binlog
+mysqlbinlog --start-datetime="2024-01-01 00:00:00" \
+            --stop-datetime="2024-01-02 00:00:00" \
+            mysql-bin.000001
+
+# 恢复到指定时间点
+mysqlbinlog --start-datetime="2024-01-01 00:00:00" \
+            --stop-datetime="2024-01-01 12:00:00" \
+            mysql-bin.000001 | mysql -uroot -p
+
+# 恢复到指定位置
+mysqlbinlog --start-position=1000 \
+            --stop-position=2000 \
+            mysql-bin.000001 | mysql -uroot -p
+```
+
+## 自动化备份脚本
+
+### Shell 脚本
+
+```bash
+#!/bin/bash
+# backup.sh
+
+# 配置
+BACKUP_DIR="/backup/mysql"
+MYSQL_USER="root"
+MYSQL_PASSWORD="your_password"
+MYSQL_HOST="localhost"
+RETENTION_DAYS=30
+
+# 创建备份目录
+mkdir -p $BACKUP_DIR
+
+# 备份文件名
+DATE=$(date +%Y%m%d_%H%M%S)
+BACKUP_FILE="$BACKUP_DIR/all_databases_$DATE.sql.gz"
+
+# 执行备份
+mysqldump -h$MYSQL_HOST -u$MYSQL_USER -p$MYSQL_PASSWORD \
+  --single-transaction \
+  --routines \
+  --triggers \
+  --events \
+  --all-databases | gzip > $BACKUP_FILE
+
+# 检查备份是否成功
+if [ $? -eq 0 ]; then
+  echo "Backup successful: $BACKUP_FILE"
+  echo "Backup successful: $BACKUP_FILE" >> $BACKUP_DIR/backup.log
+else
+  echo "Backup failed!"
+  echo "Backup failed: $DATE" >> $BACKUP_DIR/error.log
+  exit 1
+fi
+
+# 删除过期备份
+find $BACKUP_DIR -name "*.sql.gz" -mtime +$RETENTION_DAYS -delete
+
+echo "Backup completed at $(date)"
+```
+
+### 定时任务（Cron）
+
+```bash
+# 编辑 crontab
+crontab -e
+
+# 每天凌晨 2 点执行备份
+0 2 * * * /path/to/backup.sh
+
+# 每周日凌晨 3 点执行完整备份
+0 3 * * 0 /path/to/full_backup.sh
+
+# 每小时执行增量备份（binlog）
+0 * * * * /path/to/incremental_backup.sh
+```
+
+## 云服务备份
+
+### AWS RDS
+
+```bash
+# 自动备份
+# RDS 控制台配置自动备份
+
+# 手动快照
+aws rds create-db-snapshot \
+  --db-instance-identifier mydb \
+  --db-snapshot-identifier mydb-snapshot-$(date +%Y%m%d)
+
+# 恢复
+aws rds restore-db-instance-from-db-snapshot \
+  --db-instance-identifier mydb-restored \
+  --db-snapshot-identifier mydb-snapshot-20240101
+```
+
+### 阿里云 RDS
+
+```bash
+# 控制台配置备份策略
+# - 自动备份：保留 7-730 天
+# - 手动备份：永久保留
+
+# 使用 SQL 恢复
+# 控制台 → 选择备份 → 恢复
+```
+
+## 备份策略
+
+### 推荐策略
+
+```
+完全备份：每周一次
+增量备份：每天一次
+Binlog：实时
+
+示例：
+周日 02:00：完全备份 (10GB)
+周一 02:00：增量备份 (100MB)
+周二 02:00：增量备份 (120MB)
+...
+周六 02:00：增量备份 (150MB)
+
+恢复时：先恢复完全备份，再依次恢复增量备份
+```
+
+### 备份检查
+
+```sql
+-- 定期检查备份完整性
+-- 1. 恢复到测试环境
+-- 2. 检查数据完整性
+-- 3. 记录检查日志
+
+-- 示例脚本
+mysql -uroot -p test < /backup/shop_backup.sql
+mysql -uroot -p test -e "SELECT COUNT(*) FROM users;"
+```
+
+## 最佳实践
+
+### 1. 3-2-1 原则
+
+```
+3 份数据副本（生产 + 2 份备份）
+2 种不同介质（磁盘 + 云/异地）
+1 份异地备份
+```
+
+### 2. 备份验证
+
+```bash
+# ✅ 定期恢复测试
+# - 每月测试一次
+# - 验证数据完整性
+# - 记录恢复时间
+```
+
+### 3. 备份加密
+
+```bash
+# 加密备份
+mysqldump -uroot -p shop | gzip | openssl enc -e -aes-256-cbc -salt -out shop_backup.sql.gz.enc
+
+# 解密恢复
+openssl enc -d -aes-256-cbc -in shop_backup.sql.gz.enc | gunzip | mysql -uroot -p shop
+```
+
+## 总结
+
+本文介绍了备份与恢复，主要内容：
+
+**备份类型**：
+
+- ✅ 逻辑备份 vs 物理备份
+- ✅ 完全、增量、差异备份
+
+**mysqldump**：
+
+- ✅ 常用参数
+- ✅ 恢复方法
+
+**Binlog**：
+
+- ✅ 启用和查看
+- ✅ 基于 binlog 恢复
+
+**备份策略**：
+
+- ✅ 自动化脚本
+- ✅ 云服务备份
+- ✅ 3-2-1 原则
+
+掌握备份恢复后，数据就安全了。接下来我们将学习主从复制。
+
+## 下一步
+
+在下一篇文章《17 主从复制与高可用》中，我们将学习：
+
+- 复制原理和类型
+- 主从复制搭建
+- GTID 复制
+- 读写分离
+- 高可用方案
+- 故障切换
+
+---
+
+- **上一篇**：[15 用户管理与安全](./15-user-management-and-security.mdx)
+- **下一篇**：[17 主从复制与高可用](./17-replication-and-high-availability.mdx)

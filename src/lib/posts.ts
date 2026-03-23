@@ -5,6 +5,7 @@ import { compileMDX } from "next-mdx-remote/rsc";
 import { ReactElement } from "react";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
+import { dirToCategoryMap, categoryToDirMap } from "./category-map";
 
 const postsDirectory = path.join(process.cwd(), "content/posts");
 
@@ -58,6 +59,10 @@ export function getAllPosts(): PostMeta[] {
     const baseName = path.basename(fileName, ".mdx"); // 获取文件名（不含扩展名）
     const slug = baseName.replace(/^\d+-/, ""); // 去掉序号前缀，如 "01-"
 
+    // 从文件路径中提取目录名，并映射为中文分类名
+    const dirName = path.dirname(fileName);
+    const categoryFromDir = dirToCategoryMap[dirName] || dirName;
+
     const fullPath = path.join(postsDirectory, fileName);
     const fileContents = fs.readFileSync(fullPath, "utf8");
     const { data } = matter(fileContents);
@@ -68,7 +73,7 @@ export function getAllPosts(): PostMeta[] {
       date: data.date,
       summary: data.summary,
       tags: data.tags || [],
-      category: data.category,
+      category: categoryFromDir, // 使用从目录名映射得到的分类
       cover: data.cover,
       draft: data.draft || false,
     };
@@ -110,7 +115,7 @@ export function getPostsByCategory(): Record<string, PostMeta[]> {
     "全栈",
     "测试",
     "运维",
-    "大模型/AI",
+    "大模型",
     "提效工具",
   ];
 
@@ -136,7 +141,11 @@ function findFileByCategoryAndSlug(
   category: string,
   slug: string
 ): string | null {
-  const categoryDir = path.join(postsDirectory, category);
+  // 解码 URL 编码的 category
+  const decodedCategory = decodeURIComponent(category);
+  // 将中文分类名映射到实际目录名
+  const dirName = categoryToDirMap[decodedCategory] || decodedCategory;
+  const categoryDir = path.join(postsDirectory, dirName);
 
   if (!fs.existsSync(categoryDir)) {
     return null;
@@ -209,7 +218,11 @@ export function getNextPost(
   category: string,
   currentSlug: string
 ): PostMeta | null {
-  const categoryDir = path.join(postsDirectory, category);
+  // 解码 URL 编码的 category
+  const decodedCategory = decodeURIComponent(category);
+  // 将中文分类名映射到实际目录名
+  const dirName = categoryToDirMap[decodedCategory] || decodedCategory;
+  const categoryDir = path.join(postsDirectory, dirName);
 
   if (!fs.existsSync(categoryDir)) {
     return null;

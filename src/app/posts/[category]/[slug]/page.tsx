@@ -2,13 +2,21 @@ import { getAllPosts, getPostBySlug, getNextPost } from "@/lib/posts";
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import BackButton from "./BackButton";
+import { categoryToDirMap } from "@/lib/category-map";
+
+// 从文件路径中提取目录名的辅助函数
+function getCategoryDirFromPath(category: string): string {
+  return categoryToDirMap[category] || category;
+}
 
 export async function generateStaticParams() {
   const posts = getAllPosts();
-  return posts.map((post) => ({
-    category: post.category,
+  const params = posts.map((post) => ({
+    category: getCategoryDirFromPath(post.category), // 使用目录名
     slug: post.slug,
   }));
+
+  return params;
 }
 
 export async function generateMetadata({
@@ -36,8 +44,7 @@ function getCategoryColor(category: string) {
     全栈: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400",
     测试: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400",
     运维: "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400",
-    "大模型/AI":
-      "bg-pink-100 text-pink-700 dark:bg-pink-900/30 dark:text-pink-400",
+    大模型: "bg-pink-100 text-pink-700 dark:bg-pink-900/30 dark:text-pink-400",
     提效工具:
       "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
     数据库: "bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-400",
@@ -118,7 +125,7 @@ export default async function Post({
         {/* 下一篇链接 */}
         {nextPost && (
           <Link
-            href={`/posts/${nextPost.category}/${nextPost.slug}`}
+            href={`/posts/${getCategoryDirFromPath(nextPost.category)}/${nextPost.slug}`}
             className="glass block w-full rounded-xl p-6 border border-gray-200 dark:border-neutral-700 hover:border-blue-400 dark:hover:border-blue-500 transition-all group"
           >
             <div className="flex items-center justify-between">

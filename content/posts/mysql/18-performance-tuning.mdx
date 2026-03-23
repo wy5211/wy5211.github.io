@@ -1,0 +1,508 @@
+---
+title: "18 性能调优实战"
+date: "2026-03-23"
+summary: "全面掌握 MySQL 性能调优的方法和工具，通过实际案例提升数据库性能。"
+tags: ["MySQL", "性能调优", "性能监控", "配置优化"]
+category: "mysql"
+cover: ""
+draft: false
+series: "MySQL 渐进式学习指南"
+seriesOrder: 18
+---
+
+## 前言
+
+性能调优是数据库管理的核心技能。本文将综合运用前面学到的知识，通过实战案例全面讲解 MySQL 性能优化。
+
+## 性能监控工具
+
+### SHOW STATUS
+
+```sql
+-- 查看 MySQL 运行状态
+SHOW STATUS;
+
+-- 关键指标
+SHOW STATUS LIKE 'Questions';           -- 总查询数
+SHOW STATUS LIKE 'Threads_connected';   -- 当前连接数
+SHOW STATUS LIKE 'Threads_running';     -- 正在执行的查询
+SHOW STATUS LIKE 'Qcache%';            -- 查询缓存（MySQL 8.0 已移除）
+SHOW STATUS LIKE 'Innodb%';            -- InnoDB 状态
+
+-- 计算每秒查询数
+SHOW GLOBAL STATUS LIKE 'Questions';
+-- 结合 uptime 计算 QPS
+```
+
+### SHOW PROCESSLIST
+
+```sql
+-- 查看当前执行的进程
+SHOW PROCESSLIST;
+SHOW FULL PROCESSLIST;
+
+-- 关键列：
+-- Id：进程 ID
+-- User：用户
+-- Host：主机
+-- db：数据库
+-- Command：命令类型
+-- Time：执行时间
+-- State：状态
+-- Info：执行的 SQL
+
+-- 杀掉长时间查询
+KILL 123;
+```
+
+### Performance Schema（MySQL 5.7+）
+
+```sql
+-- 启用 Performance Schema
+UPDATE performance_schema.setup_instruments
+SET ENABLED = 'YES', TIMED = 'YES'
+WHERE NAME LIKE '%statement%';
+
+-- 查看最慢的 SQL
+SELECT
+  DIGEST_TEXT,
+  COUNT_STAR AS exec_count,
+  AVG_TIMER_WAIT/1000000000000 AS avg_sec,
+  SUM_TIMER_WAIT/1000000000000 AS total_sec
+FROM performance_schema.events_statements_summary_by_digest
+ORDER BY SUM_TIMER_WAIT DESC
+LIMIT 10;
+
+-- 查看表 IO 统计
+SELECT
+  object_schema,
+  object_name,
+  count_fetch,
+  count_insert,
+  count_update,
+  count_delete
+FROM performance_schema.table_io_waits_summary_by_table
+ORDER BY sum_timer_wait DESC
+LIMIT 10;
+```
+
+## 配置参数优化
+
+### InnoDB 缓冲池
+
+```sql
+-- 查看 InnoDB 缓冲池大小
+SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
+
+-- 查看 InnoDB 缓冲池命中率
+SHOW STATUS LIKE 'Innodb_buffer_pool_read%';
+
+-- 命中率计算：
+-- Innodb_buffer_pool_read_requests -- 总请求数
+-- Innodb_buffer_pool_reads -- 从磁盘读取数
+-- 命中率 = 1 - (Innodb_buffer_pool_reads / Innodb_buffer_pool_read_requests)
+-- 应该 > 99%
+
+-- 优化建议
+-- innodb_buffer_pool_size = 物理内存的 50-70%
+-- 示例：16GB 内存，设置为 8-12GB
+SET GLOBAL innodb_buffer_pool_size = 8589934592;  -- 8GB
+```
+
+### 连接数
+
+```sql
+-- 查看最大连接数
+SHOW VARIABLES LIKE 'max_connections';
+
+-- 查看当前连接数
+SHOW STATUS LIKE 'Threads_connected';
+
+-- 查看历史最大连接数
+SHOW STATUS LIKE 'Max_used_connections';
+
+-- 优化建议
+-- max_connections = (活跃连接数 * 2)
+-- 避免设置过大，占用内存
+SET GLOBAL max_connections = 500;
+```
+
+### 其他重要参数
+
+```sql
+-- InnoDB 刷盘策略
+-- 1: 每秒刷盘（默认，平衡性能和安全）
+-- 0: 不刷盘（最快，可能丢数据）
+-- 2: 每次提交刷盘（最慢，最安全）
+SET GLOBAL innodb_flush_log_at_trx_commit = 1;
+
+-- InnoDB IO 容量
+-- 限制 InnoDB 写入速度，避免磁盘打满
+SET GLOBAL innodb_io_capacity = 2000;
+SET GLOBAL innodb_io_capacity_max = 4000;
+
+-- 临时表大小
+SET GLOBAL tmp_table_size = 268435456;      -- 256MB
+SET GLOBAL max_heap_table_size = 268435456;  -- 256MB
+
+-- 表定义缓存
+SET GLOBAL table_definition_cache = 2000;
+SET GLOBAL table_open_cache = 4000;
+```
+
+## SQL 优化实战
+
+### 案例 1：慢查询优化
+
+```sql
+-- 原始查询（3秒）
+SELECT
+  u.username,
+  o.order_no,
+  oi.product_name,
+  oi.quantity
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+INNER JOIN order_items oi ON o.id = oi.order_id
+WHERE u.city = '北京'
+  AND o.status = 'completed'
+  AND o.created_at >= '2024-01-01';
+
+-- EXPLAIN 分析
+-- type: ALL（全表扫描）
+-- rows: 1000000
+
+-- 优化方案：
+-- 1. 添加索引
+CREATE INDEX idx_city ON users(city);
+CREATE INDEX idx_status_created ON orders(status, created_at);
+
+-- 2. 优化查询
+SELECT
+  u.username,
+  o.order_no,
+  oi.product_name,
+  oi.quantity
+FROM users u
+INNER JOIN orders o
+  ON u.id = o.user_id
+  AND o.status = 'completed'
+  AND o.created_at >= '2024-01-01'
+INNER JOIN order_items oi ON o.id = oi.order_id
+WHERE u.city = '北京';
+
+-- 结果：0.05秒（提升60倍）
+```
+
+### 案例 2：子查询优化
+
+```sql
+-- 原始查询（相关子查询）
+SELECT
+  u.username,
+  (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) AS order_count,
+  (SELECT SUM(total_amount) FROM orders o WHERE o.user_id = u.id) AS total_amount
+FROM users u;
+
+-- 优化：使用 JOIN
+SELECT
+  u.username,
+  COUNT(o.id) AS order_count,
+  SUM(o.total_amount) AS total_amount
+FROM users u
+LEFT JOIN orders o ON u.id = o.user_id
+GROUP BY u.id, u.username;
+```
+
+### 案例 3：分页优化
+
+```sql
+-- 深分页问题
+SELECT * FROM orders
+ORDER BY created_at DESC
+LIMIT 1000000, 20;  -- 10秒
+
+-- 优化方案1：使用上次最大ID
+SELECT * FROM orders
+WHERE id > 1000000
+ORDER BY id ASC
+LIMIT 20;  -- 0.01秒
+
+-- 优化方案2：延迟关联
+SELECT o.* FROM orders o
+INNER JOIN (
+  SELECT id FROM orders
+  ORDER BY created_at DESC
+  LIMIT 1000000, 20
+) tmp ON o.id = tmp.id;  -- 0.1秒
+```
+
+## 索引优化实战
+
+### 案例 1：复合索引优化
+
+```sql
+-- 原始查询
+SELECT * FROM orders
+WHERE user_id = 1
+  AND status = 'completed'
+ORDER BY created_at DESC;
+
+-- 添加复合索引（注意字段顺序）
+CREATE INDEX idx_user_status_created ON orders(user_id, status, created_at DESC);
+
+-- 验证
+EXPLAIN SELECT * FROM orders
+WHERE user_id = 1 AND status = 'completed'
+ORDER BY created_at DESC;
+-- type: ref（使用了索引）
+```
+
+### 案例 2：覆盖索引优化
+
+```sql
+-- 原始查询
+SELECT status, created_at, total_amount
+FROM orders
+WHERE user_id = 1
+ORDER BY created_at DESC;
+
+-- 创建覆盖索引
+CREATE INDEX idx_user_status_created_total ON orders(user_id, status, created_at, total_amount);
+
+-- 验证
+EXPLAIN SELECT status, created_at, total_amount
+FROM orders
+WHERE user_id = 1
+ORDER BY created_at DESC;
+-- Extra: Using index（使用了覆盖索引，无需回表）
+```
+
+## 系统级优化
+
+### 操作系统优化
+
+```bash
+# 1. 调整文件描述符限制
+# /etc/security/limits.conf
+mysql soft nofile 65535
+mysql hard nofile 65535
+
+# 2. 禁用 swap
+# /etc/fstab
+# 注释掉 swap 行
+
+# 3. 调整 I/O 调度器
+# SSD 使用 noop 或 deadline
+echo noop > /sys/block/sda/queue/scheduler
+
+# 4. 调整 vm.swappiness
+# /etc/sysctl.conf
+vm.swappiness = 1
+```
+
+### 硬件优化
+
+```
+1. CPU
+   - 多核、高主频
+   - InnoDB 利用多核
+
+2. 内存
+   - 大内存（64GB+）
+   - InnoDB 缓冲池利用
+
+3. 磁盘
+   - SSD 优于 HDD
+   - RAID 10（性能+冗余）
+   - NVMe 更好
+
+4. 网络
+   - 千兆网络
+   - 减少网络延迟
+```
+
+## 性能测试
+
+### 基准测试
+
+```bash
+# 使用 sysbench
+# 安装
+sudo apt install sysbench
+
+# 准备测试数据
+sysbench /usr/share/sysbench/oltp_read_write.lua \
+  --mysql-host=localhost \
+  --mysql-user=root \
+  --mysql-password=root123 \
+  --mysql-db=shop \
+  --tables=10 \
+  --table-size=100000 \
+  prepare
+
+# 执行测试
+sysbench /usr/share/sysbench/oltp_read_write.lua \
+  --mysql-host=localhost \
+  --mysql-user=root \
+  --mysql-password=root123 \
+  --mysql-db=shop \
+  --tables=10 \
+  --table-size=100000 \
+  --threads=8 \
+  --time=300 \
+  run
+
+# 清理
+sysbench /usr/share/sysbench/oltp_read_write.lua \
+  --mysql-host=localhost \
+  --mysql-user=root \
+  --mysql-password=root123 \
+  --mysql-db=shop \
+  cleanup
+```
+
+### 压力测试
+
+```bash
+# 模拟并发查询
+for i in {1..100}; do
+  mysql -uroot -proot123 -e "SELECT * FROM shop.users LIMIT 1000" &
+done
+wait
+```
+
+## 调优流程
+
+### 系统化调优步骤
+
+```
+1. 监控分析
+   - 慢查询日志
+   - Performance Schema
+   - SHOW STATUS
+
+2. 定位瓶颈
+   - SQL 问题
+   - 索引问题
+   - 配置问题
+   - 硬件问题
+
+3. 优化实施
+   - SQL 优化
+   - 索引优化
+   - 参数调整
+   - 硬件升级
+
+4. 效果验证
+   - 基准测试
+   - 性能对比
+   - 持续监控
+```
+
+## 最佳实践总结
+
+### 1. 监控优先
+
+```sql
+-- ✅ 建立监控体系
+-- - 慢查询日志
+-- - Performance Schema
+-- - 定期 SHOW STATUS
+-- - 第三方监控工具（Prometheus、Grafana）
+```
+
+### 2. 索引优化
+
+```sql
+-- ✅ 索引设计原则
+-- - 为 WHERE、JOIN、ORDER BY 字段建索引
+-- - 使用复合索引
+-- - 避免过多索引
+-- - 定期维护索引
+```
+
+### 3. SQL 优化
+
+```sql
+-- ✅ SQL 编写原则
+-- - 避免 SELECT *
+-- - 避免 SELECT DISTINCT
+-- - 优化子查询为 JOIN
+-- - 使用 LIMIT
+-- - 避免在索引列上使用函数
+```
+
+### 4. 配置优化
+
+```sql
+-- ✅ 参数调优原则
+-- - innodb_buffer_pool_size：最重要
+-- - max_connections：合理设置
+-- - 不要盲目调优
+-- - 监控效果
+```
+
+## 总结
+
+本文综合讲解了 MySQL 性能调优，主要内容：
+
+**监控工具**：
+
+- ✅ SHOW STATUS / SHOW PROCESSLIST
+- ✅ Performance Schema
+- ✅ 慢查询日志
+
+**配置优化**：
+
+- ✅ InnoDB 缓冲池
+- ✅ 连接数
+- ✅ IO 容量
+
+**优化实战**：
+
+- ✅ SQL 优化案例
+- ✅ 索引优化案例
+- ✅ 系统级优化
+
+**调优流程**：
+
+- ✅ 监控分析 → 定位瓶颈 → 优化实施 → 效果验证
+
+---
+
+## 恭喜完成 MySQL 系列学习！
+
+你已经掌握了：
+
+- ✅ MySQL 环境搭建和基础操作
+- ✅ 表设计和数据类型选择
+- ✅ 增删改查和高级查询
+- ✅ 索引设计和优化策略
+- ✅ 事务和锁机制
+- ✅ 数据库设计原则
+- ✅ 视图、存储过程、触发器
+- ✅ 用户管理和安全
+- ✅ 备份恢复策略
+- ✅ 主从复制和高可用
+- ✅ 性能调优实战
+
+现在你已经具备了：
+
+- 独立搭建 MySQL 数据库的能力
+- 设计规范数据库结构的能力
+- 优化查询性能的能力
+- 保证数据安全的能力
+- 构建高可用架构的能力
+
+继续实践和深入学习，你将成为 MySQL 专家！
+
+**学习资源**：
+
+- MySQL 官方文档：https://dev.mysql.com/doc/
+- 《高性能 MySQL》- Baron Schwartz
+- 《MySQL 技术内幕：InnoDB 存储引擎》- 姜宇
+
+---
+
+- **上一篇**：[17 主从复制与高可用](./17-replication-and-high-availability.mdx)
