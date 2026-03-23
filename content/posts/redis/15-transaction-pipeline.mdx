@@ -1,0 +1,314 @@
+---
+title: "15. 事务与 Pipeline：Redis 原子操作与性能优化"
+date: "2026-03-23"
+summary: "掌握 Redis 事务、Pipeline 和 Lua 脚本，实现原子操作和性能优化。"
+tags: ["Redis", "事务", "Pipeline", "Lua"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 15
+---
+
+## 前言
+
+Redis 提供了事务、Pipeline 和 Lua 脚本三种机制来保证原子性和提升性能。
+
+---
+
+## 事务
+
+### 基础用法
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+// 开启事务
+const multi = redis.multi();
+
+multi.set("key1", "value1");
+multi.set("key2", "value2");
+multi.incr("counter");
+
+// 执行事务
+const results = await multi.exec();
+console.log(results);
+```
+
+### 事务的 ACID
+
+- **原子性**：要么全部执行，要么全部不执行
+- **一致性**：事务执行前后数据一致
+- **隔离性**：事务执行期间不会被其他命令打断
+- **持久性**：取决于持久化配置
+
+### WATCH 命令
+
+```typescript
+// 乐观锁
+async function transfer(from: string, to: string, amount: number) {
+  // 监视账户
+  await redis.watch(`account:${from}`);
+
+  const balance = parseInt((await redis.get(`account:${from}`)) || "0");
+
+  if (balance < amount) {
+    await redis.unwatch();
+    throw new Error("余额不足");
+  }
+
+  // 开启事务
+  const multi = redis.multi();
+  multi.decrby(`account:${from}`, amount);
+  multi.incrby(`account:${to}`, amount);
+
+  const results = await multi.exec();
+
+  if (!results) {
+    // 事务被取消，重试
+    return await transfer(from, to, amount);
+  }
+
+  return results;
+}
+```
+
+---
+
+## Pipeline
+
+### 基础用法
+
+```typescript
+// Pipeline 批量执行
+const pipeline = redis.pipeline();
+
+pipeline.set("key1", "value1");
+pipeline.get("key1");
+pipeline.incr("counter");
+pipeline.set("key2", "value2");
+
+const results = await pipeline.exec();
+console.log(results);
+```
+
+### 批量操作优化
+
+```typescript
+// ❌ 多次网络往返
+for (let i = 0; i < 1000; i++) {
+  await redis.set(`key:${i}`, `value:${i}`);
+}
+
+// ✅ 使用 Pipeline
+const pipeline = redis.pipeline();
+for (let i = 0; i < 1000; i++) {
+  pipeline.set(`key:${i}`, `value:${i}`);
+}
+await pipeline.exec();
+```
+
+### Pipeline vs 事务
+
+| 特性       | Pipeline | 事务       |
+| ---------- | -------- | ---------- |
+| 原子性     | ❌       | ✅         |
+| 网络往返   | 减少     | 减少       |
+| 命令间依赖 | 不支持   | 支持       |
+| 适用场景   | 批量操作 | 原子性操作 |
+
+---
+
+## Lua 脚本
+
+### 基础用法
+
+```typescript
+// 执行 Lua 脚本
+const script = `
+  local key = KEYS[1]
+  local value = tonumber(ARGV[1])
+
+  local current = tonumber(redis.call("GET", key) or "0")
+  local newValue = current + value
+
+  redis.call("SET", key, newValue)
+
+  return newValue
+`;
+
+const result = await redis.eval(script, 1, "counter", 10);
+console.log(result); // 10
+```
+
+### 原子操作
+
+```typescript
+// 原子性的获取并删除
+const script = `
+  local value = redis.call("GET", KEYS[1])
+  redis.call("DEL", KEYS[1])
+  return value
+`;
+
+const value = await redis.eval(script, 1, "mykey");
+```
+
+### 复杂业务逻辑
+
+```typescript
+// 限流
+const rateLimitScript = `
+  local key = KEYS[1]
+  local limit = tonumber(ARGV[1])
+  local window = tonumber(ARGV[2])
+
+  local current = redis.call("GET", key)
+  if current == false then
+    redis.call("SET", key, 1, "EX", window)
+    return 1
+  end
+
+  current = tonumber(current)
+  if current < limit then
+    redis.call("INCR", key)
+    return 1
+  else
+    return 0
+  end
+`;
+
+const allowed = await redis.eval(
+  rateLimitScript,
+  1,
+  "ratelimit:user:123",
+  100,
+  60
+);
+```
+
+### 脚本缓存
+
+```typescript
+// 第一次执行后脚本会被缓存
+const script = `
+  return redis.call("GET", KEYS[1])
+`;
+
+const sha1 = await redis.script("load", script);
+
+// 之后可以使用 SHA1 执行
+await redis.evalsha(sha1, 1, "mykey");
+```
+
+---
+
+## 实际应用
+
+### 批量设置过期时间
+
+```typescript
+async function setExpireBatch(pattern: string, seconds: number) {
+  const keys = await redis.keys(pattern);
+
+  const pipeline = redis.pipeline();
+  for (const key of keys) {
+    pipeline.expire(key, seconds);
+  }
+
+  await pipeline.exec();
+}
+```
+
+### 原子性转账
+
+```typescript
+async function atomicTransfer(from: string, to: string, amount: number) {
+  const script = `
+    local fromKey = "account:" .. ARGV[1]
+    local toKey = "account:" .. ARGV[2]
+    local amount = tonumber(ARGV[3])
+
+    local fromBalance = tonumber(redis.call("GET", fromKey) or "0")
+    if fromBalance < amount then
+      return -1
+    end
+
+    redis.call("DECRBY", fromKey, amount)
+    redis.call("INCRBY", toKey, amount)
+
+    return 1
+  `;
+
+  const result = await redis.eval(script, 0, from, to, amount);
+  if (result === -1) {
+    throw new Error("余额不足");
+  }
+}
+```
+
+---
+
+## 性能对比
+
+| 操作        | 单次    | Pipeline | 事务  |
+| ----------- | ------- | -------- | ----- |
+| 100 次 SET  | ~100ms  | ~5ms     | ~10ms |
+| 1000 次 SET | ~1000ms | ~20ms    | ~50ms |
+
+---
+
+## 最佳实践
+
+### 1. 复杂操作用 Lua
+
+```typescript
+// ✅ Lua 保证原子性
+const script = `
+  local value = redis.call("GET", KEYS[1])
+  if value then
+    redis.call("DEL", KEYS[1])
+    return value
+  end
+  return nil
+`;
+```
+
+### 2. 批量操作用 Pipeline
+
+```typescript
+// ✅ Pipeline 减少网络往返
+const pipeline = redis.pipeline();
+for (let i = 0; i < 100; i++) {
+  pipeline.incr("counter");
+}
+await pipeline.exec();
+```
+
+### 3. 脚本不要过长
+
+```typescript
+// ❌ 过长的脚本会阻塞 Redis
+const longScript = "for i = 1, 100000 do ... end";
+
+// ✅ 拆分为多个脚本
+const script1 = "for i = 1, 1000 do ... end";
+```
+
+---
+
+## 总结
+
+本文我们学习了：
+
+✅ 事务：MULTI/EXEC/WATCH
+✅ Pipeline：批量操作
+✅ Lua 脚本：复杂原子操作
+
+---
+
+## 下一步
+
+继续阅读：[16. 主从复制与哨兵模式](./16-replication-sentinel.mdx)

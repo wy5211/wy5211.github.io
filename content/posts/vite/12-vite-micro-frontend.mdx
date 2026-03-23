@@ -1,0 +1,469 @@
+---
+title: "12. 微前端支持：构建可扩展的微前端架构"
+date: "2025-03-23"
+summary: "掌握 Vite 的微前端解决方案，学习模块联邦、qiankun 集成、独立部署等微前端架构技术。"
+tags: ["Vite", "微前端", "模块联邦", "qiankun"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 深入实战"
+seriesOrder: 12
+---
+
+## 前言
+
+微前端是大型应用架构的解决方案。Vite 对微前端提供了良好的支持。本文将深入探讨 Vite 的微前端实现方案。
+
+## 微前端基础
+
+### 什么是微前端
+
+微前端是将前端应用分解为更小、更简单的块，每个块可以独立开发、测试和部署。
+
+```
+主应用（Shell）
+    ├─ 子应用 A（React）
+    ├─ 子应用 B（Vue）
+    └─ 子应用 C（Angular）
+```
+
+### 优势
+
+- **独立开发**：团队独立开发
+- **独立部署**：按需部署
+- **技术栈无关**：可以使用不同框架
+- **增量升级**：逐步迁移
+
+## 模块联邦
+
+### 配置模块联邦
+
+```typescript
+// vite.config.ts
+import federation from "@originjs/vite-plugin-federation";
+
+export default defineConfig({
+  plugins: [
+    federation({
+      name: "host_app",
+      remotes: {
+        remote_app: {
+          type: "module",
+          name: "remote_app",
+          entry: "http://localhost:5001/assets/remoteEntry.js",
+          entryGlobalName: "remote_app",
+          shareScope: "default",
+        },
+      },
+      shared: ["react", "react-dom", "react-router-dom"],
+    }),
+  ],
+});
+```
+
+### 使用远程模块
+
+```typescript
+// src/App.tsx
+import { lazy, Suspense } from 'react';
+
+// 懒加载远程组件
+const RemoteComponent = lazy(() =>
+  import('remote_app/Component')
+);
+
+function App() {
+  return (
+    <div>
+      <h1>Host App</h1>
+
+      <Suspense fallback={<div>Loading...</div>}>
+        <RemoteComponent />
+      </Suspense>
+    </div>
+  );
+}
+```
+
+### 暴露模块
+
+```typescript
+// remote/vite.config.ts
+export default defineConfig({
+  plugins: [
+    federation({
+      name: "remote_app",
+      filename: "remoteEntry.js",
+      exposes: {
+        "./Component": "./src/components/Component",
+      },
+      shared: ["react", "react-dom"],
+    }),
+  ],
+});
+```
+
+## qiankun 集成
+
+### 主应用配置
+
+```typescript
+// src/microApps.ts
+export const microApps = [
+  {
+    name: "app1",
+    entry: "//localhost:7100",
+    container: "#subapp-container",
+    activeRule: "/app1",
+  },
+  {
+    name: "app2",
+    entry: "//localhost:7200",
+    container: "#subapp-container",
+    activeRule: "/app2",
+  },
+];
+```
+
+```typescript
+// src/main.tsx
+import { registerMicroApps, start } from "qiankun";
+import { microApps } from "./microApps";
+
+registerMicroApps(microApps);
+
+start({
+  sandbox: {
+    strictStyleIsolation: true,
+    experimentalStyleIsolation: true,
+  },
+});
+```
+
+### 子应用配置
+
+```typescript
+// 子应用入口文件
+let publicPath = '//localhost:7100';
+
+if (window.__POWERED_BY_QIANKUN__) {
+  __webpack_public_path__ = window.__INJECTED_PUBLIC_PATH_BY_QIANKUN__;
+}
+
+export async function bootstrap() {
+  console.log('React app bootstraped');
+}
+
+export async function mount(props) {
+  const { container } = props;
+  ReactDOM.render(<App />, container.querySelector('#root'));
+}
+
+export async function unmount(props) {
+  ReactDOM.unmountComponentAtNode(props.container.querySelector('#root'));
+}
+
+if (!window.__POWERED_BY_QIANKUN__) {
+  ReactDOM.render(<App />, document.getElementById('root'));
+}
+```
+
+### Vite 适配 qiankun
+
+```typescript
+// vite.config.ts
+import { qiankun } from "vite-plugin-qiankun";
+
+export default defineConfig({
+  plugins: [
+    qiankun("app1", {
+      useDevMode: true,
+    }),
+  ],
+});
+```
+
+## 独立部署
+
+### 构建配置
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  base: "/app1/", // 部署路径
+
+  build: {
+    rollupOptions: {
+      output: {
+        // 确保资源路径正确
+        assetFileNames: "app1/assets/[name]-[hash][extname]",
+        chunkFileNames: "app1/assets/[name]-[hash].js",
+        entryFileNames: "app1/assets/[name]-[hash].js",
+      },
+    },
+  },
+});
+```
+
+### Nginx 配置
+
+```nginx
+server {
+    listen 80;
+    server_name example.com;
+
+    # 主应用
+    location / {
+        root /var/www/host;
+        try_files $uri $uri/ /index.html;
+    }
+
+    # 子应用 1
+    location /app1 {
+        root /var/www;
+        try_files $uri $uri/ /app1/index.html;
+    }
+
+    # 子应用 2
+    location /app2 {
+        root /var/www;
+        try_files $uri $uri/ /app2/index.html;
+    }
+}
+```
+
+## 通信方案
+
+### 事件总线
+
+```typescript
+// src/utils/eventBus.ts
+class EventBus {
+  private events: Record<string, Function[]> = {};
+
+  on(event: string, callback: Function) {
+    if (!this.events[event]) {
+      this.events[event] = [];
+    }
+    this.events[event].push(callback);
+  }
+
+  emit(event: string, data?: any) {
+    if (this.events[event]) {
+      this.events[event].forEach((callback) => callback(data));
+    }
+  }
+
+  off(event: string, callback: Function) {
+    if (this.events[event]) {
+      this.events[event] = this.events[event].filter((cb) => cb !== callback);
+    }
+  }
+}
+
+export const eventBus = new EventBus();
+```
+
+### 状态共享
+
+```typescript
+// src/store/sharedStore.ts
+import { signal } from "@preact/signals-react";
+
+export const sharedState = {
+  user: signal(null),
+  theme: signal("light"),
+};
+
+// 主应用设置状态
+sharedState.user.value = { name: "Alice" };
+
+// 子应用使用状态
+import { sharedState } from "sharedStore";
+
+console.log(sharedState.user.value);
+```
+
+### Props 传递
+
+```typescript
+// 主应用
+import { loadMicroApp } from "qiankun";
+
+const app = loadMicroApp({
+  name: "app1",
+  entry: "//localhost:7100",
+  container: "#container",
+  props: {
+    data: { user: "Alice" },
+    onData: (data) => console.log("Received:", data),
+  },
+});
+
+// 子应用
+export function mount(props) {
+  const { data, onData } = props;
+  console.log("Received data:", data);
+
+  // 发送数据
+  onData({ result: "success" });
+}
+```
+
+## 样式隔离
+
+### CSS Scope
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  css: {
+    modules: {
+      generateScopedName: "[name]__[local]__[hash:base64:5]",
+    },
+  },
+});
+```
+
+### Shadow DOM
+
+```typescript
+// 使用 Shadow DOM 隔离
+class MicroApp extends HTMLElement {
+  connectedCallback() {
+    const shadow = this.attachShadow({ mode: "open" });
+
+    shadow.innerHTML = `
+      <style>
+        /* 隔离的样式 */
+      </style>
+      <div id="root"></div>
+    `;
+  }
+}
+
+customElements.define("micro-app", MicroApp);
+```
+
+### qiankun 样式隔离
+
+```typescript
+start({
+  sandbox: {
+    strictStyleIsolation: true, // 严格样式隔离
+    experimentalStyleIsolation: true, // 实验性样式隔离
+  },
+});
+```
+
+## 最佳实践
+
+### 1. 应用拆分
+
+```
+按业务域拆分
+├─ 用户中心（独立团队）
+├─ 订单管理（独立团队）
+└─ 商品管理（独立团队）
+```
+
+### 2. 版本管理
+
+```typescript
+// 版本兼容
+export const SUPPORTED_VERSIONS = {
+  app1: "^1.0.0",
+  app2: "^2.0.0",
+};
+
+// 加载前检查版本
+function checkVersion(name: string, version: string) {
+  const supported = SUPPORTED_VERSIONS[name];
+  return satisfies(version, supported);
+}
+```
+
+### 3. 错误处理
+
+```typescript
+// 全局错误处理
+window.addEventListener('error', (event) => {
+  console.error('Global error:', event.error);
+});
+
+// Promise 错误
+window.addEventListener('unhandledrejection', (event) => {
+  console.error('Unhandled promise rejection:', event.reason);
+});
+
+// qiankun 错误处理
+registerMicroApps([...], {
+  // 加载失败
+  onLoadError: (app) => {
+    console.error('Failed to load app:', app);
+  },
+  // 渲染失败
+  onError: (err) => {
+    console.error('Micro app error:', err);
+  }
+});
+```
+
+## 常见问题
+
+### Q1: 路由冲突？
+
+A: 使用不同的路由前缀：
+
+```typescript
+// 主应用
+<Routes>
+  <Route path="/app1/*" element={<MicroApp1 />} />
+  <Route path="/app2/*" element={<MicroApp2 />} />
+</Routes>
+
+// 子应用使用相对路由
+<Routes>
+  <Route path="/page1" element={<Page1 />} />
+</Routes>
+```
+
+### Q2: 状态共享复杂？
+
+A: 使用事件总线或状态管理：
+
+```typescript
+// 简单场景：事件总线
+eventBus.emit("user:update", user);
+
+// 复杂场景：状态管理
+import { sharedStore } from "sharedStore";
+```
+
+### Q3: 性能问题？
+
+A: 优化策略：
+
+1. 按需加载子应用
+2. 预加载关键资源
+3. 使用缓存策略
+
+## 总结
+
+Vite 微前端要点：
+
+1. **模块联邦**：Webpack 模块联邦在 Vite 中的实现
+2. **qiankun 集成**：成熟的微前端框架
+3. **独立部署**：Nginx 配置和部署策略
+4. **通信方案**：事件总线、状态共享、Props 传递
+5. **样式隔离**：CSS Scope、Shadow DOM
+6. **最佳实践**：应用拆分、版本管理、错误处理
+
+## 下一步
+
+微前端支持完成后，下一步我们将学习库模式开发。
+
+---
+
+- **上一篇**：[11. 测试集成方案](./11-vite-testing-integration)
+- **下一篇**：[13. 库模式开发](./13-vite-library-mode)

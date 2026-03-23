@@ -1,0 +1,671 @@
+---
+title: "10 函数重载与签名设计"
+date: "2026-03-23"
+summary: "掌握函数重载的艺术，设计优雅且类型安全的 API，处理复杂的参数类型关系。"
+tags: ["TypeScript", "函数重载", "类型签名", "API设计"]
+category: "typescript"
+draft: false
+series: "TypeScript 高级技巧系列"
+seriesOrder: 10
+---
+
+## 前言
+
+函数重载（Function Overloads）允许我们为同一个函数定义多个签名，根据不同的参数类型或数量提供不同的类型行为。这对于设计灵活、类型安全的 API 非常有用。
+
+JavaScript 没有真正的函数重载，但 TypeScript 的类型系统让我们可以在类型层面实现这个功能。
+
+## 核心概念
+
+### 基础重载语法
+
+```typescript
+// 重载签名
+function process(value: string): string;
+function process(value: number): number;
+function process(value: string | number): string | number {
+  return value;
+}
+
+// ✅ 类型安全
+const result1 = process("hello"); // 返回 string
+const result2 = process(123); // 返回 number
+
+// ❌ 类型错误
+const result3 = process(true); // boolean 不允许
+```
+
+### 重载签名与实现签名
+
+```typescript
+// 重载签名（可以被调用者看到）
+function greet(name: string): string;
+function greet(age: number): string;
+function greet(isActive: boolean): string;
+
+// 实现签名（不被调用者看到，必须是兼容的）
+function greet(name: string | number | boolean): string {
+  if (typeof name === "string") {
+    return `Hello, ${name}!`;
+  } else if (typeof name === "number") {
+    return `You are ${name} years old`;
+  } else {
+    return `Active: ${name}`;
+  }
+}
+```
+
+## 高级技巧
+
+### 技巧 1：智能的查询构建器
+
+```typescript
+interface QueryBuilder {
+  where(condition: string): this;
+  where(field: string, operator: string, value: any): this;
+  where(conditions: Record<string, any>): this;
+}
+
+class Query implements QueryBuilder {
+  private conditions: string[] = [];
+
+  where(condition: string): this;
+  where(field: string, operator: string, value: any): this;
+  where(conditions: Record<string, any>): this;
+  where(
+    arg1: string | Record<string, any>,
+    operator?: string,
+    value?: any
+  ): this {
+    if (typeof arg1 === "string") {
+      if (operator && value !== undefined) {
+        this.conditions.push(`${arg1} ${operator} ${value}`);
+      } else {
+        this.conditions.push(arg1);
+      }
+    } else {
+      Object.entries(arg1).forEach(([key, val]) => {
+        this.conditions.push(`${key} = ${val}`);
+      });
+    }
+    return this;
+  }
+
+  build(): string {
+    return `WHERE ${this.conditions.join(" AND ")}`;
+  }
+}
+
+// ✅ 类型安全
+const query = new Query();
+
+query.where("active = true");
+query.where("age", ">", 18);
+query.where({ name: "Alice", status: "active" });
+
+const sql = query.build();
+```
+
+---
+
+### 技巧 2：类型受控的 HTTP 客户端
+
+```typescript
+type HttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
+
+interface HttpClient {
+  get<T>(url: string): Promise<T>;
+  post<T>(url: string, data: any): Promise<T>;
+  put<T>(url: string, data: any): Promise<T>;
+  delete<T>(url: string): Promise<T>;
+  patch<T>(url: string, data: any): Promise<T>;
+
+  request<T>(method: "GET", url: string): Promise<T>;
+  request<T>(
+    method: "POST" | "PUT" | "PATCH",
+    url: string,
+    data: any
+  ): Promise<T>;
+  request<T>(method: "DELETE", url: string): Promise<T>;
+}
+
+class ApiClient implements HttpClient {
+  constructor(private baseUrl: string) {}
+
+  async get<T>(url: string): Promise<T> {
+    return this.request<T>("GET", url);
+  }
+
+  async post<T>(url: string, data: any): Promise<T> {
+    return this.request<T>("POST", url, data);
+  }
+
+  async put<T>(url: string, data: any): Promise<T> {
+    return this.request<T>("PUT", url, data);
+  }
+
+  async delete<T>(url: string): Promise<T> {
+    return this.request<T>("DELETE", url);
+  }
+
+  async patch<T>(url: string, data: any): Promise<T> {
+    return this.request<T>("PATCH", url, data);
+  }
+
+  async request<T>(method: HttpMethod, url: string, data?: any): Promise<T> {
+    const options: RequestInit = {
+      method,
+      headers: {
+        "Content-Type": "application/json",
+      },
+    };
+
+    if (data && method !== "GET") {
+      options.body = JSON.stringify(data);
+    }
+
+    const response = await fetch(`${this.baseUrl}${url}`, options);
+    return response.json();
+  }
+}
+
+// 使用示例
+interface User {
+  id: number;
+  name: string;
+}
+
+const api = new ApiClient("https://api.example.com");
+
+// ✅ 类型安全
+const users = await api.get<User[]>("/users");
+const user = await api.get<User>("/users/1");
+const created = await api.post<User>("/users", { name: "Alice" });
+const updated = await api.put<User>("/users/1", { name: "Bob" });
+const deleted = await api.delete<void>("/users/1");
+```
+
+---
+
+### 技巧 3：链式调用的类型控制
+
+```typescript
+interface Query<T> {
+  select<K extends keyof T>(...fields: K[]): Query<Pick<T, K>>;
+  where<K extends keyof T>(field: K, value: T[K]): Query<T>;
+  orderBy<K extends keyof T>(field: K, direction?: "ASC" | "DESC"): Query<T>;
+  limit(count: number): Query<T>;
+  execute(): Promise<T[]>;
+}
+
+class QueryBuilder<T> implements Query<T> {
+  private fields: (keyof T)[] = [];
+  private conditions: string[] = [];
+  private orders: string[] = [];
+  private limitCount?: number;
+
+  select<K extends keyof T>(...fields: K[]): Query<Pick<T, K>> {
+    this.fields = fields;
+    return this as any;
+  }
+
+  where<K extends keyof T>(field: K, value: T[K]): Query<T> {
+    this.conditions.push(`${String(field)} = ${JSON.stringify(value)}`);
+    return this;
+  }
+
+  orderBy<K extends keyof T>(
+    field: K,
+    direction: "ASC" | "DESC" = "ASC"
+  ): Query<T> {
+    this.orders.push(`${String(field)} ${direction}`);
+    return this;
+  }
+
+  limit(count: number): Query<T> {
+    this.limitCount = count;
+    return this;
+  }
+
+  async execute(): Promise<T[]> {
+    // 实际查询逻辑
+    return [];
+  }
+}
+
+// 使用示例
+interface User {
+  id: number;
+  name: string;
+  email: string;
+  age: number;
+}
+
+const query = new QueryBuilder<User>();
+
+// ✅ 类型安全的链式调用
+const result = query
+  .select("id", "name")
+  .where("age", 18)
+  .orderBy("name", "ASC")
+  .limit(10)
+  .execute();
+
+// result 类型: Promise<Array<{ id: number; name: string }>>
+```
+
+---
+
+### 技巧 4：灵活的配置函数
+
+```typescript
+type Configurator<T> = {
+  set<K extends keyof T>(key: K, value: T[K]): Configurator<T>;
+  get<K extends keyof T>(key: K): T[K];
+  build(): T;
+};
+
+function createConfig<T extends object>(defaults: T): Configurator<T> {
+  const config = { ...defaults };
+
+  return {
+    set(key, value) {
+      config[key] = value;
+      return this;
+    },
+    get(key) {
+      return config[key];
+    },
+    build() {
+      return config;
+    },
+  };
+}
+
+// 使用示例
+interface AppConfig {
+  apiUrl: string;
+  timeout: number;
+  retries: number;
+  debug: boolean;
+}
+
+const config = createConfig<AppConfig>({
+  apiUrl: "https://api.example.com",
+  timeout: 5000,
+  retries: 3,
+  debug: false,
+});
+
+const finalConfig = config.set("timeout", 10000).set("debug", true).build();
+```
+
+---
+
+### 技巧 5：泛型重载
+
+```typescript
+function createElement<T extends keyof JSX.IntrinsicElements>(
+  tag: T,
+  props?: JSX.IntrinsicElements[T],
+  ...children: React.ReactNode[]
+): React.ReactElement<JSX.IntrinsicElements[T]>
+
+function createElement<T extends React.ComponentType<any>>(
+  tag: T,
+  props?: React.ComponentProps<T>,
+  ...children: React.ReactNode[]
+): React.ReactElement<React.ComponentProps<T>>
+
+function createElement(tag: any, props: any, ...children: any[]) {
+  // 实现
+  return React.createElement(tag, props, ...children)
+}
+
+// 使用示例
+const div = createElement('div', { className: 'container' }, 'Hello')
+const button = createElement('button', { onClick: () => {} }, 'Click me')
+
+// 自定义组件
+interface MyComponentProps {
+  title: string
+  onAction: () => void
+}
+
+function MyComponent({ title, onAction }: MyComponentProps) {
+  return <div>{title}</div>
+}
+
+const myElement = createElement(MyComponent, {
+  title: 'Hello',
+  onAction: () => console.log('Action')
+})
+```
+
+---
+
+### 技巧 6：类型条件重载
+
+```typescript
+function process<T extends string>(value: T): T;
+function process<T extends number>(value: T): number;
+function process<T extends boolean>(value: T): boolean;
+function process<T>(value: T): T {
+  return value;
+}
+
+// ✅ 类型推导
+const result1 = process("hello"); // 'hello' (string)
+const result2 = process(123); // 123 (number)
+const result3 = process(true); // true (boolean)
+```
+
+## 实战应用
+
+### 构建类型安全的数据库客户端
+
+```typescript
+interface DatabaseClient {
+  query<T>(sql: string): Promise<T[]>;
+  query<T>(sql: string, params: any[]): Promise<T[]>;
+  queryOne<T>(sql: string): Promise<T | null>;
+  queryOne<T>(sql: string, params: any[]): Promise<T | null>;
+
+  insert<T>(table: string, data: T): Promise<number>;
+  update<T>(table: string, id: number, data: Partial<T>): Promise<boolean>;
+  delete(table: string, id: number): Promise<boolean>;
+
+  transaction<T>(callback: (client: DatabaseClient) => Promise<T>): Promise<T>;
+}
+
+class PostgreSQLClient implements DatabaseClient {
+  constructor(private connectionString: string) {}
+
+  async query<T>(sql: string): Promise<T[]>;
+  async query<T>(sql: string, params: any[]): Promise<T[]>;
+  async query<T>(sql: string, params?: any[]): Promise<T[]> {
+    // 实现
+    return [];
+  }
+
+  async queryOne<T>(sql: string): Promise<T | null>;
+  async queryOne<T>(sql: string, params: any[]): Promise<T | null>;
+  async queryOne<T>(sql: string, params?: any[]): Promise<T | null> {
+    const results = await this.query<T>(sql, params || []);
+    return results[0] || null;
+  }
+
+  async insert<T>(table: string, data: T): Promise<number> {
+    // 实现
+    return 1;
+  }
+
+  async update<T>(
+    table: string,
+    id: number,
+    data: Partial<T>
+  ): Promise<boolean> {
+    // 实现
+    return true;
+  }
+
+  async delete(table: string, id: number): Promise<boolean> {
+    // 实现
+    return true;
+  }
+
+  async transaction<T>(
+    callback: (client: DatabaseClient) => Promise<T>
+  ): Promise<T> {
+    // 实现事务
+    return callback(this);
+  }
+}
+
+// 使用示例
+interface User {
+  id: number;
+  name: string;
+  email: string;
+}
+
+const db = new PostgreSQLClient("postgresql://localhost/mydb");
+
+// ✅ 类型安全
+const users = await db.query<User>("SELECT * FROM users");
+const user = await db.queryOne<User>("SELECT * FROM users WHERE id = $1", [1]);
+const userId = await db.insert<User>("users", {
+  name: "Alice",
+  email: "alice@example.com",
+});
+const updated = await db.update<User>("users", 1, { name: "Bob" });
+const deleted = await db.delete("users", 1);
+
+// 事务
+const result = await db.transaction(async (client) => {
+  const user = await client.queryOne<User>(
+    "SELECT * FROM users WHERE id = $1 FOR UPDATE",
+    [1]
+  );
+  if (user) {
+    await client.update("users", user.id, { name: "Updated" });
+  }
+  return user;
+});
+```
+
+### 构建类型缓存系统
+
+```typescript
+interface CacheStore {
+  get<T>(key: string): Promise<T | undefined>;
+  set<T>(key: string, value: T, ttl?: number): Promise<void>;
+  delete(key: string): Promise<boolean>;
+  clear(): Promise<void>;
+
+  getOrSet<T>(key: string, factory: () => Promise<T>, ttl?: number): Promise<T>;
+
+  getMany<T>(keys: string[]): Promise<(T | undefined)[]>;
+  setMany<T>(entries: Record<string, T>, ttl?: number): Promise<void>;
+}
+
+class RedisCache implements CacheStore {
+  private client: any; // Redis client
+
+  async get<T>(key: string): Promise<T | undefined> {
+    const value = await this.client.get(key);
+    return value ? JSON.parse(value) : undefined;
+  }
+
+  async set<T>(key: string, value: T, ttl?: number): Promise<void> {
+    const serialized = JSON.stringify(value);
+    if (ttl) {
+      await this.client.setex(key, ttl, serialized);
+    } else {
+      await this.client.set(key, serialized);
+    }
+  }
+
+  async delete(key: string): Promise<boolean> {
+    const result = await this.client.del(key);
+    return result > 0;
+  }
+
+  async clear(): Promise<void> {
+    await this.client.flushdb();
+  }
+
+  async getOrSet<T>(
+    key: string,
+    factory: () => Promise<T>,
+    ttl?: number
+  ): Promise<T> {
+    const cached = await this.get<T>(key);
+    if (cached !== undefined) {
+      return cached;
+    }
+
+    const value = await factory();
+    await this.set(key, value, ttl);
+    return value;
+  }
+
+  async getMany<T>(keys: string[]): Promise<(T | undefined)[]> {
+    const values = await this.client.mget(keys);
+    return values.map((v: string | null) => (v ? JSON.parse(v) : undefined));
+  }
+
+  async setMany<T>(entries: Record<string, T>, ttl?: number): Promise<void> {
+    const pipeline = this.client.pipeline();
+    for (const [key, value] of Object.entries(entries)) {
+      const serialized = JSON.stringify(value);
+      if (ttl) {
+        pipeline.setex(key, ttl, serialized);
+      } else {
+        pipeline.set(key, serialized);
+      }
+    }
+    await pipeline.exec();
+  }
+}
+
+// 使用示例
+const cache = new RedisCache();
+
+// ✅ 类型安全
+const user = await cache.get<User>("user:123");
+await cache.set("user:123", { id: 123, name: "Alice" }, 3600);
+const userOrCached = await cache.getOrSet(
+  "user:123",
+  async () => {
+    return await fetchUserFromDatabase(123);
+  },
+  3600
+);
+
+const users = await cache.getMany<User>(["user:1", "user:2", "user:3"]);
+await cache.setMany(
+  {
+    "user:1": { id: 1, name: "Alice" },
+    "user:2": { id: 2, name: "Bob" },
+  },
+  3600
+);
+```
+
+## 避坑指南
+
+### ❌ 错误 1：实现签名太宽泛
+
+```typescript
+// ❌ 实现签名太宽泛
+function greet(name: string): string;
+function greet(age: number): string;
+function greet(nameOrAge: any): string {
+  return String(nameOrAge);
+}
+
+// ✅ 使用联合类型
+function greet(name: string): string;
+function greet(age: number): string;
+function greet(nameOrAge: string | number): string {
+  if (typeof nameOrAge === "string") {
+    return `Hello, ${nameOrAge}!`;
+  }
+  return `You are ${nameOrAge} years old`;
+}
+```
+
+---
+
+### ❌ 错误 2：重载签名顺序错误
+
+```typescript
+// ❌ 更具体的签名应该放在前面
+function process(value: any): any;
+function process(value: string): string;
+
+// ✅ 从具体到一般
+function process(value: string): string;
+function process(value: number): number;
+function process(value: any): any;
+```
+
+---
+
+### ❌ 错误 3：忽略返回类型的一致性
+
+```typescript
+// ❌ 返回类型不一致
+function parse(input: string): number;
+function parse(input: number): string;
+function parse(input: string | number): string | number {
+  return input;
+}
+
+// ✅ 保持一致性或使用泛型
+function parse<T extends string>(input: T): T;
+function parse<T extends number>(input: T): T;
+function parse(input: string | number): string | number {
+  return input;
+}
+```
+
+---
+
+### ❌ 错误 4：过度使用重载
+
+```typescript
+// ❌ 过度复杂
+function process(a: string, b?: number, c?: boolean): any;
+function process(a: number, b?: string, c?: boolean): any;
+function process(a: boolean, b?: string, c?: number): any;
+
+// ✅ 使用配置对象
+interface ProcessOptions {
+  a: string | number | boolean;
+  b?: string | number;
+  c?: boolean;
+}
+
+function process(options: ProcessOptions): any {
+  // 统一处理
+}
+```
+
+## 总结
+
+### 核心要点
+
+1. **重载签名**：定义多个函数签名
+2. **实现签名**：提供兼容所有重载的实现
+3. **泛型重载**：结合泛型实现灵活的类型
+4. **链式调用**：保持类型安全的链式 API
+5. **类型推导**：让 TypeScript 推导正确的类型
+
+### 实用模式
+
+```typescript
+// HTTP 客户端
+function get<T>(url: string): Promise<T>;
+function post<T>(url: string, data: any): Promise<T>;
+
+// 查询构建器
+function where(condition: string): this;
+function where(field: string, operator: string, value: any): this;
+function where(conditions: Record<string, any>): this;
+
+// 缓存系统
+function get<T>(key: string): Promise<T | undefined>;
+function set<T>(key: string, value: T, ttl?: number): Promise<void>;
+```
+
+## 参考资料
+
+- [TypeScript Handbook: Function Overloads](https://www.typescriptlang.org/docs/handbook/2/functions.html#function-overloads)
+- [TypeScript Deep Dive: Function Overloading](https://basarat.gitbook.io/typescript/type-system/functions#function-overloads)
+
+---
+
+- **上一篇**：[09 React + TypeScript 高级模式](../09-react-typescript-patterns.mdx)
+- **下一篇**：[11 协变与逆变](../11-covariant-contravariant.mdx)

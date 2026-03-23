@@ -1,0 +1,605 @@
+---
+title: "18. 实时统计系统实战：UV/PV 统计与实时排行榜"
+date: "2026-03-23"
+summary: "综合运用 Redis 知识，构建一个完整的实时统计系统，包括 UV/PV 统计、在线用户和实时排行榜。"
+tags: ["Redis", "实战项目", "实时统计"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 18
+---
+
+## 前言
+
+恭喜你来到 Redis 系列的最后一篇！本文将综合运用前面学到的知识，构建一个完整的实时统计系统。
+
+---
+
+## 项目概述
+
+### 功能模块
+
+1. **UV/PV 统计**：使用 HyperLogLog 和 String
+2. **在线用户**：使用 Set 和 Sorted Set
+3. **实时排行榜**：使用 Sorted Set
+4. **访问日志**：使用 List
+5. **热点数据**：使用 Sorted Set
+
+---
+
+## UV/PV 统计
+
+### PV 统计（页面浏览量）
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+class PVCounter {
+  // 记录页面访问
+  async recordView(pageId: string): Promise<number> {
+    const today = new Date().toISOString().split("T")[0];
+    const key = `pv:${pageId}:${today}`;
+
+    return await redis.incr(key);
+  }
+
+  // 获取今日 PV
+  async getTodayPV(pageId: string): Promise<number> {
+    const today = new Date().toISOString().split("T")[0];
+    const key = `pv:${pageId}:${today}`;
+
+    const count = await redis.get(key);
+    return parseInt(count || "0");
+  }
+
+  // 获取 PV 趋势（最近 7 天）
+  async getPVTrend(pageId: string, days: number = 7) {
+    const trend = [];
+
+    for (let i = days - 1; i >= 0; i--) {
+      const date = new Date();
+      date.setDate(date.getDate() - i);
+      const dateStr = date.toISOString().split("T")[0];
+
+      const key = `pv:${pageId}:${dateStr}`;
+      const count = await redis.get(key);
+
+      trend.push({
+        date: dateStr,
+        pv: parseInt(count || "0"),
+      });
+    }
+
+    return trend;
+  }
+}
+```
+
+### UV 统计（独立访客）
+
+```typescript
+class UVCounter {
+  // 记录访客（使用 HyperLogLog）
+  async recordVisitor(pageId: string, visitorId: string) {
+    const today = new Date().toISOString().split("T")[0];
+    const key = `uv:${pageId}:${today}`;
+
+    // HyperLogLog 添加访客
+    await redis.pfadd(key, visitorId);
+
+    // 设置过期时间（30 天）
+    await redis.expire(key, 30 * 24 * 3600);
+  }
+
+  // 获取今日 UV
+  async getTodayUV(pageId: string): Promise<number> {
+    const today = new Date().toISOString().split("T")[0];
+    const key = `uv:${pageId}:${today}`;
+
+    return await redis.pfcount(key);
+  }
+
+  // 合并多天的 UV
+  async getUVByRange(pageId: string, startDate: string, endDate: string) {
+    const tempKey = `uv:${pageId}:temp:${Date.now()}`;
+    const keys = [];
+
+    let current = new Date(startDate);
+    const end = new Date(endDate);
+
+    while (current <= end) {
+      const dateStr = current.toISOString().split("T")[0];
+      keys.push(`uv:${pageId}:${dateStr}`);
+      current.setDate(current.getDate() + 1);
+    }
+
+    // 合并多个 HyperLogLog
+    await redis.pfmerge(tempKey, ...keys);
+    const count = await redis.pfcount(tempKey);
+    await redis.del(tempKey);
+
+    return count;
+  }
+}
+```
+
+---
+
+## 在线用户
+
+### 在线用户统计
+
+```typescript
+class OnlineUsers {
+  // 用户上线
+  async online(userId: string) {
+    const now = Date.now();
+
+    // 添加到在线用户集合（Set）
+    await redis.sadd("online:users", userId);
+
+    // 更新活跃时间（Sorted Set）
+    await redis.zadd("online:users:active", now, userId);
+
+    // 设置过期时间（5 分钟未活动则离线）
+    await redis.expire("online:users", 300);
+  }
+
+  // 用户活动
+  async activity(userId: string) {
+    const now = Date.now();
+    await redis.zadd("online:users:active", now, userId);
+  }
+
+  // 用户离线
+  async offline(userId: string) {
+    await redis.srem("online:users", userId);
+    await redis.zrem("online:users:active", userId);
+  }
+
+  // 获取在线用户数
+  async getOnlineCount(): Promise<number> {
+    return await redis.scard("online:users");
+  }
+
+  // 获取在线用户列表
+  async getOnlineUsers(limit: number = 100) {
+    return await redis.smembers("online:users");
+  }
+
+  // 获取最近活跃的用户
+  async getRecentActiveUsers(limit: number = 10) {
+    const now = Date.now();
+    const fiveMinutesAgo = now - 5 * 60 * 1000;
+
+    return await redis.zrangebyscore(
+      "online:users:active",
+      fiveMinutesAgo,
+      now,
+      "LIMIT",
+      0,
+      limit
+    );
+  }
+
+  // 清理过期用户
+  async cleanExpired() {
+    const now = Date.now();
+    const fiveMinutesAgo = now - 5 * 60 * 1000;
+
+    // 获取过期用户
+    const expiredUsers = await redis.zrangebyscore(
+      "online:users:active",
+      0,
+      fiveMinutesAgo
+    );
+
+    if (expiredUsers.length > 0) {
+      // 从在线用户集合移除
+      await redis.srem("online:users", ...expiredUsers);
+
+      // 从活跃集合移除
+      await redis.zremrangebyscore("online:users:active", 0, fiveMinutesAgo);
+    }
+
+    return expiredUsers.length;
+  }
+}
+```
+
+---
+
+## 实时排行榜
+
+### 文章热度排行
+
+```typescript
+class HotArticles {
+  // 增加文章热度
+  async incrementScore(articleId: string, delta: number = 1) {
+    await redis.zincrby("hot:articles", delta, articleId);
+  }
+
+  // 浏览文章
+  async view(articleId: string) {
+    // 浏览权重 1
+    await this.incrementScore(articleId, 1);
+  }
+
+  // 点赞文章
+  async like(articleId: string) {
+    // 点赞权重 5
+    await this.incrementScore(articleId, 5);
+  }
+
+  // 评论文章
+  async comment(articleId: string) {
+    // 评论权重 10
+    await this.incrementScore(articleId, 10);
+  }
+
+  // 分享文章
+  async share(articleId: string) {
+    // 分享权重 20
+    await this.incrementScore(articleId, 20);
+  }
+
+  // 获取热门文章 Top N
+  async getHotArticles(limit: number = 10) {
+    return await redis.zrevrange("hot:articles", 0, limit - 1, "WITHSCORES");
+  }
+
+  // 获取文章排名
+  async getRank(articleId: string): Promise<number | null> {
+    const rank = await redis.zrevrank("hot:articles", articleId);
+    return rank !== null ? rank + 1 : null;
+  }
+
+  // 获取指定范围的文章
+  async getRange(start: number, end: number) {
+    return await redis.zrevrange("hot:articles", start, end, "WITHSCORES");
+  }
+
+  // 定期衰减热度（每天凌晨执行）
+  async decayScores() {
+    const articles = await redis.zrange("hot:articles", 0, -1, "WITHSCORES");
+
+    const pipeline = redis.pipeline();
+    for (let i = 0; i < articles.length; i += 2) {
+      const articleId = articles[i];
+      const score = parseFloat(articles[i + 1]);
+      // 衰减为原来的 90%
+      pipeline.zadd("hot:articles", score * 0.9, articleId);
+    }
+
+    await pipeline.exec();
+  }
+}
+```
+
+### 用户积分排行
+
+```typescript
+class UserLeaderboard {
+  // 更新用户积分
+  async updateScore(userId: string, score: number) {
+    await redis.zadd("leaderboard:user:score", score, userId);
+  }
+
+  // 增加积分
+  async incrementScore(userId: string, delta: number) {
+    return await redis.zincrby("leaderboard:user:score", delta, userId);
+  }
+
+  // 获取用户排名
+  async getUserRank(userId: string): Promise<number | null> {
+    const rank = await redis.zrevrank("leaderboard:user:score", userId);
+    return rank !== null ? rank + 1 : null;
+  }
+
+  // 获取用户积分
+  async getUserScore(userId: string): Promise<number | null> {
+    const score = await redis.zscore("leaderboard:user:score", userId);
+    return score !== null ? parseFloat(score) : null;
+  }
+
+  // 获取 Top N
+  async getTopUsers(limit: number = 10) {
+    return await redis.zrevrange(
+      "leaderboard:user:score",
+      0,
+      limit - 1,
+      "WITHSCORES"
+    );
+  }
+
+  // 获取用户及前后名次
+  async getUserWithNeighbors(userId: string, range: number = 2) {
+    const rank = await this.getUserRank(userId);
+    if (!rank) return null;
+
+    const start = Math.max(0, rank - range - 1);
+    const end = rank + range - 1;
+
+    const users = await redis.zrevrange(
+      "leaderboard:user:score",
+      start,
+      end,
+      "WITHSCORES"
+    );
+
+    return {
+      rank,
+      users: users.map((u, i) => ({
+        rank: start + i + 1,
+        userId: u,
+        score: parseFloat(users[i + 1]),
+      })),
+    };
+  }
+}
+```
+
+---
+
+## 访问日志
+
+### 实时访问日志
+
+```typescript
+class AccessLog {
+  // 记录访问日志
+  async log(access: {
+    userId?: string;
+    pageId: string;
+    ip: string;
+    userAgent: string;
+    timestamp: number;
+  }) {
+    const key = `logs:access:${new Date().toISOString().split("T")[0]}`;
+
+    await redis.rpush(key, JSON.stringify(access));
+
+    // 只保留最近 7 天的日志
+    await redis.expire(key, 7 * 24 * 3600);
+  }
+
+  // 获取最近的访问日志
+  async getRecentLogs(count: number = 100) {
+    const today = new Date().toISOString().split("T")[0];
+    const key = `logs:access:${today}`;
+
+    const logs = await redis.lrange(key, -count, -1);
+
+    return logs.map((log) => JSON.parse(log));
+  }
+
+  // 统计访问量
+  async getAccessStats(hours: number = 24) {
+    const now = Date.now();
+    const oneHourAgo = now - hours * 60 * 60 * 1000;
+
+    // 使用 Sorted Set 统计时间分布
+    const key = "stats:access:timeline";
+
+    // 添加当前访问
+    await redis.zadd(key, now, `${now}-${Math.random()}`);
+
+    // 清理过期数据
+    await redis.zremrangebyscore(key, 0, oneHourAgo);
+
+    // 获取统计
+    const count = await redis.zcount(key, oneHourAgo, now);
+
+    return {
+      period: `${hours}小时`,
+      count,
+    };
+  }
+}
+```
+
+---
+
+## 综合服务
+
+### 实时统计服务
+
+```typescript
+class RealTimeStatsService {
+  private pvCounter: PVCounter;
+  private uvCounter: UVCounter;
+  private onlineUsers: OnlineUsers;
+  private hotArticles: HotArticles;
+  private userLeaderboard: UserLeaderboard;
+  private accessLog: AccessLog;
+
+  constructor(private redis: Redis) {
+    this.pvCounter = new PVCounter();
+    this.uvCounter = new UVCounter();
+    this.onlineUsers = new OnlineUsers();
+    this.hotArticles = new HotArticles();
+    this.userLeaderboard = new UserLeaderboard();
+    this.accessLog = new AccessLog();
+  }
+
+  // 页面访问
+  async pageView(pageId: string, visitorId: string, metadata: any) {
+    // 记录 PV
+    const pv = await this.pvCounter.recordView(pageId);
+
+    // 记录 UV
+    await this.uvCounter.recordVisitor(pageId, visitorId);
+
+    // 更新文章热度
+    await this.hotArticles.view(pageId);
+
+    // 记录日志
+    await this.accessLog.log({
+      userId: metadata.userId,
+      pageId,
+      ip: metadata.ip,
+      userAgent: metadata.userAgent,
+      timestamp: Date.now(),
+    });
+
+    return { pv };
+  }
+
+  // 用户登录
+  async userLogin(userId: string) {
+    await this.onlineUsers.online(userId);
+  }
+
+  // 用户活跃
+  async userActivity(userId: string) {
+    await this.onlineUsers.activity(userId);
+  }
+
+  // 用户登出
+  async userLogout(userId: string) {
+    await this.onlineUsers.offline(userId);
+  }
+
+  // 获取统计报告
+  async getStatsReport(pageId: string) {
+    const [pv, uv, onlineCount, hotArticles, topUsers] = await Promise.all([
+      this.pvCounter.getTodayPV(pageId),
+      this.uvCounter.getTodayUV(pageId),
+      this.onlineUsers.getOnlineCount(),
+      this.hotArticles.getHotArticles(10),
+      this.userLeaderboard.getTopUsers(10),
+    ]);
+
+    return {
+      page: pageId,
+      pv,
+      uv,
+      onlineUsers: onlineCount,
+      hotArticles: hotArticles.map((a, i) => ({
+        rank: i + 1,
+        articleId: a,
+        score: parseFloat(hotArticles[i + 1]),
+      })),
+      topUsers: topUsers.map((u, i) => ({
+        rank: i + 1,
+        userId: u,
+        score: parseFloat(topUsers[i + 1]),
+      })),
+    };
+  }
+}
+```
+
+---
+
+## API 示例
+
+### Express API
+
+```typescript
+import express from "express";
+
+const app = express();
+const stats = new RealTimeStatsService(redis);
+
+// 页面访问
+app.post("/api/stats/pageview", async (req, res) => {
+  const { pageId, visitorId, ...metadata } = req.body;
+
+  const result = await stats.pageView(pageId, visitorId, metadata);
+
+  res.json(result);
+});
+
+// 获取统计报告
+app.get("/api/stats/report/:pageId", async (req, res) => {
+  const { pageId } = req.params;
+
+  const report = await stats.getStatsReport(pageId);
+
+  res.json(report);
+});
+
+// 在线用户
+app.get("/api/stats/online", async (req, res) => {
+  const count = await stats["onlineUsers"].getOnlineCount();
+  const users = await stats["onlineUsers"].getRecentActiveUsers(20);
+
+  res.json({
+    count,
+    users,
+  });
+});
+
+// 热门文章
+app.get("/api/stats/hot", async (req, res) => {
+  const articles = await stats["hotArticles"].getHotArticles(20);
+
+  res.json({
+    articles: articles.map((a, i) => ({
+      rank: i + 1,
+      articleId: a,
+      score: parseFloat(articles[i + 1]),
+    })),
+  });
+});
+```
+
+---
+
+## 部署建议
+
+### 1. 持久化配置
+
+```bash
+# redis.conf
+appendonly yes
+appendfsync everysec
+```
+
+### 2. 监控指标
+
+```typescript
+// 定期检查
+setInterval(async () => {
+  // 清理过期在线用户
+  const expired = await stats["onlineUsers"].cleanExpired();
+  console.log(`清理了 ${expired} 个过期用户`);
+
+  // 检查内存使用
+  const info = await redis.info("memory");
+  console.log("内存使用:", info.match(/used_memory_human:(.+)/)?.[1]);
+}, 60000);
+```
+
+### 3. 数据备份
+
+```bash
+# 定期备份
+crontab -e
+# 每天凌晨 2 点备份
+0 2 * * * redis-cli --rdb /backup/redis-$(date +\%Y\%m\%d).rdb
+```
+
+---
+
+## 总结
+
+恭喜你完成了 Redis 渐进式学习路线！
+
+通过本系列文章，你学会了：
+
+✅ **基础篇**：Redis 安装、命令行、数据类型
+✅ **数据结构篇**：String、Hash、List、Set、Sorted Set
+✅ **缓存篇**：缓存模式、问题解决、分布式锁
+✅ **高级篇**：发布订阅、事务、Lua 脚本
+✅ **集群篇**：主从复制、Sentinel、Cluster
+✅ **实战篇**：实时统计系统
+
+现在你已经具备了在生产环境中使用 Redis 的能力！
+
+继续深入学习 Redis，构建更强大的应用！🚀

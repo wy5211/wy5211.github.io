@@ -1,0 +1,691 @@
+---
+title: "02 模板字面量类型实战"
+date: "2026-03-23"
+summary: "利用模板字面量类型在编译期进行字符串操作，构建类型安全的路由、事件和配置系统。"
+tags: ["TypeScript", "模板字面量类型", "类型安全", "字符串类型"]
+category: "typescript"
+draft: false
+series: "TypeScript 高级技巧系列"
+seriesOrder: 2
+---
+
+## 前言
+
+TypeScript 4.1 引入了**模板字面量类型**（Template Literal Types），让我们能够在类型级别操作字符串。这意味着我们可以在编译期对字符串进行拼接、转换、匹配等操作，从而实现之前需要运行时才能完成的类型检查。
+
+这对于构建类型安全的 API、路由系统、事件监听器等场景非常有用。
+
+## 核心概念
+
+### 基础语法
+
+模板字面量类型使用反引号和 `${}` 语法：
+
+```typescript
+type Greeting = `hello ${string}`;
+
+const a: Greeting = "hello world"; // ✅
+const b: Greeting = "hello world!"; // ✅
+const c: Greeting = "hello"; // ❌ 缺少空格后的部分
+const d: Greeting = "hi world"; // ❌ 不是 'hello' 开头
+```
+
+### 联合类型的分发
+
+模板字面量类型会分发联合类型：
+
+```typescript
+type Color = "red" | "blue";
+type Quantity = "one" | "two";
+
+type ColorQuantity = `${Color}-${Quantity}`;
+// 'red-one' | 'red-two' | 'blue-one' | 'blue-two'
+
+type AllColors = `${Color | "green"}-${"light" | "dark"}`;
+// 'red-light' | 'red-dark' | 'blue-light' | 'blue-dark' | 'green-light' | 'green-dark'
+```
+
+### 内置字符串操作类型
+
+TypeScript 提供了四个内置的字符串操作类型：
+
+```typescript
+type S1 = Uppercase<'hello'>      // 'HELLO'
+type S2 = Lowercase<'HELLO'>      // 'hello'
+type S3 = Capitalize<'hello'>     // 'Hello'
+type S4 = Uncapitalize<'Hello'>   // 'hello'
+
+// 在模板字面量中使用
+type PascalCase<T extends string> =
+  T extends `${infer First}-${infer Rest}`
+    ? Capitalize<First> + PascalCase<Rest>
+    : Capitalize<T>
+
+type Result = PascalCase<'foo-bar-baz'>
+// 'FooBarBaz'
+```
+
+## 高级技巧
+
+### 技巧 1：类型安全的路由系统
+
+构建一个能够自动提取路由参数的类型安全路由系统：
+
+```typescript
+// 提取路由参数
+type ExtractRouteParams<T extends string> =
+  T extends `${string}:${infer Param}/${infer Rest}`
+    ? Param | ExtractRouteParams<`/${Rest}`>
+    : T extends `${string}:${infer Param}`
+      ? Param
+      : never;
+
+// 完整的路由类型定义
+type Route = string;
+
+type RouteParams<T extends Route> =
+  T extends `${string}:${infer Param}/${infer Rest}`
+    ? Param extends `${infer Optional}?`
+      ? { [K in Param]?: string }
+      : { [K in Param]: string }
+    : T extends `${string}:${infer Param}`
+      ? Param extends `${infer Optional}?`
+        ? { [K in Param]?: string }
+        : { [K in Param]: string }
+      : {};
+
+// 使用示例
+type UserRoutes =
+  | "/users"
+  | "/users/:id"
+  | "/users/:userId/posts/:postId"
+  | "/search/:query?";
+
+type UserRouteParams = RouteParams<UserRoutes>;
+// {
+//   id?: string
+//   userId?: string
+//   postId?: string
+//   query?: string
+// }
+
+// 类型安全的路由函数
+function navigate<T extends Route>(route: T, params: RouteParams<T>): string {
+  let result = route;
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined) {
+      result = result.replace(`:${key}`, String(value));
+      result = result.replace(`:${key}?`, String(value));
+    } else {
+      result = result.replace(`/${key}?`, "");
+      result = result.replace(`:${key}?`, "");
+    }
+  }
+  return result;
+}
+
+// ✅ 类型安全
+navigate("/users/:id", { id: "123" });
+navigate("/users/:userId/posts/:postId", { userId: "123", postId: "456" });
+navigate("/search/:query?", { query: "typescript" });
+navigate("/search/:query?", {}); // query 可选
+
+// ❌ 类型错误
+navigate("/users/:id", {}); // 缺少 id
+navigate("/users/:id", { id: "123", extra: "value" }); // extra 不存在
+```
+
+---
+
+### 技巧 2：类型安全的事件系统
+
+构建一个编译期类型检查的事件系统：
+
+```typescript
+// 定义事件类型
+type Events = {
+  "user:created": { id: string; name: string; email: string };
+  "user:updated": { id: string; changes: Partial<User> };
+  "user:deleted": { id: string };
+  "post:published": { id: string; authorId: string; title: string };
+  "post:deleted": { id: string; authorId: string };
+};
+
+// 提取所有事件名
+type EventNames<T> = T extends Record<string, any> ? keyof T : never;
+
+type AllEventNames = EventNames<Events>;
+// 'user:created' | 'user:updated' | 'user:deleted' | 'post:published' | 'post:deleted'
+
+// 按前缀过滤事件
+type EventsByPrefix<T extends Record<string, any>, P extends string> =
+  T extends Record<infer K extends string, any>
+    ? K extends `${P}:${infer Rest}`
+      ? K
+      : never
+    : never;
+
+type UserEvents = EventsByPrefix<Events, "user">;
+// 'user:created' | 'user:updated' | 'user:deleted'
+
+type PostEvents = EventsByPrefix<Events, "post">;
+// 'post:published' | 'post:deleted'
+
+// 类型安全的事件发射器
+class TypedEventEmitter<E extends Record<string, any>> {
+  private listeners = new Map<keyof E, Set<Function>>();
+
+  on<K extends keyof E>(event: K, handler: (data: E[K]) => void): this {
+    if (!this.listeners.has(event)) {
+      this.listeners.set(event, new Set());
+    }
+    this.listeners.get(event)!.add(handler);
+    return this;
+  }
+
+  off<K extends keyof E>(event: K, handler: (data: E[K]) => void): this {
+    this.listeners.get(event)?.delete(handler);
+    return this;
+  }
+
+  emit<K extends keyof E>(event: K, data: E[K]): this {
+    this.listeners.get(event)?.forEach((handler) => handler(data));
+    return this;
+  }
+
+  once<K extends keyof E>(event: K, handler: (data: E[K]) => void): this {
+    const onceHandler = (data: E[K]) => {
+      handler(data);
+      this.off(event, onceHandler as any);
+    };
+    return this.on(event, onceHandler as any);
+  }
+}
+
+// 使用示例
+type User = { id: string; name: string; email: string };
+
+const emitter = new TypedEventEmitter<Events>();
+
+// ✅ 类型安全
+emitter.on("user:created", (user) => {
+  // user 类型被正确推断为 { id: string; name: string; email: string }
+  console.log(`User created: ${user.name}`);
+});
+
+emitter.emit("user:created", {
+  id: "123",
+  name: "Alice",
+  email: "alice@example.com",
+});
+
+// ❌ 类型错误
+emitter.emit("user:created", { id: "123" }); // 缺少 name 和 email
+emitter.on("unknown:event", (data) => {}); // 'unknown:event' 不存在
+```
+
+---
+
+### 技巧 3：类型安全的 CSS-in-JS
+
+使用模板字面量类型实现类型安全的样式属性：
+
+```typescript
+// CSS 属性类型
+type CSSValue =
+  | string
+  | number
+  | `${number}${"px" | "em" | "rem" | "%" | "vh" | "vw"}`
+  | `calc(${string})`;
+
+type CSSProperties = {
+  [K in keyof CSSStyleDeclaration]?: CSSValue;
+};
+
+// 颜色类型
+type Color =
+  | `#${string}`
+  | `rgb(${number}, ${number}, ${number})`
+  | `rgba(${number}, ${number}, ${number}, ${number})`
+  | "transparent"
+  | "inherit";
+
+// 边框类型
+type Border = `${number}px ${"solid" | "dashed" | "dotted"} ${Color}` | "none";
+
+// 专门的样式类型
+type BoxStyle = {
+  width?: CSSValue;
+  height?: CSSValue;
+  margin?: CSSValue | `${CSSValue} ${CSSValue}`;
+  padding?: CSSValue | `${CSSValue} ${CSSValue}`;
+  backgroundColor?: Color;
+  border?: Border;
+  borderRadius?: `${number}px`;
+};
+
+// 类型安全的样式函数
+function createStyle<T extends BoxStyle>(styles: T): T {
+  return styles;
+}
+
+// ✅ 类型安全
+const buttonStyle = createStyle({
+  width: "100px",
+  height: "40px",
+  padding: "10px 20px",
+  backgroundColor: "#007bff",
+  border: "1px solid #0056b3",
+  borderRadius: "4px",
+});
+
+const flexStyle = createStyle({
+  width: "100%",
+  height: "50vh",
+  margin: "20px",
+  backgroundColor: "rgba(0, 0, 0, 0.5)",
+});
+
+// ❌ 类型错误
+const badStyle = createStyle({
+  width: "100pixels", // ❌ 单位错误
+  backgroundColor: "#GGG", // ❌ 颜色格式错误
+  border: "1px solid", // ❌ 缺少颜色
+});
+```
+
+---
+
+### 技巧 4：类型安全的国际化（i18n）
+
+构建一个类型安全的翻译系统：
+
+```typescript
+// 定义翻译键
+type TranslationKeys =
+  | "common.save"
+  | "common.cancel"
+  | "common.delete"
+  | "user.profile.title"
+  | "user.profile.edit"
+  | "user.settings.notifications";
+
+// 按前缀提取翻译键
+type NamespaceTranslations<
+  T extends string,
+  N extends string,
+> = T extends `${N}.${infer Rest}` ? Rest : never;
+
+type CommonTranslations = NamespaceTranslations<TranslationKeys, "common">;
+// 'save' | 'cancel' | 'delete'
+
+type UserTranslations = NamespaceTranslations<TranslationKeys, "user">;
+// 'profile.title' | 'profile.edit' | 'settings.notifications'
+
+// 翻译函数
+type Translations = Record<TranslationKeys, string>;
+
+function t<K extends TranslationKeys>(
+  key: K,
+  translations: Translations
+): Translations[K] {
+  return translations[key];
+}
+
+// 使用示例
+const translations: Translations = {
+  "common.save": "保存",
+  "common.cancel": "取消",
+  "common.delete": "删除",
+  "user.profile.title": "用户资料",
+  "user.profile.edit": "编辑资料",
+  "user.settings.notifications": "通知设置",
+};
+
+// ✅ 类型安全
+const saveText = t("common.save", translations);
+const profileTitle = t("user.profile.title", translations);
+
+// ❌ 类型错误
+const invalid = t("common.invalid", translations); // 'common.invalid' 不存在
+
+// 带参数的翻译
+type ParametricKey = "welcome.user" | "items.count";
+
+type TranslationWithParams =
+  | { key: "welcome.user"; params: { name: string } }
+  | { key: "items.count"; params: { count: number } };
+
+function translateWithParams<T extends TranslationWithParams>(
+  config: T
+): string {
+  switch (config.key) {
+    case "welcome.user":
+      return `Welcome, ${config.params.name}!`;
+    case "items.count":
+      return `You have ${config.params.count} items`;
+  }
+}
+
+// ✅ 类型安全
+translateWithParams({ key: "welcome.user", params: { name: "Alice" } });
+translateWithParams({ key: "items.count", params: { count: 5 } });
+
+// ❌ 类型错误
+translateWithParams({ key: "welcome.user", params: { age: 25 } });
+```
+
+---
+
+### 技巧 5：类型状态的机
+
+使用模板字面量类型构建类型状态机：
+
+```typescript
+// 状态类型
+type State = "idle" | "loading" | "success" | "error";
+
+// 状态转换
+type StateTransitions = {
+  idle: "loading";
+  loading: "success" | "error";
+  success: "idle";
+  error: "idle" | "loading";
+};
+
+// 状态机类型
+type StateMachine<
+  TState extends State,
+  TTransitions extends StateTransitions,
+> = {
+  state: TState;
+  transition<TTo extends TTransitions[TState]>(
+    to: TTo
+  ): StateMachine<TTo, TTransitions>;
+};
+
+// 创建状态机
+function createStateMachine<S extends State, T extends StateTransitions>(
+  initialState: S,
+  transitions: T
+): StateMachine<S, T> {
+  return {
+    state: initialState,
+    transition(to) {
+      return createStateMachine(to, transitions);
+    },
+  };
+}
+
+// 使用示例
+type AppTransitions = {
+  idle: "loading";
+  loading: "success" | "error";
+  success: "idle";
+  error: "idle" | "loading";
+};
+
+const machine = createStateMachine<"idle", AppTransitions>("idle", {
+  idle: "loading",
+  loading: ["success", "error"] as any,
+  success: "idle",
+  error: ["idle", "loading"] as any,
+});
+
+// ✅ 类型安全的状态转换
+const m1 = machine.transition("loading");
+const m2 = m1.transition("success");
+const m3 = m2.transition("idle");
+
+// ❌ 类型错误：不允许的转换
+const m4 = machine.transition("success"); // 不能从 idle 直接到 success
+```
+
+---
+
+### 技巧 6：类型安全的命令模式
+
+构建一个类型安全的命令/查询系统：
+
+```typescript
+// 命令类型
+type Command =
+  | "user:create"
+  | "user:update"
+  | "user:delete"
+  | "post:create"
+  | "post:update"
+  | "post:delete";
+
+// 命令参数类型
+type CommandParams = {
+  "user:create": { name: string; email: string };
+  "user:update": { id: string; changes: Partial<User> };
+  "user:delete": { id: string };
+  "post:create": { title: string; content: string; authorId: string };
+  "post:update": { id: string; changes: Partial<Post> };
+  "post:delete": { id: string };
+};
+
+// 命令处理器
+type CommandHandler<T extends Command> = (
+  params: CommandParams[T]
+) => Promise<void>;
+
+// 命令总线
+class CommandBus {
+  private handlers = new Map<Command, CommandHandler<any>>();
+
+  register<T extends Command>(command: T, handler: CommandHandler<T>): void {
+    this.handlers.set(command, handler);
+  }
+
+  async execute<T extends Command>(
+    command: T,
+    params: CommandParams[T]
+  ): Promise<void> {
+    const handler = this.handlers.get(command);
+    if (!handler) {
+      throw new Error(`No handler registered for command: ${command}`);
+    }
+    await handler(params);
+  }
+}
+
+// 使用示例
+type User = { id: string; name: string; email: string };
+type Post = { id: string; title: string; content: string; authorId: string };
+
+const bus = new CommandBus();
+
+// ✅ 类型安全
+bus.register("user:create", async (params) => {
+  // params 类型: { name: string; email: string }
+  console.log(`Creating user: ${params.name}`);
+});
+
+bus.register("user:update", async (params) => {
+  // params 类型: { id: string; changes: Partial<User> }
+  console.log(`Updating user: ${params.id}`);
+});
+
+bus.execute("user:create", { name: "Alice", email: "alice@example.com" });
+bus.execute("user:update", { id: "123", changes: { name: "Bob" } });
+
+// ❌ 类型错误
+bus.execute("user:create", { name: "Alice" }); // 缺少 email
+bus.execute("unknown:command", {}); // 未知命令
+```
+
+## 实战应用
+
+### 构建类型安全的 GraphQL 查询生成器
+
+```typescript
+// GraphQL 类型定义
+type GraphQLTypes = {
+  User: {
+    id: string;
+    name: string;
+    email: string;
+    posts: Post[];
+  };
+  Post: {
+    id: string;
+    title: string;
+    content: string;
+    author: User;
+  };
+  Query: {
+    user: User;
+    users: User[];
+    post: Post;
+    posts: Post[];
+  };
+};
+
+// 字符串字面量类型操作
+type camelize<S extends string> = S extends `${infer P}_${infer Q}`
+  ? `${P}${Capitalize<camelize<Q>>}`
+  : S;
+
+type GraphQLField<T extends keyof GraphQLTypes> =
+  | keyof GraphQLTypes[T]
+  | `${NestedFields<T>}`;
+
+type NestedFields<
+  T extends keyof GraphQLTypes,
+  K extends keyof GraphQLTypes[T] = keyof GraphQLTypes[T],
+> = K extends string
+  ? GraphQLTypes[T][K] extends infer R
+    ? R extends (infer Item)[]
+      ? Item extends object
+        ? `${K} { ${NestedFields<keyof GraphQLTypes>} }`
+        : K
+      : R extends object
+        ? `${K} { ${NestedFields<keyof GraphQLTypes>} }`
+        : K
+    : never
+  : never;
+
+// 查询构建器
+class GraphQLQueryBuilder<T extends keyof GraphQLTypes> {
+  private fields: string[] = [];
+
+  select<K extends keyof GraphQLTypes[T]>(field: K): this {
+    this.fields.push(String(field));
+    return this;
+  }
+
+  nested<K extends keyof GraphQLTypes[T]>(
+    field: K,
+    builder: (qb: GraphQLQueryBuilder<keyof GraphQLTypes>) => void
+  ): this {
+    const nested = new GraphQLQueryBuilder<keyof GraphQLTypes>();
+    builder(nested);
+    this.fields.push(`${String(field)} { ${nested.build()} }`);
+    return this;
+  }
+
+  build(): string {
+    return this.fields.join("\n  ");
+  }
+}
+
+// 使用示例
+const query = new GraphQLQueryBuilder<"Query">()
+  .nested("user", (qb) => {
+    qb.select("id").select("name");
+  })
+  .build();
+
+console.log(query);
+// user {
+//   id
+//   name
+// }
+```
+
+## 避坑指南
+
+### ❌ 错误 1：过度复杂的模板字面量类型
+
+```typescript
+// ❌ 性能差：过于复杂的嵌套
+type Complex<T> =
+  T extends `${infer A}:${infer B}:${infer C}:${infer D}:${infer E}`
+    ? `${A}-${B}-${C}-${D}-${E}`
+    : never;
+
+// ✅ 性能好：简化逻辑
+type Simple<T> =
+  T extends `${string}:${string}:${string}:${string}:${infer Rest}`
+    ? Rest
+    : never;
+```
+
+---
+
+### ❌ 错误 2：忘记联合类型的分发特性
+
+```typescript
+type ToUpperCase<T extends string> = Uppercase<T>;
+
+type Result1 = ToUpperCase<"hello" | "world">;
+// 'HELLO' | 'WORLD' (正确)
+
+// 但在模板字面量中需要小心
+type Prefix<T extends string> = `prefix_${T}`;
+
+type Result2 = Prefix<"a" | "b">;
+// 'prefix_a' | 'prefix_b' (正确分发)
+
+// 使用联合类型时要注意
+type Double<T> = `${T}${T}`;
+type Result3 = Double<"a" | "b">;
+// 'aa' | 'bb' (不是 'aa' | 'ab' | 'ba' | 'bb')
+```
+
+---
+
+### ❌ 错误 3：假设字符串操作会改变类型
+
+```typescript
+// Capitalize 等操作不会创建新类型，只是类型转换
+type Test1 = Capitalize<"hello">;
+// 'Hello'
+
+// 但在条件类型中使用时要注意
+type Test2<T> = T extends `hello` ? "yes" : "no";
+
+type Result1 = Test2<"hello">;
+// 'yes'
+
+type Result2 = Test2<Capitalize<"hello">>;
+// 'no' (因为 'Hello' 不匹配 'hello')
+```
+
+## 总结
+
+### 核心要点
+
+1. **模板字面量类型**：在类型级别操作字符串
+2. **联合类型分发**：自动应用到联合类型的每个成员
+3. **内置字符串类型**：Uppercase、Lowercase、Capitalize、Uncapitalize
+4. **实战应用**：路由系统、事件系统、CSS-in-JS、i18n 等
+
+### 性能建议
+
+- 避免过度复杂的嵌套模板字面量类型
+- 使用辅助类型简化复杂逻辑
+- 在性能关键场景考虑使用类型别名缓存
+
+## 参考资料
+
+- [TypeScript Handbook: Template Literal Types](https://www.typescriptlang.org/docs/handbook/2/template-literal-types.html)
+- [TypeScript 4.1 Release Notes](https://www.typescriptlang.org/docs/handbook/release-notes/typescript-4-1.html)
+
+---
+
+- **上一篇**：[01 条件类型与类型推断](../01-conditional-types-inference.mdx)
+- **下一篇**：[03 泛型高级应用](../03-advanced-generics.mdx)

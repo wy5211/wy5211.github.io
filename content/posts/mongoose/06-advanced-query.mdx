@@ -1,0 +1,786 @@
+---
+title: "06 高级查询与聚合"
+date: "2026-03-23"
+summary: "掌握 MongoDB 聚合管道（Aggregation Pipeline），实现复杂的数据统计、分组和关联查询"
+tags: ["Mongoose", "聚合", "Aggregation", "$lookup"]
+category: "mongoose"
+draft: false
+series: "Mongoose 渐进式学习"
+seriesOrder: 6
+---
+
+## 前言
+
+MongoDB 的聚合管道（Aggregation Pipeline）是强大的数据处理工具，类似于 SQL 的 GROUP BY、JOIN 等操作。
+
+通过聚合管道，我们可以在数据库层面完成复杂的数据转换、统计和分析。
+
+## 核心概念
+
+### 聚合管道阶段
+
+```
+Input → [$match] → [$project] → [$lookup] → [$unwind] → [$group] → [$sort] → Output
+          ↓           ↓            ↓           ↓          ↓
+         筛选       字段选择      关联查询    展开数组    分组统计
+```
+
+### 常用 Stage
+
+| Stage          | 说明          | 类似 SQL            |
+| -------------- | ------------- | ------------------- |
+| $match         | 筛选文档      | WHERE               |
+| $project       | 选择字段      | SELECT              |
+| $lookup        | 关联查询      | LEFT JOIN           |
+| $unwind        | 展开数组      | UNNEST              |
+| $group         | 分组统计      | GROUP BY + 聚合函数 |
+| $sort          | 排序          | ORDER BY            |
+| $limit / $skip | 分页          | LIMIT / OFFSET      |
+| $facet         | 多 facet 聚合 | 多个独立查询        |
+| $addFields     | 添加字段      | AS                  |
+| $count         | 计数          | COUNT(\*)           |
+
+## 实战演练
+
+### 基础聚合管道
+
+创建 `src/examples/aggregation-basic.ts`：
+
+```typescript
+import Post from "../models/Post";
+import connectDB from "../config/database";
+
+await connectDB();
+
+// ==================== $match + $project + $sort ====================
+console.log("\n=== 基础聚合管道 ===");
+
+const result1 = await Post.aggregate([
+  // Stage 1: 筛选
+  {
+    $match: {
+      status: "published",
+      views: { $gte: 100 },
+    },
+  },
+  // Stage 2: 选择字段
+  {
+    $project: {
+      title: 1,
+      views: 1,
+      likes: 1,
+      tags: 1,
+      popularity: { $add: ["$views", "$likes"] }, // 计算字段
+    },
+  },
+  // Stage 3: 排序
+  {
+    $sort: { popularity: -1 },
+  },
+  // Stage 4: 限制
+  {
+    $limit: 5,
+  },
+]);
+
+console.log("基础聚合结果（已发布 + 浏览>=100 + 按热度排序）:");
+result1.forEach((post: any) => {
+  console.log(
+    `  - ${post.title}: ${post.views} 浏览 + ${post.likes} 点赞 = ${post.popularity} 热度`
+  );
+});
+
+// ==================== $group 分组统计 ====================
+console.log("\n=== $group 分组统计 ===");
+
+const result2 = await Post.aggregate([
+  // 只查询已发布的文章
+  {
+    $match: { status: "published" },
+  },
+  // 按标签分组
+  {
+    $unwind: "$tags",
+  },
+  // 分组统计
+  {
+    $group: {
+      _id: "$tags",
+      count: { $sum: 1 },
+      totalViews: { $sum: "$views" },
+      avgViews: { $avg: "$views" },
+      maxViews: { $max: "$views" },
+      posts: {
+        $push: {
+          title: "$title",
+          views: "$views",
+          createdAt: "$createdAt",
+        },
+      },
+    },
+  },
+  // 排序
+  {
+    $sort: { count: -1 },
+  },
+  // 限制
+  {
+    $limit: 10,
+  },
+  // 格式化输出
+  {
+    $project: {
+      tag: "$_id",
+      count: 1,
+      totalViews: 1,
+      avgViews: { $round: ["$avgViews", 2] },
+      latestPost: { $last: "$posts.title" },
+    },
+  },
+]);
+
+console.log("标签统计（按文章数排序）:");
+result2.forEach((stat: any) => {
+  console.log(`  ${stat.tag}:`);
+  console.log(`    - 文章数: ${stat.count}`);
+  console.log(`    - 总浏览: ${stat.totalViews}`);
+  console.log(`    - 平均浏览: ${stat.avgViews}`);
+  console.log(`    - 最新文章: ${stat.latestPost}`);
+});
+
+// ==================== $facet 多 facet 聚合 ====================
+console.log("\n=== $facet 多 facet 聚合 ===");
+
+const result3 = await Post.aggregate([
+  {
+    $match: { status: "published" },
+  },
+  {
+    $facet: {
+      // Facet 1: 热门文章
+      popularPosts: [
+        { $sort: { views: -1 } },
+        { $limit: 5 },
+        { $project: { title: 1, views: 1, _id: 0 } },
+      ],
+      // Facet 2: 最新文章
+      latestPosts: [
+        { $sort: { createdAt: -1 } },
+        { $limit: 5 },
+        { $project: { title: 1, createdAt: 1, _id: 0 } },
+      ],
+      // Facet 3: 统计数据
+      stats: [
+        {
+          $group: {
+            _id: null,
+            totalPosts: { $sum: 1 },
+            totalViews: { $sum: "$views" },
+            avgViews: { $avg: "$views" },
+          },
+        },
+      ],
+      // Facet 4: 标签分布
+      tags: [
+        { $unwind: "$tags" },
+        {
+          $group: {
+            _id: "$tags",
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { count: -1 } },
+        { $limit: 5 },
+      ],
+    },
+  },
+]);
+
+console.log("多 facet 聚合结果:");
+console.log("\n📈 热门文章:");
+result3[0].popularPosts.forEach((post: any) => {
+  console.log(`  - ${post.title}: ${post.views} 浏览`);
+});
+
+console.log("\n🆕 最新文章:");
+result3[0].latestPosts.forEach((post: any) => {
+  console.log(`  - ${post.title}: ${post.createdAt.toLocaleDateString()}`);
+});
+
+console.log("\n📊 统计数据:");
+const stats = result3[0].stats[0];
+console.log(`  - 总文章: ${stats.totalPosts}`);
+console.log(`  - 总浏览: ${stats.totalViews}`);
+console.log(`  - 平均浏览: ${stats.avgViews.toFixed(2)}`);
+
+console.log("\n🏷️  标签分布:");
+result3[0].tags.forEach((tag: any) => {
+  console.log(`  - ${tag._id}: ${tag.count} 篇`);
+});
+
+process.exit(0);
+```
+
+### $lookup 关联查询
+
+创建 `src/examples/aggregation-lookup.ts`：
+
+```typescript
+import Post from "../models/Post";
+import User from "../models/User";
+import connectDB from "../config/database";
+
+await connectDB();
+
+// ==================== 基础 $lookup ====================
+console.log("\n=== 基础 $lookup ===");
+
+const result1 = await Post.aggregate([
+  {
+    $match: { status: "published" },
+  },
+  // 关联用户表
+  {
+    $lookup: {
+      from: "users", // 要关联的集合
+      localField: "author", // 当前集合的字段
+      foreignField: "_id", // 被关联集合的字段
+      as: "authorInfo", // 输出字段名
+    },
+  },
+  { $unwind: "$authorInfo" },
+  // 选择字段
+  {
+    $project: {
+      title: 1,
+      "authorInfo.name": 1,
+      "authorInfo.email": 1,
+      views: 1,
+    },
+  },
+]);
+
+console.log("文章及作者信息:");
+result1.forEach((post: any) => {
+  console.log(`  - ${post.title}`);
+  console.log(`    作者: ${post.authorInfo.name} (${post.authorInfo.email})`);
+});
+
+// ==================== $lookup + $unwind ====================
+console.log("\n=== $lookup + $unwind ===");
+
+const result2 = await Post.aggregate([
+  {
+    $match: { status: "published" },
+  },
+  {
+    $lookup: {
+      from: "users",
+      localField: "author",
+      foreignField: "_id",
+      as: "authorInfo",
+    },
+  },
+  {
+    $unwind: {
+      path: "$authorInfo",
+      preserveNullAndEmptyArrays: true,
+    },
+  },
+  {
+    $project: {
+      title: 1,
+      authorName: "$authorInfo.name",
+      authorEmail: "$authorInfo.email",
+      views: 1,
+    },
+  },
+]);
+
+result2.forEach((post: any) => {
+  console.log(`  - ${post.title} by ${post.authorName}`);
+});
+
+// ==================== 复杂关联查询 ====================
+console.log("\n=== 复杂关联查询 ===");
+
+const result3 = await Post.aggregate([
+  {
+    $match: { status: "published" },
+  },
+  {
+    $lookup: {
+      from: "users",
+      let: { authorId: "$author" },
+      pipeline: [
+        {
+          $match: {
+            $expr: {
+              $eq: ["$_id", "$$authorId"],
+            },
+          },
+        },
+        {
+          $project: {
+            name: 1,
+            email: 1,
+            role: 1,
+          },
+        },
+      ],
+      as: "authorInfo",
+    },
+  },
+  {
+    $unwind: "$authorInfo",
+  },
+  {
+    $match: {
+      "authorInfo.role": "author", // 只查询作者的文章
+    },
+  },
+  {
+    $project: {
+      title: 1,
+      authorName: "$authorInfo.name",
+      authorRole: "$authorInfo.role",
+      views: 1,
+    },
+  },
+]);
+
+console.log("作者的文章:");
+result3.forEach((post: any) => {
+  console.log(`  - ${post.title} by ${post.authorName} (${post.authorRole})`);
+});
+
+// ==================== 多层 $lookup ====================
+console.log("\n=== 多层 $lookup ===");
+
+const result4 = await Post.aggregate([
+  {
+    $match: { status: "published" },
+  },
+  // 第一层：关联作者
+  {
+    $lookup: {
+      from: "users",
+      localField: "author",
+      foreignField: "_id",
+      as: "authorInfo",
+    },
+  },
+  {
+    $unwind: "$authorInfo",
+  },
+  // 第二层：关联作者的帖子数
+  {
+    $lookup: {
+      from: "posts",
+      let: { authorId: "$authorInfo._id" },
+      pipeline: [
+        {
+          $match: {
+            $expr: {
+              $eq: ["$author", "$$authorId"],
+            },
+          },
+        },
+        {
+          $count: "postCount",
+        },
+      ],
+      as: "authorPosts",
+    },
+  },
+  {
+    $addFields: {
+      "authorInfo.postCount": { $arrayElemAt: ["$authorPosts.postCount", 0] },
+    },
+  },
+  {
+    $project: {
+      title: 1,
+      authorName: "$authorInfo.name",
+      authorPostCount: "$authorInfo.postCount",
+      views: 1,
+    },
+  },
+]);
+
+console.log("作者的文章统计:");
+result4.forEach((post: any) => {
+  console.log(
+    `  - ${post.title} by ${post.authorName} (作者共有 ${post.authorPostCount} 篇文章)`
+  );
+});
+
+process.exit(0);
+```
+
+### $addFields 计算字段
+
+创建 `src/examples/aggregation-addfields.ts`：
+
+```typescript
+import Post from "../models/Post";
+import connectDB from "../config/database";
+
+await connectDB();
+
+const result = await Post.aggregate([
+  {
+    $match: { status: "published" },
+  },
+  // 添加计算字段
+  {
+    $addFields: {
+      // 热度 = 浏览 + 点赞
+      popularity: { $add: ["$views", "$likes"] },
+      // 是否热门（浏览量 > 100）
+      isPopular: { $cond: [{ $gt: ["$views", 100] }, true, false] },
+      // 标签数量
+      tagCount: { $size: "$tags" },
+      // 创建日期（只取年月）
+      createdYearMonth: {
+        $dateToString: {
+          format: "%Y-%m",
+          date: "$createdAt",
+        },
+      },
+    },
+  },
+  // 使用计算字段进行过滤
+  {
+    $match: {
+      isPopular: true,
+      tagCount: { $gte: 2 },
+    },
+  },
+  {
+    $project: {
+      title: 1,
+      popularity: 1,
+      isPopular: 1,
+      tagCount: 1,
+      createdYearMonth: 1,
+    },
+  },
+]);
+
+console.log("热门且有多个标签的文章:");
+result.forEach((post: any) => {
+  console.log(`  - ${post.title}`);
+  console.log(`    热度: ${post.popularity}`);
+  console.log(`    标签数: ${post.tagCount}`);
+  console.log(`    创建时间: ${post.createdYearMonth}`);
+});
+
+process.exit(0);
+```
+
+## 实战应用
+
+### 文章统计面板
+
+```typescript
+import Post from "../models/Post";
+import connectDB from "../config/database";
+
+async function getDashboardStats() {
+  await connectDB();
+
+  const stats = await Post.aggregate([
+    {
+      $match: {
+        status: "published",
+        deletedAt: { $exists: false },
+      },
+    },
+    {
+      $facet: {
+        // 总体统计
+        overview: [
+          {
+            $group: {
+              _id: null,
+              totalPosts: { $sum: 1 },
+              totalViews: { $sum: "$views" },
+              totalLikes: { $sum: "$likes" },
+              avgViews: { $avg: "$views" },
+              avgLikes: { $avg: "$likes" },
+            },
+          },
+        ],
+        // 时间趋势（按天）
+        trend: [
+          {
+            $group: {
+              _id: {
+                $dateToString: {
+                  format: "%Y-%m-%d",
+                  date: "$createdAt",
+                },
+              },
+              posts: { $sum: 1 },
+              views: { $sum: "$views" },
+            },
+          },
+          { $sort: { _id: 1 } },
+          { $limit: 30 },
+        ],
+        // 作者排行
+        topAuthors: [
+          {
+            $lookup: {
+              from: "users",
+              localField: "author",
+              foreignField: "_id",
+              as: "author",
+            },
+          },
+          { $unwind: "$author" },
+          {
+            $group: {
+              _id: "$author",
+              authorName: { $first: "$author.name" },
+              postCount: { $sum: 1 },
+              totalViews: { $sum: "$views" },
+            },
+          },
+          { $sort: { postCount: -1 } },
+          { $limit: 10 },
+        ],
+        // 标签分布
+        tagDistribution: [
+          { $unwind: "$tags" },
+          {
+            $group: {
+              _id: "$tags",
+              count: { $sum: 1 },
+              totalViews: { $sum: "$views" },
+            },
+          },
+          { $sort: { count: -1 } },
+          { $limit: 20 },
+        ],
+        // 文章状态分布
+        statusDistribution: [
+          {
+            $group: {
+              _id: "$status",
+              count: { $sum: 1 },
+            },
+          },
+        ],
+      },
+    },
+  ]);
+
+  return stats[0];
+}
+
+// 使用示例
+const dashboard = await getDashboardStats();
+
+console.log("\n📊 总体统计:");
+const overview = dashboard.overview[0];
+console.log(`  - 总文章: ${overview.totalPosts}`);
+console.log(`  - 总浏览: ${overview.totalViews}`);
+console.log(`  - 平均浏览: ${overview.avgViews.toFixed(2)}`);
+
+console.log("\n📈 最近30天趋势:");
+dashboard.trend.slice(0, 7).forEach((trend: any) => {
+  console.log(`  ${trend._id}: ${trend.posts} 篇, ${trend.views} 浏览`);
+});
+
+console.log("\n✍️  作者排行:");
+dashboard.topAuthors.slice(0, 5).forEach((author: any) => {
+  console.log(
+    `  ${author.authorName}: ${author.postCount} 篇文章, ${author.totalViews} 浏览`
+  );
+});
+
+console.log("\n🏷️  标签分布:");
+dashboard.tagDistribution.slice(0, 10).forEach((tag: any) => {
+  console.log(`  ${tag._id}: ${tag.count} 篇文章, ${tag.totalViews} 浏览`);
+});
+```
+
+### 图搜索（$graphLookup）
+
+```typescript
+// 查找用户的关注网络
+const userNetwork = await User.aggregate([
+  {
+    $match: { _id: userId },
+  },
+  {
+    $graphLookup: {
+      from: "users",
+      startWith: "$following",
+      connectFromField: "following",
+      connectToField: "following",
+      as: "network",
+      depthField: "level",
+      maxDepth: 3, // 3层关注关系
+    },
+  },
+  {
+    $project: {
+      name: 1,
+      level: 1,
+      network: {
+        $map: {
+          input: "$network",
+          as: "user",
+          in: ["name", "level"],
+        },
+      },
+    },
+  },
+]);
+
+console.log("用户关注网络:");
+userNetwork.forEach((user: any) => {
+  console.log(`  ${user.name} (Level ${user.level})`);
+  if (user.network && user.network.length > 0) {
+    user.network.forEach((following: any) => {
+      console.log(`    - ${following.name} (Level ${following.level})`);
+    });
+  }
+});
+```
+
+## 最佳实践
+
+### 1. 聚合管道优化
+
+```typescript
+// ✅ 尽早使用 $match 过滤
+const result = await Post.aggregate([
+  { $match: { status: 'published' } }, // 先过滤
+  { $lookup: { ... } }, // 再关联
+  { $limit: 100 } // 最后限制
+]);
+
+// ✅ 使用 $project 减少数据
+const result = await Post.aggregate([
+  { $project: { title: 1, views: 1 } }, // 只选择需要的字段
+  { $match: { views: { $gte: 100 } } }
+]);
+
+// ✅ 使用索引
+postSchema.index({ status: 1, createdAt: -1 });
+```
+
+### 2. 避免内存限制
+
+```typescript
+// ✅ 使用 allowDiskUse
+const result = await Post.aggregate([
+  { $match: { ... } },
+  { $sort: { createdAt: -1 } }
+], { allowDiskUse: true });
+
+// ⚠️ 注意：allowDiskUse 可能影响性能
+```
+
+### 3. 使用 $facet 并行执行
+
+```typescript
+// ✅ $facet 并行执行多个管道
+const result = await Post.aggregate([
+  { $match: { status: "published" } },
+  {
+    $facet: {
+      latest: [{ $sort: { createdAt: -1 } }, { $limit: 5 }],
+      popular: [{ $sort: { views: -1 } }, { $limit: 5 }],
+    },
+  },
+]);
+
+// ❌ 避免顺序执行
+const latest = await Post.find().sort({ createdAt: -1 }).limit(5);
+const popular = await Post.find().sort({ views: -1 }).limit(5);
+```
+
+## 常见问题
+
+### Q1: 聚合管道和 find() 的区别？
+
+**A**:
+
+- **find()**: 返回完整的 Mongoose Document
+- **aggregate()**: 返回普通 JS 对象（性能更好）
+
+```typescript
+// find() - 返回 Document
+const posts = await Post.find();
+
+// aggregate() - 返回普通对象
+const posts = await Post.aggregate([]);
+```
+
+### Q2: $lookup 和 populate 的区别？
+
+**A**:
+
+- **populate**: 应用层 join（多个查询）
+- **$lookup**: 数据库层 join（一次查询）
+
+```typescript
+// populate - 应用层
+const posts = await Post.find().populate("author");
+
+// $lookup - 数据库层
+const posts = await Post.aggregate([
+  {
+    $lookup: {
+      from: "users",
+      localField: "author",
+      foreignField: "_id",
+      as: "author",
+    },
+  },
+]);
+```
+
+### Q3: 如何处理聚合结果？
+
+**A**:
+
+```typescript
+const result = await Post.aggregate([...]);
+
+// 转换为 Model 实例
+const posts = result.map(doc => new Post(doc));
+
+// 或保持为普通对象（性能更好）
+const plainObjects = result.map(doc => ({ ...doc }));
+```
+
+## 总结
+
+本文掌握了 MongoDB 聚合管道：
+
+1. ✅ 基础 Stage：$match、$project、$sort、$limit
+2. ✅ $group 分组统计
+3. ✅ $lookup 关联查询
+4. ✅ $facet 多 facet 聚合
+5. ✅ $addFields 计算字段
+6. ✅ $graphLookup 图搜索
+
+## 下一步
+
+下一篇文章将学习 **中间件与 Hooks 机制**，探讨：
+
+- Document 中间件
+- Query 中间件
+- pre/post Hooks
+- 业务逻辑实现
+
+---
+
+- **上一篇**：[05 关系设计与建模](../05-relationships.mdx)
+- **下一篇**：[07 中间件与 Hooks](../07-middleware-hooks.mdx)

@@ -1,0 +1,811 @@
+---
+title: "05. 插件开发实战：扩展 Vite 的能力"
+date: "2025-03-23"
+summary: "掌握 Vite 插件开发的核心技术，学习自定义转换、虚拟模块、钩子函数等高级特性，开发属于自己的 Vite 插件。"
+tags: ["Vite", "插件开发", "Rollup", "扩展"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 深入实战"
+seriesOrder: 5
+---
+
+## 前言
+
+Vite 的强大之处在于其插件系统。通过插件，我们可以扩展 Vite 的能力，实现代码转换、虚拟模块、自定义服务器等功能。本文将深入讲解 Vite 插件开发的技术。
+
+## 插件基础
+
+### 插件结构
+
+```typescript
+// my-plugin.ts
+import type { Plugin } from "vite";
+
+export function myPlugin(): Plugin {
+  return {
+    // 插件名称
+    name: "vite-plugin-my-plugin",
+
+    // 应用模式
+    apply: "serve", // 'serve' | 'build' | ((config) => boolean)
+
+    // 执行顺序
+    enforce: "pre", // 'pre' | 'post' | undefined
+
+    // 配置钩子
+    config(config, { command }) {
+      // 修改 Vite 配置
+      return {
+        define: {
+          __MY_PLUGIN__: JSON.stringify(true),
+        },
+      };
+    },
+
+    // 配置解析完成
+    configResolved(resolvedConfig) {
+      console.log("Config resolved:", resolvedConfig);
+    },
+
+    // 配置开发服务器
+    configureServer(server) {
+      // 返回后置中间件
+      return () => {
+        server.middlewares.use((req, res, next) => {
+          if (req.url === "/hello") {
+            res.end("Hello from plugin!");
+          } else {
+            next();
+          }
+        });
+      };
+    },
+
+    // 转换 HTML
+    transformIndexHtml(html) {
+      return html.replace(
+        "</title>",
+        '</title><script src="/my-plugin-init.js"></script>'
+      );
+    },
+
+    // Rollup 钩子
+    resolveId(source) {
+      if (source === "virtual:my-module") {
+        return source;
+      }
+      return null;
+    },
+
+    load(id) {
+      if (id === "virtual:my-module") {
+        return 'export default "Hello from virtual module"';
+      }
+      return null;
+    },
+
+    transform(code, id) {
+      if (id.endsWith(".custom")) {
+        return {
+          code: `// transformed\n${code}`,
+          map: null,
+        };
+      }
+    },
+  };
+}
+```
+
+### 使用插件
+
+```typescript
+// vite.config.ts
+import { myPlugin } from "./my-plugin";
+
+export default defineConfig({
+  plugins: [myPlugin()],
+});
+```
+
+## 核心钩子详解
+
+### 通用钩子
+
+#### name
+
+插件名称，用于调试和错误提示。
+
+```typescript
+{
+  name: "vite-plugin-my-plugin";
+}
+```
+
+#### apply
+
+控制插件的应用模式。
+
+```typescript
+// 只在开发环境应用
+{
+  apply: 'serve'
+}
+
+// 只在生产构建时应用
+{
+  apply: 'build'
+}
+
+// 动态判断
+{
+  apply(config, { command }) {
+    return command === 'serve' && config.mode === 'development';
+  }
+}
+```
+
+#### enforce
+
+控制插件的执行顺序。
+
+```typescript
+// 前置执行（在 Vite 核心插件之前）
+{
+  enforce: "pre";
+}
+
+// 后置执行（在 Vite 核心插件之后）
+{
+  enforce: "post";
+}
+
+// 默认顺序
+{
+  enforce: undefined;
+}
+```
+
+### 配置钩子
+
+#### config
+
+在配置解析前执行，可以修改配置。
+
+```typescript
+{
+  config(config, { command }) {
+    return {
+      // 合并到配置
+      define: {
+        __APP_VERSION__: JSON.stringify('1.0.0')
+      },
+
+      // 修改别名
+      resolve: {
+        alias: {
+          '@custom': '/src/custom'
+        }
+      }
+    };
+  }
+}
+```
+
+#### configResolved
+
+配置解析完成后执行。
+
+```typescript
+{
+  configResolved(resolvedConfig) {
+    // 读取最终配置
+    const { root, build, server } = resolvedConfig;
+
+    console.log('Project root:', root);
+    console.log('Build target:', build.target);
+    console.log('Server port:', server.port);
+  }
+}
+```
+
+### 服务器钩子
+
+#### configureServer
+
+配置开发服务器。
+
+```typescript
+{
+  configureServer(server) {
+    // 添加中间件
+    server.middlewares.use((req, res, next) => {
+      if (req.url === '/api/time') {
+        res.setHeader('Content-Type', 'application/json');
+        res.end(JSON.stringify({ time: Date.now() }));
+      } else {
+        next();
+      }
+    });
+
+    // 访问 HMR 上下文
+    server.ws.on('connection', () => {
+      console.log('Client connected');
+    });
+
+    // 返回清理函数
+    return () => {
+      console.log('Server closed');
+    };
+  }
+}
+```
+
+### 转换钩子
+
+#### transform
+
+转换文件内容。
+
+```typescript
+{
+  transform(code, id) {
+    // 只处理特定文件
+    if (!id.endsWith('.my-lang')) {
+      return null;
+    }
+
+    // 转换代码
+    const transformed = compileMyLang(code);
+
+    // 返回结果
+    return {
+      code: transformed.code,
+      map: transformed.map  // Source Map
+    };
+  }
+}
+```
+
+#### transformIndexHtml
+
+转换 index.html。
+
+```typescript
+{
+  transformIndexHtml(html) {
+    return {
+      html: html.replace(
+        '</body>',
+        '<script src="/inject.js"></script></body>'
+      ),
+      tags: [
+        {
+          tag: 'script',
+          attrs: { src: '/inject.js' },
+          children: '',
+          injectTo: 'body'
+        }
+      ]
+    };
+  }
+}
+```
+
+### Rollup 钩子
+
+#### resolveId
+
+自定义模块解析。
+
+```typescript
+{
+  resolveId(source, importer) {
+    // 处理虚拟模块
+    if (source.startsWith('virtual:')) {
+      return source;  // 返回 ID 表明处理
+    }
+
+    // 处理别名
+    if (source === '@my-alias') {
+      return '/src/actual-file.js';
+    }
+
+    // 返回 null 使用默认解析
+    return null;
+  }
+}
+```
+
+#### load
+
+自定义模块加载。
+
+```typescript
+{
+  load(id) {
+    // 虚拟模块
+    if (id === 'virtual:my-module') {
+      return `
+        export const value = 'Hello';
+        export default function() {
+          console.log(value);
+        }
+      `;
+    }
+
+    return null;
+  }
+}
+```
+
+## 虚拟模块开发
+
+### 基础虚拟模块
+
+```typescript
+// vite-plugin-version.ts
+import type { Plugin } from "vite";
+import fs from "fs";
+import path from "path";
+
+export function versionPlugin(): Plugin {
+  const virtualModuleId = "virtual:app-version";
+  const resolvedVirtualModuleId = "\0" + virtualModuleId;
+
+  return {
+    name: "vite-plugin-version",
+
+    resolveId(id) {
+      if (id === virtualModuleId) {
+        return resolvedVirtualModuleId;
+      }
+    },
+
+    load(id) {
+      if (id === resolvedVirtualModuleId) {
+        const pkg = JSON.parse(
+          fs.readFileSync(path.resolve("package.json"), "utf-8")
+        );
+
+        return `
+          export const version = '${pkg.version}';
+          export const name = '${pkg.name}';
+          export const buildTime = '${new Date().toISOString()}';
+        `;
+      }
+    },
+  };
+}
+
+// 类型声明
+// src/vite-env.d.ts
+declare module "virtual:app-version" {
+  export const version: string;
+  export const name: string;
+  export const buildTime: string;
+}
+
+// 使用
+import { version, name } from "virtual:app-version";
+console.log(`${name} v${version}`);
+```
+
+### 动态虚拟模块
+
+```typescript
+// vite-plugin-env.ts
+export function envPlugin(): Plugin {
+  const virtualModuleId = "virtual:env";
+
+  return {
+    name: "vite-plugin-env",
+
+    resolveId(id) {
+      if (id === virtualModuleId) {
+        return "\0" + virtualModuleId;
+      }
+    },
+
+    load(id, options) {
+      if (id === "\0" + virtualModuleId) {
+        const isSSR = options?.ssr ?? false;
+
+        // 根据 SSR/客户端生成不同代码
+        const env = isSSR ? process.env : import.meta.env;
+
+        const entries = Object.entries(env)
+          .filter(([key]) => key.startsWith("VITE_"))
+          .map(([key, value]) => `export const ${key} = '${value}';`)
+          .join("\n");
+
+        return entries;
+      }
+    },
+  };
+}
+```
+
+## 代码转换插件
+
+### 自定义语言支持
+
+```typescript
+// vite-plugin-custom-lang.ts
+export function customLangPlugin(): Plugin {
+  return {
+    name: "vite-plugin-custom-lang",
+
+    transform(code, id) {
+      if (!id.endsWith(".custom")) {
+        return null;
+      }
+
+      // 解析自定义语言
+      const ast = parseCustomLang(code);
+
+      // 转换为 JavaScript
+      const jsCode = generateJS(ast);
+
+      return {
+        code: jsCode,
+        map: null, // 可选：生成 Source Map
+      };
+    },
+  };
+}
+```
+
+### 自动导入插件
+
+```typescript
+// vite-plugin-auto-import.ts
+import { parse } from "@babel/parser";
+import traverse from "@babel/traverse";
+import generate from "@babel/generator";
+import t from "@babel/types";
+
+export function autoImportPlugin(): Plugin {
+  const imports = {
+    React: 'import React from "react"',
+    useState: 'import { useState } from "react"',
+    useEffect: 'import { useEffect } from "react"',
+    useMemo: 'import { useMemo } from "react"',
+  };
+
+  return {
+    name: "vite-plugin-auto-import",
+    enforce: "pre",
+
+    transform(code, id) {
+      if (!/\.(t|j)sx?$/.test(id)) {
+        return null;
+      }
+
+      const ast = parse(code, {
+        sourceType: "module",
+        plugins: ["jsx", "typescript"],
+      });
+
+      const used = new Set<string>();
+
+      traverse(ast, {
+        Identifier(path) {
+          const name = path.node.name;
+
+          if (imports[name] && !path.scope.hasBinding(name)) {
+            used.add(name);
+          }
+        },
+      });
+
+      if (used.size === 0) {
+        return null;
+      }
+
+      const importStatements = Array.from(used)
+        .map((name) => imports[name])
+        .join("\n");
+
+      return {
+        code: `${importStatements}\n${code}`,
+        map: null,
+      };
+    },
+  };
+}
+```
+
+### 组件自动注册
+
+```typescript
+// vite-plugin-component-register.ts
+import fg from "fast-glob";
+import path from "path";
+
+export function componentRegisterPlugin(): Plugin {
+  return {
+    name: "vite-plugin-component-register",
+    enforce: "pre",
+
+    transform(code, id) {
+      if (!id.includes("component-register.js")) {
+        return null;
+      }
+
+      // 扫描组件目录
+      const components = fg.sync("src/components/**/*.vue");
+
+      // 生成注册代码
+      const registerCode = components
+        .map((file) => {
+          const name = path.basename(file, ".vue");
+          const relativePath = file.replace("src/", "@/");
+          return `Vue.component('${name}', () => import('${relativePath}'));`;
+        })
+        .join("\n");
+
+      return {
+        code: registerCode,
+        map: null,
+      };
+    },
+  };
+}
+```
+
+## HMR 增强
+
+### 自定义 HMR 处理
+
+```typescript
+// vite-plugin-custom-hmr.ts
+export function customHMRPlugin(): Plugin {
+  return {
+    name: "vite-plugin-custom-hmr",
+
+    handleHotUpdate({ file, server, modules }) {
+      // 处理特定文件类型
+      if (file.endsWith(".custom")) {
+        // 自定义 HMR 逻辑
+        server.ws.send({
+          type: "custom",
+          event: "custom-update",
+          data: { file },
+        });
+
+        // 返回空数组阻止默认 HMR
+        return [];
+      }
+
+      // 返回模块列表让 Vite 处理
+      return modules;
+    },
+
+    configureServer(server) {
+      server.ws.on("connection", () => {
+        console.log("HMR client connected");
+      });
+
+      // 自定义事件处理
+      server.ws.on("custom:my-event", (data) => {
+        console.log("Custom event:", data);
+      });
+    },
+  };
+}
+```
+
+### 客户端代码注入
+
+```typescript
+// vite-plugin-client-inject.ts
+export function clientInjectPlugin(): Plugin {
+  const clientCode = `
+    if (import.meta.hot) {
+      import.meta.hot.on('custom-event', (data) => {
+        console.log('Received:', data);
+      });
+    }
+  `;
+
+  return {
+    name: "vite-plugin-client-inject",
+
+    transformIndexHtml(html) {
+      return html.replace("</body>", `<script>${clientCode}</script></body>`);
+    },
+  };
+}
+```
+
+## 插件调试
+
+### 日志输出
+
+```typescript
+export function debugPlugin(): Plugin {
+  return {
+    name: "vite-plugin-debug",
+
+    configureServer(server) {
+      // 打印配置
+      console.log("[Plugin] Config:", server.config);
+
+      // 打印插件列表
+      server.config.plugins.forEach((plugin) => {
+        console.log("[Plugin] Loaded:", plugin.name);
+      });
+    },
+
+    transform(code, id) {
+      // 打印转换信息
+      if (id.includes("debug-me")) {
+        console.log("[Plugin] Transforming:", id);
+        console.log("[Plugin] Original code:", code);
+      }
+
+      return null;
+    },
+
+    buildEnd() {
+      console.log("[Plugin] Build completed");
+    },
+  };
+}
+```
+
+### 错误处理
+
+```typescript
+export function safePlugin(): Plugin {
+  return {
+    name: "vite-plugin-safe",
+
+    transform(code, id) {
+      try {
+        // 可能出错的操作
+        const result = riskyTransform(code);
+        return result;
+      } catch (error) {
+        // 打印错误但不中断构建
+        this.error(`Failed to transform ${id}: ${error.message}`);
+
+        // 或者返回警告
+        this.warn(`Warning in ${id}: ${error.message}`);
+
+        return null;
+      }
+    },
+  };
+}
+```
+
+## 插件测试
+
+### 单元测试
+
+```typescript
+// plugin.test.ts
+import { describe, it, expect } from "vitest";
+import { myPlugin } from "./my-plugin";
+import { build } from "vite";
+
+describe("myPlugin", () => {
+  it("should transform code", async () => {
+    const result = await build({
+      plugins: [myPlugin()],
+      configFile: false,
+    });
+
+    expect(result).toBeDefined();
+  });
+
+  it("should resolve virtual module", async () => {
+    // 测试虚拟模块解析
+  });
+});
+```
+
+## 最佳实践
+
+### 1. 插件命名规范
+
+```typescript
+// 官方插件
+@vitejs/plugin-react
+@vitejs/plugin-vue
+
+// 社区插件
+vite-plugin-xxx
+```
+
+### 2. 类型安全
+
+```typescript
+import type { Plugin, ResolvedConfig } from "vite";
+
+interface PluginOptions {
+  option1?: string;
+  option2?: boolean;
+}
+
+export function myPlugin(options: PluginOptions = {}): Plugin {
+  // 使用类型
+  const { option1, option2 } = options;
+
+  return {
+    name: "vite-plugin-my-plugin",
+    // ...
+  };
+}
+```
+
+### 3. 配置验证
+
+```typescript
+export function myPlugin(options: PluginOptions = {}): Plugin {
+  // 验证配置
+  if (options.option1 && typeof options.option1 !== "string") {
+    throw new Error("option1 must be a string");
+  }
+
+  return {
+    name: "vite-plugin-my-plugin",
+    // ...
+  };
+}
+```
+
+## 常见问题
+
+### Q1: 虚拟模块找不到类型？
+
+A: 添加类型声明：
+
+```typescript
+declare module "virtual:my-module" {
+  export const value: string;
+}
+```
+
+### Q2: 插件不生效？
+
+A: 检查以下几点：
+
+1. 插件是否正确添加到 plugins 数组
+2. enforce 顺序是否正确
+3. 是否在正确的模式下运行（serve/build）
+
+### Q3: 如何调试插件？
+
+A: 使用 console.log 或 VS Code 调试器：
+
+```typescript
+{
+  name: 'my-plugin',
+  transform(code, id) {
+    debugger;  // 设置断点
+    return null;
+  }
+}
+```
+
+## 总结
+
+Vite 插件开发要点：
+
+1. **钩子函数**：掌握核心钩子的使用
+2. **虚拟模块**：创建不存在的模块
+3. **代码转换**：自定义文件处理
+4. **HMR 增强**：自定义热更新逻辑
+5. **调试技巧**：日志和错误处理
+
+## 下一步
+
+掌握了插件开发，下一步我们将探索 Vite 的高级插件生态。
+
+---
+
+- **上一篇**：[04. 生产构建优化](./04-vite-build-optimization)
+- **下一篇**：[06. 高级插件生态](./06-vite-advanced-plugins)

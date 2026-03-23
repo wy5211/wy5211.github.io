@@ -1,0 +1,540 @@
+---
+title: "20. 实战项目：RESTful API"
+date: "2026-03-23"
+summary: "综合运用所学知识，从零构建一个完整的 RESTful API 项目，包括数据库操作、中间件、测试和部署。"
+tags: ["Go", "Golang", "实战项目", "RESTful API", "Gin"]
+category: "golang"
+cover: ""
+draft: false
+series: "Go 语言渐进式学习"
+seriesOrder: 20
+---
+
+## 前言
+
+恭喜你来到 Go 语言系列的最后一篇文章！我们将综合运用所有知识，构建一个完整的 RESTful API 项目。
+
+---
+
+## 项目概述
+
+### 技术栈
+
+- Gin Web 框架
+- GORM ORM
+- MySQL 数据库
+- JWT 认证
+- 配置管理
+
+### 项目结构
+
+```
+todo-api/
+├── main.go
+├── config/
+│   └── config.go
+├── models/
+│   └── user.go
+├── controllers/
+│   └── user_controller.go
+├── services/
+│   └── user_service.go
+├── middlewares/
+│   └── auth.go
+├── utils/
+│   └── jwt.go
+└── go.mod
+```
+
+---
+
+## 初始化项目
+
+```bash
+# 创建项目目录
+mkdir todo-api
+cd todo-api
+
+# 初始化模块
+go mod init todo-api
+
+# 安装依赖
+go get -u github.com/gin-gonic/gin
+go get -u gorm.io/gorm
+go get -u gorm.io/driver/mysql
+go get -u github.com/golang-jwt/jwt/v5
+```
+
+---
+
+## 数据模型
+
+### User 模型
+
+```go
+package models
+
+import (
+    "time"
+    "gorm.io/gorm"
+)
+
+type User struct {
+    ID        uint           `gorm:"primaryKey" json:"id"`
+    Username string          `gorm:"size:50;uniqueIndex;not null" json:"username"`
+    Email    string          `gorm:"size:100;uniqueIndex;not null" json:"email"`
+    Password string          `gorm:"size:255;not null" json:"-"`
+    CreatedAt time.Time      `json:"created_at"`
+    UpdatedAt time.Time      `json:"updated_at"`
+    DeletedAt gorm.DeletedAt `gorm:"index" json:"-"`
+}
+```
+
+---
+
+## 配置管理
+
+```go
+package config
+
+import (
+    "os"
+)
+
+type Config struct {
+    DBHost     string
+    DBPort     string
+    DBUser     string
+    DBPassword string
+    DBName     string
+    JWTSecret  string
+}
+
+func LoadConfig() *Config {
+    return &Config{
+        DBHost:     getEnv("DB_HOST", "localhost"),
+        DBPort:     getEnv("DB_PORT", "3306"),
+        DBUser:     getEnv("DB_USER", "root"),
+        DBPassword: getEnv("DB_PASSWORD", ""),
+        DBName:     getEnv("DB_NAME", "todo_api"),
+        JWTSecret:  getEnv("JWT_SECRET", "secret"),
+    }
+}
+
+func getEnv(key, defaultValue string) string {
+    if value := os.Getenv(key); value != "" {
+        return value
+    }
+    return defaultValue
+}
+```
+
+---
+
+## JWT 工具
+
+```go
+package utils
+
+import (
+    "errors"
+    "time"
+
+    "github.com/golang-jwt/jwt/v5"
+)
+
+type Claims struct {
+    UserID uint `json:"user_id"`
+    jwt.RegisteredClaims
+}
+
+func GenerateToken(userID uint, secret string) (string, error) {
+    claims := Claims{
+        UserID: userID,
+        RegisteredClaims: jwt.RegisteredClaims{
+            ExpiresAt: jwt.NewNumericDate(time.Now().Add(24 * time.Hour)),
+        },
+    }
+
+    token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+    return token.SignedString([]byte(secret))
+}
+
+func ValidateToken(tokenString, secret string) (*Claims, error) {
+    token, err := jwt.ParseWithClaims(tokenString, &Claims{}, func(token *jwt.Token) (interface{}, error) {
+        if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
+            return nil, errors.New("无效的签名算法")
+        }
+        return []byte(secret), nil
+    })
+
+    if err != nil {
+        return nil, err
+    }
+
+    if claims, ok := token.Claims.(*Claims); ok && token.Valid {
+        return claims, nil
+    }
+
+    return nil, errors.New("无效的 token")
+}
+```
+
+---
+
+## 认证中间件
+
+```go
+package middlewares
+
+import (
+    "net/http"
+    "strings"
+
+    "todo-api/config"
+    "todo-api/utils"
+
+    "github.com/gin-gonic/gin"
+)
+
+func AuthMiddleware(cfg *config.Config) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        authHeader := c.GetHeader("Authorization")
+        if authHeader == "" {
+            c.JSON(http.StatusUnauthorized, gin.H{"error": "未提供认证信息"})
+            c.Abort()
+            return
+        }
+
+        tokenString := strings.TrimPrefix(authHeader, "Bearer ")
+        claims, err := utils.ValidateToken(tokenString, cfg.JWTSecret)
+        if err != nil {
+            c.JSON(http.StatusUnauthorized, gin.H{"error": "无效的 token"})
+            c.Abort()
+            return
+        }
+
+        c.Set("userID", claims.UserID)
+        c.Next()
+    }
+}
+```
+
+---
+
+## Controller
+
+```go
+package controllers
+
+import (
+    "net/http"
+    "todo-api/models"
+    "todo-api/services"
+
+    "github.com/gin-gonic/gin"
+)
+
+type UserController struct {
+    userService *services.UserService
+}
+
+func NewUserController(userService *services.UserService) *UserController {
+    return &UserController{userService: userService}
+}
+
+func (uc *UserController) Register(c *gin.Context) {
+    var user models.User
+    if err := c.ShouldBindJSON(&user); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+
+    if err := uc.userService.Register(&user); err != nil {
+        c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+        return
+    }
+
+    c.JSON(http.StatusCreated, gin.H{
+        "id":       user.ID,
+        "username": user.Username,
+        "email":    user.Email,
+    })
+}
+
+func (uc *UserController) Login(c *gin.Context) {
+    var loginRequest struct {
+        Email    string `json:"email"`
+        Password string `json:"password"`
+    }
+
+    if err := c.ShouldBindJSON(&loginRequest); err != nil {
+        c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+        return
+    }
+
+    token, err := uc.userService.Login(loginRequest.Email, loginRequest.Password)
+    if err != nil {
+        c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+        return
+    }
+
+    c.JSON(http.StatusOK, gin.H{"token": token})
+}
+```
+
+---
+
+## Service
+
+```go
+package services
+
+import (
+    "errors"
+    "todo-api/models"
+    "todo-api/utils"
+    "gorm.io/gorm"
+)
+
+type UserService struct {
+    db *gorm.DB
+}
+
+func NewUserService(db *gorm.DB) *UserService {
+    return &UserService{db: db}
+}
+
+func (s *UserService) Register(user *models.User) error {
+    // 检查用户是否存在
+    var existingUser models.User
+    if err := s.db.Where("email = ?", user.Email).First(&existingUser).Error; err == nil {
+        return errors.New("邮箱已被注册")
+    }
+
+    // 创建用户
+    if err := s.db.Create(user).Error; err != nil {
+        return err
+    }
+
+    return nil
+}
+
+func (s *UserService) Login(email, password string) (string, error) {
+    var user models.User
+    if err := s.db.Where("email = ?", email).First(&user).Error; err != nil {
+        return "", errors.New("邮箱或密码错误")
+    }
+
+    if user.Password != password {
+        return "", errors.New("邮箱或密码错误")
+    }
+
+    token, err := utils.GenerateToken(user.ID, "secret")
+    if err != nil {
+        return "", err
+    }
+
+    return token, nil
+}
+```
+
+---
+
+## 主程序
+
+```go
+package main
+
+import (
+    "log"
+
+    "todo-api/config"
+    "todo-api/controllers"
+    "todo-api/middlewares"
+    "todo-api/models"
+
+    "github.com/gin-gonic/gin"
+    "gorm.io/driver/mysql"
+    "gorm.io/gorm"
+)
+
+func main() {
+    // 加载配置
+    cfg := config.LoadConfig()
+
+    // 连接数据库
+    dsn := cfg.DBUser + ":" + cfg.DBPassword + "@tcp(" + cfg.DBHost + ":" + cfg.DBPort + ")/" + cfg.DBName + "?charset=utf8mb4&parseTime=True&loc=Local"
+    db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+    if err != nil {
+        log.Fatal("数据库连接失败:", err)
+    }
+
+    // 自动迁移
+    db.AutoMigrate(&models.User{})
+
+    // 创建 Gin 实例
+    r := gin.Default()
+
+    // 初始化 service 和 controller
+    userService := services.NewUserService(db)
+    userController := controllers.NewUserController(userService)
+
+    // 路由
+    r.POST("/register", userController.Register)
+    r.POST("/login", userController.Login)
+
+    authorized := r.Group("/")
+    authorized.Use(middlewares.AuthMiddleware(cfg))
+    {
+        authorized.GET("/users", userController.GetUsers)
+    }
+
+    // 启动服务器
+    r.Run(":8080")
+}
+```
+
+---
+
+## 测试
+
+```go
+package main
+
+import (
+    "bytes"
+    "encoding/json"
+    "net/http"
+    "net/http/httptest"
+    "testing"
+
+    "github.com/stretchr/testify/assert"
+)
+
+func TestRegister(t *testing.T) {
+    r := setupRouter()
+
+    user := map[string]string{
+        "username": "testuser",
+        "email":    "test@example.com",
+        "password": "password123",
+    }
+
+    jsonData, _ := json.Marshal(user)
+    req, _ := http.NewRequest("POST", "/register", bytes.NewBuffer(jsonData))
+    req.Header.Set("Content-Type", "application/json")
+
+    w := httptest.NewRecorder()
+    r.ServeHTTP(w, req)
+
+    assert.Equal(t, http.StatusCreated, w.Code)
+}
+```
+
+---
+
+## 部署
+
+### Docker 部署
+
+```dockerfile
+# Dockerfile
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+RUN go build -o main .
+
+FROM alpine:latest
+RUN apk --no-cache add ca-certificates
+WORKDIR /root/
+
+COPY --from=builder /app/main .
+
+EXPOSE 8080
+CMD ["./main"]
+```
+
+```yaml
+# docker-compose.yml
+version: "3"
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_USER=root
+      - DB_PASSWORD=secret
+      - DB_NAME=todo_api
+    depends_on:
+      - mysql
+
+  mysql:
+    image: mysql:8
+    environment:
+      - MYSQL_ROOT_PASSWORD=secret
+      - MYSQL_DATABASE=todo_api
+    volumes:
+      - mysql_data:/var/lib/mysql
+
+volumes:
+  mysql_data:
+```
+
+---
+
+## 项目总结
+
+### 技术要点
+
+✅ **Gin 框架**：路由、中间件
+✅ **GORM**：数据库操作
+✅ **JWT**：身份认证
+✅ **配置管理**：环境变量
+✅ **测试**：单元测试
+✅ **Docker**：容器化部署
+
+### 最佳实践
+
+1. 分层架构（Controller → Service → Model）
+2. 依赖注入
+3. 错误处理
+4. 配置外部化
+5. 代码测试
+
+---
+
+## 结语
+
+恭喜你完成了整个 Go 语言系列的学习！
+
+通过这 20 篇文章，你已经掌握了：
+
+- Go 基础语法和类型
+- 并发编程（goroutine、channel）
+- 面向对象（接口、方法）
+- HTTP 编程和 Web 开发
+- 数据库操作
+- 测试和部署
+
+**继续学习的建议**：
+
+- 深入学习微服务架构
+- 学习 RPC（gRPC）
+- 掌握性能优化
+- 了解分布式系统
+
+感谢你的陪伴，祝你在 Go 的开发之路上越走越远！🚀
+
+**相关资源**：
+
+- [Go 官方网站](https://go.dev)
+- [Go by Example](https://gobyexample.com)
+- [Effective Go](https://go.dev/doc/effective_go)

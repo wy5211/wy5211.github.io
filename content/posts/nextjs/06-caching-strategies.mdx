@@ -1,0 +1,738 @@
+---
+title: "06. 缓存策略与数据获取优化"
+date: "2026-03-23"
+summary: "深入理解 Next.js 的缓存系统，学习如何使用 fetch 缓存、ISR、缓存标签等优化数据获取策略，提升应用性能。"
+tags: ["Next.js", "缓存", "性能优化", "ISR", "数据获取"]
+category: "nextjs"
+cover: ""
+draft: false
+series: "Next.js 渐进式全栈开发"
+seriesOrder: 6
+---
+
+## 前言
+
+缓存是提升 Web 应用性能的关键技术。Next.js 提供了强大的缓存系统，让你能够在保持数据新鲜度的同时获得最佳性能。
+
+**学习目标**：
+
+- ✅ 理解 Next.js 缓存层次
+- ✅ 掌握 fetch 缓存配置
+- ✅ 学会使用 ISR 和增量静态生成
+- ✅ 掌握缓存标签和路径重新验证
+- ✅ 优化数据获取性能
+
+---
+
+## Next.js 缓存层次
+
+### 缓存架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      Next.js 缓存层次                        │
+├─────────────────────────────────────────────────────────────┤
+│  1. 构建时缓存（SSG）                                        │
+│     - 构建时生成 HTML                                        │
+│     - 部署到 CDN                                             │
+│     - 性能最佳，但数据可能过时                               │
+│                                                              │
+│  2. 请求时缓存（SSR）                                        │
+│     - 每次请求生成 HTML                                      │
+│     - 可配置缓存时间                                         │
+│     - 平衡性能和数据新鲜度                                   │
+│                                                              │
+│  3. 增量静态再生（ISR）                                      │
+│     - 结合 SSG 和 SSR                                        │
+│     - 后台重新生成页面                                       │
+│     - 最佳平衡                                              │
+│                                                              │
+│  4. 客户端缓存                                              │
+│     - 浏览器缓存                                             │
+│     - SWR、React Query                                      │
+│     - 减少服务器请求                                         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 缓存决策树
+
+```
+数据变化频率？
+├─ 极少变化（文档、博客）
+│   └─ SSG（构建时生成）
+├─ 偶尔变化（产品页面、用户资料）
+│   └─ ISR（定时重新验证）
+├─ 频繁变化（评论、通知）
+│   └─ SSR（每次请求）
+└─ 实时数据（股票、聊天）
+    └─ 无缓存（no-store）或客户端轮询
+```
+
+---
+
+## fetch 缓存配置
+
+### 默认缓存
+
+```typescript
+// 默认行为：强制缓存
+async function Posts() {
+  // 数据会被缓存，直到手动重新验证
+  const posts = await fetch('https://api.example.com/posts');
+  const data = await posts.json();
+
+  return <PostList posts={data} />;
+}
+```
+
+### 不缓存（no-store）
+
+```typescript
+// 不缓存：每次请求都获取最新数据
+async function RealTimeData() {
+  const data = await fetch('https://api.example.com/data', {
+    cache: 'no-store',
+  }).then(res => res.json());
+
+  return <DataDisplay data={data} />;
+}
+```
+
+### 重新验证（revalidate）
+
+```typescript
+// 设置重新验证时间
+async function Posts() {
+  // 每 3600 秒（1 小时）重新验证一次
+  const posts = await fetch('https://api.example.com/posts', {
+    next: { revalidate: 3600 },
+  }).then(res => res.json());
+
+  return <PostList posts={posts} />;
+}
+```
+
+### 缓存标签（tags）
+
+```typescript
+// 使用缓存标签进行按需重新验证
+async function Post({ id }: { id: string }) {
+  const post = await fetch(`https://api.example.com/posts/${id}`, {
+    next: { tags: [`post-${id}`] },
+  }).then(res => res.json());
+
+  return <PostDetail post={post} />;
+}
+```
+
+### 完整示例
+
+```typescript
+// app/blog/page.tsx
+async function getPosts() {
+  const res = await fetch('https://api.example.com/posts', {
+    // 缓存策略：1 小时后重新验证
+    next: {
+      revalidate: 3600,
+      tags: ['posts'],
+    },
+  });
+
+  if (!res.ok) throw new Error('Failed to fetch');
+  return res.json();
+}
+
+export default async function BlogPage() {
+  const posts = await getPosts();
+
+  return (
+    <div>
+      {posts.map((post: any) => (
+        <article key={post.id}>{post.title}</article>
+      ))}
+    </div>
+  );
+}
+```
+
+---
+
+## ISR（增量静态再生）
+
+### ISR 基础
+
+```typescript
+// app/blog/page.tsx
+// 每 60 秒重新生成页面
+export const revalidate = 60;
+
+async function getPosts() {
+  const res = await fetch('https://api.example.com/posts');
+  return res.json();
+}
+
+export default async function BlogPage() {
+  const posts = await getPosts();
+
+  return (
+    <div>
+      {posts.map((post) => (
+        <article key={post.id}>{post.title}</article>
+      ))}
+    </div>
+  );
+}
+```
+
+### ISR 工作流程
+
+```
+1. 首次请求
+   用户请求 → 返回缓存的 HTML
+                ↓
+              后台重新生成
+                ↓
+              更新缓存
+
+2. 后续请求（60 秒内）
+   用户请求 → 返回缓存的 HTML（快速）
+
+3. 后续请求（60 秒后）
+   用户请求 → 返回旧缓存（快速）
+                ↓
+              后台重新生成
+                ↓
+              下次请求返回新内容
+```
+
+### on-demand ISR（按需重新验证）
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { revalidateTag } from "next/cache";
+import { revalidatePath } from "next/cache";
+
+// 按标签重新验证
+export async function revalidatePostTag(id: string) {
+  revalidateTag(`post-${id}`);
+}
+
+// 按路径重新验证
+export async function revalidatePostPath(slug: string) {
+  revalidatePath(`/blog/${slug}`);
+}
+
+// 重新验证所有文章列表
+export async function revalidatePosts() {
+  revalidateTag("posts");
+  revalidatePath("/blog");
+}
+```
+
+```typescript
+// app/admin/posts/actions.ts
+"use server";
+
+import { revalidateTag } from "next/cache";
+import { db } from "@/lib/db";
+
+export async function publishPost(id: string) {
+  // 更新数据库
+  await db.posts.update({
+    where: { id },
+    data: { status: "published" },
+  });
+
+  // 重新验证相关缓存
+  revalidateTag(`post-${id}`);
+  revalidateTag("posts");
+  revalidatePath("/blog");
+}
+```
+
+---
+
+## 缓存策略模式
+
+### Stale-While-Revalidate
+
+```typescript
+// app/posts/page.tsx
+export const revalidate = 3600; // 1 小时
+
+export default async function PostsPage() {
+  const posts = await fetch('https://api.example.com/posts', {
+    next: { revalidate: 3600 },
+  }).then(res => res.json());
+
+  return (
+    <div>
+      {posts.map((post) => (
+        <article key={post.id}>{post.title}</article>
+      ))}
+    </div>
+  );
+}
+```
+
+**效果**：
+
+- 首次请求：生成页面并缓存
+- 1 小时内：返回缓存（快速）
+- 1 小时后：返回旧缓存 + 后台重新生成
+- 下次请求：返回新内容
+
+### Stale-If-Error
+
+```typescript
+async function getData() {
+  try {
+    const data = await fetch("https://api.example.com/data", {
+      next: { revalidate: 3600 },
+    }).then((res) => res.json());
+    return data;
+  } catch (error) {
+    // 出错时返回缓存数据（如果存在）
+    return getStaleData();
+  }
+}
+```
+
+### 动态重新验证
+
+```typescript
+// app/api/webhooks/revalidate/route.ts
+import { NextResponse } from "next/server";
+import { revalidateTag } from "next/cache";
+
+export async function POST(request: Request) {
+  const body = await request.json();
+  const { tag } = body;
+
+  if (!tag) {
+    return NextResponse.json({ error: "缺少 tag 参数" }, { status: 400 });
+  }
+
+  revalidateTag(tag);
+
+  return NextResponse.json({
+    revalidated: true,
+    now: Date.now(),
+  });
+}
+```
+
+---
+
+## 数据库查询缓存
+
+### Prisma 查询缓存
+
+```typescript
+// lib/db.ts
+import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+export const prisma = globalForPrisma.prisma ?? new PrismaClient();
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+
+// 扩展 Prisma Client 添加缓存
+import { cache } from "react";
+
+export const getCachedPosts = cache(async () => {
+  return prisma.post.findMany({
+    orderBy: { createdAt: "desc" },
+  });
+});
+
+export const getCachedPostBySlug = cache(async (slug: string) => {
+  return prisma.post.findUnique({
+    where: { slug },
+  });
+});
+```
+
+### 使用缓存查询
+
+```typescript
+// app/blog/page.tsx
+import { getCachedPosts } from '@/lib/db';
+
+export default async function BlogPage() {
+  // React cache 确保相同参数只查询一次
+  const posts = await getCachedPosts();
+
+  return (
+    <div>
+      {posts.map((post) => (
+        <article key={post.id}>
+          <h2>{post.title}</h2>
+          <p>{post.excerpt}</p>
+        </article>
+      ))}
+    </div>
+  );
+}
+```
+
+---
+
+## 客户端数据获取
+
+### 使用 SWR
+
+```typescript
+// components/RealTimeComments.tsx
+"use client";
+
+import useSWR from 'swr';
+
+const fetcher = (url: string) => fetch(url).then(res => res.json());
+
+export function RealTimeComments({ postId }: { postId: string }) {
+  const { data, error, mutate } = useSWR(
+    `/api/posts/${postId}/comments`,
+    fetcher,
+    {
+      refreshInterval: 3000, // 每 3 秒刷新
+      revalidateOnFocus: true,
+    }
+  );
+
+  if (error) return <div>加载失败</div>;
+  if (!data) return <div>加载中...</div>;
+
+  return (
+    <div>
+      <ul>
+        {data.map((comment: any) => (
+          <li key={comment.id}>{comment.content}</li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+```
+
+### 使用 React Query
+
+```typescript
+// components/PostsList.tsx
+"use client";
+
+import { useQuery } from '@tanstack/react-query';
+
+export function PostsList() {
+  const { data, isLoading, error } = useQuery({
+    queryKey: ['posts'],
+    queryFn: () => fetch('/api/posts').then(res => res.json()),
+    staleTime: 5000, // 5 秒内数据视为新鲜
+    cacheTime: 10000, // 10 秒后清理缓存
+  });
+
+  if (isLoading) return <div>加载中...</div>;
+  if (error) return <div>加载失败</div>;
+
+  return (
+    <ul>
+      {data.map((post: any) => (
+        <li key={post.id}>{post.title}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+---
+
+## 性能监控
+
+### 缓存命中率监控
+
+```typescript
+// lib/cache-monitor.ts
+import { redis } from "@/lib/redis";
+
+export async function trackCacheHit(key: string, hit: boolean) {
+  const metric = hit ? "cache_hit" : "cache_miss";
+  await redis.hincrby("cache_stats", metric, 1);
+}
+
+export async function getCacheStats() {
+  const stats = await redis.hgetall("cache_stats");
+  const hitRate = stats.cache_hit / (stats.cache_hit + stats.cache_miss);
+  return {
+    hits: stats.cache_hit,
+    misses: stats.cache_miss,
+    hitRate: hitRate.toFixed(2),
+  };
+}
+```
+
+### 性能指标
+
+```typescript
+// app/api/cache-stats/route.ts
+import { NextResponse } from "next/server";
+import { getCacheStats } from "@/lib/cache-monitor";
+
+export async function GET() {
+  const stats = await getCacheStats();
+
+  return NextResponse.json({
+    ...stats,
+    timestamp: new Date().toISOString(),
+  });
+}
+```
+
+---
+
+## 实战：博客缓存策略
+
+```typescript
+// app/blog/[slug]/page.tsx
+import { notFound } from 'next/navigation';
+import { revalidateTag } from 'next/cache';
+
+// 每 24 小时重新验证
+export const revalidate = 86400;
+
+async function getPost(slug: string) {
+  const res = await fetch(`https://api.example.com/posts/${slug}`, {
+    next: {
+      revalidate: 86400,
+      tags: [`post-${slug}`, 'posts'],
+    },
+  });
+
+  if (!res.ok) return null;
+  return res.json();
+}
+
+export default async function BlogPost({ params }: { params: { slug: string } }) {
+  const post = await getPost(params.slug);
+
+  if (!post) {
+    notFound();
+  }
+
+  return (
+    <article>
+      <h1>{post.title}</h1>
+      <div dangerouslySetInnerHTML={{ __html: post.content }} />
+      <Comments postId={post.id} />
+    </article>
+  );
+}
+
+// 评论使用客户端缓存（实时更新）
+import { Comments } from '@/components/Comments';
+```
+
+```typescript
+// components/Comments.tsx
+"use client";
+
+import useSWR from 'swr';
+
+export function Comments({ postId }: { postId: string }) {
+  const { data } = useSWR(
+    `/api/posts/${postId}/comments`,
+    fetcher,
+    {
+      refreshInterval: 10000, // 每 10 秒刷新评论
+      fallbackData: [],
+    }
+  );
+
+  return (
+    <div>
+      <h3>评论 ({data.length})</h3>
+      <CommentList comments={data} />
+    </div>
+  );
+}
+```
+
+---
+
+## 最佳实践
+
+### ✅ 推荐做法
+
+1. **使用适当的缓存策略**
+
+```typescript
+// ✅ 静态内容使用长时间缓存
+export const revalidate = 86400; // 24 小时
+
+// ✅ 动态内容使用短时间缓存
+export const revalidate = 60; // 1 分钟
+```
+
+2. **使用缓存标签**
+
+```typescript
+const data = await fetch(url, {
+  next: { tags: ["posts", `post-${id}`] },
+});
+```
+
+3. **按需重新验证**
+
+```typescript
+revalidateTag(`post-${id}`);
+revalidatePath("/blog");
+```
+
+4. **监控缓存性能**
+
+```typescript
+trackCacheHit(key, true);
+```
+
+### ❌ 避免做法
+
+1. **不要过度缓存实时数据**
+
+```typescript
+// ❌ 股票价格不应该缓存
+const stocks = await fetch("/api/stocks", {
+  next: { revalidate: 3600 },
+});
+
+// ✅ 使用 no-store
+const stocks = await fetch("/api/stocks", {
+  cache: "no-store",
+});
+```
+
+2. **不要忘记重新验证**
+
+```typescript
+// ❌ 更新数据后没有重新验证
+await db.posts.update({ data });
+return { success: true };
+
+// ✅ 重新验证相关缓存
+await db.posts.update({ data });
+revalidateTag("posts");
+revalidatePath("/blog");
+return { success: true };
+```
+
+3. **不要忽略错误处理**
+
+```typescript
+// ❌ 缓存失败时没有降级方案
+const data = await fetch(url).then((res) => res.json());
+
+// ✅ 提供降级方案
+try {
+  const data = await fetch(url).then((res) => res.json());
+} catch (error) {
+  const data = await getStaleData();
+}
+```
+
+---
+
+## 常见问题
+
+**Q: SSG、SSR、ISR 有什么区别？**
+
+A:
+
+- **SSG**：构建时生成，内容静态
+- **SSR**：每次请求生成，内容动态
+- **ISR**：构建时生成 + 定期更新
+
+**Q: 如何选择重新验证时间？**
+
+A: 根据数据变化频率：
+
+- 内容不变：`revalidate: false` 或大数值
+- 偶尔变化：`revalidate: 3600`（1 小时）
+- 频繁变化：`revalidate: 60`（1 分钟）
+
+**Q: 缓存标签和路径重新验证有什么区别？**
+
+A:
+
+- **标签**：更灵活，可以重新验证多个页面
+- **路径**：更直接，重新验证特定路径
+
+**Q: 如何测试缓存是否工作？**
+
+A: 使用网络面板查看响应头：
+
+- `X-Vercel-Cache`: HIT/MISS
+- `Cache-Control`: max-age=...
+
+---
+
+## 总结
+
+本文我们学习了：
+
+✅ **Next.js 缓存层次**
+
+- 构建时缓存（SSG）
+- 请求时缓存（SSR）
+- 增量静态再生（ISR）
+- 客户端缓存
+
+✅ **fetch 缓存配置**
+
+- 默认缓存
+- no-store
+- revalidate
+- 缓存标签
+
+✅ **ISR 实现**
+
+- 基础 ISR
+- on-demand ISR
+- 重新验证策略
+
+✅ **数据库查询缓存**
+
+- Prisma 查询缓存
+- React cache
+
+✅ **客户端数据获取**
+
+- SWR
+- React Query
+- 缓存策略
+
+✅ **性能监控**
+
+- 缓存命中率
+- 性能指标
+
+现在你应该能够为不同场景选择合适的缓存策略。下一步，我们将学习 **数据验证与类型安全**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- Zod 验证库
+- Server Actions 验证
+- API Routes 验证
+- 端到端类型安全
+- 表单验证
+- 错误处理模式
+
+继续阅读：[07 数据验证与类型安全](./07-validation-type-safety.mdx)

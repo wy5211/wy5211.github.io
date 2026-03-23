@@ -1,0 +1,467 @@
+---
+title: "01. Vite 核心原理与架构：深入理解下一代构建工具"
+date: "2025-03-23"
+summary: "深入剖析 Vite 的核心原理，理解 ESM、依赖预构建、HMR 等关键技术，掌握 Vite 极速背后的秘密。"
+tags: ["Vite", "前端工程", "ESM", "构建工具", "性能优化"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 深入实战"
+seriesOrder: 1
+---
+
+## 前言
+
+Vite 的出现彻底改变了前端构建的游戏规则。传统的 Webpack 需要打包整个应用才能启动，而 Vite 可以在毫秒级启动开发服务器。这背后的秘密是什么？本文将深入剖析 Vite 的核心原理。
+
+## ESM vs CommonJS：模块系统的革命
+
+### CommonJS 的问题
+
+```javascript
+// CommonJS - 同步加载
+const React = require("react");
+const ReactDOM = require("react-dom");
+
+// 问题：
+// 1. 同步加载，需要等待模块下载完成
+// 2. 无法实现 Tree Shaking
+// 3. 不支持浏览器原生运行
+```
+
+### ESM 的优势
+
+```javascript
+// ESM - 异步加载
+import React, { useState } from "react";
+import { createRoot } from "react-dom/client";
+
+// 优势：
+// 1. 异步加载，浏览器可以并行下载
+// 2. 支持 Tree Shaking
+// 3. 浏览器原生支持
+```
+
+### ESM 浏览器支持
+
+```html
+<!-- 浏览器原生 ESM -->
+<script type="module">
+  import React from "https://esm.sh/react@18";
+  import { useState } from "https://esm.sh/react@18";
+
+  // 按需加载，并行下载
+</script>
+```
+
+## Vite 的双模式架构
+
+### 开发环境：No-bundle
+
+```
+传统 Webpack 开发环境：
+源码 → 打包 → Bundle → 启动服务器 → 浏览器
+      (耗时 10-30s)
+
+Vite 开发环境：
+源码 → 启动服务器 → 浏览器请求 → 按需编译
+      (< 1s)
+```
+
+**核心思想**：利用浏览器原生 ESM 能力，按需编译，无需打包。
+
+### 生产环境：Rollup 打包
+
+```
+生产构建：
+源码 → Rollup 打包 → 优化产物 → 部署
+```
+
+**为什么生产环境需要打包？**
+
+1. **减少 HTTP 请求**：合并多个模块
+2. **代码压缩**：Terser 压缩
+3. **Tree Shaking**：移除未使用代码
+4. **兼容性**：转换 ES5+ 语法
+5. **性能优化**：代码分割、懒加载
+
+## 依赖预构建
+
+### 为什么需要预构建？
+
+**问题 1：CJS 到 ESM 的转换**
+
+```javascript
+// node_modules/lodash - CommonJS 格式
+module.exports = {
+  debounce: function () {},
+  throttle: function () {},
+};
+
+// 浏览器 ESM 无法直接使用
+import { debounce } from "lodash"; // ❌ 报错
+```
+
+**问题 2：过多的网络请求**
+
+```javascript
+// 一个简单的导入
+import React from 'react';
+
+// 可能触发数百个请求
+node_modules/react/index.js
+  → node_modules/react/package.json
+  → node_modules/react/cjs/react.production.min.js
+  → node_modules/object-assign/index.js
+  → ... (数百个依赖)
+```
+
+### 预构建方案
+
+```javascript
+// Vite 配置
+export default defineConfig({
+  optimizeDeps: {
+    // 预构建依赖
+    include: ["react", "react-dom", "lodash"],
+
+    // 排除某些依赖
+    exclude: ["your-local-package"],
+
+    // 强制重新预构建
+    force: true,
+  },
+});
+```
+
+### 预构建产物
+
+```javascript
+// node_modules/.vite/deps/react.js
+// 所有依赖被合并到单个文件
+import { jsx runtime } from 'react';
+export { useState, useEffect, /* ... */ };
+
+// 启动时只需加载一个文件
+```
+
+### esbuild：极速的预构建工具
+
+```javascript
+// esbuild vs 其他工具
+// 编译速度对比（打包 10 个文件）
+
+工具              时间
+- Babel           1000ms
+- SWC             200ms
+- esbuild (Go)    20ms  ⚡️
+```
+
+**为什么 esbuild 这么快？**
+
+1. **Go 语言编写**：编译型语言，执行效率高
+2. **并行处理**：充分利用多核 CPU
+3. **原生解析**：不依赖 AST 转换
+
+## 模块热替换（HMR）原理
+
+### Webpack HMR vs Vite HMR
+
+```javascript
+// Webpack HMR
+修改文件 → Webpack 重新编译 → 生成新 Bundle → HMR 运行时更新
+           (5-10s)
+
+// Vite HMR
+修改文件 → Vite 编译单个模块 → 浏览器请求新模块 → HMR 更新
+           (< 100ms) ⚡️
+```
+
+### Vite HMR 实现原理
+
+#### 1. WebSocket 连接
+
+```javascript
+// Vite 注入 HMR 客户端
+<script type="module">
+  import { createHotContext } from '/@vite/client';
+
+  // 建立 WebSocket 连接
+  const ws = new WebSocket('ws://localhost:3000');
+
+  ws.onmessage = ({ data }) => {
+    const { type, path } = JSON.parse(data);
+
+    if (type === 'update') {
+      // 热更新逻辑
+      hot.update(path);
+    }
+  };
+</script>
+```
+
+#### 2. 模块依赖图
+
+```javascript
+// Vite 维护的模块依赖图
+const moduleGraph = {
+  "/src/App.tsx": {
+    imports: ["/src/Header.tsx", "/src/Footer.tsx"],
+    importers: ["/src/main.tsx"],
+    module: null,
+  },
+  "/src/Header.tsx": {
+    imports: [],
+    importers: ["/src/App.tsx"],
+    module: null,
+  },
+};
+
+// 文件变化时，精确更新受影响的模块
+```
+
+#### 3. HMR 边界处理
+
+```javascript
+// 组件 HMR 处理
+if (import.meta.hot) {
+  import.meta.hot.accept((newModule) => {
+    // 接收新模块
+    console.log("Module updated:", newModule);
+  });
+}
+
+// 如果模块没有 accept，向上冒泡查找 HMR 边界
+```
+
+### HMR 优化技巧
+
+```javascript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    hmr: {
+      // 覆盖默认端口
+      port: 24678,
+
+      // HMR 覆盖层
+      overlay: true,
+    },
+  },
+});
+```
+
+## 开发服务器架构
+
+### 请求处理流程
+
+```
+浏览器请求 http://localhost:3000/src/App.tsx
+    ↓
+Vite 开发服务器接收
+    ↓
+判断请求类型
+    ├─ /@fs/... → 文件系统请求
+    ├─ /@vite/... → Vite 内部模块
+    ├─ /node_modules/... → 预构建依赖
+    └─ /src/... → 源码文件
+    ↓
+按需编译（esbuild）
+    ↓
+返回 ESM 格式的代码
+```
+
+### 中间件插件系统
+
+```javascript
+// Vite Connect 中间件
+import connect from "vite/dist/node/chttps";
+
+const middlewares = connect();
+
+// 1. HMR 中间件
+middlewares.use(hmrMiddleware);
+
+// 2. 转换中间件
+middlewares.use(transformMiddleware);
+
+// 3. 静态资源中间件
+middlewares.use(staticMiddleware);
+
+// 4. 代理中间件
+middlewares.use(proxyMiddleware);
+
+// 5. 索引 HTML 中间件
+middlewares.use(indexHtmlMiddleware);
+```
+
+## 核心配置解析
+
+### 基础配置
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  // 插件
+  plugins: [react()],
+
+  // 开发服务器
+  server: {
+    port: 3000,
+    host: true,
+    open: true,
+  },
+
+  // 构建配置
+  build: {
+    outDir: "dist",
+    minify: "terser",
+  },
+
+  // 解析配置
+  resolve: {
+    alias: {
+      "@": "/src",
+    },
+  },
+});
+```
+
+### 高级配置
+
+```typescript
+export default defineConfig({
+  // 预构建配置
+  optimizeDeps: {
+    include: ["react", "react-dom"],
+    exclude: [],
+  },
+
+  // CSS 配置
+  css: {
+    modules: {
+      scopeBehaviour: "local",
+      generateScopedName: "[name]__[local]__[hash:base64:5]",
+    },
+  },
+
+  // 构建优化
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ["react", "react-dom"],
+        },
+      },
+    },
+  },
+});
+```
+
+## 性能对比
+
+### 冷启动时间
+
+```
+项目规模     Webpack    Vite
+小型（100文件）  3-5s       < 1s  ⚡️
+中型（1000文件） 15-30s     1-3s  ⚡️
+大型（10000文件）60-120s    3-8s  ⚡️
+```
+
+### 热更新速度
+
+```
+场景              Webpack    Vite
+单文件修改        1-2s       < 100ms  ⚡️
+样式修改          1s         < 50ms   ⚡️
+组件修改          2-3s       < 200ms  ⚡️
+```
+
+## 最佳实践
+
+### 1. 合理配置预构建
+
+```typescript
+export default defineConfig({
+  optimizeDeps: {
+    // 只预构建大型依赖
+    include: ["react", "react-dom", "react-router-dom", "lodash", "axios"],
+  },
+});
+```
+
+### 2. 利用 HMR 边界
+
+```typescript
+// App.tsx
+if (import.meta.hot) {
+  import.meta.hot.accept("./module", (newModule) => {
+    // 精确控制更新逻辑
+    console.log("Module updated");
+  });
+}
+```
+
+### 3. 优化模块解析
+
+```typescript
+export default defineConfig({
+  resolve: {
+    // 减少解析时间
+    extensions: [".js", ".jsx", ".ts", ".tsx", ".json"],
+
+    // 使用别名
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+    },
+  },
+});
+```
+
+## 常见问题
+
+### Q1: 为什么开发环境快但生产构建慢？
+
+A: 开发环境使用 esbuild 预构建（极快），生产环境使用 Rollup（功能丰富但较慢）。
+
+### Q2: 依赖预构建什么时候失效？
+
+A: 以下情况会重新预构建：
+
+- package.json 的 dependencies 变化
+- lockfile 变化
+- vite.config.js 的 optimizeDeps 变化
+- 手动删除 node_modules/.vite
+
+### Q3: 如何调试 HMR？
+
+A: 在浏览器控制台查看：
+
+```javascript
+// Vite 注入的调试信息
+console.log("[vite] connecting...");
+console.log("[vite] connected.");
+console.log("[vite] page reload src/App.tsx");
+```
+
+## 总结
+
+Vite 核心原理要点：
+
+1. **ESM 驱动**：利用浏览器原生模块能力
+2. **依赖预构建**：esbuild 极速处理 node_modules
+3. **按需编译**：只编译当前请求的模块
+4. **精确 HMR**：基于模块依赖图的精确更新
+5. **双模式架构**：开发 No-bundle，生产 Rollup 打包
+
+## 下一步
+
+理解了 Vite 的核心原理，下一步我们将学习如何初始化项目和深入配置。
+
+---
+
+- **下一篇**：[02. 项目初始化与配置详解](./02-vite-project-setup)

@@ -1,0 +1,286 @@
+---
+title: "16. 数据库操作"
+date: "2026-03-23"
+summary: "掌握 Go 语言的数据库操作，学习使用 database/sql 包和 GORM 进行数据库开发。"
+tags: ["Go", "Golang", "数据库", "SQL", "GORM"]
+category: "golang"
+cover: ""
+draft: false
+series: "Go 语言渐进式学习"
+seriesOrder: 16
+---
+
+## 前言
+
+Go 通过 database/sql 包提供统一的数据库接口，支持 MySQL、PostgreSQL、SQLite 等多种数据库。
+
+---
+
+## 使用 database/sql
+
+### 连接数据库
+
+```go
+package main
+
+import (
+    "database/sql"
+    "fmt"
+    _ "github.com/go-sql-driver/mysql"
+)
+
+func main() {
+    // 连接 MySQL
+    dsn := "user:password@tcp(127.0.0.1:3306)/dbname"
+    db, err := sql.Open("mysql", dsn)
+    if err != nil {
+        panic(err)
+    }
+    defer db.Close()
+
+    // 测试连接
+    err = db.Ping()
+    if err != nil {
+        panic(err)
+    }
+
+    fmt.Println("连接成功")
+}
+```
+
+### 查询操作
+
+```go
+package main
+
+import (
+    "database/sql"
+    "fmt"
+    _ "github.com/go-sql-driver/mysql"
+)
+
+type User struct {
+    ID    int
+    Name  string
+    Email string
+}
+
+func main() {
+    db, err := sql.Open("mysql", "user:password@tcp(127.0.0.1:3306)/dbname")
+    if err != nil {
+        panic(err)
+    }
+    defer db.Close()
+
+    // 查询单行
+    var user User
+    err = db.QueryRow("SELECT id, name, email FROM users WHERE id = ?", 1).Scan(
+        &user.ID, &user.Name, &user.Email,
+    )
+    if err != nil {
+        panic(err)
+    }
+    fmt.Println(user)
+
+    // 查询多行
+    rows, err := db.Query("SELECT id, name, email FROM users")
+    if err != nil {
+        panic(err)
+    }
+    defer rows.Close()
+
+    for rows.Next() {
+        var u User
+        err := rows.Scan(&u.ID, &u.Name, &u.Email)
+        if err != nil {
+            panic(err)
+        }
+        fmt.Println(u)
+    }
+}
+```
+
+### 插入、更新、删除
+
+```go
+package main
+
+import (
+    "database/sql"
+    "fmt"
+    _ "github.com/go-sql-driver/mysql"
+)
+
+func main() {
+    db, _ := sql.Open("mysql", "user:password@tcp(127.0.0.1:3306)/dbname")
+    defer db.Close()
+
+    // 插入
+    result, err := db.Exec(
+        "INSERT INTO users (name, email) VALUES (?, ?)",
+        "张三", "zhangsan@example.com",
+    )
+    if err != nil {
+        panic(err)
+    }
+
+    id, _ := result.LastInsertId()
+    fmt.Println("插入的ID:", id)
+
+    // 更新
+    _, err = db.Exec(
+        "UPDATE users SET email = ? WHERE id = ?",
+        "newemail@example.com", 1,
+    )
+    if err != nil {
+        panic(err)
+    }
+
+    // 删除
+    _, err = db.Exec("DELETE FROM users WHERE id = ?", 1)
+    if err != nil {
+        panic(err)
+    }
+}
+```
+
+---
+
+## 使用 GORM
+
+### 安装 GORM
+
+```bash
+go get -u gorm.io/gorm
+go get -u gorm.io/driver/mysql
+```
+
+### GORM 基础
+
+```go
+package main
+
+import (
+    "fmt"
+    "gorm.io/driver/mysql"
+    "gorm.io/gorm"
+)
+
+type User struct {
+    ID    uint   `gorm:"primaryKey"`
+    Name  string `gorm:"size:255"`
+    Email string `gorm:"size:255;uniqueIndex"`
+}
+
+func main() {
+    // 连接数据库
+    dsn := "user:password@tcp(127.0.0.1:3306)/dbname?charset=utf8mb4&parseTime=True&loc=Local"
+    db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
+    if err != nil {
+        panic("连接数据库失败")
+    }
+
+    // 自动迁移
+    db.AutoMigrate(&User{})
+
+    // 创建
+    user := User{Name: "张三", Email: "zhangsan@example.com"}
+    db.Create(&user)
+
+    // 查询
+    var result User
+    db.First(&result, 1)
+    fmt.Println(result)
+
+    // 更新
+    db.Model(&result).Update("Email", "newemail@example.com")
+
+    // 删除
+    db.Delete(&result)
+}
+```
+
+---
+
+## 事务处理
+
+### database/sql 事务
+
+```go
+package main
+
+import (
+    "database/sql"
+    "fmt"
+    _ "github.com/go-sql-driver/mysql"
+)
+
+func transfer(db *sql.DB, from, to int, amount float64) error {
+    tx, err := db.Begin()
+    if err != nil {
+        return err
+    }
+
+    defer func() {
+        if p := recover(); p != nil {
+            tx.Rollback()
+            panic(p)
+        }
+    }()
+
+    // 扣除
+    _, err = tx.Exec("UPDATE accounts SET balance = balance - ? WHERE id = ?", amount, from)
+    if err != nil {
+        tx.Rollback()
+        return err
+    }
+
+    // 增加
+    _, err = tx.Exec("UPDATE accounts SET balance = balance + ? WHERE id = ?", amount, to)
+    if err != nil {
+        tx.Rollback()
+        return err
+    }
+
+    return tx.Commit()
+}
+```
+
+### GORM 事务
+
+```go
+package main
+
+import (
+    "gorm.io/gorm"
+)
+
+func transfer(db *gorm.DB, from, to uint, amount float64) error {
+    return db.Transaction(func(tx *gorm.DB) error {
+        // 扣除
+        if err := tx.Model(&Account{}).Where("id = ?", from).Update("balance", gorm.Expr("balance - ?", amount)).Error; err != nil {
+            return err
+        }
+
+        // 增加
+        if err := tx.Model(&Account{}).Where("id = ?", to).Update("balance", gorm.Expr("balance + ?", amount)).Error; err != nil {
+            return err
+        }
+
+        return nil
+    })
+}
+```
+
+---
+
+## 总结
+
+本文学习了：
+
+- database/sql 包
+- GORM 使用
+- CRUD 操作
+- 事务处理
+
+下一步：[17 单元测试](./17-testing.mdx)

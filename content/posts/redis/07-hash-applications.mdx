@@ -1,0 +1,543 @@
+---
+title: "07. Hash 类型实战应用：对象存储、购物车与 Session"
+date: "2026-03-23"
+summary: "掌握 Redis Hash 类型的实际应用，实现高效的对象存储、购物车系统和 Session 管理。"
+tags: ["Redis", "Hash"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 7
+---
+
+## 前言
+
+Hash 是 Redis 中非常适合存储对象的数据类型。与 String 存储整个 JSON 对象相比，Hash 可以让你：
+
+- ✅ 只获取需要的字段
+- ✅ 只更新需要的字段
+- ✅ 内存使用更高效
+
+本文将学习 Hash 的三大经典应用：
+
+- 📦 **对象存储**：用户信息、商品信息等
+- 🛒 **购物车**：在线购物系统
+- 💼 **Session 管理**：用户会话存储
+
+---
+
+## 对象存储
+
+### 基础用法
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+// 存储用户信息
+async function saveUser(userId: string, userData: Record<string, string>) {
+  const key = `user:${userId}`;
+  await redis.hset(key, userData);
+}
+
+// 使用示例
+await saveUser("123", {
+  name: "张三",
+  email: "zhangsan@example.com",
+  age: "25",
+  city: "北京",
+});
+
+// 获取用户信息
+async function getUser(userId: string) {
+  const key = `user:${userId}`;
+  return await redis.hgetall(key);
+}
+
+// 获取部分字段
+async function getUserFields(userId: string, fields: string[]) {
+  const key = `user:${userId}`;
+  return await redis.hmget(key, ...fields);
+}
+
+// 使用示例：只获取需要的字段
+const [name, email] = await getUserFields("123", ["name", "email"]);
+```
+
+### 更新部分字段
+
+```typescript
+// 只更新部分字段
+async function updateUserFields(
+  userId: string,
+  fields: Record<string, string>
+) {
+  const key = `user:${userId}`;
+  await redis.hset(key, fields);
+}
+
+// 使用示例：只更新邮箱
+await updateUserFields("123", {
+  email: "newemail@example.com",
+});
+```
+
+### 字段存在性检查
+
+```typescript
+// 检查字段是否存在
+async function hasField(userId: string, field: string): Promise<boolean> {
+  const key = `user:${userId}`;
+  const exists = await redis.hexists(key, field);
+  return exists === 1;
+}
+
+// 使用示例
+const hasEmail = await hasField("123", "email");
+```
+
+### 字段数值操作
+
+```typescript
+// 数值字段自增
+async function incrementUserField(
+  userId: string,
+  field: string,
+  value: number
+) {
+  const key = `user:${userId}`;
+  return await redis.hincrby(key, field, value);
+}
+
+// 使用示例：增加用户积分
+await incrementUserField("123", "points", 100);
+```
+
+---
+
+## 购物车系统
+
+### 基础购物车
+
+```typescript
+class ShoppingCart {
+  constructor(private redis: Redis) {}
+
+  // 添加商品到购物车
+  async addItem(userId: string, productId: string, quantity: number = 1) {
+    const key = `cart:${userId}`;
+    return await redis.hincrby(key, productId, quantity);
+  }
+
+  // 获取购物车所有商品
+  async getCart(userId: string) {
+    const key = `cart:${userId}`;
+    return await redis.hgetall(key);
+  }
+
+  // 获取单个商品数量
+  async getItemQuantity(userId: string, productId: string) {
+    const key = `cart:${userId}`;
+    const quantity = await redis.hget(key, productId);
+    return parseInt(quantity || "0");
+  }
+
+  // 更新商品数量
+  async updateItem(userId: string, productId: string, quantity: number) {
+    const key = `cart:${userId}`;
+
+    if (quantity <= 0) {
+      return await redis.hdel(key, productId);
+    }
+
+    return await redis.hset(key, productId, quantity);
+  }
+
+  // 删除商品
+  async removeItem(userId: string, productId: string) {
+    const key = `cart:${userId}`;
+    return await redis.hdel(key, productId);
+  }
+
+  // 清空购物车
+  async clearCart(userId: string) {
+    const key = `cart:${userId}`;
+    return await redis.del(key);
+  }
+
+  // 获取购物车商品数量
+  async getCartSize(userId: string) {
+    const key = `cart:${userId}`;
+    return await redis.hlen(key);
+  }
+}
+
+// 使用示例
+const cart = new ShoppingCart(redis);
+
+// 添加商品
+await cart.addItem("user:123", "product:456", 2);
+
+// 获取购物车
+const items = await cart.getCart("user:123");
+// { "product:456": "2" }
+
+// 更新数量
+await cart.updateItem("user:123", "product:456", 5);
+
+// 删除商品
+await cart.removeItem("user:123", "product:456");
+```
+
+### 带商品信息的购物车
+
+```typescript
+class EnhancedShoppingCart {
+  constructor(
+    private redis: Redis,
+    private productDb: any
+  ) {}
+
+  async addItem(userId: string, productId: string, quantity: number = 1) {
+    // 检查商品是否存在
+    const product = await this.productDb.getProduct(productId);
+    if (!product) {
+      throw new Error("商品不存在");
+    }
+
+    // 检查库存
+    if (product.stock < quantity) {
+      throw new Error("库存不足");
+    }
+
+    const key = `cart:${userId}`;
+    return await redis.hincrby(key, productId, quantity);
+  }
+
+  async getCartWithDetails(userId: string) {
+    const key = `cart:${userId}`;
+    const cartItems = await redis.hgetall(key);
+
+    // 获取商品详情
+    const productIds = Object.keys(cartItems);
+    const products = await this.productDb.getProducts(productIds);
+
+    // 组合数据
+    return products.map((product: any) => ({
+      ...product,
+      quantity: parseInt(cartItems[product.id]),
+      subtotal: product.price * parseInt(cartItems[product.id]),
+    }));
+  }
+
+  async getCartTotal(userId: string) {
+    const items = await this.getCartWithDetails(userId);
+    return items.reduce((sum, item) => sum + item.subtotal, 0);
+  }
+}
+```
+
+---
+
+## Session 管理
+
+### 基础 Session
+
+```typescript
+class SessionManager {
+  constructor(private redis: Redis) {}
+
+  // 创建 Session
+  async createSession(
+    userId: string,
+    data: Record<string, any>,
+    ttl: number = 86400
+  ) {
+    const sessionId = this.generateSessionId();
+    const key = `session:${sessionId}`;
+
+    // 存储 Session
+    await redis.hset(key, {
+      userId,
+      ...data,
+      createdAt: Date.now().toString(),
+    });
+
+    // 设置过期时间
+    await redis.expire(key, ttl);
+
+    return sessionId;
+  }
+
+  // 获取 Session
+  async getSession(sessionId: string) {
+    const key = `session:${sessionId}`;
+    const session = await redis.hgetall(key);
+
+    if (!session || Object.keys(session).length === 0) {
+      return null;
+    }
+
+    return session;
+  }
+
+  // 更新 Session
+  async updateSession(sessionId: string, data: Record<string, any>) {
+    const key = `session:${sessionId}`;
+    await redis.hset(key, data);
+  }
+
+  // 删除 Session
+  async deleteSession(sessionId: string) {
+    const key = `session:${sessionId}`;
+    return await redis.del(key);
+  }
+
+  // 刷新 Session 过期时间
+  async refreshSession(sessionId: string, ttl: number = 86400) {
+    const key = `session:${sessionId}`;
+    return await redis.expire(key, ttl);
+  }
+
+  private generateSessionId(): string {
+    return `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  }
+}
+
+// 使用示例
+const sessions = new SessionManager(redis);
+
+// 登录时创建 Session
+const sessionId = await sessions.createSession("user:123", {
+  role: "admin",
+  permissions: ["read", "write"],
+});
+
+// 请求时验证 Session
+const session = await sessions.getSession(sessionId);
+if (!session) {
+  throw new Error("Session 已过期");
+}
+
+// 活动时刷新 Session
+await sessions.refreshSession(sessionId);
+```
+
+### Session 中间件
+
+```typescript
+import { Context, Next } from "hono";
+
+class SessionMiddleware {
+  constructor(private sessions: SessionManager) {}
+
+  middleware() {
+    return async (c: Context, next: Next) => {
+      const sessionId = c.req.header("X-Session-ID") || c.cookie("session_id");
+
+      if (!sessionId) {
+        return c.json({ error: "未登录" }, 401);
+      }
+
+      const session = await this.sessions.getSession(sessionId);
+
+      if (!session) {
+        return c.json({ error: "Session 已过期" }, 401);
+      }
+
+      // 将 Session 信息注入到上下文
+      c.set("session", session);
+      c.set("userId", session.userId);
+
+      // 刷新 Session
+      await this.sessions.refreshSession(sessionId);
+
+      await next();
+    };
+  }
+}
+
+// 使用示例
+const sessionMiddleware = new SessionMiddleware(sessions);
+app.use("/api/*", sessionMiddleware.middleware());
+```
+
+---
+
+## 实际应用案例
+
+### 案例 1：用户配置系统
+
+```typescript
+class UserSettings {
+  constructor(private redis: Redis) {}
+
+  async saveSettings(userId: string, settings: Record<string, any>) {
+    const key = `settings:${userId}`;
+
+    // 将所有值转换为字符串
+    const stringSettings: Record<string, string> = {};
+    for (const [k, v] of Object.entries(settings)) {
+      stringSettings[k] = typeof v === "string" ? v : JSON.stringify(v);
+    }
+
+    await redis.hset(key, stringSettings);
+  }
+
+  async getSettings(userId: string) {
+    const key = `settings:${userId}`;
+    const settings = await redis.hgetall(key);
+
+    // 尝试解析 JSON 值
+    const result: Record<string, any> = {};
+    for (const [k, v] of Object.entries(settings)) {
+      try {
+        result[k] = JSON.parse(v);
+      } catch {
+        result[k] = v;
+      }
+    }
+
+    return result;
+  }
+
+  async updateSetting(userId: string, key: string, value: any) {
+    const settingsKey = `settings:${userId}`;
+    const stringValue =
+      typeof value === "string" ? value : JSON.stringify(value);
+    await redis.hset(settingsKey, key, stringValue);
+  }
+
+  async getSetting(userId: string, key: string) {
+    const settingsKey = `settings:${userId}`;
+    const value = await redis.hget(settingsKey, key);
+
+    if (!value) return null;
+
+    try {
+      return JSON.parse(value);
+    } catch {
+      return value;
+    }
+  }
+}
+```
+
+### 案例 2：文章元数据
+
+```typescript
+class ArticleMetadata {
+  constructor(private redis: Redis) {}
+
+  async setMetadata(
+    articleId: string,
+    metadata: {
+      title: string;
+      author: string;
+      category: string;
+      tags: string;
+      readTime: number;
+    }
+  ) {
+    const key = `article:${articleId}:meta`;
+    await redis.hset(key, metadata);
+  }
+
+  async getMetadata(articleId: string) {
+    const key = `article:${articleId}:meta`;
+    return await redis.hgetall(key);
+  }
+
+  async incrementViews(articleId: string) {
+    const key = `article:${articleId}:meta`;
+    return await redis.hincrby(key, "views", 1);
+  }
+
+  async updateAuthor(articleId: string, newAuthor: string) {
+    const key = `article:${articleId}:meta`;
+    await redis.hset(key, "author", newAuthor);
+  }
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 合理使用 Hash
+
+```typescript
+// ✅ 适合使用 Hash：对象字段
+await redis.hset("user:123", {
+  name: "张三",
+  email: "user@example.com",
+});
+
+// ❌ 不适合：简单键值
+await redis.hset("counter", "value", "1");
+// 应该用：
+await redis.set("counter", "1");
+```
+
+### 2. 避免 HGETALL 大 Hash
+
+```typescript
+// ❌ 如果 Hash 有很多字段
+const all = await redis.hgetall("user:123");
+
+// ✅ 只获取需要的字段
+const data = await redis.hmget("user:123", "name", "email");
+```
+
+### 3. 使用 HMSET/HMGET 批量操作
+
+```typescript
+// ✅ 批量设置
+await redis.hset("user:123", {
+  name: "张三",
+  email: "user@example.com",
+  age: "25",
+});
+
+// ✅ 批量获取
+const [name, email] = await redis.hmget("user:123", "name", "email");
+```
+
+---
+
+## 常见问题
+
+### Q1: Hash vs String 存储对象？
+
+**A**: Hash 更适合：
+
+- 需要部分获取字段
+- 需要部分更新字段
+- 字段数量适中（< 1000）
+
+### Q2: Hash 有大小限制吗？
+
+**A**:
+
+- 每个 Hash 最多 2³² - 1 个字段
+- 每个字段值最大 512MB
+- 但建议每个 Hash 不超过 1000 个字段
+
+---
+
+## 总结
+
+本文我们学习了 Hash 类型的三大应用：
+
+✅ **对象存储**：部分获取和更新
+✅ **购物车系统**：商品管理
+✅ **Session 管理**：用户会话
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将学习 **List 实现消息队列**。
+
+继续阅读：[08. List 实现消息队列](./08-list-queue-implementation.mdx)

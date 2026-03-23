@@ -1,0 +1,640 @@
+---
+title: "15. PWA 集成实战：构建渐进式 Web 应用"
+date: "2025-03-23"
+summary: "深入掌握 Vite 的 PWA 集成，学习 Service Worker、离线策略、推送通知等 PWA 核心技术。"
+tags: ["Vite", "PWA", "Service Worker", "离线应用"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 深入实战"
+seriesOrder: 15
+---
+
+## 前言
+
+PWA（渐进式 Web 应用）让 Web 应用具备原生应用的体验。Vite 对 PWA 提供了优秀的支持。本文将深入探讨 PWA 的集成方案。
+
+## PWA 基础
+
+### 什么是 PWA
+
+```
+PWA 核心技术：
+├─ Service Worker（离线缓存）
+├─ Manifest（应用清单）
+├─ Push API（推送通知）
+└─ Sync API（后台同步）
+```
+
+### PWA 优势
+
+- **离线可用**：Service Worker 缓存资源
+- **添加到主屏幕**：类似原生应用
+- **推送通知**：实时消息推送
+- **自动更新**：后台更新应用
+
+## vite-plugin-pwa 配置
+
+### 基础配置
+
+```typescript
+// vite.config.ts
+import { VitePWA } from "vite-plugin-pwa";
+
+export default defineConfig({
+  plugins: [
+    VitePWA({
+      registerType: "autoUpdate",
+
+      manifest: {
+        name: "My App",
+        short_name: "App",
+        description: "My PWA Application",
+        theme_color: "#ffffff",
+        background_color: "#ffffff",
+
+        display: "standalone",
+
+        icons: [
+          {
+            src: "/pwa-192x192.png",
+            sizes: "192x192",
+            type: "image/png",
+          },
+          {
+            src: "/pwa-512x512.png",
+            sizes: "512x512",
+            type: "image/png",
+          },
+        ],
+      },
+
+      workbox: {
+        globPatterns: ["**/*.{js,css,html,ico,png,svg}"],
+      },
+    }),
+  ],
+});
+```
+
+### 注册类型
+
+```typescript
+// autoUpdate（推荐）
+VitePWA({
+  registerType: "autoUpdate",
+});
+
+// 手动更新
+VitePWA({
+  registerType: "promptUpdate",
+});
+```
+
+## Service Worker 配置
+
+### 缓存策略
+
+```typescript
+VitePWA({
+  workbox: {
+    // 缓存模式
+    navigateFallback: "/index.html",
+
+    // 运行时缓存
+    runtimeCaching: [
+      {
+        // API 请求
+        urlPattern: /^https:\/\/api\./,
+        handler: "NetworkFirst", // 优先网络
+        options: {
+          cacheName: "api-cache",
+          expiration: {
+            maxEntries: 10,
+            maxAgeSeconds: 60 * 60 * 24, // 24 小时
+          },
+          cacheableResponse: {
+            statuses: [0, 200],
+          },
+        },
+      },
+      {
+        // 静态资源
+        urlPattern: /\.(?:png|jpg|jpeg|svg|gif)$/,
+        handler: "CacheFirst",
+        options: {
+          cacheName: "images-cache",
+          expiration: {
+            maxEntries: 60,
+            maxAgeSeconds: 60 * 60 * 24 * 30, // 30 天
+          },
+        },
+      },
+      {
+        // 字体文件
+        urlPattern: /\.(?:woff|woff2|ttf|otf)$/,
+        handler: "CacheFirst",
+        options: {
+          cacheName: "fonts-cache",
+          expiration: {
+            maxEntries: 20,
+            maxAgeSeconds: 60 * 60 * 24 * 365, // 1 年
+          },
+        },
+      },
+    ],
+
+    // 预缓存
+    globPatterns: [
+      "**/*.{js,css,html}",
+      "**/*.{png,jpg,jpeg,svg,gif}",
+      "**/*.{woff,woff2,ttf}",
+    ],
+
+    // 预缓存忽略文件
+    globIgnores: ["**/node_modules/**"],
+  },
+});
+```
+
+### 缓存策略说明
+
+```typescript
+// CacheFirst：优先缓存
+{
+  urlPattern: /\.(?:png|jpg)$/,
+  handler: 'CacheFirst'
+}
+
+// NetworkFirst：优先网络
+{
+  urlPattern: /^https:\/\/api\./,
+  handler: 'NetworkFirst'
+}
+
+// StaleWhileRevalidate：使用缓存同时更新
+{
+  urlPattern: /^https:\/\/cdn\./,
+  handler: 'StaleWhileRevalidate'
+}
+
+// NetworkOnly：只用网络
+{
+  urlPattern: /^https:\/\/payment\./,
+  handler: 'NetworkOnly'
+}
+```
+
+## 客户端集成
+
+### 注册 Service Worker
+
+```typescript
+// src/main.tsx
+import { registerSW } from "virtual:pwa-register";
+
+// 更新检测
+const updateSW = registerSW({
+  onNeedRefresh() {
+    // 显示更新提示
+    if (confirm("New version available. Reload?")) {
+      updateSW(true);
+    }
+  },
+
+  onOfflineReady() {
+    // 离线就绪
+    console.log("App ready to work offline");
+  },
+
+  onRegistered(registration) {
+    // 注册成功
+    console.log("SW registered:", registration);
+
+    // 定期检查更新（每小时）
+    setInterval(
+      () => {
+        registration?.update();
+      },
+      60 * 60 * 1000
+    );
+  },
+
+  onRegisterError(error) {
+    // 注册失败
+    console.error("SW registration error:", error);
+  },
+});
+```
+
+### 更新 UI 组件
+
+```typescript
+// src/components/ReloadPrompt.tsx
+import { useRegisterSW } from 'virtual:pwa-register/react';
+
+export function ReloadPrompt() {
+  const {
+    offlineReady: [offlineReady, setOfflineReady],
+    needRefresh: [needRefresh, setNeedRefresh],
+    updateServiceWorker
+  } = useRegisterSW();
+
+  const close = () => {
+    setOfflineReady(false);
+    setNeedRefresh(false);
+  };
+
+  return (
+    <div className="reload-prompt">
+      {offlineReady && (
+        <div>
+          <p>App ready to work offline</p>
+          <button onClick={close}>Close</button>
+        </div>
+      )}
+
+      {needRefresh && (
+        <div>
+          <p>New content available, click on reload button to update.</p>
+          <button onClick={() => updateServiceWorker(true)}>
+            Reload
+          </button>
+          <button onClick={close}>Close</button>
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+## 离线策略
+
+### 离线页面
+
+```html
+<!-- offline.html -->
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Offline</title>
+    <style>
+      body {
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        font-family: Arial, sans-serif;
+      }
+    </style>
+  </head>
+  <body>
+    <div>
+      <h1>You are offline</h1>
+      <p>Please check your internet connection.</p>
+    </div>
+  </body>
+</html>
+```
+
+```typescript
+// vite.config.ts
+VitePWA({
+  workbox: {
+    navigateFallback: "/offline.html",
+  },
+});
+```
+
+### 离线检测
+
+```typescript
+// src/hooks/useOnline.ts
+export function useOnline() {
+  const [isOnline, setIsOnline] = useState(navigator.onLine);
+
+  useEffect(() => {
+    const handleOnline = () => setIsOnline(true);
+    const handleOffline = () => setIsOnline(false);
+
+    window.addEventListener('online', handleOnline);
+    window.addEventListener('offline', handleOffline);
+
+    return () => {
+      window.removeEventListener('online', handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, []);
+
+  return isOnline;
+}
+
+// 使用
+function App() {
+  const isOnline = useOnline();
+
+  if (!isOnline) {
+    return <div>You are offline</div>;
+  }
+
+  return <MainApp />;
+}
+```
+
+## 推送通知
+
+### 请求权限
+
+```typescript
+// src/utils/notifications.ts
+export async function requestNotificationPermission() {
+  if (!('Notification' in window)) {
+    console.log('This browser does not support notifications');
+    return false;
+  }
+
+  const permission = await Notification.requestPermission();
+
+  if (permission === 'granted') {
+    return true;
+  }
+
+  return false;
+}
+
+// 使用
+<button onClick={requestNotificationPermission}>
+  Enable Notifications
+</button>
+```
+
+### 显示通知
+
+```typescript
+export function showNotification(title: string, options?: NotificationOptions) {
+  if (Notification.permission === "granted") {
+    new Notification(title, {
+      icon: "/icon-192.png",
+      badge: "/badge-72.png",
+      ...options,
+    });
+  }
+}
+
+// 使用
+showNotification("Hello", {
+  body: "This is a notification",
+  tag: "hello-notification",
+});
+```
+
+### Service Worker 推送
+
+```typescript
+// src/sw-push.js（自定义 Service Worker）
+self.addEventListener("push", (event) => {
+  const options = {
+    body: event.data.text(),
+    icon: "/icon-192.png",
+    badge: "/badge-72.png",
+    vibrate: [100, 50, 100],
+    data: {
+      dateOfArrival: Date.now(),
+    },
+  };
+
+  event.waitUntil(
+    self.registration.showNotification("Push Notification", options)
+  );
+});
+
+self.addEventListener("notificationclick", (event) => {
+  event.notification.close();
+
+  event.waitUntil(clients.openWindow("/"));
+});
+```
+
+## 自定义 Service Worker
+
+### 拦截请求
+
+```typescript
+// src/sw-custom.ts
+export default {
+  async fetch(event: FetchEvent) {
+    const { request } = event;
+
+    // 自定义缓存逻辑
+    if (request.url.includes("/api/")) {
+      // API 请求处理
+      const cachedResponse = await caches.match(request);
+
+      if (cachedResponse) {
+        return cachedResponse;
+      }
+
+      const networkResponse = await fetch(request);
+
+      if (networkResponse.ok) {
+        const cache = await caches.open("api-cache");
+        cache.put(request, networkResponse.clone());
+      }
+
+      return networkResponse;
+    }
+
+    // 其他请求使用默认处理
+    return fetch(request);
+  },
+};
+```
+
+### 后台同步
+
+```typescript
+// Service Worker
+self.addEventListener("sync", (event) => {
+  if (event.tag === "sync-messages") {
+    event.waitUntil(syncMessages());
+  }
+});
+
+async function syncMessages() {
+  // 同步消息到服务器
+  const messages = await getMessagesFromDB();
+
+  for (const message of messages) {
+    await fetch("/api/messages", {
+      method: "POST",
+      body: JSON.stringify(message),
+    });
+  }
+}
+
+// 注册同步
+navigator.serviceWorker.ready.then((registration) => {
+  registration.sync.register("sync-messages");
+});
+```
+
+## 图标生成
+
+### 使用工具生成
+
+```bash
+# 安装工具
+npm install -D pwa-asset-generator
+
+# 生成图标
+npx pwa-asset-generator public/logo.png public/icons
+```
+
+### Manifest 配置
+
+```typescript
+VitePWA({
+  manifest: {
+    icons: [
+      {
+        src: "/icons/icon-72x72.png",
+        sizes: "72x72",
+        type: "image/png",
+        purpose: "any maskable",
+      },
+      {
+        src: "/icons/icon-96x96.png",
+        sizes: "96x96",
+        type: "image/png",
+        purpose: "any maskable",
+      },
+      {
+        src: "/icons/icon-128x128.png",
+        sizes: "128x128",
+        type: "image/png",
+        purpose: "any",
+      },
+      {
+        src: "/icons/icon-144x144.png",
+        sizes: "144x144",
+        type: "image/png",
+        purpose: "any",
+      },
+      {
+        src: "/icons/icon-152x152.png",
+        sizes: "152x152",
+        type: "image/png",
+        purpose: "any",
+      },
+      {
+        src: "/icons/icon-192x192.png",
+        sizes: "192x192",
+        type: "image/png",
+        purpose: "any maskable",
+      },
+      {
+        src: "/icons/icon-384x384.png",
+        sizes: "384x384",
+        type: "image/png",
+        purpose: "any",
+      },
+      {
+        src: "/icons/icon-512x512.png",
+        sizes: "512x512",
+        type: "image/png",
+        purpose: "any maskable",
+      },
+    ],
+  },
+});
+```
+
+## 最佳实践
+
+### 1. 渐进增强
+
+```typescript
+// 检查 PWA 支持
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/sw.js");
+}
+```
+
+### 2. 错误处理
+
+```typescript
+// 处理 SW 错误
+navigator.serviceWorker.addEventListener("error", (event) => {
+  console.error("Service Worker error:", event);
+});
+```
+
+### 3. 性能优化
+
+```typescript
+// 限制缓存大小
+workbox: {
+  runtimeCaching: [
+    {
+      urlPattern: /\.(?:png|jpg)$/,
+      handler: "CacheFirst",
+      options: {
+        expiration: {
+          maxEntries: 50, // 最多缓存 50 个
+          maxAgeSeconds: 60 * 60 * 24 * 7, // 7 天
+        },
+      },
+    },
+  ];
+}
+```
+
+## 常见问题
+
+### Q1: Service Worker 不更新？
+
+A: 使用 autoUpdate 模式：
+
+```typescript
+VitePWA({
+  registerType: "autoUpdate",
+});
+```
+
+### Q2: 离线时页面 404？
+
+A: 配置 navigateFallback：
+
+```typescript
+workbox: {
+  navigateFallback: "/index.html";
+}
+```
+
+### Q3: 如何调试 SW？
+
+A: 使用 Chrome DevTools：
+
+1. 打开 Application → Service Workers
+2. 查看 SW 状态和日志
+3. 使用 Update on reload
+
+## 总结
+
+Vite PWA 集成要点：
+
+1. **基础配置**：vite-plugin-pwa
+2. **Service Worker**：缓存策略
+3. **客户端集成**：注册、更新
+4. **离线策略**：离线页面、检测
+5. **推送通知**：权限、显示
+6. **自定义 SW**：拦截、同步
+
+## 下一步
+
+PWA 集成完成后，下一步我们将学习从 Webpack 迁移到 Vite。
+
+---
+
+- **上一篇**：[14. 服务端渲染支持](./14-vite-ssr-support)
+- **下一篇**：[16. 从 Webpack 迁移指南](./16-vite-migration-guide)

@@ -40,7 +40,6 @@ export default function PostList({ posts }: PostListProps) {
       "测试",
       "运维",
       "大模型",
-      "提效工具",
       "数据库",
     ];
 
@@ -79,8 +78,6 @@ export default function PostList({ posts }: PostListProps) {
       运维: "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400",
       大模型:
         "bg-pink-100 text-pink-700 dark:bg-pink-900/30 dark:text-pink-400",
-      提效工具:
-        "bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400",
       数据库:
         "bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-400",
     };

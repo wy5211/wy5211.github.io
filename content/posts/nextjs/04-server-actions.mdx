@@ -1,0 +1,992 @@
+---
+title: "04. Server Actions：简化数据修改"
+date: "2026-03-23"
+summary: "掌握 Next.js Server Actions，学习如何简化表单处理和数据修改，使用 useFormState 和 useFormStatus，以及实现乐观更新和错误处理。"
+tags: ["Next.js", "Server Actions", "表单处理", "数据验证", "TypeScript"]
+category: "nextjs"
+cover: ""
+draft: false
+series: "Next.js 渐进式全栈开发"
+seriesOrder: 4
+---
+
+## 前言
+
+在传统的 React 应用中，处理表单提交和数据修改通常需要创建 API 端点、编写客户端逻辑、处理加载和错误状态。Next.js Server Actions 改变了这一切，让你能够直接在组件中调用服务器函数，大大简化了数据交互。
+
+**学习目标**：
+
+- ✅ 理解 Server Actions 的工作原理
+- ✅ 掌握表单处理和数据修改
+- ✅ 学会使用 useFormState 和 useFormStatus
+- ✅ 实现乐观更新和错误处理
+- ✅ 了解数据验证和安全最佳实践
+
+---
+
+## Server Actions 基础
+
+### 什么是 Server Actions
+
+Server Actions 是在服务器上执行的异步函数，可以直接从 Client 或 Server Components 中调用：
+
+```
+传统方式：
+┌─────────────┐      API Request      ┌─────────────┐
+│   Client    │ ──────────────────────→ │   Server    │
+│  Component  │ ←────────────────────── │   Route     │
+└─────────────┘      JSON Response     └─────────────┘
+     ↓ 需要编写 API 端点、处理状态管理
+
+Server Actions：
+┌─────────────┐      Direct Call       ┌─────────────┐
+│   Client    │ ──────────────────────→ │   Server    │
+│  Component  │ ←────────────────────── │   Action    │
+└─────────────┘      Result            └─────────────┘
+     ↓ 直接调用函数，自动处理状态
+```
+
+### 创建第一个 Server Action
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { db } from "@/lib/db";
+import { revalidatePath } from "next/cache";
+
+export async function createPost(formData: FormData) {
+  const title = formData.get("title") as string;
+  const content = formData.get("content") as string;
+
+  if (!title || !content) {
+    return { error: "标题和内容不能为空" };
+  }
+
+  const post = await db.posts.create({
+    data: { title, content },
+  });
+
+  // 重新验证缓存
+  revalidatePath("/blog");
+
+  return { success: true, post };
+}
+```
+
+### 在表单中使用
+
+```typescript
+// app/blog/new/page.tsx
+import { createPost } from '@/app/actions';
+
+export default function NewPostPage() {
+  return (
+    <form action={createPost}>
+      <div>
+        <label htmlFor="title">标题</label>
+        <input
+          id="title"
+          name="title"
+          type="text"
+          required
+        />
+      </div>
+
+      <div>
+        <label htmlFor="content">内容</label>
+        <textarea
+          id="content"
+          name="content"
+          required
+        />
+      </div>
+
+      <button type="submit">发布</button>
+    </form>
+  );
+}
+```
+
+---
+
+## 表单处理
+
+### 基础表单处理
+
+```typescript
+// app/actions.ts
+"use server";
+
+export async function createComment(formData: FormData) {
+  const postId = formData.get("postId") as string;
+  const content = formData.get("content") as string;
+
+  // 验证
+  if (!content || content.length < 10) {
+    return {
+      error: "评论内容至少需要 10 个字符",
+    };
+  }
+
+  // 保存到数据库
+  const comment = await db.comments.create({
+    data: {
+      postId,
+      content,
+      authorId: "user-id", // 从会话获取
+    },
+  });
+
+  // 重新验证缓存
+  revalidatePath(`/blog/${postId}`);
+
+  return { success: true, comment };
+}
+```
+
+### useFormState 管理表单状态
+
+```typescript
+// components/CommentForm.tsx
+"use client";
+
+import { useFormState } from 'react-dom';
+import { createComment } from '@/app/actions';
+
+const initialState = {
+  error: '',
+  success: false,
+};
+
+export function CommentForm({ postId }: { postId: string }) {
+  const [state, formAction] = useFormState(
+    createComment.bind(null, postId),
+    initialState
+  );
+
+  return (
+    <form action={formAction}>
+      <textarea
+        name="content"
+        placeholder="写下你的评论..."
+        required
+        minLength={10}
+      />
+      <button type="submit">提交评论</button>
+
+      {state.error && (
+        <p className="error">{state.error}</p>
+      )}
+
+      {state.success && (
+        <p className="success">评论已发布！</p>
+      )}
+    </form>
+  );
+}
+```
+
+### useFormStatus 显示加载状态
+
+```typescript
+// components/SubmitButton.tsx
+"use client";
+
+import { useFormStatus } from 'react-dom';
+
+export function SubmitButton() {
+  const { pending } = useFormStatus();
+
+  return (
+    <button type="submit" disabled={pending}>
+      {pending ? '提交中...' : '提交'}
+    </button>
+  );
+}
+```
+
+```typescript
+// 在表单中使用
+import { SubmitButton } from '@/components/SubmitButton';
+
+export function CommentForm() {
+  return (
+    <form action={createComment}>
+      <textarea name="content" required />
+      <SubmitButton />
+    </form>
+  );
+}
+```
+
+### 完整表单示例
+
+```typescript
+// app/blog/new/page.tsx
+import { createPost } from '@/app/actions';
+import { useFormState } from 'react-dom';
+import { SubmitButton } from '@/components/SubmitButton';
+
+export default function NewPostPage() {
+  const [state, formAction] = useFormState(createPost, null);
+
+  return (
+    <div>
+      <h1>发布新文章</h1>
+
+      <form action={formAction} className="post-form">
+        <div className="field">
+          <label htmlFor="title">标题</label>
+          <input
+            id="title"
+            name="title"
+            type="text"
+            placeholder="输入文章标题"
+            required
+          />
+        </div>
+
+        <div className="field">
+          <label htmlFor="content">内容</label>
+          <textarea
+            id="content"
+            name="content"
+            placeholder="输入文章内容"
+            rows={10}
+            required
+          />
+        </div>
+
+        <SubmitButton />
+
+        {state?.error && (
+          <div className="error-message">
+            {state.error}
+          </div>
+        )}
+
+        {state?.success && (
+          <div className="success-message">
+            文章已发布！
+          </div>
+        )}
+      </form>
+    </div>
+  );
+}
+```
+
+---
+
+## 数据验证
+
+### 使用 Zod 验证
+
+```typescript
+// lib/schemas.ts
+import { z } from "zod";
+
+export const createPostSchema = z.object({
+  title: z
+    .string()
+    .min(5, "标题至少需要 5 个字符")
+    .max(100, "标题不能超过 100 个字符"),
+  content: z
+    .string()
+    .min(50, "内容至少需要 50 个字符")
+    .max(5000, "内容不能超过 5000 个字符"),
+  category: z.enum(["tech", "life", "tutorial"]),
+  tags: z.array(z.string()).max(5, "最多 5 个标签"),
+});
+```
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { createPostSchema } from "@/lib/schemas";
+import { db } from "@/lib/db";
+import { revalidatePath } from "next/cache";
+
+export async function createPost(formData: FormData) {
+  // 提取数据
+  const rawData = {
+    title: formData.get("title"),
+    content: formData.get("content"),
+    category: formData.get("category"),
+    tags: formData.getAll("tags"),
+  };
+
+  // 验证
+  const result = createPostSchema.safeParse(rawData);
+
+  if (!result.success) {
+    const errors = result.error.flatten();
+    return {
+      error: "验证失败",
+      fieldErrors: errors.fieldErrors,
+    };
+  }
+
+  // 保存到数据库
+  const post = await db.posts.create({
+    data: result.data,
+  });
+
+  revalidatePath("/blog");
+
+  return { success: true, post };
+}
+```
+
+### 显示验证错误
+
+```typescript
+// components/PostForm.tsx
+"use client";
+
+import { useFormState } from 'react-dom';
+import { createPost } from '@/app/actions';
+
+export function PostForm() {
+  const [state, formAction] = useFormState(createPost, null);
+
+  return (
+    <form action={formAction}>
+      <div>
+        <label htmlFor="title">标题</label>
+        <input id="title" name="title" type="text" />
+        {state?.fieldErrors?.title && (
+          <span className="error">
+            {state.fieldErrors.title[0]}
+          </span>
+        )}
+      </div>
+
+      <div>
+        <label htmlFor="content">内容</label>
+        <textarea id="content" name="content" />
+        {state?.fieldErrors?.content && (
+          <span className="error">
+            {state.fieldErrors.content[0]}
+          </span>
+        )}
+      </div>
+
+      <button type="submit">发布</button>
+    </form>
+  );
+}
+```
+
+---
+
+## 乐观更新
+
+### 使用 useOptimistic
+
+```typescript
+// components/CommentList.tsx
+"use client";
+
+import { useOptimistic } from 'react';
+import { addComment } from '@/app/actions';
+
+export function CommentList({
+  comments,
+  postId,
+}: {
+  comments: Comment[];
+  postId: string;
+}) {
+  const [optimisticComments, addOptimisticComment] = useOptimistic(
+    comments,
+    (state, newComment: Comment) => [
+      ...state,
+      { ...newComment, id: `optimistic-${Date.now()}` },
+    ]
+  );
+
+  return (
+    <div>
+      <ul>
+        {optimisticComments.map(comment => (
+          <li key={comment.id}>
+            <p>{comment.content}</p>
+            <small>{comment.author}</small>
+          </li>
+        ))}
+      </ul>
+
+      <CommentForm
+        postId={postId}
+        onSubmit={(content) => {
+          addOptimisticComment({
+            content,
+            author: '当前用户',
+            id: '',
+          });
+          return addComment(postId, content);
+        }}
+      />
+    </div>
+  );
+}
+```
+
+### 乐观更新表单
+
+```typescript
+// components/LikeButton.tsx
+"use client";
+
+import { useOptimistic } from 'react';
+import { toggleLike } from '@/app/actions';
+
+export function LikeButton({
+  postId,
+  initialLikes,
+  isLiked,
+}: {
+  postId: string;
+  initialLikes: number;
+  isLiked: boolean;
+}) {
+  const [optimisticState, addOptimisticState] = useOptimistic(
+    { likes: initialLikes, isLiked },
+    (state, newIsLiked: boolean) => ({
+      likes: state.likes + (newIsLiked ? 1 : -1),
+      isLiked: newIsLiked,
+    })
+  );
+
+  return (
+    <button
+      onClick={() => {
+        addOptimisticState(!optimisticState.isLiked);
+        toggleLike(postId);
+      }}
+      className={optimisticState.isLiked ? 'liked' : ''}
+    >
+      ♥ {optimisticState.likes}
+    </button>
+  );
+}
+```
+
+---
+
+## 错误处理
+
+### Server Action 错误处理
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { z } from "zod";
+import { createPostSchema } from "@/lib/schemas";
+
+export async function createPost(formData: FormData) {
+  try {
+    // 验证
+    const rawData = {
+      title: formData.get("title"),
+      content: formData.get("content"),
+    };
+
+    const result = createPostSchema.safeParse(rawData);
+
+    if (!result.success) {
+      return {
+        error: "验证失败",
+        fieldErrors: result.error.flatten().fieldErrors,
+      };
+    }
+
+    // 保存到数据库
+    const post = await db.posts.create({
+      data: result.data,
+    });
+
+    revalidatePath("/blog");
+
+    return { success: true, post };
+  } catch (error) {
+    // 记录错误
+    console.error("创建文章失败:", error);
+
+    return {
+      error: "创建文章时出错，请稍后重试",
+    };
+  }
+}
+```
+
+### 重定向处理
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { redirect } from "next/navigation";
+import { revalidatePath } from "next/cache";
+
+export async function createPost(formData: FormData) {
+  const post = await db.posts.create({
+    data: {
+      title: formData.get("title") as string,
+      content: formData.get("content") as string,
+    },
+  });
+
+  revalidatePath("/blog");
+  redirect(`/blog/${post.id}`); // 重定向到新文章
+}
+```
+
+### 可恢复的错误
+
+```typescript
+// app/actions.ts
+"use server";
+
+export async function updatePost(formData: FormData) {
+  const id = formData.get("id") as string;
+  const title = formData.get("title") as string;
+
+  try {
+    await db.posts.update({
+      where: { id },
+      data: { title },
+    });
+
+    revalidatePath("/blog");
+    return { success: true };
+  } catch (error) {
+    // 可恢复的错误，不抛出
+    return {
+      error: "更新失败",
+      message: error instanceof Error ? error.message : "未知错误",
+    };
+  }
+}
+```
+
+---
+
+## 安全最佳实践
+
+### 输入验证
+
+```typescript
+// ✅ 始终验证输入
+export async function createPost(formData: FormData) {
+  const title = formData.get("title") as string;
+
+  // 验证
+  if (!title || title.length > 100) {
+    return { error: "无效的标题" };
+  }
+
+  // 清理（防止 XSS）
+  const sanitizedTitle = title.trim();
+
+  // 保存
+  await db.posts.create({
+    data: { title: sanitizedTitle },
+  });
+}
+```
+
+### 认证和授权
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { auth } from "@/lib/auth";
+import { redirect } from "next/navigation";
+
+export async function createPost(formData: FormData) {
+  // 检查认证
+  const session = await auth();
+
+  if (!session?.user) {
+    redirect("/login");
+  }
+
+  // 检查授权
+  if (!session.user.canCreatePost) {
+    return {
+      error: "你没有权限创建文章",
+    };
+  }
+
+  // 创建文章
+  await db.posts.create({
+    data: {
+      title: formData.get("title") as string,
+      authorId: session.user.id,
+    },
+  });
+}
+```
+
+### CSRF 保护
+
+Server Actions 自动包含 CSRF 保护，无需额外配置：
+
+```typescript
+// ✅ 自动 CSRF 保护
+export async function sensitiveAction(formData: FormData) {
+  // Server Actions 自动验证 CSRF token
+  // 无需手动处理
+}
+```
+
+### 速率限制
+
+```typescript
+// lib/rate-limit.ts
+import { ratelimit } from "@/lib/upstash";
+
+export async function checkRateLimit(userId: string) {
+  const { success, remaining } = await ratelimit.limit(userId);
+
+  if (!success) {
+    throw new Error("请求过于频繁，请稍后重试");
+  }
+
+  return remaining;
+}
+```
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { checkRateLimit } from "@/lib/rate-limit";
+import { auth } from "@/lib/auth";
+
+export async function createPost(formData: FormData) {
+  const session = await auth();
+
+  // 速率限制
+  await checkRateLimit(session.user.id);
+
+  // 创建文章
+  await db.posts.create({
+    data: {
+      /* ... */
+    },
+  });
+}
+```
+
+---
+
+## 实战：评论系统
+
+让我们创建一个完整的评论系统：
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { z } from "zod";
+import { db } from "@/lib/db";
+import { revalidatePath } from "next/cache";
+import { auth } from "@/lib/auth";
+
+const commentSchema = z.object({
+  content: z
+    .string()
+    .min(10, "评论至少需要 10 个字符")
+    .max(1000, "评论不能超过 1000 个字符"),
+  postId: z.string().uuid("无效的文章 ID"),
+});
+
+export async function addComment(formData: FormData) {
+  // 认证检查
+  const session = await auth();
+  if (!session?.user) {
+    return { error: "请先登录" };
+  }
+
+  // 速率限制
+  await checkRateLimit(session.user.id);
+
+  // 验证
+  const rawData = {
+    content: formData.get("content"),
+    postId: formData.get("postId"),
+  };
+
+  const result = commentSchema.safeParse(rawData);
+
+  if (!result.success) {
+    return {
+      error: "验证失败",
+      fieldErrors: result.error.flatten().fieldErrors,
+    };
+  }
+
+  // 保存评论
+  const comment = await db.comments.create({
+    data: {
+      content: result.data.content,
+      postId: result.data.postId,
+      authorId: session.user.id,
+    },
+  });
+
+  // 重新验证
+  revalidatePath(`/blog/${result.data.postId}`);
+
+  return { success: true, comment };
+}
+```
+
+```typescript
+// components/CommentForm.tsx
+"use client";
+
+import { useFormState, useFormStatus } from 'react-dom';
+import { addComment } from '@/app/actions';
+
+const initialState = {
+  error: '',
+  fieldErrors: {},
+  success: false,
+};
+
+export function CommentForm({ postId }: { postId: string }) {
+  const [state, formAction] = useFormState(
+    addComment,
+    initialState
+  );
+
+  return (
+    <form action={formAction} className="comment-form">
+      <input type="hidden" name="postId" value={postId} />
+
+      <div className="field">
+        <label htmlFor="content">评论</label>
+        <textarea
+          id="content"
+          name="content"
+          placeholder="写下你的评论..."
+          rows={4}
+          aria-invalid={!!state.fieldErrors?.content}
+        />
+        {state.fieldErrors?.content && (
+          <span className="error">
+            {state.fieldErrors.content[0]}
+          </span>
+        )}
+      </div>
+
+      <SubmitButton />
+
+      {state.error && !state.fieldErrors && (
+        <div className="error-message">
+          {state.error}
+        </div>
+      )}
+
+      {state.success && (
+        <div className="success-message">
+          评论已发布！
+        </div>
+      )}
+    </form>
+  );
+}
+
+function SubmitButton() {
+  const { pending } = useFormStatus();
+
+  return (
+    <button type="submit" disabled={pending}>
+      {pending ? '发布中...' : '发布评论'}
+    </button>
+  );
+}
+```
+
+---
+
+## 最佳实践
+
+### ✅ 推荐做法
+
+1. **使用 Zod 验证**
+
+```typescript
+const schema = z.object({
+  title: z.string().min(1),
+});
+const result = schema.safeParse(data);
+```
+
+2. **使用 revalidatePath 更新缓存**
+
+```typescript
+revalidatePath("/blog");
+```
+
+3. **处理错误**
+
+```typescript
+try {
+  // 操作
+} catch (error) {
+  return { error: "错误消息" };
+}
+```
+
+4. **使用 useFormState 和 useFormStatus**
+
+```typescript
+const [state, formAction] = useFormState(action, initialState);
+const { pending } = useFormStatus();
+```
+
+### ❌ 避免做法
+
+1. **不要忘记验证输入**
+
+```typescript
+// ❌ 缺少验证
+export async function action(formData: FormData) {
+  const title = formData.get("title");
+  await db.posts.create({ data: { title } });
+}
+
+// ✅ 添加验证
+export async function action(formData: FormData) {
+  const title = formData.get("title");
+  if (!title || typeof title !== "string") {
+    return { error: "无效的标题" };
+  }
+  await db.posts.create({ data: { title } });
+}
+```
+
+2. **不要在 Server Action 中使用客户端库**
+
+```typescript
+// ❌ 错误：Server Actions 中不能使用客户端库
+"use server";
+import { useState } from "react"; // Error!
+
+// ✅ Server Actions 只使用服务端代码
+("use server");
+import { db } from "@/lib/db"; // OK
+```
+
+3. **不要忘记处理错误**
+
+```typescript
+// ❌ 没有错误处理
+export async function action(formData: FormData) {
+  await db.posts.create({
+    /* ... */
+  });
+  redirect("/blog");
+}
+
+// ✅ 添加错误处理
+export async function action(formData: FormData) {
+  try {
+    await db.posts.create({
+      /* ... */
+    });
+    redirect("/blog");
+  } catch (error) {
+    return { error: "创建失败" };
+  }
+}
+```
+
+---
+
+## 常见问题
+
+**Q: Server Actions 和 API Routes 有什么区别？**
+
+A: Server Actions 是函数调用，API Routes 是 HTTP 端点。Server Actions 更简单，但 API Routes 更适合构建公开 API。
+
+**Q: Server Actions 安全吗？**
+
+A: 是的。Server Actions 自动包含 CSRF 保护、输入验证和类型安全。但仍需遵循安全最佳实践。
+
+**Q: 可以在 Server Action 中使用环境变量吗？**
+
+A: 可以。Server Actions 在服务器运行，可以安全地访问环境变量和数据库。
+
+**Q: Server Actions 会重新验证所有缓存吗？**
+
+A: 不会。你需要手动调用 `revalidatePath` 或 `revalidateTag` 来更新缓存。
+
+---
+
+## 总结
+
+本文我们学习了：
+
+✅ **Server Actions 基础**
+
+- 工作原理和优势
+- 创建和使用 Server Actions
+- 表单处理
+
+✅ **状态管理**
+
+- useFormState 管理表单状态
+- useFormStatus 显示加载状态
+- 完整表单示例
+
+✅ **数据验证**
+
+- 使用 Zod 进行验证
+- 显示验证错误
+- 类型安全
+
+✅ **乐观更新**
+
+- useOptimistic 钩子
+- 即时 UI 更新
+- 用户体验优化
+
+✅ **错误处理**
+
+- 错误捕获和返回
+- 重定向处理
+- 可恢复错误
+
+✅ **安全最佳实践**
+
+- 输入验证
+- 认证和授权
+- CSRF 保护
+- 速率限制
+
+现在你应该能够使用 Server Actions 构建复杂的表单和数据交互功能。下一步，我们将学习 **API Routes**，并对比 Server Actions 的使用场景。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- API Routes 基础和 REST API 设计
+- Server Actions vs API Routes 对比
+- 公开 API 端点设计
+- Webhook 处理
+- 文件上传
+- 选择合适的方案
+
+继续阅读：[05 API Routes 与 Server Actions 对比](./05-api-routes-comparison.mdx)

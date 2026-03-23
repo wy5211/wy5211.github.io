@@ -1,0 +1,478 @@
+---
+title: "10. 环境变量与多环境配置：管理不同环境的配置"
+date: "2025-03-23"
+summary: "深入掌握 Vite 的环境变量系统，学习多环境配置、敏感信息处理、配置热更新等高级技巧。"
+tags: ["Vite", "环境变量", "配置管理", "多环境部署"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 深入实战"
+seriesOrder: 10
+---
+
+## 前言
+
+环境变量是连接代码和配置的桥梁。Vite 提供了强大的环境变量系统，支持多环境配置和动态加载。本文将深入探讨 Vite 的环境变量管理。
+
+## 环境变量基础
+
+### 环境变量文件
+
+```bash
+# .env                 # 所有环境共享
+# .env.local           # 所有环境（本地优先，git 忽略）
+# .env.development     # 开发环境
+# .env.development.local
+# .env.production      # 生产环境
+# .env.production.local
+# .env.test            # 测试环境
+```
+
+### 变量定义规则
+
+```bash
+# .env.development
+VITE_API_URL=http://localhost:8080/api
+VITE_APP_TITLE=开发环境
+VITE_ENABLE_MOCK=true
+VITE_APP_VERSION=1.0.0
+
+# 注意：必须以 VITE_ 开头才能暴露给客户端
+SECRET_KEY=abc123  # ❌ 不会暴露
+VITE_SECRET_KEY=abc123  # ✅ 会暴露给客户端
+```
+
+### 使用环境变量
+
+```typescript
+// 代码中使用
+const apiUrl = import.meta.env.VITE_API_URL;
+const appTitle = import.meta.env.VITE_APP_TITLE;
+
+// 内置环境变量
+console.log(import.meta.env.MODE); // 'development' | 'production'
+console.log(import.meta.env.DEV); // true in development
+console.log(import.meta.env.PROD); // true in production
+console.log(import.meta.env.SSR); // true in SSR
+console.log(import.meta.env.BASE_URL); // 基础路径
+```
+
+## 类型安全
+
+### 类型声明
+
+```typescript
+// src/vite-env.d.ts
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  // 必须以 VITE_ 开头
+  readonly VITE_API_URL: string;
+  readonly VITE_APP_TITLE: string;
+  readonly VITE_ENABLE_MOCK: "true" | "false";
+  readonly VITE_APP_VERSION: string;
+  readonly VITE_CDN_URL?: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+
+### 配置验证
+
+```typescript
+// src/config/env.ts
+interface EnvConfig {
+  apiUrl: string;
+  appTitle: string;
+  enableMock: boolean;
+  version: string;
+}
+
+export function loadEnvConfig(): EnvConfig {
+  const env = import.meta.env;
+
+  // 验证必需的环境变量
+  const required: (keyof ImportMetaEnv)[] = ["VITE_API_URL", "VITE_APP_TITLE"];
+
+  const missing = required.filter((key) => !env[key]);
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required environment variables: ${missing.join(", ")}`
+    );
+  }
+
+  return {
+    apiUrl: env.VITE_API_URL,
+    appTitle: env.VITE_APP_TITLE,
+    enableMock: env.VITE_ENABLE_MOCK === "true",
+    version: env.VITE_APP_VERSION || "1.0.0",
+  };
+}
+
+// 使用
+import { loadEnvConfig } from "@/config/env";
+
+const config = loadEnvConfig();
+console.log(config.apiUrl);
+```
+
+## 多环境配置
+
+### 环境切换
+
+```bash
+# 开发环境
+npm run dev
+
+# 预发布环境
+npm run dev:staging
+
+# 生产构建
+npm run build
+
+# 自定义环境
+npm run dev -- --mode custom
+```
+
+### 环境配置文件
+
+```bash
+# .env.development
+VITE_API_URL=http://localhost:8080/api
+VITE_APP_TITLE=开发环境
+VITE_ENABLE_MOCK=true
+
+# .env.staging
+VITE_API_URL=https://staging-api.example.com
+VITE_APP_TITLE=预发布环境
+VITE_ENABLE_MOCK=false
+
+# .env.production
+VITE_API_URL=https://api.example.com
+VITE_APP_TITLE=生产环境
+VITE_ENABLE_MOCK=false
+```
+
+### 脚本配置
+
+```json
+// package.json
+{
+  "scripts": {
+    "dev": "vite",
+    "dev:staging": "vite --mode staging",
+    "build": "vite build",
+    "build:staging": "vite build --mode staging",
+    "preview": "vite preview"
+  }
+}
+```
+
+## 配置热更新
+
+### 监听环境变量变化
+
+```typescript
+// vite.config.ts
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, process.cwd(), "");
+
+  return {
+    // 环境变量变化时自动重启
+    server: {
+      watch: {
+        ignored: ["!**/.env*"], // 监听环境文件
+      },
+    },
+
+    define: {
+      __APP_ENV__: JSON.stringify(env),
+    },
+  };
+});
+```
+
+### 动态环境变量
+
+```typescript
+// src/config/dynamic-env.ts
+let cachedConfig: EnvConfig | null = null;
+
+export async function getDynamicConfig(): Promise<EnvConfig> {
+  if (cachedConfig) {
+    return cachedConfig;
+  }
+
+  // 从远程获取配置
+  const response = await fetch("/api/config");
+  const remoteConfig = await response.json();
+
+  cachedConfig = {
+    ...loadEnvConfig(),
+    ...remoteConfig,
+  };
+
+  return cachedConfig;
+}
+```
+
+## 敏感信息处理
+
+### 服务端环境变量
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  // 定义只在构建时可用的变量
+  define: {
+    __API_KEY__: JSON.stringify(process.env.API_KEY),
+  },
+});
+```
+
+### 环境变量加密
+
+```typescript
+// scripts/encrypt-env.js
+import crypto from "crypto";
+
+const key = process.env.ENCRYPTION_KEY;
+const algorithm = "aes-256-cbc";
+
+function encrypt(text) {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(algorithm, Buffer.from(key), iv);
+
+  let encrypted = cipher.update(text);
+  encrypted = Buffer.concat([encrypted, cipher.final()]);
+
+  return iv.toString("hex") + ":" + encrypted.toString("hex");
+}
+
+// 加密环境变量
+const encrypted = encrypt("SECRET_VALUE");
+console.log(encrypted);
+
+// 使用时在服务端解密
+```
+
+### 后端代理
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    proxy: {
+      "/api": {
+        target: "http://backend:3000",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ""),
+      },
+    },
+  },
+});
+```
+
+## 配置管理最佳实践
+
+### 1. 分层配置
+
+```typescript
+// config/base.ts - 基础配置
+export const baseConfig = {
+  timeout: 10000,
+  retry: 3,
+};
+
+// config/development.ts
+export const devConfig = {
+  ...baseConfig,
+  apiUrl: "http://localhost:8080",
+  enableMock: true,
+};
+
+// config/production.ts
+export const prodConfig = {
+  ...baseConfig,
+  apiUrl: "https://api.example.com",
+  enableMock: false,
+};
+
+// config/index.ts
+export function getConfig() {
+  const isProd = import.meta.env.PROD;
+
+  return isProd ? prodConfig : devConfig;
+}
+```
+
+### 2. 配置文件组织
+
+```
+config/
+  env.ts           # 环境变量处理
+  api.ts          # API 配置
+  features.ts     # 功能开关
+  index.ts        # 统一导出
+```
+
+### 3. 功能开关
+
+```typescript
+// config/features.ts
+export const features = {
+  enableNewUI: import.meta.env.VITE_ENABLE_NEW_UI === "true",
+  enableBetaFeatures: import.meta.env.VITE_ENABLE_BETA === "true",
+  enableAnalytics: import.meta.env.VITE_ENABLE_ANALYTICS === "true",
+};
+
+// 使用
+import { features } from "@/config/features";
+
+if (features.enableNewUI) {
+  renderNewUI();
+} else {
+  renderOldUI();
+}
+```
+
+## 环境特定配置
+
+### 开发环境
+
+```typescript
+// vite.config.ts
+export default defineConfig(({ mode }) => {
+  const isDev = mode === "development";
+
+  return {
+    server: {
+      host: "0.0.0.0",
+      port: 3000,
+      open: !isDev, // 生产预览时自动打开
+    },
+
+    build: {
+      sourcemap: isDev, // 开发环境生成 sourcemap
+      minify: !isDev, // 开发环境不压缩
+    },
+  };
+});
+```
+
+### 生产环境
+
+```typescript
+export default defineConfig(({ mode }) => {
+  const isProd = mode === "production";
+
+  return {
+    build: {
+      terserOptions: isProd
+        ? {
+            compress: {
+              drop_console: true, // 生产环境移除 console
+              drop_debugger: true,
+            },
+          }
+        : undefined,
+    },
+  };
+});
+```
+
+## 最佳实践
+
+### 1. 使用 .env.local
+
+```bash
+# .env.local - 本地开发配置（不提交到 git）
+VITE_API_URL=http://localhost:8080
+VITE_DEBUG=true
+```
+
+### 2. 文档化环境变量
+
+```markdown
+# 环境变量文档
+
+## 开发环境
+
+- `VITE_API_URL`: API 地址 (默认: http://localhost:8080)
+- `VITE_ENABLE_MOCK`: 是否启用 Mock (默认: true)
+
+## 生产环境
+
+- `VITE_API_URL`: 生产 API 地址
+- `VITE_CDN_URL`: CDN 地址（可选）
+```
+
+### 3. 环境变量验证
+
+```typescript
+// src/config/env-validator.ts
+export function validateEnv() {
+  const env = import.meta.env;
+
+  if (!env.VITE_API_URL) {
+    throw new Error("VITE_API_URL is required");
+  }
+
+  // 验证 URL 格式
+  try {
+    new URL(env.VITE_API_URL);
+  } catch {
+    throw new Error("VITE_API_URL must be a valid URL");
+  }
+}
+```
+
+## 常见问题
+
+### Q1: 环境变量不生效？
+
+A: 检查以下几点：
+
+1. 变量名是否以 `VITE_` 开头
+2. 是否重启了开发服务器
+3. 文件命名是否正确（`.env.development`）
+
+### Q2: 如何在代码中使用环境变量？
+
+A: 使用 `import.meta.env`：
+
+```typescript
+const url = import.meta.env.VITE_API_URL;
+```
+
+### Q3: 生产环境如何隐藏敏感信息？
+
+A: 使用后端代理或服务端渲染：
+
+```typescript
+// 敏感操作通过后端 API
+fetch("/api/sensitive-operation");
+```
+
+## 总结
+
+Vite 环境变量管理要点：
+
+1. **基础规则**：VITE\_ 前缀暴露给客户端
+2. **类型安全**：TypeScript 类型声明
+3. **多环境**：不同环境配置文件
+4. **验证机制**：必需变量检查
+5. **敏感信息**：服务端处理
+6. **最佳实践**：文档化、分层配置
+
+## 下一步
+
+环境变量配置完成后，下一步我们将学习测试集成方案。
+
+---
+
+- **上一篇**：[09. 静态资源管理](./09-vite-asset-management)
+- **下一篇**：[11. 测试集成方案](./11-vite-testing-integration)

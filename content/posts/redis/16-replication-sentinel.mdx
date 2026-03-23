@@ -1,0 +1,292 @@
+---
+title: "16. 主从复制与哨兵模式：Redis 高可用架构"
+date: "2026-03-23"
+summary: "掌握 Redis 主从复制和哨兵模式，构建高可用的 Redis 集群。"
+tags: ["Redis", "主从复制", "Sentinel"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 16
+---
+
+## 前言
+
+生产环境中单节点 Redis 存在单点故障。本文将学习如何通过主从复制和哨兵模式实现高可用。
+
+---
+
+## 主从复制
+
+### 工作原理
+
+```
+1. 从节点连接主节点
+2. 从节点发送 SYNC 命令
+3. 主节点生成 RDB 快照
+4. 主节点发送快照给从节点
+5. 主节点持续发送写命令
+```
+
+### 配置主从复制
+
+#### 方式 1：配置文件
+
+```bash
+# 从节点配置文件 redis.conf
+
+# 指定主节点
+replicaof 192.168.1.100 6379
+
+# 主节点密码（如果有）
+masterauth your_password
+
+# 只读模式
+replica-read-only yes
+```
+
+#### 方式 2：命令行
+
+```bash
+# 在从节点上执行
+redis-cli REPLICAOF 192.168.1.100 6379
+```
+
+### 验证主从复制
+
+```bash
+# 在主节点上
+redis-cli INFO replication
+# role:master
+# connected_slaves:2
+
+# 在从节点上
+redis-cli INFO replication
+# role:slave
+# master_host:192.168.1.100
+```
+
+### 主从复制的优缺点
+
+**优点**：
+
+- 数据备份
+- 读写分离
+- 故障恢复
+
+**缺点**：
+
+- 主节点故障需要手动切换
+- 无法自动故障转移
+
+---
+
+## 哨兵模式
+
+### 工作原理
+
+```
+1. Sentinel 监控主从节点
+2. 主节点故障时，Sentinel 选举新主节点
+3. 通知其他从节点复制新主节点
+4. 通知客户端新主节点地址
+```
+
+### 配置 Sentinel
+
+#### 创建 Sentinel 配置
+
+```bash
+# sentinel-1.conf
+
+port 26379
+sentinel monitor mymaster 192.168.1.100 6379 2
+sentinel down-after-milliseconds mymaster 5000
+sentinel parallel-syncs mymaster 1
+sentinel failover-timeout mymaster 10000
+sentinel auth-pass mymaster your_password
+```
+
+**配置说明**：
+
+- `sentinel monitor`：监控主节点，2 表示至少 2 个 Sentinel 同意才故障转移
+- `down-after-milliseconds`：主观下线时间
+- `parallel-syncs`：同时复制的从节点数量
+- `failover-timeout`：故障转移超时时间
+
+#### 启动 Sentinel
+
+```bash
+redis-sentinel sentinel-1.conf
+
+# 或
+redis-server /path/to/sentinel-1.conf --sentinel
+```
+
+### Sentinel 集群
+
+```
++---------------------+
+|    Application      |
++----------+----------+
+           |
+           v
++---------------------+
+|  Sentinel Cluster   |
+|  + Sentinel 1 (26379)
+|  + Sentinel 2 (26380)
+|  + Sentinel 3 (26381)
++----------+----------+
+           |
+           v
++---------------------+
+|   Redis Cluster     |
+|  + Master (6379)    |
+|  + Slave 1 (6380)   |
+|  + Slave 2 (6381)   |
++---------------------+
+```
+
+### 客户端连接 Sentinel
+
+```typescript
+import Redis from "ioredis";
+
+// 使用 Sentinel 连接
+const redis = new Redis({
+  sentinels: [
+    { host: "192.168.1.100", port: 26379 },
+    { host: "192.168.1.101", port: 26379 },
+    { host: "192.168.1.102", port: 26379 },
+  ],
+  name: "mymaster",
+  sentinelPassword: "your_sentinel_password",
+  password: "your_redis_password",
+});
+
+// 正常使用
+await redis.set("key", "value");
+const value = await redis.get("key");
+```
+
+---
+
+## 主从复制实现
+
+### 读写分离
+
+```typescript
+class ReadWriteSplitRedis {
+  private master: Redis;
+  private slaves: Redis[] = [];
+  private slaveIndex = 0;
+
+  constructor(masterConfig: any, slaveConfigs: any[]) {
+    this.master = new Redis(masterConfig);
+
+    for (const config of slaveConfigs) {
+      this.slaves.push(new Redis(config));
+    }
+  }
+
+  // 写操作使用主节点
+  async write(key: string, value: any) {
+    return await this.master.set(key, value);
+  }
+
+  // 读操作使用从节点
+  async read(key: string) {
+    const slave = this.getNextSlave();
+    return await slave.get(key);
+  }
+
+  private getNextSlave() {
+    const slave = this.slaves[this.slaveIndex];
+    this.slaveIndex = (this.slaveIndex + 1) % this.slaves.length;
+    return slave;
+  }
+}
+```
+
+---
+
+## 故障转移
+
+### 手动故障转移
+
+```bash
+# 在 Sentinel 上执行
+redis-cli -p 26379 SENTINEL failover mymaster
+```
+
+### 自动故障转移
+
+```bash
+# 配置自动故障转移
+sentinel monitor mymaster 192.168.1.100 6379 2
+```
+
+---
+
+## 最佳实践
+
+### 1. 至少 3 个 Sentinel
+
+```
+生产环境建议至少 3 个 Sentinel 节点，
+分布在不同的机器上，避免单点故障。
+```
+
+### 2. 定期备份
+
+```bash
+# 定期备份主节点
+crontab -e
+# 每天凌晨 2 点备份
+0 2 * * * redis-cli --rdb /backup/dump-$(date +\%Y\%m\%d).rdb
+```
+
+### 3. 监控复制延迟
+
+```typescript
+async function checkReplicationDelay() {
+  const info = await redis.info("replication");
+
+  // 主节点：检查 slave 信息
+  // 从节点：检查 master_link_down_since_seconds
+}
+```
+
+---
+
+## 常见问题
+
+### Q1: 主从复制延迟怎么办？
+
+**A**: 可以使用 `WAIT` 命令确保写入被复制：
+
+```typescript
+await redis.set("key", "value");
+await redis.wait(1, 1000); // 等待至少 1 个从节点复制，超时 1 秒
+```
+
+### Q2: 主节点宕机后数据丢失？
+
+**A**: 配置合适的持久化策略，最少 1 个从节点。
+
+---
+
+## 总结
+
+本文我们学习了：
+
+✅ 主从复制原理和配置
+✅ Sentinel 高可用
+✅ 读写分离实现
+✅ 故障转移机制
+
+---
+
+## 下一步
+
+继续阅读：[17. Redis Cluster 集群架构](./17-cluster-architecture.mdx)

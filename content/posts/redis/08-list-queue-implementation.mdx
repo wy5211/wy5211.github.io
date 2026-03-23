@@ -1,0 +1,383 @@
+---
+title: "08. List 实现消息队列：队列、栈与阻塞队列"
+date: "2026-03-23"
+summary: "使用 Redis List 实现各种队列结构，包括 FIFO 队列、LIFO 栈和阻塞队列。"
+tags: ["Redis", "List", "消息队列"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 8
+---
+
+## 前言
+
+List 是 Redis 的有序列表结构，非常适合实现队列和栈。本文将学习：
+
+- 📤 FIFO 队列（消息队列）
+- 📥 LIFO 栈
+- ⏳ 阻塞队列
+- 📋 最新列表
+
+---
+
+## FIFO 队列
+
+### 基础实现
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+class MessageQueue {
+  constructor(
+    private redis: Redis,
+    private queueName: string
+  ) {}
+
+  // 生产者：发送消息
+  async send(message: any) {
+    return await this.redis.rpush(this.queueName, JSON.stringify(message));
+  }
+
+  // 消费者：接收消息
+  async receive() {
+    const message = await this.redis.lpop(this.queueName);
+    return message ? JSON.parse(message) : null;
+  }
+
+  // 批量发送
+  async sendBatch(messages: any[]) {
+    return await this.redis.rpush(
+      this.queueName,
+      ...messages.map((m) => JSON.stringify(m))
+    );
+  }
+
+  // 批量接收
+  async receiveBatch(count: number) {
+    const messages: any[] = [];
+    for (let i = 0; i < count; i++) {
+      const message = await this.receive();
+      if (!message) break;
+      messages.push(message);
+    }
+    return messages;
+  }
+
+  // 获取队列长度
+  async size() {
+    return await this.redis.llen(this.queueName);
+  }
+
+  // 清空队列
+  async clear() {
+    return await this.redis.del(this.queueName);
+  }
+}
+
+// 使用示例
+const queue = new MessageQueue(redis, "queue:email");
+
+// 生产者
+await queue.send({ to: "user@example.com", subject: "Hello" });
+
+// 消费者
+const message = await queue.receive();
+```
+
+---
+
+## 阻塞队列
+
+### 基础实现
+
+```typescript
+class BlockingQueue {
+  constructor(
+    private redis: Redis,
+    private queueName: string
+  ) {}
+
+  // 阻塞接收（超时时间为 0 表示永久阻塞）
+  async receive(timeout: number = 0) {
+    const result = await this.redis.blpop(this.queueName, timeout);
+    if (!result) return null;
+
+    const [, message] = result;
+    return JSON.parse(message);
+  }
+
+  // 非阻塞发送
+  async send(message: any) {
+    return await this.redis.rpush(this.queueName, JSON.stringify(message));
+  }
+}
+
+// 使用示例
+const queue = new BlockingQueue(redis, "queue:tasks");
+
+// 消费者
+async function worker() {
+  while (true) {
+    const task = await queue.receive(30); // 阻塞 30 秒
+    if (task) {
+      console.log("处理任务:", task);
+      await processTask(task);
+    }
+  }
+}
+
+worker();
+```
+
+---
+
+## 优先级队列
+
+### 使用多个 List 实现
+
+```typescript
+class PriorityQueue {
+  constructor(
+    private redis: Redis,
+    private queueName: string
+  ) {}
+
+  private getQueueKey(priority: number) {
+    return `${this.queueName}:${priority}`;
+  }
+
+  // 发送消息（指定优先级，数字越小优先级越高）
+  async send(message: any, priority: number = 5) {
+    const queueKey = this.getQueueKey(priority);
+    return await this.redis.rpush(queueKey, JSON.stringify(message));
+  }
+
+  // 接收消息（从最高优先级开始）
+  async receive() {
+    for (let priority = 1; priority <= 10; priority++) {
+      const queueKey = this.getQueueKey(priority);
+      const message = await this.redis.lpop(queueKey);
+      if (message) {
+        return JSON.parse(message);
+      }
+    }
+    return null;
+  }
+}
+
+// 使用示例
+const queue = new PriorityQueue(redis, "queue:priority");
+
+// 发送不同优先级的消息
+await queue.send({ task: "low" }, 8);
+await queue.send({ task: "high" }, 2);
+await queue.send({ task: "medium" }, 5);
+
+// 接收时会按优先级处理
+```
+
+---
+
+## 延时队列
+
+### 使用 Sorted Set 实现
+
+```typescript
+class DelayedQueue {
+  constructor(
+    private redis: Redis,
+    private queueName: string
+  ) {}
+
+  // 发送延时消息（delay 为毫秒）
+  async send(message: any, delay: number) {
+    const executeTime = Date.now() + delay;
+    return await this.redis.zadd(
+      this.queueName,
+      executeTime,
+      JSON.stringify(message)
+    );
+  }
+
+  // 获取到期消息
+  async receive() {
+    const now = Date.now();
+    const results = await this.redis.zrangebyscore(
+      this.queueName,
+      0,
+      now,
+      "LIMIT",
+      0,
+      1
+    );
+
+    if (results.length === 0) return null;
+
+    const messageStr = results[0];
+    const removed = await this.redis.zrem(this.queueName, messageStr);
+
+    if (removed === 0) return null; // 被其他消费者抢走了
+
+    return JSON.parse(messageStr);
+  }
+
+  // 获取待处理消息数量
+  async size() {
+    return await this.redis.zcard(this.queueName);
+  }
+}
+```
+
+---
+
+## 栈（LIFO）
+
+```typescript
+class Stack {
+  constructor(
+    private redis: Redis,
+    private stackName: string
+  ) {}
+
+  push(item: any) {
+    return this.redis.lpush(this.stackName, JSON.stringify(item));
+  }
+
+  pop() {
+    return this.redis
+      .lpop(this.stackName)
+      .then((msg) => (msg ? JSON.parse(msg) : null));
+  }
+
+  peek() {
+    return this.redis
+      .lindex(this.stackName, 0)
+      .then((msg) => (msg ? JSON.parse(msg) : null));
+  }
+
+  size() {
+    return this.redis.llen(this.stackName);
+  }
+}
+
+// 使用示例：撤销操作
+const stack = new Stack(redis, "stack:operations");
+
+await stack.push({ type: "insert", data: "xxx" });
+await stack.push({ type: "delete", id: 123 });
+
+// 撤销时弹出
+const operation = await stack.pop();
+```
+
+---
+
+## 最新列表
+
+```typescript
+class LatestList {
+  constructor(
+    private redis: Redis,
+    private listName: string,
+    private maxSize: number = 100
+  ) {}
+
+  async addItem(item: any) {
+    const str = JSON.stringify(item);
+    await this.redis.lpush(this.listName, str);
+    await this.redis.ltrim(this.listName, 0, this.maxSize - 1);
+  }
+
+  async getList(count: number = 10) {
+    return await this.redis
+      .lrange(this.listName, 0, count - 1)
+      .then((items) => items.map((i) => JSON.parse(i)));
+  }
+}
+
+// 使用示例：最新文章
+const latest = new LatestList(redis, "latest:articles", 100);
+
+await latest.addItem({ id: "123", title: "新文章" });
+const articles = await latest.getList(10);
+```
+
+---
+
+## 最佳实践
+
+### 1. 队列监控
+
+```typescript
+async function monitorQueue(queueName: string) {
+  const size = await redis.llen(queueName);
+  console.log(`队列 ${queueName} 长度: ${size}`);
+
+  if (size > 1000) {
+    console.warn("队列积压严重！");
+  }
+}
+```
+
+### 2. 消息确认机制
+
+```typescript
+class ReliableQueue {
+  async receive() {
+    const message = await redis.lpop("queue");
+    if (message) {
+      // 先放入处理中队列
+      await redis.rpush("queue:processing", message);
+      return JSON.parse(message);
+    }
+    return null;
+  }
+
+  async confirm(message: any) {
+    const str = JSON.stringify(message);
+    await redis.lrem("queue:processing", 1, str);
+  }
+}
+```
+
+---
+
+## 常见问题
+
+### Q1: List 队列会丢失消息吗？
+
+**A**: Redis 重启且没有持久化时会丢失。解决方案：
+
+1. 启用 AOF 持久化
+2. 使用 Redis Stream（Redis 5.0+）
+3. 使用专用消息队列（如 RabbitMQ、Kafka）
+
+### Q2: 如何实现延迟任务？
+
+**A**: 使用 Sorted Set：
+
+```typescript
+await redis.zadd("delay:queue", Date.now() + 5000, JSON.stringify(task));
+```
+
+---
+
+## 总结
+
+本文我们学习了 List 的多种应用：
+
+✅ FIFO 队列
+✅ 阻塞队列
+✅ 优先级队列
+✅ 延时队列
+✅ 栈
+✅ 最新列表
+
+---
+
+## 下一步
+
+继续阅读：[09. Set 集合运算与社交应用](./09-set-intersection-operations.mdx)

@@ -1,0 +1,439 @@
+---
+title: "09. Set 集合运算与社交应用：关注、标签与共同好友"
+date: "2026-03-23"
+summary: "使用 Redis Set 实现社交网络功能，包括关注系统、标签系统和共同好友查询。"
+tags: ["Redis", "Set", "社交功能"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 9
+---
+
+## 前言
+
+Set 的最大特点是**唯一性**和**集合运算**。这使得它非常适合实现社交网络功能。本文将学习：
+
+- 👥 关注系统
+- 🏷️ 标签系统
+- 🤝 共同好友
+- 👍 点赞系统
+
+---
+
+## 关注系统
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+class FollowSystem {
+  constructor(private redis: Redis) {}
+
+  // 关注
+  async follow(userId: string, targetUserId: string) {
+    const pipeline = this.redis.pipeline();
+    pipeline.sadd(`user:${userId}:following`, targetUserId);
+    pipeline.sadd(`user:${targetUserId}:followers`, userId);
+    await pipeline.exec();
+  }
+
+  // 取关
+  async unfollow(userId: string, targetUserId: string) {
+    const pipeline = this.redis.pipeline();
+    pipeline.srem(`user:${userId}:following`, targetUserId);
+    pipeline.srem(`user:${targetUserId}:followers`, userId);
+    await pipeline.exec();
+  }
+
+  // 获取关注列表
+  async getFollowing(userId: string) {
+    return await this.redis.smembers(`user:${userId}:following`);
+  }
+
+  // 获取粉丝列表
+  async getFollowers(userId: string) {
+    return await this.redis.smembers(`user:${userId}:followers`);
+  }
+
+  // 检查是否关注
+  async isFollowing(userId: string, targetUserId: string) {
+    return (
+      (await this.redis.sismember(`user:${userId}:following`, targetUserId)) ===
+      1
+    );
+  }
+
+  // 获取关注数和粉丝数
+  async getStats(userId: string) {
+    const pipeline = this.redis.pipeline();
+    pipeline.scard(`user:${userId}:following`);
+    pipeline.scard(`user:${userId}:followers`);
+    const results = await pipeline.exec();
+    return {
+      following: results[0][1],
+      followers: results[1][1],
+    };
+  }
+
+  // 共同关注
+  async getCommonFollowing(userId1: string, userId2: string) {
+    return await this.redis.sinter(
+      `user:${userId1}:following`,
+      `user:${userId2}:following`
+    );
+  }
+
+  // 推荐关注（关注的人还关注了谁）
+  async getRecommendFollows(userId: string, limit: number = 10) {
+    // 获取所有关注的用户
+    const following = await this.getFollowing(userId);
+    if (following.length === 0) return [];
+
+    // 获取这些用户的关注，统计出现次数
+    const key = `temp:recommend:${userId}`;
+    await this.redis.del(key);
+
+    for (const targetId of following) {
+      await this.redis.sunionstore(key, key, `user:${targetId}:following`);
+    }
+
+    // 移除已关注的
+    await this.redis.srem(key, ...following, userId);
+
+    // 返回推荐
+    const recommends = await this.redis.srandmember(key, limit);
+    await this.redis.del(key);
+
+    return recommends || [];
+  }
+}
+
+// 使用示例
+const follow = new FollowSystem(redis);
+await follow.follow("user:1", "user:2");
+const common = await follow.getCommonFollowing("user:1", "user:3");
+```
+
+---
+
+## 标签系统
+
+```typescript
+class TagSystem {
+  constructor(private redis: Redis) {}
+
+  // 给文章添加标签
+  async addTags(articleId: string, tags: string[]) {
+    const pipeline = this.redis.pipeline();
+
+    // 文章的标签
+    pipeline.sadd(`article:${articleId}:tags`, ...tags);
+
+    // 标签下的文章
+    for (const tag of tags) {
+      pipeline.sadd(`tag:${tag}:articles`, articleId);
+    }
+
+    await pipeline.exec();
+  }
+
+  // 获取文章的标签
+  async getArticleTags(articleId: string) {
+    return await this.redis.smembers(`article:${articleId}:tags`);
+  }
+
+  // 获取标签下的文章
+  async getTaggedArticles(tag: string) {
+    return await this.redis.smembers(`tag:${tag}:articles`);
+  }
+
+  // 删除文章标签
+  async removeTags(articleId: string, tags: string[]) {
+    const pipeline = this.redis.pipeline();
+
+    pipeline.srem(`article:${articleId}:tags`, ...tags);
+
+    for (const tag of tags) {
+      pipeline.srem(`tag:${tag}:articles`, articleId);
+    }
+
+    await pipeline.exec();
+  }
+
+  // 查找同时拥有多个标签的文章
+  async findArticlesWithAllTags(tags: string[]) {
+    const keys = tags.map((t) => `tag:${t}:articles`);
+    return await this.redis.sinter(...keys);
+  }
+
+  // 查找拥有任意标签的文章
+  async findArticlesWithAnyTags(tags: string[]) {
+    const keys = tags.map((t) => `tag:${t}:articles`);
+    return await this.redis.sunion(...keys);
+  }
+
+  // 相关标签（共同文章多的标签）
+  async getRelatedTags(tag: string, limit: number = 10) {
+    // 获取该标签的所有文章
+    const articles = await this.getTaggedArticles(tag);
+
+    if (articles.length === 0) return [];
+
+    // 获取这些文章的所有标签
+    const tempKey = `temp:related:${tag}`;
+    await this.redis.del(tempKey);
+
+    for (const articleId of articles) {
+      await this.redis.sunionstore(
+        tempKey,
+        tempKey,
+        `article:${articleId}:tags`
+      );
+    }
+
+    // 移除当前标签
+    await this.redis.srem(tempKey, tag);
+
+    // 获取相关标签
+    const related = await this.redis.srandmember(tempKey, limit);
+    await this.redis.del(tempKey);
+
+    return related || [];
+  }
+}
+
+// 使用示例
+const tags = new TagSystem(redis);
+await tags.addTags("article:123", ["redis", "database", "cache"]);
+const articles = await tags.findArticlesWithAllTags(["redis", "cache"]);
+```
+
+---
+
+## 点赞系统
+
+```typescript
+class LikeSystem {
+  constructor(private redis: Redis) {}
+
+  // 点赞
+  async like(userId: string, targetType: string, targetId: string) {
+    const key = `${targetType}:${targetId}:likes`;
+    const userKey = `user:${userId}:liked:${targetType}`;
+
+    const result = await this.redis.sadd(key, userId);
+    if (result === 1) {
+      // 首次点赞，记录到用户列表
+      await this.redis.sadd(userKey, targetId);
+      // 增加点赞计数
+      await this.redis.incr(`${targetType}:${targetId}:like_count`);
+    }
+
+    return result === 1;
+  }
+
+  // 取消点赞
+  async unlike(userId: string, targetType: string, targetId: string) {
+    const key = `${targetType}:${targetId}:likes`;
+    const userKey = `user:${userId}:liked:${targetType}`;
+
+    const result = await this.redis.srem(key, userId);
+    if (result === 1) {
+      // 从用户列表移除
+      await this.redis.srem(userKey, targetId);
+      // 减少点赞计数
+      await this.redis.decr(`${targetType}:${targetId}:like_count`);
+    }
+
+    return result === 1;
+  }
+
+  // 检查是否点赞
+  async hasLiked(userId: string, targetType: string, targetId: string) {
+    const key = `${targetType}:${targetId}:likes`;
+    return (await this.redis.sismember(key, userId)) === 1;
+  }
+
+  // 获取点赞列表
+  async getLikers(targetType: string, targetId: string) {
+    const key = `${targetType}:${targetId}:likes`;
+    return await this.redis.smembers(key);
+  }
+
+  // 获取点赞数
+  async getLikeCount(targetType: string, targetId: string) {
+    const count = await this.redis.get(`${targetType}:${targetId}:like_count`);
+    return parseInt(count || "0");
+  }
+
+  // 获取用户点赞的内容
+  async getUserLiked(userId: string, targetType: string) {
+    const userKey = `user:${userId}:liked:${targetType}`;
+    return await this.redis.smembers(userKey);
+  }
+
+  // 共同点赞（谁也点赞了这个）
+  async getCoLikers(userId: string, targetType: string, targetId: string) {
+    // 获取用户点赞的其他内容
+    const userLiked = await this.getUserLiked(userId, targetType);
+
+    const coLikers: Set<string> = new Set();
+
+    for (const otherId of userLiked) {
+      if (otherId === targetId) continue;
+      const likers = await this.getLikers(targetType, otherId);
+      likers.forEach((liker) => coLikers.add(liker));
+    }
+
+    // 移除自己
+    coLikers.delete(userId);
+
+    return Array.from(coLikers);
+  }
+}
+```
+
+---
+
+## 实际应用案例
+
+### 案例 1：用户推荐
+
+```typescript
+class UserRecommendation {
+  constructor(private redis: Redis) {}
+
+  async getRecommendations(userId: string, limit: number = 10) {
+    // 1. 获取共同好友最多的用户
+    const following = await this.redis.smembers(`user:${userId}:following`);
+    if (following.length === 0) return [];
+
+    const tempKey = `temp:recommend:${userId}`;
+    await this.redis.del(tempKey);
+
+    // 统计关注的人关注的用户
+    for (const friendId of following.slice(0, 50)) {
+      // 限制数量
+      const friendsFollowing = await this.redis.smembers(
+        `user:${friendId}:following`
+      );
+      for (const recommendId of friendsFollowing) {
+        if (recommendId !== userId && !following.includes(recommendId)) {
+          await this.redis.pfadd(tempKey, recommendId);
+        }
+      }
+    }
+
+    // 2. 获取相似标签的用户
+    const userTags = await this.redis.smembers(`user:${userId}:tags`);
+    if (userTags.length > 0) {
+      for (const tag of userTags) {
+        const taggedUsers = await this.redis.smembers(`tag:${tag}:users`);
+        for (const recommendId of taggedUsers) {
+          if (recommendId !== userId && !following.includes(recommendId)) {
+            await this.redis.pfadd(tempKey, recommendId);
+          }
+        }
+      }
+    }
+
+    const recommendations = await this.redis.srandmember(tempKey, limit);
+    await this.redis.del(tempKey);
+
+    return recommendations || [];
+  }
+}
+```
+
+### 案例 2：抽奖系统
+
+```typescript
+class LotterySystem {
+  constructor(private redis: Redis) {}
+
+  // 用户参与抽奖
+  async participate(userId: string, lotteryId: string) {
+    const key = `lottery:${lotteryId}:participants`;
+
+    // 每个用户只能参与一次
+    const added = await this.redis.sadd(key, userId);
+    return added === 1;
+  }
+
+  // 随机抽取中奖者（从集合中移除）
+  async drawWinner(lotteryId: string, count: number = 1) {
+    const key = `lottery:${lotteryId}:participants`;
+    const winners = await this.redis.spop(key, count);
+    return winners || [];
+  }
+
+  // 查看参与者数量
+  async getParticipantCount(lotteryId: string) {
+    const key = `lottery:${lotteryId}:participants`;
+    return await this.redis.scard(key);
+  }
+
+  // 检查是否参与
+  async hasParticipated(userId: string, lotteryId: string) {
+    const key = `lottery:${lotteryId}:participants`;
+    return (await this.redis.sismember(key, userId)) === 1;
+  }
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 使用集合运算简化查询
+
+```typescript
+// ✅ 使用 SINTER
+const common = await redis.sinter("set1", "set2");
+
+// ❌ 手动实现
+const s1 = await redis.smembers("set1");
+const s2 = await redis.smembers("set2");
+const common = s1.filter((x) => s2.includes(x));
+```
+
+### 2. 注意集合大小
+
+```typescript
+// ✅ 限制集合大小
+const members = await redis.smembers("large:set");
+if (members.length > 1000) {
+  // 分页处理
+}
+```
+
+---
+
+## 常见问题
+
+### Q1: Set 和 List 的区别？
+
+**A**: Set 唯一、无序；List 可重复、有序。
+
+### Q2: 集合运算性能？
+
+**A**: O(N\*M)，N 是最小集合大小，M 是集合数量。
+
+---
+
+## 总结
+
+本文我们学习了 Set 的社交应用：
+
+✅ 关注系统
+✅ 标签系统
+✅ 点赞系统
+✅ 共同好友
+
+---
+
+## 下一步
+
+继续阅读：[10. Sorted Set 排行榜系统](./10-sorted-set-leaderboard.mdx)

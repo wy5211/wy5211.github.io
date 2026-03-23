@@ -1,0 +1,949 @@
+---
+title: "07. 数据验证与类型安全"
+date: "2026-03-23"
+summary: "掌握 Next.js 应用中的数据验证和类型安全，学习使用 Zod 进行数据验证，实现端到端的类型安全，以及错误处理模式。"
+tags: ["Next.js", "数据验证", "Zod", "类型安全", "TypeScript"]
+category: "nextjs"
+cover: ""
+draft: false
+series: "Next.js 渐进式全栈开发"
+seriesOrder: 7
+---
+
+## 前言
+
+在全栈应用中，数据验证和类型安全是确保应用稳定性和安全性的关键。Next.js 结合 TypeScript 和 Zod，提供了强大的端到端类型安全保障。
+
+**学习目标**：
+
+- ✅ 掌握 Zod 验证库的使用
+- ✅ 实现 Server Actions 数据验证
+- ✅ 实现 API Routes 数据验证
+- ✅ 达到端到端类型安全
+- ✅ 学习错误处理模式
+
+---
+
+## Zod 验证库
+
+### 基础验证
+
+```typescript
+// lib/schemas.ts
+import { z } from "zod";
+
+// 简单字符串验证
+const nameSchema = z.string();
+
+// 带约束的字符串
+const titleSchema = z
+  .string()
+  .min(5, "标题至少需要 5 个字符")
+  .max(100, "标题不能超过 100 个字符");
+
+// 数字验证
+const ageSchema = z.number().min(18, "必须年满 18 岁").max(120, "无效的年龄");
+
+// 布尔值
+const subscribedSchema = z.boolean();
+
+// 枚举
+const categorySchema = z.enum(["tech", "life", "tutorial"]);
+
+// 可选字段
+const bioSchema = z.string().optional();
+
+// 可空字段
+const nicknameSchema = z.string().nullable();
+
+// 默认值
+const roleSchema = z.enum(["admin", "user"]).default("user");
+
+// 转换
+const countSchema = z.string().transform((val) => parseInt(val));
+```
+
+### 对象验证
+
+```typescript
+// 创建文章 Schema
+const createPostSchema = z.object({
+  title: z
+    .string()
+    .min(5, "标题至少需要 5 个字符")
+    .max(100, "标题不能超过 100 个字符"),
+
+  content: z
+    .string()
+    .min(50, "内容至少需要 50 个字符")
+    .max(5000, "内容不能超过 5000 个字符"),
+
+  excerpt: z.string().max(200, "摘要不能超过 200 个字符").optional(),
+
+  category: z.enum(["tech", "life", "tutorial"]),
+
+  tags: z.array(z.string()).min(1, "至少需要一个标签").max(5, "最多 5 个标签"),
+
+  published: z.boolean().default(false),
+
+  publishDate: z.coerce.date().optional(),
+});
+
+// 使用 Schema
+const result = createPostSchema.safeParse({
+  title: "我的文章",
+  content: "这是一篇关于 Next.js 的文章...",
+  category: "tech",
+  tags: ["nextjs", "react"],
+  published: true,
+});
+
+if (result.success) {
+  // 数据有效
+  console.log(result.data);
+} else {
+  // 验证失败
+  console.log(result.error.flatten());
+}
+```
+
+### 嵌套对象
+
+```typescript
+// 用户注册 Schema
+const registerSchema = z.object({
+  email: z.string().email("无效的邮箱地址"),
+  password: z
+    .string()
+    .min(8, "密码至少需要 8 个字符")
+    .regex(/[A-Z]/, "密码必须包含大写字母")
+    .regex(/[a-z]/, "密码必须包含小写字母")
+    .regex(/[0-9]/, "密码必须包含数字"),
+
+  profile: z.object({
+    name: z.string().min(2, "姓名至少需要 2 个字符"),
+    bio: z.string().max(500).optional(),
+    avatar: z.string().url("无效的图片 URL").optional(),
+  }),
+
+  preferences: z
+    .object({
+      newsletter: z.boolean().default(false),
+      notifications: z.boolean().default(true),
+    })
+    .optional(),
+});
+```
+
+### 数组和元组
+
+```typescript
+// 数组验证
+const tagsSchema = z.array(z.string()).min(1).max(5);
+
+// 固定长度数组（元组）
+const coordinateSchema = z.tuple([
+  z.number(), // x
+  z.number(), // y
+  z.number(), // z
+]);
+
+// 示例
+const result = tagsSchema.parse(["nextjs", "react"]); // ✅
+const result = tagsSchema.parse([]); // ❌ Error
+```
+
+### 自定义验证
+
+```typescript
+// 自定义验证器
+const passwordSchema = z
+  .string()
+  .min(8, "密码至少需要 8 个字符")
+  .refine((val) => /[A-Z]/.test(val), "密码必须包含大写字母")
+  .refine((val) => /[a-z]/.test(val), "密码必须包含小写字母")
+  .refine((val) => /[0-9]/.test(val), "密码必须包含数字")
+  .refine((val) => /[!@#$%^&*]/.test(val), "密码必须包含特殊字符");
+
+// 自定义错误消息
+const usernameSchema = z
+  .string()
+  .min(3, "用户名至少需要 3 个字符")
+  .refine(
+    async (username) => {
+      // 检查用户名是否已存在
+      const user = await db.user.findUnique({
+        where: { username },
+      });
+      return !user;
+    },
+    { message: "用户名已被占用" }
+  );
+```
+
+---
+
+## Server Actions 验证
+
+### 基础验证
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { z } from "zod";
+import { db } from "@/lib/db";
+import { revalidatePath } from "next/cache";
+
+// 定义 Schema
+const createPostSchema = z.object({
+  title: z.string().min(5).max(100),
+  content: z.string().min(50),
+  category: z.enum(["tech", "life", "tutorial"]),
+});
+
+export async function createPost(formData: FormData) {
+  // 提取数据
+  const rawData = {
+    title: formData.get("title"),
+    content: formData.get("content"),
+    category: formData.get("category"),
+  };
+
+  // 验证
+  const result = createPostSchema.safeParse(rawData);
+
+  if (!result.success) {
+    return {
+      error: "验证失败",
+      fieldErrors: result.error.flatten().fieldErrors,
+    };
+  }
+
+  // 保存到数据库
+  const post = await db.posts.create({
+    data: result.data,
+  });
+
+  revalidatePath("/blog");
+
+  return { success: true, post };
+}
+```
+
+### 类型推断
+
+```typescript
+// app/actions.ts
+import { z } from "zod";
+
+const createPostSchema = z.object({
+  title: z.string().min(5),
+  content: z.string().min(50),
+});
+
+// 推断类型
+type CreatePostInput = z.infer<typeof createPostSchema>;
+// 等价于:
+// type CreatePostInput = {
+//   title: string;
+//   content: string;
+// }
+
+export async function createPost(data: CreatePostInput) {
+  // data 是完全类型安全的
+  const post = await db.posts.create({ data });
+  return post;
+}
+```
+
+### 显示验证错误
+
+```typescript
+// components/PostForm.tsx
+"use client";
+
+import { useFormState } from 'react-dom';
+import { createPost } from '@/app/actions';
+
+const initialState = {
+  error: '',
+  fieldErrors: {} as Record<string, string[]>,
+  success: false,
+};
+
+export function PostForm() {
+  const [state, formAction] = useFormState(createPost, initialState);
+
+  return (
+    <form action={formAction}>
+      <div>
+        <label htmlFor="title">标题</label>
+        <input
+          id="title"
+          name="title"
+          type="text"
+          aria-invalid={!!state.fieldErrors?.title}
+        />
+        {state.fieldErrors?.title && (
+          <span className="error">
+            {state.fieldErrors.title[0]}
+          </span>
+        )}
+      </div>
+
+      <div>
+        <label htmlFor="content">内容</label>
+        <textarea
+          id="content"
+          name="content"
+          rows={10}
+          aria-invalid={!!state.fieldErrors?.content}
+        />
+        {state.fieldErrors?.content && (
+          <span className="error">
+            {state.fieldErrors.content[0]}
+          </span>
+        )}
+      </div>
+
+      <button type="submit">发布</button>
+
+      {state.error && !state.fieldErrors && (
+        <div className="error">
+          {state.error}
+        </div>
+      )}
+    </form>
+  );
+}
+```
+
+---
+
+## API Routes 验证
+
+### 请求体验证
+
+```typescript
+// app/api/posts/route.ts
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { db } from "@/lib/db";
+
+const createPostSchema = z.object({
+  title: z.string().min(5).max(100),
+  content: z.string().min(50),
+  category: z.enum(["tech", "life", "tutorial"]),
+  tags: z.array(z.string()).min(1).max(5),
+});
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+
+    // 验证
+    const result = createPostSchema.safeParse(body);
+
+    if (!result.success) {
+      return NextResponse.json(
+        {
+          error: "验证失败",
+          details: result.error.flatten(),
+        },
+        { status: 400 }
+      );
+    }
+
+    // 创建文章
+    const post = await db.posts.create({
+      data: result.data,
+    });
+
+    return NextResponse.json(post, { status: 201 });
+  } catch (error) {
+    return NextResponse.json({ error: "服务器错误" }, { status: 500 });
+  }
+}
+```
+
+### 查询参数验证
+
+```typescript
+// app/api/posts/route.ts
+const querySchema = z.object({
+  page: z.coerce.number().min(1).default(1),
+  limit: z.coerce.number().min(1).max(100).default(10),
+  category: z.enum(["tech", "life", "tutorial"]).optional(),
+  search: z.string().optional(),
+});
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+
+  // 验证查询参数
+  const query = querySchema.safeParse(Object.fromEntries(searchParams));
+
+  if (!query.success) {
+    return NextResponse.json(
+      { error: "无效的查询参数", details: query.error.flatten() },
+      { status: 400 }
+    );
+  }
+
+  const { page, limit, category, search } = query.data;
+
+  // 构建查询
+  const where = {
+    ...(category && { category }),
+    ...(search && {
+      OR: [{ title: { contains: search } }, { content: { contains: search } }],
+    }),
+  };
+
+  const [posts, total] = await Promise.all([
+    db.posts.findMany({
+      where,
+      take: limit,
+      skip: (page - 1) * limit,
+      orderBy: { createdAt: "desc" },
+    }),
+    db.posts.count({ where }),
+  ]);
+
+  return NextResponse.json({
+    posts,
+    pagination: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  });
+}
+```
+
+---
+
+## 端到端类型安全
+
+### 共享类型
+
+```typescript
+// types/post.ts
+import { z } from "zod";
+
+export const postSchema = z.object({
+  id: z.string().uuid(),
+  title: z.string(),
+  content: z.string(),
+  excerpt: z.string().nullable(),
+  category: z.enum(["tech", "life", "tutorial"]),
+  tags: z.array(z.string()),
+  published: z.boolean(),
+  createdAt: z.date(),
+  updatedAt: z.date(),
+});
+
+// 推断类型
+export type Post = z.infer<typeof postSchema>;
+
+// 输入类型
+export const createPostInputSchema = postSchema.omit({
+  id: true,
+  createdAt: true,
+  updatedAt: true,
+});
+
+export type CreatePostInput = z.infer<typeof createPostInputSchema>;
+
+// 更新类型
+export const updatePostInputSchema = postSchema.partial().required({
+  id: true,
+});
+
+export type UpdatePostInput = z.infer<typeof updatePostInputSchema>;
+```
+
+### API 路由类型
+
+```typescript
+// app/api/posts/route.ts
+import { NextResponse } from "next/server";
+import { createPostInputSchema, Post } from "@/types/post";
+
+export async function POST(request: Request) {
+  const body = await request.json();
+
+  // 类型安全的验证
+  const result = createPostInputSchema.safeParse(body);
+
+  if (!result.success) {
+    return NextResponse.json(
+      { error: result.error.flatten() },
+      { status: 400 }
+    );
+  }
+
+  // result.data 是完全类型安全的
+  const post: Post = await db.posts.create({
+    data: result.data,
+  });
+
+  return NextResponse.json(post);
+}
+```
+
+### 客户端类型
+
+```typescript
+// lib/api.ts
+import { Post, CreatePostInput } from '@/types/post';
+
+// 类型安全的 API 客户端
+export async function createPost(data: CreatePostInput): Promise<Post> {
+  const response = await fetch('/api/posts', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+
+  if (!response.ok) {
+    throw new Error('创建文章失败');
+  }
+
+  return response.json();
+}
+
+// 使用
+// components/CreatePost.tsx
+"use client";
+
+import { useState } from 'react';
+import { createPost, type CreatePostInput } from '@/lib/api';
+
+export function CreatePostForm() {
+  const [formData, setFormData] = useState<CreatePostInput>({
+    title: '',
+    content: '',
+    excerpt: '',
+    category: 'tech',
+    tags: [],
+    published: false,
+  });
+
+  const handleSubmit = async () => {
+    // formData 被完全类型检查
+    const post = await createPost(formData);
+    console.log(post);
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input
+        value={formData.title}
+        onChange={(e) => setFormData({ ...formData, title: e.target.value })}
+      />
+      {/* ... */}
+    </form>
+  );
+}
+```
+
+---
+
+## 错误处理模式
+
+### 统一错误响应
+
+```typescript
+// lib/errors.ts
+export class ValidationError extends Error {
+  constructor(public details: Record<string, string[]>) {
+    super("验证失败");
+    this.name = "ValidationError";
+  }
+}
+
+export class NotFoundError extends Error {
+  constructor(resource: string) {
+    super(`${resource} 未找到`);
+    this.name = "NotFoundError";
+  }
+}
+
+export class UnauthorizedError extends Error {
+  constructor(message = "未授权") {
+    super(message);
+    this.name = "UnauthorizedError";
+  }
+}
+```
+
+### 错误处理中间件
+
+```typescript
+// lib/api-handler.ts
+import { NextResponse } from "next/server";
+import { ZodError } from "zod";
+import { ValidationError } from "./errors";
+
+export function withErrorHandler(
+  handler: (request: Request) => Promise<NextResponse>
+) {
+  return async (request: Request) => {
+    try {
+      return await handler(request);
+    } catch (error) {
+      // Zod 验证错误
+      if (error instanceof ZodError) {
+        return NextResponse.json(
+          {
+            error: "验证失败",
+            details: error.flatten(),
+          },
+          { status: 400 }
+        );
+      }
+
+      // 自定义验证错误
+      if (error instanceof ValidationError) {
+        return NextResponse.json(
+          {
+            error: error.message,
+            details: error.details,
+          },
+          { status: 400 }
+        );
+      }
+
+      // 未找到错误
+      if (error instanceof NotFoundError) {
+        return NextResponse.json({ error: error.message }, { status: 404 });
+      }
+
+      // 未授权错误
+      if (error instanceof UnauthorizedError) {
+        return NextResponse.json({ error: error.message }, { status: 401 });
+      }
+
+      // 未知错误
+      console.error("Unhandled error:", error);
+      return NextResponse.json({ error: "服务器错误" }, { status: 500 });
+    }
+  };
+}
+```
+
+### 使用错误处理
+
+```typescript
+// app/api/posts/[id]/route.ts
+import { NextResponse } from "next/server";
+import { z } from "zod";
+import { db } from "@/lib/db";
+import { withErrorHandler } from "@/lib/api-handler";
+import { NotFoundError } from "@/lib/errors";
+
+const updatePostSchema = z.object({
+  title: z.string().min(5).optional(),
+  content: z.string().min(50).optional(),
+  category: z.enum(["tech", "life", "tutorial"]).optional(),
+});
+
+export const PUT = withErrorHandler(
+  async (request: Request, { params }: { params: { id: string } }) => {
+    const body = await request.json();
+    const result = updatePostSchema.safeParse(body);
+
+    if (!result.success) {
+      throw new ZodError(result.error.issues);
+    }
+
+    // 检查文章是否存在
+    const existingPost = await db.posts.findUnique({
+      where: { id: params.id },
+    });
+
+    if (!existingPost) {
+      throw new NotFoundError("文章");
+    }
+
+    // 更新文章
+    const post = await db.posts.update({
+      where: { id: params.id },
+      data: result.data,
+    });
+
+    return NextResponse.json(post);
+  }
+);
+```
+
+---
+
+## 实战：用户注册
+
+```typescript
+// lib/schemas.ts
+import { z } from "zod";
+
+export const registerSchema = z
+  .object({
+    email: z
+      .string()
+      .email("无效的邮箱地址")
+      .refine(
+        async (email) => {
+          const user = await db.user.findUnique({ where: { email } });
+          return !user;
+        },
+        { message: "邮箱已被注册" }
+      ),
+
+    username: z
+      .string()
+      .min(3, "用户名至少需要 3 个字符")
+      .max(20, "用户名不能超过 20 个字符")
+      .regex(/^[a-zA-Z0-9_]+$/, "用户名只能包含字母、数字和下划线")
+      .refine(
+        async (username) => {
+          const user = await db.user.findUnique({ where: { username } });
+          return !user;
+        },
+        { message: "用户名已被占用" }
+      ),
+
+    password: z
+      .string()
+      .min(8, "密码至少需要 8 个字符")
+      .regex(/[A-Z]/, "密码必须包含大写字母")
+      .regex(/[a-z]/, "密码必须包含小写字母")
+      .regex(/[0-9]/, "密码必须包含数字"),
+
+    confirmPassword: z.string(),
+  })
+  .refine((data) => data.password === data.confirmPassword, {
+    message: "两次密码不一致",
+    path: ["confirmPassword"],
+  });
+
+export type RegisterInput = z.infer<typeof registerSchema>;
+```
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { registerSchema } from "@/lib/schemas";
+import { db } from "@/lib/db";
+import { hash } from "bcryptjs";
+
+export async function register(formData: FormData) {
+  const rawData = {
+    email: formData.get("email"),
+    username: formData.get("username"),
+    password: formData.get("password"),
+    confirmPassword: formData.get("confirmPassword"),
+  };
+
+  const result = registerSchema.safeParse(rawData);
+
+  if (!result.success) {
+    return {
+      error: "验证失败",
+      fieldErrors: result.error.flatten().fieldErrors,
+    };
+  }
+
+  // 创建用户
+  const hashedPassword = await hash(result.data.password, 10);
+
+  const user = await db.user.create({
+    data: {
+      email: result.data.email,
+      username: result.data.username,
+      password: hashedPassword,
+    },
+    select: {
+      id: true,
+      email: true,
+      username: true,
+    },
+  });
+
+  return { success: true, user };
+}
+```
+
+---
+
+## 最佳实践
+
+### ✅ 推荐做法
+
+1. **始终验证输入**
+
+```typescript
+const result = schema.safeParse(input);
+if (!result.success) {
+  return { error: result.error.flatten() };
+}
+```
+
+2. **使用类型推断**
+
+```typescript
+type Input = z.infer<typeof schema>;
+```
+
+3. **集中管理 Schema**
+
+```typescript
+// lib/schemas.ts
+export const postSchemas = {
+  create: z.object({
+    /* ... */
+  }),
+  update: z.object({
+    /* ... */
+  }),
+  delete: z.object({
+    /* ... */
+  }),
+};
+```
+
+4. **提供友好的错误消息**
+
+```typescript
+min(5, "标题至少需要 5 个字符");
+```
+
+### ❌ 避免做法
+
+1. **不要跳过验证**
+
+```typescript
+// ❌ 不安全
+export async function createPost(data: any) {
+  await db.posts.create({ data });
+}
+
+// ✅ 安全
+export async function createPost(data: unknown) {
+  const result = schema.safeParse(data);
+  if (!result.success) {
+    return { error: result.error };
+  }
+  await db.posts.create({ data: result.data });
+}
+```
+
+2. **不要使用 `any` 类型**
+
+```typescript
+// ❌ 错误
+function process(data: any) {}
+
+// ✅ 正确
+function process(data: z.infer<typeof schema>) {}
+```
+
+3. **不要忽略验证错误**
+
+```typescript
+// ❌ 忽略错误
+schema.parse(input); // 可能抛出异常
+
+// ✅ 处理错误
+const result = schema.safeParse(input);
+if (!result.success) {
+  // 处理错误
+}
+```
+
+---
+
+## 常见问题
+
+**Q: Zod 和 TypeScript 类型有什么区别？**
+
+A: TypeScript 类型只在编译时检查，Zod 在运行时验证。使用 Zod 可以确保数据在运行时也是有效的。
+
+**Q: 如何在客户端和服务端共享类型？**
+
+A: 创建共享的类型文件，使用 `z.infer` 推断类型：
+
+```typescript
+// types/post.ts
+export const postSchema = z.object({
+  /* ... */
+});
+export type Post = z.infer<typeof postSchema>;
+```
+
+**Q: 如何处理复杂的验证逻辑？**
+
+A: 使用 `.refine()` 添加自定义验证：
+
+```typescript
+.refine(async (val) => {
+  // 自定义验证逻辑
+  return isValid;
+}, { message: '验证失败' });
+```
+
+---
+
+## 总结
+
+本文我们学习了：
+
+✅ **Zod 验证库**
+
+- 基础类型验证
+- 对象验证
+- 嵌套对象
+- 自定义验证
+
+✅ **Server Actions 验证**
+
+- 数据验证
+- 类型推断
+- 错误显示
+
+✅ **API Routes 验证**
+
+- 请求体验证
+- 查询参数验证
+- 错误处理
+
+✅ **端到端类型安全**
+
+- 共享类型
+- 类型安全的 API
+- 客户端类型
+
+✅ **错误处理模式**
+
+- 统一错误响应
+- 错误处理中间件
+- 自定义错误
+
+现在你应该能够在 Next.js 应用中实现完整的数据验证和类型安全。下一步，我们将学习 **身份验证与授权**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- NextAuth.js 基础
+- OAuth 集成
+- 凭证登录
+- 会话管理
+- 中间件保护
+- 角色和权限
+
+继续阅读：[08 身份验证与授权](./08-authentication.mdx)

@@ -1,0 +1,823 @@
+---
+title: "08 装饰器与元数据"
+date: "2026-03-23"
+summary: "掌握 TypeScript 装饰器的高级用法，结合 reflect-metadata 实现元编程、依赖注入和 AOP 编程。"
+tags: ["TypeScript", "装饰器", "元数据", "元编程", "依赖注入"]
+category: "typescript"
+draft: false
+series: "TypeScript 高级技巧系列"
+seriesOrder: 8
+---
+
+## 前言
+
+装饰器（Decorators）是一种特殊的语法，允许我们在类、方法、属性和参数上添加注解，并在运行时修改它们的行为。结合 `reflect-metadata` 库，我们可以实现强大的元编程能力，比如依赖注入、AOP（面向切面编程）、自动验证等。
+
+TypeScript 5.0 引入了新的装饰器标准，与之前的实验性装饰器有重要区别。本文将重点介绍新的标准装饰器。
+
+## 核心概念
+
+### 装饰器类型
+
+TypeScript 支持以下几种装饰器：
+
+1. **类装饰器**（Class Decorators）
+2. **方法装饰器**（Method Decorators）
+3. **属性装饰器**（Field Decorators）
+4. **Getter/Setter 装饰器**
+5. **参数装饰器**（Accessor Decorators）
+
+### 启用装饰器
+
+在 `tsconfig.json` 中启用装饰器：
+
+```json
+{
+  "compilerOptions": {
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true
+  }
+}
+```
+
+### 安装 reflect-metadata
+
+```bash
+npm install reflect-metadata
+```
+
+在应用入口导入：
+
+```typescript
+import "reflect-metadata";
+```
+
+## 基础装饰器
+
+### 类装饰器
+
+```typescript
+// 类装饰器工厂
+function Singleton<T extends { new (...args: any[]): {} }>(
+  constructor: T,
+  context: ClassDecoratorContext
+) {
+  return class extends constructor {
+    private static instance: any;
+
+    constructor(...args: any[]) {
+      if ((constructor as any).instance) {
+        return (constructor as any).instance;
+      }
+      super(...args);
+      (constructor as any).instance = this;
+    }
+  };
+}
+
+@Singleton
+class Database {
+  constructor(private connectionString: string) {
+    console.log("Connecting to database...");
+  }
+
+  query(sql: string) {
+    console.log(`Executing: ${sql}`);
+  }
+}
+
+const db1 = new Database("localhost:5432");
+const db2 = new Database("localhost:5432");
+
+console.log(db1 === db2); // true
+```
+
+### 方法装饰器
+
+```typescript
+// 日志装饰器
+function Log(target: any, propertyKey: string, descriptor: PropertyDescriptor) {
+  const originalMethod = descriptor.value;
+
+  descriptor.value = function (...args: any[]) {
+    console.log(`Calling ${propertyKey} with`, args);
+    const result = originalMethod.apply(this, args);
+    console.log(`${propertyKey} returned`, result);
+    return result;
+  };
+
+  return descriptor;
+}
+
+class UserService {
+  @Log
+  getUser(id: number) {
+    return { id, name: "Alice" };
+  }
+}
+
+const service = new UserService();
+service.getUser(1);
+// Output:
+// Calling getUser with [1]
+// getUser returned { id: 1, name: 'Alice' }
+```
+
+### 属性装饰器
+
+```typescript
+// 只读属性装饰器
+function ReadOnly(
+  target: any,
+  propertyKey: string,
+  descriptor: PropertyDescriptor
+) {
+  descriptor.writable = false;
+  return descriptor;
+}
+
+class User {
+  @ReadOnly
+  id: number;
+
+  constructor(id: number) {
+    this.id = id;
+  }
+}
+
+const user = new User(1);
+user.id = 2; // TypeError: Cannot assign to 'id' because it is read-only
+```
+
+### 参数装饰器
+
+```typescript
+// 参数装饰器
+function Required(target: any, propertyKey: string, parameterIndex: number) {
+  const existingRequiredParameters: number[] =
+    Reflect.getMetadata("required", target, propertyKey) || [];
+  existingRequiredParameters.push(parameterIndex);
+  Reflect.defineMetadata(
+    "required",
+    existingRequiredParameters,
+    target,
+    propertyKey
+  );
+}
+
+function validate(
+  target: any,
+  propertyKey: string,
+  descriptor: PropertyDescriptor
+) {
+  const originalMethod = descriptor.value;
+
+  descriptor.value = function (...args: any[]) {
+    const requiredParameters: number[] =
+      Reflect.getMetadata("required", target, propertyKey) || [];
+
+    requiredParameters.forEach((index) => {
+      if (args[index] === undefined || args[index] === null) {
+        throw new Error(
+          `Parameter at position ${index} is required for ${propertyKey}`
+        );
+      }
+    });
+
+    return originalMethod.apply(this, args);
+  };
+
+  return descriptor;
+}
+
+class Validator {
+  @validate
+  createUser(@Required name: string, @Required email: string) {
+    console.log(`Creating user: ${name}, ${email}`);
+  }
+}
+
+const validator = new Validator();
+validator.createUser("Alice", "alice@example.com"); // ✅
+validator.createUser("Alice", null); // ❌ Error: Parameter at position 1 is required
+```
+
+## 高级应用
+
+### 依赖注入容器
+
+```typescript
+// 依赖注入装饰器
+function Injectable(token?: string) {
+  return function (target: any) {
+    const actualToken = token || target.name;
+    Reflect.defineMetadata("injectable", true, target);
+    Reflect.defineMetadata("token", actualToken, target);
+  };
+}
+
+// 注入装饰器
+function Inject(token: string) {
+  return function (
+    target: any,
+    propertyKey: string | symbol | undefined,
+    parameterIndex: number
+  ) {
+    const dependencies = Reflect.getMetadata("design:paramtypes", target) || [];
+    const existingTokens = Reflect.getMetadata("inject", target) || [];
+    existingTokens[parameterIndex] = token;
+    Reflect.defineMetadata("inject", existingTokens, target);
+  };
+}
+
+// 服务定义
+@Injectable("ILogger")
+class Logger {
+  log(message: string) {
+    console.log(`[LOG] ${message}`);
+  }
+}
+
+@Injectable("IUserService")
+class UserService {
+  constructor(@Inject("ILogger") private logger: Logger) {}
+
+  getUsers() {
+    this.logger.log("Fetching users...");
+    return [{ id: 1, name: "Alice" }];
+  }
+}
+
+// 依赖注入容器
+class DIContainer {
+  private services = new Map<string, any>();
+
+  register<T>(token: string, constructor: new (...args: any[]) => T): void {
+    this.services.set(token, constructor);
+  }
+
+  resolve<T>(token: string): T {
+    const constructor = this.services.get(token);
+    if (!constructor) {
+      throw new Error(`Service not found: ${token}`);
+    }
+
+    // 获取构造函数参数类型
+    const paramTypes: any[] =
+      Reflect.getMetadata("design:paramtypes", constructor) || [];
+
+    // 获取注入的 token
+    const injectTokens: string[] =
+      Reflect.getMetadata("inject", constructor) || [];
+
+    // 解析依赖
+    const dependencies = paramTypes.map((paramType, index) => {
+      const token = injectTokens[index];
+      if (token) {
+        return this.resolve(token);
+      }
+      return paramType;
+    });
+
+    // 创建实例
+    return new constructor(...dependencies);
+  }
+}
+
+// 使用示例
+const container = new DIContainer();
+container.register("ILogger", Logger);
+container.register("IUserService", UserService);
+
+const userService = container.resolve<IUserService>("IUserService");
+const users = userService.getUsers();
+console.log(users);
+```
+
+### AOP 面向切面编程
+
+```typescript
+// 切面装饰器
+function Aspect(
+  advice: "before" | "after" | "around",
+  adviceFunction: (...args: any[]) => any
+) {
+  return function (
+    target: any,
+    propertyKey: string,
+    descriptor: PropertyDescriptor
+  ) {
+    const originalMethod = descriptor.value;
+
+    if (advice === "before") {
+      descriptor.value = function (...args: any[]) {
+        adviceFunction.apply(this, args);
+        return originalMethod.apply(this, args);
+      };
+    } else if (advice === "after") {
+      descriptor.value = function (...args: any[]) {
+        const result = originalMethod.apply(this, args);
+        adviceFunction.apply(this, [result, ...args]);
+        return result;
+      };
+    } else if (advice === "around") {
+      descriptor.value = function (...args: any[]) {
+        return adviceFunction.apply(this, [originalMethod.bind(this), ...args]);
+      };
+    }
+
+    return descriptor;
+  };
+}
+
+// 使用示例
+class TransactionService {
+  @Aspect("before", function () {
+    console.log("🔒 Starting transaction...");
+  })
+  @Aspect("after", function (result: any) {
+    console.log("✅ Transaction completed, result:", result);
+  })
+  @Aspect("around", function (fn: Function, ...args: any[]) {
+    console.log("🎯 Around advice: before execution");
+    const result = fn(...args);
+    console.log("🎯 Around advice: after execution");
+    return result;
+  })
+  transferMoney(from: string, to: string, amount: number) {
+    console.log(`Transferring ${amount} from ${from} to ${to}`);
+    return { success: true, amount };
+  }
+}
+
+const service = new TransactionService();
+service.transferMoney("Alice", "Bob", 100);
+```
+
+### 缓存装饰器
+
+```typescript
+// 缓存装饰器
+function Memoize(
+  target: any,
+  propertyKey: string,
+  descriptor: PropertyDescriptor
+) {
+  const originalMethod = descriptor.value;
+  const cache = new Map<string, any>();
+
+  descriptor.value = function (...args: any[]) {
+    const cacheKey = JSON.stringify(args);
+
+    if (cache.has(cacheKey)) {
+      console.log(`📦 Cache hit for ${propertyKey}`);
+      return cache.get(cacheKey);
+    }
+
+    console.log(`💾 Cache miss for ${propertyKey}`);
+    const result = originalMethod.apply(this, args);
+    cache.set(cacheKey, result);
+    return result;
+  };
+
+  return descriptor;
+}
+
+// 使用示例
+class MathService {
+  @Memoize
+  fibonacci(n: number): number {
+    if (n <= 1) return n;
+    return this.fibonacci(n - 1) + this.fibonacci(n - 2);
+  }
+
+  @Memoize
+  factorial(n: number): number {
+    if (n <= 1) return 1;
+    return n * this.factorial(n - 1);
+  }
+}
+
+const math = new MathService();
+console.log(math.fibonacci(10)); // 第一次计算
+console.log(math.fibonacci(10)); // 从缓存读取
+console.log(math.factorial(5)); // 第一次计算
+console.log(math.factorial(5)); // 从缓存读取
+```
+
+### 验证装饰器
+
+```typescript
+// 验证装饰器集合
+function validateEmail(value: string): boolean {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(value);
+}
+
+function validateMinLength(min: number) {
+  return function (value: string): boolean {
+    return value.length >= min;
+  };
+}
+
+function validateMax(max: number) {
+  return function (value: number): boolean {
+    return value <= max;
+  };
+}
+
+// 属性验证装饰器
+function Email(target: any, propertyKey: string) {
+  const validators = Reflect.getMetadata("validators", target) || [];
+  validators.push({
+    property: propertyKey,
+    validator: validateEmail,
+    message: `${propertyKey} must be a valid email`,
+  });
+  Reflect.defineMetadata("validators", validators, target);
+}
+
+function MinLength(min: number) {
+  return function (target: any, propertyKey: string) {
+    const validators = Reflect.getMetadata("validators", target) || [];
+    validators.push({
+      property: propertyKey,
+      validator: validateMinLength(min),
+      message: `${propertyKey} must be at least ${min} characters`,
+    });
+    Reflect.defineMetadata("validators", validators, target);
+  };
+}
+
+function Max(max: number) {
+  return function (target: any, propertyKey: string) {
+    const validators = Reflect.getMetadata("validators", target) || [];
+    validators.push({
+      property: propertyKey,
+      validator: validateMax(max),
+      message: `${propertyKey} must be less than or equal to ${max}`,
+    });
+    Reflect.defineMetadata("validators", validators, target);
+  };
+}
+
+// 验证方法装饰器
+function Validate(
+  target: any,
+  propertyKey: string,
+  descriptor: PropertyDescriptor
+) {
+  const originalMethod = descriptor.value;
+
+  descriptor.value = function (...args: any[]) {
+    const validators =
+      Reflect.getMetadata("validators", target.constructor) || [];
+
+    for (const validator of validators) {
+      const value = this[validator.property];
+      if (!validator.validator(value)) {
+        throw new Error(validator.message);
+      }
+    }
+
+    return originalMethod.apply(this, args);
+  };
+
+  return descriptor;
+}
+
+// 使用示例
+class UserRegistration {
+  @Email
+  email = "";
+
+  @MinLength(8)
+  password = "";
+
+  @Max(120)
+  age = 0;
+
+  @Validate
+  register() {
+    console.log(`Registering user with email: ${this.email}`);
+    return { success: true };
+  }
+}
+
+const registration = new UserRegistration();
+registration.email = "invalid-email";
+registration.password = "short";
+registration.age = 25;
+
+try {
+  registration.register();
+} catch (error) {
+  console.error(error.message); // email must be a valid email
+}
+```
+
+### 性能监控装饰器
+
+```typescript
+// 性能监控装饰器
+function MeasurePerformance(
+  target: any,
+  propertyKey: string,
+  descriptor: PropertyDescriptor
+) {
+  const originalMethod = descriptor.value;
+
+  descriptor.value = function (...args: any[]) {
+    const start = performance.now();
+    const result = originalMethod.apply(this, args);
+    const end = performance.now();
+    console.log(`⏱️ ${propertyKey} took ${(end - start).toFixed(2)}ms`);
+    return result;
+  };
+
+  return descriptor;
+}
+
+// 异步性能监控
+function MeasureAsyncPerformance(
+  target: any,
+  propertyKey: string,
+  descriptor: PropertyDescriptor
+) {
+  const originalMethod = descriptor.value;
+
+  descriptor.value = async function (...args: any[]) {
+    const start = performance.now();
+    const result = await originalMethod.apply(this, args);
+    const end = performance.now();
+    console.log(`⏱️ ${propertyKey} took ${(end - start).toFixed(2)}ms`);
+    return result;
+  };
+
+  return descriptor;
+}
+
+// 使用示例
+class DataProcessor {
+  @MeasurePerformance
+  processLargeData(data: any[]) {
+    // 模拟数据处理
+    return data.map((item) => ({ ...item, processed: true }));
+  }
+
+  @MeasureAsyncPerformance
+  async fetchUserData(userId: number) {
+    // 模拟 API 调用
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    return { id: userId, name: "Alice" };
+  }
+}
+
+const processor = new DataProcessor();
+const largeData = Array(1000000).fill({ id: 1, name: "Test" });
+processor.processLargeData(largeData);
+
+processor.fetchUserData(1);
+```
+
+## 实战应用
+
+### 构建完整的验证系统
+
+```typescript
+// 验证器接口
+interface Validator {
+  validate(value: any): boolean;
+  message: string;
+}
+
+// 验证装饰器
+function Validate(
+  target: any,
+  propertyKey: string,
+  descriptor: PropertyDescriptor
+) {
+  const originalMethod = descriptor.value;
+
+  descriptor.value = function (...args: any[]) {
+    const errors: string[] = [];
+
+    // 获取所有验证器
+    const validators: Map<string, Validator[]> =
+      Reflect.getMetadata("validators", target.constructor) || new Map();
+
+    // 验证所有属性
+    for (const [property, propertyValidators] of validators) {
+      const value = this[property];
+      for (const validator of propertyValidators) {
+        if (!validator.validate(value)) {
+          errors.push(`${property}: ${validator.message}`);
+        }
+      }
+    }
+
+    if (errors.length > 0) {
+      throw new Error(`Validation failed:\n${errors.join("\n")}`);
+    }
+
+    return originalMethod.apply(this, args);
+  };
+
+  return descriptor;
+}
+
+// 属性验证装饰器
+function addValidator(target: any, propertyKey: string, validator: Validator) {
+  let validators =
+    Reflect.getMetadata("validators", target.constructor) || new Map();
+
+  if (!validators.has(propertyKey)) {
+    validators.set(propertyKey, []);
+  }
+
+  validators.get(propertyKey)!.push(validator);
+  Reflect.defineMetadata("validators", validators, target.constructor);
+}
+
+// 具体验证装饰器
+function Required(target: any, propertyKey: string) {
+  addValidator(target, propertyKey, {
+    validate: (value) => value !== null && value !== undefined && value !== "",
+    message: "is required",
+  });
+}
+
+function Min(min: number) {
+  return function (target: any, propertyKey: string) {
+    addValidator(target, propertyKey, {
+      validate: (value) => typeof value === "number" && value >= min,
+      message: `must be at least ${min}`,
+    });
+  };
+}
+
+function Max(max: number) {
+  return function (target: any, propertyKey: string) {
+    addValidator(target, propertyKey, {
+      validate: (value) => typeof value === "number" && value <= max,
+      message: `must be at most ${max}`,
+    });
+  };
+}
+
+function Pattern(regex: RegExp) {
+  return function (target: any, propertyKey: string) {
+    addValidator(target, propertyKey, {
+      validate: (value) => regex.test(value),
+      message: `must match pattern ${regex}`,
+    });
+  };
+}
+
+// 使用示例
+class CreateUserDTO {
+  @Required
+  @Pattern(/^[a-zA-Z\s]+$/)
+  name: string = "";
+
+  @Required
+  @Pattern(/^[^\s@]+@[^\s@]+\.[^\s@]+$/)
+  email: string = "";
+
+  @Required
+  @Min(18)
+  @Max(120)
+  age: number = 0;
+
+  @Validate
+  create() {
+    console.log(`Creating user: ${this.name}, ${this.email}, ${this.age}`);
+    return { success: true };
+  }
+}
+
+const user = new CreateUserDTO();
+user.name = "Alice";
+user.email = "alice@example.com";
+user.age = 25;
+
+user.create(); // ✅ Success
+
+user.name = "";
+try {
+  user.create();
+} catch (error) {
+  console.error(error.message);
+}
+```
+
+## 避坑指南
+
+### ❌ 错误 1：忘记导入 reflect-metadata
+
+```typescript
+// ❌ 忘记导入，元数据 API 不工作
+import "reflect-metadata";
+
+// ✅ 正确：在应用入口导入
+import "reflect-metadata";
+import { SomeClass } from "./some-class";
+```
+
+---
+
+### ❌ 错误 2：装饰器执行顺序错误
+
+```typescript
+// 装饰器执行顺序：
+// 1. 属性装饰器（从下到上）
+// 2. 参数装饰器（从下到上）
+// 3. 方法装饰器（从下到上）
+// 4. 类装饰器（从下到上）
+
+class Example {
+  @Decorator1 // 第二个执行
+  @Decorator2 // 第一个执行
+  method() {}
+
+  @Decorator3 // 第二个执行
+  @Decorator4 // 第一个执行
+  property: any;
+}
+```
+
+---
+
+### ❌ 错误 3：在箭头函数中使用装饰器
+
+```typescript
+// ❌ 箭头函数不能有装饰器
+class Example {
+  @Log
+  method = () => {
+    console.log("Hello");
+  };
+}
+
+// ✅ 使用方法定义
+class Example {
+  @Log
+  method() {
+    console.log("Hello");
+  }
+}
+```
+
+---
+
+### ❌ 错误 4：修改装饰器返回值
+
+```typescript
+// ❌ 忘记返回 descriptor
+function Log(target: any, propertyKey: string, descriptor: PropertyDescriptor) {
+  const original = descriptor.value;
+  descriptor.value = function (...args: any[]) {
+    console.log("Calling", propertyKey);
+    return original.apply(this, args);
+  };
+  // 忘记返回 descriptor！
+}
+
+// ✅ 正确返回 descriptor
+function Log(target: any, propertyKey: string, descriptor: PropertyDescriptor) {
+  const original = descriptor.value;
+  descriptor.value = function (...args: any[]) {
+    console.log("Calling", propertyKey);
+    return original.apply(this, args);
+  };
+  return descriptor; // ✅ 返回修改后的 descriptor
+}
+```
+
+## 总结
+
+### 核心要点
+
+1. **装饰器类型**：类、方法、属性、参数装饰器
+2. **元数据**：使用 `reflect-metadata` 存储和读取元数据
+3. **依赖注入**：通过装饰器实现 IoC 容器
+4. **AOP 编程**：实现切面逻辑（日志、缓存、验证等）
+5. **装饰器组合**：多个装饰器的协同工作
+
+### 实用装饰器库
+
+- **日志**：@Log 记录方法调用
+- **缓存**：@Memoize 缓存计算结果
+- **验证**：@Validate 验证输入参数
+- **性能监控**：@MeasurePerformance 测量执行时间
+- **依赖注入**：@Injectable、@Inject 管理依赖
+
+## 参考资料
+
+- [TypeScript Handbook: Decorators](https://www.typescriptlang.org/docs/handbook/decorators.html)
+- [reflect-metadata Documentation](https://www.npmjs.com/package/reflect-metadata)
+
+---
+
+- **上一篇**：[07 类型推断与映射类型](../07-inference-keyof-mapped.mdx)
+- **下一篇**：[09 React + TypeScript 高级模式](../09-react-typescript-patterns.mdx)

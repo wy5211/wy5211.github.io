@@ -1,0 +1,343 @@
+---
+title: "12. 电商系统实战：综合运用 MyBatis 知识"
+date: "2026-03-23"
+summary: "综合运用 MyBatis 知识，构建一个完整的电商系统。"
+tags: ["MyBatis", "实战项目", "电商"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 渐进式学习路线"
+seriesOrder: 12
+---
+
+## 前言
+
+恭喜你来到 MyBatis 系列的最后一篇！本文将综合运用所学知识，构建一个完整的电商系统。
+
+---
+
+## 项目概述
+
+### 功能模块
+
+1. **用户管理**：注册、登录、个人信息
+2. **商品管理**：商品 CRUD、分类管理
+3. **订单系统**：创建订单、订单查询、状态更新
+4. **库存管理**：库存扣减、库存查询
+
+---
+
+## 数据库设计
+
+### 表结构
+
+```sql
+-- 用户表
+CREATE TABLE users (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    password VARCHAR(100) NOT NULL,
+    email VARCHAR(100) NOT NULL UNIQUE,
+    phone VARCHAR(20),
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 商品表
+CREATE TABLE products (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    product_name VARCHAR(200) NOT NULL,
+    price DECIMAL(10, 2) NOT NULL,
+    stock INT NOT NULL DEFAULT 0,
+    category_id BIGINT,
+    description TEXT,
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 订单表
+CREATE TABLE orders (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    order_no VARCHAR(50) NOT NULL UNIQUE,
+    user_id BIGINT NOT NULL,
+    total_amount DECIMAL(10, 2) NOT NULL,
+    status INT NOT NULL DEFAULT 0,
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+-- 订单详情表
+CREATE TABLE order_items (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    order_id BIGINT NOT NULL,
+    product_id BIGINT NOT NULL,
+    quantity INT NOT NULL,
+    price DECIMAL(10, 2) NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES orders(id),
+    FOREIGN KEY (product_id) REFERENCES products(id)
+);
+```
+
+---
+
+## 用户模块
+
+### 实体类
+
+```java
+@Data
+public class User {
+    private Long id;
+    private String username;
+    private String password;
+    private String email;
+    private String phone;
+    private LocalDateTime createTime;
+}
+```
+
+### Mapper
+
+```java
+@Mapper
+public interface UserMapper {
+    User selectById(Long id);
+    User selectByUsername(String username);
+    int insert(User user);
+    int update(User user);
+}
+```
+
+### Service
+
+```java
+@Service
+public class UserService {
+
+    @Autowired
+    private UserMapper userMapper;
+
+    public void register(String username, String password, String email) {
+        // 检查用户名是否存在
+        User existUser = userMapper.selectByUsername(username);
+        if (existUser != null) {
+            throw new BusinessException("用户名已存在");
+        }
+
+        // 创建用户
+        User user = new User();
+        user.setUsername(username);
+        user.setPassword(BCrypt.hashpw(password));
+        user.setEmail(email);
+
+        userMapper.insert(user);
+    }
+}
+```
+
+---
+
+## 商品模块
+
+### 实体类
+
+```java
+@Data
+public class Product {
+    private Long id;
+    private String productName;
+    private BigDecimal price;
+    private Integer stock;
+    private Long categoryId;
+    private String description;
+    private LocalDateTime createTime;
+}
+```
+
+### Mapper
+
+```java
+@Mapper
+public interface ProductMapper extends BaseMapper<Product> {
+    // 继承 BaseMapper 获得 CRUD 方法
+    List<Product> selectByCategory(Long categoryId);
+
+    @Select("SELECT * FROM products WHERE product_name LIKE CONCAT('%', #{keyword}, '%')")
+    List<Product> searchProducts(String keyword);
+}
+```
+
+### Service
+
+```java
+@Service
+public class ProductService {
+
+    @Autowired
+    private ProductMapper productMapper;
+
+    public PageInfo<Product> getProductsByPage(int pageNum, int pageSize) {
+        PageHelper.startPage(pageNum, pageSize);
+        List<Product> products = productMapper.selectList(null);
+        return new PageInfo<>(products);
+    }
+
+    @Transactional
+    public void updateStock(Long productId, Integer quantity) {
+        Product product = productMapper.selectById(productId);
+
+        if (product.getStock() < quantity) {
+            throw new BusinessException("库存不足");
+        }
+
+        product.setStock(product.getStock() - quantity);
+        productMapper.updateById(product);
+    }
+}
+```
+
+---
+
+## 订单模块
+
+### 实体类
+
+```java
+@Data
+public class Order {
+    private Long id;
+    private String orderNo;
+    private Long userId;
+    private BigDecimal totalAmount;
+    private Integer status;
+    private LocalDateTime createTime;
+}
+
+@Data
+public class OrderItem {
+    private Long id;
+    private Long orderId;
+    private Long productId;
+    private Integer quantity;
+    private BigDecimal price;
+}
+```
+
+### Mapper
+
+```java
+@Mapper
+public interface OrderMapper extends BaseMapper<Order> {
+    List<Order> selectByUserId(Long userId);
+}
+
+@Mapper
+public interface OrderItemMapper extends BaseMapper<OrderItem> {
+    List<OrderItem> selectByOrderId(Long orderId);
+}
+```
+
+### Service
+
+```java
+@Service
+public class OrderService {
+
+    @Autowired
+    private OrderMapper orderMapper;
+
+    @Autowired
+    private OrderItemMapper orderItemMapper;
+
+    @Autowired
+    private ProductService productService;
+
+    @Transactional
+    public Order createOrder(Long userId, List<CartItem> items) {
+        // 1. 创建订单
+        Order order = new Order();
+        order.setOrderNo(generateOrderNo());
+        order.setUserId(userId);
+        order.setStatus(0);
+
+        BigDecimal totalAmount = BigDecimal.ZERO;
+
+        // 2. 添加订单项并扣减库存
+        for (CartItem item : items) {
+            Product product = productService.getProductById(item.getProductId());
+
+            // 扣减库存
+            productService.updateStock(item.getProductId(), item.getQuantity());
+
+            // 创建订单项
+            OrderItem orderItem = new OrderItem();
+            orderItem.setOrderId(order.getId());
+            orderItem.setProductId(item.getProductId());
+            orderItem.setQuantity(item.getQuantity());
+            orderItem.setPrice(product.getPrice());
+            orderItemMapper.insert(orderItem);
+
+            totalAmount = totalAmount.add(
+                product.getPrice().multiply(new BigDecimal(item.getQuantity()))
+            );
+        }
+
+        order.setTotalAmount(totalAmount);
+        orderMapper.insert(order);
+
+        return order;
+    }
+}
+```
+
+---
+
+## 完整项目结构
+
+```
+ecommerce-project/
+├── src/main/java/com/example/ecommerce/
+│   ├── entity/          # 实体类
+│   │   ├── User.java
+│   │   ├── Product.java
+│   │   ├── Order.java
+│   │   └── OrderItem.java
+│   ├── mapper/          # Mapper 接口
+│   │   ├── UserMapper.java
+│   │   ├── ProductMapper.java
+│   │   ├── OrderMapper.java
+│   │   └── OrderItemMapper.java
+│   ├── service/         # Service 层
+│   │   ├── UserService.java
+│   │   ├── ProductService.java
+│   │   └── OrderService.java
+│   ├── controller/      # Controller 层
+│   │   ├── UserController.java
+│   │   ├── ProductController.java
+│   │   └── OrderController.java
+│   └── EcommerceApplication.java
+└── src/main/resources/
+    ├── mapper/          # Mapper XML
+    │   ├── UserMapper.xml
+    │   ├── ProductMapper.xml
+    │   └── OrderMapper.xml
+    └── application.yml
+```
+
+---
+
+## 总结
+
+恭喜你完成了 MyBatis 渐进式学习路线！
+
+通过本系列，你学会了：
+
+✅ MyBatis 基础和配置
+✅ 动态 SQL 处理
+✅ 结果映射和关联映射
+✅ 注解开发方式
+✅ Spring Boot 整合
+✅ PageHelper 分页
+✅ MyBatis-Plus 增强
+✅ 性能优化技巧
+✅ 电商系统实战
+
+现在你已经具备了在企业中使用 MyBatis 的能力！🎉

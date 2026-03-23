@@ -1,0 +1,664 @@
+---
+title: "06. String 类型深度应用：计数器、分布式锁与限流"
+date: "2026-03-23"
+summary: "深入掌握 Redis String 类型的高级应用，实现计数器、分布式锁、限流等实用功能。"
+tags: ["Redis", "String", "分布式锁"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 6
+---
+
+## 前言
+
+String 是 Redis 最基础的数据类型，但它的用途远不止简单的键值存储。通过 String 的原子操作，我们可以实现很多实用的功能。
+
+本文将带你深入学习 String 类型的三大经典应用：
+
+- 🔢 **计数器**：文章浏览量、点赞数、在线人数
+- 🔒 **分布式锁**：防止并发冲突、保证数据一致性
+- 🚦 **限流**：API 访问频率控制、防刷
+
+---
+
+## 计数器
+
+### 基础计数器
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+// 简单计数器
+async function incrementCounter(key: string) {
+  return await redis.incr(key);
+}
+
+// 使用示例
+const views = await incrementCounter("article:123:views");
+console.log("浏览次数:", views); // 1
+```
+
+### 带过期时间的计数器
+
+```typescript
+// 日访问量统计
+async function trackDailyViews(articleId: string) {
+  const today = new Date().toISOString().split("T")[0];
+  const key = `views:${articleId}:${today}`;
+
+  const count = await redis.incr(key);
+
+  // 第一次设置时添加过期时间（7 天）
+  if (count === 1) {
+    await redis.expire(key, 7 * 24 * 3600);
+  }
+
+  return count;
+}
+
+// 使用示例
+const views = await trackDailyViews("article:123");
+console.log("今日浏览:", views);
+```
+
+### 并发安全的计数器
+
+```typescript
+// 批量增加计数
+async function incrementBy(key: string, value: number) {
+  return await redis.incrby(key, value);
+}
+
+// 使用示例：批量增加浏览量
+await incrementBy("article:123:views", 10);
+```
+
+### 实际应用：文章浏览量
+
+```typescript
+class ArticleViewCounter {
+  constructor(private redis: Redis) {}
+
+  // 记录浏览
+  async view(articleId: string): Promise<number> {
+    const key = `article:${articleId}:views`;
+    return await this.redis.incr(key);
+  }
+
+  // 获取浏览量
+  async getViews(articleId: string): Promise<number> {
+    const key = `article:${articleId}:views`;
+    const views = await this.redis.get(key);
+    return parseInt(views || "0");
+  }
+
+  // 批量获取文章浏览量
+  async getMultipleViews(
+    articleIds: string[]
+  ): Promise<Record<string, number>> {
+    const keys = articleIds.map((id) => `article:${id}:views`);
+    const values = await this.redis.mget(...keys);
+
+    const result: Record<string, number> = {};
+    articleIds.forEach((id, index) => {
+      result[id] = parseInt(values[index] || "0");
+    });
+
+    return result;
+  }
+}
+
+// 使用示例
+const counter = new ArticleViewCounter(redis);
+await counter.view("article:123");
+const views = await counter.getViews("article:123");
+```
+
+---
+
+## 分布式锁
+
+### 基础实现
+
+```typescript
+class DistributedLock {
+  constructor(private redis: Redis) {}
+
+  // 获取锁
+  async acquire(lockName: string, ttl: number = 30): Promise<string | null> {
+    const lockKey = `lock:${lockName}`;
+    const lockValue = `${Date.now()}-${Math.random()}`;
+
+    // SETNX + EXPIRE 原子操作
+    const result = await this.redis.set(lockKey, lockValue, "EX", ttl, "NX");
+
+    if (result === "OK") {
+      return lockValue;
+    }
+
+    return null;
+  }
+
+  // 释放锁
+  async release(lockName: string, lockValue: string): Promise<boolean> {
+    const lockKey = `lock:${lockName}`;
+
+    // 使用 Lua 脚本确保只释放自己的锁
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      else
+        return 0
+      end
+    `;
+
+    const result = await this.redis.eval(script, 1, lockKey, lockValue);
+    return result === 1;
+  }
+
+  // 延长锁的过期时间
+  async extend(
+    lockName: string,
+    lockValue: string,
+    ttl: number
+  ): Promise<boolean> {
+    const lockKey = `lock:${lockName}`;
+
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("expire", KEYS[1], ARGV[2])
+      else
+        return 0
+      end
+    `;
+
+    const result = await this.redis.eval(script, 1, lockKey, lockValue, ttl);
+    return result === 1;
+  }
+}
+
+// 使用示例
+const lock = new DistributedLock(redis);
+
+async function processTask(taskId: string) {
+  const lockValue = await lock.acquire(`task:${taskId}`, 30);
+
+  if (!lockValue) {
+    throw new Error("任务正在处理中");
+  }
+
+  try {
+    // 执行任务
+    console.log("处理任务:", taskId);
+    await doSomething();
+
+    // 如果任务耗时较长，可以延长锁的过期时间
+    await lock.extend(`task:${taskId}`, lockValue, 30);
+  } finally {
+    // 释放锁
+    await lock.release(`task:${taskId}`, lockValue);
+  }
+}
+```
+
+### Redlock 算法（多节点锁）
+
+```typescript
+class Redlock {
+  private redisInstances: Redis[];
+
+  constructor(redisUrls: string[]) {
+    this.redisInstances = redisUrls.map((url) => new Redis(url));
+  }
+
+  async acquire(lockName: string, ttl: number = 30): Promise<string | null> {
+    const lockValue = `${Date.now()}-${Math.random()}`;
+    const startTime = Date.now();
+    let successCount = 0;
+
+    // 尝试在所有节点上获取锁
+    for (const redis of this.redisInstances) {
+      try {
+        const result = await redis.set(
+          `lock:${lockName}`,
+          lockValue,
+          "PX",
+          ttl * 1000,
+          "NX"
+        );
+        if (result === "OK") {
+          successCount++;
+        }
+      } catch (error) {
+        console.error("获取锁失败:", error);
+      }
+    }
+
+    // 检查是否在大多数节点上获取成功
+    const majority = Math.floor(this.redisInstances.length / 2) + 1;
+    const elapsedTime = Date.now() - startTime;
+
+    if (successCount >= majority && elapsedTime < ttl * 1000) {
+      return lockValue;
+    }
+
+    // 未获取成功，释放已获取的锁
+    this.release(lockName, lockValue);
+    return null;
+  }
+
+  async release(lockName: string, lockValue: string): Promise<void> {
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      else
+        return 0
+      end
+    `;
+
+    for (const redis of this.redisInstances) {
+      try {
+        await redis.eval(script, 1, `lock:${lockName}`, lockValue);
+      } catch (error) {
+        console.error("释放锁失败:", error);
+      }
+    }
+  }
+}
+
+// 使用示例
+const redlock = new Redlock([
+  "redis://localhost:6379",
+  "redis://localhost:6380",
+  "redis://localhost:6381",
+]);
+
+async function safeProcess() {
+  const lockValue = await redlock.acquire("resource", 30);
+
+  if (!lockValue) {
+    throw new Error("获取锁失败");
+  }
+
+  try {
+    // 执行业务逻辑
+    await doSomething();
+  } finally {
+    await redlock.release("resource", lockValue);
+  }
+}
+```
+
+---
+
+## 限流
+
+### 固定窗口限流
+
+```typescript
+class RateLimiter {
+  constructor(private redis: Redis) {}
+
+  // 固定窗口限流
+  async fixedWindow(
+    key: string,
+    limit: number,
+    window: number
+  ): Promise<boolean> {
+    const current = await redis.incr(key);
+
+    if (current === 1) {
+      await redis.expire(key, window);
+    }
+
+    return current <= limit;
+  }
+}
+
+// 使用示例：每分钟最多 100 次请求
+const limiter = new RateLimiter(redis);
+
+async function handleRequest(userId: string) {
+  const key = `ratelimit:${userId}:${Math.floor(Date.now() / 60000)}`;
+  const allowed = await limiter.fixedWindow(key, 100, 60);
+
+  if (!allowed) {
+    throw new Error("请求过于频繁");
+  }
+
+  // 处理请求
+}
+```
+
+### 滑动窗口限流
+
+```typescript
+class SlidingWindowRateLimiter {
+  constructor(private redis: Redis) {}
+
+  async check(key: string, limit: number, window: number): Promise<boolean> {
+    const now = Date.now();
+    const windowStart = now - window * 1000;
+
+    // 使用 Sorted Set 记录请求时间戳
+    const redisKey = `ratelimit:sliding:${key}`;
+
+    // 移除窗口外的记录
+    await redis.zremrangebyscore(redisKey, 0, windowStart);
+
+    // 获取当前窗口内的请求数
+    const count = await redis.zcard(redisKey);
+
+    if (count >= limit) {
+      return false;
+    }
+
+    // 添加当前请求
+    await redis.zadd(redisKey, now, `${now}-${Math.random()}`);
+    await redis.expire(redisKey, window);
+
+    return true;
+  }
+}
+
+// 使用示例
+const limiter = new SlidingWindowRateLimiter(redis);
+
+async function handleRequest(userId: string) {
+  const allowed = await limiter.check(userId, 100, 60);
+
+  if (!allowed) {
+    throw new Error("请求过于频繁");
+  }
+
+  // 处理请求
+}
+```
+
+### 令牌桶算法
+
+```typescript
+class TokenBucketRateLimiter {
+  constructor(private redis: Redis) {}
+
+  async check(
+    key: string,
+    capacity: number,
+    refillRate: number,
+    tokens: number = 1
+  ): Promise<boolean> {
+    const redisKey = `ratelimit:tokenbucket:${key}`;
+    const now = Date.now();
+
+    // 使用 Lua 脚本保证原子性
+    const script = `
+      local key = KEYS[1]
+      local now = tonumber(ARGV[1])
+      local capacity = tonumber(ARGV[2])
+      local refill_rate = tonumber(ARGV[3])
+      local tokens = tonumber(ARGV[4])
+
+      local data = redis.call("HMGET", key, "tokens", "last_refill")
+      local current_tokens = tonumber(data[1]) or capacity
+      local last_refill = tonumber(data[2]) or now
+
+      -- 计算需要补充的令牌数
+      local elapsed = now - last_refill
+      local refill_tokens = math.floor(elapsed * refill_rate / 1000)
+
+      -- 补充令牌
+      current_tokens = math.min(capacity, current_tokens + refill_tokens)
+
+      -- 检查是否有足够的令牌
+      if current_tokens >= tokens then
+        current_tokens = current_tokens - tokens
+        redis.call("HMSET", key, "tokens", current_tokens, "last_refill", now)
+        redis.call("EXPIRE", key, math.ceil(capacity / refill_rate) + 1)
+        return 1
+      else
+        redis.call("HMSET", key, "tokens", current_tokens, "last_refill", now)
+        redis.call("EXPIRE", key, math.ceil(capacity / refill_rate) + 1)
+        return 0
+      end
+    `;
+
+    const result = await this.redis.eval(
+      script,
+      1,
+      redisKey,
+      now,
+      capacity,
+      refillRate,
+      tokens
+    );
+
+    return result === 1;
+  }
+}
+
+// 使用示例：容量 100，每秒补充 10 个令牌
+const limiter = new TokenBucketRateLimiter(redis);
+
+async function handleRequest(userId: string) {
+  const allowed = await limiter.check(userId, 100, 10, 1);
+
+  if (!allowed) {
+    throw new Error("请求过于频繁");
+  }
+
+  // 处理请求
+}
+```
+
+---
+
+## 实际应用案例
+
+### 案例 1：API 限流中间件
+
+```typescript
+import { Context } from "hono";
+
+class APIRateLimiter {
+  constructor(private redis: Redis) {}
+
+  middleware(limit: number = 100, window: number = 60) {
+    return async (c: Context, next: () => Promise<void>) => {
+      const userId =
+        c.get("userId") || c.req.header("X-User-ID") || "anonymous";
+      const key = `ratelimit:api:${userId}:${Math.floor(Date.now() / (window * 1000))}`;
+
+      const current = await this.redis.incr(key);
+
+      if (current === 1) {
+        await this.redis.expire(key, window);
+      }
+
+      if (current > limit) {
+        return c.json({ error: "请求过于频繁" }, 429);
+      }
+
+      // 设置响应头
+      c.header("X-RateLimit-Limit", limit.toString());
+      c.header(
+        "X-RateLimit-Remaining",
+        Math.max(0, limit - current).toString()
+      );
+
+      await next();
+    };
+  }
+}
+
+// 使用示例
+const limiter = new APIRateLimiter(redis);
+app.use("/api/*", limiter.middleware(100, 60));
+```
+
+### 案例 2：库存扣减
+
+```typescript
+class InventoryManager {
+  constructor(private redis: Redis) {}
+
+  // 初始化库存
+  async initInventory(productId: string, stock: number): Promise<void> {
+    const key = `inventory:${productId}`;
+    await this.redis.set(key, stock);
+  }
+
+  // 扣减库存
+  async decrease(productId: string, quantity: number): Promise<boolean> {
+    const key = `inventory:${productId}`;
+
+    // 使用 Lua 脚本保证原子性
+    const script = `
+      local stock = tonumber(redis.call("get", KEYS[1]))
+      if stock == nil then
+        return -1
+      end
+
+      if stock < tonumber(ARGV[1]) then
+        return 0
+      end
+
+      redis.call("decrby", KEYS[1], ARGV[1])
+      return 1
+    `;
+
+    const result = await this.redis.eval(script, 1, key, quantity);
+
+    if (result === -1) {
+      throw new Error("商品不存在");
+    }
+
+    return result === 1;
+  }
+
+  // 查询库存
+  async getStock(productId: string): Promise<number> {
+    const key = `inventory:${productId}`;
+    const stock = await this.redis.get(key);
+    return parseInt(stock || "0");
+  }
+}
+
+// 使用示例
+const inventory = new InventoryManager(redis);
+
+async function purchase(productId: string, quantity: number) {
+  const success = await inventory.decrease(productId, quantity);
+
+  if (!success) {
+    throw new Error("库存不足");
+  }
+
+  console.log("购买成功");
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 合理设置锁的过期时间
+
+```typescript
+// ❌ 过期时间太长
+await lock.acquire("resource", 3600); // 1 小时
+
+// ✅ 根据任务耗时设置
+await lock.acquire("resource", 30); // 30 秒
+```
+
+### 2. 始终释放锁
+
+```typescript
+const lockValue = await lock.acquire("resource", 30);
+
+if (lockValue) {
+  try {
+    // 执行业务逻辑
+    await doSomething();
+  } finally {
+    // 确保释放锁
+    await lock.release("resource", lockValue);
+  }
+}
+```
+
+### 3. 限流考虑用户体验
+
+```typescript
+// ✅ 返回剩余重试时间
+async function checkRateLimit(userId: string) {
+  const key = `ratelimit:${userId}`;
+  const ttl = await redis.ttl(key);
+
+  if (ttl > 0) {
+    return {
+      allowed: false,
+      retryAfter: ttl,
+    };
+  }
+
+  return { allowed: true };
+}
+```
+
+---
+
+## 常见问题
+
+### Q1: 分布式锁会死锁吗？
+
+**A**: 可能会。解决方案：
+
+1. 设置合理的过期时间
+2. 使用 try-finally 确保释放锁
+3. 实现锁的自动续期机制
+
+### Q2: 限流算法如何选择？
+
+**A**:
+
+| 算法     | 优点 | 缺点     | 适用场景 |
+| -------- | ---- | -------- | -------- |
+| 固定窗口 | 简单 | 突刺问题 | 简单限流 |
+| 滑动窗口 | 平滑 | 实现复杂 | 精确限流 |
+| 令牌桶   | 灵活 | 实现复杂 | 流量整形 |
+
+---
+
+## 总结
+
+本文我们学习了 String 类型的三大应用：
+
+✅ **计数器**
+
+- 简单计数
+- 带过期时间的计数
+- 并发安全的计数
+
+✅ **分布式锁**
+
+- 基础锁实现
+- Redlock 算法
+- 锁的安全释放
+
+✅ **限流**
+
+- 固定窗口限流
+- 滑动窗口限流
+- 令牌桶算法
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将学习 **Hash 类型的实战应用**，包括对象存储、购物车和 Session 管理。
+
+继续阅读：[07. Hash 类型实战应用](./07-hash-applications.mdx)

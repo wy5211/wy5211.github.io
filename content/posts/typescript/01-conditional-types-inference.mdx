@@ -1,0 +1,503 @@
+---
+title: "01 条件类型与类型推断"
+date: "2026-03-23"
+summary: "深入理解条件类型和 infer 关键字，掌握 TypeScript 类型系统中最强大的类型操作技巧。"
+tags: ["TypeScript", "高级类型", "条件类型", "infer"]
+category: "typescript"
+draft: false
+series: "TypeScript 高级技巧系列"
+seriesOrder: 1
+---
+
+## 前言
+
+在日常开发中，我们经常需要根据类型关系做出不同的类型选择。TypeScript 的**条件类型**（Conditional Types）让我们能够在类型级别实现类似三元表达式的逻辑，配合 `infer` 关键字，可以实现非常强大的类型推断和转换。
+
+条件类型是很多高级类型技巧的基础，理解了它，你就能看懂绝大多数工具类型的实现原理。
+
+## 核心概念
+
+### 条件类型语法
+
+条件类型的基本语法类似三元表达式：
+
+```typescript
+T extends U ? X : Y
+```
+
+- `T extends U`：检查类型 `T` 是否可以赋值给类型 `U`
+- 如果是，返回类型 `X`
+- 如果不是，返回类型 `Y`
+
+```typescript
+type IsString<T> = T extends string ? true : false;
+
+type Test1 = IsString<string>; // true
+type Test2 = IsString<number>; // false
+type Test3 = IsString<"hello">; // true
+```
+
+### 分布式条件类型
+
+当条件类型作用于联合类型时，会自动分发：
+
+```typescript
+type ToArray<T> = T extends any ? T[] : never;
+
+type Result = ToArray<string | number>;
+// 等价于 ToArray<string> | ToArray<number>
+// 结果：string[] | number[]
+```
+
+**重要**：分发发生在被检查类型是裸类型参数时：
+
+```typescript
+// ✅ 会分发
+type Distributive<T> = T extends any ? T[] : never;
+
+// ❌ 不会分发（被数组包裹）
+type NonDistributive<T extends any[]> = T extends any ? T : never;
+```
+
+### infer 关键字
+
+`infer` 关键字用于在条件类型中**推断**类型的一部分，并将其绑定到一个类型变量：
+
+```typescript
+// 提取函数返回值类型
+type ReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
+
+function getUser() {
+  return { id: 1, name: "Alice" };
+}
+
+type User = ReturnType<typeof getUser>;
+// { id: number; name: string }
+```
+
+## 高级技巧
+
+### 技巧 1：提取 Promise 内部类型
+
+处理异步函数时，我们经常需要提取 Promise 返回的类型：
+
+```typescript
+// 基础版本：只处理一层 Promise
+type Awaited<T> = T extends Promise<infer U> ? U : T;
+
+type Test1 = Awaited<Promise<string>>; // string
+type Test2 = Awaited<Promise<Promise<number>>>; // Promise<number>
+
+// 高级版本：递归处理多层 Promise
+type DeepAwaited<T> = T extends Promise<infer U> ? DeepAwaited<U> : T;
+
+type Test3 = DeepAwaited<Promise<Promise<Promise<boolean>>>>;
+// boolean
+```
+
+**实战应用**：
+
+```typescript
+// API 响应类型提取
+type ApiResponse<T> = Promise<{
+  code: number;
+  data: T;
+  message: string;
+}>;
+
+async function fetchUser(): ApiResponse<User> {
+  return {
+    code: 200,
+    data: { id: 1, name: "Alice" },
+    message: "success",
+  };
+}
+
+type UserData = DeepAwaited<ReturnType<typeof fetchUser>>;
+// {
+//   code: number
+//   data: User
+//   message: string
+// }
+```
+
+---
+
+### 技巧 2：提取函数参数类型
+
+```typescript
+// 提取第一个参数类型
+type FirstParam<T> = T extends (first: infer F, ...args: any[]) => any
+  ? F
+  : never;
+
+// 提取所有参数类型（元组）
+type Params<T> = T extends (...args: infer P) => any ? P : never;
+
+function greet(name: string, age: number, city: string) {
+  console.log(`${name} is ${age} years old from ${city}`);
+}
+
+type GreetFirst = FirstParam<typeof greet>; // string
+type GreetParams = Params<typeof greet>; // [string, number, string]
+```
+
+**实战应用**：类型安全的事件监听器
+
+```typescript
+type EventHandler<T extends any[]> = (...args: T) => void;
+
+class EventEmitter<Events extends Record<string, any[]>> {
+  private listeners: Map<keyof Events, Set<EventHandler<any>>> = new Map();
+
+  on<K extends keyof Events>(event: K, handler: EventHandler<Events[K]>): void {
+    if (!this.listeners.has(event)) {
+      this.listeners.set(event, new Set());
+    }
+    this.listeners.get(event)!.add(handler);
+  }
+
+  emit<K extends keyof Events>(event: K, ...args: Events[K]): void {
+    this.listeners.get(event)?.forEach((handler) => handler(...args));
+  }
+}
+
+// 使用
+interface AppEvents {
+  "user:login": [userId: string, timestamp: number];
+  "user:logout": [userId: string];
+}
+
+const emitter = new EventEmitter<AppEvents>();
+
+emitter.on("user:login", (userId, timestamp) => {
+  // userId: string
+  // timestamp: number
+  console.log(`User ${userId} logged in at ${timestamp}`);
+});
+
+// ✅ 类型安全
+emitter.emit("user:login", "user-123", Date.now());
+
+// ❌ 类型错误：参数不匹配
+emitter.emit("user:login", "user-123"); // 缺少 timestamp
+```
+
+---
+
+### 技巧 3：过滤联合类型
+
+使用条件类型可以过滤联合类型的某些成员：
+
+```typescript
+// 提取函数类型
+type OnlyFunctions<T> = T extends (...args: any[]) => any ? T : never;
+
+type Mixed = string | number | ((x: number) => string) | boolean;
+
+type FunctionsOnly = OnlyFunctions<Mixed>;
+// ((x: number) => string)
+
+// 过滤掉函数类型
+type RemoveFunctions<T> = T extends (...args: any[]) => any ? never : T;
+
+type NoFunctions = RemoveFunctions<Mixed>;
+// string | number | boolean
+```
+
+**实战应用**：提取对象的方法名
+
+```typescript
+type FunctionPropertyNames<T> = {
+  [K in keyof T]: T[K] extends Function ? K : never;
+}[keyof T];
+
+type NonFunctionPropertyNames<T> = {
+  [K in keyof T]: T[K] extends Function ? never : K;
+}[keyof T];
+
+interface User {
+  id: number;
+  name: string;
+  greet(): string;
+  update(data: Partial<User>): void;
+}
+
+type Methods = FunctionPropertyNames<User>;
+// "greet" | "update"
+
+type Properties = NonFunctionPropertyNames<User>;
+// "id" | "name"
+```
+
+---
+
+### 技巧 4：类型链式判断
+
+通过嵌套条件类型，实现复杂的类型判断：
+
+```typescript
+// 判断是否为数组
+type IsArray<T> = T extends any[] ? true : false;
+
+// 判断是否为元组
+type IsTuple<T> = T extends readonly any[]
+  ? number extends T["length"]
+    ? false
+    : true
+  : false;
+
+type Test1 = IsArray<string[]>; // true
+type Test2 = IsArray<[string, number]>; // true
+type Test3 = IsTuple<[string, number]>; // true
+type Test4 = IsTuple<string[]>; // false
+```
+
+**实战应用**：智能的 API 响应处理器
+
+```typescript
+type ApiResult<T> = T extends any[]
+  ? { type: "array"; data: T }
+  : T extends object
+    ? { type: "object"; data: T }
+    : { type: "primitive"; data: T };
+
+function processApiResult<T>(result: T): ApiResult<T> {
+  if (Array.isArray(result)) {
+    return { type: "array", data: result } as ApiResult<T>;
+  }
+  if (typeof result === "object" && result !== null) {
+    return { type: "object", data: result } as ApiResult<T>;
+  }
+  return { type: "primitive", data: result } as ApiResult<T>;
+}
+
+const result1 = processApiResult([{ id: 1 }, { id: 2 }]);
+// result1.type: "array"
+
+const result2 = processApiResult({ id: 1, name: "Alice" });
+// result2.type: "object"
+
+const result3 = processApiResult("hello");
+// result3.type: "primitive"
+```
+
+---
+
+### 技巧 5：条件类型类型推断
+
+使用 `infer` 在多个位置进行推断：
+
+```typescript
+// 提取 Promise 的 resolve 和 reject 类型
+type PromiseTypes<T> =
+  T extends Promise<infer U>
+    ? { resolve: U; reject: unknown }
+    : T extends Promise<infer U, infer E>
+      ? { resolve: U; reject: E }
+      : never;
+
+// 提取对象方法
+type ObjectMethods<T> = {
+  [K in keyof T as T[K] extends Function ? K : never]: T[K];
+};
+
+interface Service {
+  id: string;
+  getData(): Promise<Data>;
+  updateData(data: Data): Promise<void>;
+  delete(id: string): Promise<boolean>;
+}
+
+type ServiceMethods = ObjectMethods<Service>;
+// {
+//   getData: () => Promise<Data>
+//   updateData: (data: Data) => Promise<void>
+//   delete: (id: string) => Promise<boolean>
+// }
+```
+
+## 实战应用
+
+### 构建类型安全的 HTTP 客户端
+
+```typescript
+type HttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
+
+type ApiEndpoint<T extends HttpMethod, U, V> = T extends "GET"
+  ? (params?: U) => Promise<V>
+  : T extends "POST" | "PUT" | "PATCH"
+    ? (data: U) => Promise<V>
+    : T extends "DELETE"
+      ? (id: string) => Promise<V>
+      : never;
+
+interface User {
+  id: string;
+  name: string;
+  email: string;
+}
+
+interface CreateUserData {
+  name: string;
+  email: string;
+}
+
+interface UpdateUserData {
+  name?: string;
+  email?: string;
+}
+
+// API 定义
+interface UserApi {
+  getUsers: ApiEndpoint<"GET", undefined, User[]>;
+  getUserById: ApiEndpoint<"GET", { id: string }, User>;
+  createUser: ApiEndpoint<"POST", CreateUserData, User>;
+  updateUser: ApiEndpoint<"PUT", { id: string } & UpdateUserData, User>;
+  deleteUser: ApiEndpoint<"DELETE", undefined, void>;
+}
+
+// 客户端实现
+class ApiClient<Api extends Record<string, (...args: any[]) => Promise<any>>> {
+  async call<K extends keyof Api>(
+    method: K,
+    ...args: Parameters<Api[K]>
+  ): Promise<ReturnType<Api[K]>> {
+    // 实现实际的 HTTP 调用
+    return {} as any;
+  }
+}
+
+const api = new ApiClient<UserApi>();
+
+// ✅ 类型安全
+api.call("getUsers");
+api.call("getUserById", { id: "123" });
+api.call("createUser", { name: "Alice", email: "alice@example.com" });
+
+// ❌ 类型错误
+api.call("createUser", { name: "Alice" }); // 缺少 email
+```
+
+## 避坑指南
+
+### ❌ 错误 1：忽略分布式条件类型的影响
+
+```typescript
+type Naked<T> = T extends any ? T[] : never;
+type Wrapped<T extends any[]> = T extends any ? T : never;
+
+type Test1 = Naked<string | number>;
+// string[] | number[] (分发)
+
+type Test2 = Wrapped<(string | number)[]>;
+// (string | number)[] (不分发)
+```
+
+**✅ 正确做法**：理解何时分发何时不分发，根据需要选择。
+
+---
+
+### ❌ 错误 2：在错误的位置使用 infer
+
+```typescript
+// ❌ 错误：infer 不能在条件分支外使用
+type Bad<T> = infer R extends T ? R : never;
+
+// ❌ 错误：infer 必须在 extends 子句中
+type AlsoBad<T> = T extends infer R ? R : R;
+//                         ^^^^^^ 第二个 R 不合法
+
+// ✅ 正确
+type Good<T> = T extends infer R ? R : never;
+```
+
+---
+
+### ❌ 错误 3：联合类型在条件类型中的意外分发
+
+```typescript
+// 想要检查是否为联合类型
+type IsUnion<T> = T extends any ? ([any] extends [T] ? false : true) : never;
+
+type Test = IsUnion<string | number>; // true（正确）
+type Test2 = IsUnion<string>; // false（正确）
+
+// 但这有个问题
+type Test3 = IsUnion<any>; // false（可能是错误的）
+```
+
+**✅ 正确做法**：使用更健壮的联合类型检测
+
+```typescript
+type IsUnion<T, B = T> = [T] extends [UnionToIntersection<B>] ? false : true;
+
+type UnionToIntersection<U> = (U extends any ? (k: U) => void : never) extends (
+  k: infer I
+) => void
+  ? I
+  : never;
+```
+
+---
+
+### ❌ 错误 4：过度嵌套导致性能问题
+
+```typescript
+// ❌ 性能差：深层嵌套
+type Bad<T> =
+  T extends Promise<infer U>
+    ? U extends Promise<infer V>
+      ? V extends Promise<infer W>
+        ? W
+        : V
+      : U
+    : T;
+
+// ✅ 性能好：使用递归
+type Good<T> = T extends Promise<infer U> ? Good<U> : T;
+```
+
+## 总结
+
+### 核心要点
+
+1. **条件类型**：`T extends U ? X : Y` 实现类型级别的条件判断
+2. **分布式条件类型**：自动分发到联合类型的每个成员
+3. **infer 关键字**：在条件类型中推断类型的一部分
+4. **递归条件类型**：处理多层嵌套类型（如 `Promise<Promise<T>>`）
+
+### 实用工具类型
+
+```typescript
+// 提取函数返回值
+type ReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
+
+// 提取 Promise 内部类型
+type Awaited<T> = T extends Promise<infer U> ? U : T;
+
+// 提取函数参数
+type Parameters<T> = T extends (...args: infer P) => any ? P : never;
+
+// 提取实例类型
+type InstanceType<T> = T extends new (...args: any[]) => infer R ? R : any;
+
+// 提取 this 参数类型
+type ThisParameterType<T> = T extends (this: infer U, ...args: any[]) => any
+  ? U
+  : unknown;
+
+// 去除 this 参数类型
+type OmitThisParameter<T> = T extends (this: any, ...args: infer A) => infer R
+  ? (...args: A) => R
+  : T;
+```
+
+## 参考资料
+
+- [TypeScript Handbook: Conditional Types](https://www.typescriptlang.org/docs/handbook/2/conditional-types.html)
+- [TypeScript Handbook: Type Inference in Conditional Types](https://www.typescriptlang.org/docs/handbook/2/conditional-types.html#inferring-within-conditional-types)
+
+---
+
+- **下一篇**：[02 模板字面量类型实战](../02-template-literal-types.mdx)

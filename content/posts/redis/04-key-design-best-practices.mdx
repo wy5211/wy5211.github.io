@@ -1,0 +1,902 @@
+---
+title: "04. Redis 键命名与设计规范：构建可维护的 Redis 数据结构"
+date: "2026-03-23"
+summary: "学习 Redis 键的命名规范、设计模式和最佳实践，构建高效、易维护的 Redis 数据结构。"
+tags: ["Redis", "键设计", "最佳实践"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 4
+---
+
+## 前言
+
+Redis 的键（Key）设计看似简单，实则大有学问。一个好的键设计可以让你的代码更清晰、性能更好、维护更容易。
+
+你是否遇到过这样的问题：
+
+- 键名混乱，`user123`、`user:123`、`User_123` 混用？
+- 不知道哪些键什么时候会过期？
+- 键名太长导致内存浪费？
+- 无法快速找到相关的键？
+- 删除数据时担心误删？
+
+本文将带你：
+
+- 🎯 掌握 Redis 键的命名规范和最佳实践
+- 📊 学习常见的键设计模式
+- 💡 理解过期策略和内存优化技巧
+- 🔍 掌握键管理和查询方法
+- 🛠️ 构建可维护、可扩展的键结构
+
+---
+
+## 键命名规范
+
+### 基本规则
+
+### 1. 使用冒号分隔层级
+
+```typescript
+// ✅ 推荐：使用冒号 : 分隔不同的层级
+"user:123:profile";
+"user:123:settings";
+"cache:product:456";
+"session:abc123";
+"lock:order:789";
+
+// ❌ 避免：不使用分隔符或使用其他字符
+"user123profile";
+"user-123-profile";
+"user_123_profile";
+"user.123.profile";
+```
+
+**好处**：
+
+- 层级清晰，易于理解
+- 方便使用 `KEYS` 或 `SCAN` 命令查询
+- 避免键名冲突
+
+### 2. 使用小写字母和数字
+
+```typescript
+// ✅ 推荐
+"user:123:profile";
+"cache:product:456";
+"session:abc123";
+
+// ❌ 避免
+"User:123:Profile";
+"CACHE:PRODUCT:456";
+"Session:ABC123";
+```
+
+### 3. 使用有意义的名称
+
+```typescript
+// ✅ 推荐：见名知意
+"user:123:profile";
+"product:456:details";
+"order:789:status";
+
+// ❌ 避免：难以理解
+"k1";
+"key_abc";
+"temp_data";
+```
+
+### 4. 保持一致性
+
+```typescript
+// ✅ 推荐：统一风格
+"user:123:profile";
+"user:123:settings";
+"user:123:friends";
+
+// ❌ 避免：风格混乱
+"user:123:profile";
+"user:123-settings";
+"user123_friends";
+```
+
+### 常见命名模式
+
+#### 1. 对象-属性模式
+
+```typescript
+// 格式：object:id:field
+"user:123:name";
+"user:123:email";
+"user:123:age";
+
+// 或使用 Hash
+"user:123";
+//  - name: "张三"
+//  - email: "user@example.com"
+//  - age: "25"
+```
+
+#### 2. 实体-关系模式
+
+```typescript
+// 格式：entity1:id:relation:entity2:id
+"user:123:following:user:456";
+"user:123:posts:post:789";
+
+// 或简化
+"user:123:following"; // Set
+"user:123:posts"; // List
+```
+
+#### 3. 类型-对象-标识模式
+
+```typescript
+// 格式：type:object:id
+"cache:user:123";
+"lock:order:456";
+"queue:email:messages";
+"counter:page:views:789";
+```
+
+#### 4. 时间序列模式
+
+```typescript
+// 格式：metric:timestamp 或 metric:date:time
+"analytics:2026-03-23:page_views";
+"analytics:2026-03-23:14:30:00:events";
+"metrics:cpu:1679529600";
+
+// 或使用 Sorted Set
+"metrics:cpu"; // score = timestamp
+```
+
+### 实际应用示例
+
+#### 用户系统
+
+```typescript
+// 用户基本信息
+"user:123"; // Hash
+//  - name: "张三"
+//  - email: "user@example.com"
+//  - age: "25"
+
+// 用户会话
+"session:abc123"; // String 或 Hash
+//  - userId: "123"
+//  - createdAt: "1679529600"
+
+// 用户标签
+"user:123:tags"; // Set
+//  - "developer"
+//  - "redis"
+
+// 用户关注列表
+"user:123:following"; // Set
+"user:123:followers"; // Set
+
+// 用户缓存
+"cache:user:123"; // String (JSON)
+```
+
+#### 电商系统
+
+```typescript
+// 商品信息
+"product:456"; // Hash
+//  - name: "商品名称"
+//  - price: "99.99"
+//  - stock: "100"
+
+// 商品缓存
+"cache:product:456"; // String (JSON)
+
+// 购物车
+"cart:user:123"; // Hash
+//  - product:456: "2"
+//  - product:789: "1"
+
+// 订单状态
+"order:789:status"; // String
+
+// 商品浏览历史
+"history:user:123:products"; // List
+```
+
+#### 内容系统
+
+```typescript
+// 文章内容
+"article:1011"; // Hash
+//  - title: "文章标题"
+//  - content: "..."
+//  - author: "123"
+
+// 文章浏览量
+"counter:article:1011:views"; // String
+
+// 最新文章列表
+"latest:articles"; // List
+
+// 文章标签
+"article:1011:tags"; // Set
+
+// 标签下的文章
+"tag:redis:articles"; // Set
+```
+
+---
+
+## 过期策略
+
+### 为什么需要过期时间？
+
+Redis 数据存储在内存中，如果不设置过期时间，会导致：
+
+1. **内存泄漏**：无用数据持续占用内存
+2. **性能下降**：数据量过大导致查询变慢
+3. **数据陈旧**：缓存的数据与数据库不一致
+
+### 设置过期时间
+
+#### 方法一：创建时设置
+
+```typescript
+// 使用 SETEX
+await redis.setex("cache:user:123", 3600, userData); // 1 小时
+
+// 使用 SET with EX
+await redis.set("cache:user:123", userData, "EX", 3600);
+```
+
+#### 方法二：创建后设置
+
+```typescript
+// 设置键
+await redis.set("cache:user:123", userData);
+
+// 设置过期时间
+await redis.expire("cache:user:123", 3600); // 秒
+
+// 或使用毫秒
+await redis.pexpire("cache:user:123", 3600000); // 毫秒
+```
+
+#### 方法三：设置在指定时间过期
+
+```typescript
+// 在指定时间戳过期
+await redis.expireat("cache:user:123", 1672534800);
+
+// 在指定时间戳过期（毫秒）
+await redis.pexpireat("cache:user:123", 1672534800000);
+```
+
+### 过期时间选择指南
+
+| 数据类型         | 过期时间         | 示例                                                |
+| ---------------- | ---------------- | --------------------------------------------------- |
+| **热点数据缓存** | 1-5 分钟         | `await redis.setex("hot:data", 300, value);`        |
+| **普通数据缓存** | 1-6 小时         | `await redis.setex("cache:data", 3600, value);`     |
+| **用户会话**     | 24 小时          | `await redis.setex("session:xxx", 86400, session);` |
+| **验证码**       | 5-15 分钟        | `await redis.setex("code:123", 600, code);`         |
+| **临时锁**       | 10-30 秒         | `await redis.set("lock:xxx", "1", "EX", 30, "NX");` |
+| **计数器**       | 不过期或每天重置 | `await redis.set("counter:daily", 0);`              |
+| **统计数据**     | 长期保存         | 不设置过期时间                                      |
+
+### 实际应用示例
+
+#### 缓存过期策略
+
+```typescript
+// 短期缓存：热点数据
+async function getHotData(key: string) {
+  const cacheKey = `cache:hot:${key}`;
+  let data = await redis.get(cacheKey);
+
+  if (!data) {
+    // 缓存未命中，查询数据库
+    data = await db.query(key);
+    // 缓存 5 分钟
+    await redis.setex(cacheKey, 300, JSON.stringify(data));
+  }
+
+  return JSON.parse(data);
+}
+
+// 长期缓存：不常变化的数据
+async function getConfig(key: string) {
+  const cacheKey = `cache:config:${key}`;
+  let data = await redis.get(cacheKey);
+
+  if (!data) {
+    data = await db.getConfig(key);
+    // 缓存 6 小时
+    await redis.setex(cacheKey, 21600, JSON.stringify(data));
+  }
+
+  return JSON.parse(data);
+}
+```
+
+#### 会话过期策略
+
+```typescript
+// 用户登录
+async function login(userId: string) {
+  const sessionId = generateSessionId();
+
+  // 存储会话，24 小时过期
+  await redis.setex(
+    `session:${sessionId}`,
+    86400,
+    JSON.stringify({
+      userId,
+      loginAt: Date.now(),
+    })
+  );
+
+  // 记录用户活跃会话
+  await redis.sadd(`user:${userId}:sessions`, sessionId);
+
+  return sessionId;
+}
+
+// 用户活动时续期
+async function refreshSession(sessionId: string) {
+  const session = await redis.get(`session:${sessionId}`);
+  if (session) {
+    // 续期 24 小时
+    await redis.expire(`session:${sessionId}`, 86400);
+  }
+}
+```
+
+#### 验证码过期策略
+
+```typescript
+// 发送验证码
+async function sendCode(phone: string) {
+  const code = generateCode();
+  const key = `code:${phone}`;
+
+  // 5 分钟过期
+  await redis.setex(key, 300, code);
+
+  // 限制发送频率（1 分钟内不能重复发送）
+  const rateLimitKey = `ratelimit:code:${phone}`;
+  const canSend = await redis.set(rateLimitKey, "1", "EX", 60, "NX");
+
+  if (!canSend) {
+    throw new Error("发送过于频繁，请稍后再试");
+  }
+
+  // 发送短信...
+  return code;
+}
+
+// 验证验证码
+async function verifyCode(phone: string, code: string) {
+  const key = `code:${phone}`;
+  const storedCode = await redis.get(key);
+
+  if (!storedCode) {
+    throw new Error("验证码已过期");
+  }
+
+  if (storedCode !== code) {
+    throw new Error("验证码错误");
+  }
+
+  // 验证成功，删除验证码
+  await redis.del(key);
+}
+```
+
+### 批量设置过期时间
+
+```typescript
+// 为多个键设置相同的过期时间
+async function expirePattern(pattern: string, seconds: number) {
+  const keys = await redis.keys(pattern);
+  if (keys.length > 0) {
+    await redis.multi();
+    for (const key of keys) {
+      await redis.expire(key, seconds);
+    }
+    await redis.exec();
+  }
+}
+
+// 使用示例
+await expirePattern("cache:*", 3600);
+```
+
+---
+
+## 内存优化
+
+### 1. 选择合适的数据结构
+
+```typescript
+// ❌ 不推荐：使用 String 存储 JSON 对象
+await redis.set(
+  "user:123",
+  JSON.stringify({
+    name: "张三",
+    email: "user@example.com",
+    age: 25,
+    city: "北京",
+  })
+);
+
+// ✅ 推荐：使用 Hash 存储
+await redis.hset("user:123", {
+  name: "张三",
+  email: "user@example.com",
+  age: "25",
+  city: "北京",
+});
+```
+
+**原因**：
+
+- Hash 在字段少时使用 ziplist 编码，更节省内存
+- 可以部分获取和更新，不需要获取整个对象
+
+### 2. 使用短键名
+
+```typescript
+// ❌ 键名过长
+"this_is_a_very_long_key_name:that_wastes_memory:user:123:profile";
+
+// ✅ 使用简洁但清晰的键名
+"user:123:profile";
+```
+
+**权衡**：
+
+- 键名需要足够清晰
+- 但也要考虑内存占用
+- 每个键都会占用内存
+
+### 3. 压缩大值
+
+```typescript
+// 对于较大的值，考虑压缩
+import * as zlib from "zlib";
+
+async function setCompressed(key: string, value: string) {
+  const compressed = zlib.deflateSync(value).toString("base64");
+  await redis.set(key, compressed);
+}
+
+async function getCompressed(key: string) {
+  const compressed = await redis.get(key);
+  if (!compressed) return null;
+  const decompressed = zlib.inflateSync(Buffer.from(compressed, "base64"));
+  return decompressed.toString();
+}
+```
+
+### 4. 使用整数编码
+
+```typescript
+// ✅ Redis 会自动将纯数字字符串编码为整数
+await redis.set("counter", "100");
+
+// ✅ 使用数值操作
+await redis.incr("counter");
+```
+
+### 5. 合理设置 maxmemory-policy
+
+```bash
+# redis.conf
+
+# 设置最大内存
+maxmemory 256mb
+
+# 内存淘汰策略
+maxmemory-policy allkeys-lru
+
+# 其他策略：
+# noeviction - 不淘汰，返回错误
+# allkeys-lru - 淘汰最少使用的键
+# volatile-lru - 淘汰设置了过期时间的键中最少使用的
+# allkeys-random - 随机淘汰
+# volatile-random - 随机淘汰设置了过期时间的键
+```
+
+---
+
+## 键管理
+
+### 查询键
+
+```typescript
+// 查询所有键（不推荐生产环境）
+const allKeys = await redis.keys("*");
+
+// 查询匹配的键
+const userKeys = await redis.keys("user:*");
+const cacheKeys = await redis.keys("cache:*");
+
+// 使用 SCAN 更安全（推荐）
+async function scanKeys(pattern: string, count = 100) {
+  let cursor = "0";
+  const keys = [];
+
+  do {
+    const result = await redis.scan(cursor, "MATCH", pattern, "COUNT", count);
+    cursor = result[0];
+    keys.push(...result[1]);
+  } while (cursor !== "0");
+
+  return keys;
+}
+```
+
+### 删除键
+
+```typescript
+// 删除单个键
+await redis.del("key1");
+
+// 批量删除
+await redis.del("key1", "key2", "key3");
+
+// 删除匹配的键（谨慎使用）
+async function delPattern(pattern: string) {
+  const keys = await redis.keys(pattern);
+  if (keys.length > 0) {
+    await redis.del(...keys);
+  }
+}
+
+// 使用 SCAN 删除（推荐）
+async function delPatternSafe(pattern: string) {
+  let cursor = "0";
+  let deleted = 0;
+
+  do {
+    const result = await redis.scan(cursor, "MATCH", pattern, "COUNT", 100);
+    cursor = result[0];
+    if (result[1].length > 0) {
+      deleted += await redis.del(...result[1]);
+    }
+  } while (cursor !== "0");
+
+  return deleted;
+}
+```
+
+### 重命名键
+
+```typescript
+// 重命名键
+await redis.rename("old_key", "new_key");
+
+// 仅当新键不存在时重命名
+await redis.renamenx("old_key", "new_key");
+```
+
+### 查看键信息
+
+```typescript
+// 查看键的类型
+const type = await redis.type("key");
+
+// 查看键的剩余过期时间（秒）
+const ttl = await redis.ttl("key");
+// -1: 永不过期
+// -2: 不存在
+// >0: 剩余秒数
+
+// 查看键的内存占用
+const size = await redis.memory("USAGE", "key");
+
+// 查看键的编码方式
+const encoding = await redis.object("ENCODING", "key");
+// "ziplist", "hashtable", "intset", etc.
+```
+
+---
+
+## 键设计模式
+
+### 1. 锁模式
+
+```typescript
+// 分布式锁
+async function acquireLock(lockName: string, ttl = 30) {
+  const lockKey = `lock:${lockName}`;
+  const lockValue = Date.now().toString();
+
+  const acquired = await redis.set(lockKey, lockValue, "NX", "EX", ttl);
+
+  if (acquired === "OK") {
+    return lockValue;
+  }
+
+  return null;
+}
+
+async function releaseLock(lockName: string, lockValue: string) {
+  const lockKey = `lock:${lockName}`;
+
+  // 使用 Lua 脚本确保只释放自己的锁
+  const script = `
+    if redis.call("get", KEYS[1]) == ARGV[1] then
+      return redis.call("del", KEYS[1])
+    else
+      return 0
+    end
+  `;
+
+  return await redis.eval(script, 1, lockKey, lockValue);
+}
+```
+
+### 2. 计数器模式
+
+```typescript
+// 计数器
+async function incrementCounter(key: string, ttl?: number) {
+  const count = await redis.incr(key);
+
+  // 第一次设置时添加过期时间
+  if (count === 1 && ttl) {
+    await redis.expire(key, ttl);
+  }
+
+  return count;
+}
+
+// 使用示例
+const views = await incrementCounter("page:views:123", 86400);
+```
+
+### 3. 限流模式
+
+```typescript
+// 令牌桶算法
+async function rateLimit(userId: string, limit: number, window: number) {
+  const key = `ratelimit:${userId}`;
+
+  const current = await redis.incr(key);
+
+  // 第一次设置时添加过期时间
+  if (current === 1) {
+    await redis.expire(key, window);
+  }
+
+  return current <= limit;
+}
+
+// 使用示例：每分钟最多 100 次请求
+const allowed = await rateLimit("user:123", 100, 60);
+if (!allowed) {
+  throw new Error("请求过于频繁");
+}
+```
+
+### 4. 命名空间模式
+
+```typescript
+// 使用前缀实现命名空间
+const NAMESPACE = "app:v1";
+
+async function setKey(key: string, value: any) {
+  await redis.set(`${NAMESPACE}:${key}`, value);
+}
+
+async function getKey(key: string) {
+  return await redis.get(`${NAMESPACE}:${key}`);
+}
+
+// 清空命名空间
+async function clearNamespace() {
+  const keys = await redis.keys(`${NAMESPACE}:*`);
+  if (keys.length > 0) {
+    await redis.del(...keys);
+  }
+}
+```
+
+### 5. 版本控制模式
+
+```typescript
+// 数据版本控制
+async function setWithVersion(key: string, value: any, version: number) {
+  const versionKey = `${key}:version`;
+  const dataKey = `${key}:data:${version}`;
+
+  // 检查版本
+  const currentVersion = await redis.get(versionKey);
+  if (currentVersion && parseInt(currentVersion) !== version - 1) {
+    throw new Error("版本冲突");
+  }
+
+  // 保存数据
+  await redis.set(dataKey, JSON.stringify(value));
+  await redis.set(versionKey, version.toString());
+
+  // 清理旧版本（保留最近 3 个）
+  await redis.del(`${key}:data:${version - 4}`);
+}
+```
+
+---
+
+## 最佳实践总结
+
+### 1. 命名规范
+
+✅ **DO**：
+
+```typescript
+"user:123:profile";
+"cache:product:456";
+"session:abc123";
+```
+
+❌ **DON'T**：
+
+```typescript
+"user123profile";
+"USER:123:PROFILE";
+"user-123-profile";
+```
+
+### 2. 过期时间
+
+✅ **DO**：
+
+```typescript
+// 所有缓存都设置过期时间
+await redis.setex("cache:data", 3600, data);
+```
+
+❌ **DON'T**：
+
+```typescript
+// 不设置过期时间可能导致内存泄漏
+await redis.set("cache:data", data);
+```
+
+### 3. 键管理
+
+✅ **DO**：
+
+```typescript
+// 使用 SCAN 代替 KEYS
+let cursor = "0";
+do {
+  const result = await redis.scan(cursor, "MATCH", pattern, "COUNT", 100);
+  cursor = result[0];
+  // 处理结果...
+} while (cursor !== "0");
+```
+
+❌ **DON'T**：
+
+```typescript
+// KEYS 会阻塞 Redis
+const keys = await redis.keys("*");
+```
+
+### 4. 批量操作
+
+✅ **DO**：
+
+```typescript
+// 使用 MGET
+const values = await redis.mget("key1", "key2", "key3");
+```
+
+❌ **DON'T**：
+
+```typescript
+// 多次网络往返
+const v1 = await redis.get("key1");
+const v2 = await redis.get("key2");
+const v3 = await redis.get("key3");
+```
+
+---
+
+## 常见问题
+
+### Q1: 键名应该多长？
+
+**A**: 平衡清晰度和内存占用：
+
+- ✅ `user:123:profile` - 清晰且简洁
+- ❌ `u:p:123` - 太短，不够清晰
+- ❌ `this_is_a_very_long_key_name:user:123:profile` - 太长，浪费内存
+
+### Q2: 如何避免键名冲突？
+
+**A**:
+
+1. 使用命名空间/前缀
+2. 使用层级结构（冒号分隔）
+3. 统一命名规范
+4. 使用版本号（如 `app:v1:key`）
+
+### Q3: 如何处理大量键的删除？
+
+**A**:
+
+```typescript
+// ❌ 避免一次性删除大量键
+const keys = await redis.keys("pattern:*");
+await redis.del(...keys); // 可能阻塞
+
+// ✅ 使用 SCAN 分批删除
+async function delPatternSafe(pattern: string) {
+  let cursor = "0";
+  let deleted = 0;
+
+  do {
+    const result = await redis.scan(cursor, "MATCH", pattern, "COUNT", 100);
+    cursor = result[0];
+    if (result[1].length > 0) {
+      deleted += await redis.del(...result[1]);
+    }
+  } while (cursor !== "0");
+
+  return deleted;
+}
+```
+
+---
+
+## 总结
+
+本文我们系统学习了 Redis 键的设计和管理：
+
+✅ **命名规范**
+
+- 使用冒号分隔层级
+- 使用小写字母和数字
+- 使用有意义的名称
+- 保持一致性
+
+✅ **过期策略**
+
+- 所有缓存都设置过期时间
+- 根据数据类型选择合适的过期时间
+- 热点数据短过期，冷数据长过期
+
+✅ **内存优化**
+
+- 选择合适的数据结构
+- 使用简洁但清晰的键名
+- 压缩大值
+- 合理设置淘汰策略
+
+✅ **键管理**
+
+- 使用 SCAN 代替 KEYS
+- 批量操作减少网络往返
+- 谨慎删除数据
+
+✅ **设计模式**
+
+- 锁模式
+- 计数器模式
+- 限流模式
+- 命名空间模式
+- 版本控制模式
+
+---
+
+## 下一步
+
+现在你已经掌握了 Redis 键的设计规范，在下一篇文章中，我们将深入学习 **Redis 持久化机制**，了解如何将内存数据保存到磁盘。
+
+继续阅读：[05. Redis 持久化机制](./05-persistence-mechanisms.mdx)

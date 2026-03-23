@@ -1,0 +1,269 @@
+---
+title: "17. Redis Cluster 集群架构：分布式存储与扩容"
+date: "2026-03-23"
+summary: "深入理解 Redis Cluster 集群架构，掌握分布式存储、数据分片和集群扩容。"
+tags: ["Redis", "Cluster", "集群"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 17
+---
+
+## 前言
+
+Redis Cluster 是 Redis 的分布式解决方案，可以自动分片和高可用。
+
+---
+
+## Cluster 架构
+
+### 工作原理
+
+```
+1. 数据分片：16384 个槽位
+2. 每个节点负责部分槽位
+3. 节点间通过 Gossip 协议通信
+4. 自动故障转移
+```
+
+### 槽位分配
+
+```
+Node A: 0 - 5460
+Node B: 5461 - 10922
+Node C: 10923 - 16383
+```
+
+### 创建 Cluster
+
+#### 方式 1：使用 redis-cli
+
+```bash
+# 创建 6 个节点（3 主 3 从）
+# 节点配置
+port 7000
+cluster-enabled yes
+cluster-config-file nodes-7000.conf
+cluster-node-timeout 5000
+appendonly yes
+
+# 启动节点
+redis-server redis-7000.conf
+redis-server redis-7001.conf
+redis-server redis-7002.conf
+redis-server redis-7003.conf
+redis-server redis-7004.conf
+redis-server redis-7005.conf
+
+# 创建集群
+redis-cli --cluster create \
+  127.0.0.1:7000 127.0.0.1:7001 127.0.0.1:7002 \
+  --cluster-replicas 1
+```
+
+#### 方式 2：使用 Docker
+
+```bash
+# 使用 Docker Compose
+docker-compose up -d
+
+# 创建集群
+docker exec -it redis-cluster-1 redis-cli --cluster create \
+  redis-cluster-1:6379 \
+  redis-cluster-2:6379 \
+  redis-cluster-3:6379 \
+  --cluster-replicas 1
+```
+
+### 连接 Cluster
+
+```bash
+# 连接到 Cluster
+redis-cli -c -p 7000
+
+# 查看集群信息
+cluster info
+
+# 查看节点
+cluster nodes
+```
+
+---
+
+## 数据分片
+
+### 哈希标签
+
+```typescript
+// 使用哈希标签确保相关数据在同一节点
+// 格式：{tag}
+
+redis.set("user:123:profile", data); // 可能分到不同节点
+redis.set("{user:123}:profile", data); // 相同 tag 会在同一节点
+redis.set("{user:123}:settings", data);
+```
+
+### 计算槽位
+
+```typescript
+function calculateSlot(key: string): number {
+  // 提取哈希标签
+  const match = key.match(/\{(.*)\}/);
+  const effectiveKey = match ? match[1] : key;
+
+  // 计算 CRC16
+  const crc = crc16(effectiveKey);
+
+  // 取模 16384
+  return crc % 16384;
+}
+```
+
+---
+
+## 客户端连接
+
+### ioredis 连接 Cluster
+
+```typescript
+import Redis from "ioredis";
+
+// 连接到 Cluster
+const cluster = new Redis.Cluster(
+  [
+    { host: "127.0.0.1", port: 7000 },
+    { host: "127.0.0.1", port: 7001 },
+    { host: "127.0.0.1", port: 7002 },
+  ],
+  {
+    redisOptions: {
+      password: "your_password",
+    },
+  }
+);
+
+// 正常使用
+await cluster.set("key", "value");
+const value = await cluster.get("key");
+```
+
+---
+
+## 集群管理
+
+### 添加节点
+
+```bash
+# 添加新主节点
+redis-cli --cluster add-node 127.0.0.1:7006 127.0.0.1:7000
+
+# 重新分片
+redis-cli --cluster reshard 127.0.0.1:7000
+# 按提示操作：
+# - 目标节点 ID
+# - 要迁移的槽数量
+# - 源节点 ID
+```
+
+### 删除节点
+
+```bash
+# 先移除槽位
+redis-cli --cluster reshard 127.0.0.1:7000
+
+# 删除节点
+redis-cli --cluster del-node 127.0.0.1:7000 <node-id>
+```
+
+### 故障转移
+
+```typescript
+// Cluster 自动故障转移
+// 主节点故障时，从节点自动升级为主节点
+```
+
+---
+
+## 最佳实践
+
+### 1. 使用哈希标签
+
+```typescript
+// ✅ 相关数据使用相同 tag
+await cluster.set("{user:123}:profile", profile);
+await cluster.set("{user:123}:settings", settings);
+
+// ❌ 不使用哈希标签可能导致跨节点
+await cluster.set("user:123:profile", profile);
+await cluster.set("user:123:settings", settings);
+```
+
+### 2. 批量操作使用 pipeline
+
+```typescript
+// ✅ 使用 pipeline
+const pipeline = cluster.pipeline();
+for (let i = 0; i < 100; i++) {
+  pipeline.set(`key:${i}`, `value:${i}`);
+}
+await pipeline.exec();
+```
+
+### 3. 监控集群状态
+
+```typescript
+async function checkClusterHealth() {
+  const info = await cluster.info("cluster");
+
+  // cluster_state:ok
+  // cluster_slots_assigned:16384
+  // cluster_slots_ok:16384
+  // cluster_slots_pfail:0
+  // cluster_slots_fail:0
+
+  return info.includes("cluster_state:ok");
+}
+```
+
+---
+
+## 常见问题
+
+### Q1: Cluster 不支持多键操作？
+
+**A**: 支持但有限制：
+
+```typescript
+// ✅ 相同槽位可以
+await cluster.mset("{user:123}:name", "张三", "{user:123}:age", "25");
+
+// ❌ 不同槽位不支持
+await cluster.mset("key1", "value1", "key2", "value2");
+```
+
+### Q2: 如何扩容？
+
+**A**: 添加新节点并重新分片：
+
+```bash
+redis-cli --cluster add-node new-host:6379 existing-host:6379
+redis-cli --cluster reshard existing-host:6379
+```
+
+---
+
+## 总结
+
+本文我们学习了：
+
+✅ Cluster 架构原理
+✅ 数据分片机制
+✅ 集群管理操作
+✅ 客户端连接
+
+---
+
+## 下一步
+
+继续阅读：[18. 实时统计系统实战](./18-real-time-analytics-project.mdx)

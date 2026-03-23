@@ -1,0 +1,341 @@
+---
+title: "14. 发布订阅机制：实时消息推送与广播"
+date: "2026-03-23"
+summary: "掌握 Redis 发布订阅机制，实现实时消息推送、聊天室和消息广播功能。"
+tags: ["Redis", "发布订阅", "Pub/Sub"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 14
+---
+
+## 前言
+
+Redis 的发布订阅（Pub/Sub）是一种消息通信模式，可以实现实时消息推送。
+
+---
+
+## 基础用法
+
+### 发布消息
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+// 发布消息
+await redis.publish(
+  "channel:news",
+  JSON.stringify({
+    title: "重要新闻",
+    content: "...",
+  })
+);
+
+// 返回订阅者数量
+const count = await redis.publish("channel:news", message);
+console.log(`消息发送给 ${count} 个订阅者`);
+```
+
+### 订阅消息
+
+```typescript
+// 创建订阅者（需要独立的连接）
+const subscriber = new Redis();
+
+subscriber.subscribe("channel:news");
+
+subscriber.on("message", (channel, message) => {
+  console.log(`收到消息 [${channel}]:`, message);
+  const data = JSON.parse(message);
+  // 处理消息
+});
+
+// 取消订阅
+subscriber.unsubscribe("channel:news");
+
+// 订阅多个频道
+subscriber.subscribe(["channel:news", "channel:updates"]);
+```
+
+### 模式订阅
+
+```typescript
+// 订阅匹配的模式
+subscriber.psubscribe("channel:*");
+
+subscriber.on("pmessage", (pattern, channel, message) => {
+  console.log(`模式匹配 [${pattern}]: ${channel}`);
+  console.log("消息:", message);
+});
+
+// 取消模式订阅
+subscriber.punsubscribe("channel:*");
+```
+
+---
+
+## 实际应用
+
+### 聊天室
+
+```typescript
+class ChatRoom {
+  private publisher: Redis;
+  private subscribers: Map<string, Redis> = new Map();
+
+  constructor() {
+    this.publisher = new Redis();
+  }
+
+  join(userId: string, roomId: string, callback: (msg: any) => void) {
+    const subscriber = new Redis();
+    const channel = `chat:${roomId}`;
+
+    subscriber.subscribe(channel);
+    subscriber.on("message", (ch, message) => {
+      if (ch === channel) {
+        callback(JSON.parse(message));
+      }
+    });
+
+    this.subscribers.set(userId, subscriber);
+  }
+
+  leave(userId: string) {
+    const subscriber = this.subscribers.get(userId);
+    if (subscriber) {
+      subscriber.disconnect();
+      this.subscribers.delete(userId);
+    }
+  }
+
+  send(roomId: string, userId: string, message: string) {
+    const channel = `chat:${roomId}`;
+    this.publisher.publish(
+      channel,
+      JSON.stringify({
+        userId,
+        message,
+        timestamp: Date.now(),
+      })
+    );
+  }
+}
+
+// 使用
+const chatRoom = new ChatRoom();
+
+// 用户加入
+chatRoom.join("user:1", "room:123", (msg) => {
+  console.log("收到消息:", msg);
+});
+
+// 发送消息
+chatRoom.send("room:123", "user:1", "Hello!");
+```
+
+### 实时通知
+
+```typescript
+class NotificationService {
+  private redis: Redis;
+
+  constructor() {
+    this.redis = new Redis();
+  }
+
+  async notify(userId: string, notification: any) {
+    const channel = `notification:${userId}`;
+    await this.redis.publish(
+      channel,
+      JSON.stringify({
+        ...notification,
+        createdAt: Date.now(),
+      })
+    );
+  }
+
+  async broadcast(notification: any) {
+    const channel = "notification:all";
+    await this.redis.publish(channel, JSON.stringify(notification));
+  }
+
+  subscribe(userId: string, callback: (msg: any) => void) {
+    const subscriber = new Redis();
+    subscriber.subscribe(`notification:${userId}`);
+    subscriber.on("message", (ch, msg) => {
+      callback(JSON.parse(msg));
+    });
+    return subscriber;
+  }
+}
+```
+
+### 系统事件
+
+```typescript
+class EventBus {
+  private redis: Redis;
+
+  constructor() {
+    this.redis = new Redis();
+  }
+
+  emit(event: string, data: any) {
+    const channel = `event:${event}`;
+    this.redis.publish(channel, JSON.stringify(data));
+  }
+
+  on(event: string, callback: (data: any) => void) {
+    const subscriber = new Redis();
+    subscriber.subscribe(`event:${event}`);
+    subscriber.on("message", (ch, msg) => {
+      callback(JSON.parse(msg));
+    });
+    return subscriber;
+  }
+}
+
+// 使用
+const eventBus = new EventBus();
+
+eventBus.on("user.created", (data) => {
+  console.log("新用户:", data);
+});
+
+eventBus.emit("user.created", { id: "123", name: "张三" });
+```
+
+---
+
+## 最佳实践
+
+### 1. 消息持久化
+
+```typescript
+// Pub/Sub 不持久化消息，离线用户收不到
+// 解决方案：结合 Stream 或 List
+
+class PersistentPubSub {
+  constructor(private redis: Redis) {}
+
+  async publish(channel: string, message: any) {
+    // 发布实时消息
+    await this.redis.publish(channel, JSON.stringify(message));
+
+    // 保存到 Stream（离线用户可以读取）
+    await this.redis.xadd(
+      `stream:${channel}`,
+      "*",
+      "data",
+      JSON.stringify(message)
+    );
+  }
+
+  async subscribe(channel: string, callback: (msg: any) => void) {
+    const subscriber = new Redis();
+
+    // 订阅实时消息
+    subscriber.subscribe(channel);
+    subscriber.on("message", (ch, msg) => {
+      callback(JSON.parse(msg));
+    });
+
+    // 读取历史消息
+    const stream = `stream:${channel}`;
+    let lastId = "0";
+
+    while (true) {
+      const messages = await this.redis.xread(
+        "BLOCK",
+        1000,
+        "STREAMS",
+        stream,
+        lastId
+      );
+
+      if (messages) {
+        for (const [, streamMessages] of messages) {
+          for (const [id, fields] of streamMessages) {
+            lastId = id;
+            callback(JSON.parse(fields[1]));
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### 2. 消息确认
+
+```typescript
+class ReliablePubSub {
+  async publish(channel: string, message: any) {
+    const msgId = `${Date.now()}-${Math.random()}`;
+    const data = JSON.stringify({ id: msgId, ...message });
+
+    // 发送到确认队列
+    await this.redis.rpush(`pending:${channel}`, data);
+
+    // 发布消息
+    await this.redis.publish(channel, data);
+
+    return msgId;
+  }
+
+  async acknowledge(channel: string, msgId: string) {
+    // 从待确认队列移除
+    const script = `
+      local pending = "pending:${ARGV[1]}"
+      for i = 1, redis.call("llen", pending) do
+        local msg = redis.call("lindex", pending, i - 1)
+        if string.find(msg, '"id":"' .. ARGV[2] .. '"') then
+          redis.call("lrem", pending, 1, msg)
+          return 1
+        end
+      end
+      return 0
+    `;
+    await this.redis.eval(script, 1, channel, msgId);
+  }
+}
+```
+
+---
+
+## 注意事项
+
+### 1. Pub/Sub 的局限性
+
+- 消息不持久化，离线订阅者收不到
+- 没有消息确认机制
+- 网络断开后需要重新订阅
+
+### 2. 替代方案
+
+对于需要可靠消息的场景，考虑：
+
+- Redis Stream（Redis 5.0+）
+- 专用消息队列（RabbitMQ、Kafka）
+- WebSocket 长连接
+
+---
+
+## 总结
+
+本文我们学习了 Redis 发布订阅：
+
+✅ 基础用法
+✅ 聊天室实现
+✅ 实时通知
+✅ 消息持久化
+
+---
+
+## 下一步
+
+继续阅读：[15. 事务与 Pipeline](./15-transaction-pipeline.mdx)

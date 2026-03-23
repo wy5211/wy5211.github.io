@@ -1,0 +1,682 @@
+---
+title: "05 关系设计与建模"
+date: "2026-03-23"
+summary: "理解 NoSQL 数据建模最佳实践，掌握嵌入式和引用式设计，实现一对多、多对多关系"
+tags: ["Mongoose", "数据建模", "关系设计", "Populate"]
+category: "mongoose"
+draft: false
+series: "Mongoose 渐进式学习"
+seriesOrder: 5
+---
+
+## 前言
+
+MongoDB 的 NoSQL 特性给予我们灵活的数据建模方式。与关系型数据库不同，MongoDB 支持嵌入式和引用式两种设计模式。
+
+选择正确的建模方式对于应用性能和可维护性至关重要。
+
+## 核心概念
+
+### 嵌入式 vs 引用式
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    数据建模策略                             │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  嵌入式（Embedding）                                         │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ 优点：                                                │   │
+│  │ • 查询性能好（一次查询获取所有数据）                  │   │
+│  │ • 无需 join 操作                                      │   │
+│  │ • 原子性更新                                         │   │
+│  │                                                      │   │
+│  │ 缺点：                                                │   │
+│  │ • 文档大小限制（16MB）                                │   │
+│  │ • 数据重复                                           │   │
+│  │ • 并发冲突                                           │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                               │
+│  引用式（Referencing）                                      │
+│  ┌──────────────────────────────────────────────────────┐   │
+│  │ 优点：                                                │   │
+│  │ • 数据不重复                                         │   │
+│  │ • 灵活性高                                           │   │
+│  │ • 无文档大小限制                                     │   │
+│  │                                                      │   │
+│  │ 缺点：                                                │   │
+│  │ • 需要多次查询或 join                                 │   │
+│  │ • 应用层 join                                        │   │
+│  │ • 非原子性                                           │   │
+│  └──────────────────────────────────────────────────────┘   │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 关系类型决策树
+
+```
+数据量小且不变 → 嵌入式
+     │
+     ├─ 一对一 (1:1)
+     │  ├─ 访问频率高 → 嵌入式
+     │  └─ 访问频率低 → 引用式
+     │
+     ├─ 一对多 (1:N)
+     │  ├─ "多"方数量少 (<100) → 嵌入式
+     │  ├─ "多"方数量多 (≥100) → 引用式
+     │  └─ 需要单独查询"多"方 → 引用式
+     │
+     └─ 多对多 (N:M)
+        └─ 总是使用引用式（需要中间集合）
+```
+
+## 实战演练
+
+### 一对一关系：用户资料
+
+创建 `src/models/User.ts`：
+
+```typescript
+import mongoose, { Schema, Model, Document } from "mongoose";
+
+// 用户资料子文档
+interface IProfile {
+  bio?: string;
+  avatar?: string;
+  website?: string;
+  location?: string;
+  social?: {
+    twitter?: string;
+    github?: string;
+    linkedin?: string;
+  };
+  preferences?: {
+    emailNotifications: boolean;
+    theme: "light" | "dark";
+    language: string;
+  };
+}
+
+const profileSchema = new Schema<IProfile>(
+  {
+    bio: { type: String, maxlength: 500 },
+    avatar: String,
+    website: String,
+    location: String,
+    social: {
+      twitter: String,
+      github: String,
+      linkedin: String,
+    },
+    preferences: {
+      emailNotifications: { type: Boolean, default: true },
+      theme: { type: String, enum: ["light", "dark"], default: "light" },
+      language: { type: String, default: "zh-CN" },
+    },
+  },
+  { _id: false }
+);
+
+// 用户主文档
+interface IUser extends Document {
+  name: string;
+  email: string;
+  password?: string;
+  role: "user" | "author" | "admin";
+  isActive: boolean;
+  profile: IProfile; // 嵌入式：一对一关系
+}
+
+const userSchema = new Schema<IUser>({
+  name: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  email: {
+    type: String,
+    required: true,
+    unique: true,
+    lowercase: true,
+  },
+  password: {
+    type: String,
+    select: false,
+  },
+  role: {
+    type: String,
+    enum: ["user", "author", "admin"],
+    default: "user",
+  },
+  isActive: {
+    type: Boolean,
+    default: true,
+  },
+  profile: {
+    type: profileSchema,
+    default: () => ({}),
+  },
+});
+
+const User = mongoose.model<IUser>("User", userSchema);
+
+export default User;
+```
+
+**使用示例**：
+
+```typescript
+// 创建用户（包含资料）
+const user = await User.create({
+  name: "张三",
+  email: "zhangsan@example.com",
+  password: "hashedpassword",
+  profile: {
+    bio: "全栈开发者",
+    avatar: "https://example.com/avatar.jpg",
+    location: "北京",
+    social: {
+      github: "https://github.com/zhangsan",
+      twitter: "https://twitter.com/zhangsan",
+    },
+    preferences: {
+      theme: "dark",
+      language: "zh-CN",
+    },
+  },
+});
+
+// 查询时自动包含资料
+const foundUser = await User.findById(user.id);
+console.log(foundUser.profile.bio); // 一次查询获取所有数据
+
+// 更新资料
+await User.findByIdAndUpdate(user.id, {
+  "profile.bio": "更新的个人简介",
+  "profile.preferences.theme": "light",
+});
+```
+
+### 一对多关系：文章与评论
+
+创建 `src/models/Post.ts`：
+
+```typescript
+import mongoose, { Schema, Model, Document } from "mongoose";
+
+// 评论嵌入文档（适合少量评论）
+interface IComment {
+  content: string;
+  author: mongoose.Types.ObjectId;
+  authorName?: string;
+  authorAvatar?: string;
+  createdAt: Date;
+  updatedAt: Date;
+  likes: number;
+  replies?: IComment[];
+}
+
+const commentSchema = new Schema<IComment>(
+  {
+    content: {
+      type: String,
+      required: true,
+      minlength: 1,
+      maxlength: 1000,
+    },
+    author: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    authorName: String,
+    authorAvatar: String,
+    createdAt: {
+      type: Date,
+      default: Date.now,
+    },
+    updatedAt: {
+      type: Date,
+      default: Date.now,
+    },
+    likes: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    replies: [commentSchema], // 嵌套评论（回复）
+  },
+  { timestamps: true }
+);
+
+// 文章文档
+interface IPost extends Document {
+  title: string;
+  content: string;
+  author: mongoose.Types.ObjectId; // 引用式：指向用户
+  status: "draft" | "published" | "archived";
+  comments: IComment[]; // 嵌入式：少量评论
+  tags: string[];
+  views: number;
+}
+
+const postSchema = new Schema<IPost>({
+  title: {
+    type: String,
+    required: true,
+    trim: true,
+  },
+  content: {
+    type: String,
+    required: true,
+  },
+  author: {
+    type: Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+    index: true,
+  },
+  status: {
+    type: String,
+    enum: ["draft", "published", "archived"],
+    default: "draft",
+  },
+  comments: [commentSchema], // 嵌入评论数组
+  tags: [String],
+  views: {
+    type: Number,
+    default: 0,
+  },
+});
+
+const Post = mongoose.model<IPost>("Post", postSchema);
+
+export default Post;
+```
+
+**使用示例**：
+
+```typescript
+// 创建文章
+const post = await Post.create({
+  title: "Mongoose 入门教程",
+  content: "详细内容...",
+  author: userId,
+  tags: ["mongodb", "nodejs"],
+});
+
+// 添加评论（嵌入）
+const updatedPost = await Post.findByIdAndUpdate(
+  post.id,
+  {
+    $push: {
+      comments: {
+        content: "很棒的文章！",
+        author: commentUserId,
+        authorName: "李四",
+        authorAvatar: "avatar.jpg",
+      },
+    },
+  },
+  { new: true }
+);
+
+// 查询文章时包含评论
+const foundPost = await Post.findById(post.id)
+  .populate("author", "name avatar")
+  .populate("comments.author", "name avatar");
+
+console.log(foundPost.title);
+console.log(foundPost.author.name); // 通过 populate 获取作者信息
+console.log(foundPost.comments[0].content); // 直接获取评论（嵌入）
+console.log(foundPost.comments[0].authorName); // 评论作者的快照
+```
+
+### 多对多关系：文章与标签
+
+创建 `src/models/Tag.ts`：
+
+```typescript
+import mongoose, { Schema, Model, Document } from "mongoose";
+
+interface ITag extends Document {
+  name: string;
+  slug: string;
+  description?: string;
+  postCount: number;
+  color?: string;
+}
+
+const tagSchema = new Schema<ITag>({
+  name: {
+    type: String,
+    required: true,
+    unique: true,
+    trim: true,
+  },
+  slug: {
+    type: String,
+    unique: true,
+    lowercase: true,
+    trim: true,
+  },
+  description: String,
+  postCount: {
+    type: Number,
+    default: 0,
+  },
+  color: {
+    type: String,
+    default: "#3B82F6",
+  },
+});
+
+tagSchema.pre("save", function (next) {
+  // 自动生成 slug
+  if (!this.slug) {
+    this.slug = this.name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "");
+  }
+  next();
+});
+
+tagSchema.virtual("posts", {
+  ref: "Post",
+  localField: "_id",
+  foreignField: "tags",
+});
+
+const Tag = mongoose.model<ITag>("Tag", tagSchema);
+
+export default Tag;
+```
+
+**更新 Post Schema**：
+
+```typescript
+// 在 postSchema 中添加
+postSchema.virtual("tagObjects", {
+  ref: "Tag",
+  localField: "tags",
+  foreignField: "name",
+});
+```
+
+**使用示例**：
+
+```typescript
+// 创建标签
+const mongoTag = await Tag.create({
+  name: "MongoDB",
+  description: "MongoDB 相关文章",
+  color: "#47A992",
+});
+
+const nodeTag = await Tag.create({
+  name: "Node.js",
+  description: "Node.js 相关文章",
+  color: "#68A063",
+});
+
+// 创建文章（使用标签名）
+const post = await Post.create({
+  title: "Node.js 操作 MongoDB",
+  content: "...",
+  author: userId,
+  tags: ["MongoDB", "Node.js"], // 存储标签名
+});
+
+// 查询文章并 populate 标签
+const foundPost = await Post.findById(post.id).populate(
+  "tagObjects",
+  "name slug color"
+);
+
+console.log(foundPost.title);
+foundPost.tagObjects.forEach((tag: any) => {
+  console.log(`  标签: ${tag.name} (${tag.slug})`);
+});
+
+// 查询标签并 populate 文章
+const tag = await Tag.findOne({ name: "MongoDB" }).populate(
+  "posts",
+  "title status"
+);
+
+console.log(`\n标签: ${tag.name}`);
+console.log(`文章数: ${tag.postCount}`);
+tag.posts.forEach((post: any) => {
+  console.log(`  - ${post.title}`);
+});
+```
+
+### 反向关系设计
+
+**在 User Schema 中添加虚拟字段**：
+
+```typescript
+userSchema.virtual("posts", {
+  ref: "Post",
+  localField: "_id",
+  foreignField: "author",
+  count: true, // 只返回数量
+});
+
+userSchema.virtual("publishedPosts", {
+  ref: "Post",
+  localField: "_id",
+  foreignField: "author",
+  match: { status: "published" }, // 过滤条件
+});
+```
+
+**使用示例**：
+
+```typescript
+// 查询用户及其文章
+const user = await User.findById(userId)
+  .populate("posts", "title status views")
+  .populate("publishedPosts", "title");
+
+console.log(`用户: ${user.name}`);
+console.log(`总文章数: ${user.posts.length}`);
+user.posts.forEach((post: any) => {
+  console.log(`  - ${post.title} (${post.status})`);
+});
+
+// 使用 populate 选项
+const userWithLimit = await User.findById(userId).populate({
+  path: "posts",
+  select: "title views createdAt",
+  options: { limit: 10 }, // 限制数量
+  match: { status: "published" }, // 过滤条件
+});
+```
+
+## 建模决策示例
+
+### 场景 1：博客文章与评论
+
+**决策**：文章 → 评论（1:N），使用嵌入
+
+```typescript
+// ✅ 正确：嵌入评论
+const postSchema = new Schema({
+  title: String,
+  content: String,
+  comments: [
+    {
+      content: String,
+      author: ObjectId,
+      createdAt: Date,
+    },
+  ],
+});
+
+// 原因：
+// - 评论数量通常较少（<100）
+// - 总是和文章一起显示
+// - 评论很少单独查询
+```
+
+### 场景 2：电商订单与商品
+
+**决策**：订单 → 商品（N:M），使用引用
+
+```typescript
+// ✅ 正确：引用商品
+const orderSchema = new Schema({
+  customer: ObjectId,
+  items: [
+    {
+      product: { type: ObjectId, ref: "Product" },
+      quantity: Number,
+      price: Number,
+    },
+  ],
+  totalAmount: Number,
+});
+
+// 原因：
+// - 商品信息独立变化
+// - 商品可能出现在多个订单中
+// - 需要单独查询商品信息
+```
+
+### 场景 3：用户与关注者
+
+**决策**：使用双向引用
+
+```typescript
+// User Schema
+const userSchema = new Schema({
+  name: String,
+  following: [{ type: ObjectId, ref: "User" }], // 我关注的人
+  followers: [{ type: ObjectId, ref: "User" }], // 关注我的人
+});
+
+// 使用 $addToSet 和 $pull
+await User.findByIdAndUpdate(userId, {
+  $addToSet: { following: targetUserId },
+});
+
+await User.findByIdAndUpdate(targetUserId, {
+  $addToSet: { followers: userId },
+});
+```
+
+## 最佳实践
+
+### 1. 嵌入式使用场景
+
+```typescript
+// ✅ 适合嵌入：
+- 一对一关系（用户资料）
+- 一对少（文章评论 <100）
+- 数据几乎一起访问
+- 数据不常变化
+
+// ❌ 不适合嵌入：
+- 一对多（文章太多）
+- 大数据（超过1MB）
+- 频繁变化
+- 需要独立查询
+```
+
+### 2. 引用式使用场景
+
+```typescript
+// ✅ 适合引用：
+- 一对多（用户→文章）
+- 多对多（文章↔标签）
+- 需要单独查询
+- 数据独立变化
+
+// ⚠️ 注意：
+- 使用 populate 避免 N+1 查询
+- 考虑使用聚合管道
+```
+
+### 3. 混合建模策略
+
+```typescript
+// 文章作者：引用
+// 文章评论：嵌入
+// 文章标签：双向引用
+
+const postSchema = new Schema({
+  title: String,
+  author: { type: ObjectId, ref: "User" }, // 引用
+  comments: [
+    {
+      // 嵌入
+      content: String,
+      author: { type: ObjectId, ref: "User" },
+    },
+  ],
+  tags: [String], // 引用 Tag 的 name
+});
+```
+
+## 常见问题
+
+### Q1: 嵌入式文档有大小限制吗？
+
+**A**:
+
+- BSON 文档最大 16MB
+- 实际建议 < 1MB（性能考虑）
+- 大数据应拆分为多个文档
+
+### Q2: Populate 是真 join 吗？
+
+**A**:
+
+- ❌ 不是真正的 SQL join
+- ✅ 应用层 join（多次查询）
+- ⚠️ 注意 N+1 查询问题
+
+### Q3: 如何选择建模方式？
+
+**A**:
+
+```
+1. 访问模式：数据总是一起访问吗？
+   → 是 → 嵌入
+   → 否 → 引用
+
+2. 数据量：数据量小吗？
+   → 是 (<100) → 嵌入
+   → 否 (≥100) → 引用
+
+3. 数据变化：数据独立变化吗？
+   → 是 → 引用
+   → 否 → 嵌入
+```
+
+## 总结
+
+本文深入理解了 NoSQL 数据建模：
+
+1. ✅ 嵌入式 vs 引用式的优缺点
+2. ✅ 一对一、一对多、多对多关系设计
+3. ✅ Populate 的使用和限制
+4. ✅ 反向关系设计
+5. ✅ 建模决策最佳实践
+
+## 下一步
+
+下一篇文章将学习 **高级查询与聚合**，深入探讨：
+
+- Aggregation Pipeline
+- $lookup 关联查询
+- $facet 多 facet 聚合
+- 复杂的数据统计
+
+---
+
+- **上一篇**：[04 查询构建器与筛选](../04-query-building.mdx)
+- **下一篇**：[06 高级查询与聚合](../06-advanced-query.mdx)

@@ -1,0 +1,700 @@
+---
+title: "03. 开发服务器深入：掌握 Vite 开发环境的高级特性"
+date: "2025-03-23"
+summary: "深入理解 Vite 开发服务器的工作机制，掌握代理配置、HMR 高级用法、调试技巧和性能优化。"
+tags: ["Vite", "开发服务器", "HMR", "代理", "调试"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 深入实战"
+seriesOrder: 3
+---
+
+## 前言
+
+Vite 开发服务器是其最强大的特性之一。本文将深入探讨开发服务器的内部机制、高级配置和调试技巧，帮助你充分利用 Vite 的开发体验。
+
+## 开发服务器架构
+
+### 核心组件
+
+```
+Vite Dev Server
+    ↓
+┌─────────────────────────────────┐
+│  Connect 中间件系统              │
+│  ├─ HMR 中间件                  │
+│  ├─ 转换中间件                  │
+│  ├─ 静态资源中间件              │
+│  ├─ 代理中间件                  │
+│  └─ 索引 HTML 中间件            │
+└─────────────────────────────────┘
+    ↓
+┌─────────────────────────────────┐
+│  插件系统                        │
+│  ├─ transform 钩子              │
+│  ├─ configureServer 钩子        │
+│  └─ handleHotUpdate 钩子        │
+└─────────────────────────────────┘
+```
+
+### 请求处理流程
+
+```
+浏览器请求 /src/App.tsx
+    ↓
+Vite 接收请求
+    ↓
+判断请求类型
+    ├─ /@fs/...      → 文件系统请求
+    ├─ /@vite/...    → Vite 内部模块
+    ├─ /node_modules/ → 预构建依赖
+    └─ 源码文件       → 按需编译
+    ↓
+esbuild 转换（如果是 TS/JSX）
+    ↓
+返回 ESM 格式代码
+    ↓
+浏览器执行并建立 HMR 连接
+```
+
+## 服务器配置详解
+
+### 基础配置
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    // 监听地址
+    host: "0.0.0.0", // 监听所有地址
+    port: 3000, // 端口号
+    strictPort: false, // 端口被占用时自动尝试下一个
+
+    // 自动打开浏览器
+    open: true,
+    open: "/docs", // 打开指定路径
+
+    // CORS
+    cors: true,
+
+    // HTTPS
+    https: false,
+
+    // 监听文件变化
+    watch: {
+      usePolling: false, // 轮询（WSL/docker 环境）
+      interval: 100, // 轮询间隔
+      ignored: ["**/node_modules/**", "**/.git/**"],
+    },
+  },
+});
+```
+
+### HTTPS 配置
+
+```typescript
+import fs from "fs";
+
+export default defineConfig({
+  server: {
+    https: {
+      key: fs.readFileSync("./certs/key.pem"),
+      cert: fs.readFileSync("./certs/cert.pem"),
+      ca: fs.readFileSync("./certs/ca.pem"),
+    },
+  },
+});
+```
+
+### 自动重载配置
+
+```typescript
+export default defineConfig({
+  server: {
+    // 配置文件变化时自动重启服务器
+    watch: {
+      ignored: ["!**/node_modules/@vite/**"],
+    },
+  },
+});
+```
+
+## 代理配置
+
+### 基础代理
+
+```typescript
+export default defineConfig({
+  server: {
+    proxy: {
+      // 字符串简写
+      "/api": "http://localhost:8080",
+
+      // 对象配置
+      "/api": {
+        target: "http://localhost:8080",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ""),
+      },
+    },
+  },
+});
+```
+
+### 高级代理配置
+
+```typescript
+export default defineConfig({
+  server: {
+    proxy: {
+      // 多个代理
+      "/api": {
+        target: "http://localhost:8080",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, "/v1"),
+      },
+
+      "/auth": {
+        target: "https://auth.example.com",
+        changeOrigin: true,
+        secure: false, // 不验证 SSL 证书
+        ws: true, // 代理 WebSocket
+      },
+
+      // 正则表达式匹配
+      "^/fallback/.*": {
+        target: "http://jsonplaceholder.typicode.com",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/fallback/, ""),
+      },
+    },
+  },
+});
+```
+
+### 代理中间件
+
+```typescript
+import { defineConfig } from "vite";
+import proxy from "http-proxy-middleware";
+
+export default defineConfig({
+  server: {
+    proxy: {
+      "/api": {
+        target: "http://localhost:8080",
+        configure: (proxy, options) => {
+          // 自定义代理处理
+          proxy.on("proxyReq", (proxyReq, req, res) => {
+            console.log("[Proxy]", req.method, req.url);
+
+            // 添加请求头
+            proxyReq.setHeader("X-Custom-Header", "value");
+          });
+
+          proxy.on("proxyRes", (proxyRes, req, res) => {
+            console.log("[Proxy Response]", proxyRes.statusCode);
+
+            // 修改响应头
+            proxyRes.headers["X-Added-Header"] = "value";
+          });
+
+          proxy.on("error", (err, req, res) => {
+            console.error("[Proxy Error]", err);
+
+            res.statusCode = 500;
+            res.end("Proxy Error");
+          });
+        },
+      },
+    },
+  },
+});
+```
+
+### Mock 数据集成
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    proxy: {
+      "/api": {
+        target: "http://localhost:8080",
+        changeOrigin: true,
+
+        // 开发环境使用 Mock
+        bypass: (req, res, options) => {
+          if (process.env.MOCK === "true") {
+            const mock = getMockData(req.url);
+
+            if (mock) {
+              res.setHeader("Content-Type", "application/json");
+              res.end(JSON.stringify(mock));
+              return false; // 不转发到真实服务器
+            }
+          }
+        },
+      },
+    },
+  },
+});
+
+// mock 数据
+function getMockData(url: string) {
+  const mocks: Record<string, any> = {
+    "/api/users": [{ id: 1, name: "Alice" }],
+    "/api/posts": [{ id: 1, title: "Hello" }],
+  };
+
+  return mocks[url];
+}
+```
+
+## HMR 深入
+
+### HMR API
+
+```typescript
+// src/main.tsx
+if (import.meta.hot) {
+  // 接受当前模块的更新
+  import.meta.hot.accept((newModule) => {
+    console.log("Module updated:", newModule);
+  });
+
+  // 接受依赖模块的更新
+  import.meta.hot.accept("./helpers", (newHelpers) => {
+    console.log("Helpers updated:", newHelpers);
+  });
+
+  // 销毁回调
+  import.meta.hot.dispose((data) => {
+    // 清理副作用
+    console.log("Disposing module");
+  });
+
+  // 发生错误时的回调
+  import.meta.hot.accept((err) => {
+    console.error("HMR error:", err);
+
+    // 可以选择刷新页面
+    window.location.reload();
+  });
+}
+```
+
+### React Fast Refresh
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  plugins: [
+    react({
+      // 启用 Fast Refresh
+      babel: {
+        plugins: ["react-refresh/babel"],
+      },
+    }),
+  ],
+});
+```
+
+### 组件级 HMR
+
+```typescript
+// src/components/MyComponent.tsx
+import { useEffect, useState } from "react";
+
+if (import.meta.hot) {
+  // 保存组件状态
+  const savedState = new WeakMap();
+
+  import.meta.hot.accept((newModule) => {
+    // 恢复状态
+    console.log("Component updated with state preserved");
+  });
+
+  import.meta.hot.dispose((data) => {
+    // 保存状态到 data
+    // 可以在 accept 中恢复
+  });
+}
+```
+
+### 自定义 HMR 处理
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  plugins: [
+    {
+      name: "custom-hmr",
+      handleHotUpdate({ file, server, modules }) {
+        // 自定义 HMR 处理逻辑
+
+        if (file.endsWith(".custom")) {
+          server.ws.send({
+            type: "custom",
+            event: "custom-update",
+            data: { file },
+          });
+
+          // 返回空数组阻止默认 HMR
+          return [];
+        }
+
+        // 返回模块列表让 Vite 处理
+        return modules;
+      },
+    },
+  ],
+});
+```
+
+### HMR 错误处理
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    hmr: {
+      // HMR 覆盖层
+      overlay: true,
+    },
+  },
+});
+
+// 自定义错误处理
+if (import.meta.hot) {
+  import.meta.hot.on("vite:error", (err) => {
+    console.error("HMR Error:", err);
+
+    // 上报错误
+    reportError(err);
+  });
+}
+```
+
+## 开发工具集成
+
+### React DevTools
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  define: {
+    // 启用 React DevTools
+    __REACT_DEVTOOLS_GLOBAL_HOOK__: "true",
+  },
+});
+```
+
+### Vue DevTools
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  plugins: [
+    vue({
+      template: {
+        compilerOptions: {
+          // 启用 DevTools
+          isCustomElement: (tag) => tag.includes("-"),
+        },
+      },
+    }),
+  ],
+});
+```
+
+### Source Map 配置
+
+```typescript
+export default defineConfig({
+  server: {
+    // 开发环境使用 eval-source-map（最快）
+    hmr: {
+      protocol: "ws",
+      host: "localhost",
+    },
+  },
+
+  build: {
+    // 开发环境
+    sourcemap: true, // inline-source-map
+
+    // 生产环境（可选）
+    sourcemap: false, // 不生成 sourcemap
+  },
+});
+```
+
+## 性能优化
+
+### 减少文件监听
+
+```typescript
+export default defineConfig({
+  server: {
+    watch: {
+      // 忽略不必要的文件
+      ignored: [
+        "**/node_modules/**",
+        "**/.git/**",
+        "**/dist/**",
+        "**/build/**",
+        "**/.vscode/**",
+        "**/.idea/**",
+      ],
+    },
+  },
+});
+```
+
+### 优化预构建
+
+```typescript
+export default defineConfig({
+  optimizeDeps: {
+    // 只预构建大型依赖
+    include: ["react", "react-dom", "react-router-dom", "lodash", "axios"],
+
+    // 排除小型 ESM 包
+    exclude: ["tiny-esm-package"],
+
+    // 强制重新预构建（开发时）
+    // force: true
+  },
+});
+```
+
+### 禁用不必要的功能
+
+```typescript
+export default defineConfig({
+  server: {
+    // 禁用 HMR（某些场景）
+    hmr: false,
+
+    // 禁用文件监听
+    watch: null,
+  },
+});
+```
+
+## 调试技巧
+
+### 服务器日志
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  plugins: [
+    {
+      name: "debug-plugin",
+      configureServer(server) {
+        // 服务器启动时的日志
+        server.httpServer?.once("listening", () => {
+          console.log("Server started!");
+
+          // 获取实际监听的端口
+          const address = server.httpServer?.address();
+          console.log("Address:", address);
+        });
+
+        // 请求日志
+        server.middlewares.use((req, res, next) => {
+          console.log(`[${req.method}] ${req.url}`);
+          next();
+        });
+      },
+    },
+  ],
+});
+```
+
+### Vite 调试模式
+
+```bash
+# 启用 Vite 调试日志
+DEBUG=vite:* npm run dev
+
+# 只查看特定模块的日志
+DEBUG=vite:deps npm run dev
+DEBUG=vite:hmr npm run dev
+```
+
+### 插件调试
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  plugins: [
+    {
+      name: "debug-plugin",
+      configureServer(server) {
+        // 打印配置
+        console.log("Vite config:", server.config);
+
+        // 打印插件列表
+        console.log("Plugins:", server.config.plugins);
+      },
+
+      transform(code, id) {
+        // 打印转换信息
+        if (id.includes("debug-me")) {
+          console.log("Transforming:", id);
+          console.log("Code:", code);
+        }
+
+        return null; // 不修改代码
+      },
+    },
+  ],
+});
+```
+
+## 多环境开发
+
+### 环境切换
+
+```bash
+# 开发环境
+npm run dev
+
+# 预发布环境
+npm run dev:staging
+
+# 自定义环境
+npm run dev -- --mode custom
+```
+
+### 环境配置
+
+```typescript
+// vite.config.ts
+export default defineConfig(({ mode }) => {
+  const isDev = mode === "development";
+  const isStaging = mode === "staging";
+
+  return {
+    server: {
+      port: isStaging ? 3001 : 3000,
+      proxy: {
+        "/api": {
+          target: isDev
+            ? "http://localhost:8080"
+            : "https://staging-api.example.com",
+        },
+      },
+    },
+  };
+});
+```
+
+## 最佳实践
+
+### 1. 开发/生产一致性
+
+```typescript
+// 使用环境变量保持配置一致
+export default defineConfig({
+  server: {
+    proxy: {
+      "/api": {
+        target: import.meta.env.VITE_API_URL,
+        changeOrigin: true,
+      },
+    },
+  },
+});
+```
+
+### 2. 错误处理
+
+```typescript
+export default defineConfig({
+  server: {
+    // HMR 错误覆盖
+    hmr: {
+      overlay: true,
+    },
+  },
+});
+```
+
+### 3. 安全配置
+
+```typescript
+export default defineConfig({
+  server: {
+    // 限制访问
+    host: "localhost", // 不使用 0.0.0.0
+
+    // HTTPS
+    https: {
+      key: fs.readFileSync("./certs/key.pem"),
+      cert: fs.readFileSync("./certs/cert.pem"),
+    },
+  },
+});
+```
+
+## 常见问题
+
+### Q1: HMR 不工作？
+
+A: 检查以下几点：
+
+1. 确保浏览器支持 WebSocket
+2. 检查防火墙是否阻止了 WebSocket
+3. 查看 HMR 日志：`DEBUG=vite:hmr npm run dev`
+
+### Q2: 代理 404？
+
+A: 检查代理配置：
+
+```typescript
+proxy: {
+  '/api': {
+    target: 'http://localhost:8080',
+    changeOrigin: true,  // 必须设置
+    rewrite: (path) => path.replace(/^\/api/, '')
+  }
+}
+```
+
+### Q3: 如何在 Docker 中使用？
+
+A: 使用轮询模式：
+
+```typescript
+server: {
+  watch: {
+    usePolling: true,
+    interval: 100
+  },
+  host: '0.0.0.0'
+}
+```
+
+## 总结
+
+Vite 开发服务器要点：
+
+1. **架构**：基于 Connect 的中间件系统
+2. **代理**：灵活的 API 代理配置
+3. **HMR**：精确的模块级热更新
+4. **调试**：丰富的调试工具和日志
+5. **性能**：按需编译和智能缓存
+
+## 下一步
+
+掌握了开发服务器，下一步我们将深入生产构建优化。
+
+---
+
+- **上一篇**：[02. 项目初始化与配置详解](./02-vite-project-setup)
+- **下一篇**：[04. 生产构建优化](./04-vite-build-optimization)

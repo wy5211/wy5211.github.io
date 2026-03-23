@@ -2,14 +2,9 @@
 // key 是文章 frontmatter 中的 category 值
 // value 是实际的目录名
 export const categoryToDirMap: Record<string, string> = {
-  前端: "前端",
   后端: "后端",
   nestjs: "nestjs",
-  全栈: "全栈",
-  测试: "测试",
   运维: "运维",
-  大模型: "大模型",
-  提效工具: "提效工具",
   数据库: "database",
   "claude-code": "claude-code",
   java: "java",
@@ -17,18 +12,19 @@ export const categoryToDirMap: Record<string, string> = {
   prisma: "prisma",
   mysql: "mysql",
   docker: "docker",
+  nextjs: "nextjs",
+  golang: "golang",
+  mongoose: "mongoose",
+  typescript: "typescript",
+  redis: "redis",
+  mybatis: "mybatis",
 };
 
 // 目录名到中文分类名的反向映射
 export const dirToCategoryMap: Record<string, string> = {
-  前端: "前端",
   后端: "后端",
   nestjs: "nestjs",
-  全栈: "全栈",
-  测试: "测试",
   运维: "运维",
-  大模型: "大模型",
-  提效工具: "提效工具",
   database: "数据库",
   "claude-code": "claude-code",
   java: "java",
@@ -36,4 +32,10 @@ export const dirToCategoryMap: Record<string, string> = {
   prisma: "prisma",
   mysql: "mysql",
   docker: "docker",
+  nextjs: "nextjs",
+  golang: "golang",
+  mongoose: "mongoose",
+  typescript: "typescript",
+  redis: "redis",
+  mybatis: "mybatis",
 };

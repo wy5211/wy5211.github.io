@@ -1,0 +1,931 @@
+---
+title: "03. Redis 五大数据类型概览：选择合适的数据结构"
+date: "2026-03-23"
+summary: "深入理解 Redis 五大数据类型的特点、使用场景和底层实现，学会选择合适的数据结构解决问题。"
+tags: ["Redis", "数据类型"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 3
+---
+
+## 前言
+
+Redis 之所以强大，不仅因为它的速度快，更因为它提供了**丰富的数据结构**。不同的数据结构适用于不同的场景，选择正确的数据结构可以让你的代码更简洁、性能更高。
+
+很多开发者只把 Redis 当作简单的键值存储，用来缓存字符串数据。这就像是买了一把瑞士军刀，却只用它来切苹果——浪费了它 90% 的功能！
+
+在本文中，我们将：
+
+- 🎯 全面了解 Redis 的五种核心数据类型
+- 📊 学习每种数据类型的底层实现原理
+- 💡 掌握不同场景下的数据结构选择技巧
+- 🔍 对比各数据类型的性能特点
+- 🛠️ 通过实际案例理解最佳实践
+
+---
+
+## 数据类型总览
+
+Redis 提供了五种核心数据类型：
+
+| 数据类型       | 底层实现              | 主要特点                   | 典型场景                   |
+| -------------- | --------------------- | -------------------------- | -------------------------- |
+| **String**     | SDS（简单动态字符串） | 二进制安全、可存储任意数据 | 缓存、计数器、分布式锁     |
+| **Hash**       | 哈希表 + 压缩列表     | 键值对集合、适合存储对象   | 用户信息、购物车、Session  |
+| **List**       | 双向链表 + 快速列表   | 有序、可重复               | 消息队列、最新列表、栈     |
+| **Set**        | 哈希表 + 整数集合     | 无序、唯一、支持集合运算   | 标签、关注系统、共同好友   |
+| **Sorted Set** | 跳表 + 哈希表         | 有序、唯一、按分数排序     | 排行榜、延时队列、范围查询 |
+
+**选择决策树**：
+
+```
+需要存储对象？
+├─ 是 → Hash
+└─ 否 → 需要排序？
+        ├─ 是 → Sorted Set
+        └─ 否 → 需要去重？
+                ├─ 是 → Set
+                └─ 否 → 需要按顺序？
+                        ├─ 是 → List
+                        └─ 否 → String
+```
+
+---
+
+## String 类型
+
+### 概述
+
+String 是 Redis 最基本的数据类型，可以存储任何形式的字符串，包括二进制数据。一个 String 类型的值最大能存储 **512MB**。
+
+### 底层实现
+
+String 的底层实现是 **SDS（Simple Dynamic String）**，相比于 C 字符串，SDS 有以下优势：
+
+```c
+struct sdshdr {
+    int len;        // 字符串长度
+    int free;       // 未使用空间
+    char buf[];     // 字节数组
+};
+```
+
+**优势**：
+
+- **O(1) 时间复杂度获取长度**：不需要遍历
+- **防止缓冲区溢出**：扩容前检查空间
+- **减少内存分配**：空间预分配和惰性释放
+- **二进制安全**：可以存储任意二进制数据
+
+### 常用命令
+
+```bash
+# 基础操作
+SET key value
+GET key
+MSET key1 value1 key2 value2
+MGET key1 key2
+
+# 过期时间
+SETEX key 3600 value
+SET key value EX 3600
+
+# 条件设置
+SETNX key value    # 仅当 key 不存在时设置
+
+# 数值操作
+INCR key
+INCRBY key increment
+DECR key
+DECRBY key decrement
+INCRBYFLOAT key increment
+```
+
+### 适用场景
+
+#### 场景 1：缓存
+
+```typescript
+// 缓存用户信息
+await redis.setex(`user:${userId}`, 3600, JSON.stringify(userData));
+
+// 读取缓存
+const cached = await redis.get(`user:${userId}`);
+if (cached) {
+  return JSON.parse(cached);
+}
+
+// 缓存未命中，查询数据库...
+```
+
+#### 场景 2：计数器
+
+```typescript
+// 文章浏览次数
+await redis.incr(`article:articleId:views`);
+
+// 限流（每分钟限制 100 次请求）
+const key = `limit:${userId}:${minute}`;
+const count = await redis.incr(key);
+if (count === 1) {
+  await redis.expire(key, 60);
+}
+if (count > 100) {
+  throw new Error("请求过于频繁");
+}
+```
+
+#### 场景 3：分布式锁
+
+```typescript
+// 获取锁
+const lock = await redis.set(`lock:resource`, "unique_id", "NX", "EX", 30);
+if (lock === "OK") {
+  try {
+    // 执行业务逻辑
+  } finally {
+    // 释放锁（使用 Lua 脚本保证原子性）
+    await redis.eval(
+      `if redis.call("get", KEYS[1]) == ARGV[1] then return redis.call("del", KEYS[1]) else return 0 end`,
+      1,
+      `lock:resource`,
+      "unique_id"
+    );
+  }
+}
+```
+
+### 性能特点
+
+| 操作      | 时间复杂度 |
+| --------- | ---------- |
+| SET/GET   | O(1)       |
+| MSET/MGET | O(N)       |
+| INCR/DECR | O(1)       |
+| APPEND    | O(1)       |
+| STRLEN    | O(1)       |
+
+### 最佳实践
+
+✅ **使用合理的前缀组织键**
+
+```typescript
+// ✅ 好的命名
+"user:123:profile";
+"cache:product:456";
+"counter:article:789:views";
+
+// ❌ 避免的命名
+"user123profile";
+"user-123-profile";
+```
+
+✅ **设置过期时间防止内存泄漏**
+
+```typescript
+await redis.setex(key, 3600, value); // 推荐方式
+// 或
+await redis.set(key, value, "EX", 3600);
+```
+
+❌ **避免存储过大的值**
+
+```typescript
+// ❌ 避免：单个值过大
+await redis.set("big_data", hugeObject); // 可能达到 512MB 限制
+
+// ✅ 推荐：拆分为多个键
+for (let i = 0; i < chunks.length; i++) {
+  await redis.set(`big_data:${i}`, chunks[i]);
+}
+```
+
+---
+
+## Hash 类型
+
+### 概述
+
+Hash 是一个键值对集合，特别适合存储对象。每个 Hash 可以存储 **2³² - 1** 个键值对（约 40 亿）。
+
+### 底层实现
+
+Hash 的底层实现有两种编码方式：
+
+1. **ziplist（压缩列表）**：当键值对数量少且值小时使用
+   - 节省内存
+   - 连续内存存储
+
+2. **hashtable（哈希表）**：当数据量大或值大时使用
+   - 查找效率 O(1)
+   - 内存占用稍高
+
+**转换条件**：
+
+- hash-max-ziplist-entries：默认 512
+- hash-max-ziplist-value：默认 64 字节
+
+### 常用命令
+
+```bash
+# 单字段操作
+HSET key field value
+HGET key field
+HDEL key field
+
+# 多字段操作
+HMSET key field1 value1 field2 value2
+HMGET key field1 field2
+HGETALL key
+
+# 字段判断
+HEXISTS key field
+HKEYS key
+HVALS key
+HLEN key
+
+# 数值操作
+HINCRBY key field increment
+HINCRBYFLOAT key field increment
+```
+
+### 适用场景
+
+#### 场景 1：存储对象
+
+```typescript
+// 用户信息
+await redis.hset(`user:${userId}`, {
+  name: "张三",
+  email: "zhangsan@example.com",
+  age: "25",
+  city: "北京",
+});
+
+// 获取单个字段
+const name = await redis.hget(`user:${userId}`, "name");
+
+// 获取多个字段
+const user = await redis.hmget(`user:${userId}`, "name", "email", "age");
+
+// 获取所有字段
+const allFields = await redis.hgetall(`user:${userId}`);
+```
+
+#### 场景 2：购物车
+
+```typescript
+// 添加商品到购物车
+await redis.hset(`cart:${userId}`, `product:${productId}`, quantity);
+
+// 增加商品数量
+await redis.hincrby(`cart:${userId}`, `product:${productId}`, 1);
+
+// 查看购物车
+const cart = await redis.hgetall(`cart:${userId}`);
+
+// 删除商品
+await redis.hdel(`cart:${userId}`, `product:${productId}`);
+```
+
+#### 场景 3：Session 存储
+
+```typescript
+// 存储 Session
+await redis.hset(`session:${sessionId}`, {
+  userId: "123",
+  createdAt: Date.now().toString(),
+  lastActivity: Date.now().toString(),
+  data: JSON.stringify(sessionData),
+});
+await redis.expire(`session:${sessionId}`, 3600);
+
+// 更新活动时间
+await redis.hset(`session:${sessionId}`, "lastActivity", Date.now().toString());
+
+// 获取 Session
+const session = await redis.hgetall(`session:${sessionId}`);
+```
+
+### 性能特点
+
+| 操作      | 时间复杂度 |
+| --------- | ---------- |
+| HSET/HGET | O(1)       |
+| HMGET     | O(N)       |
+| HGETALL   | O(N)       |
+| HINCRBY   | O(1)       |
+
+### 最佳实践
+
+✅ **Hash vs String 存储对象**
+
+```typescript
+// ✅ Hash 方式（推荐）
+await redis.hset("user:123", "name", "张三");
+await redis.hset("user:123", "age", "25");
+await redis.hset("user:123", "city", "北京");
+// 只获取需要的字段
+const name = await redis.hget("user:123", "name");
+
+// ⚠️ String 方式
+await redis.set(
+  "user:123",
+  JSON.stringify({ name: "张三", age: 25, city: "北京" })
+);
+// 需要获取整个对象
+const user = JSON.parse(await redis.get("user:123"));
+```
+
+❌ **避免使用 HGETALL 获取大 Hash**
+
+```typescript
+// ❌ 如果 Hash 有很多字段，HGETALL 会很慢
+const all = await redis.hgetall("user:123");
+
+// ✅ 只获取需要的字段
+const data = await redis.hmget("user:123", "name", "email");
+```
+
+---
+
+## List 类型
+
+### 概述
+
+List 是一个简单的字符串列表，按插入顺序排序。可以在列表的头部（左侧）或尾部（右侧）添加元素。
+
+### 底层实现
+
+List 的底层实现也有两种编码方式：
+
+1. **ziplist（压缩列表）**：元素少且值小时使用
+2. **linkedlist（双向链表）**：数据量大时使用
+3. **quicklist（快速列表）**：Redis 3.2+，结合了 ziplist 和 linkedlist 的优势
+
+### 常用命令
+
+```bash
+# 左侧操作（头插、头删）
+LPUSH key value1 value2
+LPOP key
+BLPOP key timeout
+
+# 右侧操作（尾插、尾删）
+RPUSH key value1 value2
+RPOP key
+BRPOP key timeout
+
+# 范围操作
+LRANGE key start stop
+LTRIM key start stop
+LLEN key
+
+# 索引操作
+LINDEX key index
+LSET key index value
+```
+
+### 适用场景
+
+#### 场景 1：消息队列（FIFO）
+
+```typescript
+// 生产者：推送消息到队列右侧
+await redis.rpush(
+  "queue:email",
+  JSON.stringify({
+    to: "user@example.com",
+    subject: "Hello",
+    body: "...",
+  })
+);
+
+// 消费者：从队列左侧弹出消息
+const message = await redis.blpop("queue:email", 0);
+if (message) {
+  const email = JSON.parse(message[1]);
+  // 发送邮件...
+}
+```
+
+#### 场景 2：栈（LIFO）
+
+```typescript
+// 压栈
+await redis.lpush("stack:operations", "operation1");
+await redis.lpush("stack:operations", "operation2");
+
+// 出栈
+const operation = await redis.lpop("stack:operations");
+```
+
+#### 场景 3：最新列表
+
+```typescript
+// 添加最新文章
+await redis.lpush("latest:articles", `article:${articleId}`);
+
+// 只保留最新的 10 篇
+await redis.ltrim("latest:articles", 0, 9);
+
+// 获取最新文章列表
+const articles = await redis.lrange("latest:articles", 0, 9);
+```
+
+#### 场景 4：阻塞队列
+
+```typescript
+// 生产者
+await redis.rpush("queue:tasks", JSON.stringify(task));
+
+// 消费者（阻塞式，超时时间 5 秒）
+const result = await redis.brpop("queue:tasks", 5);
+if (result) {
+  const task = JSON.parse(result[1]);
+  // 处理任务...
+}
+```
+
+### 性能特点
+
+| 操作        | 时间复杂度 |
+| ----------- | ---------- |
+| LPUSH/RPUSH | O(1)       |
+| LPOP/RPOP   | O(1)       |
+| LINDEX      | O(N)       |
+| LRANGE      | O(S+N)     |
+| LINSERT     | O(N)       |
+
+### 最佳实践
+
+✅ **使用阻塞命令实现简单的消息队列**
+
+```typescript
+// ✅ 简单场景下的队列实现
+await redis.brpop("queue", 0);
+```
+
+❌ **复杂消息队列考虑使用专用工具**
+
+```typescript
+// 对于需要以下功能的场景，考虑使用 Bull/BullMQ：
+// - 任务重试
+// - 延迟任务
+// - 优先级队列
+// - 任务调度
+// - 死信队列
+```
+
+---
+
+## Set 类型
+
+### 概述
+
+Set 是一个无序的字符串集合，不允许重复元素。支持集合间的交集、并集、差集操作。
+
+### 底层实现
+
+Set 的底层实现有两种：
+
+1. **intset（整数集合）**：当所有元素都是整数且数量少时使用
+2. **hashtable（哈希表）**：元素多或有非整数时使用
+
+### 常用命令
+
+```bash
+# 元素操作
+SADD key member1 member2
+SREM key member1
+SPOP key [count]
+SRANDMEMBER key [count]
+
+# 查询操作
+SMEMBERS key
+SCARD key
+SISMEMBER key member
+
+# 集合运算
+SINTER key1 key2 ...        # 交集
+SUNION key1 key2 ...        # 并集
+SDIFF key1 key2 ...         # 差集
+
+# 运算并存储
+SINTERSTORE dest key1 key2
+SUNIONSTORE dest key1 key2
+SDIFFSTORE dest key1 key2
+```
+
+### 适用场景
+
+#### 场景 1：标签系统
+
+```typescript
+// 文章添加标签
+await redis.sadd(`post:${postId}:tags`, "redis", "database", "cache");
+
+// 获取文章的所有标签
+const tags = await redis.smembers(`post:${postId}:tags`);
+
+// 查找带有特定标签的文章
+await redis.sadd(`tag:redis:posts`, postId);
+await redis.sadd(`tag:database:posts`, postId);
+
+// 获取所有带 "redis" 标签的文章
+const posts = await redis.smembers("tag:redis:posts");
+```
+
+#### 场景 2：关注系统
+
+```typescript
+// 用户关注
+await redis.sadd(`user:${userId}:following`, targetUserId);
+await redis.sadd(`user:${targetUserId}:followers`, userId);
+
+// 获取关注列表
+const following = await redis.smembers(`user:${userId}:following`);
+
+// 获取粉丝列表
+const followers = await redis.smembers(`user:${userId}:followers`);
+
+// 检查是否关注
+const isFollowing = await redis.sismember(
+  `user:${userId}:following`,
+  targetUserId
+);
+
+// 取消关注
+await redis.srem(`user:${userId}:following`, targetUserId);
+await redis.srem(`user:${targetUserId}:followers`, userId);
+```
+
+#### 场景 3：共同好友
+
+```typescript
+// 获取两个用户的共同好友
+const commonFriends = await redis.sinter(
+  `user:${userId1}:friends`,
+  `user:${userId2}:friends`
+);
+
+// 获取用户 A 关注但用户 B 没关注的
+const diffFriends = await redis.sdiff(
+  `user:${userId1}:friends`,
+  `user:${userId2}:friends`
+);
+```
+
+#### 场景 4：抽奖系统
+
+```typescript
+// 添加参与用户
+await redis.sadd("lottery:participants", userId);
+
+// 随机抽取中奖者（从集合中随机移除）
+const winner = await redis.spop("lottery:participants");
+
+// 或者只查看不移除
+const luckyUser = await redis.srandmember("lottery:participants");
+```
+
+### 性能特点
+
+| 操作                | 时间复杂度 |
+| ------------------- | ---------- |
+| SADD/SREM           | O(1)       |
+| SISMEMBER           | O(1)       |
+| SMEMBERS            | O(N)       |
+| SINTER/SUNION/SDIFF | O(N\*M)    |
+
+### 最佳实践
+
+✅ **使用 Set 实现去重功能**
+
+```typescript
+// ✅ 自动去重
+await redis.sadd("unique:visitors", visitorId);
+const uniqueCount = await redis.scard("unique:visitors");
+```
+
+✅ **使用集合运算简化复杂查询**
+
+```typescript
+// ✅ 直接使用 SINTER 命令
+const common = await redis.sinter("set1", "set2");
+
+// ❌ 手动实现交集（效率低）
+const set1 = await redis.smembers("set1");
+const set2 = await redis.smembers("set2");
+const common = set1.filter((x) => set2.includes(x));
+```
+
+---
+
+## Sorted Set 类型
+
+### 概述
+
+Sorted Set 是一个有序的集合，每个元素关联一个分数（score）。按照分数从小到大排序，分数相同时按字典序排序。
+
+### 底层实现
+
+Sorted Set 同时使用两种数据结构：
+
+1. **skiplist（跳表）**：用于范围查询和排序，时间复杂度 O(log N)
+2. **hashtable（哈希表）**：用于成员到分数的映射，O(1) 查找
+
+### 常用命令
+
+```bash
+# 元素操作
+ZADD key score member [score member ...]
+ZREM key member [member ...]
+ZINCRBY key increment member
+
+# 查询操作
+ZSCORE key member
+ZCARD key
+ZCOUNT key min max
+
+# 范围查询
+ZRANGE key start stop [WITHSCORES]
+ZREVRANGE key start stop [WITHSCORES]
+ZRANGEBYSCORE key min max [WITHSCORES]
+ZREVRANGEBYSCORE key max min [WITHSCORES]
+
+# 排名查询
+ZRANK key member
+ZREVRANK key member
+
+# 集合运算
+ZUNIONSTORE dest numkeys key [key ...]
+ZINTERSTORE dest numkeys key [key ...]
+```
+
+### 适用场景
+
+#### 场景 1：排行榜
+
+```typescript
+// 更新用户分数
+await redis.zadd("game:leaderboard", [
+  { score: 1500, value: `player:${playerId1}` },
+  { score: 2000, value: `player:${playerId2}` },
+]);
+
+// 获取 Top 10
+const top10 = await redis.zrange("game:leaderboard", 0, 9, {
+  rev: true,
+  withScores: true,
+});
+
+// 获取用户排名
+const rank = await redis.zrevrank("game:leaderboard", `player:${playerId}`);
+
+// 增加分数
+await redis.zincrby("game:leaderboard", 100, `player:${playerId}`);
+```
+
+#### 场景 2：延时队列
+
+```typescript
+// 添加任务（使用时间戳作为分数）
+const executeTime = Math.floor(Date.now() / 1000) + 3600; // 1 小时后
+await redis.zadd("delay:queue", [
+  { score: executeTime, value: JSON.stringify(task) },
+]);
+
+// 获取到期的任务
+const now = Math.floor(Date.now() / 1000);
+const tasks = await redis.zrangebyscore("delay:queue", 0, now);
+
+// 删除已处理的任务
+await redis.zrem("delay:queue", JSON.stringify(task));
+```
+
+#### 场景 3：范围查询
+
+```typescript
+// 按分数范围查询
+const users = await redis.zrangebyscore("game:leaderboard", 1000, 2000);
+
+// 按排名范围查询
+const top100 = await redis.zrange("game:leaderboard", 0, 99, {
+  withScores: true,
+});
+```
+
+#### 场景 4：地理位置（使用 GEO 命令）
+
+```typescript
+// 添加位置
+await redis.geoadd("locations", {
+  longitude: 116.404,
+  latitude: 39.915,
+  member: "Beijing",
+});
+
+// 查询附近的位置
+const nearby = await redis.georadius("locations", 116.404, 39.915, 100, "km");
+```
+
+### 性能特点
+
+| 操作      | 时间复杂度   |
+| --------- | ------------ |
+| ZADD/ZREM | O(log N)     |
+| ZSCORE    | O(1)         |
+| ZRANK     | O(log N)     |
+| ZRANGE    | O(log N + M) |
+
+### 最佳实践
+
+✅ **使用 Sorted Set 实现高性能排行榜**
+
+```typescript
+// ✅ 高效的 Top N 查询
+await redis.zrange("leaderboard", 0, 9, { rev: true, withScores: true });
+```
+
+✅ **使用时间戳作为分数实现时间排序**
+
+```typescript
+// ✅ 按时间排序的事件流
+await redis.zadd("events:timeline", [{ score: Date.now(), value: eventId }]);
+```
+
+---
+
+## 数据类型选择指南
+
+### 决策流程图
+
+```
+                     开始
+                       │
+                       ▼
+              需要存储对象？
+                  │
+      ┌────YES────┴────NO────┐
+      │                      │
+      ▼                      ▼
+   使用 Hash            需要排序？
+      │              ┌──YES──┴──NO──┐
+      │              │              │
+      │              ▼              ▼
+      │         Sorted Set    需要去重？
+      │              │        ┌─YES─┴─NO─┐
+      │              │        │         │
+      │              │        ▼         ▼
+      │              │       Set    需要顺序？
+      │              │        │    ──YES──┴──NO──
+      │              │        │         │        │
+      │              │        │         ▼        ▼
+      │              │        │       List    String
+      │              │        │
+      └──────────────┴────────┴────────┘
+```
+
+### 对比总结
+
+| 场景     | 推荐类型   | 替代方案            | 不推荐 |
+| -------- | ---------- | ------------------- | ------ |
+| 缓存     | String     | Hash                | -      |
+| 对象存储 | Hash       | String (JSON)       | -      |
+| 计数器   | String     | Hash                | -      |
+| 队列     | List       | Stream (Redis 5.0+) | -      |
+| 栈       | List       | -                   | -      |
+| 去重     | Set        | -                   | List   |
+| 标签     | Set        | -                   | -      |
+| 关注系统 | Set        | -                   | -      |
+| 排行榜   | Sorted Set | List (需手动排序)   | -      |
+| 延时队列 | Sorted Set | List + ZSET         | -      |
+| 范围查询 | Sorted Set | -                   | Set    |
+
+---
+
+## 最佳实践总结
+
+### 1. 选择合适的数据类型
+
+```typescript
+// ✅ 根据场景选择
+await redis.hset("user:123", "name", "张三"); // 对象字段
+await redis.sadd("user:123:tags", "redis", "db"); // 标签集合
+await redis.zadd("leaderboard", [{ score: 100, value: "user:123" }]); // 排行榜
+```
+
+### 2. 合理设置过期时间
+
+```typescript
+// ✅ 所有缓存都设置过期时间
+await redis.setex("cache:data", 3600, data);
+await redis.expire("temp:data", 60);
+```
+
+### 3. 使用批量操作减少网络往返
+
+```typescript
+// ✅ 使用 MGET 而不是多次 GET
+const values = await redis.mget("key1", "key2", "key3");
+
+// ❌ 避免
+const v1 = await redis.get("key1");
+const v2 = await redis.get("key2");
+const v3 = await redis.get("key3");
+```
+
+### 4. 避免存储大 Key
+
+```typescript
+// ❌ 避免单个 Key 过大
+await redis.set("big", hugeData);
+
+// ✅ 拆分为多个 Key
+for (let i = 0; i < chunks.length; i++) {
+  await redis.set(`big:${i}`, chunks[i]);
+}
+```
+
+### 5. 使用合适的前缀组织数据
+
+```typescript
+// ✅ 使用冒号分隔层级
+"user:123:profile";
+"cache:product:456";
+"session:abc123";
+
+// ❌ 避免混乱的命名
+"user123profile";
+"user-123-profile";
+"user123_profile";
+```
+
+---
+
+## 常见问题
+
+### Q1: String 和 Hash 存储对象，哪个更好？
+
+**A**:
+
+| 方案       | 优势                         | 劣势                       | 适用场景                 |
+| ---------- | ---------------------------- | -------------------------- | ------------------------ |
+| **String** | 简单、一次性获取             | 获取整个对象、无法部分更新 | 对象字段少、总是整体使用 |
+| **Hash**   | 可部分获取和更新、内存效率高 | 字段多时 HGETALL 慢        | 对象字段多、需要部分操作 |
+
+**推荐**：
+
+- 字段少于 10 个 → Hash
+- 总是整体使用 → String
+- 需要部分更新 → Hash
+
+### Q2: Set 和 List 有什么区别？
+
+**A**:
+
+| 特性     | Set        | List       |
+| -------- | ---------- | ---------- |
+| 唯一性   | ✅ 唯一    | ❌ 可重复  |
+| 有序性   | ❌ 无序    | ✅ 有序    |
+| 集合运算 | ✅ 支持    | ❌ 不支持  |
+| 典型场景 | 标签、关注 | 队列、列表 |
+
+### Q3: 为什么 Redis 要实现多种数据结构？
+
+**A**:
+
+1. **性能**：不同的数据结构有不同的性能特点
+2. **便利性**：合适的数据结构可以简化业务逻辑
+3. **内存效率**：不同的底层实现优化了内存使用
+4. **功能**：支持更丰富的操作（如集合运算、范围查询）
+
+---
+
+## 总结
+
+本文我们系统学习了 Redis 的五种核心数据类型：
+
+✅ **String**：最基础的类型，适用于缓存、计数器、分布式锁
+✅ **Hash**：键值对集合，适用于对象存储、购物车、Session
+✅ **List**：有序列表，适用于消息队列、栈、最新列表
+✅ **Set**：无序唯一集合，适用于标签、关注系统、共同好友
+✅ **Sorted Set**：有序唯一集合，适用于排行榜、延时队列、范围查询
+
+**选择数据类型的关键**：
+
+- 理解每种数据类型的特点
+- 根据业务场景选择合适的类型
+- 考虑性能和内存效率
+- 遵循最佳实践
+
+---
+
+## 下一步
+
+现在你已经了解了 Redis 的五种数据类型，在下一篇文章中，我们将深入学习 **Redis 键命名与设计规范**，学习如何设计高效、易维护的 Redis 键结构。
+
+继续阅读：[04. Redis 键命名与设计规范](./04-key-design-best-practices.mdx)

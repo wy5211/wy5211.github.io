@@ -1,0 +1,839 @@
+---
+title: "05. API Routes 与 Server Actions 对比"
+date: "2026-03-23"
+summary: "深入理解 Next.js API Routes 和 Server Actions 的使用场景，学习何时使用哪种方案，以及如何设计 REST API 和处理 Webhook。"
+tags: ["Next.js", "API Routes", "Server Actions", "REST API", "Webhook"]
+category: "nextjs"
+cover: ""
+draft: false
+series: "Next.js 渐进式全栈开发"
+seriesOrder: 5
+---
+
+## 前言
+
+Next.js 提供了两种处理数据的方式：API Routes 和 Server Actions。了解它们的区别和适用场景，可以帮助你做出更好的架构决策。
+
+**学习目标**：
+
+- ✅ 理解 API Routes 和 Server Actions 的区别
+- ✅ 掌握 REST API 设计原则
+- ✅ 学会何时使用哪种方案
+- ✅ 处理 Webhook 和文件上传
+- ✅ 构建公开 API 端点
+
+---
+
+## API Routes 基础
+
+### 什么是 API Routes
+
+API Routes 允许你在 Next.js 应用中创建自定义 API 端点：
+
+```
+传统后端：
+Client → API Gateway → Backend Service → Database
+
+Next.js API Routes：
+Client → API Route → Database
+```
+
+### 创建 API Route
+
+```typescript
+// app/api/posts/route.ts
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+
+export async function GET() {
+  try {
+    const posts = await db.posts.findMany({
+      orderBy: { createdAt: "desc" },
+    });
+
+    return NextResponse.json(posts);
+  } catch (error) {
+    return NextResponse.json({ error: "获取文章失败" }, { status: 500 });
+  }
+}
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+    const { title, content } = body;
+
+    const post = await db.posts.create({
+      data: { title, content },
+    });
+
+    return NextResponse.json(post, { status: 201 });
+  } catch (error) {
+    return NextResponse.json({ error: "创建文章失败" }, { status: 500 });
+  }
+}
+```
+
+### 动态 API Routes
+
+```typescript
+// app/api/posts/[id]/route.ts
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+
+export async function GET(
+  request: Request,
+  { params }: { params: { id: string } }
+) {
+  try {
+    const post = await db.posts.findUnique({
+      where: { id: params.id },
+    });
+
+    if (!post) {
+      return NextResponse.json({ error: "文章未找到" }, { status: 404 });
+    }
+
+    return NextResponse.json(post);
+  } catch (error) {
+    return NextResponse.json({ error: "获取文章失败" }, { status: 500 });
+  }
+}
+
+export async function PUT(
+  request: Request,
+  { params }: { params: { id: string } }
+) {
+  try {
+    const body = await request.json();
+    const post = await db.posts.update({
+      where: { id: params.id },
+      data: body,
+    });
+
+    return NextResponse.json(post);
+  } catch (error) {
+    return NextResponse.json({ error: "更新文章失败" }, { status: 500 });
+  }
+}
+
+export async function DELETE(
+  request: Request,
+  { params }: { params: { id: string } }
+) {
+  try {
+    await db.posts.delete({
+      where: { id: params.id },
+    });
+
+    return NextResponse.json({ success: true });
+  } catch (error) {
+    return NextResponse.json({ error: "删除文章失败" }, { status: 500 });
+  }
+}
+```
+
+---
+
+## Server Actions vs API Routes
+
+### 对比表格
+
+| 特性       | API Routes          | Server Actions     |
+| ---------- | ------------------- | ------------------ |
+| 主要用途   | 构建公开 API        | 处理表单和数据修改 |
+| 访问方式   | HTTP REST           | 函数调用           |
+| 适用场景   | 第三方集成、Webhook | 表单提交、用户操作 |
+| 客户端调用 | fetch/axios         | 直接调用           |
+| 类型安全   | 需要手动定义        | 自动类型推断       |
+| 缓存       | 支持 HTTP 缓存      | 支持 Next.js 缓存  |
+| 错误处理   | HTTP 状态码         | 返回值/错误对象    |
+
+### 使用场景决策树
+
+```
+需要处理数据？
+├─ 是 → 公开 API？
+│   ├─ 是 → API Routes
+│   └─ 否 → Server Actions
+└─ 否 → 静态内容
+```
+
+### 示例对比
+
+**API Routes 方式**：
+
+```typescript
+// app/api/posts/route.ts
+export async function POST(request: Request) {
+  const body = await request.json();
+  const post = await db.posts.create({ data: body });
+  return NextResponse.json(post);
+}
+
+// 客户端调用
+// components/CreatePost.tsx
+"use client";
+
+export function CreatePost() {
+  const handleSubmit = async () => {
+    const response = await fetch('/api/posts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, content }),
+    });
+    const data = await response.json();
+  };
+
+  return <button onClick={handleSubmit}>创建</button>;
+}
+```
+
+**Server Actions 方式**：
+
+```typescript
+// app/actions.ts
+"use server";
+
+export async function createPost(formData: FormData) {
+  const post = await db.posts.create({
+    data: {
+      title: formData.get('title') as string,
+      content: formData.get('content') as string,
+    },
+  });
+  return post;
+}
+
+// 客户端调用
+// components/CreatePost.tsx
+export function CreatePost() {
+  return (
+    <form action={createPost}>
+      <input name="title" />
+      <textarea name="content" />
+      <button type="submit">创建</button>
+    </form>
+  );
+}
+```
+
+---
+
+## REST API 设计
+
+### RESTful 原则
+
+```
+GET    /api/posts        # 获取所有文章
+GET    /api/posts/:id    # 获取单个文章
+POST   /api/posts        # 创建文章
+PUT    /api/posts/:id    # 更新文章（全部）
+PATCH  /api/posts/:id    # 更新文章（部分）
+DELETE /api/posts/:id    # 删除文章
+```
+
+### 完整 REST API 示例
+
+```typescript
+// app/api/posts/route.ts
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { auth } from "@/lib/auth";
+
+// GET /api/posts?limit=10&skip=0
+export async function GET(request: Request) {
+  try {
+    const { searchParams } = new URL(request.url);
+    const limit = parseInt(searchParams.get("limit") || "10");
+    const skip = parseInt(searchParams.get("skip") || "0");
+
+    const [posts, total] = await Promise.all([
+      db.posts.findMany({
+        take: limit,
+        skip,
+        orderBy: { createdAt: "desc" },
+      }),
+      db.posts.count(),
+    ]);
+
+    return NextResponse.json({
+      posts,
+      total,
+      page: Math.floor(skip / limit) + 1,
+      pageSize: limit,
+    });
+  } catch (error) {
+    return NextResponse.json({ error: "获取文章失败" }, { status: 500 });
+  }
+}
+
+// POST /api/posts
+export async function POST(request: Request) {
+  try {
+    const session = await auth();
+    if (!session?.user) {
+      return NextResponse.json({ error: "未授权" }, { status: 401 });
+    }
+
+    const body = await request.json();
+    const { title, content, category } = body;
+
+    const post = await db.posts.create({
+      data: {
+        title,
+        content,
+        category,
+        authorId: session.user.id,
+      },
+    });
+
+    return NextResponse.json(post, { status: 201 });
+  } catch (error) {
+    return NextResponse.json({ error: "创建文章失败" }, { status: 500 });
+  }
+}
+```
+
+### API 版本控制
+
+```
+app/
+└── api/
+    └── v1/
+        └── posts/
+            └── route.ts    # /api/v1/posts
+```
+
+```typescript
+// app/api/v1/posts/route.ts
+export async function GET(request: Request) {
+  // v1 实现
+  const posts = await db.posts.findMany();
+  return NextResponse.json(posts);
+}
+```
+
+---
+
+## Webhook 处理
+
+### Webhook 基础
+
+```typescript
+// app/api/webhooks/stripe/route.ts
+import { NextResponse } from "next/server";
+import { headers } from "next/headers";
+import Stripe from "stripe";
+
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY!);
+const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET!;
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.text();
+    const signature = headers().get("stripe-signature")!;
+
+    // 验证 webhook
+    const event = stripe.webhooks.constructEvent(
+      body,
+      signature,
+      webhookSecret
+    );
+
+    // 处理事件
+    switch (event.type) {
+      case "checkout.session.completed":
+        await handleCheckoutCompleted(event.data.object);
+        break;
+      case "invoice.paid":
+        await handleInvoicePaid(event.data.object);
+        break;
+      default:
+        console.log(`Unhandled event type: ${event.type}`);
+    }
+
+    return NextResponse.json({ received: true });
+  } catch (error) {
+    console.error("Webhook error:", error);
+    return NextResponse.json({ error: "Webhook 处理失败" }, { status: 400 });
+  }
+}
+
+async function handleCheckoutCompleted(session: any) {
+  // 更新订单状态
+  await db.orders.update({
+    where: { stripeSessionId: session.id },
+    data: { status: "completed" },
+  });
+}
+
+async function handleInvoicePaid(invoice: any) {
+  // 续订订阅
+  await db.subscriptions.update({
+    where: { stripeCustomerId: invoice.customer },
+    data: {
+      status: "active",
+      currentPeriodEnd: new Date(invoice.period_end * 1000),
+    },
+  });
+}
+```
+
+### GitHub Webhook
+
+```typescript
+// app/api/webhooks/github/route.ts
+import { NextResponse } from "next/server";
+import { headers } from "next/headers";
+
+export async function POST(request: Request) {
+  try {
+    const body = await request.json();
+    const signature = headers().get("x-hub-signature-256")!;
+
+    // 验证签名
+    const crypto = require("crypto");
+    const hmac = crypto.createHmac(
+      "sha256",
+      process.env.GITHUB_WEBHOOK_SECRET!
+    );
+    const digest = "sha256=" + hmac.update(JSON.stringify(body)).digest("hex");
+
+    if (signature !== digest) {
+      return NextResponse.json({ error: "Invalid signature" }, { status: 401 });
+    }
+
+    // 处理事件
+    if (body.action === "opened" && body.pull_request) {
+      await handlePROpened(body.pull_request);
+    }
+
+    return NextResponse.json({ received: true });
+  } catch (error) {
+    return NextResponse.json({ error: "Webhook 处理失败" }, { status: 500 });
+  }
+}
+
+async function handlePROpened(pr: any) {
+  // 处理 PR 打开事件
+  console.log(`PR opened: ${pr.title}`);
+}
+```
+
+---
+
+## 文件上传
+
+### 使用 API Routes 上传
+
+```typescript
+// app/api/upload/route.ts
+import { NextResponse } from "next/server";
+import { put } from "@vercel/blob";
+
+export async function POST(request: Request) {
+  try {
+    const formData = await request.formData();
+    const file = formData.get("file") as File;
+
+    if (!file) {
+      return NextResponse.json({ error: "没有文件" }, { status: 400 });
+    }
+
+    // 上传到 Vercel Blob
+    const blob = await put(file.name, file, {
+      access: "public",
+    });
+
+    return NextResponse.json({
+      url: blob.url,
+      downloadUrl: blob.downloadUrl,
+    });
+  } catch (error) {
+    return NextResponse.json({ error: "上传失败" }, { status: 500 });
+  }
+}
+```
+
+### 客户端上传
+
+```typescript
+// components/FileUpload.tsx
+"use client";
+
+import { useState } from 'react';
+
+export function FileUpload() {
+  const [uploading, setUploading] = useState(false);
+
+  const handleUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setUploading(true);
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const response = await fetch('/api/upload', {
+        method: 'POST',
+        body: formData,
+      });
+
+      const data = await response.json();
+      console.log('上传成功:', data.url);
+    } catch (error) {
+      console.error('上传失败:', error);
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return (
+    <div>
+      <input
+        type="file"
+        onChange={handleUpload}
+        disabled={uploading}
+      />
+      {uploading && <p>上传中...</p>}
+    </div>
+  );
+}
+```
+
+---
+
+## 公开 API 设计
+
+### API 认证
+
+```typescript
+// lib/api-auth.ts
+import { headers } from "next/headers";
+
+export async function validateApiKey() {
+  const headersList = headers();
+  const apiKey = headersList.get("x-api-key");
+
+  if (!apiKey) {
+    throw new Error("缺少 API Key");
+  }
+
+  const validKey = await db.apiKeys.findUnique({
+    where: { key: apiKey },
+  });
+
+  if (!validKey) {
+    throw new Error("无效的 API Key");
+  }
+
+  // 更新使用统计
+  await db.apiKeys.update({
+    where: { key: apiKey },
+    data: {
+      lastUsed: new Date(),
+      usageCount: { increment: 1 },
+    },
+  });
+
+  return validKey;
+}
+```
+
+### 速率限制
+
+```typescript
+// lib/rate-limit.ts
+import { Ratelimit } from "@upstash/ratelimit";
+import { Redis } from "@upstash/redis";
+
+const ratelimit = new Ratelimit({
+  redis: Redis.fromEnv(),
+  limiter: Ratelimit.slidingWindow(10, "1 m"),
+});
+
+export async function checkRateLimit(identifier: string) {
+  const { success, remaining, reset } = await ratelimit.limit(identifier);
+
+  if (!success) {
+    throw new Error("请求过于频繁");
+  }
+
+  return { remaining, reset };
+}
+```
+
+### 完整的 API Route
+
+```typescript
+// app/api/v1/posts/route.ts
+import { NextResponse } from "next/server";
+import { validateApiKey } from "@/lib/api-auth";
+import { checkRateLimit } from "@/lib/rate-limit";
+import { db } from "@/lib/db";
+
+export async function GET(request: Request) {
+  try {
+    // 认证
+    const apiKey = await validateApiKey();
+
+    // 速率限制
+    await checkRateLimit(apiKey.id);
+
+    // 查询参数
+    const { searchParams } = new URL(request.url);
+    const limit = Math.min(parseInt(searchParams.get("limit") || "10"), 100);
+    const skip = parseInt(searchParams.get("skip") || "0");
+
+    // 获取数据
+    const [posts, total] = await Promise.all([
+      db.posts.findMany({
+        take: limit,
+        skip,
+        orderBy: { createdAt: "desc" },
+        select: {
+          id: true,
+          title: true,
+          excerpt: true,
+          createdAt: true,
+        },
+      }),
+      db.posts.count(),
+    ]);
+
+    // 响应头
+    const headers = new Headers();
+    headers.set("X-RateLimit-Remaining", "9");
+    headers.set("X-Total-Count", total.toString());
+
+    return NextResponse.json(
+      {
+        posts,
+        pagination: {
+          total,
+          limit,
+          skip,
+          hasMore: skip + limit < total,
+        },
+      },
+      { headers }
+    );
+  } catch (error: any) {
+    if (
+      error.message === "缺少 API Key" ||
+      error.message === "无效的 API Key"
+    ) {
+      return NextResponse.json({ error: error.message }, { status: 401 });
+    }
+
+    if (error.message === "请求过于频繁") {
+      return NextResponse.json({ error: error.message }, { status: 429 });
+    }
+
+    return NextResponse.json({ error: "服务器错误" }, { status: 500 });
+  }
+}
+```
+
+---
+
+## 最佳实践
+
+### ✅ 推荐做法
+
+1. **使用适当的 HTTP 方法**
+
+```typescript
+GET    /api/posts    # 获取
+POST   /api/posts    # 创建
+PUT    /api/posts/:id# 更新
+DELETE /api/posts/:id# 删除
+```
+
+2. **返回一致的响应格式**
+
+```typescript
+return NextResponse.json({
+  success: true,
+  data: post,
+  error: null,
+});
+```
+
+3. **使用适当的 HTTP 状态码**
+
+```typescript
+200 OK          // 成功
+201 Created     // 创建成功
+400 Bad Request // 请求错误
+401 Unauthorized // 未授权
+404 Not Found   // 未找到
+500 Server Error // 服务器错误
+```
+
+4. **验证和错误处理**
+
+```typescript
+try {
+  // 验证输入
+  if (!title) {
+    return NextResponse.json({ error: "标题不能为空" }, { status: 400 });
+  }
+
+  // 执行操作
+  const post = await db.posts.create({ data: { title } });
+  return NextResponse.json(post);
+} catch (error) {
+  return NextResponse.json({ error: "操作失败" }, { status: 500 });
+}
+```
+
+### ❌ 避免做法
+
+1. **不要在 API Route 中使用客户端钩子**
+
+```typescript
+// ❌ 错误
+import { useState } from "react"; // Error!
+
+export async function GET() {
+  return NextResponse.json({});
+}
+```
+
+2. **不要忘记验证输入**
+
+```typescript
+// ❌ 缺少验证
+export async function POST(request: Request) {
+  const body = await request.json();
+  await db.posts.create({ data: body });
+}
+
+// ✅ 添加验证
+export async function POST(request: Request) {
+  const body = await request.json();
+  if (!body.title) {
+    return NextResponse.json({ error: "标题不能为空" }, { status: 400 });
+  }
+  await db.posts.create({ data: body });
+}
+```
+
+3. **不要返回敏感信息**
+
+```typescript
+// ❌ 返回密码
+export async function GET() {
+  const users = await db.users.findMany();
+  return NextResponse.json(users);
+}
+
+// ✅ 过滤敏感字段
+export async function GET() {
+  const users = await db.users.findMany({
+    select: {
+      id: true,
+      name: true,
+      email: false, // 不返回密码
+    },
+  });
+  return NextResponse.json(users);
+}
+```
+
+---
+
+## 常见问题
+
+**Q: 应该使用 API Routes 还是 Server Actions？**
+
+A:
+
+- **API Routes**：公开 API、Webhook、第三方集成
+- **Server Actions**：表单提交、用户操作、内部数据修改
+
+**Q: API Routes 的性能如何？**
+
+A: API Routes 性能很好，但记住它们运行在服务器。使用缓存和适当的数据库索引优化性能。
+
+**Q: 可以在 API Routes 中使用环境变量吗？**
+
+A: 可以。API Routes 在服务器运行，可以安全地访问所有环境变量。
+
+**Q: 如何处理 CORS？**
+
+A: 使用 Next.js 配置或手动设置 CORS 头：
+
+```typescript
+export async function OPTIONS(request: Request) {
+  return new NextResponse(null, {
+    status: 200,
+    headers: {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE",
+      "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    },
+  });
+}
+```
+
+---
+
+## 总结
+
+本文我们学习了：
+
+✅ **API Routes 基础**
+
+- 创建和使用 API Routes
+- 动态路由处理
+- HTTP 方法实现
+
+✅ **Server Actions vs API Routes**
+
+- 使用场景对比
+- 决策树
+- 实现方式对比
+
+✅ **REST API 设计**
+
+- RESTful 原则
+- 完整 CRUD 实现
+- 版本控制
+
+✅ **Webhook 处理**
+
+- Webhook 验证
+- 事件处理
+- 第三方集成
+
+✅ **文件上传**
+
+- API Routes 上传
+- 客户端实现
+- 云存储集成
+
+✅ **公开 API 设计**
+
+- API 认证
+- 速率限制
+- 错误处理
+
+现在你应该能够根据需求选择合适的方案。下一步，我们将学习 **缓存策略与数据获取优化**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- Next.js 缓存层次
+- fetch 缓存配置
+- ISR 和增量静态生成
+- 缓存标签和路径重新验证
+- 性能监控
+
+继续阅读：[06 缓存策略与数据获取优化](./06-caching-strategies.mdx)

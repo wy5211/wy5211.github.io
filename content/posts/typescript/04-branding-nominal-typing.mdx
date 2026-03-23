@@ -1,0 +1,653 @@
+---
+title: "04 品牌类型与名义类型"
+date: "2026-03-23"
+summary: "在 TypeScript 的结构化类型系统中实现名义类型，防止类型混淆，提高代码安全性。"
+tags: ["TypeScript", "品牌类型", "名义类型", "类型安全"]
+category: "typescript"
+draft: false
+series: "TypeScript 高级技巧系列"
+seriesOrder: 4
+---
+
+## 前言
+
+TypeScript 使用的是**结构化类型系统**（Structural Typing），这意味着类型的兼容性由其结构决定，而不是名称。这很灵活，但有时会导致意外的问题。
+
+例如，`UserID` 和 `OrderID` 可能都是 `string`，但它们不应该互相赋值。**品牌类型**（Branded Types）和**名义类型**（Nominal Typing）技巧可以帮助我们在需要时实现更严格的类型检查。
+
+## 核心概念
+
+### 结构化类型 vs 名义类型
+
+```typescript
+// 结构化类型（TypeScript 默认）
+type UserID = string;
+type OrderID = string;
+
+const userId: UserID = "user-123";
+const orderId: OrderID = userId; // ✅ 允许（但可能不应该）
+
+// 名义类型（理想情况）
+// UserID 和 OrderID 即使结构相同，也应该互不兼容
+```
+
+### 品牌类型基础
+
+通过交叉类型添加一个独特的"品牌"标识：
+
+```typescript
+// 基础品牌类型
+type Brand<T, B> = T & { __brand: B };
+
+type UserID = Brand<string, "UserID">;
+type OrderID = Brand<string, "OrderID">;
+type Email = Brand<string, "Email">;
+
+// 创建品牌类型的值
+const createUserId = (id: string): UserID => {
+  return id as UserID;
+};
+
+const createOrderId = (id: string): OrderID => {
+  return id as OrderID;
+};
+
+// 使用
+const userId = createUserId("user-123");
+const orderId = createOrderId("order-456");
+
+// ✅ 类型安全
+function processUser(id: UserID) {}
+function processOrder(id: OrderID) {}
+
+processUser(userId); // ✅
+processOrder(orderId); // ✅
+
+processUser(orderId); // ❌ 类型错误：OrderID 不能赋值给 UserID
+processOrder(userId); // ❌ 类型错误：UserID 不能赋值给 OrderID
+```
+
+## 高级技巧
+
+### 技巧 1：品牌类型工厂
+
+创建可复用的品牌类型工厂：
+
+```typescript
+// 品牌类型工厂
+type Branded<T, B extends string> = T & { readonly __brand: B };
+
+// 定义品牌类型构造器
+type BrandConstructor<T, B extends string> = (value: T) => Branded<T, B>;
+
+// 创建品牌类型
+function createBrand<T, B extends string>(brand: B): BrandConstructor<T, B> {
+  return (value: T) => value as Branded<T, B>;
+}
+
+// 使用工厂创建品牌类型
+const asUserId = createBrand<string, "UserID">("UserID");
+const asOrderId = createBrand<string, "OrderID">("OrderID");
+const asEmail = createBrand<string, "Email">("Email");
+
+type UserID = ReturnType<typeof asUserId>;
+type OrderID = ReturnType<typeof asOrderId>;
+type Email = ReturnType<typeof asEmail>;
+
+// ✅ 类型安全
+const userId = asUserId("user-123");
+const orderId = asOrderId("order-456");
+
+function getUserById(id: UserID) {}
+function getOrderById(id: OrderID) {}
+
+getUserById(userId); // ✅
+getUserById(orderId); // ❌ 类型错误
+```
+
+---
+
+### 技巧 2：数字品牌类型
+
+防止数字类型的混淆（如货币、百分比、坐标等）：
+
+```typescript
+// 定义数字品牌类型
+type USD = Branded<number, "USD">;
+type EUR = Branded<number, "EUR">;
+type Percentage = Branded<number, "Percentage">;
+
+// 构造函数
+const usd = (value: number): USD => {
+  if (value < 0) {
+    throw new Error("USD cannot be negative");
+  }
+  return value as USD;
+};
+
+const eur = (value: number): EUR => {
+  if (value < 0) {
+    throw new Error("EUR cannot be negative");
+  }
+  return value as EUR;
+};
+
+const percentage = (value: number): Percentage => {
+  if (value < 0 || value > 100) {
+    throw new Error("Percentage must be between 0 and 100");
+  }
+  return value as Percentage;
+};
+
+// 货币运算（只能同种货币相加）
+function addUSD(a: USD, b: USD): USD {
+  return usd((a as number) + (b as number));
+}
+
+function addEUR(a: EUR, b: EUR): EUR {
+  return eur((a as number) + (b as number));
+}
+
+// 货币转换
+function usdToEur(amount: USD, rate: number): EUR {
+  return eur((amount as number) * rate);
+}
+
+// 使用示例
+const price1 = usd(100);
+const price2 = usd(50);
+const total = addUSD(price1, price2); // ✅ USD + USD = USD
+
+const euroPrice = usdToEur(total, 0.85); // ✅ 转换为 EUR
+
+// ❌ 类型错误：不能混合不同货币
+const invalid = addUSD(price1, eur(50));
+
+// 应用百分比
+function applyDiscount(price: USD, discount: Percentage): USD {
+  return usd((price as number) * ((100 - (discount as number)) / 100));
+}
+
+const discountedPrice = applyDiscount(price1, percentage(20)); // ✅
+const invalidDiscount = applyDiscount(price1, percentage(120)); // ❌ 运行时错误
+```
+
+---
+
+### 技巧 3：运行时验证的品牌类型
+
+结合运行时验证，确保类型安全：
+
+```typescript
+// 带验证的品牌类型
+type ValidatedBrand<T, B extends string> = T & {
+  readonly __brand: B;
+  readonly __validated: true;
+};
+
+// Email 品牌类型（带验证）
+function createEmail(value: string): ValidatedBrand<string, "Email"> {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(value)) {
+    throw new Error(`Invalid email format: ${value}`);
+  }
+  return value as ValidatedBrand<string, "Email">;
+}
+
+// URL 品牌类型（带验证）
+function createURL(value: string): ValidatedBrand<string, "URL"> {
+  try {
+    new URL(value);
+    return value as ValidatedBrand<string, "URL">;
+  } catch {
+    throw new Error(`Invalid URL: ${value}`);
+  }
+}
+
+// UUID 品牌类型（带验证）
+function createUUID(value: string): ValidatedBrand<string, "UUID"> {
+  const uuidRegex =
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  if (!uuidRegex.test(value)) {
+    throw new Error(`Invalid UUID: ${value}`);
+  }
+  return value as ValidatedBrand<string, "UUID">;
+}
+
+// 使用示例
+const email = createEmail("user@example.com"); // ✅
+const invalidEmail = createEmail("not-an-email"); // ❌ 运行时错误
+
+const url = createURL("https://example.com"); // ✅
+const invalidUrl = createURL("not-a-url"); // ❌ 运行时错误
+
+const uuid = createUUID("123e4567-e89b-12d3-a456-426614174000"); // ✅
+
+// 函数签名确保只能使用验证过的值
+function sendEmail(
+  to: ValidatedBrand<string, "Email">,
+  subject: string,
+  body: string
+) {
+  console.log(`Sending email to ${to}`);
+}
+
+sendEmail(email, "Hello", "World"); // ✅
+sendEmail("not-validated@example.com", "Hello", "World"); // ❌ 类型错误
+```
+
+---
+
+### 技巧 4：品牌类型与类型收窄
+
+结合类型守卫实现更安全的代码：
+
+```typescript
+// 品牌类型
+type PositiveNumber = Branded<number, "Positive">;
+type NonEmptyString = Branded<string, "NonEmpty">;
+
+// 类型守卫
+function isPositiveNumber(value: number): value is PositiveNumber {
+  return value > 0;
+}
+
+function isNonEmptyString(value: string): value is NonEmptyString {
+  return value.trim().length > 0;
+}
+
+// 断言函数
+function assertPositiveNumber(value: number): asserts value is PositiveNumber {
+  if (value <= 0) {
+    throw new Error(`Expected positive number, got ${value}`);
+  }
+}
+
+function assertNonEmptyString(value: string): asserts value is NonEmptyString {
+  if (value.trim().length === 0) {
+    throw new Error("String cannot be empty");
+  }
+}
+
+// 使用示例
+function calculateSquareRoot(value: number): number {
+  assertPositiveNumber(value);
+  // 在这里，value 的类型是 PositiveNumber
+  return Math.sqrt(value);
+}
+
+function greet(name: string): string {
+  assertNonEmptyString(name);
+  // 在这里，name 的类型是 NonEmptyString
+  return `Hello, ${name}!`;
+}
+
+// ✅ 正常使用
+calculateSquareRoot(16); // 4
+greet("Alice"); // "Hello, Alice!"
+
+// ❌ 运行时错误
+calculateSquareRoot(-1); // Error: Expected positive number
+greet(""); // Error: String cannot be empty
+```
+
+---
+
+### 技巧 5：不可变品牌类型
+
+创建真正的不可变类型：
+
+```typescript
+// 深度只读品牌类型
+type ImmutableBrand<T> = {
+  readonly [P in keyof T]: T[P] extends object ? ImmutableBrand<T[P]> : T[P];
+} & { readonly __immutable: true };
+
+// 创建不可变对象
+function createImmutable<T>(obj: T): ImmutableBrand<T> {
+  return Object.freeze(obj) as ImmutableBrand<T>;
+}
+
+// 使用示例
+interface User {
+  id: number;
+  name: string;
+  profile: {
+    email: string;
+    address: {
+      city: string;
+    };
+  };
+}
+
+const user = createImmutable({
+  id: 1,
+  name: "Alice",
+  profile: {
+    email: "alice@example.com",
+    address: {
+      city: "New York",
+    },
+  },
+});
+
+// ✅ 可以读取
+console.log(user.name); // "Alice"
+console.log(user.profile.email); // "alice@example.com"
+
+// ❌ TypeScript 编译错误
+user.name = "Bob"; // Cannot assign to 'name' because it is read-only
+user.profile.email = "bob@example.com"; // Cannot assign to 'email' because it is read-only
+
+// ❌ 运行时错误（严格模式下）
+Object.defineProperty(user, "name", { value: "Bob" }); // TypeError: Object is not extensible
+```
+
+---
+
+### 技巧 6：品牌类型在 API 设计中的应用
+
+```typescript
+// API 相关的品牌类型
+type APIKey = Branded<string, "APIKey">;
+type AccessToken = Branded<string, "AccessToken">;
+type RefreshToken = Branded<string, "RefreshToken">;
+type SessionID = Branded<string, "SessionID">;
+
+// Token 验证和创建
+function createAPIKey(key: string): APIKey {
+  if (!key.startsWith("sk_")) {
+    throw new Error('API key must start with "sk_"');
+  }
+  return key as APIKey;
+}
+
+function createAccessToken(token: string): AccessToken {
+  if (token.length < 32) {
+    throw new Error("Access token must be at least 32 characters");
+  }
+  return token as AccessToken;
+}
+
+// API 客户端
+class APIClient {
+  constructor(
+    private apiKey: APIKey,
+    private accessToken: AccessToken
+  ) {}
+
+  // 使用 API Key
+  publicAPI() {
+    console.log(`Calling public API with key: ${this.apiKey}`);
+  }
+
+  // 使用 Access Token
+  privateAPI() {
+    console.log(`Calling private API with token: ${this.accessToken}`);
+  }
+
+  // 刷新 Token
+  refreshToken(refreshToken: RefreshToken) {
+    console.log(`Refreshing token: ${refreshToken}`);
+  }
+}
+
+// 使用示例
+const apiKey = createAPIKey("sk_test_12345");
+const accessToken = createAccessToken("a".repeat(32));
+
+// ✅ 正确使用
+const client = new APIClient(apiKey, accessToken);
+client.publicAPI();
+client.privateAPI();
+
+// ❌ 类型错误
+const invalidClient = new APIClient(
+  "not-an-api-key", // ❌ 类型错误
+  accessToken
+);
+
+// Token 管理器
+class TokenManager {
+  private sessions = new Map<
+    SessionID,
+    { accessToken: AccessToken; refreshToken: RefreshToken }
+  >();
+
+  createSession(
+    accessToken: AccessToken,
+    refreshToken: RefreshToken
+  ): SessionID {
+    const sessionId = crypto.randomUUID() as SessionID;
+    this.sessions.set(sessionId, { accessToken, refreshToken });
+    return sessionId;
+  }
+
+  getSession(sessionId: SessionID) {
+    return this.sessions.get(sessionId);
+  }
+
+  refreshSession(sessionId: SessionID, newAccessToken: AccessToken) {
+    const session = this.sessions.get(sessionId);
+    if (session) {
+      session.accessToken = newAccessToken;
+    }
+  }
+}
+
+// 使用示例
+const tokenManager = new TokenManager();
+const session = tokenManager.createSession(
+  accessToken,
+  refreshToken as RefreshToken
+);
+const sessionData = tokenManager.getSession(session);
+```
+
+## 实战应用
+
+### 类型安全的数据库 ID 系统
+
+```typescript
+// 定义实体 ID 类型
+type EntityID<T extends string> = Branded<string, T>;
+
+type UserID = EntityID<"UserID">;
+type OrderID = EntityID<"OrderID">;
+type ProductID = EntityID<"ProductID">;
+type CategoryID = EntityID<"CategoryID">;
+
+// ID 构造器
+const createUserID = (id: string): UserID => {
+  if (!id.startsWith("user_")) {
+    throw new Error('User ID must start with "user_"');
+  }
+  return id as UserID;
+};
+
+const createOrderID = (id: string): OrderID => {
+  if (!id.startsWith("order_")) {
+    throw new Error('Order ID must start with "order_"');
+  }
+  return id as OrderID;
+};
+
+const createProductID = (id: string): ProductID => {
+  if (!id.startsWith("product_")) {
+    throw new Error('Product ID must start with "product_"');
+  }
+  return id as ProductID;
+};
+
+// 类型安全的仓储
+interface Repository<T, ID extends EntityID<any>> {
+  findById(id: ID): Promise<T | null>;
+  create(entity: Omit<T, "id">): Promise<T>;
+  update(id: ID, updates: Partial<T>): Promise<T>;
+  delete(id: ID): Promise<void>;
+}
+
+// User 仓储
+interface User {
+  id: UserID;
+  name: string;
+  email: string;
+}
+
+class UserRepository implements Repository<User, UserID> {
+  private users = new Map<UserID, User>();
+
+  async findById(id: UserID): Promise<User | null> {
+    return this.users.get(id) || null;
+  }
+
+  async create(data: Omit<User, "id">): Promise<User> {
+    const user: User = {
+      id: createUserID(`user_${Date.now()}`),
+      ...data,
+    };
+    this.users.set(user.id, user);
+    return user;
+  }
+
+  async update(id: UserID, updates: Partial<User>): Promise<User> {
+    const user = this.users.get(id);
+    if (!user) {
+      throw new Error("User not found");
+    }
+    const updated = { ...user, ...updates };
+    this.users.set(id, updated);
+    return updated;
+  }
+
+  async delete(id: UserID): Promise<void> {
+    this.users.delete(id);
+  }
+}
+
+// 使用示例
+const userRepo = new UserRepository();
+
+async function exampleUsage() {
+  const user = await userRepo.create({
+    name: "Alice",
+    email: "alice@example.com",
+  });
+  // user.id 类型: UserID
+
+  const found = await userRepo.findById(user.id); // ✅
+  const invalid = await userRepo.findById(createOrderID("order_123")); // ❌ 类型错误
+}
+```
+
+## 避坑指南
+
+### ❌ 错误 1：忘记运行时验证
+
+```typescript
+// ❌ 没有运行时验证
+type UserID = Branded<string, "UserID">;
+const userId = "user-123" as UserID; // 危险！
+
+// ✅ 添加运行时验证
+function createUserID(id: string): UserID {
+  if (!id.startsWith("user_")) {
+    throw new Error("Invalid user ID");
+  }
+  return id as UserID;
+}
+```
+
+---
+
+### ❌ 错误 2：过度使用品牌类型
+
+```typescript
+// ❌ 过度使用，增加复杂度
+type FirstName = Branded<string, "FirstName">;
+type LastName = Branded<string, "LastName">;
+type MiddleName = Branded<string, "MiddleName">;
+
+// ✅ 简化
+type UserName = {
+  first: string;
+  middle?: string;
+  last: string;
+};
+```
+
+---
+
+### ❌ 错误 3：品牌类型绕过
+
+```typescript
+// ❌ 可以被绕过
+type UserID = Branded<string, "UserID">;
+const userId = "any string" as UserID; // 绕过了验证
+
+// ✅ 使用构造函数
+function createUserID(id: string): UserID {
+  // 验证逻辑
+  return id as UserID;
+}
+```
+
+---
+
+### ❌ 错误 4：序列化/反序列化问题
+
+```typescript
+// ⚠️ JSON.stringify 会丢失品牌类型
+const userId: UserID = createUserID("user_123");
+const json = JSON.stringify(userId);
+const parsed = JSON.parse(json); // 类型是 string，不是 UserID
+
+// ✅ 添加自定义序列化
+function serializeUserID(id: UserID): string {
+  return JSON.stringify({ __type: "UserID", value: id });
+}
+
+function deserializeUserID(json: string): UserID {
+  const data = JSON.parse(json);
+  if (data.__type !== "UserID") {
+    throw new Error("Invalid UserID format");
+  }
+  return createUserID(data.value);
+}
+```
+
+## 总结
+
+### 核心要点
+
+1. **品牌类型**：通过交叉类型添加独特标识，实现名义类型
+2. **类型安全**：防止类型混淆（如不同类型的 ID）
+3. **运行时验证**：结合构造函数确保数据有效性
+4. **不可变类型**：创建真正的只读对象
+5. **实战应用**：货币、ID、Token 等场景
+
+### 使用场景
+
+- ✅ 不同类型的 ID（UserID、OrderID、ProductID）
+- ✅ 货币类型（USD、EUR、CNY）
+- ✅ 验证过的字符串（Email、URL、UUID）
+- ✅ 单位类型（百分比、坐标）
+- ✅ Token 和密钥（APIKey、AccessToken）
+
+### 最佳实践
+
+1. 总是提供构造函数，而不是直接使用类型断言
+2. 在构造函数中进行运行时验证
+3. 考虑序列化/反序列化场景
+4. 不要过度使用，只在需要严格类型区分时使用
+5. 提供类型转换函数，而不是强制类型断言
+
+## 参考资料
+
+- [Making TypeScript Click: Nominal Typing](https://michalzalecki.com/nominal-typing-in-typescript/)
+- [TypeScript Playground: Branded Types](https://www.typescriptlang.org/play?#example/branding)
+
+---
+
+- **上一篇**：[03 泛型高级应用](../03-advanced-generics.mdx)
+- **下一篇**：[05 类型守卫与断言技巧](../05-type-guards-assertions.mdx)

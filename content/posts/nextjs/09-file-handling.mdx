@@ -1,0 +1,738 @@
+---
+title: "09. 文件处理与媒体管理"
+date: "2026-03-23"
+summary: "掌握 Next.js 应用中的文件上传和媒体管理，学习使用 Server Actions 处理文件上传、图片优化，以及集成云存储服务。"
+tags: ["Next.js", "文件上传", "图片优化", "云存储", "媒体管理"]
+category: "nextjs"
+cover: ""
+draft: false
+series: "Next.js 渐进式全栈开发"
+seriesOrder: 9
+---
+
+## 前言
+
+文件上传和媒体管理是现代 Web 应用的常见功能。Next.js 提供了多种方案来处理文件上传，从本地存储到云存储服务。
+
+**学习目标**：
+
+- ✅ 掌握文件上传基础
+- ✅ 使用 Server Actions 上传文件
+- ✅ 实现图片优化
+- ✅ 集成云存储（Vercel Blob、Cloudflare R2）
+- ✅ 处理大文件上传
+- ✅ 实现媒体库管理
+
+---
+
+## 文件上传基础
+
+### 客户端上传表单
+
+```typescript
+// components/FileUpload.tsx
+"use client";
+
+import { useState } from 'react';
+import { useFormStatus } from 'react-dom';
+
+export function FileUpload() {
+  const [preview, setPreview] = useState<string>();
+
+  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // 创建预览
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      setPreview(reader.result as string);
+    };
+    reader.readAsDataURL(file);
+  }
+
+  return (
+    <form action={uploadFile}>
+      <input
+        type="file"
+        name="file"
+        onChange={handleFileChange}
+        accept="image/*"
+      />
+
+      {preview && (
+        <img
+          src={preview}
+          alt="预览"
+          style={{ maxWidth: '200px', maxHeight: '200px' }}
+        />
+      )}
+
+      <SubmitButton />
+    </form>
+  );
+}
+
+function SubmitButton() {
+  const { pending } = useFormStatus();
+
+  return (
+    <button type="submit" disabled={pending}>
+      {pending ? '上传中...' : '上传'}
+    </button>
+  );
+}
+```
+
+### Server Action 处理上传
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { writeFile } from "fs/promises";
+import { join } from "path";
+
+export async function uploadFile(formData: FormData) {
+  const file = formData.get("file") as File;
+
+  if (!file) {
+    return { error: "没有文件" };
+  }
+
+  // 验证文件类型
+  if (!file.type.startsWith("image/")) {
+    return { error: "只能上传图片" };
+  }
+
+  // 验证文件大小（5MB）
+  const MAX_SIZE = 5 * 1024 * 1024;
+  if (file.size > MAX_SIZE) {
+    return { error: "文件大小不能超过 5MB" };
+  }
+
+  // 读取文件
+  const bytes = await file.arrayBuffer();
+  const buffer = Buffer.from(bytes);
+
+  // 生成唯一文件名
+  const uniqueName = `${Date.now()}-${file.name}`;
+
+  // 保存到 public/uploads
+  const path = join(process.cwd(), "public", "uploads", uniqueName);
+  await writeFile(path, buffer);
+
+  return {
+    success: true,
+    url: `/uploads/${uniqueName}`,
+  };
+}
+```
+
+---
+
+## 图片优化
+
+### 使用 next/image
+
+```typescript
+// components/OptimizedImage.tsx
+import Image from 'next/image';
+
+export function OptimizedImage({
+  src,
+  alt,
+  width,
+  height,
+}: {
+  src: string;
+  alt: string;
+  width: number;
+  height: number;
+}) {
+  return (
+    <Image
+      src={src}
+      alt={alt}
+      width={width}
+      height={height}
+      // 自动优化
+      // - 自动选择格式（WebP、AVIF）
+      // - 响应式图片
+      // - 懒加载
+      // - 模糊占位符
+    />
+  );
+}
+```
+
+### 动态图片
+
+```typescript
+// components/UserAvatar.tsx
+import Image from 'next/image';
+
+export function UserAvatar({ userId }: { userId: string }) {
+  return (
+    <Image
+      src={`/api/users/${userId}/avatar`}
+      alt="用户头像"
+      width={100}
+      height={100}
+      priority // 首屏图片优先加载
+    />
+  );
+}
+```
+
+### 远程图片配置
+
+```typescript
+// next.config.ts
+const nextConfig = {
+  images: {
+    remotePatterns: [
+      {
+        protocol: "https",
+        hostname: "example.com",
+        port: "",
+        pathname: "/images/**",
+      },
+    ],
+  },
+};
+
+export default nextConfig;
+```
+
+```typescript
+// 使用远程图片
+import Image from 'next/image';
+
+export function RemoteImage() {
+  return (
+    <Image
+      src="https://example.com/images/photo.jpg"
+      alt="远程图片"
+      width={500}
+      height={300}
+    />
+  );
+}
+```
+
+---
+
+## Vercel Blob 存储
+
+### 安装和配置
+
+```bash
+npm install @vercel/blob
+```
+
+```env
+# .env
+BLOB_READ_WRITE_TOKEN="your-blob-token"
+```
+
+### 上传到 Blob
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { put } from "@vercel/blob";
+
+export async function uploadToBlob(formData: FormData) {
+  const file = formData.get("file") as File;
+
+  if (!file) {
+    return { error: "没有文件" };
+  }
+
+  try {
+    const blob = await put(file.name, file, {
+      access: "public",
+    });
+
+    return {
+      success: true,
+      url: blob.url,
+      downloadUrl: blob.downloadUrl,
+    };
+  } catch (error) {
+    return { error: "上传失败" };
+  }
+}
+```
+
+### 列出文件
+
+```typescript
+// app/api/files/route.ts
+import { list } from "@vercel/blob";
+import { NextResponse } from "next/server";
+
+export async function GET() {
+  const blobs = await list();
+
+  return NextResponse.json({
+    files: blobs.blobs,
+  });
+}
+```
+
+### 删除文件
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { del } from "@vercel/blob";
+
+export async function deleteFile(url: string) {
+  try {
+    await del(url);
+    return { success: true };
+  } catch (error) {
+    return { error: "删除失败" };
+  }
+}
+```
+
+---
+
+## Cloudflare R2 存储
+
+### 配置 R2
+
+```typescript
+// lib/r2.ts
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+
+const r2Client = new S3Client({
+  region: "auto",
+  endpoint: process.env.CLOUDFLARE_R2_ENDPOINT,
+  credentials: {
+    accessKeyId: process.env.CLOUDFLARE_R2_ACCESS_KEY_ID!,
+    secretAccessKey: process.env.CLOUDFLARE_R2_SECRET_ACCESS_KEY!,
+  },
+});
+
+export async function uploadToR2({ file, key }: { file: File; key: string }) {
+  const arrayBuffer = await file.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+
+  const command = new PutObjectCommand({
+    Bucket: process.env.CLOUDFLARE_R2_BUCKET!,
+    Key: key,
+    Body: buffer,
+    ContentType: file.type,
+  });
+
+  await r2Client.send(command);
+
+  return {
+    url: `${process.env.CLOUDFLARE_R2_PUBLIC_URL}/${key}`,
+  };
+}
+```
+
+### 使用 R2 上传
+
+```typescript
+// app/actions.ts
+"use server";
+
+import { uploadToR2 } from "@/lib/r2";
+
+export async function uploadFile(formData: FormData) {
+  const file = formData.get("file") as File;
+
+  if (!file) {
+    return { error: "没有文件" };
+  }
+
+  // 生成唯一键
+  const key = `${Date.now()}-${file.name}`;
+
+  try {
+    const { url } = await uploadToR2({ file, key });
+
+    return {
+      success: true,
+      url,
+    };
+  } catch (error) {
+    return { error: "上传失败" };
+  }
+}
+```
+
+---
+
+## 大文件上传
+
+### 分块上传
+
+```typescript
+// lib/chunked-upload.ts
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
+
+export async function uploadLargeFile(file: File) {
+  const chunks = Math.ceil(file.size / CHUNK_SIZE);
+  const uploadId = `${Date.now()}-${file.name}`;
+
+  for (let i = 0; i < chunks; i++) {
+    const start = i * CHUNK_SIZE;
+    const end = Math.min(start + CHUNK_SIZE, file.size);
+    const chunk = file.slice(start, end);
+
+    const formData = new FormData();
+    formData.append("chunk", chunk);
+    formData.append("chunkIndex", i.toString());
+    formData.append("totalChunks", chunks.toString());
+    formData.append("uploadId", uploadId);
+
+    await fetch("/api/upload-chunk", {
+      method: "POST",
+      body: formData,
+    });
+  }
+
+  // 合并分块
+  await fetch("/api/merge-chunks", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ uploadId, fileName: file.name }),
+  });
+}
+```
+
+### 客户端进度显示
+
+```typescript
+// components/ProgressBar.tsx
+"use client";
+
+import { useState } from 'react';
+
+export function ProgressBar() {
+  const [progress, setProgress] = useState(0);
+
+  async function handleUpload(file: File) {
+    const chunks = Math.ceil(file.size / (5 * 1024 * 1024));
+
+    for (let i = 0; i < chunks; i++) {
+      // 上传分块
+      await uploadChunk(file, i);
+
+      // 更新进度
+      setProgress(((i + 1) / chunks) * 100);
+    }
+  }
+
+  return (
+    <div>
+      <div
+        style={{
+          width: '100%',
+          height: '10px',
+          backgroundColor: '#eee',
+        }}
+      >
+        <div
+          style={{
+            width: `${progress}%`,
+            height: '100%',
+            backgroundColor: '#4CAF50',
+          }}
+        />
+      </div>
+      <p>{Math.round(progress)}%</p>
+    </div>
+  );
+}
+```
+
+---
+
+## 媒体库管理
+
+### 图片列表
+
+```typescript
+// app/admin/media/page.tsx
+import { list } from '@vercel/blob';
+
+export default async function MediaLibraryPage() {
+  const { blobs } = await list({ limit: 100 });
+
+  return (
+    <div>
+      <h1>媒体库</h1>
+
+      <div className="grid">
+        {blobs.map((blob) => (
+          <div key={blob.url} className="media-item">
+            <img src={blob.url} alt={blob.pathname} />
+            <p>{blob.pathname}</p>
+            <p>{(blob.size / 1024).toFixed(2)} KB</p>
+            <DeleteButton url={blob.url} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+### 删除按钮
+
+```typescript
+// components/DeleteButton.tsx
+"use client";
+
+import { useFormState } from 'react-dom';
+import { deleteFile } from '@/app/actions';
+
+export function DeleteButton({ url }: { url: string }) {
+  const [state, formAction] = useFormState(
+    deleteFile.bind(null, url),
+    null
+  );
+
+  return (
+    <form action={formAction}>
+      <button type="submit">删除</button>
+      {state?.error && <span>{state.error}</span>}
+    </form>
+  );
+}
+```
+
+---
+
+## 文件下载
+
+### 下载文件
+
+```typescript
+// app/api/download/[filename]/route.ts
+import { NextResponse } from "next/server";
+import { join } from "path";
+
+export async function GET(
+  request: Request,
+  { params }: { params: { filename: string } }
+) {
+  const filePath = join(process.cwd(), "uploads", params.filename);
+
+  const file = Bun.file(filePath);
+
+  return new NextResponse(file);
+}
+```
+
+### 客户端下载
+
+```typescript
+// components/DownloadButton.tsx
+"use client";
+
+export function DownloadButton({ filename }: { filename: string }) {
+  const handleDownload = async () => {
+    const response = await fetch(`/api/download/${filename}`);
+    const blob = await response.blob();
+
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.click();
+    window.URL.revokeObjectURL(url);
+  };
+
+  return (
+    <button onClick={handleDownload}>
+      下载
+    </button>
+  );
+}
+```
+
+---
+
+## 最佳实践
+
+### ✅ 推荐做法
+
+1. **验证文件类型**
+
+```typescript
+if (!file.type.startsWith("image/")) {
+  return { error: "只能上传图片" };
+}
+```
+
+2. **限制文件大小**
+
+```typescript
+const MAX_SIZE = 5 * 1024 * 1024; // 5MB
+if (file.size > MAX_SIZE) {
+  return { error: "文件太大" };
+}
+```
+
+3. **使用云存储**
+
+```typescript
+// 生产环境使用云存储
+const { url } = await put(file.name, file, {
+  access: "public",
+});
+```
+
+4. **优化图片**
+
+```typescript
+import Image from 'next/image';
+
+<Image
+  src={src}
+  alt={alt}
+  width={width}
+  height={height}
+/>
+```
+
+### ❌ 避免做法
+
+1. **不要信任客户端验证**
+
+```typescript
+// ❌ 只验证客户端
+<input accept="image/*" />
+
+// ✅ 服务端也要验证
+if (!file.type.startsWith('image/')) {
+  return { error: '无效的文件类型' };
+}
+```
+
+2. **不要存储大文件在本地**
+
+```typescript
+// ❌ 存储在本地
+await writeFile("./public/uploads/large-file.mp4", buffer);
+
+// ✅ 使用云存储
+await uploadToR2({ file, key });
+```
+
+3. **不要忘记清理临时文件**
+
+```typescript
+// ✅ 定期清理临时文件
+async function cleanupTempFiles() {
+  const tempDir = "./temp";
+  const files = await fs.readdir(tempDir);
+
+  for (const file of files) {
+    const filePath = join(tempDir, file);
+    const stats = await fs.stat(filePath);
+
+    // 删除超过 1 小时的文件
+    if (Date.now() - stats.mtimeMs > 3600000) {
+      await fs.unlink(filePath);
+    }
+  }
+}
+```
+
+---
+
+## 常见问题
+
+**Q: 应该使用本地存储还是云存储？**
+
+A:
+
+- **开发环境**：本地存储
+- **生产环境**：云存储（Vercel Blob、Cloudflare R2、AWS S3）
+
+**Q: 如何处理大文件上传？**
+
+A: 使用分块上传：
+
+```typescript
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB
+// 将文件分成多个分块上传
+```
+
+**Q: Next.js Image 组件支持哪些格式？**
+
+A: 支持常见的图片格式（JPG、PNG、WebP、AVIF、GIF、SVG），并会自动选择最优格式。
+
+---
+
+## 总结
+
+本文我们学习了：
+
+✅ **文件上传基础**
+
+- 客户端上传表单
+- Server Action 处理
+- 文件验证
+
+✅ **图片优化**
+
+- next/image 组件
+- 自动优化
+- 远程图片
+
+✅ **Vercel Blob 存储**
+
+- 上传文件
+- 列出文件
+- 删除文件
+
+✅ **Cloudflare R2 存储**
+
+- 配置 R2
+- 上传文件
+- 公开访问
+
+✅ **大文件上传**
+
+- 分块上传
+- 进度显示
+
+✅ **媒体库管理**
+
+- 文件列表
+- 删除功能
+
+✅ **文件下载**
+
+- 服务端下载
+- 客户端下载
+
+现在你应该能够处理各种文件上传和媒体管理场景。下一步，我们将学习 **性能优化实战**。
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将详细探讨：
+
+- 代码分割和懒加载
+- 图片优化
+- 字体优化
+- Bundle 分析
+- 并行数据获取
+- Core Web Vitals
+
+继续阅读：[10 性能优化实战](./10-performance-optimization.mdx)

@@ -1,0 +1,314 @@
+---
+title: "13. 分布式锁实现：Redis 分布式锁与 Redlock 算法"
+date: "2026-03-23"
+summary: "深入理解分布式锁的实现原理，掌握 Redis 分布式锁和 Redlock 算法。"
+tags: ["Redis", "分布式锁", "并发控制"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 13
+---
+
+## 前言
+
+在分布式系统中，如何保证多个节点不会同时操作同一资源？分布式锁是解决方案。
+
+---
+
+## 基础分布式锁
+
+### 实现原理
+
+```
+1. SET key value NX EX ttl
+   - NX: 仅当 key 不存在时设置
+   - EX: 设置过期时间
+
+2. 执行业务逻辑
+
+3. 释放锁（Lua 脚本保证原子性）
+```
+
+### 基础实现
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+class DistributedLock {
+  constructor(private redis: Redis) {}
+
+  async acquire(lockName: string, ttl: number = 30): Promise<string | null> {
+    const lockKey = `lock:${lockName}`;
+    const lockValue = `${Date.now()}-${Math.random()}`;
+
+    const result = await this.redis.set(lockKey, lockValue, "NX", "EX", ttl);
+
+    return result === "OK" ? lockValue : null;
+  }
+
+  async release(lockName: string, lockValue: string): Promise<boolean> {
+    const lockKey = `lock:${lockName}`;
+
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      else
+        return 0
+      end
+    `;
+
+    const result = await this.redis.eval(script, 1, lockKey, lockValue);
+    return result === 1;
+  }
+
+  async extend(
+    lockName: string,
+    lockValue: string,
+    ttl: number
+  ): Promise<boolean> {
+    const lockKey = `lock:${lockName}`;
+
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("expire", KEYS[1], ARGV[2])
+      else
+        return 0
+      end
+    `;
+
+    const result = await this.redis.eval(script, 1, lockKey, lockValue, ttl);
+    return result === 1;
+  }
+}
+
+// 使用
+const lock = new DistributedLock(redis);
+
+async function process() {
+  const lockValue = await lock.acquire("resource", 30);
+
+  if (!lockValue) {
+    throw new Error("获取锁失败");
+  }
+
+  try {
+    await doSomething();
+  } finally {
+    await lock.release("resource", lockValue);
+  }
+}
+```
+
+---
+
+## Redlock 算法
+
+### 实现原理
+
+```
+1. 获取当前时间戳
+2. 按顺序依次向 N 个 Redis 节点获取锁
+3. 计算获取锁消耗的时间
+4. 如果在大多数节点获取成功，且时间小于锁的有效期，则获取成功
+5. 释放锁时向所有节点发送释放命令
+```
+
+### 实现
+
+```typescript
+class Redlock {
+  private nodes: Redis[];
+
+  constructor(redisUrls: string[]) {
+    this.nodes = redisUrls.map((url) => new Redis(url));
+  }
+
+  async acquire(lockName: string, ttl: number = 30): Promise<string | null> {
+    const lockValue = `${Date.now()}-${Math.random()}`;
+    const startTime = Date.now();
+    let successCount = 0;
+
+    // 向所有节点请求锁
+    for (const redis of this.nodes) {
+      try {
+        const result = await redis.set(
+          `lock:${lockName}`,
+          lockValue,
+          "PX",
+          ttl * 1000,
+          "NX"
+        );
+        if (result === "OK") {
+          successCount++;
+        }
+      } catch (error) {
+        // 节点失败，继续尝试下一个
+        continue;
+      }
+    }
+
+    const elapsedTime = (Date.now() - startTime) / 1000;
+    const majority = Math.floor(this.nodes.length / 2) + 1;
+
+    // 检查是否在大多数节点获取成功
+    if (successCount >= majority && elapsedTime < ttl) {
+      return lockValue;
+    }
+
+    // 失败，释放已获取的锁
+    this.release(lockName, lockValue);
+    return null;
+  }
+
+  async release(lockName: string, lockValue: string): Promise<void> {
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      else
+        return 0
+      end
+    `;
+
+    for (const redis of this.nodes) {
+      try {
+        await redis.eval(script, 1, `lock:${lockName}`, lockValue);
+      } catch (error) {
+        continue;
+      }
+    }
+  }
+}
+
+// 使用
+const redlock = new Redlock([
+  "redis://localhost:6379",
+  "redis://localhost:6380",
+  "redis://localhost:6381",
+]);
+```
+
+---
+
+## 锁续期
+
+```typescript
+class AutoRenewLock {
+  private renewTimer?: NodeJS.Timeout;
+
+  constructor(
+    private lock: DistributedLock,
+    private lockName: string,
+    private lockValue: string,
+    private ttl: number = 30
+  ) {
+    this.startRenew();
+  }
+
+  private startRenew() {
+    // 每 ttl/3 秒续期一次
+    const interval = (this.ttl * 1000) / 3;
+
+    this.renewTimer = setInterval(async () => {
+      const success = await this.lock.extend(
+        this.lockName,
+        this.lockValue,
+        this.ttl
+      );
+      if (!success) {
+        this.stopRenew();
+        throw new Error("锁续期失败");
+      }
+    }, interval);
+  }
+
+  stopRenew() {
+    if (this.renewTimer) {
+      clearInterval(this.renewTimer);
+      this.renewTimer = undefined;
+    }
+  }
+
+  async release() {
+    this.stopRenew();
+    return await this.lock.release(this.lockName, this.lockValue);
+  }
+}
+
+// 使用
+const lock = new DistributedLock(redis);
+const lockValue = await lock.acquire("resource", 30);
+
+if (lockValue) {
+  const autoRenewLock = new AutoRenewLock(lock, "resource", lockValue, 30);
+
+  try {
+    await doSomething();
+  } finally {
+    await autoRenewLock.release();
+  }
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 设置合理的过期时间
+
+```typescript
+// 根据业务执行时间设置
+const ttl = estimatedTime * 2;
+await lock.acquire("resource", ttl);
+```
+
+### 2. 唯一值标识锁
+
+```typescript
+// 使用唯一标识，避免误删其他客户端的锁
+const lockValue = `${process.pid}-${Date.now()}-${Math.random()}`;
+```
+
+### 3. 使用 Lua 脚本
+
+```typescript
+// 所有操作使用 Lua 脚本保证原子性
+const script = `
+  if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+  else
+    return 0
+  end
+`;
+```
+
+---
+
+## 常见问题
+
+### Q1: 锁过期了但业务还在执行？
+
+**A**: 使用锁续期机制（见上文）
+
+### Q2: Redis 宕机导致锁丢失？
+
+**A**: 使用 Redlock 算法或 ZooKeeper 等专用锁服务
+
+---
+
+## 总结
+
+本文我们学习了：
+
+✅ 基础分布式锁实现
+✅ Redlock 算法
+✅ 锁续期机制
+✅ 最佳实践
+
+---
+
+## 下一步
+
+继续阅读：[14. 发布订阅机制](./14-pub-sub-mechanism.mdx)

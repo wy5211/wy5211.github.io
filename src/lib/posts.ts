@@ -91,51 +91,6 @@ export function getAllPosts(): PostMeta[] {
     });
 }
 
-// 按类别分组获取文章
-export function getPostsByCategory(): Record<string, PostMeta[]> {
-  const posts = getAllPosts();
-  const grouped: Record<string, PostMeta[]> = {};
-
-  posts.forEach((post) => {
-    const category = post.category || "未分类";
-    if (!grouped[category]) {
-      grouped[category] = [];
-    }
-    grouped[category].push(post);
-  });
-
-  // 创建有序的分组对象
-  const orderedGrouped: Record<string, PostMeta[]> = {};
-
-  // 定义分类顺序
-  const categoryOrder = [
-    "前端",
-    "后端",
-    "nestjs",
-    "全栈",
-    "测试",
-    "运维",
-    "大模型",
-    "提效工具",
-  ];
-
-  // 按指定顺序添加分类
-  categoryOrder.forEach((category) => {
-    if (grouped[category]) {
-      orderedGrouped[category] = grouped[category];
-    }
-  });
-
-  // 添加其他未在顺序列表中的分类
-  Object.keys(grouped).forEach((category) => {
-    if (!categoryOrder.includes(category)) {
-      orderedGrouped[category] = grouped[category];
-    }
-  });
-
-  return orderedGrouped;
-}
-
 // 在指定分类目录中查找匹配 slug 的文件
 function findFileByCategoryAndSlug(
   category: string,

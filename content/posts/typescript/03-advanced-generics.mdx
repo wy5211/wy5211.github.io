@@ -1,0 +1,673 @@
+---
+title: "03 泛型高级应用"
+date: "2026-03-23"
+summary: "超越基础泛型，掌握多参数泛型、泛型约束、递归泛型等高级模式，构建类型安全的通用 API。"
+tags: ["TypeScript", "泛型", "类型约束", "递归类型"]
+category: "typescript"
+draft: false
+series: "TypeScript 高级技巧系列"
+seriesOrder: 3
+---
+
+## 前言
+
+泛型是 TypeScript 类型系统中最强大的特性之一。很多开发者只停留在使用 `Array<T>` 这样的基础泛型上，但实际上泛型可以实现远超于此的高级功能。
+
+本文将深入探讨多参数泛型、泛型约束、默认泛型参数、递归泛型等高级模式，帮助你构建更加灵活、类型安全的通用 API。
+
+## 核心概念
+
+### 多个泛型参数
+
+泛型可以有多个参数，它们之间可以相互约束：
+
+```typescript
+function merge<T, U>(obj1: T, obj2: U): T & U {
+  return { ...obj1, ...obj2 };
+}
+
+const result = merge(
+  { id: 1, name: "Alice" },
+  { email: "alice@example.com", age: 30 }
+);
+// result: { id: number; name: string; email: string; age: number }
+```
+
+### 泛型约束
+
+使用 `extends` 关键字约束泛型的类型范围：
+
+```typescript
+// 基础约束
+function length<T extends { length: number }>(value: T): number {
+  return value.length;
+}
+
+length("hello"); // ✅ 5
+length([1, 2, 3]); // ✅ 3
+length({ length: 10 }); // ✅ 10
+length(123); // ❌ number 没有 length 属性
+
+// 条件约束
+type ElementType<T extends readonly any[]> = T extends readonly (infer E)[]
+  ? E
+  : never;
+
+type Element1 = ElementType<[string, number]>; // string | number
+type Element2 = ElementType<string[]>; // string
+```
+
+### 默认泛型参数
+
+为泛型参数提供默认值：
+
+```typescript
+function createMap<K extends string | number = string, V = any>(
+  initial?: Partial<Record<K, V>>
+): Map<K, V> {
+  return new Map(Object.entries(initial || {}) as [K, V][]);
+}
+
+const map1 = createMap(); // Map<string, any>
+const map2 = createMap<number, string>(); // Map<number, string>
+```
+
+## 高级技巧
+
+### 技巧 1：深度操作泛型
+
+实现对嵌套对象的深度操作：
+
+```typescript
+// 深度 Readonly
+type DeepReadonly<T> = {
+  readonly [P in keyof T]: T[P] extends object ? DeepReadonly<T[P]> : T[P];
+};
+
+interface User {
+  id: number;
+  profile: {
+    name: string;
+    address: {
+      city: string;
+      country: string;
+    };
+  };
+}
+
+type ReadonlyUser = DeepReadonly<User>;
+// 所有属性都是 readonly，包括嵌套对象
+
+// 深度 Partial
+type DeepPartial<T> = {
+  [P in keyof T]?: T[P] extends object ? DeepPartial<T[P]> : T[P];
+};
+
+// 深度 Required
+type DeepRequired<T> = {
+  [P in keyof T]-?: T[P] extends object ? DeepRequired<T[P]> : T[P];
+};
+
+// 深度 Nullable
+type DeepNullable<T> = {
+  [P in keyof T]?: T[P] extends object ? DeepNullable<T[P]> : T[P] | null;
+};
+
+// 使用示例
+function updateUser(user: User, updates: DeepPartial<User>): User {
+  return {
+    ...user,
+    ...updates,
+    profile: {
+      ...user.profile,
+      ...updates.profile,
+      address: {
+        ...user.profile.address,
+        ...updates.profile?.address,
+      },
+    },
+  };
+}
+```
+
+---
+
+### 技巧 2：类型安全的路径访问
+
+实现一个能够安全访问嵌套对象路径的类型：
+
+```typescript
+// 提取路径对应的类型
+type Path<T, K extends string> = K extends `${infer Key}.${infer Rest}`
+  ? Key extends keyof T
+    ? Path<T[Key], Rest>
+    : never
+  : K extends keyof T
+    ? T[K]
+    : never;
+
+// 实现路径访问函数
+function get<T, K extends string>(obj: T, path: K): Path<T, K> {
+  const keys = path.split(".");
+  let result: any = obj;
+  for (const key of keys) {
+    result = result?.[key];
+  }
+  return result;
+}
+
+// 使用示例
+interface User {
+  id: number;
+  name: string;
+  profile: {
+    email: string;
+    address: {
+      city: string;
+      country: string;
+    };
+  };
+}
+
+const user: User = {
+  id: 1,
+  name: "Alice",
+  profile: {
+    email: "alice@example.com",
+    address: {
+      city: "New York",
+      country: "USA",
+    },
+  },
+};
+
+const city = get(user, "profile.address.city");
+// city 类型: string
+
+const invalid = get(user, "profile.address.unknown");
+// invalid 类型: never
+
+// 实现路径设置函数
+function set<T, K extends string>(obj: T, path: K, value: Path<T, K>): void {
+  const keys = path.split(".");
+  const lastKey = keys.pop()!;
+  let target: any = obj;
+  for (const key of keys) {
+    if (!target[key]) {
+      target[key] = {};
+    }
+    target = target[key];
+  }
+  target[lastKey] = value;
+}
+
+set(user, "profile.address.city", "Boston");
+```
+
+---
+
+### 技巧 3：类型链式 API
+
+构建类型安全的链式调用 API：
+
+```typescript
+class QueryBuilder<T> {
+  private conditions: string[] = [];
+
+  where<K extends keyof T>(
+    field: K,
+    operator: "=" | "!=" | ">" | "<" | ">=" | "<=",
+    value: T[K]
+  ): this {
+    this.conditions.push(
+      `${String(field)} ${operator} ${JSON.stringify(value)}`
+    );
+    return this;
+  }
+
+  whereIn<K extends keyof T>(field: K, values: T[K][]): this {
+    this.conditions.push(
+      `${String(field)} IN (${values.map((v) => JSON.stringify(v)).join(", ")})`
+    );
+    return this;
+  }
+
+  orderBy<K extends keyof T>(
+    field: K,
+    direction: "ASC" | "DESC" = "ASC"
+  ): this {
+    this.conditions.push(`ORDER BY ${String(field)} ${direction}`);
+    return this;
+  }
+
+  limit(count: number): this {
+    this.conditions.push(`LIMIT ${count}`);
+    return this;
+  }
+
+  build(): string {
+    return `SELECT * FROM table WHERE ${this.conditions.join(" AND ")}`;
+  }
+}
+
+// 使用示例
+interface User {
+  id: number;
+  name: string;
+  age: number;
+  email: string;
+}
+
+const query = new QueryBuilder<User>()
+  .where("age", ">=", 18)
+  .whereIn("name", ["Alice", "Bob"])
+  .orderBy("name", "ASC")
+  .limit(10)
+  .build();
+
+// 类型安全：
+// query.where('age', '>=', 18)    ✅
+// query.where('age', '>=', '18')  ❌ age 是 number
+// query.where('unknown', '=', 1)  ❌ unknown 不存在
+```
+
+---
+
+### 技巧 4：泛型工厂模式
+
+使用泛型实现工厂模式：
+
+```typescript
+// 基础类型
+interface Constructor<T> {
+  new (...args: any[]): T;
+}
+
+// 泛型工厂
+interface Factory<T> {
+  create(type: string): T;
+}
+
+// 具体工厂实现
+class UserFactory implements Factory<User> {
+  private types = new Map<string, Constructor<User>>();
+
+  registerType(type: string, constructor: Constructor<User>): void {
+    this.types.set(type, constructor);
+  }
+
+  create(type: string): User {
+    const Constructor = this.types.get(type);
+    if (!Constructor) {
+      throw new Error(`Unknown type: ${type}`);
+    }
+    return new Constructor();
+  }
+}
+
+// 使用示例
+class AdminUser implements User {
+  id = 1;
+  name = "Admin";
+  permissions = ["read", "write", "delete"];
+}
+
+class RegularUser implements User {
+  id = 2;
+  name = "User";
+  permissions = ["read"];
+}
+
+const factory = new UserFactory();
+factory.registerType("admin", AdminUser);
+factory.registerType("user", RegularUser);
+
+const admin = factory.create("admin");
+const user = factory.create("user");
+```
+
+---
+
+### 技巧 5：类型安全的依赖注入容器
+
+```typescript
+// 依赖注入容器
+interface DIContainer {
+  register<T>(token: string, constructor: new (...args: any[]) => T): void;
+  resolve<T>(token: string): T;
+}
+
+class Container implements DIContainer {
+  private services = new Map<string, any>();
+
+  register<T>(token: string, constructor: new (...args: any[]) => T): void {
+    this.services.set(token, constructor);
+  }
+
+  resolve<T>(token: string): T {
+    const constructor = this.services.get(token);
+    if (!constructor) {
+      throw new Error(`Service not found: ${token}`);
+    }
+    return new constructor();
+  }
+}
+
+// 使用示例
+interface Logger {
+  log(message: string): void;
+}
+
+interface Database {
+  query(sql: string): any[];
+}
+
+class ConsoleLogger implements Logger {
+  log(message: string) {
+    console.log(`[LOG] ${message}`);
+  }
+}
+
+class PostgreSQL implements Database {
+  query(sql: string) {
+    // 实际查询逻辑
+    return [];
+  }
+}
+
+class UserService {
+  constructor(
+    private logger: Logger,
+    private db: Database
+  ) {}
+
+  getUser(id: number) {
+    this.logger.log(`Fetching user ${id}`);
+    return this.db.query(`SELECT * FROM users WHERE id = ${id}`);
+  }
+}
+
+const container = new Container();
+container.register("Logger", ConsoleLogger);
+container.register("Database", PostgreSQL);
+container.register("UserService", UserService);
+
+// 手动注入依赖
+const logger = container.resolve<Logger>("Logger");
+const db = container.resolve<Database>("Database");
+const userService = new UserService(logger, db);
+```
+
+---
+
+### 技巧 6：类型验证器
+
+```typescript
+// 验证器类型
+type Validator<T> = {
+  validate(value: unknown): value is T;
+};
+
+// 创建验证器工厂
+function createValidator<T>(check: (value: unknown) => boolean): Validator<T> {
+  return {
+    validate: (value: unknown): value is T => check(value),
+  };
+}
+
+// 常用验证器
+const stringValidator = createValidator<string>(
+  (value): value is string => typeof value === "string"
+);
+
+const numberValidator = createValidator<number>(
+  (value): value is number => typeof value === "number" && !isNaN(value)
+);
+
+const objectValidator = createValidator<Record<string, unknown>>(
+  (value): value is Record<string, unknown> =>
+    typeof value === "object" && value !== null && !Array.isArray(value)
+);
+
+// 复合验证器
+function arrayValidator<T>(itemValidator: Validator<T>): Validator<T[]> {
+  return {
+    validate: (value): value is T[] =>
+      Array.isArray(value) &&
+      value.every((item) => itemValidator.validate(item)),
+  };
+}
+
+function unionValidator<T extends unknown[]>(
+  ...validators: { [K in keyof T]: Validator<T[K]> }
+): Validator<T[number]> {
+  return {
+    validate: (value): value is T[number] =>
+      validators.some((v) => v.validate(value)),
+  };
+}
+
+// 使用示例
+interface User {
+  id: number;
+  name: string;
+  email: string;
+}
+
+const userValidator: Validator<User> = createValidator<User>((value) => {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "id" in value &&
+    "name" in value &&
+    "email" in value &&
+    numberValidator.validate((value as any).id) &&
+    stringValidator.validate((value as any).name) &&
+    stringValidator.validate((value as any).email)
+  );
+});
+
+function processData<T>(data: unknown, validator: Validator<T>): T {
+  if (validator.validate(data)) {
+    return data;
+  }
+  throw new Error("Invalid data");
+}
+
+// ✅ 类型安全
+const validUser = processData(
+  { id: 1, name: "Alice", email: "alice@example.com" },
+  userValidator
+);
+
+// ❌ 类型错误（运行时抛出异常）
+const invalidUser = processData(
+  { id: "1", name: "Alice", email: "alice@example.com" },
+  userValidator
+);
+```
+
+## 实战应用
+
+### 类型安全的 API 客户端
+
+```typescript
+// HTTP 方法类型
+type HTTPMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+
+// API 端点配置
+type EndpointConfig<TMethod extends HTTPMethod, TParams, TResponse> = {
+  method: TMethod;
+  path: string;
+};
+
+// API 客户端
+class APIClient {
+  private baseUrl: string;
+
+  constructor(baseUrl: string) {
+    this.baseUrl = baseUrl;
+  }
+
+  async request<TMethod extends HTTPMethod, TParams, TResponse>(
+    config: EndpointConfig<TMethod, TParams, TResponse>,
+    params?: TParams
+  ): Promise<TResponse> {
+    const url = new URL(config.path, this.baseUrl);
+
+    let options: RequestInit = {
+      method: config.method,
+    };
+
+    if (config.method === "GET") {
+      // GET 请求使用查询参数
+      if (params) {
+        Object.entries(params as any).forEach(([key, value]) => {
+          url.searchParams.set(key, String(value));
+        });
+      }
+    } else {
+      // 其他方法使用请求体
+      options.body = JSON.stringify(params);
+      options.headers = {
+        "Content-Type": "application/json",
+      };
+    }
+
+    const response = await fetch(url.toString(), options);
+    return response.json();
+  }
+}
+
+// 定义 API 端点
+interface User {
+  id: number;
+  name: string;
+  email: string;
+}
+
+interface CreateUserParams {
+  name: string;
+  email: string;
+}
+
+interface UpdateUserParams {
+  id: number;
+  changes: Partial<Omit<User, "id">>;
+}
+
+// API 定义
+const api = new APIClient("https://api.example.com");
+
+// ✅ 类型安全
+api.request({ method: "GET", path: "/users" });
+api.request({ method: "GET", path: "/users/:id" }, { id: 1 });
+api.request(
+  { method: "POST", path: "/users" },
+  { name: "Alice", email: "alice@example.com" }
+);
+api.request(
+  { method: "PUT", path: "/users/:id" },
+  { id: 1, changes: { name: "Bob" } }
+);
+
+// ❌ 类型错误
+api.request({ method: "GET", path: "/users/:id" }, { id: "1" }); // id 应该是 number
+api.request({ method: "POST", path: "/users" }, { name: "Alice" }); // 缺少 email
+```
+
+## 避坑指南
+
+### ❌ 错误 1：过度使用泛型导致类型复杂
+
+```typescript
+// ❌ 过于复杂
+function veryComplex<T extends { a: U }, U extends { b: V }, V extends string>(
+  arg: T
+): V {
+  return arg.a.b;
+}
+
+// ✅ 简化
+function simple<T extends { a: { b: string } }>(arg: T): string {
+  return arg.a.b;
+}
+```
+
+---
+
+### ❌ 错误 2：泛型约束过于宽松
+
+```typescript
+// ❌ 约束太宽松
+function badGetLength<T extends any>(value: T): number {
+  return (value as any).length; // 需要类型断言
+}
+
+// ✅ 正确约束
+function goodGetLength<T extends { length: number }>(value: T): number {
+  return value.length; // 类型安全
+}
+```
+
+---
+
+### ❌ 错误 3：忽略泛型参数的可推断性
+
+```typescript
+// ❌ 用户必须手动指定泛型
+function identity<T>(value: T): T {
+  return value;
+}
+const result = identity<string>("hello");
+
+// ✅ 让 TypeScript 推断
+const result = identity("hello");
+```
+
+---
+
+### ❌ 错误 4：递归泛型导致的性能问题
+
+```typescript
+// ❌ 可能导致性能问题
+type BadDeepType<T> = T extends object
+  ? { [K in keyof T]: BadDeepType<T[K]> }
+  : T
+
+// ✅ 添加深度限制
+type GoodDeepType<T, Depth extends number = 5> =
+  Depth extends 0
+    ? T
+    : T extends object
+      ? { [K in keyof T]: GoodDeepType<T[K], Depth extends 10 ? 9 : Depth - 1> }
+      : T
+```
+
+## 总结
+
+### 核心要点
+
+1. **多参数泛型**：实现复杂的类型关系
+2. **泛型约束**：限制泛型的类型范围
+3. **默认泛型参数**：提供合理的默认值
+4. **递归泛型**：处理嵌套类型结构
+5. **类型推断**：让 TypeScript 自动推断泛型类型
+
+### 实用模式
+
+- **深度操作**：DeepReadonly、DeepPartial、DeepRequired
+- **类型路径访问**：安全的嵌套对象访问
+- **链式 API**：类型安全的构建器模式
+- **工厂模式**：泛型工厂和依赖注入
+- **类型验证**：运行时和编译期双重验证
+
+## 参考资料
+
+- [TypeScript Handbook: Generics](https://www.typescriptlang.org/docs/handbook/2/generics.html)
+- [TypeScript Handbook: Generic Constraints](https://www.typescriptlang.org/docs/handbook/2/generics.html#generic-constraints)
+
+---
+
+- **上一篇**：[02 模板字面量类型实战](../02-template-literal-types.mdx)
+- **下一篇**：[04 品牌类型与名义类型](../04-branding-nominal-typing.mdx)

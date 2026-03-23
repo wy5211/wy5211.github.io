@@ -1,0 +1,534 @@
+---
+title: "10. Sorted Set 排行榜系统：游戏排名、延时队列与范围查询"
+date: "2026-03-23"
+summary: "使用 Redis Sorted Set 构建高性能排行榜，实现游戏排名、延时队列和范围查询功能。"
+tags: ["Redis", "Sorted Set", "排行榜"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 10
+---
+
+## 前言
+
+Sorted Set 是 Redis 中最强大的数据结构之一。它既有序又唯一，还支持按分数排序。本文将学习：
+
+- 🏆 游戏排行榜
+- ⏱️ 延时队列
+- 📊 范围查询
+- 📈 实时统计
+
+---
+
+## 游戏排行榜
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+class Leaderboard {
+  constructor(
+    private redis: Redis,
+    private key: string
+  ) {}
+
+  // 更新分数
+  async updateScore(member: string, score: number) {
+    return await this.redis.zadd(this.key, score, member);
+  }
+
+  // 增加分数
+  async incrementScore(member: string, increment: number) {
+    return await this.redis.zincrby(this.key, increment, member);
+  }
+
+  // 获取排名（从0开始，分数相同时按字典序）
+  async getRank(member: string) {
+    const rank = await this.redis.zrevrank(this.key, member);
+    return rank !== null ? rank + 1 : null; // 转为从1开始
+  }
+
+  // 获取分数
+  async getScore(member: string) {
+    const score = await this.redis.zscore(this.key, member);
+    return score !== null ? parseFloat(score) : null;
+  }
+
+  // 获取 Top N
+  async getTopN(n: number) {
+    return await this.redis.zrevrange(this.key, 0, n - 1, "WITHSCORES");
+  }
+
+  // 获取指定范围排名
+  async getRange(start: number, end: number) {
+    return await this.redis.zrevrange(this.key, start, end, "WITHSCORES");
+  }
+
+  // 获取指定分数范围
+  async getRangeByScore(min: number, max: number) {
+    return await this.redis.zrevrangebyscore(this.key, max, min, "WITHSCORES");
+  }
+
+  // 获取总人数
+  async getTotalCount() {
+    return await this.redis.zcard(this.key);
+  }
+
+  // 获取指定分数范围内的人数
+  async getCountByScore(min: number, max: number) {
+    return await this.redis.zcount(this.key, min, max);
+  }
+
+  // 移除成员
+  async remove(member: string) {
+    return await this.redis.zrem(this.key, member);
+  }
+
+  // 获取成员排名信息（包含排名、分数）
+  async getMemberInfo(member: string) {
+    const rank = await this.getRank(member);
+    const score = await this.getScore(member);
+    return { rank, score, member };
+  }
+}
+
+// 使用示例
+const leaderboard = new Leaderboard(redis, "game:leaderboard");
+
+// 更新分数
+await leaderboard.updateScore("player:1", 1000);
+await leaderboard.updateScore("player:2", 1500);
+await leaderboard.updateScore("player:3", 1200);
+
+// 获取 Top 10
+const top10 = await leaderboard.getTopN(10);
+
+// 获取玩家排名
+const rank = await leaderboard.getRank("player:1"); // 3
+```
+
+---
+
+## 分页排行榜
+
+```typescript
+class PaginatedLeaderboard {
+  constructor(
+    private redis: Redis,
+    private key: string
+  ) {}
+
+  async getPage(page: number = 1, pageSize: number = 10) {
+    const start = (page - 1) * pageSize;
+    const end = start + pageSize - 1;
+
+    const members = await this.redis.zrevrange(
+      this.key,
+      start,
+      end,
+      "WITHSCORES"
+    );
+
+    const total = await this.redis.zcard(this.key);
+    const totalPages = Math.ceil(total / pageSize);
+
+    return {
+      data: this.formatMembers(members),
+      pagination: {
+        page,
+        pageSize,
+        total,
+        totalPages,
+        hasNext: page < totalPages,
+        hasPrev: page > 1,
+      },
+    };
+  }
+
+  private formatMembers(members: string[]) {
+    const result = [];
+    for (let i = 0; i < members.length; i += 2) {
+      result.push({
+        member: members[i],
+        score: parseFloat(members[i + 1]),
+      });
+    }
+    return result;
+  }
+}
+
+// 使用示例
+const paginated = new PaginatedLeaderboard(redis, "game:leaderboard");
+const page1 = await paginated.getPage(1, 10);
+```
+
+---
+
+## 延时队列
+
+```typescript
+class DelayedQueue {
+  constructor(
+    private redis: Redis,
+    private queueName: string
+  ) {}
+
+  // 添加延时任务（delay 为秒）
+  async add(task: any, delay: number) {
+    const executeTime = Math.floor(Date.now() / 1000) + delay;
+    return await this.redis.zadd(
+      `${this.queueName}:delayed`,
+      executeTime,
+      JSON.stringify(task)
+    );
+  }
+
+  // 获取到期的任务
+  async getReadyTasks(count: number = 10) {
+    const now = Math.floor(Date.now() / 1000);
+    const tasks = await this.redis.zrangebyscore(
+      `${this.queueName}:delayed`,
+      0,
+      now,
+      "LIMIT",
+      0,
+      count
+    );
+
+    return tasks.map((t) => JSON.parse(t));
+  }
+
+  // 移除已处理的任务
+  async removeTask(task: any) {
+    return await this.redis.zrem(
+      `${this.queueName}:delayed`,
+      JSON.stringify(task)
+    );
+  }
+
+  // 获取待处理任务数量
+  async getPendingCount() {
+    const now = Math.floor(Date.now() / 1000);
+    return await this.redis.zcount(`${this.queueName}:delayed`, 0, now);
+  }
+
+  // 清理过期任务
+  async cleanExpired() {
+    const now = Math.floor(Date.now() / 1000);
+    return await this.redis.zremrangebyscore(
+      `${this.queueName}:delayed`,
+      0,
+      now
+    );
+  }
+}
+
+// 使用示例
+const delayed = new DelayedQueue(redis, "queue:tasks");
+
+// 添加 5 分钟后执行的任务
+await delayed.add({ action: "send_email", to: "user@example.com" }, 300);
+
+// Worker 获取到期任务
+async function worker() {
+  const tasks = await delayed.getReadyTasks(10);
+  for (const task of tasks) {
+    try {
+      await processTask(task);
+      await delayed.removeTask(task);
+    } catch (error) {
+      console.error("任务处理失败:", error);
+    }
+  }
+}
+
+setInterval(worker, 1000);
+```
+
+---
+
+## 范围查询
+
+```typescript
+class RangeQuery {
+  constructor(
+    private redis: Redis,
+    private key: string
+  ) {}
+
+  // 查询分数范围内的成员
+  async getByScoreRange(min: number, max: number) {
+    return await this.redis.zrangebyscore(this.key, min, max, "WITHSCORES");
+  }
+
+  // 查询排名范围内的成员
+  async getByRankRange(start: number, end: number) {
+    return await this.redis.zrange(this.key, start, end, "WITHSCORES");
+  }
+
+  // 统计分数范围内的成员数量
+  async countByScoreRange(min: number, max: number) {
+    return await this.redis.zcount(this.key, min, max);
+  }
+
+  // 获取成员的分数排名
+  async getRankAndScore(member: string) {
+    const score = await this.redis.zscore(this.key, member);
+    const rank = await this.redis.zrevrank(this.key, member);
+
+    return {
+      member,
+      score: score !== null ? parseFloat(score) : null,
+      rank: rank !== null ? rank + 1 : null,
+    };
+  }
+
+  // 获取指定数量的前N名和后N名
+  async getTopAndBottom(n: number) {
+    const top = await this.redis.zrevrange(this.key, 0, n - 1, "WITHSCORES");
+    const bottom = await this.redis.zrange(this.key, 0, n - 1, "WITHSCORES");
+
+    return {
+      top: this.formatMembers(top),
+      bottom: this.formatMembers(bottom),
+    };
+  }
+
+  private formatMembers(members: string[]) {
+    const result = [];
+    for (let i = 0; i < members.length; i += 2) {
+      result.push({
+        member: members[i],
+        score: parseFloat(members[i + 1]),
+      });
+    }
+    return result;
+  }
+}
+```
+
+---
+
+## 实时统计
+
+```typescript
+class RealTimeStats {
+  constructor(private redis: Redis) {}
+
+  // 记录在线用户（分数为最后活跃时间）
+  async recordActivity(userId: string) {
+    const now = Date.now();
+    return await this.redis.zadd("stats:online", now, userId);
+  }
+
+  // 获取在线用户数（最近 N 秒活跃）
+  async getOnlineUserCount(seconds: number = 300) {
+    const threshold = Date.now() - seconds * 1000;
+    return await this.redis.zcount("stats:online", threshold, Date.now());
+  }
+
+  // 获取在线用户列表
+  async getOnlineUsers(seconds: number = 300) {
+    const threshold = Date.now() - seconds * 1000;
+    return await this.redis.zrangebyscore(
+      "stats:online",
+      threshold,
+      Date.now()
+    );
+  }
+
+  // 清理过期数据
+  async cleanExpired(seconds: number = 3600) {
+    const threshold = Date.now() - seconds * 1000;
+    return await this.redis.zremrangebyscore("stats:online", 0, threshold);
+  }
+
+  // 实时排行榜（按活跃度）
+  async getMostActiveUsers(limit: number = 10) {
+    return await this.redis.zrevrange(
+      "stats:activity",
+      0,
+      limit - 1,
+      "WITHSCORES"
+    );
+  }
+
+  // 增加活跃度
+  async incrementActivity(userId: string, score: number = 1) {
+    return await this.redis.zincrby("stats:activity", score, userId);
+  }
+}
+```
+
+---
+
+## 实际应用案例
+
+### 案例 1：多维度排行榜
+
+```typescript
+class MultiDimensionalLeaderboard {
+  constructor(private redis: Redis) {}
+
+  async updateScore(userId: string, dimension: string, score: number) {
+    const key = `leaderboard:${dimension}`;
+    await this.redis.zadd(key, score, userId);
+  }
+
+  async getRank(userId: string, dimension: string) {
+    const key = `leaderboard:${dimension}`;
+    const rank = await this.redis.zrevrank(key, userId);
+    return rank !== null ? rank + 1 : null;
+  }
+
+  async getMultiDimensionRank(userId: string, dimensions: string[]) {
+    const ranks: Record<string, number | null> = {};
+
+    for (const dimension of dimensions) {
+      ranks[dimension] = await this.getRank(userId, dimension);
+    }
+
+    return ranks;
+  }
+
+  // 综合排名（多个维度的加权平均）
+  async getCompositeRank(userId: string, weights: Record<string, number>) {
+    let totalScore = 0;
+    let totalWeight = 0;
+
+    for (const [dimension, weight] of Object.entries(weights)) {
+      const score = await this.redis.zscore(`leaderboard:${dimension}`, userId);
+      if (score !== null) {
+        totalScore += parseFloat(score) * weight;
+        totalWeight += weight;
+      }
+    }
+
+    return totalWeight > 0 ? totalScore / totalWeight : 0;
+  }
+}
+```
+
+### 案例 2：时间段排行榜
+
+```typescript
+class TimeBasedLeaderboard {
+  constructor(private redis: Redis) {}
+
+  private getPeriodKey(period: string): string {
+    switch (period) {
+      case "daily":
+        return `leaderboard:daily:${new Date().toISOString().split("T")[0]}`;
+      case "weekly":
+        const weekStart = this.getWeekStart();
+        return `leaderboard:weekly:${weekStart}`;
+      case "monthly":
+        const month = new Date().toISOString().slice(0, 7);
+        return `leaderboard:monthly:${month}`;
+      default:
+        return `leaderboard:alltime`;
+    }
+  }
+
+  private getWeekStart(): string {
+    const now = new Date();
+    const day = now.getDay();
+    const diff = now.getDate() - day + (day === 0 ? -6 : 1);
+    const weekStart = new Date(now.setDate(diff));
+    return weekStart.toISOString().split("T")[0];
+  }
+
+  async updateScore(userId: string, score: number, period: string = "alltime") {
+    const key = this.getPeriodKey(period);
+    await this.redis.zincrby(key, score, userId);
+    // 设置过期时间
+    if (period === "daily") {
+      await this.redis.expire(key, 86400 * 2);
+    } else if (period === "weekly") {
+      await this.redis.expire(key, 86400 * 14);
+    } else if (period === "monthly") {
+      await this.redis.expire(key, 86400 * 60);
+    }
+  }
+
+  async getTopN(period: string, n: number) {
+    const key = this.getPeriodKey(period);
+    return await this.redis.zrevrange(key, 0, n - 1, "WITHSCORES");
+  }
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 定期清理过期数据
+
+```typescript
+// 清理旧排行榜
+async function cleanupOldLeaderboards() {
+  const keys = await redis.keys("leaderboard:*");
+  for (const key of keys) {
+    const ttl = await redis.ttl(key);
+    if (ttl === -1) {
+      // 没有设置过期时间
+      await redis.expire(key, 86400 * 7); // 7天后过期
+    }
+  }
+}
+```
+
+### 2. 使用 Lua 脚本保证原子性
+
+```typescript
+// 原子性地更新分数并获取排名
+const script = `
+  local key = KEYS[1]
+  local member = ARGV[1]
+  local score = tonumber(ARGV[2])
+
+  redis.call("zadd", key, score, member)
+  local rank = redis.call("zrevrank", key, member)
+
+  return rank + 1
+`;
+
+const newRank = await redis.eval(script, 1, "leaderboard", "player:1", 1500);
+```
+
+---
+
+## 常见问题
+
+### Q1: Sorted Set 性能如何？
+
+**A**: ZADD/ ZRANK 是 O(log N)，ZRANGE 是 O(log N + M)，M 是返回的元素数量。
+
+### Q2: 如何处理分数相同的情况？
+
+**A**: Sorted Set 按字典序排列。可以在分数中加入小数区分：
+
+```typescript
+await redis.zadd("key", 1000.001, "player1");
+await redis.zadd("key", 1000.002, "player2");
+```
+
+---
+
+## 总结
+
+本文我们学习了 Sorted Set 的应用：
+
+✅ 游戏排行榜
+✅ 延时队列
+✅ 范围查询
+✅ 实时统计
+✅ 多维度排行榜
+
+---
+
+## 下一步
+
+继续阅读：[11. Cache-Aside 缓存模式](./11-cache-aside-pattern.mdx)
