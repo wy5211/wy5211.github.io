@@ -1,0 +1,310 @@
+---
+title: "07 全局异常处理"
+date: "2026-03-23"
+summary: "掌握全局异常处理的最佳实践，学会自定义异常和统一错误响应。"
+tags: ["SpringBoot", "异常处理", "RestControllerAdvice"]
+category: "springboot"
+cover: ""
+draft: false
+series: "SpringBoot 渐进式学习指南"
+seriesOrder: 7
+---
+
+## 前言
+
+全局异常处理是保证 API 统一性和用户体验的重要机制。通过全局异常处理器，我们可以统一捕获和处理各种异常，返回友好的错误信息。
+
+## 自定义业务异常
+
+### 基础异常类
+
+```java
+public class BusinessException extends RuntimeException {
+
+    private final Integer code;
+
+    public BusinessException(String message) {
+        super(message);
+        this.code = 400;
+    }
+
+    public BusinessException(Integer code, String message) {
+        super(message);
+        this.code = code;
+    }
+
+    public Integer getCode() {
+        return code;
+    }
+}
+```
+
+### 具体异常类
+
+```java
+// 资源不存在异常
+public class ResourceNotFoundException extends BusinessException {
+
+    public ResourceNotFoundException(String message) {
+        super(404, message);
+    }
+
+    public static ResourceNotFoundException of(String resourceName, Long id) {
+        return new ResourceNotFoundException(resourceName + " [id=" + id + "] 不存在");
+    }
+}
+
+// 业务逻辑异常
+public class BusinessLogicException extends BusinessException {
+
+    public BusinessLogicException(String message) {
+        super(400, message);
+    }
+}
+
+// 未授权异常
+public class UnauthorizedException extends BusinessException {
+
+    public UnauthorizedException(String message) {
+        super(401, message);
+    }
+}
+
+// 禁止访问异常
+public class ForbiddenException extends BusinessException {
+
+    public ForbiddenException(String message) {
+        super(403, message);
+    }
+}
+```
+
+## 全局异常处理器
+
+### @RestControllerAdvice
+
+```java
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    // 业务异常
+    @ExceptionHandler(BusinessException.class)
+    public ResponseEntity<Result<?>> handleBusinessException(BusinessException e) {
+        log.warn("业务异常：{}", e.getMessage());
+        return ResponseEntity
+                .status(e.getCode())
+                .body(Result.error(e.getMessage()));
+    }
+
+    // 资源不存在异常
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<Result<?>> handleResourceNotFoundException(ResourceNotFoundException e) {
+        log.warn("资源不存在：{}", e.getMessage());
+        return ResponseEntity
+                .status(HttpStatus.NOT_FOUND)
+                .body(Result.error(404, e.getMessage()));
+    }
+
+    // 参数校验异常
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<Result<?>> handleValidationException(
+        MethodArgumentNotValidException e
+    ) {
+        String message = e.getBindingResult().getAllErrors()
+                .stream()
+                .map(ObjectError::getDefaultMessage)
+                .collect(Collectors.joining("; "));
+
+        log.warn("参数校验失败：{}", message);
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(Result.error(message));
+    }
+
+    // 参数绑定异常
+    @ExceptionHandler(BindException.class)
+    public ResponseEntity<Result<?>> handleBindException(BindException e) {
+        String message = e.getBindingResult().getAllErrors()
+                .stream()
+                .map(this::extractErrorMessage)
+                .collect(Collectors.joining("; "));
+
+        log.warn("参数绑定失败：{}", message);
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(Result.error(message));
+    }
+
+    // HTTP 请求方法不支持
+    @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
+    public ResponseEntity<Result<?>> handleMethodNotSupportedException(
+        HttpRequestMethodNotSupportedException e
+    ) {
+        log.warn("请求方法不支持：{}", e.getMethod());
+        return ResponseEntity
+                .status(HttpStatus.METHOD_NOT_ALLOWED)
+                .body(Result.error("请求方法不支持"));
+    }
+
+    // JSON 解析异常
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<Result<?>> handleHttpMessageNotReadableException(
+        HttpMessageNotReadableException e
+    ) {
+        log.warn("JSON 解析失败：{}", e.getMessage());
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(Result.error("JSON 格式不正确"));
+    }
+
+    // 系统异常
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<Result<?>> handleException(Exception e) {
+        log.error("系统异常", e);
+        return ResponseEntity
+                .status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(Result.error("系统错误，请联系管理员"));
+    }
+}
+```
+
+## 统一返回格式
+
+### Result 类
+
+```java
+public class Result<T> {
+
+    private Integer code;
+    private String message;
+    private T data;
+
+    private Result() {}
+
+    private Result(Integer code, String message, T data) {
+        this.code = code;
+        this.message = message;
+        this.data = data;
+    }
+
+    public static <T> Result<T> success(T data) {
+        return new Result<>(200, "操作成功", data);
+    }
+
+    public static <T> Result<T> success(String message, T data) {
+        return new Result<>(200, message, data);
+    }
+
+    public static <T> Result<T> error(Integer code, String message) {
+        return new Result<>(code, message, null);
+    }
+
+    public static <T> Result<T> error(String message) {
+        return new Result<>(500, message, null);
+    }
+
+    // Getter 和 Setter
+    public Integer getCode() { return code; }
+    public String getMessage() { return message; }
+    public T getData() { return data; }
+}
+```
+
+## 异常使用示例
+
+### Service 层抛出异常
+
+```java
+@Service
+public class UserService {
+
+    @Autowired
+    private UserRepository userRepository;
+
+    public User getById(Long id) {
+        return userRepository.findById(id)
+                .orElseThrow(() -> ResourceNotFoundException.of("用户", id));
+    }
+
+    public User create(UserCreateDTO dto) {
+        if (userRepository.existsByUsername(dto.getUsername())) {
+            throw new BusinessLogicException("用户名已存在");
+        }
+
+        User user = new User();
+        // ... 设置属性
+
+        return userRepository.save(user);
+    }
+}
+```
+
+## 最佳实践
+
+### 1. 自定义业务异常
+
+```java
+// ✅ 推荐：针对不同场景定义异常类
+ResourceNotFoundException
+BusinessLogicException
+UnauthorizedException
+ForbiddenException
+```
+
+### 2. 异常要有意义
+
+```java
+// ✅ 推荐：抛出有意义的异常
+throw new ResourceNotFoundException("用户不存在");
+
+// ❌ 避免：抛出通用异常
+throw new RuntimeException();
+```
+
+### 3. 日志记录
+
+```java
+// ✅ 推荐：记录异常日志
+log.error("系统异常", e);
+
+// ❌ 避免：吞掉异常
+try {
+    // ...
+} catch (Exception e) {
+    // 不做任何处理
+}
+```
+
+## 总结
+
+本文介绍了全局异常处理，主要内容：
+
+**自定义异常**：
+
+- ✅ 基础异常类
+- ✅ 具体业务异常
+
+**全局处理**：
+
+- ✅ @RestControllerAdvice
+- ✅ 各种异常类型处理
+
+**统一格式**：
+
+- ✅ Result 类
+- ✅ 错误码标准化
+
+掌握全局异常处理后，API 的错误信息会更加友好。接下来我们将学习拦截器和 AOP。
+
+## 下一步
+
+在下一篇文章《08 拦截器与 AOP》中，我们将学习：
+
+- HandlerInterceptor 拦截器
+- @Aspect 切面编程
+- @Pointcut 切入点
+- @Around 通知
+- 实际应用场景
+
+---

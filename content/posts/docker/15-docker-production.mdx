@@ -1,0 +1,393 @@
+---
+title: "15. Docker 生产环境部署：高可用架构"
+date: "2025-03-23"
+summary: "掌握 Docker 容器在生产环境的部署策略，包括负载均衡、滚动更新、健康检查和监控。"
+tags: ["Docker", "生产部署", "DevOps"]
+category: "docker"
+cover: ""
+draft: false
+series: "Docker 从入门到实战"
+seriesOrder: 15
+---
+
+## 前言
+
+生产环境部署需要考虑高可用、可扩展、可维护。本篇文章将介绍生产级的 Docker 部署方案。
+
+## 健康检查
+
+### 应用健康检查
+
+```dockerfile
+FROM node:18-alpine
+
+# 健康检查端点
+COPY healthcheck.js ./
+
+# 配置健康检查
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD node healthcheck.js || exit 1
+
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+### healthcheck.js
+
+```javascript
+const http = require("http");
+
+const options = {
+  hostname: "localhost",
+  port: 3000,
+  path: "/health",
+  timeout: 2000,
+};
+
+const request = http.request(options, (res) => {
+  if (res.statusCode === 200) {
+    process.exit(0);
+  } else {
+    process.exit(1);
+  }
+});
+
+request.on("error", () => {
+  process.exit(1);
+});
+
+request.end();
+```
+
+## 自动重启
+
+### 重启策略
+
+```bash
+docker run -d \
+  --name web \
+  --restart=unless-stopped \
+  --memory="512m" \
+  --cpus="0.5" \
+  myapp:latest
+```
+
+### 重启策略对比
+
+| 策略             | 说明         | 适用场景       |
+| ---------------- | ------------ | -------------- |
+| `no`             | 不重启       | 一次性任务     |
+| `on-failure`     | 失败时重启   | 可能恢复的服务 |
+| `always`         | 总是重启     | 必须运行的服务 |
+| `unless-stopped` | 除非手动停止 | 推荐（生产）   |
+
+## 负载均衡
+
+### Nginx 反向代理
+
+```yaml
+version: '3.8'
+
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app1
+      - app2
+      - app3
+    restart: unless-stopped
+
+  app1:
+    image: myapp:latest
+    environment:
+      - INSTANCE_ID=1
+    restart: unless-stopped
+
+  app2:
+    image: myapp:latest
+    environment:
+      - INSTANCE_ID=2
+    restart: unless-stopped
+
+  app3:
+    image = myapp:latest
+    environment:
+      - INSTANCE_ID=3
+    restart: unless-stopped
+```
+
+### nginx.conf
+
+```nginx
+upstream backend {
+    least_conn;
+    server app1:3000 max_fails=3 fail_timeout=30s;
+    server app2:3000 max_fails=3 fail_timeout=30s;
+    server app3:3000 max_fails=3 fail_timeout=30s;
+}
+
+server {
+    listen 80;
+
+    location / {
+        proxy_pass http://backend;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+
+        health_check interval=30s fails=3 passes=2;
+    }
+}
+```
+
+## 滚动更新
+
+### 零停部署
+
+```bash
+# 1. 拉取新版本
+docker pull myapp:v2.0
+
+# 2. 启动新版本（不同端口）
+docker run -d \
+  --name web-v2 \
+  -p 8081:80 \
+  myapp:v2.0
+
+# 3. 健康检查
+sleep 10
+docker exec web-v2 curl http://localhost/health
+
+# 4. 更新负载均衡器
+# 将 nginx 配置中的 app1:3000 改为 web-v2:8081
+
+# 5. 重新加载 nginx
+docker exec nginx nginx -s reload
+
+# 6. 停止旧版本
+docker stop web-v1
+docker rm web-v1
+```
+
+### Blue-Green 部署
+
+```bash
+# 绿色环境（当前生产）
+docker compose -f docker-compose.green.yml up -d
+
+# 部署蓝色环境（新版本）
+docker compose -f docker-compose.blue.yml up -d
+
+# 测试蓝色环境
+# 测试通过后切换流量
+
+# 切换流量
+# 更新负载均衡器指向蓝色环境
+
+# 停止绿色环境
+docker compose -f docker-compose.green.yml down
+```
+
+## 配置管理
+
+### 环境变量分离
+
+```bash
+# .env.production
+NODE_ENV=production
+APP_VERSION=1.0.0
+DATABASE_URL=postgres://user:pass@db:5432/myapp
+REDIS_URL=redis://redis:6379
+API_KEY=${API_KEY}
+```
+
+```yaml
+# docker-compose.prod.yml
+version: "3.8"
+
+services:
+  app:
+    image: myapp:${APP_VERSION:-latest}
+    env_file:
+      - .env.production
+    environment:
+      - NODE_ENV=${NODE_ENV:-production}
+```
+
+### ConfigMap
+
+```yaml
+version: "3.8"
+
+services:
+  app:
+    image: myapp:latest
+    configs:
+      - source: app_config
+        target: /app/config.json
+
+configs:
+  app_config:
+    file: ./config.json
+```
+
+## 日志管理
+
+### 日志轮转
+
+```yaml
+services:
+  app:
+    image: myapp:latest
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+```
+
+### 集中式日志
+
+```yaml
+version: "3.8"
+
+services:
+  app:
+    image: myapp:latest
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: localhost:24224
+        fluentd-async-connect: "true"
+
+  fluentd:
+    image: fluent/fluentd:v1.16-1
+    volumes:
+      - ./fluentd.conf:/fluentd/etc/fluent.conf
+    ports:
+      - "24224:24224"
+```
+
+## 监控告警
+
+### 监控栈
+
+```yaml
+version: "3.8"
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    ports:
+      - "9093:9093"
+```
+
+## 备份恢复
+
+### 数据备份脚本
+
+```bash
+#!/bin/bash
+# backup.sh
+
+BACKUP_DIR="/backups/$(date +%Y%m%d)"
+mkdir -p $BACKUP_DIR
+
+# 备份数据卷
+for vol in postgres-data redis-data app-logs; do
+  docker run --rm \
+    -v $vol:/data \
+    -v $BACKUP_DIR:/backup \
+    alpine tar czf /backup/$vol-$(date +%Y%m%d-%H%M%S).tar.gz /data
+done
+
+# 备份镜像
+docker save nginx:latest | gzip > $BACKUP_DIR/nginx-$(date +%Y%m%d-%H%M%S).tar.gz
+
+echo "Backup completed: $BACKUP_DIR"
+```
+
+## 安全加固
+
+### 最小权限
+
+```dockerfile
+FROM node:18-alpine
+
+# 创建非 root 用户
+RUN addgroup -g 1001 -S nodejs && \
+    adduser -S nodejs -u 1001
+
+# 切换用户
+USER nodejs
+
+# 只读文件系统（可选）
+# 运行时：docker run --read-only -v /tmp node:18 node
+```
+
+### 资源限制
+
+```yaml
+services:
+  app:
+    image: myapp:latest
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 256M
+```
+
+## 最佳实践
+
+1. **健康检查**：确保服务可用
+2. **自动重启**：failover 自动恢复
+3. **负载均衡**：Nginx 反向代理
+4. **滚动更新**：零停机部署
+5. **监控告警**：Prometheus + Grafana
+6. **日志轮转**：防止磁盘占满
+7. **资源限制**：防止资源耗尽
+8. **备份恢复**：数据安全保障
+
+## 总结
+
+生产部署关键：
+
+- **健康检查**：服务可用性保障
+- **负载均衡**：Nginx 多实例
+- **滚动更新**：平滑升级
+- **监控告警**：及时发现问题
+- **备份恢复**：数据安全
+
+恭喜！你已完成 Docker 系列学习！
+
+## 下一步
+
+1. 在实际项目中使用 Docker
+2. 学习 Kubernetes 容器编排
+3. 探索云原生生态
+4. 考取 CKA/CKAD 认证

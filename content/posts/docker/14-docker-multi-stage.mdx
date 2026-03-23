@@ -1,0 +1,213 @@
+---
+title: "14. Docker 多阶段构建深入：复杂应用构建"
+date: "2025-03-23"
+summary: "深入掌握 Docker 多阶段构建，学习依赖管理、构建缓存和跨平台编译等高级技巧。"
+tags: ["Docker", "多阶段构建", "CI/CD"]
+category: "docker"
+cover: ""
+draft: false
+series: "Docker 从入门到实战"
+seriesOrder: 14
+---
+
+## 多阶段构建原理
+
+### 构建阶段划分
+
+```
+Stage 1: Dependencies → Stage 2: Build → Stage 3: Runtime
+└─────┬────────┘           └─────┬────┘
+      │                          │
+      └──────────────┬───────────┘
+                     │
+              Only Runtime Artifacts
+```
+
+## Go 应用
+
+### 完整构建流程
+
+```dockerfile
+# ========== 阶段 1: 下载依赖 ==========
+FROM golang:1.21-alpine AS downloader
+WORKDIR /app
+RUN apk add --no-cache git
+COPY go.* ./
+RUN go mod download
+
+# ========== 阶段 2: 代码检查 ==========
+FROM golang:1.21-alpine AS linter
+WORKDIR /app
+COPY --from=downloader /go /go
+COPY . .
+RUN go vet ./...
+
+# ========== 阶段 3: 单元测试 ==========
+FROM golang:1.21-alpine AS tester
+WORKDIR /app
+COPY --from=downloader /go /go
+COPY . .
+RUN go test -v ./...
+
+# ========== 阶段 4: 构建 ==========
+FROM golang:1.21-alpine AS builder
+WORKDIR /app
+COPY --from=downloader /go /go
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o app .
+
+# ========== 阶段 5: 运行 ==========
+FROM alpine:3.19 AS runtime
+RUN apk --no-cache add ca-certificates tzdata
+WORKDIR /app
+COPY --from=builder /app/app .
+RUN addgroup -g 1001 appuser && \
+    adduser -D -u 1001 -G appuser appuser
+USER appuser
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=3s \
+  CMD wget --no-verbose --tries=1 --spider http://localhost:8080/health || exit 1
+CMD ["./app"]
+```
+
+## Python 应用
+
+### 包含构建工具
+
+```dockerfile
+# 构建阶段
+FROM python:3.11-slim AS builder
+
+WORKDIR /app
+
+# 安装构建依赖
+RUN apt-get update && \
+    apt-get install -y gcc g++ && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --user -r requirements.txt
+
+COPY . .
+
+# 运行阶段
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# 只复制运行时依赖
+COPY --from=builder /root/.local /root/.local
+COPY . .
+
+RUN groupadd -r appuser && useradd -r -g appuser appuser
+USER appuser
+
+CMD ["python", "app.py"]
+```
+
+## 跨平台构建
+
+### 多架构构建
+
+```dockerfile
+# 使用 buildx
+FROM --platform=$TARGETPLATFORM golang:1.21-alpine AS builder
+
+WORKDIR /app
+COPY . .
+RUN GOOS=$TARGETPLATFORM go build -o app
+
+FROM alpine:3.19
+WORKDIR /app
+COPY --from=builder /app/app .
+CMD ["./app"]
+```
+
+```bash
+# 构建多架构镜像
+docker buildx build \
+  --platform linux/amd64,linux/arm64 \
+  -t myapp:latest \
+  --push .
+```
+
+## 私有依赖处理
+
+### Go 私有模块
+
+```dockerfile
+# 使用 Git 认证
+FROM golang:1.21-alpine AS builder
+
+# 配置 Git
+RUN apk add --no-cache git
+
+# 使用 BuildKit secrets
+# --mount=type=ssh
+RUN --mount=type=ssh go build
+
+# 使用 .netrc
+RUN git config --global credential.helper store
+```
+
+### Python 私有包
+
+```dockerfile
+FROM python:3.11-slim
+
+# 使用 requirements.txt
+# private:
+#   --extra-index-url=https://user:pass@private.pypi.org/simple
+
+COPY requirements.txt .
+RUN pip install --extra-index-url=https://${PYPI_USER}:${PYPI_PASS}@private.pypi.org/simple -r requirements.txt
+```
+
+## 缓存优化
+
+### 构建缓存挂载
+
+```dockerfile
+FROM golang:1.21-alpine AS builder
+
+WORKDIR /app
+
+# 使用缓存挂载
+RUN --mount=type=cache,target=/go/pkg \
+    go mod download
+
+COPY . .
+
+RUN --mount=type=cache,target=/go/.cache \
+    go build -o app
+
+FROM alpine:3.19
+COPY --from=builder /app/app .
+CMD ["./app"]
+```
+
+```bash
+# 构建时指定缓存
+docker build \
+  --mount=type=cache,target=/go/pkg \
+  -t myapp .
+```
+
+## 最佳实践
+
+1. **每个阶段职责单一**
+2. **合理使用 COPY --from**
+3. **不要构建不需要的工具**
+4. **利用缓存加速构建**
+5. **使用特定版本的基础镜像**
+
+## 总结
+
+多阶段构建核心：
+
+- **职责分离**：构建 vs 运行
+- **最小化镜像**：只保留运行时需要
+- **构建缓存**：加速构建过程
+- **跨平台**：支持多架构
+
+下一步：Docker 生产环境部署

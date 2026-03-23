@@ -1,0 +1,284 @@
+---
+title: "17 性能优化"
+date: "2026-03-23"
+summary: "掌握 SpringBoot 应用的性能调优技巧，提升系统吞吐量和响应速度。"
+tags: ["SpringBoot", "性能优化", "JVM", "监控"]
+category: "springboot"
+cover: ""
+draft: false
+series: "SpringBoot 渐进式学习指南"
+seriesOrder: 17
+---
+
+## 前言
+
+性能优化是生产环境的关键环节。本文将讲解从 JVM 到应用层面的全方位优化策略。
+
+## JVM 调优
+
+### JVM 参数
+
+```bash
+java -jar app.jar \
+  -Xms512m \
+  -Xmx1024m \
+  -XX:+UseG1GC \
+  -XX:MaxGCPauseMillis=200 \
+  -XX:+HeapDumpOnOutOfMemoryError \
+  -XX:HeapDumpPath=/app/logs/heapdump.hprof
+```
+
+### Dockerfile 中配置
+
+```dockerfile
+FROM eclipse-temurin:17-jre-alpine
+WORKDIR /app
+COPY app.jar app.jar
+EXPOSE 8080
+
+ENV JAVA_OPTS="-Xms512m -Xmx1024m -XX:+UseG1GC"
+
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+```
+
+## 数据库优化
+
+### 连接池配置
+
+```yaml
+spring:
+  datasource:
+    hikari:
+      # 连接池大小
+      maximum-pool-size: 20
+      minimum-idle: 5
+
+      # 连接超时
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+
+      # 性能优化
+      connection-test-query: SELECT 1
+      validation-timeout: 3000
+```
+
+### JPA 优化
+
+```java
+// ✅ 推荐：批量插入
+@Transactional
+public void batchSave(List<User> users) {
+    userRepository.saveAll(users);
+}
+
+// ✅ 推荐：使用投影查询
+public interface UserNameOnly {
+    String getUsername();
+}
+
+@Query("SELECT u.username FROM User u")
+List<UserNameOnly> findAllUserNames();
+
+// ✅ 推荐：使用 EntityGraph
+@EntityGraph(attributePaths = {"roles", "permissions"})
+List<User> findAll();
+```
+
+### 懒加载配置
+
+```yaml
+spring:
+  jpa:
+    properties:
+      hibernate:
+        enable_lazy_load_no_trans: true
+        default_batch_fetch_size: 100
+```
+
+## 缓存优化
+
+### 多级缓存
+
+```java
+@Service
+public class UserService {
+
+    // L1：本地缓存
+    @Cacheable(value = "users", key = "#id")
+    public User findById(Long id) {
+        return userRepository.findById(id).orElse(null);
+    }
+
+    // L2：分布式缓存
+    @Cacheable(value = "userSessions", key = "#token")
+    public UserSession findByToken(String token) {
+        return sessionRepository.findByToken(token);
+    }
+}
+```
+
+### 缓存预热
+
+```java
+@Component
+public class CacheWarmup implements ApplicationRunner {
+
+    @Autowired
+    private UserService userService;
+
+    @Override
+    public void run(ApplicationArguments args) {
+        // 预热热点数据
+        userService.loadHotData();
+    }
+}
+```
+
+## 接口优化
+
+### 分页优化
+
+```java
+// ✅ 推荐：使用游标分页
+@GetMapping("/users")
+public Page<User> getUsers(
+    @RequestParam(defaultValue = "0") int page,
+    @RequestParam(defaultValue = "20") int size
+) {
+    return userRepository.findAll(
+        PageRequest.of(page, size, Sort.by("id").descending())
+    );
+}
+```
+
+### 异步处理
+
+```java
+@Service
+public class ReportService {
+
+    @Async
+    public CompletableFuture<Report> generateReport(Long id) {
+        // 耗时操作异步执行
+        Report report = buildReport(id);
+        return CompletableFuture.completedFuture(report);
+    }
+}
+```
+
+### 批量操作
+
+```java
+@RestController
+public class UserController {
+
+    @PostMapping("/users/batch")
+    public Result<Void> batchCreate(@Valid @RequestBody List<UserDTO> users) {
+        userService.batchSave(users);
+        return Result.success();
+    }
+}
+```
+
+## 监控与分析
+
+### Actuator 配置
+
+```yaml
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+```
+
+### 自定义指标
+
+```java
+@Component
+public class ApiMetrics {
+
+    private final MeterRegistry meterRegistry;
+
+    public void recordApiCall(String endpoint, long duration) {
+        Timer.builder("api.call.duration")
+            .tag("endpoint", endpoint)
+            .register(meterRegistry)
+            .record(duration, TimeUnit.MILLISECONDS);
+    }
+}
+```
+
+### 性能分析工具
+
+```bash
+# JVM 监控
+jps -l
+jstat -gcutil <pid> 1000
+
+# 线程 dump
+jstack <pid> > thread_dump.txt
+
+# 堆 dump
+jmap -dump:live,format=b,file=heap.hprof <pid>
+```
+
+## 最佳实践
+
+### 1. 避免过度优化
+
+```java
+// ✅ 推荐：先监控后优化
+// 通过 Actuator 找到真正的瓶颈
+// 优先优化热点代码
+
+// ❌ 避免：过早优化
+```
+
+### 2. 合理使用缓存
+
+```java
+// ✅ 推荐：只缓存热点数据
+@Cacheable(value = "hotData", key = "#id")
+
+// ❌ 避免：缓存所有数据
+```
+
+### 3. 异步处理耗时操作
+
+```java
+// ✅ 推荐：邮件、报表生成等使用异步
+@Async
+public void sendEmail() { }
+
+// ❌ 避免：阻塞主线程
+```
+
+## 总结
+
+本文介绍了性能优化，主要内容：
+
+- ✅ JVM 调优
+- ✅ 数据库连接池优化
+- ✅ 缓存策略优化
+- ✅ 接口性能优化
+- ✅ 监控与分析
+
+接下来我们将学习微服务架构入门。
+
+## 下一步
+
+在最后一篇文章《18 微服务架构入门》中，我们将学习：
+
+- 微服务架构设计原则
+- Spring Cloud 组件介绍
+- 服务注册与发现
+- 配置中心
+- 服务网关
+
+---

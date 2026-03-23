@@ -9,8 +9,10 @@ const basePath =
     : "";
 
 const nextConfig = {
-  // 只在生产构建时使用静态导出
-  ...(process.env.NODE_ENV === "production" ? { output: "export" } : {}),
+  // 在 GitHub Actions 或生产环境时使用静态导出
+  ...(isGithubActions || process.env.NODE_ENV === "production"
+    ? { output: "export" }
+    : {}),
   trailingSlash: true,
   ...(basePath
     ? {

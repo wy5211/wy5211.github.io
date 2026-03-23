@@ -1,0 +1,210 @@
+---
+title: "11. Docker 镜像优化技巧：构建更小更快的镜像"
+date: "2025-03-23"
+summary: "掌握 Docker 镜像的各种优化技巧，从选择基础镜像到多阶段构建，打造生产级的高效镜像。"
+tags: ["Docker", "镜像优化", "多阶段构建", "Alpine"]
+category: "docker"
+cover: ""
+draft: false
+series: "Docker 从入门到实战"
+seriesOrder: 11
+---
+
+## 前言
+
+大镜像意味着：慢、存储成本高、安全风险大。镜像优化是容器化的必备技能。本篇文章将教你如何构建更小、更安全、更快的 Docker 镜像。
+
+## 基础镜像选择
+
+### Alpine vs 标准镜像
+
+```dockerfile
+# 标准镜像：900MB
+FROM node:18
+
+# Alpine 镜像：120MB (减少 86%)
+FROM node:18-alpine
+```
+
+### distroless 镜像
+
+```dockerfile
+# Google distroless：只包含应用和运行时
+FROM gcr.io/distroless/nodejs18-debian11
+
+COPY . .
+CMD ["node", "server.js"]
+
+# 优势：
+# - 更小（~80MB）
+# - 更安全（无 shell、无包管理器）
+# - 更新及时（自动安全更新）
+```
+
+## 多阶段构建
+
+### 典型场景
+
+```dockerfile
+# 构建阶段
+FROM golang:1.21-alpine AS builder
+WORKDIR /app
+COPY go.* ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 go build -o app .
+
+# 运行阶段
+FROM alpine:3.19
+RUN apk --no-cache add ca-certificates
+WORKDIR /app
+COPY --from=builder /app/app .
+USER 1000:1000
+CMD ["./app"]
+
+# 最终镜像：~10MB (相比 300MB+ 单阶段)
+```
+
+### 前端应用
+
+```dockerfile
+# 构建
+FROM node:18-alpine AS deps
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+
+# 构建
+FROM node:18-alpine AS builder
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY . .
+RUN npm run build
+
+# 生产
+FROM nginx:alpine
+COPY --from=builder /app/dist /usr/share/nginx/html
+EXPOSE 80
+```
+
+## 层缓存优化
+
+### 最佳实践
+
+```dockerfile
+# ✅ 优化后
+FROM node:18-alpine
+WORKDIR /app
+# 先复制依赖文件（很少变化）
+COPY package*.json ./
+RUN npm ci --only=production
+# 再复制源代码（经常变化）
+COPY . .
+
+# ❌ 优化前
+FROM node:18-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+```
+
+## 构建缓存
+
+### 使用 BuildKit
+
+```bash
+# 启用 BuildKit
+export DOCKER_BUILDKIT=1
+
+# 构建时使用缓存挂载
+docker build \
+  --mount type=cache,target=/root/.cache \
+  -t myapp:latest .
+```
+
+### 并行构建
+
+```dockerfile
+FROM golang:1.21 AS builder
+WORKDIR /app
+# 利用缓存挂载加速依赖下载
+RUN --mount=type=cache,target=/go/pkg \
+    go mod download
+COPY . .
+RUN go build -o app .
+```
+
+## .dockerignore
+
+### 排除文件
+
+```dockerfile
+# .dockerignore
+node_modules
+npm-debug.log
+.git
+.gitignore
+.env
+.env.local
+.DS_Store
+coverage
+.vscode
+*.md
+.idea
+dist
+build
+```
+
+## 镜像瘦身
+
+### 清理不必要文件
+
+```dockerfile
+FROM python:3.11-slim
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        gcc \
+        && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip cache purge
+```
+
+### 使用 .dockerignore + .dockerignore
+
+```bash
+# .dockerignore 可用
+docker build -t myapp .
+```
+
+## 安全扫描
+
+### Trivy 扫描
+
+```bash
+# 扫描镜像
+trivy image myapp:latest
+
+# 扫描并输出漏洞报告
+trivy image --format json myapp:latest > report.json
+```
+
+## 最佳实践总结
+
+1. **使用 Alpine**：减小 70-90%
+2. **多阶段构建**：分离构建和运行
+3. **优化层顺序**：不常变的放前面
+4. **合并 RUN 命令**：减少层数
+5. **清理缓存**：减小镜像体积
+
+## 总结
+
+镜像优化是持续过程，核心要点：
+
+- **选择合适基础镜像**：Alpine、distroless
+- **多阶段构建**：只保留运行时需要
+- **利用缓存**：优化构建速度
+- **定期扫描**：确保安全
+
+下一步：Docker 安全最佳实践

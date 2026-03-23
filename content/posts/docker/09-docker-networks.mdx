@@ -1,0 +1,249 @@
+---
+title: "09. Docker 网络配置详解：容器间通信"
+date: "2025-03-23"
+summary: "掌握 Docker 网络的核心概念和配置方法，理解容器间通信原理，学会自定义网络和网络调试。"
+tags: ["Docker", "网络", "容器通信"]
+category: "docker"
+cover: ""
+draft: false
+series: "Docker 从入门到实战"
+seriesOrder: 9
+---
+
+## 前言
+
+Docker 容器需要相互通信才能构建复杂的应用。理解 Docker 网络对于搭建微服务架构至关重要。本篇文章将系统介绍 Docker 的网络原理和配置。
+
+## Docker 网络核心概念
+
+### CNM (Container Network Model)
+
+```
+┌─────────────────────────────────────┐
+│         Sandbox (容器)             │
+│  ┌───────────────────────────────┐ │
+│  │   Endpoint (网络接口)          │ │
+│  └───────────────────────────────┘ │
+└──────────────┬──────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────┐
+│          Network (网络)             │
+│  ┌───────────────────────────────┐ │
+│  │     Endpoint (多个容器)       │ │
+│  └───────────────────────────────┘ │
+└─────────────────────────────────────┘
+```
+
+## 网络驱动类型
+
+### bridge（桥接网络）- 默认
+
+```bash
+# 查看默认网络
+docker network ls
+
+# 创建自定义桥接网络
+docker network create my-app-net
+
+# 使用网络运行容器
+docker run -d --name web --network my-app-net nginx
+docker run -d --name api --network my-app-net myapp
+
+# 容器间可以通过名称通信
+docker exec api curl http://web
+```
+
+### host（主机网络）
+
+```bash
+# 使用宿主机网络
+docker run --network host nginx
+
+# 特点：
+# - 容器直接使用宿主机网络栈
+# - 无端口映射，直接占用宿主机端口
+# - 性能最好，但隔离性差
+```
+
+### overlay（覆盖网络）
+
+```bash
+# 用于 Swarm 集群
+docker network create --driver overlay my-overlay
+
+# 跨主机通信
+docker service create --network my-overlay web
+```
+
+### macvlan
+
+```bash
+# 为容器分配物理网络地址
+docker network create --driver macvlan \
+  --subnet=192.168.1.0/24 \
+  --gateway=192.168.1.1 \
+  -o parent=eth0 my-macvlan
+
+# 容器直接连接物理网络
+docker run --network my-macvlan nginx
+```
+
+## 容器间通信
+
+### 默认 bridge 网络
+
+```bash
+# 两个容器通过默认网络通信
+docker run -d --name db -e POSTGRES_PASSWORD=pass postgres:15
+docker run -d --name web nginx
+
+# web 无法直接访问 db（需要 --link 或自定义网络）
+```
+
+### 自定义网络
+
+```bash
+# 创建网络
+docker network create app-net
+
+# 运行容器
+docker run -d --name db --network app-net postgres:15
+docker run -d --name web --network app-net nginx
+
+# 现在可以通过名称通信
+docker exec web ping db
+```
+
+### DNS 解析
+
+```bash
+# Docker 内置 DNS 服务器
+# 容器可以通过容器名解析 IP
+
+docker exec web nslookup db
+# 输出：Server:  127.0.0.11
+#       Name:    db
+#       Address:  172.18.0.2
+```
+
+## 端口映射
+
+### 基本映射
+
+```bash
+# 映射单个端口
+docker run -d -p 8080:80 nginx
+
+# 映射多个端口
+docker run -d \
+  -p 80:80 \
+  -p 443:443 \
+  nginx
+
+# 映射到随机端口
+docker run -d -p 80 nginx
+
+# 映射 UDP
+docker run -d -p 53:53/udp \
+  --name dns-server \
+  coredns/coredns
+```
+
+### 端口范围
+
+```bash
+# 映射端口范围
+docker run -d -p 8000-8010:8000-8010 myapp
+
+# 绑定到特定接口
+docker run -d -p 127.0.0.1:8080:80 nginx
+```
+
+## 网络配置实战
+
+### 微服务网络
+
+```yaml
+version: "3.8"
+
+services:
+  frontend:
+    build: ./frontend
+    networks:
+      - frontend
+
+  backend:
+    build: ./backend
+    networks:
+      - frontend
+      - backend
+
+  database:
+    image: postgres:15
+    networks:
+      - backend
+
+networks:
+  frontend:
+  backend:
+```
+
+### 外部访问
+
+```bash
+# 发布服务到宿主机网络
+docker run -d \
+  --name web \
+  -p 80:80 \
+  --network host \
+  nginx
+
+# 或使用桥接 + 端口映射
+docker run -d \
+  --name web \
+  -p 80:80 \
+  nginx
+```
+
+## 网络调试
+
+### 查看网络配置
+
+```bash
+# 查看容器网络详情
+docker inspect web | grep -A 20 "NetworkSettings"
+
+# 查看容器 IP
+docker inspect --format='{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' web
+
+# 测试网络连通性
+docker exec web ping -c 3 api
+```
+
+### 网络抓包
+
+```bash
+# 安装 tcpdump
+docker exec web apt-get update && apt-get install -y tcpdump
+
+# 抓包
+docker exec web tcpdump -i eth0
+```
+
+## 最佳实践
+
+1. **生产环境使用自定义网络**
+2. **网络命名要有意义**
+3. **限制容器权限**：使用 `--network-alias`
+4. **定期清理未使用的网络**
+
+## 总结
+
+Docker 网络是容器通信的基础。核心要点：
+
+- **自定义网络**：容器间通过名称通信
+- **端口映射**：`-p 宿主机:容器`
+- **网络驱动**：bridge 最常用
+
+下一步：Docker Compose 进阶

@@ -1,0 +1,406 @@
+---
+title: "06 参数校验"
+date: "2026-03-23"
+summary: "掌握数据校验的各种方式，学会自定义校验注解和分组校验。"
+tags: ["SpringBoot", "参数校验", "Validation", "JSR-303"]
+category: "springboot"
+cover: ""
+draft: false
+series: "SpringBoot 渐进式学习指南"
+seriesOrder: 6
+---
+
+## 前言
+
+参数校验是保证数据质量的第一道防线。SpringBoot 通过 JSR-303/380 规范提供了强大的校验功能。
+
+本文将讲解各种校验注解的使用和自定义校验注解的方法。
+
+## 添加依赖
+
+SpringBoot 2.3+ 已包含 validation starter，无需额外添加。
+
+```xml
+<!-- SpringBoot 3.x 已包含，无需手动添加 -->
+<!-- SpringBoot 2.x 需要：-->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-validation</artifactId>
+</dependency>
+```
+
+## 内置校验注解
+
+### 空值校验
+
+```java
+public class UserCreateDTO {
+
+    @NotNull(message = "ID 不能为空")
+    private Long id;
+
+    @NotBlank(message = "用户名不能为空")
+    private String username;
+
+    @NotEmpty(message = "标签不能为空")
+    private List<String> tags;
+}
+```
+
+**区别**：
+
+- `@NotNull`： CharSequence、Collection、Map、Array 不能为 null，但可以是空
+- `@NotBlank`：字符串不能为 null 且长度必须大于 0（去除空格后）
+- `@NotEmpty`：Collection、Map、Array 不能为 null 且 size > 0
+
+### 长度校验
+
+```java
+public class UserCreateDTO {
+
+    @Size(min = 3, max = 20, message = "用户名长度3-20个字符")
+    private String username;
+
+    @Length(min = 5, max = 100, message = "邮箱长度5-100个字符")
+    private String email;
+}
+```
+
+### 数值校验
+
+```java
+public class UserCreateDTO {
+
+    @Min(value = 18, message = "年龄必须大于等于18")
+    @Max(value = 100, message = "年龄必须小于等于100")
+    private Integer age;
+
+    @Positive(message = "金额必须为正数")
+    private BigDecimal amount;
+
+    @DecimalMin(value = "0.01", message = "价格不能小于0.01")
+    private BigDecimal price;
+}
+```
+
+### 格式校验
+
+```java
+public class UserCreateDTO {
+
+    @Email(message = "邮箱格式不正确")
+    private String email;
+
+    @Pattern(regexp = "^1[3-9]\\d{9}$", message = "手机号格式不正确")
+    private String phone;
+
+    @URL(message = "个人主页格式不正确")
+    private String website;
+}
+```
+
+### 日期校验
+
+```java
+public class ArticleCreateDTO {
+
+    @Past(message = "出生日期必须是过去的时间")
+    private LocalDateTime birthday;
+
+    @Future(message = "预约时间必须是未来时间")
+    private LocalDateTime appointmentTime;
+
+    @DateTimeFormat(pattern = "yyyy-MM-dd HH:mm:ss")
+    private LocalDateTime createTime;
+}
+```
+
+## 在 Controller 中启用校验
+
+```java
+@RestController
+@RequestMapping("/api/users")
+public class UserController {
+
+    @Autowired
+    private UserService userService;
+
+    // 启用校验
+    @PostMapping
+    public Result<User> create(@Valid @RequestBody UserCreateDTO dto) {
+        User user = userService.create(dto);
+        return Result.success(user);
+    }
+
+    // 手动校验
+    @PostMapping("/manual")
+    public Result<User> createManual(@RequestBody UserCreateDTO dto) {
+        ValidatorFactory factory = Validation.buildDefaultValidatorFactory();
+        Validator validator = factory.getValidator();
+
+        Set<ConstraintViolation<UserCreateDTO>> violations =
+            validator.validate(dto);
+
+        if (!violations.isEmpty()) {
+            String message = violations.stream()
+                .map(ConstraintViolation::getMessage)
+                .collect(Collectors.joining(", "));
+            return Result.error(message);
+        }
+
+        User user = userService.create(dto);
+        return Result.success(user);
+    }
+}
+```
+
+## 分组校验
+
+### 定义分组接口
+
+```java
+// 分组接口
+public interface Create {}
+
+public interface Update {}
+
+// DTO
+public class UserDTO {
+
+    @Null(groups = Create.class, message = "创建时ID必须为空")
+    @NotNull(groups = Update.class, message = "更新时ID不能为空")
+    private Long id;
+
+    @NotBlank(groups = Create.class)
+    private String username;
+
+    @NotBlank(groups = Create.class)
+    private String email;
+}
+```
+
+### Controller 中使用分组
+
+```java
+@RestController
+@RequestMapping("/api/users")
+public class UserController {
+
+    // 创建时使用 Create 分组
+    @PostMapping
+    public Result<User> create(@Validated(Create.class) @RequestBody UserDTO dto) {
+        // ...
+    }
+
+    // 更新时使用 Update 分组
+    @PutMapping("/{id}")
+    public Result<User> update(@Validated(Update.class) @RequestBody UserDTO dto) {
+        // ...
+    }
+}
+```
+
+## 自定义校验注解
+
+### 创建校验注解
+
+```java
+// 1. 定义注解
+@Target({ElementType.FIELD})
+@Retention(RetentionPolicy.RUNTIME)
+@Constraint(validatedBy = UniqueUsernameValidator.class)
+public @interface UniqueUsername {
+
+    String message() default "用户名已存在";
+
+    Class<?>[] groups() default {};
+
+    Class<?>[] payload() default {};
+}
+```
+
+### 实现校验器
+
+```java
+// 2. 实现校验器
+@Component
+public class UniqueUsernameValidator implements ConstraintValidator<UniqueUsername, String> {
+
+    @Autowired
+    private UserRepository userRepository;
+
+    @Override
+    public void initialize(UniqueUsername constraintAnnotation) {
+        // 初始化
+    }
+
+    @Override
+    public boolean isValid(String username, ConstraintValidatorContext context) {
+        if (username == null) {
+            return true; // 使用 @NotNull 校验
+        }
+
+        boolean exists = userRepository.existsByUsername(username);
+
+        if (exists) {
+            // 禁用校验
+            context.disableDefaultConstraintViolation();
+            // 自定义错误信息
+            context.buildConstraintViolationWithTemplate(context.getDefaultConstraintMessageTemplate())
+                .addConstraintViolation();
+        }
+
+        return !exists;
+    }
+}
+```
+
+### 使用自定义注解
+
+```java
+public class UserCreateDTO {
+
+    @UniqueUsername
+    private String username;
+}
+```
+
+## 嵌套校验
+
+### @Valid 嵌套校验
+
+```java
+public class ArticleCreateDTO {
+
+    @NotBlank(message = "标题不能为空")
+    private String title;
+
+    @NotNull(message = "作者不能为空")
+    @Valid  // 嵌套校验
+    private AuthorDTO author;
+
+    @NotEmpty(message = "标签不能为空")
+    @Valid  // 列表元素校验
+    private List<TagDTO> tags;
+}
+
+public class AuthorDTO {
+
+    @NotNull(message = "作者ID不能为空")
+    private Long id;
+}
+
+public class TagDTO {
+
+    @NotBlank(message = "标签名不能为空")
+    private String name;
+}
+```
+
+## 全局异常处理
+
+```java
+@RestControllerAdvice
+public class GlobalExceptionHandler {
+
+    // 参数校验异常
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<Result<?>> handleValidationException(
+        MethodArgumentNotValidException ex
+    ) {
+        BindingResult result = ex.getBindingResult();
+
+        List<String> errors = result.getFieldErrors().stream()
+            .map(FieldError::getDefaultMessage)
+            .collect(Collectors.toList());
+
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+            .body(Result.error("参数校验失败：" + errors));
+    }
+
+    // 参数绑定异常
+    @ExceptionHandler(BindException.class)
+    public ResponseEntity<Result<?>> handleBindException(BindException ex) {
+        List<String> errors = ex.getBindingResult().getAllErrors().stream()
+            .map(objectError -> {
+                if (objectError instanceof FieldError) {
+                    return ((FieldError) objectError).getField() + ": " +
+                           objectError.getDefaultMessage();
+                }
+                return objectError.getDefaultMessage();
+            })
+            .collect(Collectors.toList());
+
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+            .body(Result.error("参数绑定失败：" + errors));
+    }
+}
+```
+
+## 最佳实践
+
+### 1. 在 DTO 层校验
+
+```java
+// ✅ 推荐：DTO 层校验
+@Valid @RequestBody UserCreateDTO dto
+
+// ❌ 避免：在 Service 或 Repository 层校验
+```
+
+### 2. 使用分组校验
+
+```java
+// ✅ 推荐：不同操作使用不同分组
+@Validated(Create.class)
+@Validated(Update.class)
+
+// ❌ 避免：所有场景使用相同校验规则
+```
+
+### 3. 提供清晰的错误信息
+
+```java
+// ✅ 推荐：清晰的错误信息
+@NotBlank(message = "用户名不能为空")
+
+// ❌ 避免：模糊的错误信息
+@NotBlank
+```
+
+## 总结
+
+本文介绍了参数校验的各种方式，主要内容：
+
+**内置注解**：
+
+- ✅ 空值校验：@NotNull、@NotBlank、@NotEmpty
+- ✅ 长度校验：@Size、@Length
+- ✅ 数值校验：@Min、@Max、@Positive
+- ✅ 格式校验：@Email、@Pattern、@URL
+
+**高级用法**：
+
+- ✅ 分组校验
+- ✅ 自定义校验注解
+- ✅ 嵌套校验
+- ✅ 全局异常处理
+
+**最佳实践**：
+
+- ✅ DTO 层校验
+- ✅ 使用分组
+- ✅ 清晰的错误信息
+
+掌握参数校验后，就能保证数据质量了。接下来我们将学习全局异常处理。
+
+## 下一步
+
+在下一篇文章《07 全局异常处理》中，我们将学习：
+
+- @RestControllerAdvice 全局异常捕获
+- 自定义业务异常
+- 异常处理最佳实践
+- 统一错误响应格式
+
+---

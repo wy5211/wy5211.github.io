@@ -1,0 +1,620 @@
+---
+title: "07. Docker 私有仓库搭建：镜像存储与管理"
+date: "2025-03-23"
+summary: "掌握 Docker 私有仓库的搭建和配置，学习镜像管理、访问控制、安全扫描等企业级功能。"
+tags: ["Docker", "Registry", "Harbor", "镜像仓库"]
+category: "docker"
+cover: ""
+draft: false
+series: "Docker 从入门到实战"
+seriesOrder: 7
+---
+
+## 前言
+
+随着容器化应用的普及，管理越来越多的 Docker 镜像成为必要。公共仓库 Docker Hub 虽然方便，但对于企业来说，搭建私有仓库更安全、更可控。本篇文章将详细介绍如何搭建和管理 Docker 私有仓库。
+
+**学习目标**：
+
+- 理解 Docker Registry 的工作原理
+- 搭建基础的私有仓库
+- 掌握 Harbor 企业级仓库的使用
+- 学习镜像的安全扫描和访问控制
+
+## Docker Registry 基础
+
+### 什么是 Registry
+
+Registry 是存储和分发 Docker 镜像的服务，类似于：
+
+- **GitHub**：存储代码
+- **NPM**：存储 Node.js 包
+- **Docker Registry**：存储 Docker 镜像
+
+### Registry vs Repository
+
+- **Registry（仓库）**：托管多个 Repository 的服务
+  - Docker Hub、阿里云容器镜像服务
+- **Repository（仓库）**：某个特定镜像的所有版本集合
+  - `nginx`、`postgres`、`myapp`
+
+### Registry 架构
+
+```
+┌─────────────────────────────────────┐
+│         Docker Client               │
+└──────────────┬──────────────────────┘
+               │ pull/push
+               ▼
+┌─────────────────────────────────────┐
+│        Docker Registry             │
+│  ┌──────────┐  ┌──────────┐       │
+│  │ nginx    │  │ myapp    │  ...  │
+│  │ └─────── │  │ └─────── │       │
+│  │ v1.24    │  │ v1.0     │        │
+│  │ v1.25    │  │ v2.0     │        │
+│  └──────────┘  └──────────┘       │
+└─────────────────────────────────────┘
+               │
+               ▼
+┌─────────────────────────────────────┐
+│          Storage Backend            │
+│     (FileSystem, S3, Azure, ...)    │
+└─────────────────────────────────────┘
+```
+
+## 搭建基础 Registry
+
+### 使用官方 Registry 镜像
+
+```bash
+# 1. 拉取 Registry 镜像
+docker pull registry:2
+
+# 2. 运行 Registry
+docker run -d \
+  --name my-registry \
+  --restart=unless-stopped \
+  -p 5000:5000 \
+  -v registry-data:/var/lib/registry \
+  registry:2
+
+# 3. 验证运行
+curl http://localhost:5000/v2/_catalog
+# 输出：{"repositories":[""]}
+```
+
+### 配置 Registry
+
+**创建配置文件**：
+
+```yaml
+# config.yml
+version: 0.1
+log:
+  level: info
+  fields:
+    service: registry
+storage:
+  cache:
+    blobdescriptor: inmemory
+  filesystem:
+    rootdirectory: /var/lib/registry
+http:
+  addr: :5000
+  headers:
+    X-Content-Type-Options: [nosniff]
+    Access-Control-Max-Age: [1728000]
+    Access-Control-Allow-Origin: ['*']
+    Access-Control-Allow-Methods: ['HEAD', 'GET', 'OPTIONS', 'DELETE']
+    Access-Control-Allow-Headers: ['Authorization', 'Accept']
+    Access-Control-Max-Age: [1728000]
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3
+```
+
+**使用自定义配置**：
+
+```bash
+docker run -d \
+  --name my-registry \
+  -p 5000:5000 \
+  -v $(pwd)/config.yml:/etc/docker/registry/config.yml \
+  -v registry-data:/var/lib/registry \
+  registry:2
+```
+
+### 使用 Docker Compose
+
+```yaml
+# docker-compose.yml
+version: "3.8"
+
+services:
+  registry:
+    image: registry:2
+    container_name: my-registry
+    restart: unless-stopped
+    ports:
+      - "5000:5000"
+    environment:
+      REGISTRY_STORAGE_DELETE_ENABLED: "true"
+    volumes:
+      - ./data:/var/lib/registry
+      - ./config.yml:/etc/docker/registry/config.yml:ro
+    networks:
+      - registry-net
+
+  registry-ui:
+    image: joxit/docker-registry-ui:latest
+    container_name: registry-ui
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      - REGISTRY_TITLE=My Docker Registry
+      - REGISTRY_URL=http://registry:5000
+      - DELETE_IMAGES=true
+    depends_on:
+      - registry
+    networks:
+      - registry-net
+
+volumes:
+  registry-data:
+
+networks:
+  registry-net:
+```
+
+**启动服务**：
+
+```bash
+docker compose up -d
+
+# 访问 UI
+open http://localhost:8080
+```
+
+## 镜像管理操作
+
+### 推送镜像到私有仓库
+
+```bash
+# 1. 标记镜像
+docker tag nginx:latest localhost:5000/nginx:latest
+
+# 2. 推送镜像
+docker push localhost:5000/nginx:latest
+
+# 3. 验证
+curl http://localhost:5000/v2/nginx/tags/list
+# 输出：{"name":"nginx","tags":["latest"]}
+```
+
+### 拉取私有仓库镜像
+
+```bash
+# 从私有仓库拉取
+docker pull localhost:5000/nginx:latest
+
+# 查看镜像
+docker images | grep localhost:5000
+```
+
+### 删除镜像
+
+```bash
+# 通过 API 删除镜像
+curl -X DELETE http://localhost:5000/v2/nginx/manifests/sha256:<digest>
+
+# 通过 UI 删除
+# 访问 http://localhost:8080
+```
+
+## 企业级仓库：Harbor
+
+### Harbor 简介
+
+Harbor 是一个开源的企业级 Docker Registry，提供：
+
+- 🎨 **Web UI**：可视化管理界面
+- 🔒 **访问控制**：基于角色的权限管理
+- 🛡️ **漏洞扫描**：集成 Trivy 安全扫描
+- 📊 **审计日志**：完整的操作日志
+- 🔄 **镜像复制**：跨 Registry 复制
+- 🏷️ **标签管理**：镜像标签和签名
+
+### 安装 Harbor
+
+**在线安装**：
+
+```bash
+# 1. 下载安装包
+wget https://github.com/goharbor/harbor/releases/download/v2.10.0/harbor-online-installer-v2.10.0.tgz
+
+# 2. 解压
+tar -xvf harbor-online-installer-v2.10.0.tgz
+cd harbor
+
+# 3. 配置 harbor.yml
+cp harbor.yml.tmpl harbor.yml
+vi harbor.yml
+
+# 主要配置项：
+hostname: harbor.example.com
+http:
+  port: 80
+https:
+  port: 443
+  certificate: /your/certificate/path
+  private_key: /your/private/key/path
+harbor_admin_password: Harbor12345
+
+# 4. 安装
+sudo ./install.sh
+```
+
+**Docker Compose 安装**：
+
+```yaml
+# docker-compose.yml
+version: "3.8"
+
+services:
+  log:
+    image: goharbor/harbor-log:v2.10.0
+    volumes:
+      - /var/log/harbor/:/var/log/docker/
+    networks:
+      - harbor
+
+  registry:
+    image: goharbor/harbor-registry:v2.10.0
+    volumes:
+      - registry_data:/storage
+    networks:
+      - harbor
+    environment:
+      - REGISTRY_HTTP_RELATIVEURLS=false
+      - REGISTRY_CREDENTIAL_USERNAME=harbor_registry_user
+      - REGISTRY_CREDENTIAL_PASSWORD=harbor_registry_password
+      - REGISTRY_STORAGE_DELETE_ENABLED=true
+
+  core:
+    image: goharbor/harbor-core:v2.10.0
+    volumes:
+      - core_data:/data
+    networks:
+      - harbor
+    env_file:
+      - ./core.env
+
+  portal:
+    image: goharbor/harbor-portal:v2.10.0
+    volumes:
+      - portal_data:/data
+    networks:
+      - harbor
+
+  database:
+    image: goharbor/harbor-db:v2.10.0
+    volumes:
+      - database_data:/var/lib/postgresql/data
+    networks:
+      - harbor
+
+  redis:
+    image: goharbor/harbor-redis:v2.10.0
+    volumes:
+      - redis_data:/data
+    networks:
+      - harbor
+
+volumes:
+  registry_data:
+  core_data:
+  portal_data:
+  database_data:
+  redis_data:
+
+networks:
+  harbor:
+```
+
+### Harbor 基本使用
+
+**1. 访问 Harbor**
+
+```
+URL: http://your-ip
+用户名: admin
+密码: Harbor12345
+```
+
+**2. 创建项目**
+
+```
+Projects → New Project
+- 名称: my-project
+- 可见性: Public/Private
+```
+
+**3. 推送镜像**
+
+```bash
+# 登录 Harbor
+docker login harbor.example.com
+
+# 标记镜像
+docker tag nginx:latest harbor.example.com/my-project/nginx:latest
+
+# 推送镜像
+docker push harbor.example.com/my-project/nginx:latest
+```
+
+**4. 设置镜像保留策略**
+
+```
+项目 → Tags → 策略设置
+- 保留最近 10 个版本
+- 清理超过 30 天的标签
+```
+
+## 安全配置
+
+### TLS/SSL 配置
+
+**生成自签名证书**：
+
+```bash
+# 1. 生成私钥
+openssl genrsa -out domain.key 4096
+
+# 2. 生成证书签名请求
+openssl req -new -sha256 \
+    -key domain.key \
+    -out domain.csr \
+    -subj "/C=CN/ST=State/L=City/O=Organization/CN=domain.com"
+
+# 3. 生成自签名证书
+openssl x509 -req -days 365 \
+    -in domain.csr \
+    -signkey domain.key \
+    -out domain.crt
+```
+
+**配置 Registry 使用 TLS**：
+
+```yaml
+# config.yml
+version: 0.1
+http:
+  addr: :5000
+  tls:
+    certificate: /etc/docker/registry/domain.crt
+    key: /etc/docker/registry/domain.key
+```
+
+### 访问控制
+
+**基本认证**：
+
+```yaml
+# config.yml
+auth:
+  htpasswd:
+    realm: basic-realm
+    path: /etc/docker/registry/htpasswd
+```
+
+**创建用户**：
+
+```bash
+# 安装 htpasswd 工具
+apt-get install apache2-utils
+
+# 创建用户文件
+htpasswd -Bn admin admin >> htpasswd
+htpasswd -Bn developer dev >> htpasswd
+
+# 启动 Registry
+docker run -d \
+  -p 5000:5000 \
+  -v $(pwd)/htpasswd:/etc/docker/registry/htpasswd \
+  -v $(pwd)/config.yml:/etc/docker/registry/config.yml \
+  registry:2
+```
+
+### 镜像签名
+
+**使用 Notary 签名镜像**：
+
+```bash
+# 1. 安装 Notary
+git clone https://github.com/theupdateframework/notary
+cd notary
+docker build -t notary .
+docker run -d --name notary -v $(pwd):/notary notary
+
+# 2. 初始化信任
+notary init docker.example.com
+
+# 3. 发布镜像
+docker push docker.example.com/myapp:1.0
+
+# 4. 签名镜像
+notary add docker.example.com/myapp:1.0 \
+  --roles=myapp \
+  --publish=true
+
+# 5. 验证签名
+docker notary verify docker.example.com/myapp:1.0
+```
+
+## 镜像安全扫描
+
+### Trivy 扫描
+
+**扫描本地镜像**：
+
+```bash
+# 安装 Trivy
+brew install trivy
+
+# 扫描镜像
+trivy image nginx:latest
+
+# 扫描并输出 JSON
+trivy image -f json nginx:latest > scan-report.json
+```
+
+**集成到 Harbor**：
+
+```
+Harbor 已内置 Trivy
+项目 → 配置 → 漏洞扫描
+- 每天扫描新镜像
+- 阻止高风险镜像部署
+```
+
+### Clair 扫描
+
+**运行 Clair**：
+
+```yaml
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_PASSWORD: password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  claif:
+    image: quay.io/coreos/clair:v4.4.4
+    depends_on:
+      - postgres
+    ports:
+      - "6060:6060"
+      - "6061:6061"
+    environment:
+      - CLAIR_DB_HOST=postgres
+      - CLAIR_DB_PASSWORD=password
+    volumes:
+      - ./clair-config.yaml:/etc/clair/config.yaml:ro
+
+volumes:
+  postgres-data:
+```
+
+## 最佳实践
+
+### 1. 备份策略
+
+```bash
+# 备份镜像
+docker pull harbor.example.com/myproject/myapp:1.0
+docker save harbor.example.com/myproject/myapp:1.0 | gzip > myapp-1.0.tar.gz
+
+# 定期备份 Registry 数据
+docker exec my-registry tar -czf /tmp/backup.tar.gz /var/lib/registry
+docker cp my-registry:/tmp/backup.tar.gz ./backup-$(date +%Y%m%d).tar.gz
+```
+
+### 2. 镜像清理
+
+```bash
+# Harbor UI 清理
+项目 → Tags → 清理策略
+
+# API 清理
+curl -X DELETE "http://harbor.example.com/api/v2.0/projects/myproject/repositories/nginx/artifacts/sha256:..."
+```
+
+### 3. 高可用配置
+
+```yaml
+# 使用负载均衡器
+services:
+  registry-1:
+    image: registry:2
+    volumes:
+      - nfs-data:/var/lib/registry
+
+  registry-2:
+    image: registry:2
+    volumes:
+      - nfs-data:/var/lib/registry
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+
+volumes:
+  nfs-data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: addr=nfs-server,rw
+      device: ":/path/to/data"
+```
+
+## 常见问题
+
+### Q1: 推送镜像报错 "http: server gave HTTP response to HTTPS client"
+
+**答**：配置 insecure-registries
+
+```json
+// /etc/docker/daemon.json
+{
+  "insecure-registries": ["harbor.example.com:5000"]
+}
+```
+
+### Q2: 如何查看 Registry 中的所有镜像？
+
+**答**：
+
+```bash
+curl -X GET http://localhost:5000/v2/_catalog
+```
+
+### Q3: Harbor 忘记管理员密码怎么办？
+
+**答**：
+
+```bash
+docker exec -it harbor-core /bin/bash
+htpasswd -Bbn admin newpassword
+```
+
+## 总结
+
+本篇文章我们学习了 Docker 私有仓库的搭建：
+
+**核心内容**：
+
+1. 📦 **Registry 基础**：架构和工作原理
+2. 🏗️ **搭建私有仓库**：官方 Registry 和 Docker Compose
+3. 🚢 **Harbor 企业级仓库**：完整的 UI 和权限管理
+4. 🔒 **安全配置**：TLS、认证、镜像签名
+5. 🛡️ **安全扫描**：Trivy 和 Clair 集成
+
+**下一步**：
+在下一篇文章中，我们将学习 Docker 数据持久化，掌握卷和绑定挂载的使用。
+
+## 参考资料
+
+- [Docker Registry 官方文档](https://docs.docker.com/registry/)
+- [Harbor 官网](https://goharbor.io/)
+- [Trivy 文档](https://aquasecurity.github.io/trivy/)
