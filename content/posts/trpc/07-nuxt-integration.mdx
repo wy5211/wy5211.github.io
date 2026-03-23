@@ -1,0 +1,1198 @@
+---
+title: "07 Nuxt + tRPC Vue 生态集成"
+date: "2026-03-23"
+summary: "掌握 Nuxt 3 与 tRPC 的深度集成，学会 Vue Composition API 中使用 tRPC，对比 Next.js 和 Nuxt 的集成差异。"
+tags: ["tRPC", "Nuxt", "Vue", "Composition API", "SSR"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 7
+---
+
+## 前言
+
+Vue 生态的开发者一直在寻找类似于 Next.js + tRPC 的类型安全解决方案。随着 Nuxt 3 的发布和 Composition API 的成熟，现在我们可以在 Vue 项目中获得同样出色的 tRPC 开发体验。
+
+**Nuxt + tRPC 的优势**：
+
+- ✅ 完整的类型安全（和 Next.js 一样）
+- ✅ 服务端渲染（SSR）支持
+- ✅ Vue Composition API 集成
+- ✅ 自动导入组件和函数
+- ✅ 优秀的开发者体验
+
+今天，我们将学习：
+
+- Nuxt 3 项目配置和 tRPC 集成
+- Vue Composition API 中使用 tRPC
+- 服务端渲染和客户端渲染
+- 与 Next.js 的对比
+- 完整的 Vue 应用实战
+
+## Nuxt vs Next.js：快速对比
+
+在深入代码之前，让我们先看看两个框架的相似之处和差异：
+
+| 特性          | Next.js (React)       | Nuxt (Vue)              |
+| ------------- | --------------------- | ----------------------- |
+| **类型安全**  | ✅ 完整               | ✅ 完整                 |
+| **SSR**       | ✅ Server Components  | ✅ useAsyncData         |
+| **组件风格**  | JSX/TSX               | Template + Script       |
+| **状态管理**  | React Query           | useAsyncData + useState |
+| **自动导入**  | 需配置                | ✅ 原生支持             |
+| **路由系统**  | App Router (文件系统) | 文件系统路由            |
+| **tRPC 集成** | @trpc/next            | @trpc-nuxt/nuxt         |
+
+**学习曲线**：如果你已经掌握了 Next.js + tRPC，学习 Nuxt + tRPC 会非常容易！
+
+## 项目初始化
+
+### 第一步：创建 Nuxt 项目
+
+```bash
+# 使用 nuxi 创建项目
+npx nuxi@latest init trpc-nuxt-app
+
+# 进入项目目录
+cd trpc-nuxt-app
+
+# 安装依赖
+npm install
+```
+
+### 第二步：安装 tRPC 和相关依赖
+
+```bash
+# 核心 tRPC 包
+npm install @trpc/server @trpc/client
+
+# Nuxt tRPC 模块
+npm install @trpc-nuxt/nuxt
+
+# TypeScript 和类型
+npm install -D typescript
+
+# Zod 验证
+npm install zod
+
+# Prisma（可选，用于数据库）
+npm install prisma @prisma/client
+```
+
+### 第三步：项目结构
+
+```
+trpc-nuxt-app/
+├── server/
+│   ├── trpc/
+│   │   ├── routers/
+│   │   │   ├── index.ts
+│   │   │   ├── posts.ts
+│   │   │   └── users.ts
+│   │   └── context.ts
+│   └── api/
+│       └── trpc/
+│           └── [...].ts
+├── app/
+│   ├── app.vue
+│   ├── pages/
+│   │   ├── index.vue
+│   │   └── posts/
+│   │       └── [id].vue
+│   └── components/
+├── nuxt.config.ts
+└── package.json
+```
+
+## 服务端配置
+
+### 创建 tRPC Context
+
+```typescript
+// server/trpc/context.ts
+
+import { CreateNuxtContextOptions } from "@trpc-nuxt/nuxt";
+import { getServerSession } from "#auth";
+
+interface User {
+  id: string;
+  name: string;
+  email: string;
+  avatar: string | null;
+}
+
+export interface Context {
+  user: User | null;
+  session: Session | null;
+}
+
+export async function createContext({
+  event,
+}: CreateNuxtContextOptions): Promise<Context> {
+  // 获取会话（使用 NextAuth 或其他认证方案）
+  const session = await getServerSession(event);
+
+  return {
+    user: session?.user || null,
+    session,
+  };
+}
+```
+
+### 创建 tRPC 实例
+
+```typescript
+// server/trpc/index.ts
+
+import { initTRPC, TRPCError } from "@trpc/server";
+import { ZodError } from "zod";
+import type { Context } from "./context";
+
+const t = initTRPC.context<Context>().create({
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError:
+          error.code === "BAD_REQUEST" && error.cause instanceof ZodError
+            ? error.cause.flatten()
+            : null,
+      },
+    };
+  },
+});
+
+// 中间件：是否已登录
+const isAuthed = t.middleware(({ ctx, next }) => {
+  if (!ctx.user) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "需要登录",
+    });
+  }
+  return next({
+    ctx: {
+      ...ctx,
+      user: ctx.user, // 非 null 断言
+    },
+  });
+});
+
+// 导出
+export const router = t.router;
+export const publicProcedure = t.procedure;
+export const protectedProcedure = t.procedure.use(isAuthed);
+```
+
+### 创建 Routers
+
+```typescript
+// server/trpc/routers/posts.ts
+
+import { z } from "zod";
+import { prisma } from "@/lib/prisma";
+import { router, protectedProcedure } from "../index";
+
+export const postsRouter = router({
+  // 获取文章列表
+  list: protectedProcedure
+    .input(
+      z.object({
+        page: z.number().default(1),
+        limit: z.number().min(1).max(100).default(20),
+        published: z.boolean().optional(),
+      })
+    )
+    .query(async ({ input }) => {
+      const { page, limit, published } = input;
+      const skip = (page - 1) * limit;
+
+      const [posts, total] = await Promise.all([
+        prisma.post.findMany({
+          where: published !== undefined ? { published } : undefined,
+          skip,
+          take: limit,
+          orderBy: { createdAt: "desc" },
+          include: {
+            author: {
+              select: {
+                id: true,
+                name: true,
+                avatar: true,
+              },
+            },
+            _count: {
+              select: {
+                comments: true,
+                likes: true,
+              },
+            },
+          },
+        }),
+        prisma.post.count({
+          where: published !== undefined ? { published } : undefined,
+        }),
+      ]);
+
+      return {
+        posts,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      };
+    }),
+
+  // 根据 ID 获取文章
+  byId: protectedProcedure
+    .input(
+      z.object({
+        id: z.string(),
+        includeComments: z.boolean().default(true),
+      })
+    )
+    .query(async ({ input }) => {
+      const post = await prisma.post.findUnique({
+        where: { id: input.id },
+        include: {
+          author: {
+            select: {
+              id: true,
+              name: true,
+              email: true,
+              avatar: true,
+              bio: true,
+            },
+          },
+          ...(input.includeComments && {
+            comments: {
+              include: {
+                author: {
+                  select: {
+                    id: true,
+                    name: true,
+                    avatar: true,
+                  },
+                },
+              },
+              orderBy: { createdAt: "desc" },
+            },
+          }),
+          likes: {
+            select: {
+              user: {
+                select: {
+                  id: true,
+                  name: true,
+                },
+              },
+            },
+          },
+        },
+      });
+
+      if (!post) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "文章不存在",
+        });
+      }
+
+      return post;
+    }),
+
+  // 创建文章
+  create: protectedProcedure
+    .input(
+      z.object({
+        title: z.string().min(1).max(200),
+        content: z.string().min(1),
+        published: z.boolean().default(false),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const post = await prisma.post.create({
+        data: {
+          ...input,
+          authorId: ctx.user.id,
+        },
+        include: {
+          author: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+        },
+      });
+
+      return post;
+    }),
+
+  // 更新文章
+  update: protectedProcedure
+    .input(
+      z.object({
+        id: z.string(),
+        title: z.string().min(1).max(200).optional(),
+        content: z.string().min(1).optional(),
+        published: z.boolean().optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const { id, ...data } = input;
+
+      const post = await prisma.post.findUnique({
+        where: { id },
+      });
+
+      if (!post) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "文章不存在",
+        });
+      }
+
+      if (post.authorId !== ctx.user.id) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "只能编辑自己的文章",
+        });
+      }
+
+      const updated = await prisma.post.update({
+        where: { id },
+        data,
+        include: {
+          author: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+        },
+      });
+
+      return updated;
+    }),
+
+  // 删除文章
+  delete: protectedProcedure
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input, ctx }) => {
+      const post = await prisma.post.findUnique({
+        where: { id: input.id },
+      });
+
+      if (!post) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "文章不存在",
+        });
+      }
+
+      if (post.authorId !== ctx.user.id) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "只能删除自己的文章",
+        });
+      }
+
+      await prisma.post.delete({
+        where: { id: input.id },
+      });
+
+      return { success: true };
+    }),
+});
+
+export type PostsRouter = typeof postsRouter;
+```
+
+### 合并 Routers
+
+```typescript
+// server/trpc/routers/index.ts
+
+import { router } from "../index";
+import { postsRouter } from "./posts";
+import { usersRouter } from "./users";
+import { commentsRouter } from "./comments";
+import { statsRouter } from "./stats";
+
+export const appRouter = router({
+  posts: postsRouter,
+  users: usersRouter,
+  comments: commentsRouter,
+  stats: statsRouter,
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+### 创建 Nitro 路由处理器
+
+```typescript
+// server/api/trpc/[...].ts
+
+import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
+import { appRouter } from "~/server/trpc/routers";
+import { createContext } from "~/server/trpc/context";
+
+export default defineEventHandler((event) => {
+  return fetchRequestHandler({
+    endpoint: "/api/trpc",
+    req: event.node.req,
+    res: event.node.res,
+    router: appRouter,
+    createContext: () => createContext(event),
+  });
+});
+```
+
+## Nuxt 配置
+
+### 配置 nuxt.config.ts
+
+```typescript
+// nuxt.config.ts
+
+export default defineNuxtConfig({
+  modules: ["@trpc-nuxt/nuxt"],
+
+  runtimeConfig: {
+    // 服务端环境变量
+    databaseUrl: process.env.DATABASE_URL,
+    jwtSecret: process.env.JWT_SECRET,
+  },
+
+  typescript: {
+    strict: true,
+    typeCheck: true,
+  },
+
+  // 自动导入配置
+  imports: {
+    dirs: ["~/components"],
+  },
+});
+```
+
+### 创建 tRPC 插件
+
+```typescript
+// server/plugins/trpc.ts
+
+import { TRPC_NUXT_APP_ROUTER } from "@trpc-nuxt/nuxt";
+import { appRouter } from "~/server/trpc/routers";
+
+export default defineNitroPlugin((nitroApp) => {
+  // 将 router 注入到上下文
+  nitroApp.context[TRPC_NUXT_APP_ROUTER] = appRouter;
+});
+```
+
+## 客户端使用
+
+### 在 Vue 组件中使用 tRPC
+
+```vue
+<!-- app/pages/index.vue -->
+
+<script setup lang="ts">
+// ✅ 自动导入，无需手动 import
+const { data, pending, error, refresh } = await useAsyncData("posts", () =>
+  $trpc.posts.list.query({
+    page: 1,
+    limit: 20,
+    published: true,
+  })
+);
+</script>
+
+<template>
+  <div class="container mx-auto px-4 py-8">
+    <h1 class="text-4xl font-bold mb-8">最新文章</h1>
+
+    <div v-if="pending">加载中...</div>
+
+    <div v-else-if="error" class="text-red-600">
+      加载失败：{{ error.message }}
+    </div>
+
+    <div v-else class="grid gap-6">
+      <article
+        v-for="post in data?.posts"
+        :key="post.id"
+        class="border rounded-lg p-6 hover:shadow-lg transition-shadow"
+      >
+        <NuxtLink :to="`/posts/${post.id}`">
+          <h2 class="text-2xl font-semibold mb-2 hover:text-blue-600">
+            {{ post.title }}
+          </h2>
+        </NuxtLink>
+
+        <p class="text-gray-600 mb-4 line-clamp-2">
+          {{ post.content.substring(0, 200) }}...
+        </p>
+
+        <div class="flex items-center justify-between">
+          <div class="flex items-center gap-3">
+            <img
+              :src="post.author.avatar || '/default-avatar.png'"
+              :alt="post.author.name"
+              class="w-8 h-8 rounded-full"
+            />
+            <span class="text-sm text-gray-600">
+              {{ post.author.name }}
+            </span>
+          </div>
+
+          <div class="flex gap-4 text-sm text-gray-500">
+            <span>💬 {{ post._count.comments }}</span>
+            <span>❤️ {{ post._count.likes }}</span>
+          </div>
+        </div>
+      </article>
+    </div>
+  </div>
+</template>
+```
+
+### 动态页面
+
+```vue
+<!-- app/pages/posts/[id].vue -->
+
+<script setup lang="ts">
+const route = useRoute();
+const postId = route.params.id as string;
+
+// 服务端获取文章数据
+const {
+  data: post,
+  pending,
+  error,
+} = await useAsyncData(`post-${postId}`, () =>
+  $trpc.posts.byId.query({
+    id: postId,
+    includeComments: true,
+  })
+);
+
+if (error.value) {
+  throw createError({
+    statusCode: 404,
+    statusMessage: "文章不存在",
+  });
+}
+
+// SEO 元数据
+useHead({
+  title: post.value?.title,
+  meta: [
+    { name: "description", content: post.value?.content.substring(0, 160) },
+  ],
+});
+</script>
+
+<template>
+  <div class="container mx-auto px-4 py-8">
+    <div v-if="pending">加载中...</div>
+
+    <article v-else-if="post" class="max-w-4xl mx-auto">
+      <h1 class="text-5xl font-bold mb-6">
+        {{ post.title }}
+      </h1>
+
+      <div class="flex items-center gap-4 mb-8">
+        <img
+          :src="post.author.avatar || '/default-avatar.png'"
+          :alt="post.author.name"
+          class="w-12 h-12 rounded-full"
+        />
+        <div>
+          <div class="font-semibold">{{ post.author.name }}</div>
+          <div class="text-sm text-gray-500">
+            {{ new Date(post.createdAt).toLocaleDateString() }}
+          </div>
+        </div>
+      </div>
+
+      <div class="prose max-w-none mb-12">
+        {{ post.content }}
+      </div>
+
+      <!-- 评论区 -->
+      <section class="mt-12">
+        <h2 class="text-2xl font-bold mb-6">
+          评论 ({{ post.comments?.length || 0 }})
+        </h2>
+
+        <div class="space-y-6">
+          <div
+            v-for="comment in post.comments"
+            :key="comment.id"
+            class="flex gap-4"
+          >
+            <img
+              :src="comment.author.avatar || '/default-avatar.png'"
+              :alt="comment.author.name"
+              class="w-10 h-10 rounded-full"
+            />
+            <div class="flex-1">
+              <div class="font-semibold mb-1">
+                {{ comment.author.name }}
+              </div>
+              <div class="text-gray-700">
+                {{ comment.content }}
+              </div>
+              <div class="text-sm text-gray-500 mt-2">
+                {{ new Date(comment.createdAt).toLocaleString() }}
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </article>
+  </div>
+</template>
+```
+
+### 客户端交互
+
+```vue
+<!-- app/components/CreatePostModal.vue -->
+
+<script setup lang="ts">
+const modalOpen = ref(false);
+const title = ref("");
+const content = ref("");
+
+// 使用 tRPC mutation
+const { mutate: createPost, pending } = useMutation({
+  mutationFn: () =>
+    $trpc.posts.create.mutate({
+      title: title.value,
+      content: content.value,
+      published: false,
+    }),
+  onSuccess: (data) => {
+    modalOpen.value = false;
+    title.value = "";
+    content.value = "";
+    // 导航到新创建的文章
+    navigateTo(`/posts/${data.id}`);
+  },
+});
+
+const handleSubmit = () => {
+  if (!title.value || !content.value) {
+    alert("请填写标题和内容");
+    return;
+  }
+  createPost();
+};
+</script>
+
+<template>
+  <div>
+    <button
+      @click="modalOpen = true"
+      class="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+    >
+      写文章
+    </button>
+
+    <div
+      v-if="modalOpen"
+      class="fixed inset-0 bg-black/50 flex items-center justify-center"
+    >
+      <div class="bg-white rounded-lg p-6 max-w-2xl w-full mx-4">
+        <h2 class="text-2xl font-bold mb-4">创建文章</h2>
+
+        <form @submit.prevent="handleSubmit" class="space-y-4">
+          <div>
+            <label class="block mb-2 font-semibold">标题</label>
+            <input
+              v-model="title"
+              type="text"
+              required
+              class="width-full px-4 py-2 border rounded-lg"
+              placeholder="输入文章标题..."
+            />
+          </div>
+
+          <div>
+            <label class="block mb-2 font-semibold">内容</label>
+            <textarea
+              v-model="content"
+              required
+              rows="10"
+              class="width-full px-4 py-2 border rounded-lg"
+              placeholder="开始写作..."
+            />
+          </div>
+
+          <div class="flex justify-end gap-3">
+            <button
+              type="button"
+              @click="modalOpen = false"
+              class="px-4 py-2 border rounded-lg"
+            >
+              取消
+            </button>
+            <button
+              type="submit"
+              :disabled="pending"
+              class="px-6 py-2 bg-blue-600 text-white rounded-lg disabled:opacity-50"
+            >
+              {{ pending ? "创建中..." : "创建" }}
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  </div>
+</template>
+```
+
+### 无限滚动
+
+```vue
+<!-- app/components/PostsInfinite.vue -->
+
+<script setup lang="ts">
+const posts = ref<any[]>([]);
+const cursor = ref<string | undefined>(undefined);
+const hasMore = ref(true);
+const loading = ref(false);
+
+const loadMore = async () => {
+  if (loading.value || !hasMore.value) return;
+
+  loading.value = true;
+  try {
+    const result = await $trpc.posts.infinite.query({
+      limit: 20,
+      cursor: cursor.value,
+    });
+
+    posts.value.push(...result.items);
+    cursor.value = result.nextCursor;
+    hasMore.value = !!result.nextCursor;
+  } finally {
+    loading.value = false;
+  }
+};
+
+// 初始加载
+onMounted(() => {
+  loadMore();
+});
+
+// 无限滚动
+const observerTarget = ref<HTMLElement | null>(null);
+
+onMounted(() => {
+  const observer = new IntersectionObserver(
+    (entries) => {
+      if (entries[0].isIntersecting && hasMore.value) {
+        loadMore();
+      }
+    },
+    { threshold: 1 }
+  );
+
+  if (observerTarget.value) {
+    observer.observe(observerTarget.value);
+  }
+});
+</script>
+
+<template>
+  <div class="space-y-6">
+    <article v-for="post in posts" :key="post.id" class="border rounded-lg p-6">
+      <NuxtLink :to="`/posts/${post.id}`">
+        <h2 class="text-2xl font-semibold mb-2">
+          {{ post.title }}
+        </h2>
+      </NuxtLink>
+      <p class="text-gray-600">
+        {{ post.content }}
+      </p>
+    </article>
+
+    <!-- 观察目标 -->
+    <div ref="observerTarget" />
+
+    <div v-if="loading" class="text-center py-8">加载中...</div>
+
+    <div v-if="!hasMore" class="text-center py-8 text-gray-500">没有更多了</div>
+  </div>
+</template>
+```
+
+## 组合式函数
+
+### 创建可复用的组合式函数
+
+```typescript
+// app/composables/usePosts.ts
+
+export const usePosts = (page: Ref<number> = ref(1)) => {
+  const { data, pending, error, refresh } = useAsyncData(
+    computed(() => `posts-page-${page.value}`),
+    () =>
+      $trpc.posts.list.query({
+        page: page.value,
+        limit: 20,
+      })
+  );
+
+  return {
+    posts: computed(() => data.value?.posts || []),
+    pagination: computed(() => data.value?.pagination),
+    pending,
+    error,
+    refresh,
+  };
+};
+```
+
+### 使用组合式函数
+
+```vue
+<!-- app/pages/index.vue -->
+
+<script setup lang="ts">
+const page = ref(1);
+const { posts, pagination, pending } = usePosts(page);
+
+const nextPage = () => {
+  if (page.value < (pagination.value?.totalPages || 0)) {
+    page.value++;
+  }
+};
+
+const prevPage = () => {
+  if (page.value > 1) {
+    page.value--;
+  }
+};
+</script>
+
+<template>
+  <div class="container mx-auto px-4 py-8">
+    <div v-if="pending">加载中...</div>
+
+    <div v-else class="space-y-6">
+      <article v-for="post in posts" :key="post.id">
+        <h2>{{ post.title }}</h2>
+        <p>{{ post.content }}</p>
+      </article>
+    </div>
+
+    <!-- 分页 -->
+    <div class="mt-8 flex justify-center gap-4">
+      <button
+        :disabled="page === 1"
+        @click="prevPage"
+        class="px-4 py-2 border rounded-lg"
+      >
+        上一页
+      </button>
+      <span class="px-4 py-2">
+        第 {{ page }} / {{ pagination?.totalPages }} 页
+      </span>
+      <button
+        :disabled="page === pagination?.totalPages"
+        @click="nextPage"
+        class="px-4 py-2 border rounded-lg"
+      >
+        下一页
+      </button>
+    </div>
+  </div>
+</template>
+```
+
+## Next.js vs Nuxt 对比
+
+### API 调用对比
+
+```typescript
+// ========== Next.js ==========
+
+// 服务端组件
+import { serverClient } from '@/lib/trpc/server';
+
+export default async function Page() {
+  const posts = await serverClient.posts.list.query();
+  return <PostList posts={posts} />;
+}
+
+// 客户端组件
+'use client';
+import { trpc } from '@/lib/trpc/client';
+
+export function PostList() {
+  const { data } = trpc.posts.list.useQuery();
+  return <div>{/* ... */}</div>;
+}
+
+// ========== Nuxt ==========
+
+// 服务端（默认）
+const { data } = await useAsyncData(() => $trpc.posts.list.query());
+
+// 客户端（需要 <ClientOnly>）
+const { data } = useAsyncData(
+  'posts',
+  () => $trpc.posts.list.query()
+);
+```
+
+### 组件定义对比
+
+```vue
+<!-- ========== Next.js (React JSX) ========== -->
+
+'use client'; import { trpc } from '@/lib/trpc/client'; export function
+PostList() { const { data, isLoading } = trpc.posts.list.useQuery(); if
+(isLoading) return
+<div>Loading...</div>
+; return (
+<div>
+      {data?.posts.map(post => (
+        <article key={post.id}>
+          <h2>{post.title}</h2>
+          <p>{post.content}</p>
+        </article>
+      ))}
+    </div>
+); }
+
+<!-- ========== Nuxt (Vue Template) ========== -->
+
+<script setup lang="ts">
+const { data, pending } = await useAsyncData(() => $trpc.posts.list.query());
+</script>
+
+<template>
+  <div>
+    <div v-if="pending">Loading...</div>
+    <article v-else v-for="post in data?.posts" :key="post.id">
+      <h2>{{ post.title }}</h2>
+      <p>{{ post.content }}</p>
+    </article>
+  </div>
+</template>
+```
+
+### 状态管理对比
+
+```typescript
+// ========== Next.js: React Query ==========
+
+const utils = trpc.useContext();
+
+const createPost = trpc.posts.create.useMutation({
+  onSuccess: () => {
+    utils.posts.list.invalidate();
+  },
+});
+
+// ========== Nuxt: useAsyncData ==========
+
+const { data, refresh } = await useAsyncData("posts", () =>
+  $trpc.posts.list.query()
+);
+
+const { mutate: createPost } = useMutation({
+  mutationFn: (data) => $trpc.posts.create.mutate(data),
+  onSuccess: () => {
+    refresh(); // 刷新数据
+  },
+});
+```
+
+## 最佳实践
+
+### 1. 使用 Composables 组织代码
+
+```typescript
+// app/composables/useAuth.ts
+
+export const useAuth = () => {
+  const {
+    data: user,
+    pending,
+    refresh,
+  } = useAsyncData("user", () => $trpc.users.me.query());
+
+  const isAuthenticated = computed(() => !!user.value);
+
+  return {
+    user,
+    pending,
+    isAuthenticated,
+    refresh,
+  };
+};
+```
+
+### 2. 服务端数据获取
+
+```vue
+<!-- ✅ 推荐：在页面顶部使用 useAsyncData -->
+<script setup lang="ts">
+// 服务端获取，支持 SSR
+const { data } = await useAsyncData("posts", () =>
+  $trpc.posts.list.query({ page: 1, limit: 20 })
+);
+</script>
+
+<!-- ⚠️ 仅在需要客户端交互时使用 onMounted -->
+<script setup lang="ts">
+const posts = ref([]);
+
+onMounted(async () => {
+  // 仅客户端获取
+  const result = await $trpc.posts.list.query();
+  posts.value = result.posts;
+});
+</script>
+```
+
+### 3. 错误处理
+
+```vue
+<script setup lang="ts">
+const { data, error } = await useAsyncData("post", () =>
+  $trpc.posts.byId.query({ id: route.params.id })
+);
+
+if (error.value) {
+  throw createError({
+    statusCode: error.value?.statusCode || 500,
+    statusMessage: error.value?.message || "加载失败",
+  });
+}
+</script>
+```
+
+## 性能优化
+
+### 1. 数据缓存
+
+```typescript
+// 使用 Nuxt 的 data 缓存
+const { data } = await useAsyncData("posts", () => $trpc.posts.list.query(), {
+  // 5分钟内不会重新获取
+  getCachedData: (key) => useNuxtData(key).data,
+});
+```
+
+### 2. 预取数据
+
+```vue
+<script setup lang="ts">
+// 预取用户信息
+const { data: user } = await useAsyncData("user", () => $trpc.users.me.query());
+
+// 预取文章统计
+const { data: stats } = await useAsyncData("stats", () =>
+  $trpc.stats.overview.query()
+);
+</script>
+```
+
+### 3. 懒加载
+
+```vue
+<script setup lang="ts">
+// 仅在客户端加载的组件
+const Comments = defineAsyncComponent(
+  () => import("~/components/Comments.vue")
+);
+</script>
+
+<template>
+  <div>
+    <h1>文章内容</h1>
+    <!-- 懒加载评论 -->
+    <ClientOnly>
+      <Comments />
+      <template #fallback>
+        <div>加载评论中...</div>
+      </template>
+    </ClientOnly>
+  </div>
+</template>
+```
+
+## 总结
+
+### 核心要点
+
+1. **Nuxt + tRPC 集成**
+   - @trpc-nuxt/nuxt 模块配置
+   - Nitro 路由处理器
+   - 自动导入和类型推断
+
+2. **Vue Composition API**
+   - useAsyncData 数据获取
+   - useMutation 数据变更
+   - composables 代码复用
+
+3. **服务端渲染**
+   - 默认 SSR 支持
+   - SEO 友好
+   - 性能优化
+
+4. **与 Next.js 对比**
+   - 相同的类型安全
+   - 不同的组件风格
+   - 各有优劣
+
+### 选择建议
+
+**选择 Next.js + tRPC 如果**：
+
+- ✅ 团队更熟悉 React
+- ✅ 需要更成熟的生态系统
+- ✅ 使用 Server Components
+
+**选择 Nuxt + tRPC 如果**：
+
+- ✅ 团队更熟悉 Vue
+- ✅ 喜欢模板语法
+- ✅ 需要自动导入功能
+
+### 下一步
+
+在下一篇文章中，我们将学习：
+
+- **NestJS + tRPC 企业级后端**
+- 依赖注入集成
+- Guards 和 Interceptors
+- 微服务架构
+
+敬请期待！🚀
+
+## 参考资源
+
+- [Nuxt 3 文档](https://nuxt.com)
+- [tRPC Nuxt 模块](https://trpc-nuxt.vercel.app)
+- [Vue Composition API](https://vueuse.org/)
+
+---
+
+**上一章**：[06. Next.js + tRPC 全栈开发](./06-nextjs-integration.mdx)
+**下一章**：[08. NestJS + tRPC 企业级后端](./08-nestjs-integration.mdx)

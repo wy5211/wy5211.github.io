@@ -1,0 +1,1024 @@
+---
+title: "02 核心概念：Routers 和 Procedures"
+date: "2026-03-23"
+summary: "深入理解 tRPC 的核心概念，掌握 Router 的组织方式和 Procedure 的使用技巧，学会构建结构清晰、类型安全的 API。"
+tags: ["tRPC", "Router", "Procedure", "API设计", "TypeScript"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 2
+---
+
+## 前言
+
+在上一篇文章中，我们快速体验了 tRPC 的魅力。今天，我们将深入学习 tRPC 的两个核心概念：**Router（路由器）**和 **Procedure（程序）**。
+
+理解这两个概念，是构建可维护、可扩展的 tRPC 应用的基础。让我们开始吧！
+
+## Router 深度解析
+
+### 什么是 Router？
+
+Router 是 tRPC API 的组织单位，类似于文件系统的目录结构。它允许我们将相关的 API 分组管理，形成清晰的层次结构。
+
+**类比理解**：
+
+- Router 就像一个**文件夹**
+- Procedure 就像文件夹中的**文件**
+- 你可以创建嵌套的文件夹（嵌套 Router）
+
+### 基础 Router 创建
+
+```typescript
+import { initTRPC } from "@trpc/server";
+
+// 1. 初始化 tRPC 实例
+const t = initTRPC.create();
+
+// 2. 创建简单的 Router
+const userRouter = t.router({
+  // 获取用户列表
+  list: t.procedure.query(() => {
+    return [
+      { id: "1", name: "Alice", email: "alice@example.com" },
+      { id: "2", name: "Bob", email: "bob@example.com" },
+    ];
+  }),
+
+  // 根据 ID 获取用户
+  byId: t.procedure.input(z.object({ id: z.string() })).query(({ input }) => {
+    return { id: input.id, name: "Alice", email: "alice@example.com" };
+  }),
+});
+
+// 3. 导出 Router 类型
+export type UserRouter = typeof userRouter;
+```
+
+### 嵌套 Router 组织
+
+实际项目中，我们需要组织多个 Router：
+
+```typescript
+import { initTRPC } from "@trpc/server";
+import { z } from "zod";
+
+const t = initTRPC.create();
+
+// ========== 子 Router：用户管理 ==========
+export const usersRouter = t.router({
+  // 查询所有用户
+  list: t.procedure.query(async () => {
+    const users = await db.user.findMany();
+    return users;
+  }),
+
+  // 根据 ID 查询
+  byId: t.procedure
+    .input(z.object({ id: z.string() }))
+    .query(async ({ input }) => {
+      const user = await db.user.findUnique({
+        where: { id: input.id },
+      });
+      return user;
+    }),
+
+  // 创建用户
+  create: t.procedure
+    .input(
+      z.object({
+        name: z.string().min(2),
+        email: z.string().email(),
+      })
+    )
+    .mutation(async ({ input }) => {
+      const user = await db.user.create({
+        data: input,
+      });
+      return user;
+    }),
+
+  // 更新用户
+  update: t.procedure
+    .input(
+      z.object({
+        id: z.string(),
+        name: z.string().min(2).optional(),
+        email: z.string().email().optional(),
+      })
+    )
+    .mutation(async ({ input }) => {
+      const { id, ...data } = input;
+      const user = await db.user.update({
+        where: { id },
+        data,
+      });
+      return user;
+    }),
+
+  // 删除用户
+  delete: t.procedure
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input }) => {
+      await db.user.delete({
+        where: { id: input.id },
+      });
+      return { success: true };
+    }),
+});
+
+// ========== 子 Router：文章管理 ==========
+export const postsRouter = t.router({
+  list: t.procedure.query(async () => {
+    return await db.post.findMany();
+  }),
+
+  byId: t.procedure
+    .input(z.object({ id: z.string() }))
+    .query(async ({ input }) => {
+      return await db.post.findUnique({
+        where: { id: input.id },
+      });
+    }),
+
+  create: t.procedure
+    .input(
+      z.object({
+        title: z.string().min(1),
+        content: z.string().min(1),
+        authorId: z.string(),
+      })
+    )
+    .mutation(async ({ input }) => {
+      return await db.post.create({
+        data: input,
+      });
+    }),
+});
+
+// ========== 子 Router：评论管理 ==========
+export const commentsRouter = t.router({
+  list: t.procedure
+    .input(z.object({ postId: z.string() }).optional())
+    .query(async ({ input }) => {
+      return await db.comment.findMany({
+        where: input ? { postId: input.postId } : undefined,
+      });
+    }),
+
+  create: t.procedure
+    .input(
+      z.object({
+        postId: z.string(),
+        content: z.string().min(1),
+        authorId: z.string(),
+      })
+    )
+    .mutation(async ({ input }) => {
+      return await db.comment.create({
+        data: input,
+      });
+    }),
+});
+
+// ========== 主 Router：整合所有子 Router ==========
+export const appRouter = t.router({
+  users: usersRouter,
+  posts: postsRouter,
+  comments: commentsRouter,
+
+  // 顶层也可以有直接的 procedure
+  health: t.procedure.query(() => {
+    return { status: "ok", timestamp: new Date().toISOString() };
+  }),
+});
+
+// 导出类型供客户端使用
+export type AppRouter = typeof appRouter;
+```
+
+### Router 合并（Merger）
+
+当项目规模变大时，可以使用 `t.mergeRouters` 合并多个 Router：
+
+```typescript
+// routers/index.ts
+import { usersRouter } from "./users";
+import { postsRouter } from "./posts";
+import { commentsRouter } from "./comments";
+import { authRouter } from "./auth";
+
+// 方式1：在定义时合并
+export const appRouter = t.router({
+  users: usersRouter,
+  posts: postsRouter,
+  comments: commentsRouter,
+  auth: authRouter,
+});
+
+// 方式2：使用 mergeRouters（适合大型项目）
+export const appRouter = t.mergeRouters(
+  usersRouter,
+  postsRouter,
+  commentsRouter,
+  authRouter
+);
+
+// 方式3：先分组再合并
+export const contentRouter = t.mergeRouters(postsRouter, commentsRouter);
+export const appRouter = t.router({
+  content: contentRouter,
+  users: usersRouter,
+  auth: authRouter,
+});
+```
+
+### 命名空间管理
+
+使用命名空间避免 API 路径冲突：
+
+```typescript
+// ✅ 推荐：使用有意义的命名空间
+export const appRouter = t.router({
+  // 用户相关 API
+  users: usersRouter,
+
+  // 管理员相关 API
+  admin: t.router({
+    users: adminUsersRouter, // /admin/users
+    posts: adminPostsRouter, // /admin/posts
+    stats: adminStatsRouter, // /admin/stats
+  }),
+
+  // API v1
+  v1: t.router({
+    users: usersV1Router,
+    posts: postsV1Router,
+  }),
+
+  // API v2
+  v2: t.router({
+    users: usersV2Router,
+    posts: postsV2Router,
+  }),
+});
+
+// 客户端调用：
+await client.users.list.query(); // /users.list
+await client.admin.users.list.query(); // /admin.users.list
+await client.v1.users.byId.query({ id }); // /v1.users.byId
+```
+
+## Procedure 深度解析
+
+### 什么是 Procedure？
+
+Procedure 是 tRPC API 的最小可执行单元，类似于函数定义。每个 Procedure 都是一个可以被客户端调用的端点。
+
+### Procedure 的三种类型
+
+#### 1. Query（查询）- 读取数据
+
+Query 用于**读取数据**，对应 HTTP 的 GET 请求。它应该是**幂等的**（多次调用结果相同）和**无副作用**的。
+
+```typescript
+const getUsers = t.procedure.query(async () => {
+  // ✅ 只读取数据
+  return await db.user.findMany();
+});
+
+const getUserById = t.procedure
+  .input(z.object({ id: z.string() }))
+  .query(async ({ input }) => {
+    // ✅ 根据 ID 查询
+    return await db.user.findUnique({
+      where: { id: input.id },
+    });
+  });
+
+// ❌ 不要在 Query 中修改数据！
+const badExample = t.procedure.query(async () => {
+  // ❌ 错误：Query 不应该有副作用
+  await db.user.create({ data: { name: "Alice" } });
+  return { success: true };
+});
+```
+
+#### 2. Mutation（变更）- 修改数据
+
+Mutation 用于**修改数据**，对应 HTTP 的 POST/PUT/DELETE 请求。
+
+```typescript
+const createUser = t.procedure
+  .input(
+    z.object({
+      name: z.string().min(2),
+      email: z.string().email(),
+    })
+  )
+  .mutation(async ({ input }) => {
+    // ✅ 创建数据
+    return await db.user.create({ data: input });
+  });
+
+const updateUser = t.procedure
+  .input(
+    z.object({
+      id: z.string(),
+      name: z.string().min(2).optional(),
+      email: z.string().email().optional(),
+    })
+  )
+  .mutation(async ({ input }) => {
+    const { id, ...data } = input;
+    // ✅ 更新数据
+    return await db.user.update({
+      where: { id },
+      data,
+    });
+  });
+
+const deleteUser = t.procedure
+  .input(z.object({ id: z.string() }))
+  .mutation(async ({ input }) => {
+    // ✅ 删除数据
+    await db.user.delete({
+      where: { id: input.id },
+    });
+    return { success: true };
+  });
+```
+
+#### 3. Subscription（订阅）- 实时数据
+
+Subscription 用于**实时数据推送**，基于 WebSocket。
+
+```typescript
+import { observable } from "@trpc/server/observable";
+import { EventEmitter } from "events";
+
+const ee = new EventEmitter();
+
+const onNewUser = t.procedure.subscription(() => {
+  return observable<User>((emit) => {
+    const onNewUser = (user: User) => {
+      emit.next(user);
+    };
+
+    ee.on("newUser", onNewUser);
+
+    // 清理函数
+    return () => {
+      ee.off("newUser", onNewUser);
+    };
+  });
+});
+
+// 触发事件
+ee.emit("newUser", {
+  id: "123",
+  name: "Alice",
+  email: "alice@example.com",
+});
+```
+
+### 输入验证（Input Validation）
+
+使用 Zod 进行类型安全的输入验证：
+
+```typescript
+import { z } from "zod";
+
+// 1. 定义输入 schema
+const createUserSchema = z.object({
+  name: z.string().min(2, "姓名至少2个字符").max(50, "姓名最多50个字符"),
+  email: z.string().email("邮箱格式不正确"),
+  age: z.number().min(18, "年龄必须大于18岁").optional(),
+  bio: z.string().max(500, "简介最多500字").optional(),
+});
+
+// 2. 应用到 procedure
+const createUser = t.procedure
+  .input(createUserSchema)
+  .mutation(async ({ input }) => {
+    // ✅ input 已经是类型安全的
+    // TypeScript 知道 input 的类型是：
+    // {
+    //   name: string;
+    //   email: string;
+    //   age?: number;
+    //   bio?: string;
+    // }
+    return await db.user.create({ data: input });
+  });
+
+// 3. 复杂验证
+const advancedUserSchema = z.object({
+  email: z.string().email(),
+  password: z
+    .string()
+    .min(8, "密码至少8位")
+    .regex(/[A-Z]/, "密码必须包含大写字母")
+    .regex(/[a-z]/, "密码必须包含小写字母")
+    .regex(/[0-9]/, "密码必须包含数字"),
+  profile: z
+    .object({
+      firstName: z.string(),
+      lastName: z.string(),
+      avatar: z.string().url().optional(),
+    })
+    .optional(),
+  preferences: z
+    .object({
+      theme: z.enum(["light", "dark"]),
+      notifications: z.boolean(),
+    })
+    .optional(),
+});
+
+const registerUser = t.procedure
+  .input(advancedUserSchema)
+  .mutation(async ({ input }) => {
+    // 复杂的嵌套验证也完全类型安全
+    return await db.user.create({
+      data: {
+        email: input.email,
+        password: await hash(input.password),
+        profile: input.profile
+          ? {
+              create: input.profile,
+            }
+          : undefined,
+        preferences: input.preferences
+          ? {
+              create: input.preferences,
+            }
+          : undefined,
+      },
+    });
+  });
+```
+
+### 输出类型推断
+
+tRPC 会自动推断 Procedure 的返回类型：
+
+```typescript
+// ❌ 不需要手动定义返回类型
+interface GetUserResponse {
+  id: string;
+  name: string;
+  email: string;
+}
+
+const getUser = t.procedure
+  .input(z.object({ id: z.string() }))
+  .query(async ({ input }): Promise<GetUserResponse> => {
+    // ❌ 冗余
+    return await db.user.findUnique({
+      where: { id: input.id },
+    });
+  });
+
+// ✅ tRPC 会自动推断
+const getUser = t.procedure
+  .input(z.object({ id: z.string() }))
+  .query(async ({ input }) => {
+    const user = await db.user.findUnique({
+      where: { id: input.id },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+      },
+    });
+    return user;
+    // tRPC 自动推断返回类型为：
+    // { id: string; name: string | null; email: string | null } | null
+  });
+```
+
+### 处理可选字段
+
+```typescript
+const updateUser = t.procedure
+  .input(
+    z.object({
+      id: z.string(),
+      name: z.string().optional(),
+      email: z.string().optional(),
+    })
+  )
+  .mutation(async ({ input }) => {
+    const { id, ...updateData } = input;
+
+    // 只更新提供的字段
+    return await db.user.update({
+      where: { id },
+      data: updateData, // Prisma 会忽略 undefined 字段
+    });
+  });
+
+// 客户端调用：
+await client.users.update.mutate({
+  id: "123",
+  name: "Alice", // ✅ 只更新 name，不更新 email
+});
+```
+
+## 实战示例：Todo API
+
+让我们构建一个完整的 Todo API：
+
+```typescript
+import { initTRPC, TRPCError } from "@trpc/server";
+import { z } from "zod";
+
+const t = initTRPC.create();
+
+// ========== 数据模型（使用内存数组） ==========
+interface Todo {
+  id: string;
+  title: string;
+  description?: string;
+  completed: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+const todos: Todo[] = [
+  {
+    id: "1",
+    title: "学习 tRPC",
+    description: "完成 tRPC 系列教程",
+    completed: false,
+    createdAt: new Date("2026-03-20"),
+    updatedAt: new Date("2026-03-20"),
+  },
+  {
+    id: "2",
+    title: "构建项目",
+    description: "使用 tRPC 构建全栈应用",
+    completed: false,
+    createdAt: new Date("2026-03-21"),
+    updatedAt: new Date("2026-03-21"),
+  },
+];
+
+// ========== 工具函数 ==========
+const generateId = () => Date.now().toString();
+
+const findTodoById = (id: string) => {
+  const todo = todos.find((t) => t.id === id);
+  if (!todo) {
+    throw new TRPCError({
+      code: "NOT_FOUND",
+      message: `Todo with id ${id} not found`,
+    });
+  }
+  return todo;
+};
+
+// ========== Todo Router ==========
+export const todoRouter = t.router({
+  // 查询所有 Todo
+  list: t.procedure
+    .input(
+      z
+        .object({
+          completed: z.boolean().optional(),
+        })
+        .optional()
+    )
+    .query(({ input }) => {
+      let filteredTodos = [...todos];
+
+      // 可选过滤
+      if (input?.completed !== undefined) {
+        filteredTodos = filteredTodos.filter(
+          (t) => t.completed === input.completed
+        );
+      }
+
+      // 按创建时间倒序
+      return filteredTodos.sort(
+        (a, b) => b.createdAt.getTime() - a.createdAt.getTime()
+      );
+    }),
+
+  // 根据 ID 查询
+  byId: t.procedure.input(z.object({ id: z.string() })).query(({ input }) => {
+    return findTodoById(input.id);
+  }),
+
+  // 创建 Todo
+  create: t.procedure
+    .input(
+      z.object({
+        title: z.string().min(1, "标题不能为空").max(100, "标题最多100字"),
+        description: z.string().max(500, "描述最多500字").optional(),
+      })
+    )
+    .mutation(({ input }) => {
+      const newTodo: Todo = {
+        id: generateId(),
+        title: input.title,
+        description: input.description,
+        completed: false,
+        createdAt: new Date(),
+        updatedAt: new Date(),
+      };
+
+      todos.push(newTodo);
+      return newTodo;
+    }),
+
+  // 更新 Todo
+  update: t.procedure
+    .input(
+      z.object({
+        id: z.string(),
+        title: z.string().min(1).max(100).optional(),
+        description: z.string().max(500).optional(),
+        completed: z.boolean().optional(),
+      })
+    )
+    .mutation(({ input }) => {
+      const todo = findTodoById(input.id);
+      const { id, ...updates } = input;
+
+      Object.assign(todo, updates, {
+        updatedAt: new Date(),
+      });
+
+      return todo;
+    }),
+
+  // 切换完成状态
+  toggle: t.procedure
+    .input(z.object({ id: z.string() }))
+    .mutation(({ input }) => {
+      const todo = findTodoById(input.id);
+      todo.completed = !todo.completed;
+      todo.updatedAt = new Date();
+      return todo;
+    }),
+
+  // 删除 Todo
+  delete: t.procedure
+    .input(z.object({ id: z.string() }))
+    .mutation(({ input }) => {
+      const index = todos.findIndex((t) => t.id === input.id);
+      if (index === -1) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: `Todo with id ${input.id} not found`,
+        });
+      }
+
+      const [deleted] = todos.splice(index, 1);
+      return deleted;
+    }),
+
+  // 清除已完成的 Todo
+  clearCompleted: t.procedure.mutation(() => {
+    const completedCount = todos.filter((t) => t.completed).length;
+    const filteredTodos = todos.filter((t) => !t.completed);
+
+    // 清空数组并添加未完成的
+    todos.length = 0;
+    todos.push(...filteredTodos);
+
+    return { deletedCount: completedCount };
+  }),
+
+  // 批量操作
+  batchUpdate: t.procedure
+    .input(
+      z.object({
+        ids: z.array(z.string()).min(1),
+        updates: z.object({
+          completed: z.boolean(),
+        }),
+      })
+    )
+    .mutation(({ input }) => {
+      const updatedTodos: Todo[] = [];
+
+      input.ids.forEach((id) => {
+        const todo = todos.find((t) => t.id === id);
+        if (todo) {
+          Object.assign(todo, input.updates, {
+            updatedAt: new Date(),
+          });
+          updatedTodos.push(todo);
+        }
+      });
+
+      return {
+        updatedCount: updatedTodos.length,
+        todos: updatedTodos,
+      };
+    }),
+});
+
+// ========== 统计 Router ==========
+export const statsRouter = t.router({
+  overview: t.procedure.query(() => {
+    const total = todos.length;
+    const completed = todos.filter((t) => t.completed).length;
+    const pending = total - completed;
+
+    return {
+      total,
+      completed,
+      pending,
+      completionRate: total > 0 ? (completed / total) * 100 : 0,
+    };
+  }),
+
+  byDate: t.procedure
+    .input(
+      z
+        .object({
+          startDate: z.date().optional(),
+          endDate: z.date().optional(),
+        })
+        .optional()
+    )
+    .query(({ input }) => {
+      let filtered = [...todos];
+
+      if (input?.startDate) {
+        filtered = filtered.filter((t) => t.createdAt >= input.startDate!);
+      }
+
+      if (input?.endDate) {
+        filtered = filtered.filter((t) => t.createdAt <= input.endDate!);
+      }
+
+      return {
+        total: filtered.length,
+        completed: filtered.filter((t) => t.completed).length,
+        todos: filtered,
+      };
+    }),
+});
+
+// ========== 主 Router ==========
+export const appRouter = t.router({
+  todos: todoRouter,
+  stats: statsRouter,
+
+  // 健康检查
+  health: t.procedure.query(() => ({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+  })),
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+## 客户端调用
+
+```typescript
+import { createTRPCProxyClient, httpBatchLink } from "@trpc/client";
+import type { AppRouter } from "./server";
+
+const client = createTRPCProxyClient<AppRouter>({
+  links: [
+    httpBatchLink({
+      url: "http://localhost:3000",
+    }),
+  ],
+});
+
+// ========== 查询操作 ==========
+
+// 1. 获取所有 Todo
+const allTodos = await client.todos.list.query();
+
+// 2. 获取已完成的 Todo
+const completedTodos = await client.todos.list.query({ completed: true });
+
+// 3. 根据 ID 获取
+const todo = await client.todos.byId.query({ id: "1" });
+
+// 4. 获取统计信息
+const stats = await client.stats.overview.query();
+// ✅ TypeScript 自动推断 stats 类型为：
+// {
+//   total: number;
+//   completed: number;
+//   pending: number;
+//   completionRate: number;
+// }
+
+// ========== 变更操作 ==========
+
+// 5. 创建 Todo
+const newTodo = await client.todos.create.mutate({
+  title: "学习 tRPC",
+  description: "完成所有教程",
+});
+
+// 6. 更新 Todo
+const updated = await client.todos.update.mutate({
+  id: "1",
+  completed: true,
+});
+
+// 7. 切换状态
+const toggled = await client.todos.toggle.mutate({ id: "1" });
+
+// 8. 删除 Todo
+const deleted = await client.todos.delete.mutate({ id: "1" });
+
+// 9. 清除已完成
+const result = await client.todos.clearCompleted.mutate();
+// ✅ TypeScript 推断 result 类型为：{ deletedCount: number }
+
+// 10. 批量更新
+const batchResult = await client.todos.batchUpdate.mutate({
+  ids: ["1", "2", "3"],
+  updates: { completed: true },
+});
+// ✅ TypeScript 推断类型为：
+// {
+//   updatedCount: number;
+//   todos: Todo[];
+// }
+```
+
+## 最佳实践
+
+### 1. Router 组织
+
+```typescript
+// ✅ 推荐：按功能模块组织
+export const appRouter = t.router({
+  users: usersRouter,
+  posts: postsRouter,
+  comments: commentsRouter,
+  notifications: notificationsRouter
+});
+
+// ❌ 避免：扁平化所有 API
+export const appRouter = t.router({
+  getUsers: t.procedure.query(...),
+  getUserById: t.procedure.query(...),
+  createUser: t.procedure.mutation(...),
+  updateUser: t.procedure.mutation(...),
+  deleteUser: t.procedure.mutation(...),
+  getPosts: t.procedure.query(...),
+  // ... 50 多个 procedure
+});
+```
+
+### 2. 命名规范
+
+```typescript
+// ✅ RESTful 风格
+list, byId, create, update, delete
+
+// ✅ CRUD 风格
+getAll, getById, create, update, remove
+
+// ✅ 动词+名词风格
+toggleComplete, clearCompleted, markAsRead
+
+// ❌ 避免模糊的命名
+process, handle, execute, do
+```
+
+### 3. 错误处理
+
+```typescript
+import { TRPCError } from "@trpc/server";
+
+const getUser = t.procedure
+  .input(z.object({ id: z.string() }))
+  .query(async ({ input }) => {
+    const user = await db.user.findUnique({
+      where: { id: input.id },
+    });
+
+    if (!user) {
+      // ✅ 使用 TRPCError 抛出标准错误
+      throw new TRPCError({
+        code: "NOT_FOUND",
+        message: `User with id ${input.id} not found`,
+      });
+    }
+
+    return user;
+  });
+
+// ✅ 客户端可以优雅处理错误
+try {
+  const user = await client.users.byId.query({ id: "123" });
+} catch (error) {
+  if (error.code === "NOT_FOUND") {
+    console.log("用户不存在");
+  }
+}
+```
+
+### 4. 性能优化
+
+```typescript
+// ✅ 使用 select 减少数据传输
+const getUserPublic = t.procedure
+  .input(z.object({ id: z.string() }))
+  .query(async ({ input }) => {
+    return await db.user.findUnique({
+      where: { id: input.id },
+      select: {
+        id: true,
+        name: true,
+        avatar: true,
+        // ❌ 不返回敏感信息：email, passwordHash
+      },
+    });
+  });
+
+// ✅ 使用分页
+const getUsers = t.procedure
+  .input(
+    z.object({
+      page: z.number().min(1).default(1),
+      limit: z.number().min(1).max(100).default(20),
+    })
+  )
+  .query(async ({ input }) => {
+    const { page, limit } = input;
+    const skip = (page - 1) * limit;
+
+    const [users, total] = await Promise.all([
+      db.user.findMany({
+        skip,
+        take: limit,
+        orderBy: { createdAt: "desc" },
+      }),
+      db.user.count(),
+    ]);
+
+    return {
+      users,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  });
+```
+
+## 总结
+
+### 核心要点
+
+1. **Router（路由器）**
+   - 用于组织和分组 API
+   - 支持嵌套和合并
+   - 形成清晰的层次结构
+
+2. **Procedure（程序）**
+   - Query：读取数据（幂等、无副作用）
+   - Mutation：修改数据
+   - Subscription：实时数据推送
+
+3. **类型安全**
+   - 输入验证使用 Zod
+   - 输出类型自动推断
+   - 端到端类型检查
+
+4. **最佳实践**
+   - 按功能模块组织 Router
+   - 使用清晰的命名规范
+   - 妥善处理错误
+   - 注意性能优化
+
+### 下一步
+
+现在你已经掌握了 tRPC 的核心概念，下一篇文章我们将学习：
+
+- **类型推断与自动补全**：深入理解 tRPC 的类型系统
+- **如何在客户端获得完整的类型提示**
+- **共享类型定义和 Monorepo 管理**
+
+敬请期待！🚀
+
+## 参考资源
+
+- [tRPC Router 文档](https://trpc.io/docs/router)
+- [tRPC Procedure 文档](https://trpc.io/docs/procedures)
+- [Zod 文档](https://zod.dev/)
+
+---
+
+**上一章**：[01. 初识 tRPC：告别类型定义重复](./01-introduction-trpc.mdx)
+**下一章**：[03. 类型推断与自动补全](./03-type-inference-autocompletion.mdx)

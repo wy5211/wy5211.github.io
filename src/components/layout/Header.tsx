@@ -16,7 +16,10 @@ export default function Header() {
     return () => window.removeEventListener("scroll", handleScroll);
   }, []);
 
-  const navItems = [{ name: "首页", href: "/" }];
+  const navItems = [
+    { name: "首页", href: "/" },
+    { name: "技术栈", href: "/stacks" },
+  ];
 
   return (
     <header

@@ -1,0 +1,803 @@
+---
+title: "12. Monorepo 中的 tRPC 架构"
+date: "2026-03-23"
+summary: "在 Monorepo 中组织 tRPC 项目，使用 Turborepo 优化构建，实现代码共享和复用，构建可扩展的大型应用。"
+tags: ["tRPC", "Monorepo", "Turborepo", "架构", "工程化"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 12
+---
+
+## 前言
+
+随着项目规模增长，Monorepo 成为管理大型项目的首选方案。在 Monorepo 中使用 tRPC，我们可以：
+
+✅ **代码共享**：前后端共享类型定义
+✅ **原子化提交**：相关改动在一个 PR 中
+✅ **统一构建**：Turborepo 极速构建
+✅ **独立部署**：每个应用可独立发布
+✅ **类型安全**：跨包的端到端类型检查
+
+今天，我们将学习：
+
+- Monorepo 项目结构
+- Turborepo 配置
+- tRPC 类型共享
+- 构建优化
+- 独立部署策略
+
+## 项目结构
+
+### Monorepo 布局
+
+```
+my-monorepo/
+├── apps/
+│   ├── web/                    # Next.js 前端
+│   ├── admin/                  # 管理后台
+│   └── api/                    # NestJS 后端
+├── packages/
+│   ├── trpc/                   # tRPC 定义
+│   │   ├── routers/
+│   │   ├── server/
+│   │   └── context/
+│   ├── ui/                     # 共享 UI 组件
+│   ├── database/               # 数据库模块
+│   │   ├── prisma/
+│   │   └── seed/
+│   └── config/                 # 共享配置
+├── package.json
+├── turbo.json
+└── pnpm-workspace.yaml
+```
+
+### 初始化项目
+
+```bash
+# 创建 Monorepo
+pnpm create turbo@latest my-monorepo
+
+cd my-monorepo
+
+# 安装 pnpm
+pnpm install
+
+# 创建 apps 和 packages 目录
+mkdir -p apps packages
+```
+
+## Turborepo 配置
+
+### 配置 turbo.json
+
+```json
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": ["**/.env.*local"],
+  "pipeline": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "!.next/cache/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "outputs": []
+    },
+    "typecheck": {
+      "dependsOn": ["^generate"]
+    },
+    "db:generate": {
+      "cache": false,
+      "outputs": ["packages/database/prisma/**"]
+    },
+    "db:push": {
+      "cache": false,
+      "dependsOn": ["db:generate"]
+    }
+  }
+}
+```
+
+### 配置 pnpm-workspace.yaml
+
+```yaml
+packages:
+  - "apps/*"
+  - "packages/*"
+```
+
+## 共享 tRPC 包
+
+### 创建 tRPC 包
+
+```bash
+# 创建 tRPC 包
+mkdir -p packages/trpc/src
+cd packages/trpc
+pnpm init
+```
+
+### package.json
+
+```json
+{
+  "name": "@my-monorepo/trpc",
+  "version": "0.0.1",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./src/*",
+    "./routers": "./src/routers/index.ts"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@trpc/server": "^11.0.0",
+    "@trpc/client": "^11.0.0",
+    "zod": "^3.22.0",
+    "superjson": "^2.2.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0"
+  }
+}
+```
+
+### 创建 Context
+
+```typescript
+// packages/trpc/src/context.ts
+
+import { CreateNextContextOptions } from "@trpc/server/adapters/next";
+import { getSession } from "next-auth/react";
+
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+  role: "USER" | "ADMIN";
+}
+
+export interface Context {
+  user: User | null;
+  session: Session | null;
+}
+
+export async function createContext({
+  req,
+  res,
+}: CreateNextContextOptions): Promise<Context> {
+  const session = await getSession({ req });
+
+  return {
+    user: session?.user || null,
+    session,
+  };
+}
+```
+
+### 创建 tRPC 实例
+
+```typescript
+// packages/trpc/src/index.ts
+
+import { initTRPC } from "@trpc/server";
+import superjson from "superjson";
+import { Context } from "./context";
+
+export const t = initTRPC.context<Context>().create({
+  transformer: superjson,
+});
+
+export const createTRPCRouter = t.router;
+export const publicProcedure = t.procedure;
+
+// 中间件
+const isAuthed = t.middleware(({ ctx, next }) => {
+  if (!ctx.user) {
+    throw new t.TRPCError({
+      code: "UNAUTHORIZED",
+      message: "需要登录",
+    });
+  }
+  return next({
+    ctx: {
+      ...ctx,
+      user: ctx.user, // 非 null 断言
+    },
+  });
+});
+
+export const protectedProcedure = t.procedure.use(isAuthed);
+```
+
+### 创建 Routers
+
+```typescript
+// packages/trpc/src/routers/index.ts
+
+import { z } from "zod";
+import {
+  createTRPCRouter,
+  publicProcedure,
+  protectedProcedure,
+} from "../index";
+import { Context } from "../context";
+
+export const appRouter = createTRPCRouter<Context>({
+  users: createTRPCRouter({
+    me: protectedProcedure.query(({ ctx }) => {
+      return ctx.user;
+    }),
+
+    list: protectedProcedure
+      .input(
+        z.object({
+          page: z.number().default(1),
+          limit: z.number().default(20),
+        })
+      )
+      .query(async ({ input }) => {
+        // 从数据库包导入
+        const { prisma } = await import("@my-monorepo/database");
+
+        const [users, total] = await Promise.all([
+          prisma.user.findMany({
+            skip: (input.page - 1) * input.limit,
+            take: input.limit,
+          }),
+          prisma.user.count(),
+        ]);
+
+        return { users, total };
+      }),
+  }),
+
+  posts: createTRPCRouter({
+    list: publicProcedure
+      .input(
+        z.object({
+          page: z.number().default(1),
+          limit: z.number().default(20),
+        })
+      )
+      .query(async ({ input }) => {
+        const { prisma } = await import("@my-monorepo/database");
+
+        const posts = await prisma.post.findMany({
+          skip: (input.page - 1) * input.limit,
+          take: input.limit,
+        });
+
+        return posts;
+      }),
+  }),
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+## 前端应用
+
+### 创建 Web 应用
+
+```bash
+# 创建 Next.js 应用
+pnpm create next-app@latest apps/web
+```
+
+### 配置依赖
+
+```json
+{
+  "name": "@my-monorepo/web",
+  "dependencies": {
+    "@my-monorepo/trpc": "workspace:*",
+    "@my-monorepo/ui": "workspace:*",
+    "@trpc/client": "^11.0.0",
+    "@trpc/react-query": "^11.0.0",
+    "@tanstack/react-query": "^5.0.0"
+  }
+}
+```
+
+### 创建 tRPC 客户端
+
+```typescript
+// apps/web/src/utils/trpc.ts
+
+import { createTRPCReact } from "@trpc/react-query";
+import type { AppRouter } from "@my-monorepo/trpc";
+
+export const trpc = createTRPCReact<AppRouter>({
+  config() {
+    return {
+      links: [
+        httpBatchLink({
+          url: "http://localhost:3000/api/trpc",
+          transformer: superjson,
+        }),
+      ],
+    };
+  },
+});
+```
+
+### 创建 Provider
+
+```typescript
+// apps/web/src/app/providers/trpc-provider.tsx
+
+'use client';
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { httpBatchLink, loggerLink } from '@trpc/client';
+import { trpc } from '@/utils/trpc';
+import { useState } from 'react';
+import superjson from 'superjson';
+
+export function TRPCProvider({ children }: { children: React.ReactNode }) {
+  const [queryClient] = useState(() => new QueryClient());
+  const [trpcClient] = useState(() =>
+    trpc.createClient({
+      links: [
+        loggerLink({
+          enabled: (opts) =>
+            process.env.NODE_ENV === 'development' ||
+            opts.direction === 'down'
+        }),
+        httpBatchLink({
+          url: 'http://localhost:3000/api/trpc',
+          transformer: superjson
+        })
+      ]
+    })
+  );
+
+  return (
+    <trpc.Provider client={trpcClient} queryClient={queryClient}>
+      <QueryClientProvider client={queryClient}>
+        {children}
+      </QueryClientProvider>
+    </trpc.Provider>
+  );
+}
+```
+
+## 后端应用
+
+### 创建 API 应用
+
+```bash
+# 创建 NestJS 应用
+nest new apps/api
+```
+
+### 配置 tRPC 模块
+
+```typescript
+// apps/api/src/trpc/trpc.module.ts
+
+import { Module, Global } from "@nestjs/common";
+import { tRPCService } from "./trpc.service";
+import { PostsRouter } from "./routers/posts.router";
+import { UsersRouter } from "./routers/users.router";
+
+@Global()
+@Module({
+  providers: [tRPCService],
+  exports: [tRPCService],
+})
+export class tRPCModule {
+  constructor(private readonly trpcService: tRPCService) {}
+
+  createRouter() {
+    return this.trpcService.router({
+      posts: new PostsRouter(this.trpcService).router,
+      users: new UsersRouter(this.trpcService).router,
+    });
+  }
+}
+```
+
+### 使用共享的 Router
+
+```typescript
+// apps/api/src/trpc/routers/users.router.ts
+
+import { Injectable } from "@nestjs/common";
+import { tRPCService } from "@my-monorepo/trpc";
+import { PrismaService } from "@my-monorepo/database";
+
+@Injectable()
+export class UsersRouter {
+  constructor(
+    private readonly trpc: tRPCService,
+    private readonly prisma: PrismaService
+  ) {}
+
+  get router() {
+    return this.trpc.router({
+      list: this.trpc.protectedProcedure
+        .input(
+          z.object({
+            page: z.number().default(1),
+            limit: z.number().default(20),
+          })
+        )
+        .query(async ({ input }) => {
+          const [users, total] = await Promise.all([
+            this.prisma.user.findMany({
+              skip: (input.page - 1) * input.limit,
+              take: input.limit,
+            }),
+            this.prisma.user.count(),
+          ]);
+
+          return { users, total };
+        }),
+    });
+  }
+}
+```
+
+## 共享数据库包
+
+### 创建数据库包
+
+```bash
+mkdir -p packages/database/prisma
+cd packages/database
+pnpm init
+```
+
+### package.json
+
+```json
+{
+  "name": "@my-monorepo/database",
+  "version": "0.0.1",
+  "exports": {
+    ".": "./src/*",
+    "./prisma": "./prisma/*"
+  },
+  "scripts": {
+    "generate": "prisma generate",
+    "push": "prisma db push",
+    "studio": "prisma studio"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.0.0",
+    "prisma": "^5.0.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0"
+  }
+}
+```
+
+### Prisma 配置
+
+```prisma
+// packages/database/prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id    String @id @default(cuid())
+  email String @unique
+  name  String
+  role  Role @default(USER)
+
+  posts Post[]
+}
+
+model Post {
+  id        String   @id @default(cuid())
+  title     String
+  content   String
+  published Boolean  @default(false)
+  authorId  String
+
+  author    User     @relation(fields: [authorId], references: [id])
+
+  @@index([authorId])
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+```
+
+### 导出 Prisma Client
+
+```typescript
+// packages/database/src/index.ts
+
+import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+export const prisma = globalForPrisma.prisma || new PrismaClient();
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+
+export * from "@prisma/client";
+```
+
+## 共享 UI 包
+
+### 创建 UI 包
+
+```bash
+mkdir -p packages/ui/src/components
+cd packages/ui
+pnpm init
+```
+
+### 创建共享组件
+
+```typescript
+// packages/ui/src/components/Button.tsx
+
+import { ButtonHTMLAttributes, forwardRef } from 'react';
+
+export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  variant?: 'primary' | 'secondary' | 'ghost';
+  size?: 'sm' | 'md' | 'lg';
+}
+
+export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
+  ({ variant = 'primary', size = 'md', className = '', ...props }, ref) => {
+  const baseStyles = 'rounded-lg font-medium transition-colors';
+
+  const variants = {
+    primary: 'bg-blue-600 text-white hover:bg-blue-700',
+    secondary: 'bg-gray-200 text-gray-900 hover:bg-gray-300',
+    ghost: 'bg-transparent hover:bg-gray-100'
+  };
+
+  const sizes = {
+    sm: 'px-3 py-1.5 text-sm',
+    md: 'px-4 py-2 text-base',
+    lg: 'px-6 py-3 text-lg'
+  };
+
+  return (
+    <button
+      ref={ref}
+      className={`${baseStyles} ${variants[variant]} ${sizes[size]} ${className}`}
+      {...props}
+    />
+  );
+});
+
+Button.displayName = 'Button';
+```
+
+### 导出组件
+
+```typescript
+// packages/ui/src/index.ts
+
+export * from "./components/Button";
+export * from "./components/Input";
+export * from "./components/Card";
+```
+
+### package.json
+
+```json
+{
+  "name": "@my-monorepo/ui",
+  "version": "0.0.1",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./src/*"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "lint": "eslint src"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.0.0",
+    "react": "^18.0.0",
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0"
+  }
+}
+```
+
+## 使用共享包
+
+### 在 Web 应用中使用
+
+```typescript
+// apps/web/src/app/page.tsx
+
+import { trpc } from '@/utils/trpc';
+import { Button } from '@my-monorepo/ui';
+
+export default function HomePage() {
+  const { data } = trpc.posts.list.useQuery({
+    page: 1,
+    limit: 10
+  });
+
+  return (
+    <div>
+      <h1>文章列表</h1>
+
+      <div className="grid gap-4">
+        {data?.posts.map((post) => (
+          <article key={post.id} className="border rounded-lg p-4">
+            <h2>{post.title}</h2>
+            <p>{post.content}</p>
+          </article>
+        ))}
+      </div>
+
+      <Button variant="primary" size="md">
+        加载更多
+      </Button>
+    </div>
+  );
+}
+```
+
+## 构建优化
+
+### Turborepo 缓存
+
+```bash
+# 远程缓存
+pnpm turbopress login
+
+# 本地缓存
+pnpm turbo build --cache-dir=.turbo/cache
+```
+
+### 任务编排
+
+```json
+{
+  "pipeline": {
+    "build": {
+      "dependsOn": ["^build"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "web#build": {
+      "dependsOn": ["trpc#build", "ui#build", "database#generate"]
+    },
+    "api#build": {
+      "dependsOn": ["trpc#build", "database#generate"]
+    }
+  }
+}
+```
+
+## 部署策略
+
+### 独立部署
+
+```bash
+# 部署 Web 应用
+cd apps/web
+vercel deploy
+
+# 部署 API 应用
+cd apps/api
+fly deploy
+```
+
+### 共享部署
+
+```yaml
+# docker-compose.yml
+version: "3.8"
+
+services:
+  web:
+    build: ./apps/web
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://api:3001
+    depends_on:
+      - api
+
+  api:
+    build: ./apps/api
+    ports:
+      - "3001:3001"
+    environment:
+      - DATABASE_URL=postgresql://db:5432/app
+    depends_on:
+      - db
+
+  db:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_DB=db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+volumes:
+  postgres_data:
+```
+
+## 总结
+
+### 核心要点
+
+1. **Monorepo 架构**
+   - apps 和 packages 组织
+   - Turborepo 配置
+   - 依赖管理
+
+2. **代码共享**
+   - tRPC 类型定义
+   - UI 组件
+   - 数据库模块
+
+3. **构建优化**
+   - Turborepo 缓存
+   - 任务编排
+   - 原子化构建
+
+4. **部署策略**
+   - 独立部署
+   - 共享部署
+   - Docker Compose
+
+### 下一步
+
+在下一篇文章中，我们将学习：
+
+- **测试 tRPC 应用**
+- 单元测试和集成测试
+- E2E 测试
+
+敬请期待！🚀
+
+## 参考资源
+
+- [Turborepo 文档](https://turbo.build/repo/docs)
+- [pnpm Workspace](https://pnpm.io/workspaces/)
+- [Monorepo 最佳实践](https://monorepo.tools/)
+
+---
+
+**上一章**：[11. 元数据与负载优化](./11-metadata-optimization.mdx)
+**下一章**：[13. 测试 tRPC 应用](./13-testing.mdx)

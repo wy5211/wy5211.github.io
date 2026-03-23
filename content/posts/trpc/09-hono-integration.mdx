@@ -1,0 +1,840 @@
+---
+title: "09 Hono + tRPC 轻量级边缘计算"
+date: "2026-03-23"
+summary: "掌握 Hono 与 tRPC 的深度集成，部署到 Cloudflare Workers，构建高性能、低延迟的边缘计算应用。"
+tags: ["tRPC", "Hono", "边缘计算", "Cloudflare Workers", "性能优化"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 9
+---
+
+## 前言
+
+边缘计算正在改变我们构建应用的方式。将 tRPC 与 Hono 结合，可以部署到 Cloudflare Workers、Vercel Edge Functions、Deno Deploy 等边缘平台，获得：
+
+✅ **全球分布式**：代码部署到全球边缘节点
+✅ **极低延迟**：用户就近访问
+✅ **无限扩展**：自动应对流量高峰
+✅ **零冷启动**：V8 Isolates 技术
+✅ **类型安全**：tRPC 端到端类型系统
+
+今天，我们将学习：
+
+- Hono 与 tRPC 集成
+- Cloudflare Workers 部署
+- D1 数据库使用
+- 边缘函数性能优化
+- 完整的边缘应用实战
+
+## 为什么选择边缘计算？
+
+### 传统服务器 vs 边缘计算
+
+```
+传统服务器架构：
+用户 → DNS → 单一服务器 → 响应
+         ↓
+    可能跨越半个地球
+
+边缘计算架构：
+用户 → DNS → 最近的边缘节点 → 响应
+         ↓
+    几公里内，极速响应
+```
+
+### 性能对比
+
+| 指标         | 传统服务器 | 边缘计算   |
+| ------------ | ---------- | ---------- |
+| **全球延迟** | 100-500ms  | 10-50ms    |
+| **冷启动**   | 秒级       | 毫秒级     |
+| **扩展性**   | 手动扩容   | 自动无限   |
+| **成本**     | 高（空闲） | 低（按量） |
+| **维护**     | 复杂       | 零维护     |
+
+## 项目初始化
+
+### 第一步：创建项目
+
+```bash
+# 使用 create-hono 创建项目
+npm create hono@latest trpc-hono-app
+
+cd trpc-hono-app
+
+# 安装依赖
+npm install @trpc/server @trpc/server@next zod
+npm install -D wrangler @cloudflare/workers-types
+```
+
+### 第二步：项目结构
+
+```
+trpc-hono-app/
+├── src/
+│   ├── index.tsx          # 入口文件
+│   ├── trpc/
+│   │   ├── index.ts       # tRPC 配置
+│   │   ├── router.ts      # API 路由
+│   │   └── context.ts     # Context 定义
+│   ├── db/
+│   │   └── schema.ts      # 数据库 Schema
+│   └── middleware/
+│       └── auth.ts        # 认证中间件
+├── wrangler.toml          # Cloudflare 配置
+└── package.json
+```
+
+### 第三步：配置 wrangler
+
+```toml
+# wrangler.toml
+
+name = "trpc-hono-app"
+main = "src/index.tsx"
+compatibility_date = "2024-01-01"
+
+# KV 命名空间
+[[kv_namespaces]]
+binding = "CACHE"
+id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# D1 数据库
+[[d1_databases]]
+binding = "DB"
+database_name = "trpc-db"
+database_id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+# 环境变量
+[vars]
+JWT_SECRET = "your-secret-key"
+API_URL = "https://api.example.com"
+```
+
+## 服务端配置
+
+### 创建 tRPC 实例
+
+```typescript
+// src/trpc/index.ts
+
+import { initTRPC, TRPCError } from "@trpc/server";
+import { Context } from "./context";
+import { z } from "zod";
+
+export const t = initTRPC.context<Context>().create({
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError:
+          error.code === "BAD_REQUEST" && error.cause instanceof z.ZodError
+            ? error.cause.flatten()
+            : null,
+      },
+    };
+  },
+});
+
+// 公开 API
+export const publicProcedure = t.procedure;
+
+// 认证中间件
+const isAuthed = t.middleware(({ ctx, next }) => {
+  if (!ctx.user) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "需要登录",
+    });
+  }
+  return next({
+    ctx: {
+      ...ctx,
+      user: ctx.user,
+    },
+  });
+});
+
+// 受保护的 API
+export const protectedProcedure = t.procedure.use(isAuthed);
+```
+
+### 创建 Context
+
+```typescript
+// src/trpc/context.ts
+
+import { Context } from "hono";
+
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+}
+
+export type Env = {
+  DB: D1Database;
+  CACHE: KVNamespace;
+  JWT_SECRET: string;
+};
+
+export interface Context {
+  user: User | null;
+  env: Env;
+}
+
+export const createContext = async (
+  c: Context<{ Bindings: Env }>,
+  next: () => Promise<void>
+): Promise<Context> => {
+  // 从请求头中获取 Token
+  const authHeader = c.req.header("Authorization");
+  const token = authHeader?.replace("Bearer ", "");
+
+  let user: User | null = null;
+
+  if (token) {
+    // 验证 JWT（需要 JWT 库）
+    try {
+      user = await verifyToken(token, c.env.JWT_SECRET);
+    } catch {
+      // Token 无效，user 保持为 null
+    }
+  }
+
+  return {
+    user,
+    env: c.env,
+  };
+};
+```
+
+### 创建 API 路由
+
+```typescript
+// src/trpc/router.ts
+
+import { z } from "zod";
+import { t, publicProcedure, protectedProcedure } from "./index";
+import { Context } from "./context";
+
+export const appRouter = t.router<Context>({
+  // ========== 用户相关 ==========
+  users: t.router({
+    // 获取当前用户
+    me: protectedProcedure.query(({ ctx }) => {
+      return ctx.user;
+    }),
+
+    // 创建用户
+    register: publicProcedure
+      .input(
+        z.object({
+          email: z.string().email(),
+          password: z.string().min(8),
+          name: z.string().min(2),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        // 使用 D1 数据库
+        const result = await ctx.env.DB.prepare(
+          "INSERT INTO users (email, password, name) VALUES (?, ?, ?)"
+        )
+          .bind(input.email, await hash(input.password), input.name)
+          .run();
+
+        return {
+          id: result.meta.last_row_id,
+          ...input,
+        };
+      }),
+  }),
+
+  // ========== 文章相关 ==========
+  posts: t.router({
+    // 获取文章列表
+    list: publicProcedure
+      .input(
+        z.object({
+          page: z.number().default(1),
+          limit: z.number().min(1).max(100).default(20),
+          published: z.boolean().optional(),
+        })
+      )
+      .query(async ({ input, ctx }) => {
+        const { page, limit, published } = input;
+        const offset = (page - 1) * limit;
+
+        // 使用 D1 数据库
+        const posts = await ctx.env.DB.prepare(
+          `SELECT * FROM posts
+           WHERE ${published ? "published = 1" : "1=1"}
+           ORDER BY created_at DESC
+           LIMIT ? OFFSET ?`
+        )
+          .bind(limit, offset)
+          .all();
+
+        const countResult = await ctx.env.DB.prepare(
+          `SELECT COUNT(*) as total FROM posts
+           WHERE ${published ? "published = 1" : "1=1"}`
+        ).first();
+
+        return {
+          posts: posts.results,
+          pagination: {
+            page,
+            limit,
+            total: countResult.total,
+            totalPages: Math.ceil(countResult.total / limit),
+          },
+        };
+      }),
+
+    // 根据 ID 获取文章
+    byId: publicProcedure
+      .input(z.object({ id: z.string() }))
+      .query(async ({ input, ctx }) => {
+        // 先尝试从 KV 缓存中获取
+        const cached = await ctx.env.CACHE.get(`post:${input.id}`);
+        if (cached) {
+          return JSON.parse(cached);
+        }
+
+        // 从数据库查询
+        const post = await ctx.env.DB.prepare(
+          "SELECT * FROM posts WHERE id = ?"
+        )
+          .bind(input.id)
+          .first();
+
+        if (!post) {
+          throw new t.TRPCError({
+            code: "NOT_FOUND",
+            message: "文章不存在",
+          });
+        }
+
+        // 缓存 5 分钟
+        await ctx.env.CACHE.put(`post:${input.id}`, JSON.stringify(post), {
+          expirationTtl: 300,
+        });
+
+        return post;
+      }),
+
+    // 创建文章
+    create: protectedProcedure
+      .input(
+        z.object({
+          title: z.string().min(1).max(200),
+          content: z.string().min(1),
+          published: z.boolean().default(false),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const result = await ctx.env.DB.prepare(
+          "INSERT INTO posts (title, content, published, author_id) VALUES (?, ?, ?, ?)"
+        )
+          .bind(input.title, input.content, input.published, ctx.user.id)
+          .run();
+
+        const post = {
+          id: result.meta.last_row_id.toString(),
+          ...input,
+          author_id: ctx.user.id,
+          created_at: new Date().toISOString(),
+        };
+
+        // 清除列表缓存
+        await ctx.env.CACHE.delete("posts:list");
+
+        return post;
+      }),
+
+    // 更新文章
+    update: protectedProcedure
+      .input(
+        z.object({
+          id: z.string(),
+          title: z.string().min(1).max(200).optional(),
+          content: z.string().min(1).optional(),
+          published: z.boolean().optional(),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const { id, ...data } = input;
+
+        // 检查权限
+        const post = await ctx.env.DB.prepare(
+          "SELECT author_id FROM posts WHERE id = ?"
+        )
+          .bind(id)
+          .first();
+
+        if (!post) {
+          throw new t.TRPCError({
+            code: "NOT_FOUND",
+            message: "文章不存在",
+          });
+        }
+
+        if (post.author_id !== ctx.user.id) {
+          throw new t.TRPCError({
+            code: "FORBIDDEN",
+            message: "只能编辑自己的文章",
+          });
+        }
+
+        // 更新
+        await ctx.env.DB.prepare(
+          `UPDATE posts SET
+           ${data.title ? "title = ?" : ""}
+           ${data.content ? ", content = ?" : ""}
+           ${data.published !== undefined ? ", published = ?" : ""}
+           WHERE id = ?`
+        )
+          .bind(
+            ...(data.title ? [data.title] : []),
+            ...(data.content ? [data.content] : []),
+            ...(data.published !== undefined ? [data.published] : []),
+            id
+          )
+          .run();
+
+        // 清除缓存
+        await ctx.env.CACHE.delete(`post:${id}`);
+        await ctx.env.CACHE.delete("posts:list");
+
+        return { success: true };
+      }),
+  }),
+
+  // ========== 统计相关 ==========
+  stats: t.router({
+    overview: publicProcedure.query(async ({ ctx }) => {
+      // 从 KV 缓存中获取
+      const cached = await ctx.env.CACHE.get("stats:overview");
+      if (cached) {
+        return JSON.parse(cached);
+      }
+
+      // 从数据库查询
+      const [users, posts, comments] = await Promise.all([
+        ctx.env.DB.prepare("SELECT COUNT(*) as count FROM users").first(),
+        ctx.env.DB.prepare("SELECT COUNT(*) as count FROM posts").first(),
+        ctx.env.DB.prepare("SELECT COUNT(*) as count FROM comments").first(),
+      ]);
+
+      const stats = {
+        users: users.count,
+        posts: posts.count,
+        comments: comments.count,
+      };
+
+      // 缓存 10 分钟
+      await ctx.env.CACHE.put("stats:overview", JSON.stringify(stats), {
+        expirationTtl: 600,
+      });
+
+      return stats;
+    }),
+  }),
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+## Hono 应用配置
+
+### 创建 Hono 应用
+
+```typescript
+// src/index.tsx
+
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { logger } from "hono/logger";
+import { trpcServer } from "@trpc/server/adapters/fetch";
+import { appRouter } from "./trpc/router";
+import { createContext, Context } from "./trpc/context";
+
+type Bindings = {
+  DB: D1Database;
+  CACHE: KVNamespace;
+  JWT_SECRET: string;
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+// 中间件
+app.use("*", logger());
+app.use(
+  "*",
+  cors({
+    origin: "*",
+    credentials: true,
+  })
+);
+
+// 健康检查
+app.get("/", (c) => {
+  return c.json({
+    name: "tRPC + Hono",
+    version: "1.0.0",
+    status: "ok",
+  });
+});
+
+// tRPC 路由
+app.use("/trpc/*", async (c, next) => {
+  const createContextValue = async () => {
+    return createContext(c as any, next as any);
+  };
+
+  return trpcServer({
+    router: appRouter,
+    createContext: createContextValue,
+  })(c);
+});
+
+// 导出
+export default app;
+```
+
+## D1 数据库
+
+### 创建数据库 Schema
+
+```sql
+-- schema.sql
+
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  password TEXT NOT NULL,
+  name TEXT NOT NULL,
+  avatar TEXT,
+  bio TEXT,
+  role TEXT DEFAULT 'USER',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS posts (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  content TEXT NOT NULL,
+  published INTEGER DEFAULT 0,
+  author_id TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS comments (
+  id TEXT PRIMARY KEY,
+  content TEXT NOT NULL,
+  post_id TEXT NOT NULL,
+  author_id TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (post_id) REFERENCES posts(id) ON DELETE CASCADE,
+  FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(author_id);
+CREATE INDEX IF NOT EXISTS idx_posts_published ON posts(published, created_at);
+CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id);
+```
+
+### 初始化数据库
+
+```bash
+# 创建 D1 数据库
+wrangler d1 create trpc-db
+
+# 执行 SQL
+wrangler d1 execute trpc-db --file=schema.sql
+
+# 或者交互式 SQL
+wrangler d1 execute trpc-db --command="SELECT * FROM users"
+```
+
+## 性能优化
+
+### 1. KV 缓存策略
+
+```typescript
+// 通用缓存函数
+async function getCached<T>(
+  kv: KVNamespace,
+  key: string,
+  fetcher: () => Promise<T>,
+  ttl: number = 300
+): Promise<T> {
+  // 尝试从缓存获取
+  const cached = await kv.get(key);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+
+  // 缓存未命中，获取数据
+  const data = await fetcher();
+
+  // 写入缓存
+  await kv.put(key, JSON.stringify(data), {
+    expirationTtl: ttl,
+  });
+
+  return data;
+}
+
+// 使用
+const post = await getCached(
+  ctx.env.CACHE,
+  `post:${id}`,
+  () => fetchPostFromDB(id),
+  300 // 5 分钟
+);
+```
+
+### 2. 批量查询优化
+
+```typescript
+// 批量获取文章
+const posts = await Promise.all([
+  ctx.env.DB.prepare("SELECT * FROM posts WHERE id = ?").bind(id1).first(),
+  ctx.env.DB.prepare("SELECT * FROM posts WHERE id = ?").bind(id2).first(),
+  ctx.env.DB.prepare("SELECT * FROM posts WHERE id = ?").bind(id3).first(),
+]);
+```
+
+### 3. SQL 查询优化
+
+```typescript
+// ❌ 避免 N+1 查询
+const comments = [];
+for (const postId of postIds) {
+  const postComments = await ctx.env.DB.prepare(
+    "SELECT * FROM comments WHERE post_id = ?"
+  )
+    .bind(postId)
+    .all();
+  comments.push(...postComments.results);
+}
+
+// ✅ 使用 IN 查询
+const allComments = await ctx.env.DB.prepare(
+  "SELECT * FROM comments WHERE post_id IN (?, ?, ?)"
+)
+  .bind(...postIds)
+  .all();
+```
+
+## 部署到 Cloudflare Workers
+
+### 构建和部署
+
+```bash
+# 开发模式（使用 wrangler）
+wrangler dev
+
+# 生产构建
+npm run build
+
+# 部署到 Cloudflare Workers
+wrangler deploy
+```
+
+### 环境变量管理
+
+```bash
+# 设置环境变量
+wrangler secret put JWT_SECRET
+
+# 列出所有密钥
+wrangler secret list
+
+# 删除密钥
+wrangler secret delete JWT_SECRET
+```
+
+### 自定义域名
+
+```toml
+# wrangler.toml
+
+routes = [
+  { pattern = "api.example.com", custom_domain = true }
+]
+```
+
+## 监控和日志
+
+### Cloudflare Analytics
+
+```typescript
+// 发送分析数据
+app.use("*", async (c, next) => {
+  const start = Date.now();
+
+  await next();
+
+  const duration = Date.now() - start;
+
+  // 发送到 Cloudflare Analytics
+  c.env.CACHE.put(
+    `analytics:${Date.now()}`,
+    JSON.stringify({
+      path: c.req.path,
+      method: c.req.method,
+      duration,
+      timestamp: new Date().toISOString(),
+    }),
+    {
+      expirationTtl: 60 * 60 * 24 * 7, // 7 天
+    }
+  );
+});
+```
+
+### 错误追踪
+
+```typescript
+// 错误中间件
+app.use("*", async (c, next) => {
+  try {
+    await next();
+  } catch (error) {
+    // 记录错误
+    console.error(error);
+
+    // 发送到错误追踪服务（如 Sentry）
+    await c.env.CACHE.put(
+      `errors:${Date.now()}`,
+      JSON.stringify({
+        error: error.message,
+        stack: error.stack,
+        path: c.req.path,
+        timestamp: new Date().toISOString(),
+      })
+    );
+
+    return c.json(
+      {
+        error: "Internal Server Error",
+      },
+      500
+    );
+  }
+});
+```
+
+## 最佳实践
+
+### 1. 冷启动优化
+
+```typescript
+// ✅ 在模块顶层初始化
+const db = new Database();
+
+// ❌ 在请求处理中初始化
+app.get("/", (c) => {
+  const db = new Database(); // 每次请求都创建新实例
+});
+```
+
+### 2. 内存管理
+
+```typescript
+// ✅ 及时释放大对象
+app.get("/large-data", async (c) => {
+  const data = await fetchLargeData();
+
+  const response = c.json(data);
+
+  // 清理
+  data = null;
+
+  return response;
+});
+```
+
+### 3. 并发控制
+
+```typescript
+// 限制并发数
+const MAX_CONCURRENT = 10;
+let currentConcurrent = 0;
+
+async function withConcurrencyLimit<T>(fn: () => Promise<T>): Promise<T> {
+  while (currentConcurrent >= MAX_CONCURRENT) {
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
+
+  currentConcurrent++;
+
+  try {
+    return await fn();
+  } finally {
+    currentConcurrent--;
+  }
+}
+```
+
+## 总结
+
+### 核心要点
+
+1. **Hono + tRPC 集成**
+   - 轻量级框架
+   - 极致性能
+   - 边缘优化
+
+2. **Cloudflare Workers**
+   - 全球分布式
+   - 零冷启动
+   - 自动扩展
+
+3. **性能优化**
+   - KV 缓存
+   - D1 数据库
+   - 查询优化
+
+4. **生产就绪**
+   - 监控日志
+   - 错误追踪
+   - 自动部署
+
+### 🎉 框架集成篇完成！
+
+恭喜！你已经完成了框架集成篇的学习（4篇文章）：
+
+- ✅ Next.js + tRPC
+- ✅ Nuxt + tRPC
+- ✅ NestJS + tRPC
+- ✅ Hono + tRPC
+
+### 下一步
+
+接下来我们将进入**高级篇**，学习：
+
+- **订阅（Subscriptions）深度解析**
+- **元数据与负载优化**
+- **Monorepo 架构**
+- **测试 tRPC 应用**
+
+敬请期待！🚀
+
+## 参考资源
+
+- [Hono 文档](https://hono.dev)
+- [Cloudflare Workers 文档](https://developers.cloudflare.com/workers/)
+- [tRPC Fetch 适配器](https://trpc.io/docs/fetch)
+
+---
+
+**上一章**：[08. NestJS + tRPC 企业级后端](./08-nestjs-integration.mdx)
+**下一章**：[10. 订阅 Subscriptions 深度解析](./10-subscriptions.mdx)

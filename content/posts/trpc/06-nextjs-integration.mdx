@@ -1,0 +1,1359 @@
+---
+title: "06 Next.js + tRPC 全栈开发"
+date: "2026-03-23"
+summary: "掌握 Next.js App Router 与 tRPC 的深度集成，学会服务端组件（RSC）中调用 tRPC，构建完整的全栈应用。"
+tags: ["tRPC", "Next.js", "App Router", "RSC", "全栈开发"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 6
+---
+
+## 前言
+
+Next.js 14 引入的 App Router 和 React Server Components（RSC）改变了我们构建全栈应用的方式。将 tRPC 与 Next.js 结合，可以获得：
+
+✅ **端到端类型安全**：从数据库到前端的完整类型系统
+✅ **服务端组件优势**：直接在服务端调用 tRPC，无需额外的 API 层
+✅ **最佳性能**：利用 RSC 减少客户端 JavaScript
+✅ **卓越的开发体验**：完整的类型推断和自动补全
+
+今天，我们将学习：
+
+- Next.js App Router 与 tRPC 集成
+- 服务端组件和客户端组件中的 tRPC 使用
+- Server Actions vs tRPC
+- 认证和中间件集成
+- 完整的全栈应用实战
+
+## 项目初始化
+
+### 第一步：创建 Next.js 项目
+
+```bash
+# 创建 Next.js 项目
+npx create-next-app@latest my-trpc-app
+
+# 选择以下选项：
+# - TypeScript: Yes
+# - ESLint: Yes
+# - Tailwind CSS: Yes
+# - App Router: Yes
+# - Src directory: Yes
+# - Import alias: @/*
+
+cd my-trpc-app
+```
+
+### 第二步：安装依赖
+
+```bash
+# 安装 tRPC 和相关依赖
+npm install @trpc/server@next @trpc/client@next @trpc/react-query@next @trpc/next@next
+npm install zod superjson
+npm install @tanstack/react-query@latest
+
+# Prisma（如果需要）
+npm install prisma @prisma/client
+npx prisma init
+```
+
+### 第三步：项目结构
+
+```
+my-trpc-app/
+├── src/
+│   ├── app/
+│   │   ├── layout.tsx
+│   │   ├── page.tsx
+│   │   └── (routes)/
+│   ├── components/
+│   │   ├── providers/
+│   │   └── ui/
+│   ├── lib/
+│   │   ├── prisma.ts
+│   │   └── trpc/
+│   │       ├── server.ts
+│   │       ├── client.ts
+│   │       └── router.ts
+│   └── server/
+│       └── rsc/
+└── prisma/
+```
+
+## 服务端配置
+
+### 创建 tRPC Router
+
+```typescript
+// src/lib/trpc/router.ts
+
+import { z } from "zod";
+import { TRPCError } from "@trpc/server";
+import { prisma } from "@/lib/prisma";
+import { createTRPCRouter, protectedProcedure } from "./server";
+
+export const appRouter = createTRPCRouter({
+  // ========== 用户相关 ==========
+  users: createTRPCRouter({
+    // 获取当前用户信息
+    me: protectedProcedure.query(async ({ ctx }) => {
+      return ctx.user;
+    }),
+
+    // 获取用户列表
+    list: protectedProcedure
+      .input(
+        z.object({
+          limit: z.number().min(1).max(100).default(20),
+          cursor: z.string().optional(),
+        })
+      )
+      .query(async ({ input }) => {
+        const { limit, cursor } = input;
+
+        const users = await prisma.user.findMany({
+          take: limit + 1,
+          ...(cursor && {
+            cursor: { id: cursor },
+            skip: 1,
+          }),
+          orderBy: { createdAt: "desc" },
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            avatar: true,
+            createdAt: true,
+          },
+        });
+
+        let nextCursor: string | undefined = undefined;
+        if (users.length > limit) {
+          const nextItem = users.pop();
+          nextCursor = nextItem!.id;
+        }
+
+        return {
+          items: users,
+          nextCursor,
+        };
+      }),
+
+    // 根据 ID 获取用户
+    byId: protectedProcedure
+      .input(z.object({ id: z.string() }))
+      .query(async ({ input }) => {
+        const user = await prisma.user.findUnique({
+          where: { id: input.id },
+          select: {
+            id: true,
+            name: true,
+            email: true,
+            avatar: true,
+            bio: true,
+            createdAt: true,
+          },
+        });
+
+        if (!user) {
+          throw new TRPCError({
+            code: "NOT_FOUND",
+            message: "用户不存在",
+          });
+        }
+
+        return user;
+      }),
+  }),
+
+  // ========== 文章相关 ==========
+  posts: createTRPCRouter({
+    // 获取文章列表
+    list: protectedProcedure
+      .input(
+        z.object({
+          page: z.number().default(1),
+          limit: z.number().min(1).max(100).default(20),
+          published: z.boolean().optional(),
+        })
+      )
+      .query(async ({ input }) => {
+        const { page, limit, published } = input;
+        const skip = (page - 1) * limit;
+
+        const [posts, total] = await Promise.all([
+          prisma.post.findMany({
+            where: published !== undefined ? { published } : undefined,
+            skip,
+            take: limit,
+            orderBy: { createdAt: "desc" },
+            include: {
+              author: {
+                select: {
+                  id: true,
+                  name: true,
+                  avatar: true,
+                },
+              },
+              _count: {
+                select: {
+                  comments: true,
+                  likes: true,
+                },
+              },
+            },
+          }),
+          prisma.post.count({
+            where: published !== undefined ? { published } : undefined,
+          }),
+        ]);
+
+        return {
+          posts,
+          pagination: {
+            page,
+            limit,
+            total,
+            totalPages: Math.ceil(total / limit),
+          },
+        };
+      }),
+
+    // 根据 ID 获取文章
+    byId: protectedProcedure
+      .input(
+        z.object({
+          id: z.string(),
+          includeComments: z.boolean().default(true),
+        })
+      )
+      .query(async ({ input }) => {
+        const post = await prisma.post.findUnique({
+          where: { id: input.id },
+          include: {
+            author: {
+              select: {
+                id: true,
+                name: true,
+                email: true,
+                avatar: true,
+                bio: true,
+              },
+            },
+            ...(input.includeComments && {
+              comments: {
+                include: {
+                  author: {
+                    select: {
+                      id: true,
+                      name: true,
+                      avatar: true,
+                    },
+                  },
+                },
+                orderBy: { createdAt: "desc" },
+              },
+            }),
+            likes: {
+              select: {
+                user: {
+                  select: {
+                    id: true,
+                    name: true,
+                  },
+                },
+              },
+            },
+          },
+        });
+
+        if (!post) {
+          throw new TRPCError({
+            code: "NOT_FOUND",
+            message: "文章不存在",
+          });
+        }
+
+        return post;
+      }),
+
+    // 创建文章
+    create: protectedProcedure
+      .input(
+        z.object({
+          title: z.string().min(1).max(200),
+          content: z.string().min(1),
+          published: z.boolean().default(false),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const post = await prisma.post.create({
+          data: {
+            ...input,
+            authorId: ctx.user.id,
+          },
+          include: {
+            author: {
+              select: {
+                id: true,
+                name: true,
+                avatar: true,
+              },
+            },
+          },
+        });
+
+        return post;
+      }),
+
+    // 更新文章
+    update: protectedProcedure
+      .input(
+        z.object({
+          id: z.string(),
+          title: z.string().min(1).max(200).optional(),
+          content: z.string().min(1).optional(),
+          published: z.boolean().optional(),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const { id, ...data } = input;
+
+        // 检查权限
+        const post = await prisma.post.findUnique({
+          where: { id },
+        });
+
+        if (!post) {
+          throw new TRPCError({
+            code: "NOT_FOUND",
+            message: "文章不存在",
+          });
+        }
+
+        if (post.authorId !== ctx.user.id) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "只能编辑自己的文章",
+          });
+        }
+
+        const updated = await prisma.post.update({
+          where: { id },
+          data,
+          include: {
+            author: {
+              select: {
+                id: true,
+                name: true,
+                avatar: true,
+              },
+            },
+          },
+        });
+
+        return updated;
+      }),
+
+    // 删除文章
+    delete: protectedProcedure
+      .input(z.object({ id: z.string() }))
+      .mutation(async ({ input, ctx }) => {
+        const post = await prisma.post.findUnique({
+          where: { id: input.id },
+        });
+
+        if (!post) {
+          throw new TRPCError({
+            code: "NOT_FOUND",
+            message: "文章不存在",
+          });
+        }
+
+        if (post.authorId !== ctx.user.id) {
+          throw new TRPCError({
+            code: "FORBIDDEN",
+            message: "只能删除自己的文章",
+          });
+        }
+
+        await prisma.post.delete({
+          where: { id: input.id },
+        });
+
+        return { success: true };
+      }),
+  }),
+
+  // ========== 评论相关 ==========
+  comments: createTRPCRouter({
+    // 创建评论
+    create: protectedProcedure
+      .input(
+        z.object({
+          postId: z.string(),
+          content: z.string().min(1).max(1000),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const comment = await prisma.comment.create({
+          data: {
+            ...input,
+            authorId: ctx.user.id,
+          },
+          include: {
+            author: {
+              select: {
+                id: true,
+                name: true,
+                avatar: true,
+              },
+            },
+          },
+        });
+
+        return comment;
+      }),
+  }),
+
+  // ========== 统计相关 ==========
+  stats: createTRPCRouter({
+    overview: protectedProcedure.query(async () => {
+      const [userCount, postCount, commentCount] = await Promise.all([
+        prisma.user.count(),
+        prisma.post.count(),
+        prisma.comment.count(),
+      ]);
+
+      return {
+        users: userCount,
+        posts: postCount,
+        comments: commentCount,
+      };
+    }),
+  }),
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+### 创建 tRPC 服务器配置
+
+```typescript
+// src/lib/trpc/server.ts
+
+import { initTRPC, TRPCError } from "@trpc/server";
+import { CreateNextContextOptions } from "@trpc/server/adapters/next";
+import { getSession } from "next-auth/react";
+import superjson from "superjson";
+
+// ========== Context 类型定义 ==========
+
+interface User {
+  id: string;
+  name: string;
+  email: string;
+  avatar: string | null;
+  role: "USER" | "MODERATOR" | "ADMIN";
+}
+
+interface CreateContextOptions {
+  session: Session | null;
+}
+
+// ========== 创建 Context ==========
+
+export const createContext = async ({ req, res }: CreateNextContextOptions) => {
+  // 获取会话
+  const session = await getSession({ req });
+
+  return {
+    session,
+    user: session?.user || null,
+  };
+};
+
+export type Context = Awaited<ReturnType<typeof createContext>>;
+
+// ========== 初始化 tRPC ==========
+
+const t = initTRPC.context<Context>().create({
+  transformer: superjson,
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError:
+          error.code === "BAD_REQUEST" && error.cause instanceof z.ZodError
+            ? error.cause.flatten()
+            : null,
+      },
+    };
+  },
+});
+
+// ========== 中间件 ==========
+
+// 是否已登录
+const isAuthed = t.middleware(({ ctx, next }) => {
+  if (!ctx.user) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "未登录",
+    });
+  }
+  return next({
+    ctx: {
+      ...ctx,
+      user: ctx.user, // 非 null 断言
+    },
+  });
+});
+
+// ========== 导出 ==========
+
+export const createTRPCRouter = t.router;
+export const publicProcedure = t.procedure;
+export const protectedProcedure = t.procedure.use(isAuthed);
+export const middleware = t.middleware;
+```
+
+### 创建 API 路由处理器
+
+```typescript
+// src/app/api/trpc/[trpc]/route.ts
+
+import { fetchRequestHandler } from "@trpc/server/adapters/next";
+import { appRouter } from "@/lib/trpc/router";
+import { createContext } from "@/lib/trpc/server";
+
+const handler = (req: Request) => {
+  return fetchRequestHandler({
+    endpoint: "/api/trpc",
+    req,
+    router: appRouter,
+    createContext,
+  });
+};
+
+export { handler as GET, handler as POST };
+```
+
+## 客户端配置
+
+### 创建 tRPC 客户端
+
+```typescript
+// src/lib/trpc/client.ts
+
+import { createTRPCReact } from "@trpc/react-query";
+import type { AppRouter } from "./router";
+
+export const trpc = createTRPCReact<AppRouter>();
+```
+
+### 创建 QueryClient Provider
+
+```typescript
+// src/components/providers/trpc-provider.tsx
+
+'use client';
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { httpBatchLink, loggerLink } from '@trpc/client';
+import { useState } from 'react';
+import superjson from 'superjson';
+import { trpc } from '@/lib/trpc/client';
+
+export function TRPCProvider({ children }: { children: React.ReactNode }) {
+  const [queryClient] = useState(() => new QueryClient({
+    defaultOptions: {
+      queries: {
+        refetchOnWindowFocus: false,
+        staleTime: 1000 * 60 * 5  // 5分钟
+      }
+    }
+  }));
+
+  const [trpcClient] = useState(() =>
+    trpc.createClient({
+      links: [
+        loggerLink({
+          enabled: (opts) =>
+            process.env.NODE_ENV === 'development' ||
+            (opts.direction === 'down' && opts.result instanceof Error)
+        }),
+        httpBatchLink({
+          transformer: superjson,
+          url: getBaseUrl() + '/api/trpc',
+          headers() {
+            return {
+              // 可添加认证头
+            };
+          }
+        })
+      ]
+    })
+  );
+
+  return (
+    <trpc.Provider client={trpcClient} queryClient={queryClient}>
+      <QueryClientProvider client={queryClient}>
+        {children}
+      </QueryClientProvider>
+    </trpc.Provider>
+  );
+}
+
+function getBaseUrl() {
+  if (typeof window !== 'undefined') {
+    return window.location.origin;
+  }
+  if (process.env.VERCEL_URL) {
+    return `https://${process.env.VERCEL_URL}`;
+  }
+  return `http://localhost:${process.env.PORT ?? 3000}`;
+}
+```
+
+### 更新根布局
+
+```typescript
+// src/app/layout.tsx
+
+import type { Metadata } from 'next';
+import { Inter } from 'next/font/google';
+import './globals.css';
+import { TRPCProvider } from '@/components/providers/trpc-provider';
+
+const inter = Inter({ subsets: ['latin'] });
+
+export const metadata: Metadata = {
+  title: 'tRPC + Next.js App',
+  description: 'Full-stack app with tRPC and Next.js'
+};
+
+export default function RootLayout({
+  children
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="zh-CN">
+      <body className={inter.className}>
+        <TRPCProvider>
+          {children}
+        </TRPCProvider>
+      </body>
+    </html>
+  );
+}
+```
+
+## 服务端组件中使用 tRPC
+
+### 方式1：使用 Server Caller
+
+```typescript
+// src/app/page.tsx
+
+import { serverClient } from '@/lib/trpc/server';
+import Link from 'next/link';
+
+export default async function HomePage() {
+  // ✅ 在服务端组件中直接调用 tRPC
+  const posts = await serverClient.posts.list.query({
+    page: 1,
+    limit: 10,
+    published: true
+  });
+
+  return (
+    <div className="container mx-auto px-4 py-8">
+      <h1 className="text-4xl font-bold mb-8">最新文章</h1>
+
+      <div className="grid gap-6">
+        {posts.posts.map((post) => (
+          <article key={post.id} className="border rounded-lg p-6">
+            <h2 className="text-2xl font-semibold mb-2">
+              <Link href={`/posts/${post.id}`}>
+                {post.title}
+              </Link>
+            </h2>
+            <p className="text-gray-600 mb-4">
+              {post.content.substring(0, 200)}...
+            </p>
+            <div className="flex items-center gap-4 text-sm text-gray-500">
+              <span>作者：{post.author.name}</span>
+              <span>{post._count.comments} 条评论</span>
+              <span>{post._count.likes} 个赞</span>
+            </div>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+### 创建 Server Caller
+
+```typescript
+// src/lib/trpc/server.ts
+
+import { appRouter } from "./router";
+import { createCallerFactory } from "@trpc/server";
+
+// 创建服务端调用器
+export const serverClient = createCallerFactory()(appRouter);
+```
+
+### 方式2：在服务端预取数据
+
+```typescript
+// src/app/posts/[id]/page.tsx
+
+import { notFound } from 'next/navigation';
+import { serverClient } from '@/lib/trpc/server';
+import { Comments } from '@/components/comments';
+
+interface PostPageProps {
+  params: {
+    id: string;
+  };
+}
+
+export default async function PostPage({ params }: PostPageProps) {
+  // 服务端获取数据
+  const post = await serverClient.posts.byId.query({
+    id: params.id,
+    includeComments: false
+  });
+
+  if (!post) {
+    notFound();
+  }
+
+  return (
+    <div className="container mx-auto px-4 py-8">
+      <article>
+        <h1 className="text-5xl font-bold mb-4">{post.title}</h1>
+
+        <div className="flex items-center gap-4 mb-8">
+          <img
+            src={post.author.avatar || '/default-avatar.png'}
+            alt={post.author.name}
+            className="w-12 h-12 rounded-full"
+          />
+          <div>
+            <div className="font-semibold">{post.author.name}</div>
+            <div className="text-sm text-gray-500">
+              {new Date(post.createdAt).toLocaleDateString()}
+            </div>
+          </div>
+        </div>
+
+        <div className="prose max-w-none mb-12">
+          {post.content}
+        </div>
+
+        {/* 客户端组件：评论 */}
+        <Comments postId={post.id} initialComments={[]} />
+      </article>
+    </div>
+  );
+}
+```
+
+## 客户端组件中使用 tRPC
+
+### 使用 React Hooks
+
+```typescript
+// src/components/comments.tsx
+
+'use client';
+
+import { trpc } from '@/lib/trpc/client';
+import { useState } from 'react';
+
+interface CommentsProps {
+  postId: string;
+  initialComments?: Comment[];
+}
+
+export function Comments({ postId }: CommentsProps) {
+  const [newComment, setNewComment] = useState('');
+
+  // ✅ 使用 useQuery 获取数据
+  const { data, isLoading, refetch } = trpc.comments.list.useQuery({
+    postId
+  });
+
+  // ✅ 使用 useMutation 创建评论
+  const createComment = trpc.comments.create.useMutation({
+    onSuccess: () => {
+      setNewComment('');
+      refetch();
+    }
+  });
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newComment.trim()) return;
+
+    createComment.mutate({
+      postId,
+      content: newComment
+    });
+  };
+
+  if (isLoading) {
+    return <div>加载评论中...</div>;
+  }
+
+  return (
+    <div className="mt-12">
+      <h2 className="text-2xl font-bold mb-6">
+        评论 ({data?.length || 0})
+      </h2>
+
+      {/* 创建评论表单 */}
+      <form onSubmit={handleSubmit} className="mb-8">
+        <textarea
+          value={newComment}
+          onChange={(e) => setNewComment(e.target.value)}
+          placeholder="写下你的评论..."
+          className="w-full p-4 border rounded-lg mb-4"
+          rows={4}
+        />
+        <button
+          type="submit"
+          disabled={createComment.isLoading}
+          className="px-6 py-2 bg-blue-600 text-white rounded-lg disabled:opacity-50"
+        >
+          {createComment.isLoading ? '发表中...' : '发表评论'}
+        </button>
+      </form>
+
+      {/* 评论列表 */}
+      <div className="space-y-6">
+        {data?.map((comment) => (
+          <div key={comment.id} className="flex gap-4">
+            <img
+              src={comment.author.avatar || '/default-avatar.png'}
+              alt={comment.author.name}
+              className="w-10 h-10 rounded-full"
+            />
+            <div className="flex-1">
+              <div className="font-semibold mb-1">
+                {comment.author.name}
+              </div>
+              <div className="text-gray-700">{comment.content}</div>
+              <div className="text-sm text-gray-500 mt-2">
+                {new Date(comment.createdAt).toLocaleString()}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+### 无限滚动
+
+```typescript
+// src/components/posts-infinite.tsx
+
+'use client';
+
+import { trpc } from '@/lib/trpc/client';
+import { useEffect, useRef } from 'react';
+
+export function PostsInfinite() {
+  const { data, fetchNextPage, hasNextPage, isFetchingNextPage } =
+    trpc.posts.infinite.useInfiniteQuery(
+      { limit: 20 },
+      {
+        getNextPageParam: (lastPage) => lastPage.nextCursor
+      }
+    );
+
+  const observerTarget = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries[0].isIntersecting && hasNextPage) {
+          fetchNextPage();
+        }
+      },
+      { threshold: 1 }
+    );
+
+    if (observerTarget.current) {
+      observer.observe(observerTarget.current);
+    }
+
+    return () => observer.disconnect();
+  }, [hasNextPage, fetchNextPage]);
+
+  return (
+    <div className="space-y-6">
+      {data?.pages.map((page) =>
+        page.items.map((post) => (
+          <article key={post.id} className="border rounded-lg p-6">
+            <h2 className="text-2xl font-semibold mb-2">
+              {post.title}
+            </h2>
+            <p className="text-gray-600">{post.content}</p>
+          </article>
+        ))
+      )}
+
+      {/* 观察目标 */}
+      <div ref={observerTarget} />
+
+      {isFetchingNextPage && <div>加载更多...</div>}
+    </div>
+  );
+}
+```
+
+## 认证集成
+
+### NextAuth.js + tRPC
+
+```typescript
+// src/app/api/auth/[...nextauth]/route.ts
+
+import NextAuth from "next-auth";
+import GoogleProvider from "next-auth/providers/google";
+
+export const { handlers, auth } = NextAuth({
+  providers: [
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+    }),
+  ],
+  callbacks: {
+    async session({ session, token }) {
+      if (token && session.user) {
+        session.user.id = token.sub!;
+      }
+      return session;
+    },
+  },
+});
+
+export const { GET, POST } = handlers;
+```
+
+### 更新 Context 以使用 NextAuth
+
+```typescript
+// src/lib/trpc/server.ts
+
+import { auth } from "@/app/api/auth/[...nextauth]/route";
+
+export const createContext = async () => {
+  const session = await auth();
+
+  return {
+    session,
+    user: session?.user || null,
+  };
+};
+```
+
+### 保护页面
+
+```typescript
+// src/app/dashboard/page.tsx
+
+import { serverClient } from '@/lib/trpc/server';
+import { redirect } from 'next/navigation';
+import { auth } from '@/app/api/auth/[...nextauth]/route';
+
+export default async function DashboardPage() {
+  const session = await auth();
+
+  if (!session) {
+    redirect('/api/auth/signin');
+  }
+
+  const stats = await serverClient.stats.overview.query();
+
+  return (
+    <div className="container mx-auto px-4 py-8">
+      <h1 className="text-3xl font-bold mb-8">仪表板</h1>
+
+      <div className="grid grid-cols-3 gap-6">
+        <div className="border rounded-lg p-6">
+          <div className="text-3xl font-bold">{stats.users}</div>
+          <div className="text-gray-600">用户总数</div>
+        </div>
+        <div className="border rounded-lg p-6">
+          <div className="text-3xl font-bold">{stats.posts}</div>
+          <div className="text-gray-600">文章总数</div>
+        </div>
+        <div className="border rounded-lg p-6">
+          <div className="text-3xl font-bold">{stats.comments}</div>
+          <div className="text-gray-600">评论总数</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+## 性能优化
+
+### 1. 数据预取
+
+```typescript
+// src/components/providers/prefetch-provider.tsx
+
+'use client';
+
+import { trpc } from '@/lib/trpc/client';
+import { useEffect } from 'react';
+
+export function PrefetchProvider({ children }: { children: React.ReactNode }) {
+  useEffect(() => {
+    // 预取常用数据
+    trpc.users.me.prefetch();
+    trpc.stats.overview.prefetch();
+  }, []);
+
+  return <>{children}</>;
+}
+```
+
+### 2. 缓存策略
+
+```typescript
+// 使用 staleTime 和 cacheTime
+const { data } = trpc.users.me.useQuery(undefined, {
+  staleTime: 1000 * 60 * 5, // 5分钟内不会重新获取
+  cacheTime: 1000 * 60 * 10, // 缓存保留10分钟
+});
+```
+
+### 3. 服务端渲染优化
+
+```typescript
+// 使用 revalidate 验证数据
+export const revalidate = 60;  // 每60秒重新验证
+
+export default async function PostsPage() {
+  const posts = await serverClient.posts.list.query({
+    page: 1,
+    limit: 20
+  });
+
+  return <PostsList posts={posts} />;
+}
+```
+
+## 完整实战：博客应用
+
+### 文章列表页面
+
+```typescript
+// src/app/posts/page.tsx
+
+import Link from 'next/link';
+import { serverClient } from '@/lib/trpc/server';
+import { CreatePostButton } from '@/components/create-post-button';
+
+export default async function PostsPage() {
+  const result = await serverClient.posts.list.query({
+    page: 1,
+    limit: 20,
+    published: true
+  });
+
+  return (
+    <div className="container mx-auto px-4 py-8">
+      <div className="flex justify-between items-center mb-8">
+        <h1 className="text-4xl font-bold">文章列表</h1>
+        <CreatePostButton />
+      </div>
+
+      <div className="grid gap-6">
+        {result.posts.map((post) => (
+          <article
+            key={post.id}
+            className="border rounded-lg p-6 hover:shadow-lg transition-shadow"
+          >
+            <Link href={`/posts/${post.id}`}>
+              <h2 className="text-2xl font-semibold mb-2 hover:text-blue-600">
+                {post.title}
+              </h2>
+            </Link>
+            <p className="text-gray-600 mb-4 line-clamp-2">
+              {post.content.substring(0, 200)}...
+            </p>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-3">
+                <img
+                  src={post.author.avatar || '/default-avatar.png'}
+                  alt={post.author.name}
+                  className="w-8 h-8 rounded-full"
+                />
+                <span className="text-sm text-gray-600">
+                  {post.author.name}
+                </span>
+              </div>
+              <div className="flex gap-4 text-sm text-gray-500">
+                <span>💬 {post._count.comments}</span>
+                <span>❤️ {post._count.likes}</span>
+              </div>
+            </div>
+          </article>
+        ))}
+      </div>
+
+      {/* 分页 */}
+      {result.pagination.totalPages > 1 && (
+        <div className="mt-8 flex justify-center gap-2">
+          {Array.from({ length: result.pagination.totalPages }, (_, i) => (
+            <Link
+              key={i + 1}
+              href={`/posts?page=${i + 1}`}
+              className="px-4 py-2 border rounded-lg hover:bg-gray-50"
+            >
+              {i + 1}
+            </Link>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+```
+
+### 创建文章模态框
+
+```typescript
+// src/components/create-post-modal.tsx
+
+'use client';
+
+import { useState } from 'react';
+import { trpc } from '@/lib/trpc/client';
+import { useRouter } from 'next/navigation';
+
+export function CreatePostButton() {
+  const [isOpen, setIsOpen] = useState(false);
+  const router = useRouter();
+  const utils = trpc.useContext();
+
+  const createPost = trpc.posts.create.useMutation({
+    onSuccess: (data) => {
+      setIsOpen(false);
+      utils.posts.list.invalidate();
+      router.push(`/posts/${data.id}`);
+    }
+  });
+
+  return (
+    <>
+      <button
+        onClick={() => setIsOpen(true)}
+        className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+      >
+        写文章
+      </button>
+
+      {isOpen && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center">
+          <div className="bg-white rounded-lg p-6 max-w-2xl w-full mx-4">
+            <h2 className="text-2xl font-bold mb-4">创建文章</h2>
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const formData = new FormData(e.currentTarget);
+                createPost.mutate({
+                  title: formData.get('title') as string,
+                  content: formData.get('content') as string,
+                  published: false
+                });
+              }}
+              className="space-y-4"
+            >
+              <div>
+                <label className="block mb-2 font-semibold">标题</label>
+                <input
+                  type="text"
+                  name="title"
+                  required
+                  className="w-full px-4 py-2 border rounded-lg"
+                  placeholder="输入文章标题..."
+                />
+              </div>
+
+              <div>
+                <label className="block mb-2 font-semibold">内容</label>
+                <textarea
+                  name="content"
+                  required
+                  rows={10}
+                  className="w-full px-4 py-2 border rounded-lg"
+                  placeholder="开始写作..."
+                />
+              </div>
+
+              <div className="flex justify-end gap-3">
+                <button
+                  type="button"
+                  onClick={() => setIsOpen(false)}
+                  className="px-4 py-2 border rounded-lg"
+                >
+                  取消
+                </button>
+                <button
+                  type="submit"
+                  disabled={createPost.isLoading}
+                  className="px-6 py-2 bg-blue-600 text-white rounded-lg disabled:opacity-50"
+                >
+                  {createPost.isLoading ? '创建中...' : '创建'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+```
+
+## 最佳实践
+
+### 1. 使用 Server Components 优先
+
+```typescript
+// ✅ 推荐：服务端组件 + serverClient
+export default async function Page() {
+  const data = await serverClient.posts.list.query();
+  return <PostList posts={data.posts} />;
+}
+
+// ⚠️ 仅在需要交互时使用客户端组件
+'use client';
+export function PostList() {
+  const { data } = trpc.posts.list.useQuery();
+  // ...
+}
+```
+
+### 2. 合理使用客户端组件
+
+```typescript
+// ✅ 只在需要交互功能时使用 'use client'
+'use client';
+
+export function LikeButton({ postId }: { postId: string }) {
+  const utils = trpc.useContext();
+  const like = trpc.posts.like.useMutation({
+    onSuccess: () => {
+      utils.posts.byId.invalidate({ id: postId });
+    }
+  });
+
+  return <button onClick={() => like.mutate({ postId })}>点赞</button>;
+}
+```
+
+### 3. 错误处理
+
+```typescript
+'use client';
+
+import { trpc } from '@/lib/trpc/client';
+import { TRPCClientError } from '@trpc/client';
+
+export function UserProfile() {
+  const { data, error, isLoading } = trpc.users.me.useQuery();
+
+  if (isLoading) return <div>加载中...</div>;
+
+  if (error) {
+    if (error instanceof TRPCClientError) {
+      if (error.code === 'UNAUTHORIZED') {
+        return <div>请先登录</div>;
+      }
+    }
+    return <div>发生错误：{error.message}</div>;
+  }
+
+  return <div>欢迎，{data?.name}</div>;
+}
+```
+
+## 总结
+
+### 核心要点
+
+1. **Next.js App Router 集成**
+   - API 路由处理器配置
+   - Server Caller 在服务端组件中使用
+   - React Hooks 在客户端组件中使用
+
+2. **Server Components 优势**
+   - 直接在服务端调用 tRPC
+   - 减少客户端 JavaScript
+   - 更好的 SEO 和性能
+
+3. **认证集成**
+   - NextAuth.js + tRPC
+   - Context 传递用户信息
+   - 保护 API 和页面
+
+4. **性能优化**
+   - 数据预取
+   - 缓存策略
+   - 服务端渲染优化
+
+### 架构优势
+
+```
+用户请求
+    ↓
+Next.js Server Component (RSC)
+    ↓
+tRPC Server Caller (类型安全)
+    ↓
+Prisma (数据库操作)
+    ↓
+返回 HTML + 数据
+```
+
+### 下一步
+
+在下一篇文章中，我们将学习：
+
+- **Nuxt + tRPC Vue 生态集成**
+- Vue Composition API 中使用 tRPC
+- 与 Next.js 对比分析
+
+敬请期待！🚀
+
+## 参考资源
+
+- [Next.js App Router 文档](https://nextjs.org/docs/app)
+- [tRPC Next.js 集成文档](https://trpc.io/docs/nextjs)
+- [React Server Components](https://react.dev/reference/react/use-client)
+
+---
+
+**上一章**：[05. Prisma 集成](./05-prisma-integration.mdx)
+**下一章**：[07. Nuxt + tRPC Vue 生态集成](./07-nuxt-integration.mdx)

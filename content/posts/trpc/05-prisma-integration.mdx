@@ -1,0 +1,518 @@
+---
+title: "05 Prisma 集成：类型安全的数据库操作"
+date: "2026-03-23"
+summary: "学会 tRPC 与 Prisma 的深度集成，掌握类型安全的数据库操作，构建完整的 CRUD API，实现端到端的类型安全。"
+tags: ["tRPC", "Prisma", "数据库", "CRUD", "TypeScript"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 5
+---
+
+## 前言
+
+如果说 tRPC 是前后端类型安全的桥梁，那么 Prisma 就是后端与数据库类型安全的桥梁。
+
+**tRPC + Prisma = 完美的类型安全组合**
+
+```
+前端 --[tRPC]--> 后端 --[Prisma]--> 数据库
+  ↓                  ↓                ↓
+类型安全          类型安全         类型安全
+```
+
+今天，我们将学习：
+
+- Prisma 基础配置和 Schema 设计
+- tRPC 与 Prisma 的完美集成
+- 构建完整的 CRUD API
+- 关联数据和高级查询
+- 性能优化技巧
+
+## 为什么选择 Prisma？
+
+### 传统 ORM vs Prisma
+
+```typescript
+// ========== TypeORM ==========
+
+// 需要定义 Entity 和 TypeScript 类型（重复！）
+@Entity()
+export class User {
+  @PrimaryColumn()
+  id: string;
+
+  @Column()
+  name: string;
+
+  @Column()
+  email: string;
+}
+
+// 查询时需要手动指定类型
+const users = await userRepository.find();
+// users 的类型是 User[]
+
+// ========== Prisma ==========
+
+// 只需定义 Schema（一次！）
+model User {
+  id    String @id
+  name  String
+  email String
+}
+
+// 自动生成类型
+const users = await prisma.user.findMany();
+// users 的类型自动推断为 User[]
+```
+
+### Prisma 的优势
+
+| 特性        | Prisma           | 其他 ORM      |
+| ----------- | ---------------- | ------------- |
+| 类型安全    | ✅ 自动生成      | ⚠️ 需手动维护 |
+| Schema 定义 | ✅ 直观易懂      | ⚠️ 装饰器繁琐 |
+| 迁移系统    | ✅ 自动生成      | ⚠️ 手动编写   |
+| 关联查询    | ✅ 类型安全      | ⚠️ 复杂       |
+| 性能        | ✅ 查询优化      | ⚠️ N+1 问题   |
+| 开发体验    | ✅ 优秀 IDE 支持 | ⚠️ 一般       |
+
+## 项目配置
+
+### 第一步：安装依赖
+
+```bash
+# 安装 Prisma
+npm install prisma @prisma/client
+
+# 初始化 Prisma
+npx prisma init
+```
+
+### 第二步：配置数据库连接
+
+```prisma
+// prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+```
+
+```env
+# .env
+DATABASE_URL="postgresql://user:password@localhost:5432/mydb?schema=public"
+```
+
+### 第三步：设计 Schema
+
+```prisma
+// prisma/schema.prisma
+
+// ========== 用户模型 ==========
+model User {
+  id        String    @id @default(cuid())
+  email     String    @unique
+  name      String
+  password  String
+  avatar    String?
+  bio       String?
+  role      Role      @default(USER)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  // 关系
+  posts     Post[]
+  comments  Comment[]
+  likes     Like[]
+
+  @@index([email])
+}
+
+// ========== 角色枚举 ==========
+enum Role {
+  USER
+  MODERATOR
+  ADMIN
+}
+
+// ========== 文章模型 ==========
+model Post {
+  id          String    @id @default(cuid())
+  title       String
+  content     String    @db.Text
+  published   Boolean   @default(false)
+  authorId    String
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  // 关系
+  author      User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments    Comment[]
+  likes       Like[]
+
+  @@index([authorId])
+  @@index([published, createdAt])
+}
+
+// ========== 评论模型 ==========
+model Comment {
+  id        String   @id @default(cuid())
+  content   String
+  postId    String
+  authorId  String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 关系
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+
+  @@index([postId])
+  @@index([authorId])
+}
+
+// ========== 点赞模型 ==========
+model Like {
+  id        String   @id @default(cuid())
+  userId    String
+  postId    String
+  createdAt DateTime @default(now())
+
+  // 关系
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, postId])
+  @@index([postId])
+}
+```
+
+### 第四步：生成 Prisma Client
+
+```bash
+# 生成 Prisma Client（自动生成类型）
+npx prisma generate
+
+# 创建数据库迁移
+npx prisma migrate dev --name init
+
+# 打开 Prisma Studio（GUI）
+npx prisma studio
+```
+
+## 创建 Prisma Client 单例
+
+```typescript
+// lib/prisma.ts
+
+import { PrismaClient } from "@prisma/client";
+
+// 防止开发环境热重载创建多个实例
+const globalForPrisma = global as unknown as { prisma: PrismaClient };
+
+export const prisma =
+  globalForPrisma.prisma ||
+  new PrismaClient({
+    log:
+      process.env.NODE_ENV === "development"
+        ? ["query", "error", "warn"]
+        : ["error"],
+  });
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+```
+
+## CRUD 操作
+
+### CREATE - 创建数据
+
+```typescript
+// ========== 创建单个用户 ==========
+
+const createUser = t.procedure
+  .input(
+    z.object({
+      email: z.string().email(),
+      name: z.string().min(2),
+      password: z.string().min(8),
+    })
+  )
+  .mutation(async ({ input }) => {
+    // ✅ 返回类型自动推断为 User
+    const user = await prisma.user.create({
+      data: {
+        email: input.email,
+        name: input.name,
+        password: await hash(input.password),
+      },
+    });
+
+    // ✅ 不返回密码
+    const { password, ...userWithoutPassword } = user;
+    return userWithoutPassword;
+  });
+
+// ========== 创建带关联的数据 ==========
+
+const createPost = t.procedure
+  .input(
+    z.object({
+      title: z.string().min(1),
+      content: z.string().min(1),
+      published: z.boolean().default(false),
+    })
+  )
+  .mutation(async ({ input, ctx }) => {
+    // ctx.user 的类型是 User（非 null，假设使用认证中间件）
+    const post = await prisma.post.create({
+      data: {
+        ...input,
+        authorId: ctx.user.id,
+      },
+      include: {
+        author: true, // 包含关联数据
+      },
+    });
+
+    return post;
+    // ✅ 返回类型：Post & { author: User }
+  });
+```
+
+### READ - 读取数据
+
+```typescript
+// ========== 查询所有（带分页）==========
+
+const getPosts = t.procedure
+  .input(
+    z.object({
+      page: z.number().default(1),
+      limit: z.number().min(1).max(100).default(20),
+      published: z.boolean().optional(),
+    })
+  )
+  .query(async ({ input }) => {
+    const { page, limit, published } = input;
+    const skip = (page - 1) * limit;
+
+    const [posts, total] = await Promise.all([
+      prisma.post.findMany({
+        where: published !== undefined ? { published } : undefined,
+        skip,
+        take: limit,
+        orderBy: { createdAt: "desc" },
+        include: {
+          author: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+          _count: {
+            select: {
+              comments: true,
+              likes: true,
+            },
+          },
+        },
+      }),
+      prisma.post.count({
+        where: published !== undefined ? { published } : undefined,
+      }),
+    ]);
+
+    return {
+      posts,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  });
+```
+
+## 完整示例：博客 API
+
+```typescript
+// routers/posts.ts
+
+import { initTRPC, TRPCError } from "@trpc/server";
+import { z } from "zod";
+import { prisma } from "../lib/prisma";
+
+const t = initTRPC.create();
+
+export const postsRouter = t.router({
+  // 获取文章列表（分页）
+  list: t.procedure
+    .input(
+      z.object({
+        page: z.number().default(1),
+        limit: z.number().min(1).max(100).default(20),
+        published: z.boolean().optional(),
+      })
+    )
+    .query(async ({ input }) => {
+      const { page, limit, published } = input;
+      const skip = (page - 1) * limit;
+
+      const [posts, total] = await Promise.all([
+        prisma.post.findMany({
+          where: published !== undefined ? { published } : undefined,
+          skip,
+          take: limit,
+          orderBy: { createdAt: "desc" },
+          include: {
+            author: {
+              select: {
+                id: true,
+                name: true,
+                avatar: true,
+              },
+            },
+            _count: {
+              select: {
+                comments: true,
+                likes: true,
+              },
+            },
+          },
+        }),
+        prisma.post.count({
+          where: published !== undefined ? { published } : undefined,
+        }),
+      ]);
+
+      return {
+        posts,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      };
+    }),
+
+  // 创建文章
+  create: t.procedure
+    .input(
+      z.object({
+        title: z.string().min(1).max(200),
+        content: z.string().min(1),
+        published: z.boolean().default(false),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const post = await prisma.post.create({
+        data: {
+          ...input,
+          authorId: ctx.user.id,
+        },
+        include: {
+          author: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+        },
+      });
+
+      return post;
+    }),
+});
+
+export type PostsRouter = typeof postsRouter;
+```
+
+## 最佳实践
+
+### 1. 类型安全
+
+```typescript
+// ✅ 推荐：使用 Prisma 生成的类型
+import { User } from "@prisma/client";
+
+const getUser = t.procedure.query(async (): Promise<User[]> => {
+  return await prisma.user.findMany();
+});
+```
+
+### 2. 性能优化
+
+```typescript
+// ✅ 推荐：使用 select 限制返回字段
+const users = await prisma.user.findMany({
+  select: {
+    id: true,
+    name: true,
+    avatar: true,
+  },
+});
+```
+
+## 总结
+
+### 核心要点
+
+1. **Prisma + tRPC = 完美组合**
+   - 端到端类型安全
+   - 自动类型生成
+   - 无需重复定义
+
+2. **CRUD 操作**
+   - Create：创建数据
+   - Read：查询数据（分页、过滤、搜索）
+   - Update：更新数据
+   - Delete：删除数据
+
+3. **性能优化**
+   - 使用 select 减少传输
+   - 避免 N+1 问题
+   - 使用游标分页
+
+### 🎉 基础篇完成！
+
+恭喜！你已经完成了 tRPC 基础篇的学习（5篇文章）：
+
+- ✅ 初识 tRPC
+- ✅ Routers 和 Procedures
+- ✅ 类型推断与自动补全
+- ✅ 中间件系统与错误处理
+- ✅ Prisma 集成
+
+### 下一步
+
+接下来我们将进入**框架集成篇**，学习如何在不同的框架中使用 tRPC：
+
+- **Next.js + tRPC** 全栈开发
+- **Nuxt + tRPC** Vue 生态集成
+- **NestJS + tRPC** 企业级后端
+- **Hono + tRPC** 轻量级边缘计算
+
+敬请期待！🚀
+
+## 参考资源
+
+- [Prisma 文档](https://www.prisma.io/docs)
+- [tRPC + Prisma 示例](https://trpc.io/docs/prisma)
+
+---
+
+**上一章**：[04. 中间件系统与错误处理](./04-middlewares-error-handling.mdx)
+**下一章**：[06. Next.js + tRPC 全栈开发](./06-nextjs-integration.mdx)

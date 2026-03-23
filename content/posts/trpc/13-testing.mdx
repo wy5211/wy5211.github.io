@@ -1,0 +1,852 @@
+---
+title: "13. 测试 tRPC 应用"
+date: "2026-03-23"
+summary: "掌握 tRPC 应用的测试方法，编写单元测试、集成测试和 E2E 测试，确保应用质量和类型安全。"
+tags: ["tRPC", "测试", "Jest", "Vitest", "Testing Library"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 13
+---
+
+## 前言
+
+测试是确保代码质量和类型安全的关键环节。tRPC 的类型系统让测试变得更加简单和安全：
+
+✅ **类型安全的测试**：编译时检查 Mock 数据
+✅ **可预测的 API**：统一的数据格式
+✅ **易于 Mock**：清晰的数据结构
+✅ **集成测试友好**：标准的 HTTP 接口
+
+今天，我们将学习：
+
+- 单元测试
+- 集成测试
+- E2E 测试
+- 测试最佳实践
+- CI/CD 集成
+
+## 项目配置
+
+### 安装测试依赖
+
+```bash
+# Vitest（推荐）
+npm install -D vitest @vitejs/plugin-react
+npm install -D @testing-library/react @testing-library/jest-dom
+npm install -D @testing-library/user-event
+npm install -D happy-dom
+
+# 或者 Jest
+npm install -D jest @testing-library/react @testing-library/jest-dom
+npm install -D ts-jest @types/jest babel-jest
+```
+
+### 配置 Vitest
+
+```typescript
+// vitest.config.ts
+
+import { defineConfig } from "vitest/config";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  test: {
+    globals: true,
+    environment: "happy-dom",
+    setupFiles: ["./src/test/setup.ts"],
+  },
+});
+```
+
+### 测试设置
+
+```typescript
+// src/test/setup.ts
+
+import { expect, afterEach } from "vitest";
+import { cleanup } from "@testing-library/react";
+import * as matchers from "@testing-library/jest-dom/matchers";
+
+// 扩展 expect
+expect.extend(matchers);
+
+// 每个测试后清理
+afterEach(() => {
+  cleanup();
+});
+```
+
+## 单元测试
+
+### 测试 Procedure
+
+```typescript
+// src/trpc/routers/__tests__/users.router.test.ts
+
+import { describe, it, expect, beforeEach } from "vitest";
+import { t } from "../index";
+import { PrismaService } from "@/database/prisma.service";
+
+describe("Users Router", () => {
+  let prisma: PrismaService;
+
+  beforeEach(async () => {
+    prisma = new PrismaService();
+    await prisma.cleanDb();
+  });
+
+  describe("me", () => {
+    it("应该返回当前用户信息", async () => {
+      const caller = createCaller({
+        user: {
+          id: "1",
+          name: "Alice",
+          email: "alice@example.com",
+          role: "USER",
+        },
+      });
+
+      const result = await caller.users.me.query();
+
+      expect(result).toEqual({
+        id: "1",
+        name: "Alice",
+        email: "alice@example.com",
+        role: "USER",
+      });
+    });
+
+    it("未登录应该抛出错误", async () => {
+      const caller = createCaller({
+        user: null,
+      });
+
+      await expect(caller.users.me.query()).rejects.toThrowError(
+        "UNAUTHORIZED"
+      );
+    });
+  });
+
+  describe("list", () => {
+    it("应该返回用户列表", async () => {
+      // 准备测试数据
+      await prisma.user.createMany({
+        data: [
+          { id: "1", name: "Alice", email: "alice@example.com" },
+          { id: "2", name: "Bob", email: "bob@example.com" },
+        ],
+      });
+
+      const caller = createCaller({
+        user: {
+          id: "1",
+          name: "Alice",
+          email: "alice@example.com",
+          role: "USER",
+        },
+      });
+
+      const result = await caller.users.list.query({
+        page: 1,
+        limit: 20,
+      });
+
+      expect(result.users).toHaveLength(2);
+      expect(result.pagination.total).toBe(2);
+    });
+
+    it("应该支持分页", async () => {
+      // 创建 25 个用户
+      const users = Array.from({ length: 25 }, (_, i) => ({
+        id: `user-${i}`,
+        name: `User ${i}`,
+        email: `user${i}@example.com`,
+      }));
+
+      await prisma.user.createMany({
+        data: users,
+      });
+
+      const caller = createCaller({
+        user: {
+          id: "1",
+          name: "Admin",
+          email: "admin@example.com",
+          role: "ADMIN",
+        },
+      });
+
+      const page1 = await caller.users.list.query({
+        page: 1,
+        limit: 10,
+      });
+
+      const page2 = await caller.users.list.query({
+        page: 2,
+        limit: 10,
+      });
+
+      expect(page1.users).toHaveLength(10);
+      expect(page2.users).toHaveLength(10);
+      expect(page1.pagination.totalPages).toBe(3);
+    });
+  });
+});
+```
+
+### 测试工具函数
+
+```typescript
+// src/test/utils.ts
+
+import { inferRouterInputs, inferRouterOutputs } from "@trpc/server";
+import type { AppRouter } from "@/trpc";
+
+// 创建测试用的 Caller
+export function createCaller({
+  user,
+  prisma,
+}: {
+  user: User | null;
+  prisma: PrismaService;
+}) {
+  const { createContext } = await import("@/trpc/context");
+
+  const testContext = await createContext({
+    req: {
+      headers: new Headers({
+        authorization: user ? `Bearer ${mockToken(user)}` : "",
+      }),
+    },
+    res: {} as any,
+  });
+
+  // 如果需要认证用户
+  if (user) {
+    testContext.user = user;
+  }
+
+  const { t } = await import("@/trpc");
+
+  return t.createCallerFactory<AppRouter>()(testContext);
+}
+
+// Mock 数据生成器
+export function mockUser(overrides: Partial<User> = {}): User {
+  return {
+    id: "1",
+    name: "Test User",
+    email: "test@example.com",
+    role: "USER",
+    ...overrides,
+  };
+}
+
+export function mockPost(overrides: Partial<Post> = {}): Post {
+  return {
+    id: "1",
+    title: "Test Post",
+    content: "Test Content",
+    published: false,
+    authorId: "1",
+    createdAt: new Date(),
+    updatedAt: new Date(),
+    ...overrides,
+  };
+}
+```
+
+## 集成测试
+
+### 测试 API 端点
+
+```typescript
+// src/test/api/users.test.ts
+
+import { describe, it, expect, beforeAll } from "vitest";
+import { set } from "zod";
+import { createTRPCProxyClient, httpBatchLink } from "@trpc/client";
+import { AppRouter } from "@/trpc/routers";
+import { prisma } from "@/database/prisma.service";
+
+describe("Users API", () => {
+  let client: ReturnType<typeof createTRPCProxyClient<AppRouter>>;
+
+  beforeAll(async () => {
+    // 清空数据库
+    await prisma.cleanDb();
+
+    // 创建测试用户
+    await prisma.user.create({
+      data: {
+        id: "1",
+        name: "Test User",
+        email: "test@example.com",
+        role: "USER",
+      },
+    });
+
+    // 创建 HTTP 服务器
+    const { server } = await import("@/server");
+
+    const httpServer = server.listen(0);
+
+    const port = (httpServer.address() as any).port;
+
+    // 创建 tRPC 客户端
+    client = createTRPCProxyClient<AppRouter>({
+      links: [
+        httpBatchLink({
+          url: `http://localhost:${port}/trpc`,
+        }),
+      ],
+    });
+  });
+
+  it("应该获取用户列表", async () => {
+    const result = await client.users.list.query({
+      page: 1,
+      limit: 20,
+    });
+
+    expect(result.users).toHaveLength(1);
+    expect(result.users[0]).toHaveProperty("id");
+    expect(result.users[0]).toHaveProperty("name");
+  });
+
+  it("应该验证输入参数", async () => {
+    // 测试无效的页码
+    await expect(
+      client.users.list.query({
+        page: -1, // 无效
+        limit: 20,
+      })
+    ).rejects.toThrow();
+  });
+
+  it("应该处理认证错误", async () => {
+    // 未登录调用需要认证的 API
+    const unauthClient = createTRPCProxyClient<AppRouter>({
+      links: [
+        httpBatchLink({
+          url: `http://localhost:${port}/trpc`,
+        }),
+      ],
+    });
+
+    await expect(unauthClient.users.me.query()).rejects.toThrow("UNAUTHORIZED");
+  });
+});
+```
+
+### 测试数据库操作
+
+```typescript
+// src/test/integration/posts.test.ts
+
+import { describe, it, expect, beforeEach } from "vitest";
+import { PrismaClient } from "@prisma/client";
+
+describe("Posts Integration", () => {
+  let prisma: PrismaClient;
+
+  beforeEach(async () => {
+    prisma = new PrismaClient();
+    await prisma.post.deleteMany();
+  });
+
+  it("应该创建文章并关联用户", async () => {
+    const user = await prisma.user.create({
+      data: {
+        id: "1",
+        name: "Test User",
+        email: "test@example.com",
+        role: "USER",
+      },
+    });
+
+    const post = await prisma.post.create({
+      data: {
+        title: "Test Post",
+        content: "Test Content",
+        authorId: user.id,
+      },
+    });
+
+    expect(post).toHaveProperty("id");
+    expect(post.title).toBe("Test Post");
+    expect(post.authorId).toBe(user.id);
+  });
+
+  it("应该支持事务", async () => {
+    await prisma.$transaction(async (tx) => {
+      const user = await tx.user.create({
+        data: {
+          id: "1",
+          name: "Test User",
+          email: "test@example.com",
+          role: "USER",
+        },
+      });
+
+      await tx.post.create({
+        data: {
+          title: "Test Post",
+          content: "Test Content",
+          authorId: user.id,
+        },
+      });
+    });
+
+    const count = await prisma.post.count();
+    expect(count).toBe(1);
+  });
+});
+```
+
+## E2E 测试
+
+### Playwright 配置
+
+```bash
+npm install -D @playwright/test
+```
+
+```typescript
+// playwright.config.ts
+
+import { defineConfig, devices } from "@playwright/test";
+
+export default defineConfig({
+  testDir: "./e2e",
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 2 : 0,
+  workers: process.env.CI ? 1 : undefined,
+  reporter: "html",
+  use: {
+    baseURL: "http://localhost:3000",
+    trace: "on-first-retry",
+    screenshot: "only-on-failure",
+  },
+
+  projects: [
+    {
+      name: "chromium",
+      use: { ...devices["Desktop Chrome"] },
+    },
+    {
+      name: "firefox",
+      use: { ...devices["Desktop Firefox"] },
+    },
+  ],
+});
+```
+
+### E2E 测试示例
+
+```typescript
+// e2e/posts.spec.ts
+
+import { test, expect } from "@playwright/test";
+
+test.describe("文章功能", () => {
+  test("应该显示文章列表", async ({ page }) => {
+    await page.goto("/");
+
+    // 等待文章加载
+    await expect(page.locator("article")).toHaveCount(20);
+
+    // 验证第一个文章
+    await expect(page.locator("article").first()).toContainText("");
+  });
+
+  test("应该创建新文章", async ({ page }) => {
+    await page.goto("/posts/new");
+
+    // 填写表单
+    await page.fill('input[name="title"]', "测试文章");
+    await page.fill('textarea[name="content"]', "这是测试内容");
+
+    // 提交表单
+    await page.click('button[type="submit"]');
+
+    // 验证成功消息
+    await expect(page.locator("text=文章创建成功")).toBeVisible();
+
+    // 验证导航到文章详情页
+    expect(page.url()).toContain("/posts/");
+  });
+
+  test("应该显示文章详情", async ({ page }) => {
+    await page.goto("/posts/test-post");
+
+    // 验证标题
+    await expect(page.locator("h1")).toContainText("测试文章");
+
+    // 验证内容
+    await expect(page.locator("article")).toContainText("这是测试内容");
+
+    // 验证评论区
+    await expect(page.locator("text=评论")).toBeVisible();
+  });
+});
+
+test.describe("用户认证", () => {
+  test.beforeEach(async ({ page }) => {
+    // 登录
+    await page.goto("/api/auth/signin");
+    await page.fill('input[name="email"]', "test@example.com");
+    await page.fill('input[name="password"]', "password123");
+    await page.click('button[type="submit"]');
+    await page.waitForURL("/");
+  });
+
+  test("应该显示用户名", async ({ page }) => {
+    await page.goto("/");
+
+    await expect(page.locator("text=test@example.com")).toBeVisible();
+  });
+
+  test("应该能创建文章", async ({ page }) => {
+    await page.goto("/posts/new");
+
+    await page.fill('input[name="title"]', "新文章");
+    await page.fill('textarea[name="content"]', "新内容");
+    await page.click('button[type="submit"]');
+
+    await expect(page.locator("text=文章创建成功")).toBeVisible();
+  });
+});
+```
+
+## React 组件测试
+
+### 测试组件
+
+```typescript
+// src/components/__tests__/PostList.test.tsx
+
+import { describe, it, expect, vi } from 'vitest';
+import { render, screen, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { PostList } from '../PostList';
+import { trpc } from '@/utils/trpc';
+
+// Mock tRPC
+vi.mock('@/utils/trpc', () => ({
+  trpc: {
+    posts: {
+      list: {
+        useQuery: vi.fn()
+      }
+    }
+  }
+}));
+
+describe('PostList', () => {
+  it('应该显示加载状态', () => {
+    // Mock 返回 loading 状态
+    vi.mocked(trpc.posts.list.useQuery).mockReturnValue({
+      data: undefined,
+      isLoading: true,
+      error: null
+    });
+
+    render(<PostList />);
+
+    expect(screen.getByText('加载中...')).toBeVisible();
+  });
+
+  it('应该显示文章列表', async () => {
+    const mockPosts = [
+      { id: '1', title: '文章1', content: '内容1' },
+      { id: '2', title: '文章2', content: '内容2' }
+    ];
+
+    vi.mocked(trpc.posts.list.useQuery).mockReturnValue({
+      data: { posts: mockPosts },
+      isLoading: false,
+      error: null
+    });
+
+    render(<PostList />);
+
+    await waitFor(() => {
+      expect(screen.getByText('文章1')).toBeVisible();
+      expect(screen.getByText('文章2')).toBeVisible();
+    });
+  });
+
+  it('应该显示错误状态', () => {
+    vi.mocked(trpc.posts.list.useQuery).mockReturnValue({
+      data: undefined,
+      isLoading: false,
+      error: new Error('加载失败')
+    });
+
+    render(<PostList />);
+
+    expect(screen.getByText('加载失败')).toBeVisible();
+  });
+
+  it('应该支持分页', async () => {
+    const mockPosts = Array.from({ length: 20 }, (_, i) => ({
+      id: `post-${i}`,
+      title: `文章${i}`,
+      content: `内容${i}`
+    }));
+
+    vi.mocked(trpc.posts.list.useQuery).mockReturnValue({
+      data: {
+        posts: mockPosts,
+        pagination: {
+          page: 1,
+          limit: 20,
+          total: 50,
+          totalPages: 3
+        }
+      },
+      isLoading: false,
+      error: null
+    });
+
+    render(<PostList />);
+
+    expect(screen.getByText('第 1 / 3 页')).toBeVisible();
+    expect(screen.getByRole('button', { name: '下一页' })).toBeVisible();
+  });
+});
+```
+
+## 性能测试
+
+### 响应时间测试
+
+```typescript
+// src/test/performance/posts.test.ts
+
+import { describe, it, expect } from "vitest";
+import { createCaller } from "../utils";
+
+describe("Posts Performance", () => {
+  it("应该在 100ms 内返回文章列表", async () => {
+    const caller = createCaller({
+      user: mockUser(),
+    });
+
+    const start = Date.now();
+
+    await caller.posts.list.query({
+      page: 1,
+      limit: 20,
+    });
+
+    const duration = Date.now() - start;
+
+    expect(duration).toBeLessThan(100);
+  });
+
+  it("应该支持并发请求", async () => {
+    const caller = createCaller({
+      user: mockUser(),
+    });
+
+    const start = Date.now();
+
+    await Promise.all([
+      caller.posts.list.query({ page: 1 }),
+      caller.posts.list.query({ page: 2 }),
+      caller.posts.list.query({ page: 3 }),
+    ]);
+
+    const duration = Date.now() - start;
+
+    // 并发请求应该比顺序请求更快
+    expect(duration).toBeLessThan(300);
+  });
+});
+```
+
+## 测试最佳实践
+
+### 1. 使用 Test Database
+
+```typescript
+// 使用内存数据库进行测试
+const testPrisma = new PrismaClient({
+  datasources: {
+    db: {
+      url: process.env.DATABASE_URL_TEST,
+    },
+  },
+});
+
+beforeAll(async () => {
+  await testPrisma.$connect();
+});
+
+afterAll(async () => {
+  await testPrisma.$disconnect();
+});
+
+beforeEach(async () => {
+  await testPrisma.user.deleteMany();
+});
+```
+
+### 2. Factory 模式
+
+```typescript
+// src/test/factories/user.factory.ts
+
+export class UserFactory {
+  static async create(overrides: Partial<User> = {}) {
+    return await prisma.user.create({
+      data: {
+        id: crypto.randomUUID(),
+        name: "Test User",
+        email: `test-${Date.now()}@example.com`,
+        role: "USER",
+        ...overrides,
+      },
+    });
+  }
+
+  static async createMany(count: number) {
+    const users = Array.from({ length: count }, (_, i) => ({
+      id: crypto.randomUUID(),
+      name: `User ${i}`,
+      email: `user${i}@example.com`,
+      role: "USER" as const,
+    }));
+
+    return await prisma.user.createMany({
+      data: users,
+    });
+  }
+}
+
+// 使用
+const user = await UserFactory.create({ name: "Custom Name" });
+const users = await UserFactory.createMany(10);
+```
+
+### 3. 快照测试
+
+```typescript
+import { snapshot } from "vitest";
+
+it("应该返回正确的用户数据结构", async () => {
+  const caller = createCaller({
+    user: mockUser(),
+  });
+
+  const result = await caller.users.byId.query({
+    id: "1",
+  });
+
+  expect(result).toMatchSnapshot();
+});
+```
+
+## CI/CD 集成
+
+### GitHub Actions
+
+```yaml
+# .github/workflows/test.yml
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v2
+        with:
+          version: 8
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Run E2E tests
+        run: pnpm test:e2e
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./coverage/lcov.info
+```
+
+## 总结
+
+### 核心要点
+
+1. **单元测试**
+   - Procedure 测试
+   - Mock 数据
+   - 类型安全验证
+
+2. **集成测试**
+   - API 端点测试
+   - 数据库测试
+   - 事务测试
+
+3. **E2E 测试**
+   - Playwright 测试
+   - 用户流程测试
+   - 跨浏览器测试
+
+4. **最佳实践**
+   - Test Database
+   - Factory 模式
+   - 快照测试
+
+### 🎉 高级篇完成！
+
+恭喜！你已经完成了高级篇的学习（4篇文章）：
+
+- ✅ 订阅 Subscriptions
+- ✅ 元数据与负载优化
+- ✅ Monorepo 架构
+- ✅ 测试 tRPC 应用
+
+### 下一步
+
+接下来我们将进入**实战篇**：
+
+- **实战项目一：协作式代码编辑器**
+- **实战项目二：全栈电商系统**
+
+敬请期待！🚀
+
+## 参考资源
+
+- [Vitest 文档](https://vitest.dev/)
+- [Testing Library](https://testing-library.com/)
+- [Playwright 文档](https://playwright.dev/)
+
+---
+
+**上一章**：[12. Monorepo 架构](./12-monorepo.mdx)
+**下一章**：[14. 实战项目一：协作式代码编辑器](./14-realtime-code-editor.mdx)

@@ -1,0 +1,614 @@
+---
+title: "11. 元数据与负载优化"
+date: "2026-03-23"
+summary: "深入理解 tRPC 元数据系统，学习数据传输优化、延迟加载、缓存策略，构建高性能的 tRPC 应用。"
+tags: ["tRPC", "性能优化", "元数据", "缓存", "负载优化"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 11
+---
+
+## 前言
+
+随着应用规模的增长，数据传输和性能优化变得至关重要。tRPC 提供了强大的元数据系统，让我们可以：
+
+✅ **减少数据传输**：只传输需要的数据
+✅ **延迟加载**：按需获取数据
+✅ **智能缓存**：减少重复请求
+✅ **批量处理**：提高网络效率
+
+今天，我们将学习：
+
+- tRPC 元数据系统
+- 数据分片和部分加载
+- 缓存策略
+- 性能监控
+- 最佳实践
+
+## 元数据系统
+
+### 什么是元数据？
+
+元数据是描述数据的数据，在 tRPC 中用于优化数据传输和处理。
+
+```typescript
+// 查询时的元数据
+const result = await client.posts.list.query({
+  limit: 20,
+  includeAuthor: true, // ← 元数据
+  includeComments: false, // ← 元数据
+});
+```
+
+### 定义元数据 Schema
+
+```typescript
+import { z } from "zod";
+
+// 定义元数据 Schema
+const postsQueryMeta = z.object({
+  limit: z.number().default(20),
+  cursor: z.string().optional(),
+  includeAuthor: z.boolean().default(true),
+  includeComments: z.boolean().default(false),
+  includeLikes: z.boolean().default(false),
+  fields: z.array(z.enum(["id", "title", "content", "author"])).optional(),
+});
+
+const getPosts = t.procedure.input(postsQueryMeta).query(async ({ input }) => {
+  // 根据元数据构建查询
+  const select: any = {
+    id: true,
+    title: true,
+    content: true,
+  };
+
+  if (input.includeAuthor) {
+    select.author = {
+      select: {
+        id: true,
+        name: true,
+        avatar: true,
+      },
+    };
+  }
+
+  if (input.includeComments) {
+    select.comments = {
+      select: {
+        id: true,
+        content: true,
+        author: {
+          select: {
+            id: true,
+            name: true,
+          },
+        },
+      },
+    };
+  }
+
+  const posts = await prisma.post.findMany({
+    select,
+    take: input.limit,
+    ...(input.cursor && {
+      cursor: { id: input.cursor },
+      skip: 1,
+    }),
+    orderBy: { createdAt: "desc" },
+  });
+
+  return posts;
+});
+```
+
+## 数据分片
+
+### 部分字段加载
+
+```typescript
+// 只返回需要的字段
+const getUser = t.procedure
+  .input(
+    z.object({
+      userId: z.string(),
+      fields: z.array(z.enum(["id", "name", "email", "avatar", "bio"])),
+    })
+  )
+  .query(async ({ input }) => {
+    const select: any = {};
+
+    input.fields.forEach((field) => {
+      select[field] = true;
+    });
+
+    const user = await prisma.user.findUnique({
+      where: { id: input.userId },
+      select,
+    });
+
+    return user;
+  });
+
+// 客户端使用
+const user = await client.getUser.query({
+  userId: "123",
+  fields: ["id", "name", "avatar"], // 只获取这些字段
+});
+```
+
+### 嵌套对象优化
+
+```typescript
+// 避免深度嵌套
+const getPosts = t.procedure
+  .input(
+    z.object({
+      include: z.object({
+        author: z.boolean().optional(),
+        comments: z.boolean().optional(),
+        commentsAuthor: z.boolean().optional(), // 只在需要时获取评论作者
+      }),
+    })
+  )
+  .query(async ({ input }) => {
+    const include: any = {};
+
+    if (input.include.author) {
+      include.author = {
+        select: {
+          id: true,
+          name: true,
+          avatar: true,
+        },
+      };
+    }
+
+    if (input.include.comments) {
+      include.comments = {
+        ...(input.include.commentsAuthor && {
+          include: {
+            author: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+          },
+        }),
+      };
+    }
+
+    const posts = await prisma.post.findMany({
+      include,
+      take: 20,
+    });
+
+    return posts;
+  });
+```
+
+## 延迟加载
+
+### 延迟加载策略
+
+```typescript
+// 服务端：定义可延迟加载的字段
+const getPostDetail = t.procedure
+  .input(
+    z.object({
+      postId: z.string(),
+      include: z.object({
+        comments: z.boolean().default(false),
+        likes: z.boolean().default(false),
+        relatedPosts: z.boolean().default(false),
+      }),
+    })
+  )
+  .query(async ({ input }) => {
+    const post = await prisma.post.findUnique({
+      where: { id: input.postId },
+      include: {
+        author: {
+          select: {
+            id: true,
+            name: true,
+            avatar: true,
+          },
+        },
+        ...(input.include.comments && {
+          comments: {
+            include: {
+              author: {
+                select: {
+                  id: true,
+                  name: true,
+                  avatar: true,
+                },
+              },
+            },
+          },
+        }),
+        ...(input.include.likes && {
+          likes: {
+            select: {
+              user: {
+                select: {
+                  id: true,
+                  name: true,
+                },
+              },
+            },
+          },
+        }),
+      },
+    });
+
+    return post;
+  });
+```
+
+### 客户端延迟加载
+
+```typescript
+// React 组件
+function PostDetail({ postId }: { postId: string }) {
+  const [showComments, setShowComments] = useState(false);
+
+  // 初始加载：不包含评论
+  const { data: post } = trpc.posts.byId.query({
+    postId,
+    include: {
+      comments: false,
+      likes: true
+    }
+  });
+
+  // 延迟加载评论
+  const { data: commentsData } = trpc.posts.byId.useQuery(
+    {
+      postId,
+      include: {
+        comments: true,
+        likes: false
+      }
+    },
+    {
+      enabled: showComments  // 只在需要时才请求
+    }
+  );
+
+  return (
+    <div>
+      <h1>{post?.title}</h1>
+      <p>{post?.content}</p>
+
+      <button onClick={() => setShowComments(!showComments)}>
+        {showComments ? '隐藏' : '显示'}评论
+      </button>
+
+      {showComments && (
+        <CommentList comments={commentsData?.comments} />
+      )}
+    </div>
+  );
+}
+```
+
+## 缓存策略
+
+### 客户端缓存
+
+```typescript
+import { dehydrate, useQueryClient } from "@tanstack/react-query";
+
+// 设置缓存时间
+const { data } = trpc.posts.list.useQuery(
+  { page: 1, limit: 20 },
+  {
+    staleTime: 1000 * 60 * 5, // 5 分钟内不会重新获取
+    cacheTime: 1000 * 60 * 10, // 缓存保留 10 分钟
+  }
+);
+
+// 预取数据
+const queryClient = useQueryClient();
+
+const prefetchPosts = async () => {
+  await queryClient.prefetchQuery(["posts", "list"], () =>
+    trpc.posts.list.query({ page: 1 })
+  );
+};
+
+// 在组件挂载时预取
+useEffect(() => {
+  prefetchPosts();
+}, []);
+```
+
+### 服务端缓存
+
+```typescript
+import { LRUCache } from "lru-cache";
+
+const cache = new LRUCache<string, any>({
+  max: 500, // 最多缓存 500 个结果
+  ttl: 1000 * 60 * 5, // 5 分钟过期
+});
+
+const getCachedPosts = t.procedure
+  .input(z.object({ page: z.number() }))
+  .query(async ({ input }) => {
+    const cacheKey = `posts:page:${input.page}`;
+
+    // 尝试从缓存获取
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      return cached;
+    }
+
+    // 缓存未命中，查询数据库
+    const posts = await prisma.post.findMany({
+      take: 20,
+      skip: (input.page - 1) * 20,
+    });
+
+    // 写入缓存
+    cache.set(cacheKey, posts);
+
+    return posts;
+  });
+```
+
+### 分布式缓存
+
+```typescript
+// 使用 Redis
+import Redis from "ioredis";
+
+const redis = new Redis({
+  host: process.env.REDIS_HOST,
+  port: 6379,
+});
+
+const getPosts = t.procedure
+  .input(z.object({ page: z.number() }))
+  .query(async ({ input }) => {
+    const cacheKey = `posts:page:${input.page}`;
+
+    // 尝试从 Redis 获取
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return JSON.parse(cached);
+    }
+
+    // 查询数据库
+    const posts = await prisma.post.findMany({
+      take: 20,
+      skip: (input.page - 1) * 20,
+    });
+
+    // 写入 Redis
+    await redis.setex(
+      cacheKey,
+      300, // 5 分钟
+      JSON.stringify(posts)
+    );
+
+    return posts;
+  });
+```
+
+## 批量操作
+
+### 批量查询
+
+```typescript
+// 服务端：批量获取多个资源
+const batchGetPosts = t.procedure
+  .input(
+    z.object({
+      ids: z.array(z.string()).min(1).max(100),
+    })
+  )
+  .query(async ({ input }) => {
+    const posts = await prisma.post.findMany({
+      where: {
+        id: { in: input.ids },
+      },
+    });
+
+    return posts;
+  });
+
+// 客户端：一次调用获取多个文章
+const posts = await client.batchGetPosts.query({
+  ids: ["1", "2", "3", "4", "5"],
+});
+```
+
+### 批量变更
+
+```typescript
+const batchUpdatePosts = t.procedure
+  .input(
+    z.object({
+      updates: z.array(
+        z.object({
+          id: z.string(),
+          title: z.string().optional(),
+          published: z.boolean().optional(),
+        })
+      ),
+    })
+  )
+  .mutation(async ({ input }) => {
+    const results = await Promise.all(
+      input.updates.map((update) =>
+        prisma.post.update({
+          where: { id: update.id },
+          data: update,
+        })
+      )
+    );
+
+    return results;
+  });
+```
+
+## 性能监控
+
+### 查询性能分析
+
+```typescript
+import { performance } from "perf_hooks";
+
+const monitoredProcedure = t.procedure.use(async ({ next }) => {
+  const start = performance.now();
+
+  const result = await next();
+
+  const duration = performance.now() - start;
+
+  // 记录慢查询
+  if (duration > 1000) {
+    console.warn(`Slow query: ${duration}ms`);
+  }
+
+  // 发送到监控服务
+  await sendToMonitoring({
+    type: "query",
+    duration,
+    timestamp: new Date(),
+  });
+
+  return result;
+});
+```
+
+### 数据传输统计
+
+```typescript
+// 记录数据传输大小
+const trackDataTransfer = t.procedure.use(async ({ next }) => {
+  const result = await next();
+
+  const size = JSON.stringify(result).length;
+
+  // 记录大数据传输
+  if (size > 1024 * 100) {
+    // > 100KB
+    console.warn(`Large payload: ${size} bytes`);
+  }
+
+  return result;
+});
+```
+
+## 最佳实践
+
+### 1. 选择性加载
+
+```typescript
+// ✅ 推荐：按需加载字段
+const getUser = t.procedure
+  .input(
+    z.object({
+      fields: z.array(z.string()),
+    })
+  )
+  .query(async ({ input }) => {
+    return {
+      id: true,
+      name: true,
+      email: true,
+      avatar: true,
+    };
+  });
+
+// ❌ 避免：总是返回所有字段
+const getUserBad = t.procedure.query(async () => {
+  return await prisma.user.findMany(); // 返回所有字段
+});
+```
+
+### 2. 分页和游标
+
+```typescript
+// ✅ 使用游标分页
+const getPosts = t.procedure
+  .input(
+    z.object({
+      limit: z.number().max(50),
+      cursor: z.string().optional(),
+    })
+  )
+  .query(async ({ input }) => {
+    return {
+      items: await prisma.post.findMany({
+        take: input.limit + 1,
+        cursor: input.cursor ? { id: input.cursor } : undefined,
+      }),
+      nextCursor:
+        posts.length > input.limit ? posts[posts.length - 1].id : null,
+    };
+  });
+```
+
+### 3. 压缩数据
+
+```typescript
+import { compress, uncompress } from "lz-string";
+
+// 压缩大数据
+const compressedResult = compress(JSON.stringify(largeData));
+
+// 解压缩
+const decompressed = JSON.parse(uncompress(compressedResult));
+```
+
+## 总结
+
+### 核心要点
+
+1. **元数据系统**
+   - 字段选择
+   - 嵌套对象优化
+   - 动态加载
+
+2. **延迟加载**
+   - 按需获取
+   - 条件查询
+   - 客户端控制
+
+3. **缓存策略**
+   - 客户端缓存
+   - 服务端缓存
+   - 分布式缓存
+
+4. **性能优化**
+   - 批量操作
+   - 性能监控
+   - 数据压缩
+
+### 下一步
+
+在下一篇文章中，我们将学习：
+
+- **Monorepo 架构**
+- Turborepo 构建
+- 代码共享和复用
+
+敬请期待！🚀
+
+## 参考资源
+
+- [React Query 缓存](https://tanstack.com/query/latest/docs/react/reference/useQuery)
+- [Redis 缓存策略](https://redis.io/docs/manual/patterns/)
+- [LRU Cache](https://github.com/isaacs/node-lru-cache)
+
+---
+
+**上一章**：[10. 订阅 Subscriptions 深度解析](./10-subscriptions.mdx)
+**下一章**：[12. Monorepo 架构](./12-monorepo.mdx)

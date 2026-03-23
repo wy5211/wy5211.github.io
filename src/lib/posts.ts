@@ -6,6 +6,7 @@ import { ReactElement } from "react";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
 import { dirToCategoryMap, categoryToDirMap } from "./category-map";
+import { getTechStackBySlug } from "./tech-stacks";
 
 const postsDirectory = path.join(process.cwd(), "content/posts");
 
@@ -227,4 +228,47 @@ export function getNextPost(
   }
 
   return null;
+}
+
+// 学习路径步骤类型定义
+export interface LearningPathStep {
+  order: number;
+  title: string;
+  category: string;
+  description: string;
+  estimatedTime: string;
+}
+
+// 根据分类数组获取文章
+export function getPostsByCategories(categories: string[]): PostMeta[] {
+  const allPosts = getAllPosts();
+  return allPosts.filter((post) => categories.includes(post.category));
+}
+
+// 根据技术栈 slug 获取文章（通过关联的分类）
+export function getPostsByTechStack(stackSlug: string): PostMeta[] {
+  const stack = getTechStackBySlug(stackSlug);
+
+  if (!stack || !stack.categories) {
+    return [];
+  }
+
+  return getPostsByCategories(stack.categories);
+}
+
+// 按学习路径获取文章（按学习步骤分组）
+export function getPostsByLearningPath(stackSlug: string): {
+  step: LearningPathStep;
+  posts: PostMeta[];
+}[] {
+  const stack = getTechStackBySlug(stackSlug);
+
+  if (!stack || !stack.learningPath) {
+    return [];
+  }
+
+  return stack.learningPath.map((step: LearningPathStep) => {
+    const posts = getPostsByCategories([step.category]);
+    return { step, posts };
+  });
 }

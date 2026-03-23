@@ -1,0 +1,625 @@
+---
+title: "10 订阅 Subscriptions 深度解析"
+date: "2026-03-23"
+summary: "掌握 tRPC 订阅机制，实现实时数据推送，构建聊天应用、协作编辑等实时功能，深入理解 Observable 模式。"
+tags: ["tRPC", "WebSocket", "订阅", "实时通信", "Observable"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 10
+---
+
+## 前言
+
+实时功能已经成为现代应用的标准配置：聊天通知、协作编辑、股票价格、游戏状态... 这些都需要服务端主动推送数据。
+
+tRPC 的 Subscription 功能让我们可以：
+
+- ✅ 类型安全的实时通信
+- ✅ 与 Query/Mutation 统一的 API
+- ✅ 自动 TypeScript 类型推断
+- ✅ WebSocket 和 SSE 支持
+
+今天，我们将深入学习：
+
+- Subscription 工作原理
+- Observable 模式
+- WebSocket 集成
+- 实时应用实战
+- 性能优化
+
+## 订阅基础
+
+### 什么是 Subscription？
+
+Subscription 是一种**长期运行的查询**，允许服务端主动推送数据更新。
+
+```
+Query：   请求 → 响应（一次性）
+Mutation：请求 → 响应（一次性）
+Subscription：连接 → 持续推送（多次）
+```
+
+### 与 Query/Mutation 的区别
+
+| 特性     | Query           | Mutation        | Subscription    |
+| -------- | --------------- | --------------- | --------------- |
+| **方向** | 客户端 → 服务端 | 客户端 → 服务端 | 服务端 → 客户端 |
+| **返回** | 单次数据        | 单次结果        | 持续数据流      |
+| **协议** | HTTP            | HTTP            | WebSocket/SSE   |
+| **用途** | 读取数据        | 修改数据        | 实时更新        |
+
+## Observable 模式
+
+### 什么是 Observable？
+
+Observable 是一个**可被观察的对象**，可以随时间推移产生多个值。
+
+```typescript
+// Promise vs Observable
+
+// Promise：产生一个值后结束
+const promise = new Promise((resolve) => {
+  setTimeout(() => resolve("single value"), 1000);
+});
+
+// Observable：可以产生多个值
+const observable = new Observable((observer) => {
+  let count = 0;
+  const interval = setInterval(() => {
+    observer.next(`value ${count++}`);
+  }, 1000);
+
+  // 清理函数
+  return () => clearInterval(interval);
+});
+```
+
+### 在 tRPC 中使用 Observable
+
+```typescript
+import { observable } from "@trpc/server/observable";
+import { EventEmitter } from "events";
+
+// 创建事件发射器
+const ee = new EventEmitter();
+
+const onNewUser = t.procedure.subscription(() => {
+  return observable<User>((emit) => {
+    const onNewUser = (user: User) => {
+      emit.next(user);
+    };
+
+    // 监听事件
+    ee.on("newUser", onNewUser);
+
+    // 清理函数
+    return () => {
+      ee.off("newUser", onNewUser);
+    };
+  });
+});
+
+// 触发事件
+ee.emit("newUser", {
+  id: "1",
+  name: "Alice",
+  email: "alice@example.com",
+});
+```
+
+## WebSocket 集成
+
+### 服务端配置
+
+```typescript
+// src/trpc/router.ts
+
+import { initTRPC } from "@trpc/server";
+import { observable } from "@trpc/server/observable";
+import { EventEmitter } from "events";
+
+const ee = new EventEmitter();
+
+const t = initTRPC.create();
+
+export const appRouter = t.router({
+  // ========== 订阅新用户 ==========
+  onNewUser: t.procedure.subscription(() => {
+    return observable<{ id: string; name: string }>((emit) => {
+      const onNewUser = (user: User) => {
+        emit.next(user);
+      };
+
+      ee.on("newUser", onNewUser);
+
+      // 清理函数
+      return () => {
+        ee.off("newUser", onNewUser);
+      };
+    });
+  }),
+
+  // ========== 订阅文章更新 ==========
+  onPostUpdate: t.procedure
+    .input(z.object({ postId: z.string() }))
+    .subscription(({ input }) => {
+      return observable<Post>((emit) => {
+        const handler = (updatedPost: Post) => {
+          if (updatedPost.id === input.postId) {
+            emit.next(updatedPost);
+          }
+        };
+
+        ee.on("post:updated", handler);
+
+        return () => {
+          ee.off("post:updated", handler);
+        };
+      });
+    }),
+});
+```
+
+### 客户端使用（React）
+
+```typescript
+// src/components/UserList.tsx
+
+'use client';
+
+import { trpc } from '@/lib/trpc/client';
+
+export function UserList() {
+  // 使用 useSubscription
+  const [users, setUsers] = useState<User[]>([]);
+
+  trpc.users.onNewUser.useSubscription(undefined, {
+    onData: (user) => {
+      setUsers(prev => [...prev, user]);
+    },
+    onError: (error) => {
+      console.error('Subscription error:', error);
+    }
+  });
+
+  return (
+    <div>
+      <h2>用户列表 ({users.length})</h2>
+      {users.map(user => (
+        <div key={user.id}>{user.name}</div>
+      ))}
+    </div>
+  );
+}
+```
+
+### 客户端使用（Vue）
+
+```vue
+<!-- src/components/UserList.vue -->
+
+<script setup lang="ts">
+import { ref } from "vue";
+import { useSubscription } from "./composables/useSubscription";
+
+const users = ref<User[]>([]);
+
+useSubscription(
+  "users.onNewUser",
+  {},
+  {
+    onData: (user: User) => {
+      users.value.push(user);
+    },
+  }
+);
+</script>
+
+<template>
+  <div>
+    <h2>用户列表 ({{ users.length }})</h2>
+    <div v-for="user in users" :key="user.id">
+      {{ user.name }}
+    </div>
+  </div>
+</template>
+```
+
+## 实战应用：聊天系统
+
+### 服务端实现
+
+```typescript
+// src/trpc/routers/chat.router.ts
+
+import { z } from "zod";
+import { EE } from "../events";
+import { t } from "../index";
+
+interface Message {
+  id: string;
+  content: string;
+  userId: string;
+  userName: string;
+  roomId: string;
+  timestamp: Date;
+}
+
+export const chatRouter = t.router({
+  // ========== 订阅房间消息 ==========
+  onMessage: t.procedure
+    .input(z.object({ roomId: z.string() }))
+    .subscription(({ input }) => {
+      return observable<Message>((emit) => {
+        const handler = (message: Message) => {
+          if (message.roomId === input.roomId) {
+            emit.next(message);
+          }
+        };
+
+        EE.on("message", handler);
+
+        return () => {
+          EE.off("message", handler);
+        };
+      });
+    }),
+
+  // ========== 发送消息 ==========
+  send: t.procedure
+    .input(
+      z.object({
+        roomId: z.string(),
+        content: z.string().min(1).max(1000),
+      })
+    )
+    .mutation(({ input, ctx }) => {
+      const message: Message = {
+        id: crypto.randomUUID(),
+        content: input.content,
+        userId: ctx.user.id,
+        userName: ctx.user.name,
+        roomId: input.roomId,
+        timestamp: new Date(),
+      };
+
+      // 触发事件
+      EE.emit("message", message);
+
+      return message;
+    }),
+
+  // ========== 获取历史消息 ==========
+  history: t.procedure
+    .input(
+      z.object({
+        roomId: z.string(),
+        limit: z.number().min(1).max(100).default(50),
+      })
+    )
+    .query(async ({ input, ctx }) => {
+      const messages = await ctx.prisma.message.findMany({
+        where: { roomId: input.roomId },
+        take: input.limit,
+        orderBy: { timestamp: "desc" },
+      });
+
+      return messages.reverse();
+    }),
+});
+```
+
+### 客户端实现
+
+```typescript
+// src/components/ChatRoom.tsx
+
+'use client';
+
+import { useState } from 'react';
+import { trpc } from '@/lib/trpc/client';
+
+interface ChatRoomProps {
+  roomId: string;
+}
+
+export function ChatRoom({ roomId }: ChatRoomProps) {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [newMessage, setNewMessage] = useState('');
+
+  // 获取历史消息
+  const { data: history } = trpc.chat.history.useQuery(
+    { roomId },
+    {
+      onSuccess: (data) => {
+        setMessages(data);
+      }
+    }
+  );
+
+  // 订阅新消息
+  trpc.chat.onMessage.useSubscription(
+    { roomId },
+    {
+      onData: (message) => {
+        setMessages(prev => [...prev, message]);
+      }
+    }
+  );
+
+  // 发送消息
+  const sendMessage = trpc.chat.send.useMutation();
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newMessage.trim()) return;
+
+    sendMessage.mutate(
+      { roomId, content: newMessage },
+      {
+        onSuccess: () => {
+          setNewMessage('');
+        }
+      }
+    );
+  };
+
+  return (
+    <div className="flex flex-col h-screen">
+      {/* 消息列表 */}
+      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        {messages.map((msg) => (
+          <div
+            key={msg.id}
+            className={`flex ${
+              msg.userId === 'current-user' ? 'justify-end' : 'justify-start'
+            }`}
+          >
+            <div
+              className={`max-w-xs lg:max-w-md px-4 py-2 rounded-lg ${
+                msg.userId === 'current-user'
+                  ? 'bg-blue-600 text-white'
+                  : 'bg-gray-200 text-gray-900'
+              }`}
+            >
+              {msg.userName && (
+                <div className="text-xs font-semibold mb-1">
+                  {msg.userName}
+                </div>
+              )}
+              <div>{msg.content}</div>
+              <div className="text-xs opacity-70 mt-1">
+                {new Date(msg.timestamp).toLocaleTimeString()}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* 输入框 */}
+      <form onSubmit={handleSubmit} className="p-4 border-t">
+        <div className="flex gap-2">
+          <input
+            type="text"
+            value={newMessage}
+            onChange={(e) => setNewMessage(e.target.value)}
+            placeholder="输入消息..."
+            className="flex-1 px-4 py-2 border rounded-lg"
+          />
+          <button
+            type="submit"
+            disabled={sendMessage.isPending}
+            className="px-6 py-2 bg-blue-600 text-white rounded-lg disabled:opacity-50"
+          >
+            {sendMessage.isPending ? '发送中...' : '发送'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+```
+
+## 高级特性
+
+### 1. 过滤和转换
+
+```typescript
+// 只订阅特定类型的更新
+onPostUpdate: t.procedure
+  .input(
+    z.object({
+      postId: z.string(),
+      filter: z.enum(["title", "content", "all"]).default("all"),
+    })
+  )
+  .subscription(({ input }) => {
+    return observable<PostUpdate>((emit) => {
+      const handler = (update: PostUpdate) => {
+        if (update.postId !== input.postId) return;
+
+        // 过滤
+        if (input.filter !== "all" && update.field !== input.filter) {
+          return;
+        }
+
+        emit.next(update);
+      };
+
+      EE.on("post:update", handler);
+
+      return () => EE.off("post:update", handler);
+    });
+  });
+```
+
+### 2. 错误处理
+
+```typescript
+const onDataSubscription = t.procedure.subscription(() => {
+  return observable((emit) => {
+    let aborted = false;
+
+    const fetchData = async () => {
+      try {
+        const data = await fetchFromAPI();
+        if (!aborted) {
+          emit.next(data);
+        }
+      } catch (error) {
+        if (!aborted) {
+          emit.error(error);
+        }
+      }
+    };
+
+    const interval = setInterval(fetchData, 5000);
+
+    return () => {
+      aborted = true;
+      clearInterval(interval);
+    };
+  });
+});
+```
+
+### 3. 重连机制
+
+```typescript
+// 客户端：自动重连
+function useSubscriptionWithAutoReconnect<T>(
+  subscription: () => void,
+  options: {
+    maxRetries?: number;
+    retryDelay?: number;
+  } = {}
+) {
+  const { maxRetries = 5, retryDelay = 1000 } = options;
+  const retryCount = useRef(0);
+
+  useEffect(() => {
+    let currentSubscription: (() => void) | null = null;
+
+    const connect = () => {
+      currentSubscription = subscription();
+
+      // 监听错误并重连
+      if (retryCount.current < maxRetries) {
+        setTimeout(() => {
+          retryCount.current++;
+          connect();
+        }, retryDelay);
+      }
+    };
+
+    connect();
+
+    return () => {
+      if (currentSubscription) {
+        currentSubscription();
+      }
+    };
+  }, []);
+}
+```
+
+## 性能优化
+
+### 1. 节流和防抖
+
+```typescript
+import { throttle } from "lodash";
+
+const throttledEmit = throttle((data) => {
+  ee.emit("update", data);
+}, 1000);
+
+// 在高频更新时使用
+for (const item of largeDataset) {
+  throttledEmit(item);
+}
+```
+
+### 2. 批量发送
+
+```typescript
+const messageBuffer: Message[] = [];
+
+setInterval(() => {
+  if (messageBuffer.length > 0) {
+    ee.emit("messages", messageBuffer.splice(0, 100));
+  }
+}, 100);
+```
+
+### 3. 连接池管理
+
+```typescript
+class ConnectionPool {
+  private connections = new Map<string, WebSocket>();
+  private maxConnections = 1000;
+
+  add(id: string, ws: WebSocket) {
+    if (this.connections.size >= this.maxConnections) {
+      throw new Error("Max connections reached");
+    }
+    this.connections.set(id, ws);
+  }
+
+  remove(id: string) {
+    this.connections.delete(id);
+  }
+
+  broadcast(data: any) {
+    for (const ws of this.connections.values()) {
+      ws.send(JSON.stringify(data));
+    }
+  }
+}
+```
+
+## 总结
+
+### 核心要点
+
+1. **Subscription 基础**
+   - 长期运行的查询
+   - 服务端推送
+   - Observable 模式
+
+2. **WebSocket 集成**
+   - 实时通信
+   - 事件驱动
+   - 类型安全
+
+3. **实战应用**
+   - 聊天系统
+   - 协作编辑
+   - 实时通知
+
+4. **性能优化**
+   - 节流防抖
+   - 批量发送
+   - 连接池管理
+
+### 下一步
+
+在下一篇文章中，我们将学习：
+
+- **元数据与负载优化**
+- 懒加载策略
+- 缓存最佳实践
+
+敬请期待！🚀
+
+## 参考资源
+
+- [tRPC Subscriptions 文档](https://trpc.io/docs/subscriptions)
+- [RxJS Observable](https://rxjs.dev/)
+- [WebSocket MDN](https://developer.mozilla.org/en-US/docs/Web/API/WebSocket)
+
+---
+
+**上一章**：[09. Hono + tRPC 轻量级边缘计算](./09-hono-integration.mdx)
+**下一章**：[11. 元数据与负载优化](./11-metadata-optimization.mdx)
