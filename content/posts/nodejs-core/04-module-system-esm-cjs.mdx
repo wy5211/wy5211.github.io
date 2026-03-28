@@ -1,0 +1,1015 @@
+---
+title: "04 Node.js 模块系统：CommonJS 与 ESM 互操作"
+date: "2026-03-31"
+summary: "深入理解 Node.js 模块系统，掌握 CommonJS 的 require 缓存机制、ESM 的 import 异步加载、条件导出、双包最佳实践"
+tags: ["Node.js", "模块系统", "CommonJS", "ESM"]
+category: "nodejs-core"
+cover: ""
+draft: false
+series: "Node.js 核心概念深度解析"
+seriesOrder: 4
+---
+
+## 剿言
+
+在 Node.js 后端开发中，**模块系统**是代码组织的基础。前端开发者习惯了 Webpack/Vite 自动处理模块，但在 Node.js 中，你需要直接面对 `require()`、`import`、`__dirname`、`__filename` 等概念。更复杂的是，Node.js 同时支持 **CommonJS（CJS）** 和 **ES Modules（ESM）** 两种模块系统，它们之间的互操作性是很多开发者的痛点。
+
+**本文将解决什么问题？**
+
+你可能想知道：
+
+- CommonJS 和 ESM 有什么区别？
+- `require()` 的缓存机制是怎样的？
+- `__dirname` 和 `__filename` 在 ESM 中如何使用？
+- 什么是条件导出（Conditional Exports）？
+- 如何构建支持 CJS/ESM 的双包库？
+- 如何解决循环依赖？
+
+**本文将带你：**
+
+1. 理解 CommonJS 和 ESM 的核心差异
+2. 掌握 `require()` 的缓存机制
+3. 学习 ESM 的 `import()` 异步加载
+4. 实战：条件导出、双包库、循环依赖解决
+
+---
+
+## 一、模块系统概览
+
+### 1.1 两种模块系统
+
+**CommonJS（CJS）**：
+
+```javascript
+// 导出
+module.exports = {
+  foo: "bar",
+};
+
+// 或
+exports.baz = "qux";
+
+// 导入
+const module = require("./module");
+const { foo } = require("./module");
+```
+
+**ES Modules（ESM）**：
+
+```javascript
+// 导出
+export const foo = "bar";
+export default { baz: "qux" };
+
+// 导入
+import module from "./module.js";
+import { foo } from "./module.js";
+```
+
+### 1.2 关键差异
+
+| 特性            | CommonJS                       | ES Modules            |
+| --------------- | ------------------------------ | --------------------- |
+| **语法**        | `require()` / `module.exports` | `import` / `export`   |
+| **加载**        | 同步运行时加载                 | 异步编译时加载        |
+| **缓存**        | `require.cache` 可编程操作     | 缓存不可直接操作      |
+| **顶层 this**   | 指向模块导出对象               | `undefined`           |
+| **动态导入**    | `require()` 动态               | `import()` 动态       |
+| **\_\_dirname** | 支持                           | 不支持（需自行计算）  |
+| **文件扩展名**  | 可选（.js）                    | 必须带（.js 或 .mjs） |
+
+### 1.3 与前端 JS 的对比
+
+**前端（Webpack/Vite）**：
+
+```javascript
+// 前端开发者写的是 ESM
+import { foo } from "./module";
+
+// Webpack/Vite 自动处理：
+// 1. 解析模块路径
+// 2. 打包到 bundle
+// 3. 运行时执行
+// 开发者不需要关心 require 缓存、__dirname 等
+```
+
+**Node.js 后端**：
+
+```javascript
+// Node.js 原生模块系统
+// 1. require 缓存可直接操作
+// 2. __dirname、__filename 需要理解
+// 3. 循环依赖需要手动处理
+// 4. CJS/ESM 互操作需要注意
+```
+
+---
+
+## 二、CommonJS 深度解析
+
+### 2.1 require() 的执行流程
+
+**步骤**：
+
+1. **解析路径** - 找到模块文件
+2. **检查缓存** - 如果已加载，直接返回缓存
+3. **编译模块** - 包装为函数
+4. **执行模块** - 运行模块代码
+5. **缓存导出** - 将 `module.exports` 存入缓存
+6. **返回导出** - 返回 `module.exports`
+
+```javascript
+// 伪代码：require 的实现
+function require(path) {
+  // 1. 解析路径
+  const filename = resolvePath(path);
+
+  // 2. 检查缓存
+  if (require.cache[filename]) {
+    return require.cache[filename].exports;
+  }
+
+  // 3. 创建模块对象
+  const module = {
+    id: filename,
+    filename: filename,
+    exports: {},
+    loaded: false,
+    children: [],
+    paths: [], // 搜索路径
+  };
+
+  // 4. 存入缓存
+  require.cache[filename] = module;
+
+  // 5. 编译模块（包装为函数）
+  const wrapper = Function(
+    "exports",
+    "require",
+    "module",
+    "__filename",
+    "__dirname",
+    fs.readFileSync(filename, "utf8")
+  );
+
+  // 6. 执行模块
+  wrapper.call(
+    module.exports,
+    module.exports,
+    require,
+    module,
+    filename,
+    path.dirname(filename)
+  );
+
+  // 7. 标记已加载
+  module.loaded = true;
+
+  // 8. 返回导出
+  return module.exports;
+}
+```
+
+### 2.2 模块包装
+
+**CommonJS 模块被包装为函数**：
+
+```javascript
+// 原始代码：math.js
+const add = (a, b) => a + b;
+module.exports = { add };
+
+// 包装后（实际执行）：
+(function (exports, require, module, __filename, __dirname) {
+  const add = (a, b) => a + b;
+  module.exports = { add };
+})(module.exports, require, module, "path/to/math.js", "path/to");
+```
+
+**关键点**：
+
+- 每个模块有独立的**作用域**
+- `exports` 是 `module.exports` 的引用
+- 修改 `exports` 不会影响 `module.exports`
+
+### 2.3 require 缓存机制
+
+**缓存原理**：
+
+```javascript
+// 第一次 require
+const mod1 = require("./math");
+console.log(mod1 === require("./math")); // true
+
+// 缓存可操作
+delete require.cache[require.resolve("./math")];
+
+const mod2 = require("./math"); // 重新加载
+console.log(mod1 === mod2); // false
+```
+
+**清空缓存**：
+
+```javascript
+// 清空所有缓存
+Object.keys(require.cache).forEach((key) => {
+  delete require.cache[key];
+});
+
+// 清空特定模块
+delete require.cache[require.resolve("./module")];
+```
+
+### 2.4 module.exports vs exports
+
+**常见错误**：
+
+```javascript
+// ❌ 错误
+exports = {
+  foo: "bar",
+};
+// exports 是 module.exports 的引用
+// 重新赋值 exports 不会影响 module.exports
+
+// ✅ 正确
+module.exports = {
+  foo: "bar",
+};
+
+// ✅ 正确
+exports.foo = "bar";
+// 相当于 module.exports.foo = 'bar';
+```
+
+**最佳实践**：
+
+```javascript
+// 方式 1：直接赋值 module.exports
+module.exports = {
+  foo: "bar",
+};
+
+// 方式 2：添加属性到 exports
+exports.foo = "bar";
+exports.baz = "qux";
+
+// 不要混用
+// ❌ 错误
+exports.foo = "bar";
+module.exports = { baz: "qux" }; // foo 丢失
+```
+
+### 2.5 模块搜索路径
+
+**查找顺序**：
+
+```javascript
+require("./module");
+
+// 1. 按文件名查找
+// - ./module.js
+// - ./module.json
+// - ./module.node
+
+// 2. 按目录查找
+// - ./module/package.json (main 字段)
+// - ./module/index.js
+
+// 3. node_modules 查找
+// - ./node_modules/module
+// - ../node_modules/module
+// - ...直到根目录
+```
+
+---
+
+## 三、ES Modules（ESM）深度解析
+
+### 3.1 启用 ESM
+
+**方式 1：使用 .mjs 扩展名**
+
+```javascript
+// math.mjs
+export const add = (a, b) => a + b;
+
+// main.mjs
+import { add } from "./math.mjs";
+console.log(add(1, 2));
+```
+
+**方式 2：package.json 设置 type**
+
+```json
+{
+  "type": "module"
+}
+```
+
+```javascript
+// math.js（.js 也被视为 ESM）
+export const add = (a, b) => a + b;
+
+// main.js
+import { add } from "./math.js"; // 必须带 .js
+```
+
+### 3.2 ESM 的关键特性
+
+**1. 静态分析**：
+
+```javascript
+// ❌ 错误：不能动态导入
+if (condition) {
+  import { foo } from "./module"; // SyntaxError
+}
+
+// ✅ 正确：使用 import() 动态导入
+if (condition) {
+  const { foo } = await import("./module.js");
+}
+```
+
+**2. 只读绑定**：
+
+```javascript
+// counter.js
+export let count = 0;
+export const increment = () => count++;
+
+// main.js
+import { count, increment } from "./counter.js";
+console.log(count); // 0
+increment();
+console.log(count); // 1（值被更新）
+```
+
+**3. 顶层 await**：
+
+```javascript
+// config.js
+export const config = await fetch("/api/config").then((r) => r.json());
+
+// main.js
+import { config } from "./config.js";
+console.log(config); // 直接使用，已经是对象
+```
+
+### 3.3 **dirname 和 **filename 的替代
+
+**问题**：ESM 不支持 `__dirname` 和 `__filename`
+
+**解决方案**：
+
+```javascript
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+console.log(__filename); // /path/to/file.js
+console.log(__dirname); // /path/to
+```
+
+### 3.4 动态导入（import()）
+
+**语法**：
+
+```javascript
+// 动态导入（返回 Promise）
+const module = await import("./math.js");
+const { add } = module;
+console.log(add(1, 2));
+```
+
+**使用场景**：
+
+```javascript
+// 1. 按需加载
+async function loadData() {
+  if (needHeavyLib) {
+    const heavyLib = await import("./heavy-lib.js");
+    return heavyLib.process(data);
+  }
+}
+
+// 2. 条件加载
+const isDev = process.env.NODE_ENV === "development";
+if (isDev) {
+  const devTools = await import("./dev-tools.js");
+  devTools.init();
+}
+
+// 3. 懒加载路由
+const routes = {
+  home: () => import("./routes/home.js"),
+  about: () => import("./routes/about.js"),
+  contact: () => import("./routes/contact.js"),
+};
+
+app.get("/:page", async (req, res) => {
+  const page = req.params.page;
+  const route = await routes[page]();
+  route.default(req, res);
+});
+```
+
+---
+
+## 四、CommonJS 与 ESM 互操作
+
+### 4.1 CJS 导入 ESM
+
+**问题**：CommonJS 不能直接 `import` ESM
+
+```javascript
+// ❌ 错误
+// math.js (ESM)
+export const add = (a, b) => a + b;
+
+// main.cjs (CJS)
+import { add } from "./math.js"; // SyntaxError
+```
+
+**解决方案**：使用动态 `import()`
+
+```javascript
+// ✅ 正确
+// main.cjs
+async function main() {
+  const { add } = await import("./math.js");
+  console.log(add(1, 2));
+}
+
+main();
+```
+
+### 4.2 ESM 导入 CJS
+
+**ESM 可以导入 CJS**：
+
+```javascript
+// math.cjs
+module.exports = {
+  add: (a, b) => a + b,
+};
+
+// main.mjs
+import math from "./math.cjs";
+console.log(math.add(1, 2));
+
+// 或（默认导入 + 命名导入）
+import { default as math } from "./math.cjs";
+```
+
+**注意**：CJS 的命名导出在 ESM 中不可用
+
+```javascript
+// utils.cjs
+exports.foo = "bar";
+exports.baz = "qux";
+
+// main.mjs
+// ❌ 不能导入命名导出
+import { foo } from "./utils.cjs"; // SyntaxError
+
+// ✅ 只能导入默认
+import utils from "./utils.cjs";
+console.log(utils.foo); // 'bar'
+```
+
+### 4.3 双包（Dual Package）最佳实践
+
+**问题**：如何让库同时支持 CJS 和 ESM？
+
+**方案 1：条件导出（Conditional Exports）**
+
+```json
+// package.json
+{
+  "name": "my-lib",
+  "version": "1.0.0",
+  "type": "module",
+  "exports": {
+    "import": "./dist/index.js",
+    "require": "./dist/index.cjs",
+    "types": "./dist/index.d.ts"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js"
+}
+```
+
+**目录结构**：
+
+```
+my-lib/
+├── src/
+│   └── index.ts
+├── dist/
+│   ├── index.js    (ESM)
+│   ├── index.cjs   (CJS)
+│   └── index.d.ts  (TypeScript)
+└── package.json
+```
+
+**构建配置**：
+
+```javascript
+// tsconfig.json
+{
+  "compilerOptions": {
+    "outDir": "./dist",
+    "module": "ESNext",
+    "moduleResolution": "node"
+  }
+}
+
+// 构建脚本
+// package.json
+{
+  "scripts": {
+    "build": "tsc && rollup -c"
+  }
+}
+```
+
+**方案 2：使用 transpiled 源码**
+
+```javascript
+// src/index.js (ESM)
+export const foo = "bar";
+
+// 构建后
+// dist/index.js (ESM)
+export const foo = "bar";
+
+// dist/index.cjs (CJS)
+("use strict");
+Object.defineProperty(exports, "__esModule", { value: true });
+exports.foo = "bar";
+```
+
+### 4.4 条件导出（Conditional Exports）
+
+**基本用法**：
+
+```json
+// package.json
+{
+  "exports": {
+    "import": "./dist/index.js",
+    "require": "./dist/index.cjs",
+    "default": "./dist/index.js"
+  }
+}
+```
+
+**条件导出（按环境）**：
+
+```json
+{
+  "exports": {
+    ".": {
+      "node": "./dist/node.js",
+      "browser": "./dist/browser.js",
+      "default": "./dist/index.js"
+    },
+    "./foo": {
+      "import": "./dist/foo.js",
+      "require": "./dist/foo.cjs"
+    }
+  }
+}
+```
+
+**使用**：
+
+```javascript
+// Node.js
+import lib from "my-lib"; // 加载 dist/node.js
+
+// 浏览器
+import lib from "my-lib"; // 加载 dist/browser.js
+
+// 子路径
+import foo from "my-lib/foo"; // 加载 dist/foo.js 或 foo.cjs
+```
+
+---
+
+## 五、循环依赖
+
+### 5.1 什么是循环依赖？
+
+**定义**：模块 A 依赖 B，B 又依赖 A
+
+```javascript
+// a.js
+const b = require("./b");
+module.exports = { a: "A" };
+
+// b.js
+const a = require("./a");
+module.exports = { b: "B" };
+```
+
+### 5.2 CommonJS 循环依赖
+
+**问题**：模块可能未完全加载
+
+```javascript
+// a.js
+const b = require("./b");
+console.log("a.js:", b);
+module.exports = { a: "A" };
+
+// b.js
+const a = require("./a");
+console.log("b.js:", a);
+module.exports = { b: "B" };
+
+// 执行顺序：
+// b.js: {}（a 未完全加载）
+// a.js: { b: 'B' }
+```
+
+**解决方案**：
+
+```javascript
+// 方式 1：延迟导入
+// a.js
+module.exports = { a: "A" };
+const b = require("./b");
+
+// 方式 2：使用函数
+// a.js
+const b = require("./b");
+module.exports = {
+  a: "A",
+  getB: () => b,
+};
+
+// b.js
+const a = require("./a");
+module.exports = {
+  b: "B",
+  getA: () => a,
+};
+```
+
+### 5.3 ESM 循环依赖
+
+**ESM 处理循环依赖更好**：
+
+```javascript
+// a.js
+import { b } from "./b.js";
+export const a = "A";
+
+// b.js
+import { a } from "./b.js";
+export const b = "B";
+
+// ✅ ESM 的绑定是实时的
+// 即使循环依赖，值也能正确获取
+```
+
+**最佳实践**：
+
+```javascript
+// 避免循环依赖
+// 1. 重构代码结构
+// 2. 使用依赖注入
+// 3. 提取共享模块到第三个文件
+```
+
+---
+
+## 六、实战案例
+
+### 6.1 构建支持 CJS/ESM 的双包库
+
+**项目结构**：
+
+```
+my-lib/
+├── src/
+│   ├── index.ts
+│   └── utils.ts
+├── dist/
+│   ├── index.js
+│   ├── index.cjs
+│   ├── index.d.ts
+│   ├── utils.js
+│   ├── utils.cjs
+│   └── utils.d.ts
+├── package.json
+├── tsconfig.json
+└── rollup.config.js
+```
+
+**package.json**：
+
+```json
+{
+  "name": "my-lib",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs",
+      "types": "./dist/index.d.ts"
+    },
+    "./utils": {
+      "import": "./dist/utils.js",
+      "require": "./dist/utils.cjs",
+      "types": "./dist/utils.d.ts"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc && rollup -c",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "rollup": "^3.0.0",
+    "typescript": "^5.0.0"
+  }
+}
+```
+
+**tsconfig.json**：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "declaration": true,
+    "outDir": "./dist",
+    "rootDir": "./src",
+    "strict": true
+  },
+  "include": ["src"]
+}
+```
+
+**rollup.config.js**：
+
+```javascript
+import { terser } from "rollup-plugin-terser";
+
+export default [
+  // ESM build
+  {
+    input: "src/index.ts",
+    output: {
+      file: "dist/index.js",
+      format: "es",
+    },
+    plugins: [terser()],
+  },
+  // CJS build
+  {
+    input: "src/index.ts",
+    output: {
+      file: "dist/index.cjs",
+      format: "cjs",
+      exports: "auto",
+    },
+    plugins: [terser()],
+  },
+];
+```
+
+**使用**：
+
+```javascript
+// ESM 项目
+import { foo } from "my-lib";
+
+// CJS 项目
+const { foo } = require("my-lib");
+```
+
+### 6.2 条件导出实战
+
+```json
+// package.json
+{
+  "name": "universal-lib",
+  "exports": {
+    ".": {
+      "node": {
+        "import": "./dist/node.js",
+        "require": "./dist/node.cjs"
+      },
+      "browser": {
+        "import": "./dist/browser.js",
+        "require": "./dist/browser.cjs"
+      },
+      "default": "./dist/index.js"
+    },
+    "./react": {
+      "node": "./dist/react-node.js",
+      "browser": "./dist/react-browser.js"
+    }
+  }
+}
+```
+
+**使用**：
+
+```javascript
+// Node.js ESM
+import lib from "universal-lib"; // dist/node.js
+
+// Node.js CJS
+const lib = require("universal-lib"); // dist/node.cjs
+
+// 浏览器 ESM
+import lib from "universal-lib"; // dist/browser.js
+
+// React 集成
+import ReactComponent from "universal-lib/react";
+```
+
+### 6.3 模块热重载
+
+```javascript
+// watch.js
+const chokidar = require("chokidar");
+
+// 监听文件变化
+const watcher = chokidar.watch("./src/**/*.js", {
+  persistent: true,
+});
+
+watcher.on("change", (path) => {
+  console.log(`File ${path} changed`);
+
+  // 清除缓存
+  delete require.cache[require.resolve(path)];
+
+  // 重新加载
+  require(path);
+});
+
+// HMR for ESM (需要构建工具)
+// Vite、Webpack 自动处理
+```
+
+### 6.4 诊断模块问题
+
+```javascript
+// 检查模块缓存
+function checkModuleCache(moduleId) {
+  const resolved = require.resolve(moduleId);
+  const cached = require.cache[resolved];
+
+  if (cached) {
+    console.log("Module info:", {
+      id: cached.id,
+      loaded: cached.loaded,
+      filename: cached.filename,
+      children: cached.children.map((c) => c.id),
+      exports: cached.exports,
+    });
+  } else {
+    console.log("Module not cached:", moduleId);
+  }
+}
+
+checkModuleCache("./math.js");
+
+// 列出所有缓存的模块
+function listCachedModules() {
+  Object.keys(require.cache).forEach((key) => {
+    console.log(key);
+  });
+}
+```
+
+---
+
+## 七、常见问题
+
+### Q1: 为什么 ESM 必须带文件扩展名？
+
+**A**: ESM 规范要求明确的文件扩展名：
+
+```javascript
+// ❌ 错误
+import { foo } from "./module";
+
+// ✅ 正确
+import { foo } from "./module.js";
+```
+
+**原因**：
+
+- 浏览器需要明确知道资源类型
+- 避免歧义（`module` 可能是文件或目录）
+- 性能优化（不需要尝试多个扩展名）
+
+### Q2: 什么时候使用 CJS 或 ESM？
+
+**A**:
+
+**使用 CJS**：
+
+```javascript
+// 1. 遗留项目
+// 2. 需要同步加载
+// 3. 兼容旧工具
+```
+
+**使用 ESM**：
+
+```javascript
+// 1. 新项目
+// 2. 需要树摇（tree-shaking）
+// 3. 顶层 await
+// 4. 动态导入
+```
+
+### Q3: 如何在 ESM 中使用 \_\_dirname？
+
+**A**: 使用 `import.meta.url`：
+
+```javascript
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+```
+
+### Q4: 能否在 CJS 中使用 import()？
+
+**A**: 可以：
+
+```javascript
+// main.cjs
+async function loadModule() {
+  const module = await import("./math.mjs");
+  return module.add(1, 2);
+}
+
+loadModule().then(console.log);
+```
+
+---
+
+## 八、总结
+
+**本文我们完成了**：
+
+✅ 理解了 CommonJS 和 ESM 的核心差异
+✅ 掌握了 `require()` 的缓存机制
+✅ 学习了 ESM 的 `import()` 异步加载
+✅ 实战：条件导出、双包库、循环依赖解决
+
+**核心要点回顾**：
+
+1. **CJS vs ESM** - CJS 同步运行时，ESM 异步编译时
+2. **require 缓存** - 可操作，需要时手动清空
+3. **ESM 特性** - 静态分析、只读绑定、顶层 await
+4. **互操作** - CJS 用 `import()` 加 ESM，ESM 可直接加载 CJS
+5. **双包** - 使用条件导出同时支持 CJS/ESM
+
+**最佳实践**：
+
+- ✅ 新项目优先使用 ESM
+- ✅ 避免循环依赖
+- ✅ ESM 文件扩展名必须带 `.js`
+- ✅ 使用条件导出构建双包库
+- ✅ 理解 `module.exports` 和 `exports` 的区别
+
+**下一步**：
+
+在下一篇文章《文件系统深度实战》中，我们将深入学习：
+
+- fs.promises vs fs.callback vs fs.sync
+- 文件描述符（fd）与内存映射
+- watch()/watchFile() 文件监听机制
+- path 模块跨平台路径处理
+- 实战：日志轮转、配置热更新、文件夹遍历
+
+---
+
+**相关代码**：
+
+- 完整示例：[nodejs-core-examples](https://github.com/your-repo/nodejs-core-examples)
+- Node.js 模块文档：[nodejs.org/api/modules.html](https://nodejs.org/api/modules.html)
+
+**有问题？** 欢迎在评论区留言，我会尽快回复！

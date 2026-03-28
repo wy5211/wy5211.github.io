@@ -1,0 +1,366 @@
+---
+title: "06 Node.js 进程管理：从子进程到进程池"
+date: "2026-04-02"
+summary: "深入掌握 Node.js 的进程管理，理解 spawn/exec/fork 的区别，掌握管道通信、进程池设计、信号处理等实战技能"
+tags: ["Node.js", "进程管理", "子进程", "进程池"]
+category: "nodejs-core"
+cover: ""
+draft: false
+series: "Node.js 核心概念深度解析"
+seriesOrder: 6
+---
+
+## 前言
+
+在 Node.js 后端开发中，**进程管理**是高级技能。虽然 Node.js 是单线程的，但可以创建子进程来执行其他程序、处理 CPU 密集任务、实现多进程并行。理解进程管理对于构建高性能应用、处理复杂任务至关重要。
+
+**本文将解决什么问题？**
+
+你可能想知道：
+
+- `spawn()`、`exec()`、`execFile()`、`fork()` 有什么区别？
+- 如何与子进程通信？
+- 如何实现进程池？
+- 如何处理进程信号和优雅关闭？
+- 如何调用 FFmpeg 等外部程序？
+
+**本文将带你：**
+
+1. 理解四种创建子进程的方式
+2. 掌握进程间通信机制
+3. 学习进程池设计与实现
+4. 实战：调用 FFmpeg、执行 Shell 脚本、实现进程池
+
+---
+
+## 一、子进程创建方式
+
+### 1.1 四种方式对比
+
+| 方法         | 特点                  | 适用场景                     |
+| ------------ | --------------------- | ---------------------------- |
+| `spawn()`    | 异步，返回流          | 长时间运行的进程、大数据输出 |
+| `exec()`     | 同步，返回缓冲区      | 短时间运行、小数据输出       |
+| `execFile()` | 直接执行文件          | 不需要 shell 的场景          |
+| `fork()`     | 专门用于 Node.js 进程 | Node.js 进程间通信           |
+
+### 1.2 spawn() - 流式输出
+
+```javascript
+const { spawn } = require("child_process");
+
+// 执行命令
+const ls = spawn("ls", ["-lh", "/usr"]);
+
+// 监听输出
+ls.stdout.on("data", (data) => {
+  console.log(`stdout: ${data}`);
+});
+
+ls.stderr.on("data", (data) => {
+  console.error(`stderr: ${data}`);
+});
+
+ls.on("close", (code) => {
+  console.log(`child process exited with code ${code}`);
+});
+```
+
+### 1.3 exec() - 缓冲输出
+
+```javascript
+const { exec } = require("child_process");
+
+// 执行命令（使用 shell）
+exec("ls -lh /usr", (error, stdout, stderr) => {
+  if (error) {
+    console.error(`exec error: ${error}`);
+    return;
+  }
+
+  console.log(`stdout: ${stdout}`);
+  console.error(`stderr: ${stderr}`);
+});
+```
+
+### 1.4 execFile() - 直接执行
+
+```javascript
+const { execFile } = require("child_process");
+
+// 直接执行文件（不使用 shell）
+execFile("node", ["--version"], (error, stdout, stderr) => {
+  if (error) {
+    console.error(`execFile error: ${error}`);
+    return;
+  }
+
+  console.log(`stdout: ${stdout}`);
+});
+```
+
+### 1.5 fork() - Node.js 进程通信
+
+```javascript
+// parent.js
+const { fork } = require("child_process");
+
+const child = fork("./child.js");
+
+child.on("message", (message) => {
+  console.log("Parent received:", message);
+});
+
+child.send({ hello: "parent" });
+
+// child.js
+process.on("message", (message) => {
+  console.log("Child received:", message);
+  process.send({ hello: "child" });
+});
+```
+
+---
+
+## 二、进程间通信
+
+### 2.1 标准输入/输出通信
+
+```javascript
+const { spawn } = require("child_process");
+
+const grep = spawn("grep", ["ssh"]);
+
+grep.stdin.write("ssh connection\n");
+grep.stdin.write("ssh protocol\n");
+grep.stdin.end();
+
+grep.stdout.on("data", (data) => {
+  console.log(`stdout: ${data}`);
+});
+
+grep.on("close", (code) => {
+  console.log(`child process exited with code ${code}`);
+});
+```
+
+### 2.2 消息传递（IPC）
+
+```javascript
+// parent.js
+const { fork } = require("child_process");
+
+const child = fork("./child.js");
+
+child.send({ type: "ping", data: "hello" });
+
+child.on("message", (message) => {
+  console.log("Received:", message);
+});
+
+// child.js
+process.on("message", (message) => {
+  console.log("Received:", message);
+
+  if (message.type === "ping") {
+    process.send({ type: "pong", data: "world" });
+  }
+});
+```
+
+### 2.3 管道通信
+
+```javascript
+const { spawn } = require("child_process");
+
+// 创建管道：ls | grep ssh
+const ls = spawn("ls", ["-lh", "/usr"]);
+const grep = spawn("grep", ["ssh"]);
+
+ls.stdout.pipe(grep.stdin);
+
+grep.stdout.on("data", (data) => {
+  console.log(`grep output: ${data}`);
+});
+
+ls.on("close", (code) => {
+  console.log(`ls process exited with code ${code}`);
+});
+
+grep.on("close", (code) => {
+  console.log(`grep process exited with code ${code}`);
+});
+```
+
+---
+
+## 三、实战案例
+
+### 3.1 调用 FFmpeg 处理视频
+
+```javascript
+const { spawn } = require("child_process");
+
+function convertVideo(input, output, callback) {
+  const ffmpeg = spawn("ffmpeg", [
+    "-i",
+    input,
+    "-c:v",
+    "libx264",
+    "-c:a",
+    "aac",
+    "-strict",
+    "experimental",
+    "-b:a",
+    "192k",
+    output,
+  ]);
+
+  ffmpeg.stderr.on("data", (data) => {
+    console.log(`FFmpeg log: ${data}`);
+  });
+
+  ffmpeg.on("close", (code) => {
+    if (code === 0) {
+      callback(null, output);
+    } else {
+      callback(new Error(`FFmpeg exited with code ${code}`));
+    }
+  });
+}
+
+convertVideo("input.avi", "output.mp4", (err, output) => {
+  if (err) {
+    console.error("Error:", err);
+    return;
+  }
+
+  console.log("Video converted:", output);
+});
+```
+
+### 3.2 执行 Shell 脚本
+
+```javascript
+const { exec } = require("child_process");
+
+exec("bash deploy.sh", (error, stdout, stderr) => {
+  if (error) {
+    console.error(`exec error: ${error}`);
+    return;
+  }
+
+  console.log(`stdout: ${stdout}`);
+  console.error(`stderr: ${stderr}`);
+});
+```
+
+### 3.3 进程池实现
+
+```javascript
+const { fork } = require("child_process");
+const os = require("os");
+
+class ProcessPool {
+  constructor(scriptPath, size = os.cpus().length) {
+    this.scriptPath = scriptPath;
+    this.size = size;
+    this.pool = [];
+    this.queue = [];
+
+    this.init();
+  }
+
+  init() {
+    for (let i = 0; i < this.size; i++) {
+      const worker = fork(this.scriptPath);
+
+      worker.on("message", (message) => {
+        const callback = worker.currentTask;
+
+        if (callback) {
+          callback(null, message);
+          worker.currentTask = null;
+        }
+
+        this.nextTask(worker);
+      });
+
+      this.pool.push(worker);
+    }
+  }
+
+  run(data, callback) {
+    const worker = this.pool.find((w) => !w.currentTask);
+
+    if (worker) {
+      worker.currentTask = callback;
+      worker.send(data);
+    } else {
+      this.queue.push({ data, callback });
+    }
+  }
+
+  nextTask(worker) {
+    if (this.queue.length > 0) {
+      const { data, callback } = this.queue.shift();
+      worker.currentTask = callback;
+      worker.send(data);
+    }
+  }
+}
+
+// 使用
+const pool = new ProcessPool("./worker.js");
+
+for (let i = 0; i < 100; i++) {
+  pool.run({ task: i }, (err, result) => {
+    console.log(`Task ${i} completed:`, result);
+  });
+}
+```
+
+---
+
+## 四、常见问题
+
+### Q1: spawn vs exec？
+
+**A**:
+
+- `spawn()`：流式输出，适合长时间运行
+- `exec()`：缓冲输出，适合短时间运行
+
+### Q2: 如何处理进程退出？
+
+**A**:
+
+```javascript
+const { spawn } = require("child_process");
+
+const child = spawn("node", ["script.js"]);
+
+child.on("exit", (code, signal) => {
+  console.log(`Process exited with code ${code}, signal ${signal}`);
+});
+```
+
+---
+
+## 五、总结
+
+**核心要点**：
+
+1. **四种方式** - spawn（流）、exec（缓冲）、execFile（直接）、fork（Node.js）
+2. **进程通信** - stdin/stdout、消息传递、管道
+3. **进程池** - 并行处理任务，提高性能
+
+**下一步**：Worker Threads 多线程编程
+
+---
+
+**相关代码**：
+
+- 完整示例：[nodejs-core-examples](https://github.com/your-repo/nodejs-core-examples)
+
+**有问题？** 欢迎在评论区留言！

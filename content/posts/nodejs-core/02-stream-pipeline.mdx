@@ -1,0 +1,1057 @@
+---
+title: "02 Node.js Stream：流式处理深度实战"
+date: "2026-03-29"
+summary: "深入理解 Node.js Stream 的四种类型、背压处理机制、pipe 与 pipeline 的区别，掌握大文件处理和数据管道构建技巧"
+tags: ["Node.js", "Stream", "流式处理", "背压"]
+category: "nodejs-core"
+cover: ""
+draft: false
+series: "Node.js 核心概念深度解析"
+seriesOrder: 2
+---
+
+## 前言
+
+在 Node.js 后端开发中，**Stream（流）** 是处理数据的神器。当你要处理 GB 级的文件、实时日志、网络数据流时，如果一次性把数据加载到内存，会导致内存溢出。Stream 让你可以**分块处理数据**，像水龙头一样，数据可以源源不断地流动，而不是一次性全部装进桶里。
+
+**本文将解决什么问题？**
+
+你可能想知道：
+
+- Stream 到底是什么？为什么要用 Stream？
+- 四种 Stream 类型有什么区别？
+- 什么是背压（backpressure）？如何处理？
+- `pipe()` 和 `pipeline()` 有什么区别？
+- 如何实现自己的 Transform 流？
+
+**本文将带你：**
+
+1. 理解 Stream 的核心概念
+2. 掌握四种 Stream 类型的使用
+3. 理解背压的产生与处理
+4. 实战：大文件复制、日志收集、数据转换管道
+5. 学会实现自定义 Transform 流
+
+---
+
+## 一、Stream 是什么？
+
+### 1.1 为什么需要 Stream？
+
+**传统方式的缺陷**：
+
+```javascript
+// ❌ 一次性读取大文件到内存
+const fs = require("fs");
+
+// 读取 1GB 的文件
+const data = fs.readFileSync("large-file.txt"); // 占用 1GB 内存！
+
+// 处理数据
+const processed = data.toString().toUpperCase();
+
+// 写入文件
+fs.writeFileSync("output.txt", processed);
+
+// 问题：需要 2GB 内存（1GB 读取 + 1GB 写入）
+```
+
+**Stream 的优势**：
+
+```javascript
+// ✅ 使用 Stream 分块处理
+const fs = require("fs");
+
+const readStream = fs.createReadStream("large-file.txt");
+const writeStream = fs.createWriteStream("output.txt");
+
+readStream.pipe(writeStream);
+
+// 内存占用：只有 64KB（默认缓冲区大小）
+// 即使文件是 1GB，内存占用也只有 64KB
+```
+
+### 1.2 Stream 的工作原理
+
+**Stream 是数据的有序集合**：
+
+```
+┌──────────────┐      ┌──────────────┐      ┌──────────────┐
+│              │      │              │      │              │
+│  文件系统     │─────→│   Readable   │─────→│  Writable    │─────→
+│  (1GB 文件)   │      │   Stream     │      │   Stream     │      输出
+│              │      │   (64KB)     │      │   (64KB)     │      文件
+└──────────────┘      └──────────────┘      └──────────────┘
+                          ↓                        ↓
+                     每次读取 64KB           每次写入 64KB
+                     写入后继续读           写入后继续接收
+```
+
+**核心概念**：
+
+1. **分块处理**：数据分成小块（chunk）处理
+2. **非阻塞**：读取和写入可以同时进行
+3. **低内存**：只保留当前块在内存中
+4. **事件驱动**：通过事件控制数据流动
+
+### 1.3 与前端 JS 的对比
+
+| 特性         | 前端 JS                           | Node.js Stream          |
+| ------------ | --------------------------------- | ----------------------- |
+| **数据处理** | 一次性加载完整数据                | 分块流式处理            |
+| **内存占用** | 随数据量增长                      | 固定小内存              |
+| **适用场景** | 小文件、DOM 操作                  | 大文件、网络 I/O        |
+| **API**      | `fetch().then(res => res.blob())` | `fs.createReadStream()` |
+| **实时性**   | 需等待完整数据                    | 数据到达即处理          |
+
+**前端示例**：
+
+```javascript
+// 前端：一次性加载
+const response = await fetch("/api/large-data");
+const data = await response.json(); // 等待完整数据
+console.log(data.length);
+```
+
+**Node.js 示例**：
+
+```javascript
+// Node.js：流式处理
+const stream = fs.createReadStream("large-data.json");
+let count = 0;
+
+stream.on("data", (chunk) => {
+  // 每收到一块数据就处理
+  count += chunk.length;
+  console.log(`Received ${chunk.length} bytes`);
+});
+
+stream.on("end", () => {
+  console.log(`Total: ${count} bytes`);
+});
+```
+
+---
+
+## 二、四种 Stream 类型
+
+### 2.1 类型概览
+
+Node.js 有四种基本 Stream 类型：
+
+```javascript
+const { Readable, Writable, Duplex, Transform } = require("stream");
+
+// Readable：可读流（数据源）
+const readable = new Readable({
+  read() {},
+});
+
+// Writable：可写流（输出目标）
+const writable = new Writable({
+  write(chunk, encoding, callback) {
+    callback();
+  },
+});
+
+// Duplex：双工流（既可读又可写）
+const duplex = new Duplex({
+  read() {},
+  write(chunk, encoding, callback) {
+    callback();
+  },
+});
+
+// Transform：转换流（读写并转换）
+const transform = new Transform({
+  transform(chunk, encoding, callback) {
+    this.push(chunk);
+    callback();
+  },
+});
+```
+
+### 2.2 Readable Stream（可读流）
+
+**特点**：数据从外部流向程序
+
+```javascript
+const fs = require("fs");
+
+// 从文件读取
+const readStream = fs.createReadStream("input.txt", {
+  highWaterMark: 64 * 1024, // 缓冲区大小 64KB
+  encoding: "utf8", // 编码
+  start: 0, // 开始位置
+  end: Infinity, // 结束位置
+});
+
+// 监听事件
+readStream.on("data", (chunk) => {
+  console.log("Received:", chunk);
+});
+
+readStream.on("end", () => {
+  console.log("No more data");
+});
+
+readStream.on("error", (err) => {
+  console.error("Error:", err);
+});
+```
+
+**可读流的两种模式**：
+
+```javascript
+const { Readable } = require("stream");
+
+// 1. 流动模式（自动读取）
+const readable = new Readable({
+  read() {
+    this.push("data");
+    this.push(null); // 结束
+  },
+});
+
+readable.on("data", (chunk) => {
+  console.log(chunk);
+});
+
+// 2. 暂停模式（手动读取）
+readable.pause();
+readable.on("readable", () => {
+  let chunk;
+  while (null !== (chunk = readable.read())) {
+    console.log(chunk);
+  }
+});
+```
+
+### 2.3 Writable Stream（可写流）
+
+**特点**：数据从程序流向外部
+
+```javascript
+const fs = require("fs");
+
+// 写入文件
+const writeStream = fs.createWriteStream("output.txt", {
+  highWaterMark: 16 * 1024, // 写入缓冲区 16KB
+  flags: "w", // 写入模式
+  mode: 0o666, // 文件权限
+});
+
+// 写入数据
+writeStream.write("Hello ");
+writeStream.write("World");
+writeStream.end(); // 结束写入
+
+// 监听事件
+writeStream.on("finish", () => {
+  console.log("All writes completed");
+});
+
+writeStream.on("error", (err) => {
+  console.error("Error:", err);
+});
+```
+
+**背压处理**：
+
+```javascript
+const fs = require("fs");
+
+const readStream = fs.createReadStream("large-file.txt");
+const writeStream = fs.createWriteStream("output.txt");
+
+readStream.on("data", (chunk) => {
+  // 检查写入缓冲区是否已满
+  if (!writeStream.write(chunk)) {
+    // 缓冲区满，暂停读取
+    readStream.pause();
+    console.log("Buffer full, paused reading");
+
+    // 等待 'drain' 事件
+    writeStream.once("drain", () => {
+      readStream.resume();
+      console.log("Buffer drained, resumed reading");
+    });
+  }
+});
+```
+
+### 2.4 Duplex Stream（双工流）
+
+**特点**：既可读又可写，数据独立流动
+
+```javascript
+const { Duplex } = require("stream");
+
+// 实现一个双工流
+const duplex = new Duplex({
+  read(size) {
+    // 可读流逻辑
+    this.push("from read");
+  },
+  write(chunk, encoding, callback) {
+    // 可写流逻辑
+    console.log("Received:", chunk.toString());
+    callback();
+  },
+});
+
+// 可读
+duplex.on("data", (chunk) => {
+  console.log("Read:", chunk.toString());
+});
+
+// 可写
+duplex.write("data to write");
+```
+
+**实际应用**：TCP Socket
+
+```javascript
+const net = require("net");
+
+const server = net.createServer((socket) => {
+  // socket 是 Duplex 流
+
+  // 读取数据
+  socket.on("data", (data) => {
+    console.log("Received:", data.toString());
+  });
+
+  // 写入数据
+  socket.write("Hello Client");
+});
+
+server.listen(8080);
+```
+
+### 2.5 Transform Stream（转换流）
+
+**特点**：读写并转换数据
+
+```javascript
+const { Transform } = require("stream");
+
+// 实现大写转换流
+const uppercase = new Transform({
+  transform(chunk, encoding, callback) {
+    // 转换数据
+    const transformed = chunk.toString().toUpperCase();
+    this.push(transformed);
+    callback();
+  },
+});
+
+// 使用
+process.stdin.pipe(uppercase).pipe(process.stdout);
+
+// 输入: hello
+// 输出: HELLO
+```
+
+**内置转换流**：
+
+```javascript
+const fs = require("fs");
+const zlib = require("zlib");
+
+// 压缩流（Transform）
+const gzip = zlib.createGzip();
+
+const readStream = fs.createReadStream("input.txt");
+const writeStream = fs.createWriteStream("input.txt.gz");
+
+readStream
+  .pipe(gzip) // 压缩
+  .pipe(writeStream);
+```
+
+---
+
+## 三、背压（Backpressure）机制
+
+### 3.1 什么是背压？
+
+**定义**：当生产者生产数据的速度快于消费者处理速度时，数据会堆积在缓冲区，这种现象称为背压。
+
+```
+生产者快 (100MB/s)
+    ↓
+[缓冲区 64KB] ←← 满了！
+    ↓
+消费者慢 (10MB/s)
+```
+
+**问题**：
+
+1. 内存溢出（缓冲区不断增长）
+2. 性能下降（数据堆积）
+3. 数据丢失（缓冲区溢出）
+
+### 3.2 背压的产生
+
+```javascript
+const fs = require("fs");
+
+// 快速生产者：从本地文件读取（快）
+const readStream = fs.createReadStream("fast-source.txt");
+
+// 慢速消费者：写入网络（慢）
+const writeStream = fs.createWriteStream("/dev/null"); // 假设是慢速网络
+
+// ❌ 没有处理背压
+readStream.on("data", (chunk) => {
+  writeStream.write(chunk); // 可能缓冲区溢出
+});
+```
+
+### 3.3 背压的解决方案
+
+**方案 1：使用 `write()` 返回值**
+
+```javascript
+const fs = require("fs");
+
+const readStream = fs.createReadStream("large-file.txt");
+const writeStream = fs.createWriteStream("output.txt");
+
+readStream.on("data", (chunk) => {
+  // write() 返回 false 表示缓冲区已满
+  if (!writeStream.write(chunk)) {
+    readStream.pause(); // 暂停读取
+    console.log("Paused reading");
+  }
+});
+
+writeStream.on("drain", () => {
+  readStream.resume(); // 恢复读取
+  console.log("Resumed reading");
+});
+```
+
+**方案 2：使用 `pipe()`（自动处理背压）**
+
+```javascript
+const fs = require("fs");
+
+const readStream = fs.createReadStream("large-file.txt");
+const writeStream = fs.createWriteStream("output.txt");
+
+// pipe() 自动处理背压
+readStream.pipe(writeStream);
+
+readStream.on("end", () => {
+  console.log("Done");
+});
+```
+
+**方案 3：使用 `pipeline()`（推荐）**
+
+```javascript
+const fs = require("fs");
+const { pipeline } = require("stream");
+const zlib = require("zlib");
+
+// pipeline 自动处理背压和错误
+pipeline(
+  fs.createReadStream("large-file.txt"),
+  zlib.createGzip(),
+  fs.createWriteStream("large-file.txt.gz"),
+  (err) => {
+    if (err) {
+      console.error("Pipeline failed:", err);
+    } else {
+      console.log("Pipeline succeeded");
+    }
+  }
+);
+```
+
+### 3.4 `pipe()` vs `pipeline()`
+
+| 特性         | `pipe()`         | `pipeline()`     |
+| ------------ | ---------------- | ---------------- |
+| **错误处理** | 不会自动传播错误 | 自动传播错误     |
+| **清理**     | 需要手动清理     | 自动清理资源     |
+| **回调**     | 不支持回调       | 支持回调通知完成 |
+| **推荐**     | 简单场景         | 所有场景（推荐） |
+
+**pipe() 的问题**：
+
+```javascript
+const fs = require("fs");
+const zlib = require("zlib");
+
+// ❌ pipe() 不会自动处理错误
+fs.createReadStream("not-exist.txt")
+  .pipe(zlib.createGzip())
+  .pipe(fs.createWriteStream("output.txt.gz"));
+
+// 如果文件不存在，错误不会被捕获！
+```
+
+**pipeline() 的优势**：
+
+```javascript
+const fs = require("fs");
+const { pipeline } = require("stream");
+const zlib = require("zlib");
+
+// ✅ pipeline() 自动处理错误
+pipeline(
+  fs.createReadStream("not-exist.txt"),
+  zlib.createGzip(),
+  fs.createWriteStream("output.txt.gz"),
+  (err) => {
+    if (err) {
+      console.error("Pipeline failed:", err);
+      // Error: ENOENT: no such file or directory
+    }
+  }
+);
+```
+
+---
+
+## 四、实战案例
+
+### 4.1 大文件复制（带进度）
+
+```javascript
+const fs = require("fs");
+const { pipeline } = require("stream");
+
+function copyFileWithProgress(source, target) {
+  const readStream = fs.createReadStream(source);
+  const writeStream = fs.createWriteStream(target);
+
+  const fileSize = fs.statSync(source).size;
+  let copiedBytes = 0;
+
+  readStream.on("data", (chunk) => {
+    copiedBytes += chunk.length;
+    const progress = ((copiedBytes / fileSize) * 100).toFixed(2);
+    process.stdout.write(`\rProgress: ${progress}%`);
+  });
+
+  pipeline(readStream, writeStream, (err) => {
+    if (err) {
+      console.error("\nCopy failed:", err);
+    } else {
+      console.log("\nCopy completed!");
+    }
+  });
+}
+
+copyFileWithProgress("large-file.txt", "large-file-copy.txt");
+```
+
+### 4.2 日志收集系统（Transform 流）
+
+```javascript
+const fs = require("fs");
+const { Transform } = require("stream");
+
+// 日志格式化 Transform 流
+class LogFormatter extends Transform {
+  constructor(options) {
+    super(options);
+    this.addTimestamp = options.addTimestamp || false;
+  }
+
+  _transform(chunk, encoding, callback) {
+    try {
+      const log = JSON.parse(chunk.toString());
+
+      // 添加时间戳
+      if (this.addTimestamp) {
+        log.timestamp = new Date().toISOString();
+      }
+
+      // 格式化日志
+      const formatted = JSON.stringify(log) + "\n";
+      this.push(formatted);
+
+      callback();
+    } catch (err) {
+      callback(err);
+    }
+  }
+}
+
+// 日志过滤 Transform 流
+class LogFilter extends Transform {
+  constructor(options) {
+    super(options);
+    this.level = options.level || "info";
+  }
+
+  _transform(chunk, encoding, callback) {
+    try {
+      const log = JSON.parse(chunk.toString());
+
+      // 过滤日志级别
+      const levels = ["debug", "info", "warn", "error"];
+      if (levels.indexOf(log.level) >= levels.indexOf(this.level)) {
+        this.push(chunk);
+      }
+
+      callback();
+    } catch (err) {
+      callback(err);
+    }
+  }
+}
+
+// 使用
+const readStream = fs.createReadStream("app.log");
+const writeStream = fs.createWriteStream("filtered.log");
+
+pipeline(
+  readStream,
+  new LogFilter({ level: "warn" }),
+  new LogFormatter({ addTimestamp: true }),
+  writeStream,
+  (err) => {
+    if (err) console.error("Pipeline failed:", err);
+    else console.log("Logs processed!");
+  }
+);
+```
+
+### 4.3 CSV 解析器
+
+```javascript
+const fs = require("fs");
+const { Transform } = require("stream");
+
+class CSVParser extends Transform {
+  constructor(options) {
+    super({ ...options, objectMode: true });
+    this.headers = null;
+    this.buffer = "";
+  }
+
+  _transform(chunk, encoding, callback) {
+    this.buffer += chunk.toString();
+
+    const lines = this.buffer.split("\n");
+    this.buffer = lines.pop(); // 保留不完整的行
+
+    for (const line of lines) {
+      if (!line.trim()) continue;
+
+      const values = line.split(",");
+
+      if (!this.headers) {
+        this.headers = values;
+      } else {
+        const obj = {};
+        this.headers.forEach((header, index) => {
+          obj[header] = values[index];
+        });
+        this.push(obj);
+      }
+    }
+
+    callback();
+  }
+
+  _flush(callback) {
+    if (this.buffer.trim()) {
+      const values = this.buffer.split(",");
+      if (!this.headers) {
+        this.headers = values;
+      } else {
+        const obj = {};
+        this.headers.forEach((header, index) => {
+          obj[header] = values[index];
+        });
+        this.push(obj);
+      }
+    }
+    callback();
+  }
+}
+
+// 使用
+const fs = require("fs");
+
+pipeline(
+  fs.createReadStream("data.csv"),
+  new CSVParser(),
+  new Transform({
+    objectMode: true,
+    transform(chunk, encoding, callback) {
+      console.log("Parsed:", chunk);
+      callback();
+    },
+  }),
+  (err) => {
+    if (err) console.error("Error:", err);
+  }
+);
+```
+
+### 4.4 多媒体转码管道
+
+```javascript
+const fs = require("fs");
+const { spawn } = require("child_process");
+const { pipeline } = require("stream");
+
+function convertVideo(input, output) {
+  // 使用 FFmpeg 转码
+  const ffmpeg = spawn("ffmpeg", [
+    "-i",
+    "pipe:0", // 从 stdin 读取
+    "-c:v",
+    "libx264", // 视频编码
+    "-c:a",
+    "aac", // 音频编码
+    "-f",
+    "mp4", // 格式
+    "pipe:1", // 输出到 stdout
+  ]);
+
+  const inputStream = fs.createReadStream(input);
+  const outputStream = fs.createWriteStream(output);
+
+  pipeline(inputStream, ffmpeg.stdin, ffmpeg.stdout, outputStream, (err) => {
+    if (err) {
+      console.error("Conversion failed:", err);
+      ffmpeg.kill();
+    } else {
+      console.log("Conversion completed!");
+    }
+  });
+
+  ffmpeg.stderr.on("data", (data) => {
+    console.error("FFmpeg log:", data.toString());
+  });
+}
+
+// convertVideo('input.avi', 'output.mp4');
+```
+
+### 4.5 压缩中间件
+
+```javascript
+const zlib = require("zlib");
+const { Transform } = require("stream");
+
+class CompressMiddleware extends Transform {
+  constructor(options) {
+    super(options);
+    this.encoding = options.encoding || "gzip";
+    this.threshold = options.threshold || 1024; // 1KB 以上才压缩
+    this.buffer = Buffer.alloc(0);
+  }
+
+  _transform(chunk, encoding, callback) {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+    callback();
+  }
+
+  _flush(callback) {
+    if (this.buffer.length < this.threshold) {
+      // 太小，不压缩
+      this.push(this.buffer);
+    } else {
+      // 压缩
+      const compressStream =
+        this.encoding === "gzip"
+          ? zlib.createGzip()
+          : zlib.createBrotliCompress();
+
+      compressStream.on("data", (data) => {
+        this.push(data);
+      });
+
+      compressStream.on("end", () => {
+        callback();
+      });
+
+      compressStream.write(this.buffer);
+      compressStream.end();
+    }
+  }
+}
+
+// 使用
+const http = require("http");
+
+const server = http.createServer((req, res) => {
+  const data = Buffer.from("x".repeat(2000)); // 2KB 数据
+
+  pipeline(new CompressMiddleware({ encoding: "gzip" }), res, (err) => {
+    if (err) console.error("Error:", err);
+  });
+});
+
+server.listen(3000);
+```
+
+---
+
+## 五、自定义 Transform 流
+
+### 5.1 基础模板
+
+```javascript
+const { Transform } = require("stream");
+
+class MyTransform extends Transform {
+  constructor(options) {
+    super(options);
+    // 初始化代码
+  }
+
+  _transform(chunk, encoding, callback) {
+    try {
+      // 1. 处理输入数据
+      const output = this.processData(chunk);
+
+      // 2. 推送输出数据
+      this.push(output);
+
+      // 3. 表示处理完成
+      callback();
+    } catch (err) {
+      // 发生错误
+      callback(err);
+    }
+  }
+
+  _flush(callback) {
+    // 流结束时调用
+    // 处理剩余数据
+    callback();
+  }
+
+  processData(chunk) {
+    // 自定义处理逻辑
+    return chunk;
+  }
+}
+```
+
+### 5.2 实用示例
+
+**示例 1：大写转换流**
+
+```javascript
+const { Transform } = require("stream");
+
+class UppercaseTransform extends Transform {
+  _transform(chunk, encoding, callback) {
+    const upper = chunk.toString().toUpperCase();
+    this.push(upper);
+    callback();
+  }
+}
+
+// 使用
+process.stdin.pipe(new UppercaseTransform()).pipe(process.stdout);
+```
+
+**示例 2：HTML 压缩流**
+
+```javascript
+const { Transform } = require("stream");
+
+class HTMLMinifier extends Transform {
+  constructor(options) {
+    super(options);
+    this.removeComments = options.removeComments !== false;
+    this.removeWhitespace = options.removeWhitespace !== false;
+  }
+
+  _transform(chunk, encoding, callback) {
+    let html = chunk.toString();
+
+    // 移除注释
+    if (this.removeComments) {
+      html = html.replace(/<!--[\s\S]*?-->/g, "");
+    }
+
+    // 移除多余空白
+    if (this.removeWhitespace) {
+      html = html.replace(/\s+/g, " ").trim();
+    }
+
+    this.push(html);
+    callback();
+  }
+}
+```
+
+**示例 3：分块聚合流**
+
+```javascript
+const { Transform } = require("stream");
+
+class ChunkAggregator extends Transform {
+  constructor(options) {
+    super(options);
+    this.chunkSize = options.chunkSize || 1024;
+    this.buffer = Buffer.alloc(0);
+  }
+
+  _transform(chunk, encoding, callback) {
+    this.buffer = Buffer.concat([this.buffer, chunk]);
+
+    while (this.buffer.length >= this.chunkSize) {
+      const toSend = this.buffer.slice(0, this.chunkSize);
+      this.buffer = this.buffer.slice(this.chunkSize);
+      this.push(toSend);
+    }
+
+    callback();
+  }
+
+  _flush(callback) {
+    if (this.buffer.length > 0) {
+      this.push(this.buffer);
+    }
+    callback();
+  }
+}
+```
+
+---
+
+## 六、常见问题
+
+### Q1: Stream 事件有哪些？
+
+**A**: 主要事件：
+
+```javascript
+// Readable Stream
+readable.on("data", (chunk) => {}); // 收到数据
+readable.on("end", () => {}); // 数据结束
+readable.on("error", (err) => {}); // 错误
+readable.on("close", () => {}); // 流关闭
+readable.on("pause", () => {}); // 暂停
+readable.on("resume", () => {}); // 恢复
+
+// Writable Stream
+writable.on("drain", () => {}); // 缓冲区清空
+writable.on("finish", () => {}); // 写入完成
+writable.on("error", (err) => {}); // 错误
+writable.on("close", () => {}); // 流关闭
+writable.on("pipe", (src) => {}); // 被管道
+writable.on("unpipe", (src) => {}); // 取消管道
+```
+
+### Q2: 如何处理 Stream 错误？
+
+**A**: 始终监听 `error` 事件：
+
+```javascript
+const fs = require("fs");
+
+const readStream = fs.createReadStream("file.txt");
+
+readStream.on("error", (err) => {
+  console.error("Read error:", err);
+});
+
+// 使用 pipeline 自动处理错误
+const { pipeline } = require("stream");
+
+pipeline(readStream, writeStream, (err) => {
+  if (err) console.error("Pipeline error:", err);
+});
+```
+
+### Q3: Stream 可以暂停和恢复吗？
+
+**A**: 可以：
+
+```javascript
+const readStream = fs.createReadStream("file.txt");
+
+// 暂停
+readStream.pause();
+
+// 恢复
+readStream.resume();
+
+// 或者
+readStream.isPaused(); // 检查是否暂停
+```
+
+### Q4: Object Mode 是什么？
+
+**A**: Object Mode 允许流处理任意 JavaScript 对象：
+
+```javascript
+const { Transform } = require("stream");
+
+// 默认：Buffer/String 模式
+const defaultStream = new Transform();
+
+// Object Mode
+const objectStream = new Transform({
+  objectMode: true, // 允许对象
+});
+
+objectStream.on("data", (obj) => {
+  console.log(obj); // { key: 'value' }
+});
+
+objectStream.push({ key: "value" });
+```
+
+---
+
+## 七、总结
+
+**本文我们完成了**：
+
+✅ 理解了 Stream 的核心概念
+✅ 掌握了四种 Stream 类型的使用
+✅ 理解了背压的产生与处理
+✅ 实战：大文件复制、日志收集、CSV 解析、视频转码
+✅ 学会了实现自定义 Transform 流
+
+**核心要点回顾**：
+
+1. **Stream 是什么** - 数据的分块有序集合，像水流一样流动
+2. **四种类型** - Readable（可读）、Writable（可写）、Duplex（双工）、Transform（转换）
+3. **背压** - 生产者快于消费者时，数据堆积在缓冲区
+4. **pipe vs pipeline** - pipeline 自动处理错误和清理，推荐使用
+5. **Transform 流** - 读写并转换数据，是最常用的类型
+
+**最佳实践**：
+
+- ✅ 处理大文件始终使用 Stream
+- ✅ 使用 `pipeline()` 而不是 `pipe()`
+- ✅ 自定义 Transform 流时正确处理错误
+- ✅ 监听 `error` 事件
+- ✅ 使用 `objectMode: true` 处理对象
+
+**下一步**：
+
+在下一篇文章《Event Loop 事件循环深度剖析》中，我们将深入学习：
+
+- libuv 事件循环的六个阶段
+- timers、poll、check 阶段的执行时机
+- microtask vs macrotask 在 Node.js 中的差异
+- process.nextTick() vs setImmediate()
+- 事件循环阻塞检测与性能优化
+
+---
+
+**相关代码**：
+
+- 完整示例：[nodejs-core-examples](https://github.com/your-repo/nodejs-core-examples)
+- Stream 官方文档：[nodejs.org/api/stream.html](https://nodejs.org/api/stream.html)
+
+**有问题？** 欢迎在评论区留言，我会尽快回复！

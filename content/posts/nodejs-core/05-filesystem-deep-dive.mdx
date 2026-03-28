@@ -1,0 +1,912 @@
+---
+title: "05 Node.js 文件系统：深度实战"
+date: "2026-04-01"
+summary: "深入掌握 Node.js 文件系统操作，理解 fs.promises、文件描述符、文件监听机制，实现日志轮转、配置热更新等实战功能"
+tags: ["Node.js", "文件系统", "fs", "文件监听"]
+category: "nodejs-core"
+cover: ""
+draft: false
+series: "Node.js 核心概念深度解析"
+seriesOrder: 5
+---
+
+## 前言
+
+在 Node.js 后端开发中，**文件系统操作**是必备技能。与浏览器不同，Node.js 可以直接操作文件系统，读取配置、写入日志、处理文件上传等。但很多开发者对 `fs.promises`、`fs.callback`、`fs.sync` 三种 API 的区别和使用场景不清晰，对文件描述符（fd）、内存映射、文件监听等概念也不了解。
+
+**本文将解决什么问题？**
+
+你可能想知道：
+
+- `fs.promises`、`fs.callback`、`fs.sync` 有什么区别？
+- 什么是文件描述符（fd）？
+- 如何高效地监听文件变化？
+- 如何实现日志轮转？
+- 如何处理大文件？
+- 如何实现配置热更新？
+
+**本文将带你：**
+
+1. 理解文件系统的三种 API 风格
+2. 掌握文件描述符与内存映射
+3. 学习文件监听机制
+4. 实战：日志轮转、配置热更新、大文件处理
+
+---
+
+## 一、文件系统 API 概览
+
+### 1.1 三种 API 风格
+
+**1. 同步 API（fs.sync）**：
+
+```javascript
+const fs = require("fs");
+
+// 阻塞执行
+const data = fs.readFileSync("file.txt", "utf8");
+console.log(data);
+
+// 适合：脚本启动时读取配置
+// 不适合：HTTP 请求中（会阻塞事件循环）
+```
+
+**2. 回调 API（fs.callback）**：
+
+```javascript
+const fs = require("fs");
+
+// 异步执行
+fs.readFile("file.txt", "utf8", (err, data) => {
+  if (err) {
+    console.error(err);
+    return;
+  }
+  console.log(data);
+});
+
+// 适合：旧代码维护
+// 不推荐：容易回调地狱
+```
+
+**3. Promise API（fs.promises）**：
+
+```javascript
+const fs = require("fs").promises;
+
+// 异步执行，返回 Promise
+async function main() {
+  try {
+    const data = await fs.readFile("file.txt", "utf8");
+    console.log(data);
+  } catch (err) {
+    console.error(err);
+  }
+}
+
+main();
+
+// 适合：新代码（推荐）
+// 现代 async/await 语法
+```
+
+### 1.2 性能对比
+
+```javascript
+const fs = require("fs");
+const fsPromises = require("fs").promises;
+
+// 同步：阻塞
+console.time("sync");
+const data = fs.readFileSync("large-file.txt", "utf8");
+console.timeEnd("sync"); // 100ms
+
+// 异步：不阻塞
+console.time("async");
+fs.readFile("large-file.txt", "utf8", () => {
+  console.timeEnd("async"); // 100ms
+});
+
+// Promise：不阻塞
+console.time("promise");
+fsPromises.readFile("large-file.txt", "utf8").then(() => {
+  console.timeEnd("promise"); // 100ms
+});
+```
+
+**关键点**：
+
+- 同步 API 会阻塞事件循环
+- 异步 API 和 Promise API 不会阻塞
+- 性能差异不大（都是异步 I/O）
+
+### 1.3 与前端 JS 的对比
+
+**前端（浏览器）**：
+
+```javascript
+// 受限的文件访问
+// 1. File API（用户选择文件）
+const fileInput = document.querySelector('input[type="file"]');
+const file = fileInput.files[0];
+const reader = new FileReader();
+reader.onload = (e) => console.log(e.target.result);
+reader.readAsText(file);
+
+// 2. IndexedDB（本地存储）
+// 3. localStorage（键值存储）
+```
+
+**Node.js（后端）**：
+
+```javascript
+// 完全的文件系统访问
+const fs = require("fs").promises;
+
+// 读取/写入任意文件
+await fs.readFile("/etc/passwd");
+await fs.writeFile("/tmp/test.txt", "data");
+
+// 操作目录
+await fs.mkdir("/tmp/test");
+await fs.readdir("/tmp");
+
+// 操作权限、软链接、硬链接
+await fs.chmod("/tmp/test.txt", 0o755);
+await fs.symlink("/tmp/test.txt", "/tmp/link");
+```
+
+---
+
+## 二、文件描述符与内存映射
+
+### 2.1 文件描述符（File Descriptor）
+
+**定义**：文件描述符是操作系统对打开文件的引用
+
+```javascript
+const fs = require("fs");
+
+// 打开文件，返回文件描述符
+const fd = fs.openSync("file.txt", "r");
+console.log(fd); // 3（0=stdin, 1=stdout, 2=stderr）
+
+// 读取文件
+const buffer = Buffer.alloc(1024);
+const bytesRead = fs.readSync(fd, buffer, 0, 1024, 0);
+console.log(buffer.slice(0, bytesRead).toString());
+
+// 关闭文件
+fs.closeSync(fd);
+```
+
+**为什么需要文件描述符**：
+
+```javascript
+// 1. 性能优化（避免重复打开文件）
+const fs = require("fs");
+
+const fd = fs.openSync("file.txt", "r");
+
+// 多次读取
+for (let i = 0; i < 100; i++) {
+  const buffer = Buffer.alloc(1024);
+  fs.readSync(fd, buffer, 0, 1024, i * 1024);
+}
+
+fs.closeSync(fd);
+
+// 2. 精确控制读写位置
+// 3. 共享文件访问（多进程）
+// 4. 文件锁
+```
+
+### 2.2 内存映射（mmap）
+
+**什么是内存映射**：将文件映射到内存空间，访问内存就像访问文件
+
+```javascript
+const fs = require("fs");
+const { mmap } = require("node:os");
+
+// Node.js 没有直接的 mmap API
+// 需要使用第三方库或 Buffer
+
+// 使用 Buffer 模拟
+const fd = fs.openSync("file.txt", "r");
+const stats = fs.fstatSync(fd);
+const buffer = Buffer.alloc(stats.size);
+fs.readSync(fd, buffer, 0, stats.size, 0);
+fs.closeSync(fd);
+
+// 现在 buffer 就是文件内容
+console.log(buffer.toString());
+```
+
+### 2.3 高效文件操作
+
+**读取大文件**：
+
+```javascript
+const fs = require("fs");
+const bufferSize = 64 * 1024; // 64KB
+
+const fd = fs.openSync("large-file.txt", "r");
+const buffer = Buffer.alloc(bufferSize);
+
+let bytesRead;
+let totalBytes = 0;
+
+do {
+  bytesRead = fs.readSync(fd, buffer, 0, bufferSize, null);
+  totalBytes += bytesRead;
+
+  // 处理数据
+  console.log(`Read ${totalBytes} bytes`);
+} while (bytesRead === bufferSize);
+
+fs.closeSync(fd);
+```
+
+**写入大文件**：
+
+```javascript
+const fs = require("fs");
+const bufferSize = 64 * 1024;
+
+const fd = fs.openSync("output.txt", "w");
+const buffer = Buffer.alloc(bufferSize, "x");
+
+for (let i = 0; i < 100; i++) {
+  fs.writeSync(fd, buffer, 0, bufferSize, null);
+}
+
+fs.closeSync(fd);
+```
+
+---
+
+## 三、文件监听
+
+### 3.1 watch() vs watchFile()
+
+**watch()**：
+
+```javascript
+const fs = require("fs");
+
+// 监听文件变化
+const watcher = fs.watch("file.txt", (eventType, filename) => {
+  console.log(`Event: ${eventType}, File: ${filename}`);
+});
+
+// 停止监听
+watcher.close();
+```
+
+**特点**：
+
+- 基于操作系统事件（inotify、FSEvents）
+- 高性能（不轮询）
+- 可能丢失事件（事件风暴）
+- 不跨平台一致
+
+**watchFile()**：
+
+```javascript
+const fs = require("fs");
+
+// 监听文件变化（轮询）
+fs.watchFile("file.txt", (curr, prev) => {
+  console.log("File changed");
+  console.log("Previous mtime:", prev.mtime);
+  console.log("Current mtime:", curr.mtime);
+});
+
+// 停止监听
+fs.unwatchFile("file.txt");
+```
+
+**特点**：
+
+- 基于轮询（stat）
+- 低性能（持续轮询）
+- 不丢失事件
+- 可配置轮询间隔
+
+### 3.2 文件监听实战
+
+**配置热更新**：
+
+```javascript
+const fs = require("fs");
+const path = require("path");
+
+class ConfigManager {
+  constructor(configPath) {
+    this.configPath = configPath;
+    this.config = {};
+    this.watchers = [];
+
+    this.load();
+    this.watch();
+  }
+
+  load() {
+    try {
+      const content = fs.readFileSync(this.configPath, "utf8");
+      this.config = JSON.parse(content);
+      console.log("Config loaded:", this.config);
+    } catch (err) {
+      console.error("Failed to load config:", err);
+    }
+  }
+
+  watch() {
+    const watcher = fs.watch(this.configPath, (eventType, filename) => {
+      if (eventType === "change") {
+        console.log("Config changed, reloading...");
+        this.load();
+        this.notify();
+      }
+    });
+
+    this.watchers.push(watcher);
+  }
+
+  notify() {
+    // 通知配置更新
+    console.log("Config updated:", this.config);
+  }
+
+  get(key) {
+    return this.config[key];
+  }
+
+  close() {
+    this.watchers.forEach((watcher) => watcher.close());
+  }
+}
+
+// 使用
+const config = new ConfigManager("./config.json");
+console.log("Database host:", config.get("database.host"));
+```
+
+### 3.3 目录监听
+
+```javascript
+const fs = require("fs");
+
+// 监听目录
+const watcher = fs.watch("./uploads", (eventType, filename) => {
+  console.log(`${eventType}: ${filename}`);
+
+  if (eventType === "rename" && filename) {
+    const filePath = path.join("./uploads", filename);
+
+    // 检查是文件还是目录
+    try {
+      const stats = fs.statSync(filePath);
+      if (stats.isFile()) {
+        console.log("New file:", filename);
+        // 处理新文件
+      }
+    } catch (err) {
+      // 文件可能已删除
+      console.log("File deleted:", filename);
+    }
+  }
+});
+
+// 停止监听
+watcher.close();
+```
+
+---
+
+## 四、实战案例
+
+### 4.1 日志轮转（Log Rotation）
+
+**实现**：
+
+```javascript
+const fs = require("fs");
+const path = require("path");
+const zlib = require("zlib");
+
+class LogRotator {
+  constructor(options = {}) {
+    this.logFile = options.logFile || "./app.log";
+    this.maxSize = options.maxSize || 10 * 1024 * 1024; // 10MB
+    this.maxFiles = options.maxFiles || 5;
+    this.compress = options.compress !== false;
+  }
+
+  write(message) {
+    const timestamp = new Date().toISOString();
+    const logMessage = `[${timestamp}] ${message}\n`;
+
+    // 检查文件大小
+    if (fs.existsSync(this.logFile)) {
+      const stats = fs.statSync(this.logFile);
+      if (stats.size >= this.maxSize) {
+        this.rotate();
+      }
+    }
+
+    // 写入日志
+    fs.appendFileSync(this.logFile, logMessage);
+  }
+
+  rotate() {
+    console.log("Rotating log file...");
+
+    // 删除最旧的日志
+    const oldestFile = `${this.logFile}.${this.maxFiles}.gz`;
+    if (fs.existsSync(oldestFile)) {
+      fs.unlinkSync(oldestFile);
+    }
+
+    // 重命名现有日志文件
+    for (let i = this.maxFiles - 1; i >= 1; i--) {
+      const currentFile =
+        i === 1 ? this.logFile : `${this.logFile}.${i - 1}.gz`;
+
+      const newFile = `${this.logFile}.${i}.gz`;
+
+      if (fs.existsSync(currentFile)) {
+        if (this.compress) {
+          const content = fs.readFileSync(currentFile);
+          const compressed = zlib.gzipSync(content);
+          fs.writeFileSync(newFile, compressed);
+        } else {
+          fs.renameSync(currentFile, newFile);
+        }
+      }
+    }
+  }
+}
+
+// 使用
+const logger = new LogRotator({
+  logFile: "./logs/app.log",
+  maxSize: 1024 * 1024, // 1MB
+  maxFiles: 3,
+});
+
+// 写入日志
+logger.write("Application started");
+logger.write("Processing data");
+```
+
+### 4.2 大文件分块处理
+
+```javascript
+const fs = require("fs");
+const path = require("path");
+
+async function processLargeFile(inputPath, outputPath, processor) {
+  const fd = await fs.promises.open(inputPath, "r");
+  const stats = await fd.stat();
+  const fileSize = stats.size;
+  const chunkSize = 1024 * 1024; // 1MB
+
+  let position = 0;
+  let processedBytes = 0;
+
+  try {
+    while (position < fileSize) {
+      const buffer = Buffer.alloc(Math.min(chunkSize, fileSize - position));
+      const { bytesRead } = await fd.read(buffer, 0, buffer.length, position);
+
+      // 处理数据块
+      const processed = processor(buffer.slice(0, bytesRead));
+
+      // 写入输出文件
+      await fs.promises.appendFile(outputPath, processed);
+
+      // 更新进度
+      processedBytes += bytesRead;
+      const progress = ((processedBytes / fileSize) * 100).toFixed(2);
+      console.log(`Progress: ${progress}%`);
+
+      position += bytesRead;
+    }
+  } finally {
+    await fd.close();
+  }
+}
+
+// 使用：转换大文件为小写
+async function main() {
+  await processLargeFile("./large-input.txt", "./large-output.txt", (chunk) =>
+    chunk.toString().toLowerCase()
+  );
+  console.log("File processed successfully");
+}
+
+main();
+```
+
+### 4.3 文件上传处理
+
+```javascript
+const fs = require("fs");
+const path = require("path");
+
+async function handleFileUpload(file, uploadDir) {
+  // 确保上传目录存在
+  if (!fs.existsSync(uploadDir)) {
+    fs.mkdirSync(uploadDir, { recursive: true });
+  }
+
+  // 生成唯一文件名
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).substring(7);
+  const filename = `${timestamp}-${random}${path.extname(file.name)}`;
+  const filepath = path.join(uploadDir, filename);
+
+  // 写入文件
+  await fs.promises.writeFile(filepath, file.data);
+
+  // 返回文件信息
+  const stats = await fs.promises.stat(filepath);
+  return {
+    filename,
+    filepath,
+    size: stats.size,
+    mimetype: file.mimetype,
+  };
+}
+
+// 使用（Express 示例）
+const express = require("express");
+const multer = require("multer");
+const app = express();
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10MB
+});
+
+app.post("/upload", upload.single("file"), async (req, res) => {
+  try {
+    const file = req.file;
+
+    if (!file) {
+      return res.status(400).json({ error: "No file uploaded" });
+    }
+
+    // 处理文件上传
+    const result = await handleFileUpload(file, "./uploads");
+
+    res.json({
+      success: true,
+      data: result,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.listen(3000);
+```
+
+### 4.4 文件夹遍历
+
+```javascript
+const fs = require("fs");
+const path = require("path");
+
+async function traverseDirectory(dir, callback) {
+  const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+
+  for (const entry of entries) {
+    const fullPath = path.join(dir, entry.name);
+
+    if (entry.isDirectory()) {
+      // 递归遍历子目录
+      await traverseDirectory(fullPath, callback);
+    } else if (entry.isFile()) {
+      // 调用回调处理文件
+      await callback(fullPath);
+    }
+  }
+}
+
+// 使用：查找所有 .js 文件
+async function findJSFiles(dir) {
+  const jsFiles = [];
+
+  await traverseDirectory(dir, async (filePath) => {
+    if (filePath.endsWith(".js")) {
+      jsFiles.push(filePath);
+      console.log("Found JS file:", filePath);
+    }
+  });
+
+  return jsFiles;
+}
+
+findJSFiles("./src").then((files) => {
+  console.log(`Found ${files.length} JS files`);
+});
+```
+
+### 4.5 文件备份系统
+
+```javascript
+const fs = require("fs");
+const path = require("path");
+
+class FileBackup {
+  constructor(sourceDir, backupDir) {
+    this.sourceDir = sourceDir;
+    this.backupDir = backupDir;
+  }
+
+  async backup() {
+    console.log("Starting backup...");
+
+    // 创建备份目录
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+    const backupPath = path.join(this.backupDir, timestamp);
+
+    if (!fs.existsSync(this.backupDir)) {
+      fs.mkdirSync(this.backupDir, { recursive: true });
+    }
+
+    fs.mkdirSync(backupPath, { recursive: true });
+
+    // 遍历源目录
+    await this.copyDirectory(this.sourceDir, backupPath);
+
+    console.log("Backup completed:", backupPath);
+  }
+
+  async copyDirectory(source, target) {
+    await fs.promises.mkdir(target, { recursive: true });
+
+    const entries = await fs.promises.readdir(source, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const sourcePath = path.join(source, entry.name);
+      const targetPath = path.join(target, entry.name);
+
+      if (entry.isDirectory()) {
+        await this.copyDirectory(sourcePath, targetPath);
+      } else {
+        await fs.promises.copyFile(sourcePath, targetPath);
+      }
+    }
+  }
+
+  async restore(backupTimestamp) {
+    const backupPath = path.join(this.backupDir, backupTimestamp);
+
+    if (!fs.existsSync(backupPath)) {
+      throw new Error("Backup not found");
+    }
+
+    console.log("Restoring from backup:", backupPath);
+
+    // 清空源目录
+    await this.emptyDirectory(this.sourceDir);
+
+    // 复制备份文件
+    await this.copyDirectory(backupPath, this.sourceDir);
+
+    console.log("Restore completed");
+  }
+
+  async emptyDirectory(dir) {
+    const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      const fullPath = path.join(dir, entry.name);
+
+      if (entry.isDirectory()) {
+        await this.emptyDirectory(fullPath);
+        await fs.promises.rmdir(fullPath);
+      } else {
+        await fs.promises.unlink(fullPath);
+      }
+    }
+  }
+
+  async listBackups() {
+    if (!fs.existsSync(this.backupDir)) {
+      return [];
+    }
+
+    const backups = await fs.promises.readdir(this.backupDir);
+    return backups.filter((name) => {
+      const backupPath = path.join(this.backupDir, name);
+      return fs.statSync(backupPath).isDirectory();
+    });
+  }
+}
+
+// 使用
+const backup = new FileBackup("./data", "./backups");
+
+// 创建备份
+await backup.backup();
+
+// 列出备份
+const backups = await backup.listBackups();
+console.log("Backups:", backups);
+
+// 恢复备份
+await backup.restore("2024-01-01T12-00-00Z");
+```
+
+---
+
+## 五、path 模块
+
+### 5.1 跨平台路径处理
+
+```javascript
+const path = require("path");
+
+// 路径拼接
+const fullPath = path.join("src", "views", "home.html");
+console.log(fullPath); // src/views/home.html（跨平台）
+
+// 路径解析
+const parsed = path.parse("/Users/user/project/src/index.js");
+console.log(parsed);
+// {
+//   root: '/',
+//   dir: '/Users/user/project/src',
+//   base: 'index.js',
+//   ext: '.js',
+//   name: 'index'
+// }
+
+// 路径规范化
+const normalized = path.normalize("/src/../src/./views/home.html");
+console.log(normalized); // /src/views/home.html
+
+// 绝对路径
+const absolute = path.resolve("src/index.js");
+console.log(absolute); // /Users/user/project/src/index.js
+
+// 相对路径
+const relative = path.relative("/src/views", "/src/utils");
+console.log(relative); // ../utils
+```
+
+### 5.2 **dirname 和 **filename
+
+```javascript
+// CommonJS
+console.log(__dirname); // 文件所在目录
+console.log(__filename); // 文件完整路径
+
+// ESM
+import { fileURLToPath } from "url";
+import { dirname } from "path";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+```
+
+---
+
+## 六、常见问题
+
+### Q1: fs.unlink vs fs.rm？
+
+**A**:
+
+```javascript
+// fs.unlink：删除文件
+fs.unlink("file.txt", (err) => {});
+
+// fs.rm：删除文件或目录（Node.js 14+）
+fs.rm("dir", { recursive: true }, (err) => {});
+```
+
+### Q2: 如何检查文件是否存在？
+
+**A**:
+
+```javascript
+const fs = require("fs");
+
+// 方式 1：fs.existsSync
+if (fs.existsSync("file.txt")) {
+  // 文件存在
+}
+
+// 方式 2：fs.promises.access
+try {
+  await fs.promises.access("file.txt");
+  // 文件存在
+} catch {
+  // 文件不存在
+}
+
+// 方式 3：fs.stat（推荐）
+try {
+  await fs.promises.stat("file.txt");
+  // 文件存在
+} catch (err) {
+  if (err.code === "ENOENT") {
+    // 文件不存在
+  }
+}
+```
+
+### Q3: 如何处理 EACCES（权限错误）？
+
+**A**:
+
+```javascript
+const fs = require("fs");
+
+try {
+  fs.writeFileSync("/root/file.txt", "data");
+} catch (err) {
+  if (err.code === "EACCES") {
+    console.error("Permission denied");
+  }
+}
+
+// 检查权限
+fs.access("/root/file.txt", fs.constants.W_OK, (err) => {
+  if (err) {
+    console.error("No write permission");
+  }
+});
+```
+
+---
+
+## 七、总结
+
+**本文我们完成了**：
+
+✅ 理解了文件系统的三种 API 风格
+✅ 掌握了文件描述符与内存映射
+✅ 学习了文件监听机制
+✅ 实战：日志轮转、配置热更新、大文件处理
+
+**核心要点回顾**：
+
+1. **三种 API** - sync（阻塞）、callback（旧）、promises（推荐）
+2. **文件描述符** - 操作系统对打开文件的引用
+3. **文件监听** - watch()（高性能）vs watchFile()（可靠）
+4. **path 模块** - 跨平台路径处理
+5. **实战** - 日志轮转、大文件处理、文件备份
+
+**最佳实践**：
+
+- ✅ 新代码使用 `fs.promises`
+- ✅ 避免在 HTTP 请求中使用同步 API
+- ✅ 使用 Stream 处理大文件
+- ✅ 监听文件变化使用 `watch()`
+- ✅ 使用 `path.join()` 处理路径
+
+**下一步**：
+
+在下一篇文章《进程与子进程管理》中，我们将深入学习：
+
+- spawn()、exec()、execFile()、fork() 的区别
+- stdin/stdout/stderr 管道通信
+- 进程池设计与实现
+- 信号处理与优雅关闭
+- 实战：调用 FFmpeg 处理视频、执行 Shell 脚本
+
+---
+
+**相关代码**：
+
+- 完整示例：[nodejs-core-examples](https://github.com/your-repo/nodejs-core-examples)
+- fs 官方文档：[nodejs.org/api/fs.html](https://nodejs.org/api/fs.html)
+
+**有问题？** 欢迎在评论区留言，我会尽快回复！

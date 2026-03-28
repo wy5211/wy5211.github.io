@@ -1,0 +1,267 @@
+---
+title: "07 Node.js Worker Threads：多线程编程实战"
+date: "2026-04-03"
+summary: "深入理解 Node.js Worker Threads 的内存模型，掌握 parentPort 通信、SharedArrayBuffer、线程池设计，实现图片批量处理等实战功能"
+tags: ["Node.js", "Worker Threads", "多线程", "CPU 密集"]
+category: "nodejs-core"
+cover: ""
+draft: false
+series: "Node.js 核心概念深度解析"
+seriesOrder: 7
+---
+
+## 前言
+
+Node.js 是单线程的，但可以通过 **Worker Threads** 实现多线程。Worker Threads 让你可以在 Node.js 中执行 CPU 密集任务，避免阻塞事件循环。与子进程不同，Worker Threads 共享内存，通信更高效。
+
+**核心内容**：
+
+- Worker Threads 的内存模型
+- parentPort 与 postMessage 通信
+- SharedArrayBuffer 与 Atomics
+- 线程池设计模式
+- 实战：图片批量处理
+
+---
+
+## 一、Worker Threads 基础
+
+### 1.1 创建 Worker
+
+```javascript
+// main.js
+const { Worker } = require("worker_threads");
+
+const worker = new Worker("./worker.js");
+
+worker.on("message", (message) => {
+  console.log("Received:", message);
+});
+
+worker.on("error", (error) => {
+  console.error("Error:", error);
+});
+
+worker.on("exit", (code) => {
+  if (code !== 0) {
+    console.error(`Worker stopped with code ${code}`);
+  }
+});
+
+worker.postMessage({ hello: "world" });
+```
+
+```javascript
+// worker.js
+const { parentPort } = require("worker_threads");
+
+parentPort.on("message", (message) => {
+  console.log("Received:", message);
+  parentPort.postMessage({ echo: message });
+});
+```
+
+### 1.2 共享内存（SharedArrayBuffer）
+
+```javascript
+// main.js
+const { Worker } = require("worker_threads");
+
+const sharedBuffer = new SharedArrayBuffer(4);
+const sharedArray = new Int32Array(sharedBuffer);
+
+const worker = new Worker("./worker.js", {
+  workerData: { sharedBuffer },
+});
+
+worker.on("message", () => {
+  console.log("Shared value:", sharedArray[0]);
+});
+```
+
+```javascript
+// worker.js
+const { parentPort, workerData } = require("worker_threads");
+
+const sharedArray = new Int32Array(workerData.sharedBuffer);
+
+// 修改共享内存
+Atomics.store(sharedArray, 0, 42);
+parentPort.postMessage({ done: true });
+```
+
+---
+
+## 二、实战案例
+
+### 2.1 图片批量处理
+
+```javascript
+// main.js
+const { Worker } = require("worker_threads");
+const path = require("path");
+
+function processImages(imagePaths) {
+  const workers = [];
+  const results = [];
+
+  imagePaths.forEach((imagePath, index) => {
+    const worker = new Worker("./image-worker.js", {
+      workerData: { imagePath, index },
+    });
+
+    worker.on("message", (result) => {
+      results.push(result);
+
+      if (results.length === imagePaths.length) {
+        console.log("All images processed");
+      }
+    });
+
+    workers.push(worker);
+  });
+
+  return workers;
+}
+
+const images = ["image1.jpg", "image2.jpg", "image3.jpg"];
+processImages(images);
+```
+
+```javascript
+// image-worker.js
+const { parentPort, workerData } = require("worker_threads");
+const sharp = require("sharp");
+
+async function processImage(imagePath) {
+  try {
+    const processed = await sharp(imagePath)
+      .resize(800, 800)
+      .jpeg({ quality: 85 })
+      .toBuffer();
+
+    parentPort.postMessage({
+      index: workerData.index,
+      success: true,
+      size: processed.length,
+    });
+  } catch (error) {
+    parentPort.postMessage({
+      index: workerData.index,
+      success: false,
+      error: error.message,
+    });
+  }
+}
+
+processImage(workerData.imagePath);
+```
+
+### 2.2 Worker 线程池
+
+```javascript
+// main.js
+const { Worker } = require("worker_threads");
+const os = require("os");
+
+class WorkerPool {
+  constructor(scriptPath, size = os.cpus().length) {
+    this.scriptPath = scriptPath;
+    this.size = size;
+    this.workers = [];
+    this.queue = [];
+
+    this.init();
+  }
+
+  init() {
+    for (let i = 0; i < this.size; i++) {
+      const worker = new Worker(this.scriptPath);
+
+      worker.on("message", (result) => {
+        const callback = worker.currentTask;
+
+        if (callback) {
+          callback(null, result);
+          worker.currentTask = null;
+        }
+
+        this.nextTask(worker);
+      });
+
+      this.workers.push(worker);
+    }
+  }
+
+  run(data, callback) {
+    const worker = this.workers.find((w) => !w.currentTask);
+
+    if (worker) {
+      worker.currentTask = callback;
+      worker.postMessage(data);
+    } else {
+      this.queue.push({ data, callback });
+    }
+  }
+
+  nextTask(worker) {
+    if (this.queue.length > 0) {
+      const { data, callback } = this.queue.shift();
+      worker.currentTask = callback;
+      worker.postMessage(data);
+    }
+  }
+}
+
+// 使用
+const pool = new WorkerPool("./worker.js");
+
+for (let i = 0; i < 100; i++) {
+  pool.run({ task: i }, (err, result) => {
+    console.log(`Task ${i} completed:`, result);
+  });
+}
+```
+
+---
+
+## 三、常见问题
+
+### Q1: Worker Threads vs 子进程？
+
+**A**:
+
+- Worker Threads：共享内存，通信更快
+- 子进程：独立进程，隔离性好
+
+### Q2: 如何处理 Worker 错误？
+
+**A**:
+
+```javascript
+worker.on("error", (error) => {
+  console.error("Worker error:", error);
+});
+
+worker.on("exit", (code) => {
+  if (code !== 0) {
+    console.error("Worker exited with error");
+  }
+});
+```
+
+---
+
+## 四、总结
+
+**核心要点**：
+
+1. Worker Threads 实现多线程
+2. SharedArrayBuffer 共享内存
+3. 线程池提高并发性能
+
+**下一步**：网络编程 TCP/UDP
+
+---
+
+**相关代码**：[nodejs-core-examples](https://github.com/your-repo/nodejs-core-examples)
