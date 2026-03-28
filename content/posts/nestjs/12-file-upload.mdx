@@ -1,7 +1,7 @@
 ---
-title: "12 NestJS 文件上传：实现文件和图片上传功能"
+title: "12 NestJS 文件上传：从零实现文件和图片上传功能"
 date: "2026-03-19"
-summary: "深入掌握 NestJS 的文件上传机制，实现单文件、多文件上传，以及图片处理、文件存储等功能"
+summary: "深入掌握 NestJS 的文件上传机制，理解前端发送的文件格式，实现单文件、多文件上传，以及图片处理、文件存储等功能"
 tags: ["NestJS", "文件上传", "Multer", "图片处理", "OSS"]
 category: "nestjs"
 cover: ""
@@ -12,33 +12,223 @@ seriesOrder: 12
 
 ## 前言
 
-文件上传是 Web 应用的常见功能。在 NestJS 中，我们可以使用 Multer 来轻松实现文件上传。
+文件上传是 Web 应用的常见功能，比如用户头像、商品图片、文档上传等。但很多人对文件上传的原理并不清楚，不知道前端发送的数据长什么样，后端又是如何接收和处理的。
+
+**本文将解决什么问题？**
+
+你可能想知道：
+
+- 前端发送的文件数据到底是什么格式？
+- `multipart/form-data` 是什么？
+- 后端接收到的文件对象包含哪些信息？
+- 如何验证文件类型和大小？
+- 如何处理图片（压缩、裁剪）？
+- 如何将文件上传到云存储（OSS）？
 
 **本文将带你：**
 
-1. 配置文件上传
-2. 实现单文件上传
-3. 实现多文件上传
-4. 图片处理和压缩
-5. 文件存储（本地/OSS）
+1. 理解文件上传的原理
+2. 了解前端发送的数据格式
+3. 掌握 NestJS 接收文件的方式
+4. 实现单文件和多文件上传
+5. 图片处理（压缩、缩略图）
+6. 文件存储（本地/OSS）
 
 ---
 
-## 一、安装依赖
+## 一、文件上传原理
+
+### 1.1 前端发送的文件长什么样？
+
+当我们使用 FormData 上传文件时，浏览器会将数据编码为 `multipart/form-data` 格式。
+
+**前端代码示例**：
+
+```typescript
+// 前端发送请求
+const formData = new FormData();
+formData.append("avatar", file); // file 是 File 对象
+formData.append("userId", "123"); // 可以同时发送其他字段
+
+fetch("http://localhost:3000/upload/avatar", {
+  method: "POST",
+  body: formData,
+  // 注意：不需要设置 Content-Type，浏览器会自动设置
+  // 并生成 boundary 分隔符
+});
+```
+
+**实际的 HTTP 请求**：
+
+```http
+POST /upload/avatar HTTP/1.1
+Host: localhost:3000
+Content-Type: multipart/form-data; boundary=----WebKitFormBoundary7MA4YWxkTrZu0gW
+
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="avatar"; filename="photo.jpg"
+Content-Type: image/jpeg
+
+[这里是文件的二进制数据...]
+------WebKitFormBoundary7MA4YWxkTrZu0gW
+Content-Disposition: form-data; name="userId"
+
+123
+------WebKitFormBoundary7MA4YWxkTrZu0gW--
+```
+
+**关键点**：
+
+1. **Content-Type**: `multipart/form-data; boundary=----WebKitFormBoundary...`
+2. **boundary**: 浏览器自动生成的分隔符，用于区分不同的字段
+3. **每个字段**都包含：
+   - `Content-Disposition: form-data; name="字段名"; filename="文件名"`
+   - `Content-Type`: 文件的 MIME 类型
+   - 文件的二进制数据
+
+### 1.2 后端如何解析？
+
+NestJS 使用 Express 框架，Express 使用 **Multer** 中间件来处理 `multipart/form-data`。
+
+**Multer 的作用**：
+
+```
+浏览器发送的原始数据
+    ↓
+Multer 解析 multipart/form-data
+    ↓
+将文件保存到磁盘/内存
+    ↓
+在 req 对象中添加 file/files 属性
+    ↓
+控制器通过 @UploadedFile() 装饰器获取文件
+```
+
+---
+
+## 二、安装依赖
+
+### 2.1 安装 Multer 类型定义
 
 ```bash
 pnpm add -D @types/multer
 ```
 
-Multer 已包含在 `@nestjs/platform-express` 中。
+Multer 已经包含在 `@nestjs/platform-express` 中，无需额外安装。
+
+### 2.2 安装图片处理库
+
+```bash
+pnpm add sharp
+```
+
+### 2.3 安装 OSS SDK（可选）
+
+```bash
+pnpm add ali-oss @nestjs/config
+```
 
 ---
 
-## 二、基础文件上传
+## 三、后端接收到的文件对象
 
-### 2.1 单文件上传
+### 3.1 Express.Multer.File 对象结构
+
+当文件上传成功后，`@UploadedFile()` 装饰器会返回一个 `Express.Multer.File` 对象：
 
 ```typescript
+{
+  // 文件在服务器上的存储路径（磁盘存储）
+  path: string;
+
+  // 文件名（可能是重命名后的文件名）
+  filename: string;
+
+  // 原始文件名（用户上传时的文件名）
+  originalname: string;
+
+  // 文件的 MIME 类型
+  mimetype: string;
+
+  // 文件大小（字节）
+  size: number;
+
+  // 文件存储在内存中的 Buffer（内存存储）
+  buffer: Buffer;
+
+  // 字段名（FormData 中使用的字段名）
+  fieldname: string;
+
+  // 文件编码
+  encoding: string;
+}
+```
+
+**实际示例**：
+
+```typescript
+// 用户上传 photo.jpg
+{
+  fieldname: 'avatar',
+  originalname: 'photo.jpg',
+  encoding: '7bit',
+  mimetype: 'image/jpeg',
+  size: 245678,
+  filename: '1710876543210-photo.jpg',
+  path: '/uploads/avatars/1710876543210-photo.jpg'
+}
+```
+
+### 3.2 文件存储方式
+
+Multer 支持两种存储方式：
+
+**1. 内存存储（Memory Storage）**
+
+```typescript
+{
+  storage: multer.memoryStorage();
+}
+```
+
+- 文件存储在内存中（Buffer）
+- 适合小文件或需要直接处理的文件
+- 处理完后需要手动保存
+
+**2. 磁盘存储（Disk Storage）**
+
+```typescript
+{
+  storage: multer.diskStorage({
+    destination: "./uploads",
+    filename: (req, file, cb) => {
+      cb(null, file.originalname);
+    },
+  });
+}
+```
+
+- 文件保存到磁盘
+- 适合大文件
+- 可以自定义文件名
+
+---
+
+## 四、单文件上传
+
+### 4.1 基础实现
+
+**创建上传模块**：
+
+```bash
+nest g module upload
+nest g controller upload
+```
+
+**实现单文件上传**：
+
+```typescript
+// src/upload/upload.controller.ts
 import {
   Controller,
   Post,
@@ -47,6 +237,7 @@ import {
 } from "@nestjs/common";
 import { FileInterceptor } from "@nestjs/platform-express";
 import { diskStorage } from "multer";
+import { extname } from "path";
 
 @Controller("upload")
 export class UploadController {
@@ -56,102 +247,268 @@ export class UploadController {
       storage: diskStorage({
         destination: "./uploads/avatars",
         filename: (req, file, cb) => {
-          const filename = `${Date.now()}-${file.originalname}`;
+          // 生成唯一文件名：时间戳 + 随机数 + 原始扩展名
+          const uniqueSuffix =
+            Date.now() + "-" + Math.round(Math.random() * 1e9);
+          const ext = extname(file.originalname);
+          const filename = `${uniqueSuffix}${ext}`;
           cb(null, filename);
         },
       }),
+      // 文件过滤器
       fileFilter: (req, file, cb) => {
-        if (!file.originalname.match(/\.(jpg|jpeg|png|gif)$/)) {
-          return cb(new Error("只允许上传图片"), false);
+        // 只允许图片
+        if (!file.originalname.match(/\.(jpg|jpeg|png|gif)$/i)) {
+          return cb(new Error("只允许上传图片！"), false);
         }
         cb(null, true);
       },
+      // 限制文件大小：5MB
       limits: {
-        fileSize: 5 * 1024 * 1024, // 5MB
+        fileSize: 5 * 1024 * 1024,
       },
     })
   )
   uploadAvatar(@UploadedFile() file: Express.Multer.File) {
+    // 返回文件信息
     return {
-      filename: file.filename,
-      originalname: file.originalname,
-      size: file.size,
+      success: true,
+      message: "文件上传成功",
+      data: {
+        filename: file.filename,
+        originalname: file.originalname,
+        mimetype: file.mimetype,
+        size: file.size,
+        url: `/uploads/avatars/${file.filename}`,
+      },
     };
   }
 }
 ```
 
-### 2.2 多文件上传
+**测试上传**：
 
-```typescript
-import { FilesInterceptor } from '@nestjs/platform-express';
+```bash
+# 使用 curl 测试
+curl -X POST http://localhost:3000/upload/avatar \
+  -F "avatar=@/path/to/photo.jpg"
+```
 
-@Post('gallery')
-@UseInterceptors(
-  FilesInterceptor('files', 10, {
-    storage: diskStorage({
-      destination: './uploads/gallery',
-      filename: (req, file, cb) => {
-        const filename = `${Date.now()}-${file.originalname}`;
-        cb(null, filename);
-      },
-    }),
-    limits: {
-      fileSize: 10 * 1024 * 1024, // 10MB
-    },
-  }),
-)
-uploadGallery(@UploadedFiles() files: Express.Multer.File[]) {
-  return files.map(file => ({
-    filename: file.filename,
-    originalname: file.originalname,
-    size: file.size,
-  }));
+**返回结果**：
+
+```json
+{
+  "success": true,
+  "message": "文件上传成功",
+  "data": {
+    "filename": "1710876543210-123456789.jpg",
+    "originalname": "photo.jpg",
+    "mimetype": "image/jpeg",
+    "size": 245678,
+    "url": "/uploads/avatars/1710876543210-123456789.jpg"
+  }
 }
 ```
 
-### 2.3 字段文件上传
+### 4.2 创建上传目录
+
+确保上传目录存在：
 
 ```typescript
-import { FileFieldsInterceptor } from '@nestjs/platform-express';
+// src/main.ts
+import * as fs from "fs";
+import * as path from "path";
 
-@Post('documents')
-@UseInterceptors(
-  FileFieldsInterceptor([
-    { name: 'idCard', maxCount: 1 },
-    { name: 'passport', maxCount: 1 },
-  ]),
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  // 创建上传目录
+  const uploadDirs = [
+    "./uploads",
+    "./uploads/avatars",
+    "./uploads/gallery",
+    "./uploads/images",
+    "./uploads/images/thumbnails",
+  ];
+
+  uploadDirs.forEach((dir) => {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  });
+
+  // 提供静态文件访问
+  app.useStaticAssets(path.join(__dirname, "..", "uploads"));
+
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+### 4.3 静态文件访问
+
+配置静态文件访问后，可以通过 URL 访问上传的文件：
+
+```
+http://localhost:3000/avatars/1710876543210-123456789.jpg
+```
+
+---
+
+## 五、多文件上传
+
+### 5.1 基础实现
+
+```typescript
+import { FilesInterceptor } from "@nestjs/platform-express";
+
+@Controller("upload")
+export class UploadController {
+  @Post("gallery")
+  @UseInterceptors(
+    FilesInterceptor("files", 10, {
+      storage: diskStorage({
+        destination: "./uploads/gallery",
+        filename: (req, file, cb) => {
+          const uniqueSuffix =
+            Date.now() + "-" + Math.round(Math.random() * 1e9);
+          const ext = extname(file.originalname);
+          cb(null, `${uniqueSuffix}${ext}`);
+        },
+      }),
+      limits: {
+        fileSize: 10 * 1024 * 1024, // 10MB
+      },
+    })
+  )
+  uploadGallery(@UploadedFiles() files: Express.Multer.File[]) {
+    return {
+      success: true,
+      message: `成功上传 ${files.length} 个文件`,
+      data: files.map((file) => ({
+        filename: file.filename,
+        originalname: file.originalname,
+        size: file.size,
+        url: `/uploads/gallery/${file.filename}`,
+      })),
+    };
+  }
+}
+```
+
+**FilesInterceptor 参数**：
+
+```typescript
+FilesInterceptor(
+  'files',  // 字段名
+  10,       // 最多上传 10 个文件
+  { ... }   // Multer 选项
 )
-uploadDocuments(@UploadedFiles() files: any) {
-  return {
-    idCard: files.idCard?.[0],
-    passport: files.passport?.[0],
-  };
+```
+
+### 5.2 字段文件上传
+
+同时上传多个不同字段的文件：
+
+```typescript
+import { FileFieldsInterceptor } from "@nestjs/platform-express";
+
+@Controller("upload")
+export class UploadController {
+  @Post("documents")
+  @UseInterceptors(
+    FileFieldsInterceptor([
+      { name: "idCard", maxCount: 1 },
+      { name: "passport", maxCount: 1 },
+      { name: "photos", maxCount: 5 },
+    ])
+  )
+  uploadDocuments(
+    @UploadedFiles()
+    files: {
+      idCard?: Express.Multer.File[];
+      passport?: Express.Multer.File[];
+      photos?: Express.Multer.File[];
+    }
+  ) {
+    return {
+      success: true,
+      data: {
+        idCard: files.idCard?.[0],
+        passport: files.passport?.[0],
+        photos: files.photos,
+      },
+    };
+  }
+}
+```
+
+**前端示例**：
+
+```typescript
+const formData = new FormData();
+formData.append("idCard", idCardFile);
+formData.append("passport", passportFile);
+photos.forEach((photo) => {
+  formData.append("photos", photo);
+});
+
+fetch("/upload/documents", {
+  method: "POST",
+  body: formData,
+});
+```
+
+### 5.3 任意字段文件上传
+
+```typescript
+import { AnyFilesInterceptor } from "@nestjs/platform-express";
+
+@Controller("upload")
+export class UploadController {
+  @Post("multiple")
+  @UseInterceptors(
+    AnyFilesInterceptor({
+      storage: diskStorage({
+        destination: "./uploads/multiple",
+        filename: (req, file, cb) => {
+          const uniqueSuffix = Date.now();
+          const ext = extname(file.originalname);
+          cb(null, `${uniqueSuffix}-${file.fieldname}${ext}`);
+        },
+      }),
+    })
+  )
+  uploadMultiple(@UploadedFiles() files: Express.Multer.File[]) {
+    return {
+      success: true,
+      data: files,
+    };
+  }
 }
 ```
 
 ---
 
-## 三、图片处理
+## 六、图片处理
 
-### 3.1 安装 Sharp
+### 6.1 使用 Sharp 处理图片
 
-```bash
-pnpm add sharp
-```
-
-### 3.2 图片压缩和缩略图
+Sharp 是一个高性能的图片处理库，支持压缩、裁剪、缩放等操作。
 
 ```typescript
+// src/images/images.controller.ts
 import {
   Controller,
   Post,
   UseInterceptors,
   UploadedFile,
+  BadRequestException,
 } from "@nestjs/common";
 import { FileInterceptor } from "@nestjs/platform-express";
-import * as sharp from "sharp";
+import { diskStorage } from "multer";
 import { extname } from "path";
+import * as sharp from "sharp";
 
 @Controller("images")
 export class ImagesController {
@@ -160,43 +517,131 @@ export class ImagesController {
     FileInterceptor("image", {
       storage: diskStorage({
         destination: "./uploads/images",
-        filename: async (req, file, cb) => {
-          const filename = `${Date.now()}${extname(file.originalname)}`;
-          cb(null, filename);
+        filename: (req, file, cb) => {
+          const uniqueSuffix = Date.now();
+          const ext = extname(file.originalname);
+          cb(null, `${uniqueSuffix}${ext}`);
         },
       }),
+      fileFilter: (req, file, cb) => {
+        if (!file.mimetype.startsWith("image/")) {
+          return cb(new BadRequestException("只允许上传图片"), false);
+        }
+        cb(null, true);
+      },
+      limits: {
+        fileSize: 10 * 1024 * 1024, // 10MB
+      },
     })
   )
   async uploadImage(@UploadedFile() file: Express.Multer.File) {
     const originalPath = file.path;
-    const thumbnailPath = `./uploads/images/thumbnails/${file.filename}`;
+    const thumbnailDir = "./uploads/images/thumbnails";
+    const thumbnailPath = `${thumbnailDir}/${file.filename}`;
 
-    // 生成缩略图
-    await sharp(originalPath)
-      .resize(200, 200, { fit: "cover" })
-      .toFile(thumbnailPath);
+    try {
+      // 生成缩略图：200x200，裁剪模式
+      await sharp(originalPath)
+        .resize(200, 200, {
+          fit: "cover",
+          position: "center",
+        })
+        .jpeg({ quality: 80 })
+        .toFile(thumbnailPath);
 
-    return {
-      original: file.filename,
-      thumbnail: `thumbnails/${file.filename}`,
-    };
+      // 生成中等尺寸：800x800，保持比例
+      const mediumPath = `./uploads/images/medium-${file.filename}`;
+      await sharp(originalPath)
+        .resize(800, 800, {
+          fit: "inside",
+          withoutEnlargement: true,
+        })
+        .jpeg({ quality: 85 })
+        .toFile(mediumPath);
+
+      return {
+        success: true,
+        data: {
+          original: `/uploads/images/${file.filename}`,
+          thumbnail: `/uploads/images/thumbnails/${file.filename}`,
+          medium: `/uploads/images/medium-${file.filename}`,
+        },
+      };
+    } catch (error) {
+      throw new BadRequestException("图片处理失败");
+    }
   }
+}
+```
+
+### 6.2 图片裁剪
+
+```typescript
+@Post('crop')
+@UseInterceptors(FileInterceptor('image'))
+async cropImage(
+  @UploadedFile() file: Express.Multer.File,
+  @Body() cropDto: { x: number; y: number; width: number; height: number },
+) {
+  const outputPath = `./uploads/cropped/${Date.now()}-${file.originalname}`;
+
+  await sharp(file.buffer)
+    .extract({
+      left: cropDto.x,
+      top: cropDto.y,
+      width: cropDto.width,
+      height: cropDto.height,
+    })
+    .toFile(outputPath);
+
+  return { success: true, url: outputPath };
+}
+```
+
+### 6.3 图片压缩
+
+```typescript
+@Post('compress')
+@UseInterceptors(FileInterceptor('image'))
+async compressImage(@UploadedFile() file: Express.Multer.File) {
+  const outputPath = `./uploads/compressed/${Date.now()}-${file.originalname}`;
+
+  // 获取原始图片信息
+  const metadata = await sharp(file.buffer).metadata();
+
+  // 根据原始大小决定压缩比例
+  let quality = 80;
+  if (metadata.size && metadata.size > 5 * 1024 * 1024) {
+    quality = 60; // 大于 5MB，压缩更多
+  }
+
+  await sharp(file.buffer)
+    .jpeg({ quality })
+    .toFile(outputPath);
+
+  return { success: true, url: outputPath };
 }
 ```
 
 ---
 
-## 四、阿里云 OSS
+## 七、阿里云 OSS 上传
 
-### 4.1 安装 SDK
+### 7.1 配置 OSS
 
-```bash
-pnpm add ali-oss @nestjs/config
+**环境变量**（`.env`）：
+
+```env
+OSS_REGION=oss-cn-hangzhou
+OSS_ACCESS_KEY_ID=your_access_key_id
+OSS_ACCESS_KEY_SECRET=your_access_key_secret
+OSS_BUCKET=your-bucket-name
 ```
 
-### 4.2 OSS 服务
+### 7.2 创建 OSS 服务
 
 ```typescript
+// src/oss/oss.service.ts
 import { Injectable } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import * as OSS from "ali-oss";
@@ -214,28 +659,667 @@ export class OssService {
     });
   }
 
-  async uploadFile(filename: string, file: Buffer) {
-    const result = await this.client.put(filename, file);
-    return result.url;
+  /**
+   * 上传文件到 OSS
+   * @param filename 文件名
+   * @param file 文件 Buffer
+   * @param folder 文件夹路径
+   */
+  async uploadFile(filename: string, file: Buffer, folder: string = "uploads") {
+    const key = `${folder}/${Date.now()}-${filename}`;
+
+    try {
+      const result = await this.client.put(key, file);
+      return {
+        url: result.url,
+        name: result.name,
+      };
+    } catch (error) {
+      throw new Error(`OSS 上传失败: ${error.message}`);
+    }
   }
 
+  /**
+   * 删除文件
+   */
   async deleteFile(filename: string) {
-    await this.client.delete(filename);
+    try {
+      await this.client.delete(filename);
+      return { success: true };
+    } catch (error) {
+      throw new Error(`OSS 删除失败: ${error.message}`);
+    }
+  }
+
+  /**
+   * 获取文件签名 URL（临时访问）
+   */
+  async getSignedUrl(filename: string, expires: number = 3600) {
+    try {
+      const url = this.client.signatureUrl(filename, { expires });
+      return url;
+    } catch (error) {
+      throw new Error(`生成签名 URL 失败: ${error.message}`);
+    }
+  }
+}
+```
+
+### 7.3 OSS 上传控制器
+
+```typescript
+// src/oss/oss.controller.ts
+import {
+  Controller,
+  Post,
+  UseInterceptors,
+  UploadedFile,
+} from "@nestjs/common";
+import { FileInterceptor } from "@nestjs/platform-express";
+import { OssService } from "./oss.service";
+
+@Controller("oss")
+export class OssController {
+  constructor(private ossService: OssService) {}
+
+  @Post("upload")
+  @UseInterceptors(
+    FileInterceptor("file", {
+      limits: {
+        fileSize: 10 * 1024 * 1024, // 10MB
+      },
+    })
+  )
+  async uploadToOss(@UploadedFile() file: Express.Multer.File) {
+    // 直接上传内存中的文件
+    const result = await this.ossService.uploadFile(
+      file.originalname,
+      file.buffer,
+      "avatars"
+    );
+
+    return {
+      success: true,
+      message: "文件上传成功",
+      data: {
+        url: result.url,
+        name: result.name,
+        originalName: file.originalname,
+        size: file.size,
+        mimetype: file.mimetype,
+      },
+    };
+  }
+}
+```
+
+### 7.4 OSS 模块
+
+```typescript
+// src/oss/oss.module.ts
+import { Module } from "@nestjs/common";
+import { OssController } from "./oss.controller";
+import { OssService } from "./oss.service";
+import { ConfigModule } from "@nestjs/config";
+
+@Module({
+  imports: [ConfigModule],
+  controllers: [OssController],
+  providers: [OssService],
+  exports: [OssService],
+})
+export class OssModule {}
+```
+
+---
+
+## 八、文件验证
+
+### 8.1 文件类型验证
+
+```typescript
+// src/common/utils/file.utils.ts
+export const ALLOWED_IMAGE_TYPES = [
+  "image/jpeg",
+  "image/jpg",
+  "image/png",
+  "image/gif",
+  "image/webp",
+];
+
+export const ALLOWED_DOCUMENT_TYPES = [
+  "application/pdf",
+  "application/msword",
+  "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  "text/plain",
+];
+
+export const FILE_SIZE_LIMITS = {
+  avatar: 5 * 1024 * 1024, // 5MB
+  image: 10 * 1024 * 1024, // 10MB
+  document: 20 * 1024 * 1024, // 20MB
+};
+
+export function validateFileType(
+  file: Express.Multer.File,
+  allowedTypes: string[]
+): boolean {
+  return allowedTypes.includes(file.mimetype);
+}
+
+export function validateFileSize(
+  file: Express.Multer.File,
+  maxSize: number
+): boolean {
+  return file.size <= maxSize;
+}
+```
+
+### 8.2 自定义文件过滤器
+
+```typescript
+// src/common/interceptors/file-upload.interceptor.ts
+import { BadRequestException } from "@nestjs/common";
+import { FileInterceptor } from "@nestjs/platform-express";
+import { diskStorage } from "multer";
+import { extname } from "path";
+import {
+  ALLOWED_IMAGE_TYPES,
+  FILE_SIZE_LIMITS,
+  validateFileType,
+  validateFileSize,
+} from "../utils/file.utils";
+
+export function ImageFileInterceptor(fieldName: string) {
+  return FileInterceptor(fieldName, {
+    storage: diskStorage({
+      destination: "./uploads/images",
+      filename: (req, file, cb) => {
+        const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
+        const ext = extname(file.originalname);
+        cb(null, `${uniqueSuffix}${ext}`);
+      },
+    }),
+    fileFilter: (req, file, cb) => {
+      // 验证文件类型
+      if (!validateFileType(file, ALLOWED_IMAGE_TYPES)) {
+        return cb(new BadRequestException("不支持的文件类型"), false);
+      }
+
+      // 验证文件大小
+      if (!validateFileSize(file, FILE_SIZE_LIMITS.image)) {
+        return cb(new BadRequestException("文件大小超过限制（10MB）"), false);
+      }
+
+      cb(null, true);
+    },
+    limits: {
+      fileSize: FILE_SIZE_LIMITS.image,
+    },
+  });
+}
+```
+
+### 8.3 使用自定义拦截器
+
+```typescript
+@Controller("upload")
+export class UploadController {
+  @Post("image")
+  @UseInterceptors(ImageFileInterceptor("image"))
+  uploadImage(@UploadedFile() file: Express.Multer.File) {
+    return {
+      success: true,
+      data: {
+        url: `/uploads/images/${file.filename}`,
+      },
+    };
   }
 }
 ```
 
 ---
 
-## 五、总结
+## 九、错误处理
 
-**核心要点**：
+### 9.1 文件上传异常
 
-1. **FileInterceptor** - 单文件上传
-2. **FilesInterceptor** - 多文件上传
-3. **Sharp** - 图片处理
-4. **OSS** - 云存储
+```typescript
+// src/common/exceptions/file-upload.exception.ts
+import { HttpException, HttpStatus } from "@nestjs/common";
 
-**下一步**：《异步任务队列（BullMQ）》
+export class FileUploadException extends HttpException {
+  constructor(
+    message: string,
+    statusCode: HttpStatus = HttpStatus.BAD_REQUEST
+  ) {
+    super(
+      {
+        success: false,
+        message,
+        code: "FILE_UPLOAD_ERROR",
+      },
+      statusCode
+    );
+  }
+}
+
+export class FileTooLargeException extends FileUploadException {
+  constructor(maxSize: string) {
+    super(`文件大小超过限制（最大 ${maxSize}）`, HttpStatus.PAYLOAD_TOO_LARGE);
+  }
+}
+
+export class InvalidFileTypeException extends FileUploadException {
+  constructor(allowedTypes: string[]) {
+    super(`不支持的文件类型，允许的类型：${allowedTypes.join(", ")}`);
+  }
+}
+```
+
+### 9.2 全局异常处理
+
+```typescript
+// src/common/filters/file-upload.filter.ts
+import {
+  ExceptionFilter,
+  Catch,
+  ArgumentsHost,
+  HttpException,
+} from "@nestjs/common";
+import { Response } from "express";
+
+@Catch(Error)
+export class FileUploadFilter implements ExceptionFilter {
+  catch(exception: Error, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse<Response>();
+
+    if (exception.name === "MulterError") {
+      // Multer 错误
+      let message = "文件上传失败";
+      if (exception.message === "File too large") {
+        message = "文件大小超过限制";
+      } else if (exception.message === "Unexpected field") {
+        message = "字段名错误";
+      }
+
+      return response.status(400).json({
+        success: false,
+        message,
+        code: "MULTER_ERROR",
+      });
+    }
+
+    // 其他错误
+    return response.status(500).json({
+      success: false,
+      message: "服务器错误",
+      code: "INTERNAL_SERVER_ERROR",
+    });
+  }
+}
+```
 
 ---
+
+## 十、完整实战示例
+
+### 10.1 用户头像上传
+
+```typescript
+// src/users/users.controller.ts
+import {
+  Controller,
+  Post,
+  UseInterceptors,
+  UploadedFile,
+  ParseFilePipe,
+  MaxFileSizeValidator,
+  FileTypeValidator,
+  BadRequestException,
+} from "@nestjs/common";
+import { FileInterceptor } from "@nestjs/platform-express";
+import { diskStorage } from "multer";
+import { extname } from "path";
+import { UsersService } from "./users.service";
+
+@Controller("users")
+export class UsersController {
+  constructor(private usersService: UsersService) {}
+
+  @Post(":id/avatar")
+  @UseInterceptors(
+    FileInterceptor("avatar", {
+      storage: diskStorage({
+        destination: "./uploads/avatars",
+        filename: (req, file, cb) => {
+          // 使用用户 ID 作为文件名前缀
+          const userId = req.params.id;
+          const ext = extname(file.originalname);
+          cb(null, `user-${userId}${ext}`);
+        },
+      }),
+      fileFilter: (req, file, cb) => {
+        if (!file.mimetype.startsWith("image/")) {
+          return cb(new BadRequestException("只允许上传图片"), false);
+        }
+        cb(null, true);
+      },
+      limits: {
+        fileSize: 5 * 1024 * 1024, // 5MB
+      },
+    })
+  )
+  async uploadAvatar(
+    @Param("id") id: string,
+    @UploadedFile(
+      new ParseFilePipe({
+        validators: [
+          new MaxFileSizeValidator({ maxSize: 5 * 1024 * 1024 }),
+          new FileTypeValidator({ fileType: /(jpg|jpeg|png|gif)$/ }),
+        ],
+        exceptionFactory: (error) => {
+          throw new BadRequestException("文件验证失败");
+        },
+      })
+    )
+    file: Express.Multer.File
+  ) {
+    // 更新数据库中的头像路径
+    const avatarUrl = await this.usersService.updateAvatar(id, file.filename);
+
+    return {
+      success: true,
+      message: "头像上传成功",
+      data: {
+        avatarUrl,
+      },
+    };
+  }
+}
+```
+
+**服务层**：
+
+```typescript
+// src/users/users.service.ts
+import { Injectable, NotFoundException } from "@nestjs/common";
+import { PrismaService } from "../prisma/prisma.service";
+
+@Injectable()
+export class UsersService {
+  constructor(private prisma: PrismaService) {}
+
+  async updateAvatar(userId: string, filename: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id: userId },
+    });
+
+    if (!user) {
+      throw new NotFoundException("用户不存在");
+    }
+
+    // 更新头像
+    await this.prisma.user.update({
+      where: { id: userId },
+      data: {
+        avatar: `/uploads/avatars/${filename}`,
+      },
+    });
+
+    return `/uploads/avatars/${filename}`;
+  }
+}
+```
+
+### 10.2 前端完整示例
+
+```typescript
+// 前端组件
+import { useState } from 'react';
+
+export function AvatarUpload() {
+  const [uploading, setUploading] = useState(false);
+  const [preview, setPreview] = useState<string | null>(null);
+
+  const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // 客户端验证
+    if (!file.type.startsWith('image/')) {
+      alert('请选择图片文件');
+      return;
+    }
+
+    if (file.size > 5 * 1024 * 1024) {
+      alert('文件大小不能超过 5MB');
+      return;
+    }
+
+    // 预览
+    setPreview(URL.createObjectURL(file));
+
+    // 上传
+    setUploading(true);
+    try {
+      const formData = new FormData();
+      formData.append('avatar', file);
+
+      const response = await fetch(`/api/users/${userId}/avatar`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      const result = await response.json();
+
+      if (result.success) {
+        alert('头像上传成功！');
+        // 刷新用户信息
+      } else {
+        alert(result.message);
+      }
+    } catch (error) {
+      alert('上传失败，请重试');
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  return (
+    <div>
+      <input
+        type="file"
+        accept="image/*"
+        onChange={handleFileChange}
+        disabled={uploading}
+      />
+      {preview && (
+        <img src={preview} alt="预览" style={{ width: 200, height: 200 }} />
+      )}
+      {uploading && <p>上传中...</p>}
+    </div>
+  );
+}
+```
+
+---
+
+## 十一、最佳实践
+
+### 11.1 文件命名
+
+✅ **推荐做法**：
+
+```typescript
+// 时间戳 + 随机数 + 原始扩展名
+const filename = `${Date.now()}-${Math.random().toString(36).substring(7)}${ext}`;
+
+// 或者使用 UUID
+import { v4 as uuidv4 } from "uuid";
+const filename = `${uuidv4()}${ext}`;
+
+// 或者使用用户 ID
+const filename = `user-${userId}-${Date.now()}${ext}`;
+```
+
+❌ **不推荐**：
+
+```typescript
+// 直接使用原始文件名（可能导致覆盖）
+const filename = file.originalname;
+
+// 使用时间戳（可能重复）
+const filename = `${Date.now()}${ext}`;
+```
+
+### 11.2 文件存储
+
+✅ **推荐做法**：
+
+```typescript
+// 按日期分层存储
+const folder = `uploads/${new Date().toISOString().split("T")[0]}`;
+
+// 按用户分层存储
+const folder = `uploads/users/${userId}`;
+
+// 按类型分层存储
+const folders = {
+  avatar: "uploads/avatars",
+  document: "uploads/documents",
+  image: "uploads/images",
+};
+```
+
+### 11.3 安全性
+
+✅ **必须做**：
+
+```typescript
+// 1. 验证文件类型
+fileFilter: (req, file, cb) => {
+  if (!ALLOWED_TYPES.includes(file.mimetype)) {
+    return cb(new Error('不支持的文件类型'), false);
+  }
+  cb(null, true);
+}
+
+// 2. 限制文件大小
+limits: {
+  fileSize: 5 * 1024 * 1024, // 5MB
+}
+
+// 3. 重命名文件（防止路径遍历攻击）
+filename: (req, file, cb) => {
+  // 不要使用 file.originalname
+  const safeName = `${Date.now()}-${Math.random().toString(36)}${ext}`;
+  cb(null, safeName);
+}
+
+// 4. 验证文件内容（不只是扩展名）
+import { fileTypeFromBuffer } from 'file-type';
+const type = await fileTypeFromBuffer(file.buffer);
+if (!ALLOWED_TYPES.includes(type.mime)) {
+  throw new BadRequestException('文件类型不匹配');
+}
+```
+
+### 11.4 性能优化
+
+```typescript
+// 1. 使用流式处理（大文件）
+import { createReadStream } from 'fs';
+const stream = createReadStream(file.path);
+await this.ossService.uploadStream(filename, stream);
+
+// 2. 异步处理图片
+@Post('upload')
+async upload(@UploadedFile() file: Express.Multer.File) {
+  // 立即返回，后台处理
+  this.imageQueue.add('process', { file: file.filename });
+  return { success: true, message: '上传成功，正在处理中...' };
+}
+
+// 3. 使用 CDN
+const imageUrl = `https://cdn.example.com/${filename}`;
+```
+
+### 11.5 清理临时文件
+
+```typescript
+// 定期清理临时文件
+import * as fs from 'fs';
+import * as path from 'path';
+
+@Cron('0 0 * * *') // 每天凌晨执行
+async cleanTempFiles() {
+  const tempDir = './uploads/temp';
+  const files = fs.readdirSync(tempDir);
+  const now = Date.now();
+  const maxAge = 24 * 60 * 60 * 1000; // 24 小时
+
+  for (const file of files) {
+    const filePath = path.join(tempDir, file);
+    const stats = fs.statSync(filePath);
+
+    if (now - stats.mtimeMs > maxAge) {
+      fs.unlinkSync(filePath);
+      this.logger.log(`删除临时文件: ${file}`);
+    }
+  }
+}
+```
+
+---
+
+## 十二、总结
+
+**本文我们完成了**：
+
+✅ 理解了文件上传的原理
+✅ 了解了前端发送的数据格式
+✅ 掌握了 NestJS 接收文件的方式
+✅ 实现了单文件和多文件上传
+✅ 图片处理（压缩、缩略图）
+✅ 文件存储（本地/OSS）
+
+**核心要点回顾**：
+
+1. **multipart/form-data** - 浏览器发送文件的格式
+2. **Multer** - NestJS 用于解析文件上传的中间件
+3. **Express.Multer.File** - 后端接收到的文件对象
+4. **FileInterceptor** - 单文件上传拦截器
+5. **FilesInterceptor** - 多文件上传拦截器
+6. **Sharp** - 图片处理库
+7. **OSS** - 阿里云对象存储
+
+**最佳实践**：
+
+- ✅ 始终验证文件类型和大小
+- ✅ 使用安全的文件命名方式
+- ✅ 合理组织文件存储结构
+- ✅ 图片处理后保存（压缩、缩略图）
+- ✅ 考虑使用云存储（OSS）
+- ✅ 定期清理临时文件
+- ✅ 做好错误处理
+
+**下一步**：
+
+在下一篇文章《异步任务队列（BullMQ）》中，我们将深入学习：
+
+- 什么是异步任务队列
+- 使用 BullMQ 处理耗时任务
+- 图片处理异步化
+- 邮件发送队列化
+- 任务失败重试机制
+
+---
+
+**相关代码**：
+
+- 完整项目示例：[blog-api](https://github.com/your-repo/blog-api)
+- 本篇代码示例：[branch: 12-file-upload](https://github.com/your-repo/blog-api/tree/12-file-upload)
+
+**有问题？** 欢迎在评论区留言，我会尽快回复！
