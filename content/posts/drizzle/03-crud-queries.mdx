@@ -1,0 +1,789 @@
+---
+title: "03. CRUD 操作和查询构建器"
+date: "2026-03-24"
+summary: "深入掌握 Drizzle ORM 的 CRUD 操作，学习类型安全的查询构建器，掌握 where 条件、orderBy、分页等核心功能。"
+tags: ["Drizzle ORM", "CRUD", "查询构建器", "TypeScript", "PostgreSQL"]
+category: "drizzle"
+draft: false
+series: "Drizzle ORM 类型安全的数据库访问实战"
+seriesOrder: 3
+---
+
+## 前言
+
+CRUD（增删改查）是数据库操作的核心。Drizzle ORM 提供了**类型安全**的查询 API，让编写查询变得简单而可靠。
+
+**本文核心内容**：
+
+- ✅ Create（插入数据）
+- ✅ Read（查询数据）
+- ✅ Update（更新数据）
+- ✅ Delete（删除数据）
+- ✅ 查询构建器详解
+- ✅ where 条件、orderBy、分页
+
+---
+
+## 一、Create - 插入数据
+
+### 1.1 基础插入
+
+```typescript
+import { db } from "./db";
+import { users } from "./schema";
+
+// 插入单条数据
+const [newUser] = await db
+  .insert(users)
+  .values({
+    email: "test@example.com",
+    name: "Test User",
+  })
+  .returning();
+
+// 返回值：{ id: 1, email: 'test@example.com', name: 'Test User', createdAt: Date }
+
+// 不使用 returning
+await db.insert(users).values({
+  email: "test2@example.com",
+  name: "Test User 2",
+});
+// 返回值：无（只影响行数）
+```
+
+### 1.2 批量插入
+
+```typescript
+// 批量插入多条数据
+const insertedUsers = await db
+  .insert(users)
+  .values([
+    { email: "user1@example.com", name: "User 1" },
+    { email: "user2@example.com", name: "User 2" },
+    { email: "user3@example.com", name: "User 3" },
+  ])
+  .returning();
+
+// 生成的 SQL：
+// INSERT INTO users (email, name) VALUES
+//   ('user1@example.com', 'User 1'),
+//   ('user2@example.com', 'User 2'),
+//   ('user3@example.com', 'User 3')
+// RETURNING *
+```
+
+### 1.3 使用默认值
+
+```typescript
+import { pgTable, serial, varchar, text, timestamp } from "drizzle-orm/pg-core";
+
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  email: varchar("email", { length: 255 }).notNull(),
+  name: text("name"),
+  role: varchar("role", { length: 50 }).default("user"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+// 只提供必要字段，其他使用默认值
+await db.insert(users).values({
+  email: "test@example.com",
+  // role 默认为 'user'
+  // createdAt 默认为当前时间
+});
+```
+
+### 1.4 插入并获取 ID
+
+```typescript
+// PostgreSQL 使用 returning 获取自增 ID
+const [user] = await db
+  .insert(users)
+  .values({
+    email: "test@example.com",
+    name: "Test",
+  })
+  .returning();
+
+console.log(user.id); // 新插入记录的 ID
+
+// 或者只返回特定字段
+const [userId] = await db
+  .insert(users)
+  .values({
+    email: "test@example.com",
+    name: "Test",
+  })
+  .returning({ id: users.id });
+```
+
+---
+
+## 二、Read - 查询数据
+
+### 2.1 基础查询
+
+```typescript
+// 查询所有字段
+const allUsers = await db.select().from(users);
+
+// 生成的 SQL：
+// SELECT id, email, name, role, created_at FROM users
+
+// 查询特定字段
+const userEmails = await db
+  .select({
+    id: users.id,
+    email: users.email,
+  })
+  .from(users);
+
+// 生成的 SQL：
+// SELECT id, email FROM users
+```
+
+### 2.2 where 条件
+
+```typescript
+import { eq, and, or, ne, gt, gte, lt, lte, like, ilike } from "drizzle-orm";
+
+// 等于
+const users = await db
+  .select()
+  .from(users)
+  .where(eq(users.email, "test@example.com"));
+// SQL：WHERE email = 'test@example.com'
+
+// 不等于
+const activeUsers = await db
+  .select()
+  .from(users)
+  .where(ne(users.role, "banned"));
+
+// 大于
+const recentUsers = await db
+  .select()
+  .from(users)
+  .where(gt(users.createdAt, new Date("2024-01-01")));
+
+// AND 条件
+const result = await db
+  .select()
+  .from(users)
+  .where(
+    and(eq(users.role, "admin"), gt(users.createdAt, new Date("2024-01-01")))
+  );
+// SQL：WHERE role = 'admin' AND created_at > '2024-01-01'
+
+// OR 条件
+const result = await db
+  .select()
+  .from(users)
+  .where(or(eq(users.email, "admin@example.com"), eq(users.role, "admin")));
+// SQL：WHERE email = 'admin@example.com' OR role = 'admin'
+
+// 复杂条件
+const result = await db
+  .select()
+  .from(users)
+  .where(
+    or(
+      and(eq(users.role, "admin"), gt(users.createdAt, new Date("2024-01-01"))),
+      eq(users.email, "superadmin@example.com")
+    )
+  );
+// SQL：WHERE (role = 'admin' AND created_at > '2024-01-01') OR email = 'superadmin@example.com'
+```
+
+### 2.3 模糊查询
+
+```typescript
+// LIKE（区分大小写）
+const users = await db.select().from(users).where(like(users.name, "John%"));
+// SQL：WHERE name LIKE 'John%'
+
+// ILIKE（不区分大小写）
+const users = await db.select().from(users).where(ilike(users.name, "%john%"));
+// SQL：WHERE name ILIKE '%john%'
+```
+
+### 2.4 排序
+
+```typescript
+import { desc, asc } from "drizzle-orm";
+
+// 升序
+const users = await db.select().from(users).orderBy(asc(users.createdAt));
+
+// 降序
+const users = await db.select().from(users).orderBy(desc(users.createdAt));
+
+// 多字段排序
+const users = await db
+  .select()
+  .from(users)
+  .orderBy(desc(users.role), asc(users.createdAt));
+// SQL：ORDER BY role DESC, created_at ASC
+```
+
+### 2.5 限制和偏移
+
+```typescript
+// 限制结果数量
+const users = await db.select().from(users).limit(10);
+
+// 分页
+const page = 2;
+const pageSize = 10;
+const users = await db
+  .select()
+  .from(users)
+  .limit(pageSize)
+  .offset((page - 1) * pageSize);
+
+// SQL：SELECT ... LIMIT 10 OFFSET 10
+```
+
+### 2.6 单条记录查询
+
+```typescript
+// 使用 findFirst 获取第一条
+const user = await db
+  .select()
+  .from(users)
+  .where(eq(users.email, "test@example.com"))
+  .limit(1);
+
+// 使用解构获取单条
+const [user] = await db.select().from(users).where(eq(users.id, 1));
+
+// 如果没有找到，user 为 undefined
+if (!user) {
+  throw new Error("User not found");
+}
+```
+
+---
+
+## 三、Update - 更新数据
+
+### 3.1 基础更新
+
+```typescript
+// 更新单条记录
+await db.update(users).set({ name: "Updated Name" }).where(eq(users.id, 1));
+
+// SQL：UPDATE users SET name = 'Updated Name' WHERE id = 1
+
+// 更新并返回
+const [updatedUser] = await db
+  .update(users)
+  .set({ name: "Updated Name" })
+  .where(eq(users.id, 1))
+  .returning();
+```
+
+### 3.2 更新多个字段
+
+```typescript
+await db
+  .update(users)
+  .set({
+    name: "New Name",
+    email: "newemail@example.com",
+    role: "admin",
+  })
+  .where(eq(users.id, 1));
+```
+
+### 3.3 条件更新
+
+```typescript
+import { sql } from "drizzle-orm";
+
+// 使用 SQL 表达式
+await db
+  .update(users)
+  .set({
+    // 访问次数 +1
+    visitCount: sql`${users.visitCount} + 1`,
+    // 更新时间
+    updatedAt: new Date(),
+  })
+  .where(eq(users.id, 1));
+
+// 多条件更新
+await db
+  .update(users)
+  .set({ role: "inactive" })
+  .where(
+    and(lt(users.lastLoginAt, new Date("2024-01-01")), eq(users.role, "user"))
+  );
+```
+
+### 3.4 批量更新
+
+```typescript
+// 更新所有匹配的记录
+await db
+  .update(users)
+  .set({ status: "inactive" })
+  .where(lt(users.lastLoginAt, new Date("2024-01-01")));
+
+// 注意：没有 where 时会更新所有记录！
+await db.update(users).set({ status: "active" });
+// SQL：UPDATE users SET status = 'active'（影响所有行！）
+```
+
+---
+
+## 四、Delete - 删除数据
+
+### 4.1 基础删除
+
+```typescript
+// 删除单条记录
+await db.delete(users).where(eq(users.id, 1));
+
+// SQL：DELETE FROM users WHERE id = 1
+
+// 删除并返回
+const [deletedUser] = await db.delete(users).where(eq(users.id, 1)).returning();
+```
+
+### 4.2 条件删除
+
+```typescript
+// 删除所有符合条件的记录
+await db
+  .delete(users)
+  .where(
+    and(lt(users.createdAt, new Date("2023-01-01")), eq(users.role, "guest"))
+  );
+
+// 删除所有记录（危险！）
+await db.delete(users);
+// SQL：DELETE FROM users（删除所有行！）
+```
+
+### 4.3 软删除
+
+```typescript
+import {
+  pgTable,
+  serial,
+  varchar,
+  timestamp,
+  boolean,
+} from "drizzle-orm/pg-core";
+
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  email: varchar("email", { length: 255 }).notNull(),
+  deleted: boolean("deleted").default(false),
+  deletedAt: timestamp("deleted_at"),
+});
+
+// 软删除：更新 deleted 标记
+await db
+  .update(users)
+  .set({
+    deleted: true,
+    deletedAt: new Date(),
+  })
+  .where(eq(users.id, 1));
+
+// 查询时过滤已删除
+const activeUsers = await db
+  .select()
+  .from(users)
+  .where(eq(users.deleted, false));
+```
+
+---
+
+## 五、查询构建器详解
+
+### 5.1 链式调用
+
+```typescript
+const result = await db
+  .select({
+    id: users.id,
+    name: users.name,
+    email: users.email,
+  })
+  .from(users)
+  .where(eq(users.role, "admin"))
+  .orderBy(desc(users.createdAt))
+  .limit(10)
+  .offset(0);
+```
+
+### 5.2 动态查询
+
+```typescript
+// 根据条件动态构建查询
+async function findUsers(filters: {
+  role?: string;
+  search?: string;
+  limit?: number;
+}) {
+  const conditions = [];
+
+  if (filters.role) {
+    conditions.push(eq(users.role, filters.role));
+  }
+
+  if (filters.search) {
+    conditions.push(
+      or(
+        ilike(users.name, `%${filters.search}%`),
+        ilike(users.email, `%${filters.search}%`)
+      )
+    );
+  }
+
+  const query = db
+    .select()
+    .from(users)
+    .where(conditions.length > 0 ? and(...conditions) : undefined);
+
+  if (filters.limit) {
+    query.limit(filters.limit);
+  }
+
+  return await query;
+}
+
+// 使用
+const admins = await findUsers({ role: "admin", limit: 10 });
+const searchResults = await findUsers({ search: "john" });
+```
+
+### 5.3 计数
+
+```typescript
+import { count, sql } from "drizzle-orm";
+
+// 方式 1：使用 count 函数
+const [result] = await db
+  .select({
+    count: count(),
+  })
+  .from(users);
+console.log(result.count); // 总用户数
+
+// 方式 2：使用 sql
+const [result] = await db
+  .select({
+    count: sql<number>`COUNT(*)`.as("count"),
+  })
+  .from(users);
+
+// 条件计数
+const [result] = await db
+  .select({
+    count: count(),
+  })
+  .from(users)
+  .where(eq(users.role, "admin"));
+```
+
+### 5.4 去重
+
+```typescript
+import { distinct } from "drizzle-orm";
+
+// 获取所有不同的角色
+const roles = await db
+  .selectDistinct({
+    role: users.role,
+  })
+  .from(users);
+
+// SQL：SELECT DISTINCT role FROM users
+```
+
+---
+
+## 六、实战示例
+
+### 6.1 博客文章 CRUD
+
+```typescript
+import {
+  pgTable,
+  serial,
+  varchar,
+  text,
+  timestamp,
+  boolean,
+} from "drizzle-orm/pg-core";
+import { eq, and, desc, asc } from "drizzle-orm";
+
+export const posts = pgTable("posts", {
+  id: serial("id").primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  slug: varchar("slug", { length: 255 }).notNull().unique(),
+  content: text("content").notNull(),
+  excerpt: text("excerpt"),
+  published: boolean("published").default(false),
+  authorId: integer("author_id").references(() => users.id),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+// 创建文章
+async function createPost(data: {
+  title: string;
+  slug: string;
+  content: string;
+  excerpt?: string;
+  authorId: number;
+}) {
+  const [post] = await db
+    .insert(posts)
+    .values({
+      ...data,
+      published: false,
+    })
+    .returning();
+  return post;
+}
+
+// 获取文章列表
+async function getPosts(filters: {
+  published?: boolean;
+  authorId?: number;
+  page?: number;
+  limit?: number;
+}) {
+  const conditions = [];
+
+  if (filters.published !== undefined) {
+    conditions.push(eq(posts.published, filters.published));
+  }
+
+  if (filters.authorId) {
+    conditions.push(eq(posts.authorId, filters.authorId));
+  }
+
+  const page = filters.page || 1;
+  const limit = filters.limit || 10;
+
+  const items = await db
+    .select()
+    .from(posts)
+    .where(conditions.length > 0 ? and(...conditions) : undefined)
+    .orderBy(desc(posts.createdAt))
+    .limit(limit)
+    .offset((page - 1) * limit);
+
+  return items;
+}
+
+// 根据 slug 获取文章
+async function getPostBySlug(slug: string) {
+  const [post] = await db
+    .select()
+    .from(posts)
+    .where(eq(posts.slug, slug))
+    .limit(1);
+
+  return post;
+}
+
+// 更新文章
+async function updatePost(
+  id: number,
+  data: {
+    title?: string;
+    content?: string;
+    excerpt?: string;
+    published?: boolean;
+  }
+) {
+  const [post] = await db
+    .update(posts)
+    .set({
+      ...data,
+      updatedAt: new Date(),
+    })
+    .where(eq(posts.id, id))
+    .returning();
+
+  return post;
+}
+
+// 删除文章
+async function deletePost(id: number) {
+  await db.delete(posts).where(eq(posts.id, id));
+}
+```
+
+### 6.2 用户管理 CRUD
+
+```typescript
+import { eq, and, or, ilike, ne } from "drizzle-orm";
+
+// 获取活跃用户
+async function getActiveUsers(limit = 50) {
+  return await db
+    .select({
+      id: users.id,
+      email: users.email,
+      name: users.name,
+      role: users.role,
+      createdAt: users.createdAt,
+    })
+    .from(users)
+    .where(ne(users.role, "banned"))
+    .orderBy(desc(users.createdAt))
+    .limit(limit);
+}
+
+// 搜索用户
+async function searchUsers(query: string) {
+  return await db
+    .select()
+    .from(users)
+    .where(
+      or(ilike(users.name, `%${query}%`), ilike(users.email, `%${query}%`))
+    )
+    .limit(20);
+}
+
+// 更新用户角色
+async function updateUserRole(userId: number, role: string) {
+  const [user] = await db
+    .update(users)
+    .set({ role })
+    .where(eq(users.id, userId))
+    .returning();
+
+  return user;
+}
+
+// 封禁用户
+async function banUser(userId: number) {
+  await db.update(users).set({ role: "banned" }).where(eq(users.id, userId));
+}
+```
+
+---
+
+## 七、最佳实践
+
+### 7.1 类型安全
+
+```typescript
+// ✅ 好的做法：使用 select 指定字段
+const result = await db
+  .select({
+    id: users.id,
+    name: users.name,
+  })
+  .from(users);
+
+// result 类型：{ id: number; name: string }[]
+
+// ❌ 不推荐：select() * 返回所有字段
+const result = await db.select().from(users);
+// 性能较差，类型复杂
+```
+
+### 7.2 事务处理
+
+```typescript
+// 原子操作：创建用户和默认文章
+await db.transaction(async (tx) => {
+  const [user] = await tx
+    .insert(users)
+    .values({ email: "test@example.com", name: "Test" })
+    .returning();
+
+  await tx.insert(posts).values({
+    title: "Welcome",
+    content: "Your first post",
+    authorId: user.id,
+  });
+});
+```
+
+### 7.3 错误处理
+
+```typescript
+async function getUser(id: number) {
+  try {
+    const [user] = await db
+      .select()
+      .from(users)
+      .where(eq(users.id, id))
+      .limit(1);
+
+    if (!user) {
+      throw new Error(`User ${id} not found`);
+    }
+
+    return user;
+  } catch (error) {
+    console.error("Database error:", error);
+    throw error;
+  }
+}
+```
+
+### 7.4 性能优化
+
+```typescript
+// ✅ 使用索引字段查询
+await db.select().from(users).where(eq(users.email, "test@example.com"));
+
+// ❌ 避免 LIKE 前缀通配符（无法使用索引）
+await db.select().from(users).where(like(users.email, "%@example.com"));
+
+// ✅ 限制返回字段
+await db
+  .select({
+    id: users.id,
+    name: users.name,
+  })
+  .from(users);
+
+// ❌ 避免返回大字段
+await db.select().from(posts); // 包含 content（可能很大）
+```
+
+---
+
+## 八、总结
+
+**本文我们学习了**：
+
+✅ **Create** - insert() + values() + returning()
+✅ **Read** - select() + where() + orderBy() + limit() + offset()
+✅ **Update** - update() + set() + where()
+✅ **Delete** - delete() + where()
+
+**核心运算符**：
+
+- `eq()` - 等于
+- `ne()` - 不等于
+- `and()` / `or()` - 逻辑运算
+- `gt()` / `gte()` / `lt()` / `lte()` - 比较
+- `like()` / `ilike()` - 模糊匹配
+- `desc()` / `asc()` - 排序
+
+**下一步**：
+
+在下一篇文章《关系查询和联表操作》中，我们将学习：
+
+- 一对一、一对多、多对多关系
+- JOIN 操作
+- 关系查询优化
+- 聚合查询
+
+---
+
+**相关代码**：[03-crud-queries](https://github.com/yourname/drizzle-examples/tree/03-crud-queries)

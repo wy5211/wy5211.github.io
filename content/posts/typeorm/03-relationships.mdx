@@ -1,0 +1,929 @@
+---
+title: "03. 关系映射 - 一对一、一对多、多对多"
+date: "2026-03-28"
+summary: "深入掌握 TypeORM 的关系映射机制，学会使用 @OneToOne、@ManyToOne、@OneToMany、@ManyToMany 定义实体关系，理解级联操作、加载策略和自引用关系。"
+tags: ["TypeORM", "关系映射", "数据库设计", "NestJS", "ORM"]
+category: "typeorm"
+draft: false
+series: "TypeORM 实战：NestJS 数据库开发"
+seriesOrder: 3
+---
+
+## 前言
+
+在关系型数据库中，表与表之间的**关系**是数据建模的核心。TypeORM 通过装饰器优雅地定义了一对一、一对多、多对多等关系，让 TypeScript 对象之间的导航变得自然流畅。
+
+**本篇你将学到**：
+
+- 四种关系类型的定义和使用
+- 级联操作（cascade）的正确使用方式
+- Eager 加载 vs 懒加载
+- 自引用关系（树形结构）
+- 关系映射的最佳实践
+
+---
+
+## 关系类型概览
+
+| 关系类型      | 装饰器        | 示例            |
+| ------------- | ------------- | --------------- |
+| 一对一（1:1） | `@OneToOne`   | 用户 ↔ 个人资料 |
+| 一对多（1:N） | `@OneToMany`  | 用户 → 文章     |
+| 多对一（N:1） | `@ManyToOne`  | 文章 → 用户     |
+| 多对多（M:N） | `@ManyToMany` | 文章 ↔ 标签     |
+
+**TypeORM 关系定义的核心原则**：
+
+- **拥有方（Owning Side）**：包含外键列的一方，负责持久化关系
+- **反引用方（Inverse Side）**：不含外键列，仅用于对象导航
+- `@JoinColumn` 只能在拥有方使用
+
+---
+
+## @OneToOne 一对一关系
+
+一对一关系用于两个实体之间严格的一一对应。例如：一个用户只有一个个人资料。
+
+### 基本定义
+
+```typescript
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  OneToOne,
+  JoinColumn,
+} from "typeorm";
+
+@Entity("users")
+export class User {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  name: string;
+
+  // 一对一：用户拥有一个资料
+  @OneToOne(() => Profile, (profile) => profile.user)
+  @JoinColumn() // 在拥有方添加外键列
+  profile: Profile;
+}
+
+@Entity("profiles")
+export class Profile {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  bio: string;
+
+  @Column()
+  website: string;
+
+  // 反引用方：不需要 @JoinColumn
+  @OneToOne(() => User, (user) => user.profile)
+  user: User;
+}
+```
+
+**生成的 SQL**：
+
+```sql
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  name VARCHAR(255) NOT NULL
+);
+
+CREATE TABLE profiles (
+  id SERIAL PRIMARY KEY,
+  bio VARCHAR(255) NOT NULL,
+  website VARCHAR(255) NOT NULL,
+  user_id INTEGER UNIQUE REFERENCES users(id)
+);
+```
+
+### 操作一对一关系
+
+```typescript
+const userRepo = dataSource.getRepository(User);
+const profileRepo = dataSource.getRepository(Profile);
+
+// 创建用户和资料
+const user = userRepo.create({ name: "张三" });
+await userRepo.save(user);
+
+const profile = profileRepo.create({
+  bio: "全栈开发者",
+  website: "https://example.com",
+  user: user, // 关联用户
+});
+await profileRepo.save(profile);
+
+// 查询用户时加载资料
+const userWithProfile = await userRepo.findOne({
+  where: { id: 1 },
+  relations: ["profile"],
+});
+// { id: 1, name: '张三', profile: { id: 1, bio: '全栈开发者', ... } }
+
+// 通过资料查找用户
+const profileWithUser = await profileRepo.findOne({
+  where: { id: 1 },
+  relations: ["user"],
+});
+// { id: 1, bio: '全栈开发者', user: { id: 1, name: '张三' } }
+```
+
+### 自定义外键列名
+
+```typescript
+@Entity("users")
+export class User {
+  @OneToOne(() => Profile, (profile) => profile.user)
+  @JoinColumn({ name: "profile_id" }) // 自定义外键列名
+  profile: Profile;
+}
+```
+
+---
+
+## @ManyToOne / @OneToMany 一对多关系
+
+一对多是最常见的关系类型。例如：一个用户可以写多篇文章。
+
+### 基本定义
+
+```typescript
+@Entity("posts")
+export class Post {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  title: string;
+
+  @Column()
+  content: string;
+
+  // 多对一：多篇文章属于一个用户
+  // 拥有方：Post 拥有外键
+  @ManyToOne(() => User, (user) => user.posts)
+  @JoinColumn({ name: "author_id" })
+  author: User;
+}
+
+@Entity("users")
+export class User {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  name: string;
+
+  // 一对多：一个用户有多篇文章
+  // 反引用方：不存储外键
+  @OneToMany(() => Post, (post) => post.author)
+  posts: Post[];
+}
+```
+
+**关键规则**：
+
+- `@ManyToOne` 总是**拥有方**（包含外键）
+- `@OneToMany` 总是**反引用方**
+- `@JoinColumn` 只能放在 `@ManyToOne` 一侧
+
+**生成的 SQL**：
+
+```sql
+CREATE TABLE posts (
+  id SERIAL PRIMARY KEY,
+  title VARCHAR(255) NOT NULL,
+  content TEXT NOT NULL,
+  author_id INTEGER REFERENCES users(id)
+);
+```
+
+### 操作一对多关系
+
+```typescript
+const userRepo = dataSource.getRepository(User);
+const postRepo = dataSource.getRepository(Post);
+
+// 创建用户
+const user = await userRepo.save({ name: "张三" });
+
+// 创建文章并关联用户
+const post1 = await postRepo.save({
+  title: "第一篇文章",
+  content: "Hello World",
+  author: user,
+});
+
+const post2 = await postRepo.save({
+  title: "第二篇文章",
+  content: "TypeORM 关系映射",
+  author: user,
+});
+
+// 查询用户的所有文章
+const userWithPosts = await userRepo.findOne({
+  where: { id: 1 },
+  relations: ["posts"],
+});
+// { id: 1, name: '张三', posts: [post1, post2] }
+
+// 查询文章及其作者
+const postWithAuthor = await postRepo.findOne({
+  where: { id: 1 },
+  relations: ["author"],
+});
+// { id: 1, title: '第一篇文章', author: { id: 1, name: '张三' } }
+```
+
+---
+
+## @ManyToMany 多对多关系
+
+多对多关系需要一个**中间表**来关联两个实体。例如：一篇文章可以有多个标签，一个标签也可以属于多篇文章。
+
+### 基本定义
+
+```typescript
+@Entity("posts")
+export class Post {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  title: string;
+
+  // 多对多：拥有方
+  @ManyToMany(() => Tag, (tag) => tag.posts)
+  @JoinTable({
+    name: "post_tags", // 中间表名
+    joinColumn: { name: "post_id", referencedColumnName: "id" },
+    inverseJoinColumn: { name: "tag_id", referencedColumnName: "id" },
+  })
+  tags: Tag[];
+}
+
+@Entity("tags")
+export class Tag {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  name: string;
+
+  // 多对多：反引用方
+  @ManyToMany(() => Post, (post) => post.tags)
+  posts: Post[];
+}
+```
+
+**生成的 SQL**：
+
+```sql
+CREATE TABLE post_tags (
+  post_id INTEGER REFERENCES posts(id),
+  tag_id INTEGER REFERENCES tags(id),
+  PRIMARY KEY (post_id, tag_id)
+);
+```
+
+### 操作多对多关系
+
+```typescript
+const postRepo = dataSource.getRepository(Post);
+const tagRepo = dataSource.getRepository(Tag);
+
+// 创建标签
+const tagTS = await tagRepo.save({ name: "TypeScript" });
+const tagORM = await tagRepo.save({ name: "TypeORM" });
+const tagNest = await tagRepo.save({ name: "NestJS" });
+
+// 创建文章并关联标签
+const post = await postRepo.save({
+  title: "TypeORM 关系映射",
+  tags: [tagTS, tagORM, tagNest],
+});
+
+// 查询文章及其标签
+const postWithTags = await postRepo.findOne({
+  where: { id: 1 },
+  relations: ["tags"],
+});
+// { id: 1, title: 'TypeORM 关系映射', tags: [tagTS, tagORM, tagNest] }
+
+// 查询标签下的所有文章
+const tagWithPosts = await tagRepo.findOne({
+  where: { id: 1 },
+  relations: ["posts"],
+});
+```
+
+### 使用显式中间表实体
+
+当中间表需要额外字段时（如创建时间），需要定义中间表实体：
+
+```typescript
+// 中间表实体
+@Entity("post_tags")
+export class PostTag {
+  @PrimaryColumn()
+  postId: number;
+
+  @PrimaryColumn()
+  tagId: number;
+
+  @ManyToOne(() => Post)
+  post: Post;
+
+  @ManyToOne(() => Tag)
+  tag: Tag;
+
+  @Column({ name: "created_at", default: () => "NOW()" })
+  createdAt: Date;
+
+  // 中间表可以有额外字段
+  @Column({ nullable: true })
+  note: string;
+}
+```
+
+```typescript
+// 使用显式中间表
+const postTagRepo = dataSource.getRepository(PostTag);
+
+// 创建关联
+await postTagRepo.save({
+  postId: 1,
+  tagId: 2,
+  note: "核心标签",
+});
+
+// 查询文章的所有标签（带额外字段）
+const postTags = await postTagRepo.find({
+  where: { postId: 1 },
+  relations: ["tag"],
+});
+```
+
+---
+
+## 级联操作（Cascade）
+
+级联操作允许你在操作父实体时自动操作关联的子实体。
+
+### 级联选项
+
+```typescript
+@Entity("posts")
+export class Post {
+  @ManyToOne(() => User, (user) => user.posts, {
+    cascade: true, // 保存文章时自动保存用户
+  })
+  author: User;
+}
+
+@Entity("users")
+export class User {
+  @OneToMany(() => Post, (post) => post.author, {
+    cascade: true, // 保存用户时自动保存文章
+  })
+  posts: Post[];
+}
+```
+
+### 级联选项详解
+
+```typescript
+@OneToMany(() => Post, (post) => post.author, {
+  cascade: true, // 启用所有级联操作
+
+  // 或细粒度控制
+  cascade: ["insert", "update"], // 只级联插入和更新
+
+  // 可选值：
+  // "insert" - 插入时级联
+  // "update" - 更新时级联
+  // "remove" - 删除时级联
+  // "soft-remove" - 软删除时级联
+  // "recover" - 恢复时级联
+})
+posts: Post[];
+```
+
+### 级联插入
+
+```typescript
+// 级联插入：保存用户时自动创建文章
+const user = userRepo.create({
+  name: "张三",
+  posts: [
+    { title: "文章一", content: "内容一" },
+    { title: "文章二", content: "内容二" },
+  ],
+});
+await userRepo.save(user);
+// 一条 save 操作同时创建了用户和两篇文章
+```
+
+### 级联更新
+
+```typescript
+const user = await userRepo.findOne({
+  where: { id: 1 },
+  relations: ["posts"],
+});
+
+// 更新用户的文章
+user.posts[0].title = "更新后的标题";
+await userRepo.save(user); // 自动更新关联的文章
+```
+
+### 级联删除
+
+```typescript
+// ⚠️ 危险操作：删除用户时同时删除所有文章
+@OneToMany(() => Post, (post) => post.author, {
+  cascade: ["remove"],
+})
+posts: Post[];
+
+// 更安全的做法：在 @ManyToOne 上设置 onDelete
+@ManyToOne(() => User, (user) => user.posts, {
+  onDelete: "CASCADE", // 数据库级别的级联删除
+})
+author: User;
+```
+
+### 最佳实践
+
+```typescript
+// ✅ 推荐：使用 cascade: ["insert", "update"]
+// 适合：子实体的生命周期完全依赖父实体
+@OneToMany(() => Post, (post) => post.author, {
+  cascade: ["insert", "update"],
+})
+posts: Post[];
+
+// ❌ 谨慎使用：cascade: ["remove"]
+// 可能导致意外删除大量数据
+
+// ✅ 推荐：使用数据库级别的 onDelete
+@ManyToOne(() => User, {
+  onDelete: "CASCADE", // 数据库层面保证一致性
+})
+author: User;
+```
+
+---
+
+## 加载策略
+
+TypeORM 提供两种加载关联数据的方式。
+
+### Eager 加载
+
+每次查询主实体时自动加载关联数据。
+
+```typescript
+@Entity("users")
+export class User {
+  @OneToMany(() => Post, (post) => post.author, {
+    eager: true, // 每次查询用户时自动加载文章
+  })
+  posts: Post[];
+}
+
+// 查询用户时自动加载文章
+const users = await userRepo.find();
+// users[0].posts 自动可用
+```
+
+### Lazy 加载
+
+使用 Promise 按需加载关联数据。
+
+```typescript
+@Entity("users")
+export class User {
+  @OneToMany(() => Post, (post) => post.author)
+  posts: Promise<Post[]>; // 注意：类型是 Promise
+}
+
+// 按需加载
+const user = await userRepo.findOneBy({ id: 1 });
+const posts = await user.posts; // 访问时才加载
+```
+
+### 手动加载（推荐）
+
+通过 `relations` 选项显式指定要加载的关联。
+
+```typescript
+// 加载单个关系
+const user = await userRepo.findOne({
+  where: { id: 1 },
+  relations: ["posts"],
+});
+
+// 加载嵌套关系
+const user = await userRepo.findOne({
+  where: { id: 1 },
+  relations: {
+    posts: {
+      tags: true, // 加载文章的标签
+    },
+  },
+});
+
+// 使用 join 加载（更灵活）
+const user = await userRepo
+  .createQueryBuilder("user")
+  .leftJoinAndSelect("user.posts", "post")
+  .leftJoinAndSelect("post.tags", "tag")
+  .where("user.id = :id", { id: 1 })
+  .getOne();
+```
+
+### 加载策略对比
+
+| 策略         | 优点               | 缺点                     |
+| ------------ | ------------------ | ------------------------ |
+| Eager        | 简单，自动加载     | 可能产生不必要查询       |
+| Lazy         | 按需加载，性能好   | 需要 Promise，代码稍复杂 |
+| 手动（推荐） | 完全控制，性能最优 | 需要显式指定             |
+
+---
+
+## 自引用关系
+
+自引用关系用于表达同一实体内部的层级关系，如评论回复、组织架构。
+
+### 父子关系
+
+```typescript
+@Entity("categories")
+export class Category {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  name: string;
+
+  // 父分类
+  @ManyToOne(() => Category, (category) => category.children)
+  @JoinColumn({ name: "parent_id" })
+  parent: Category;
+
+  // 子分类
+  @OneToMany(() => Category, (category) => category.parent)
+  children: Category[];
+}
+```
+
+**使用示例**：
+
+```typescript
+const categoryRepo = dataSource.getRepository(Category);
+
+// 创建分类层级
+const rootCategory = await categoryRepo.save({ name: "编程" });
+const childCategory = await categoryRepo.save({
+  name: "TypeScript",
+  parent: rootCategory,
+});
+const grandChildCategory = await categoryRepo.save({
+  name: "TypeORM",
+  parent: childCategory,
+});
+
+// 查询分类及其子分类
+const categories = await categoryRepo
+  .createQueryBuilder("category")
+  .leftJoinAndSelect("category.children", "child")
+  .where("category.parent IS NULL") // 只查顶级分类
+  .getMany();
+```
+
+### 评论回复树
+
+```typescript
+@Entity("comments")
+export class Comment {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column({ type: "text" })
+  content: string;
+
+  // 父评论
+  @ManyToOne(() => Comment, (comment) => comment.replies, {
+    nullable: true,
+  })
+  @JoinColumn({ name: "parent_id" })
+  parent: Comment;
+
+  // 子评论（回复）
+  @OneToMany(() => Comment, (comment) => comment.parent)
+  replies: Comment[];
+}
+```
+
+---
+
+## 关系查询实战
+
+### 查询用户及其文章和标签
+
+```typescript
+// 方式 1：使用 find + relations
+const users = await userRepo.find({
+  relations: {
+    posts: {
+      tags: true,
+      comments: true,
+    },
+  },
+});
+
+// 方式 2：使用 QueryBuilder
+const users = await userRepo
+  .createQueryBuilder("user")
+  .leftJoinAndSelect("user.posts", "post")
+  .leftJoinAndSelect("post.tags", "tag")
+  .leftJoinAndSelect("post.comments", "comment")
+  .getMany();
+
+// 方式 3：条件查询关联数据
+const users = await userRepo.find({
+  where: {
+    posts: {
+      status: "PUBLISHED",
+    },
+  },
+  relations: {
+    posts: true,
+  },
+});
+```
+
+### 关联数据过滤
+
+```typescript
+// 使用 QueryBuilder 过滤关联数据
+const user = await userRepo
+  .createQueryBuilder("user")
+  .leftJoinAndSelect("user.posts", "post", "post.status = :status", {
+    status: "PUBLISHED",
+  })
+  .leftJoinAndSelect("post.tags", "tag")
+  .where("user.id = :id", { id: 1 })
+  .getOne();
+// 只加载已发布的文章
+```
+
+### 关联计数
+
+```typescript
+// 查询用户及其文章数量
+const users = await userRepo
+  .createQueryBuilder("user")
+  .leftJoin("user.posts", "post")
+  .loadRelationCountAndMap("user.postCount", "user.posts")
+  .getMany();
+// [{ id: 1, name: '张三', postCount: 5 }, ...]
+
+// 带条件的关联计数
+const users = await userRepo
+  .createQueryBuilder("user")
+  .leftJoin("user.posts", "post")
+  .loadRelationCountAndMap(
+    "user.publishedPostCount",
+    "user.posts",
+    "post",
+    (qb) => qb.where("post.status = :status", { status: "PUBLISHED" })
+  )
+  .getMany();
+```
+
+---
+
+## 实战：博客系统关系设计
+
+将前面定义的实体用关系连接起来：
+
+```typescript
+// User 实体
+@Entity("users")
+export class User {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  name: string;
+
+  @OneToOne(() => Profile, (profile) => profile.user, { cascade: true })
+  @JoinColumn()
+  profile: Profile;
+
+  @OneToMany(() => Post, (post) => post.author)
+  posts: Post[];
+
+  @OneToMany(() => Comment, (comment) => comment.author)
+  comments: Comment[];
+}
+
+// Post 实体
+@Entity("posts")
+export class Post {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  title: string;
+
+  @ManyToOne(() => User, (user) => user.posts, { onDelete: "CASCADE" })
+  @JoinColumn({ name: "author_id" })
+  author: User;
+
+  @OneToMany(() => Comment, (comment) => comment.post, {
+    cascade: ["insert"],
+  })
+  comments: Comment[];
+
+  @ManyToMany(() => Tag, (tag) => tag.posts)
+  @JoinTable()
+  tags: Tag[];
+}
+
+// Comment 实体
+@Entity("comments")
+export class Comment {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column({ type: "text" })
+  content: string;
+
+  @ManyToOne(() => User, (user) => user.comments, { onDelete: "SET NULL" })
+  @JoinColumn({ name: "author_id" })
+  author: User;
+
+  @ManyToOne(() => Post, (post) => post.comments, { onDelete: "CASCADE" })
+  @JoinColumn({ name: "post_id" })
+  post: Post;
+
+  // 自引用：评论回复
+  @ManyToOne(() => Comment, (comment) => comment.replies, {
+    nullable: true,
+    onDelete: "CASCADE",
+  })
+  @JoinColumn({ name: "parent_id" })
+  parent: Comment;
+
+  @OneToMany(() => Comment, (comment) => comment.parent)
+  replies: Comment[];
+}
+
+// Tag 实体
+@Entity("tags")
+export class Tag {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column({ unique: true })
+  name: string;
+
+  @ManyToMany(() => Post, (post) => post.tags)
+  posts: Post[];
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 正确选择拥有方
+
+```typescript
+// ✅ 拥有方应该在"多"的一方
+// 文章（多）属于用户（一）
+@Entity("posts")
+export class Post {
+  @ManyToOne(() => User) // ✅ 这是拥有方
+  @JoinColumn({ name: "author_id" })
+  author: User;
+}
+
+// ❌ 不要在一的一方使用 @JoinColumn
+// @OneToMany 不能使用 @JoinColumn
+```
+
+### 2. 避免过度使用 eager
+
+```typescript
+// ❌ 避免：全局 eager 加载
+@OneToMany(() => Post, (post) => post.author, { eager: true })
+posts: Post[];
+// 每次查询用户都会查询所有文章，性能浪费
+
+// ✅ 推荐：手动指定加载
+const user = await userRepo.findOne({
+  where: { id: 1 },
+  relations: ["posts"], // 按需加载
+});
+```
+
+### 3. 谨慎使用级联删除
+
+```typescript
+// ❌ 危险
+@OneToMany(() => Post, (post) => post.author, {
+  cascade: ["remove"], // 删除用户会删除所有文章
+})
+posts: Post[];
+
+// ✅ 更安全：使用数据库级别的 onDelete
+@ManyToOne(() => User, { onDelete: "CASCADE" })
+author: User;
+
+// ✅ 最安全：使用软删除 + 手动清理
+@ManyToOne(() => User, { onDelete: "SET NULL" })
+author: User;
+```
+
+### 4. 使用 QueryBuilder 处理复杂查询
+
+```typescript
+// 对于涉及多层关系和条件的查询，使用 QueryBuilder
+const result = await postRepo
+  .createQueryBuilder("post")
+  .leftJoinAndSelect("post.author", "author")
+  .leftJoinAndSelect("post.tags", "tag")
+  .leftJoin("post.comments", "comment")
+  .where("post.status = :status", { status: "PUBLISHED" })
+  .andWhere("author.isActive = :active", { active: true })
+  .loadRelationCountAndMap("post.commentCount", "post.comments")
+  .orderBy("post.publishedAt", "DESC")
+  .limit(10)
+  .getMany();
+```
+
+---
+
+## 总结
+
+### 核心要点
+
+1. **四种关系类型**
+   - `@OneToOne`：用户 ↔ 个人资料
+   - `@ManyToOne` / `@OneToMany`：文章 → 用户
+   - `@ManyToMany`：文章 ↔ 标签
+
+2. **拥有方原则**
+   - 拥有方包含 `@JoinColumn` 和外键
+   - `@ManyToOne` 总是拥有方
+   - `@ManyToMany` 可以任选一方
+
+3. **级联操作**
+   - `cascade: ["insert", "update"]` 常用
+   - `cascade: ["remove"]` 谨慎使用
+   - 数据库级 `onDelete` 更可靠
+
+4. **加载策略**
+   - 推荐手动加载（通过 `relations` 选项）
+   - 避免过度使用 eager 加载
+
+5. **自引用关系**
+   - 用于树形结构（分类、评论回复）
+   - 同一实体内定义 parent/children
+
+### 下一步
+
+在下一篇文章中，我们将学习：
+
+- **Repository 模式与 CRUD**
+- 自定义 Repository
+- FindOptions 详解
+- 分页封装
+- 条件构建（FindOperator）
+
+敬请期待！
+
+---
+
+## 参考资源
+
+- [TypeORM 关系文档](https://typeorm.io/relations)
+- [TypeORM JoinColumn 文档](https://typeorm.io/joincolumn)
+- [TypeORM JoinTable 文档](https://typeorm.io/jointable)
+- [数据库关系设计原则](https://www.postgresql.org/docs/current/ddl-constraints.html)
+
+---
+
+**上一篇**：[02. 实体定义与数据建模](./02-entity-definition.mdx)
+**下一篇**：[04. Repository 模式与 CRUD](./04-repository-crud.mdx)

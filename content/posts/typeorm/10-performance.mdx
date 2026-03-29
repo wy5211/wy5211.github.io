@@ -1,0 +1,633 @@
+---
+title: "10. 性能优化与最佳实践"
+date: "2026-03-29"
+summary: "识别和解决 TypeORM 中的 N+1 查询问题，掌握连接池调优、批量操作优化、查询缓存和索引策略，建立完整的性能监控体系。"
+tags: ["TypeORM", "性能优化", "N+1", "缓存", "索引"]
+category: "typeorm"
+draft: false
+series: "TypeORM 实战：NestJS 数据库开发"
+seriesOrder: 10
+---
+
+## 前言
+
+在生产环境中，ORM 的便利性有时会以性能为代价。了解 TypeORM 的性能陷阱和优化策略，是构建高性能后端应用的关键。
+
+**本篇你将学到**：
+
+- N+1 查询问题及解决方案
+- 连接池调优
+- 批量操作优化
+- 查询缓存
+- 索引策略
+- 监控与日志
+
+---
+
+## N+1 查询问题
+
+### 什么是 N+1 问题？
+
+N+1 是 ORM 中最常见的性能陷阱：查询 N 条记录后，对每条记录再执行一次关联查询，导致总共执行 N+1 次数据库查询。
+
+```typescript
+// ❌ N+1 问题示例
+async function getPostsBad() {
+  // 第 1 次查询：获取所有文章
+  const posts = await postRepo.find();
+  // SELECT * FROM posts
+
+  // 接下来 N 次查询：获取每篇文章的作者
+  for (const post of posts) {
+    post.author = await userRepo.findOneBy({ id: post.authorId });
+    // SELECT * FROM users WHERE id = ?
+    // 每次循环都执行一次查询！
+  }
+
+  return posts;
+}
+
+// 如果有 100 篇文章，总共执行 101 次查询！
+```
+
+### 解决方案 1：使用 relations（JOIN）
+
+```typescript
+// ✅ 方案 1：使用 find + relations
+const posts = await postRepo.find({
+  relations: ["author", "tags"],
+});
+// 只生成 1 条 SQL（使用 LEFT JOIN）
+// SELECT posts.*, users.*, tags.*
+// FROM posts
+// LEFT JOIN users ON posts.author_id = users.id
+// LEFT JOIN post_tags ON posts.id = post_tags.post_id
+// LEFT JOIN tags ON post_tags.tag_id = tags.id
+```
+
+### 解决方案 2：使用 QueryBuilder JOIN
+
+```typescript
+// ✅ 方案 2：使用 QueryBuilder
+const posts = await postRepo
+  .createQueryBuilder("post")
+  .leftJoinAndSelect("post.author", "author")
+  .leftJoinAndSelect("post.tags", "tag")
+  .where("post.status = :status", { status: "PUBLISHED" })
+  .getMany();
+```
+
+### 解决方案 3：使用 loadRelationCountAndMap
+
+```typescript
+// ✅ 只需要计数时，不要加载完整关联
+const posts = await postRepo
+  .createQueryBuilder("post")
+  .loadRelationCountAndMap("post.commentCount", "post.comments")
+  .loadRelationCountAndMap("post.tagCount", "post.tags")
+  .getMany();
+// 使用子查询计数，而不是加载所有关联数据
+```
+
+### 解决方案 4：批量 IN 查询
+
+```typescript
+// ✅ 手动批量查询
+async function getPostsOptimized() {
+  const posts = await postRepo.find();
+  // SELECT * FROM posts
+
+  if (posts.length === 0) return posts;
+
+  // 收集所有作者 ID
+  const authorIds = [...new Set(posts.map((p) => p.authorId))];
+
+  // 一次查询所有作者
+  const authors = await userRepo.findBy({ id: In(authorIds) });
+  // SELECT * FROM users WHERE id IN (...)
+
+  // 手动映射
+  const authorMap = new Map(authors.map((a) => [a.id, a]));
+  posts.forEach((post) => {
+    post.author = authorMap.get(post.authorId);
+  });
+
+  return posts;
+}
+```
+
+---
+
+## 连接池调优
+
+### 配置连接池
+
+```typescript
+const dataSource = new DataSource({
+  type: "postgres",
+  // ...基本配置
+  poolSize: 10, // 连接池大小（默认 10）
+
+  extra: {
+    max: 20, // 最大连接数
+    min: 5, // 最小连接数
+    idleTimeoutMillis: 30000, // 空闲超时（30 秒）
+    connectionTimeoutMillis: 5000, // 连接超时（5 秒）
+    maxUses: 7500, // 单个连接最大使用次数（防止内存泄漏）
+  },
+});
+```
+
+### 连接池大小建议
+
+```typescript
+// 经验公式：连接数 = CPU 核心数 * 2 + 磁盘数
+
+// 开发环境
+poolSize: 5
+
+// 普通 Web 应用
+poolSize: 10
+
+// 高并发 API
+poolSize: 20-50
+
+// 大批量数据处理
+poolSize: 5-10（使用单独的 DataSource）
+```
+
+### 监控连接池
+
+```typescript
+// 监测连接池状态
+import { DataSource } from "typeorm";
+
+function monitorPool(dataSource: DataSource) {
+  const pool = dataSource.driver.master as any;
+
+  setInterval(() => {
+    console.log({
+      totalCount: pool.totalCount, // 总连接数
+      idleCount: pool.idleCount, // 空闲连接数
+      waitingCount: pool.waitingCount, // 等待连接的请求数
+    });
+
+    // 告警：等待数过多
+    if (pool.waitingCount > 10) {
+      console.warn("连接池压力大，等待连接数：" + pool.waitingCount);
+    }
+  }, 5000);
+}
+```
+
+---
+
+## 批量操作优化
+
+### 批量插入
+
+```typescript
+// ❌ 逐条插入（慢）
+for (const userData of users) {
+  await userRepo.save(userData);
+}
+// 100 条数据 → 100 次 INSERT
+
+// ✅ 批量插入（快）
+await userRepo.save(users);
+// 100 条数据 → 1 次 INSERT（内部可能分批）
+
+// ✅ 使用 insert（更快，不触发监听器）
+await userRepo.insert(users);
+
+// ✅ 大批量数据分块插入
+const batchSize = 1000;
+for (let i = 0; i < largeData.length; i += batchSize) {
+  const batch = largeData.slice(i, i + batchSize);
+  await userRepo.insert(batch);
+}
+```
+
+### 批量更新
+
+```typescript
+// ❌ 逐条更新
+for (const user of users) {
+  user.isActive = true;
+  await userRepo.save(user);
+}
+
+// ✅ 条件更新
+await userRepo.update({ role: "READER" }, { isActive: true });
+
+// ✅ 使用 QueryBuilder 批量更新
+await dataSource
+  .createQueryBuilder()
+  .update(User)
+  .set({ lastLoginAt: new Date() })
+  .where("id IN (:...ids)", { ids: userIds })
+  .execute();
+
+// ✅ 使用 CASE 实现不同值的批量更新
+await dataSource
+  .createQueryBuilder()
+  .update(User)
+  .set({
+    name: () =>
+      `CASE id
+        WHEN 1 THEN '张三'
+        WHEN 2 THEN '李四'
+        WHEN 3 THEN '王五'
+        ELSE name
+      END`,
+  })
+  .where("id IN (:...ids)", { ids: [1, 2, 3] })
+  .execute();
+```
+
+### 批量删除
+
+```typescript
+// ✅ 批量删除
+await userRepo.delete({ isActive: false });
+
+// ✅ 批量软删除
+await userRepo.softDelete({ status: "INACTIVE" });
+```
+
+---
+
+## 查询缓存
+
+TypeORM 支持查询级别的缓存。
+
+### 启用缓存
+
+```typescript
+const dataSource = new DataSource({
+  // ...
+  cache: true, // 全局启用缓存
+  // 或自定义
+  cache: {
+    type: "database", // 使用数据库表存储缓存
+    tableName: "query_result_cache",
+    duration: 30000, // 默认缓存 30 秒
+  },
+});
+```
+
+### 使用查询缓存
+
+```typescript
+// 启用缓存的查询
+const users = await userRepo.find({
+  cache: true, // 使用默认缓存时间
+  where: { isActive: true },
+});
+
+// 自定义缓存时间
+const users = await userRepo.find({
+  cache: {
+    id: "active_users", // 缓存 ID
+    milliseconds: 60000, // 缓存 1 分钟
+  },
+  where: { isActive: true },
+});
+
+// QueryBuilder 中使用缓存
+const posts = await postRepo
+  .createQueryBuilder("post")
+  .where("post.status = :status", { status: "PUBLISHED" })
+  .cache(true) // 或 .cache(60000)
+  .getMany();
+
+// 清除缓存
+await dataSource.queryResultCache?.clear();
+```
+
+### 应用层缓存
+
+```typescript
+// 使用 NestJS 的 CacheModule（Redis）
+import { CacheModule, CacheService } from "@nestjs/cache-manager";
+
+@Module({
+  imports: [
+    CacheModule.register({
+      ttl: 60, // 秒
+      max: 100, // 最大缓存条目
+    }),
+  ],
+})
+export class AppModule {}
+
+// Service 中使用
+@Injectable()
+export class PostsService {
+  constructor(private cacheService: CacheService) {}
+
+  async findPublished() {
+    const cacheKey = "posts:published";
+    const cached = await this.cacheService.get(cacheKey);
+    if (cached) return cached;
+
+    const posts = await this.postRepo.find({
+      where: { status: "PUBLISHED" },
+      relations: ["author"],
+    });
+
+    await this.cacheService.set(cacheKey, posts, 60);
+    return posts;
+  }
+}
+```
+
+---
+
+## 索引策略
+
+### 选择合适的索引类型
+
+```typescript
+import { Index } from "typeorm";
+
+// B-Tree 索引（默认）：适合等值查询、范围查询、排序
+@Entity("users")
+@Index(["email"]) // 单列索引
+export class User {
+  @Column()
+  email: string;
+}
+
+// 复合索引：遵循最左前缀原则
+@Entity("posts")
+@Index(["status", "publishedAt"])
+export class Post {
+  @Column()
+  status: string;
+
+  @Column()
+  publishedAt: Date;
+}
+
+// 唯一索引：保证数据唯一性
+@Entity("users")
+export class User {
+  @Column({ unique: true })
+  email: string;
+}
+
+// 部分索引：只索引满足条件的数据
+@Entity("posts")
+@Index(["publishedAt"], {
+  where: "status = 'PUBLISHED'",
+})
+export class Post {
+  @Column()
+  status: string;
+
+  @Column()
+  publishedAt: Date;
+}
+```
+
+### 索引使用原则
+
+```typescript
+// ✅ 为 WHERE 条件中的列创建索引
+@Index(["status"])
+// SELECT * FROM posts WHERE status = 'PUBLISHED'
+
+// ✅ 为 ORDER BY 的列创建索引
+@Index(["createdAt"])
+// SELECT * FROM posts ORDER BY created_at DESC
+
+// ✅ 复合索引：区分度高的列在前
+@Index(["status", "createdAt"])
+// 好：status 区分度低（几个值），createdAt 区分度高（唯一值）
+// SELECT * FROM posts WHERE status = 'PUBLISHED' ORDER BY created_at DESC
+
+// ❌ 避免过度索引
+// 索引会降低写入性能，一般一张表不超过 5-6 个索引
+
+// ❌ 避免在低区分度列上建单列索引
+@Index(["isActive"]) // 只有 true/false 两个值，索引效果差
+```
+
+### 使用 EXPLAIN 分析查询
+
+```typescript
+// 开启 logging 查看实际 SQL
+const dataSource = new DataSource({
+  logging: true,
+});
+
+// 在数据库中执行 EXPLAIN
+await dataSource.query(`
+  EXPLAIN ANALYZE
+  SELECT * FROM posts WHERE status = 'PUBLISHED' ORDER BY created_at DESC
+`);
+
+// 关注指标：
+// - Seq Scan（全表扫描）→ 需要加索引
+// - Index Scan（索引扫描）→ 使用了索引
+// - execution time（执行时间）
+```
+
+---
+
+## 避免常见性能陷阱
+
+### 1. 避免 SELECT \*
+
+```typescript
+// ❌ 查询不需要的字段
+const posts = await postRepo.find();
+// SELECT id, title, content, ... FROM posts
+// content 可能很大，列表页不需要
+
+// ✅ 只查询需要的字段
+const posts = await postRepo.find({
+  select: ["id", "title", "excerpt", "publishedAt"],
+  where: { status: "PUBLISHED" },
+});
+```
+
+### 2. 避免过深的关联加载
+
+```typescript
+// ❌ 过深的关联
+const users = await userRepo.find({
+  relations: {
+    posts: {
+      comments: {
+        author: {
+          profile: true,
+        },
+      },
+    },
+  },
+});
+
+// ✅ 按需加载
+const users = await userRepo.find({
+  relations: ["posts"],
+});
+```
+
+### 3. 使用分页限制结果集
+
+```typescript
+// ❌ 查询所有数据
+const posts = await postRepo.find();
+
+// ✅ 使用分页
+const posts = await postRepo.find({
+  skip: 0,
+  take: 20,
+});
+```
+
+### 4. 避免在循环中查询
+
+```typescript
+// ❌ 循环中查询
+for (const tag of tags) {
+  const count = await postRepo.count({ where: { tags: { id: tag.id } } });
+  tag.postCount = count;
+}
+
+// ✅ 一次查询所有计数
+const tagCounts = await tagRepo
+  .createQueryBuilder("tag")
+  .loadRelationCountAndMap("tag.postCount", "tag.posts")
+  .getMany();
+```
+
+---
+
+## 监控与日志
+
+### SQL 日志配置
+
+```typescript
+const dataSource = new DataSource({
+  logging: true, // 打印所有 SQL
+
+  // 或细粒度控制
+  logging: ["query", "error"], // 只打印查询和错误
+
+  // 自定义 logger
+  logger: "advanced-console", // 带颜色的控制台输出
+});
+```
+
+### 自定义 Logger
+
+```typescript
+import { Logger } from "typeorm";
+
+export class CustomLogger implements Logger {
+  log(level: "log" | "info" | "warn", message: any) {
+    // 记录到日志系统
+    console.log(`[${level}] ${message}`);
+  }
+
+  logMigration(message: string) {
+    console.log(`[migration] ${message}`);
+  }
+
+  logQuery(query: string, parameters?: any[]) {
+    // 记录慢查询
+    console.log(`[query] ${query}`);
+    if (parameters?.length) {
+      console.log(`[params] ${JSON.stringify(parameters)}`);
+    }
+  }
+
+  logQueryError(error: string, query: string, parameters?: any[]) {
+    console.error(`[query-error] ${error}`);
+    console.error(`[query] ${query}`);
+  }
+
+  logQuerySlow(time: number, query: string, parameters?: any[]) {
+    console.warn(`[slow-query] ${time}ms: ${query}`);
+    // 可以发送告警
+  }
+
+  logSchemaBuild(message: string) {
+    console.log(`[schema] ${message}`);
+  }
+}
+
+// 使用自定义 logger
+const dataSource = new DataSource({
+  logger: new CustomLogger(),
+});
+```
+
+### 慢查询监控
+
+```typescript
+const dataSource = new DataSource({
+  // 超过指定时间（毫秒）的查询被记录为慢查询
+  maxQueryExecutionTime: 1000, // 1 秒
+  logging: ["query", "error"],
+});
+```
+
+---
+
+## 总结
+
+### 核心要点
+
+1. **N+1 问题**
+   - 识别：循环中的查询
+   - 解决：relations、JOIN、IN 查询
+
+2. **连接池优化**
+   - 合理设置 poolSize
+   - 监控连接池状态
+
+3. **批量操作**
+   - 使用 `insert` 代替逐条 `save`
+   - 分块处理大数据量
+
+4. **查询缓存**
+   - TypeORM 内置缓存
+   - 应用层缓存（Redis）
+
+5. **索引策略**
+   - 为 WHERE、ORDER BY 列建索引
+   - 遵循最左前缀原则
+   - 避免过度索引
+
+6. **监控**
+   - SQL 日志
+   - 慢查询监控
+   - 连接池状态
+
+### 下一步
+
+在下一篇文章中，我们将学习：
+
+- **测试策略**
+- 内存数据库测试
+- Mock DataSource
+- 单元测试、集成测试、E2E 测试
+
+敬请期待！
+
+---
+
+## 参考资源
+
+- [TypeORM 缓存文档](https://typeorm.io/caching)
+- [PostgreSQL 索引文档](https://www.postgresql.org/docs/current/indexes.html)
+- [TypeORM Logger 文档](https://typeorm.io/logging)
+
+---
+
+**上一篇**：[09. JWT 认证与授权](./09-auth-typeorm.mdx)
+**下一篇**：[11. 测试策略](./11-testing.mdx)

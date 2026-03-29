@@ -1,0 +1,689 @@
+---
+title: "09 测试策略"
+date: "2026-03-29"
+summary: "掌握 pytest 测试框架，编写可靠的单元测试、集成测试和异步测试"
+tags: ["Python", "测试", "pytest", "mock"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 渐进式学习"
+seriesOrder: 9
+---
+
+# 测试策略
+
+## 前言
+
+测试不是可选的——它是代码可维护性的基石。在 Python 生态中，[pytest](https://docs.pytest.org/) 是事实上的测试标准，它比内置的 `unittest` 更简洁、更强大。pytest 的核心理念是：让写测试像写普通代码一样自然。
+
+本文将从 pytest 基础到高级用法，包括 fixture 机制、Mock、参数化测试和异步测试，帮助你构建完整的测试体系。
+
+---
+
+## pytest 基础
+
+### 安装与运行
+
+```bash
+# 安装 pytest 及常用插件
+uv add --dev pytest pytest-asyncio pytest-cov pytest-mock syrupy
+
+# 运行所有测试
+uv run pytest
+
+# 运行指定文件
+uv run pytest tests/test_user_service.py
+
+# 运行指定函数
+uv run pytest tests/test_user_service.py::test_create_user
+
+# 运行匹配的测试（-k 支持表达式）
+uv run pytest -k "user"          # 运行所有名称包含 user 的测试
+uv run pytest -k "not slow"      # 排除包含 slow 的测试
+
+# 显示详细输出
+uv run pytest -v                 # 详细模式
+uv run pytest -vv                # 更详细
+uv run pytest -s                 # 显示 print 输出
+
+# 失败时进入调试器
+uv run pytest --pdb
+
+# 并行运行（需要 pytest-xdist）
+uv add --dev pytest-xdist
+uv run pytest -n auto            # 自动检测 CPU 核心数
+```
+
+### 编写第一个测试
+
+```python
+# tests/test_basic.py
+
+# pytest 不需要继承任何类，直接写函数即可
+def test_addition():
+    """最简单的测试"""
+    assert 1 + 1 == 2
+
+
+def test_string_concatenation():
+    assert "hello" + " " + "world" == "hello world"
+
+
+# pytest 的断言比 unittest 的 self.assertEqual 更自然
+def test_list_operations():
+    items = [1, 2, 3]
+    items.append(4)
+
+    assert len(items) == 4
+    assert items == [1, 2, 3, 4]
+    assert 3 in items
+    assert items[0] == 1
+
+
+# 异常测试
+import pytest
+
+def test_divide_by_zero():
+    with pytest.raises(ZeroDivisionError):
+        1 / 0
+
+# 更精确的异常测试
+def test_value_error():
+    with pytest.raises(ValueError, match="must be positive"):
+        int("abc")  # 这个不匹配，换一个例子
+```
+
+### pytest vs unittest 对比
+
+```python
+# ============ unittest 风格（繁琐） ============
+import unittest
+
+class TestMath(unittest.TestCase):
+    def test_add(self):
+        self.assertEqual(1 + 1, 2)
+
+    def test_exception(self):
+        with self.assertRaises(ValueError):
+            int("abc")
+
+# ============ pytest 风格（简洁） ============
+def test_add():
+    assert 1 + 1 == 2
+
+def test_exception():
+    with pytest.raises(ValueError):
+        int("abc")
+```
+
+---
+
+## fixture 机制
+
+fixture 是 pytest 最强大的特性，用于管理测试的前置条件和清理工作。
+
+### 基础 fixture
+
+```python
+# tests/conftest.py（pytest 会自动发现这个文件）
+
+import pytest
+from mypackage.services.user_service import UserService
+from mypackage.models.user import User
+
+
+@pytest.fixture
+def user_service():
+    """创建一个 UserService 实例（函数级 fixture）"""
+    service = UserService()
+    yield service  # yield 之前是 setup，之后是 teardown
+    # yield 之后的代码是 cleanup（即使测试失败也会执行）
+    service.cleanup()
+
+
+@pytest.fixture
+def sample_user():
+    """返回一个测试用户数据"""
+    return {
+        "username": "testuser",
+        "email": "test@example.com",
+        "age": 25,
+    }
+
+
+@pytest.fixture
+def created_user(user_service, sample_user):
+    """依赖其他 fixture：先创建用户，再返回"""
+    user = user_service.create_user(**sample_user)
+    return user
+```
+
+### fixture 作用域
+
+```python
+# tests/conftest.py
+
+@pytest.fixture(scope="function")
+def db_session():
+    """
+    function 级别（默认）：每个测试函数创建一次
+    """
+    session = create_session()
+    yield session
+    session.close()
+
+
+@pytest.fixture(scope="class")
+def class_db():
+    """
+    class 级别：每个测试类创建一次
+    """
+    db = create_db()
+    yield db
+    db.close()
+
+
+@pytest.fixture(scope="module")
+def module_data():
+    """
+    module 级别：每个测试文件创建一次
+    适合耗时的初始化操作
+    """
+    data = load_test_data()
+    yield data
+
+
+@pytest.fixture(scope="session")
+def docker_container():
+    """
+    session 级别：整个测试会话只创建一次
+    适合启动 Docker 容器、创建数据库等
+    """
+    container = start_container()
+    yield container
+    container.stop()
+```
+
+### 实际应用：测试数据库 fixture
+
+```python
+# tests/conftest.py
+
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+from mypackage.models.base import Base
+
+
+@pytest.fixture(scope="session")
+def engine():
+    """创建测试数据库引擎（整个会话共享）"""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    yield engine
+    engine.dispose()
+
+
+@pytest.fixture(scope="function")
+def db_session(engine):
+    """每个测试函数获取一个全新的数据库会话"""
+    connection = engine.connect()
+    transaction = connection.begin()
+
+    SessionLocal = sessionmaker(bind=connection)
+    session = SessionLocal()
+
+    yield session
+
+    session.close()
+    transaction.rollback()
+    connection.close()
+```
+
+---
+
+## 参数化测试
+
+参数化测试用同一套逻辑测试多种输入组合，减少重复代码：
+
+```python
+# tests/test_validators.py
+import pytest
+
+
+# 基础参数化
+@pytest.mark.parametrize(
+    "email, expected_valid",
+    [
+        ("user@example.com", True),
+        ("user.name@example.com", True),
+        ("user+tag@example.com", True),
+        ("invalid-email", False),
+        ("@example.com", False),
+        ("user@", False),
+        ("", False),
+    ],
+)
+def test_email_validation(email: str, expected_valid: bool):
+    """验证邮箱格式的多种情况"""
+    from mypackage.core.validators import validate_email
+    assert validate_email(email) == expected_valid
+
+
+# 多参数参数化
+@pytest.mark.parametrize(
+    "username, expected_valid",
+    [
+        ("alice", True),
+        ("alice_wonder", True),
+        ("alice123", True),
+        ("ab", False),           # 太短
+        ("a" * 21, False),       # 太长
+        ("alice@#", False),      # 非法字符
+    ],
+)
+def test_username_validation(username: str, expected_valid: bool):
+    from mypackage.core.validators import validate_username
+    assert validate_username(username) == expected_valid
+
+
+# 多参数组合
+@pytest.mark.parametrize("x", [1, 2, 3])
+@pytest.mark.parametrize("y", [10, 20])
+def test_multiply(x: int, y: int):
+    """3 x 2 = 6 种组合"""
+    assert x * y == pytest.approx(x * y)
+```
+
+### 使用 pytest.param 添加测试 ID
+
+```python
+@pytest.mark.parametrize(
+    "password, is_valid, reason",
+    [
+        pytest.param("Pass123!", True, "valid password", id="valid"),
+        pytest.param("short", False, "too short", id="too_short"),
+        pytest.param("alllowercase123!", False, "no uppercase", id="no_upper"),
+        pytest.param("ALLUPPERCASE123!", False, "no lowercase", id="no_lower"),
+        pytest.param("NoNumbers!", False, "no digits", id="no_digit"),
+        pytest.param("Valid123", False, "no special char", id="no_special"),
+    ],
+)
+def test_password_policy(password: str, is_valid: bool, reason: str):
+    from mypackage.core.validators import validate_password
+    assert validate_password(password) == is_valid, f"Failed: {reason}"
+```
+
+---
+
+## Mock 与 Patch
+
+`unittest.mock` 让你替换外部依赖（数据库、API、文件系统），实现真正的单元测试隔离。
+
+### MagicMock 基础
+
+```python
+# tests/test_user_service.py
+from unittest.mock import MagicMock, patch
+
+
+def test_user_service_with_mock():
+    """使用 MagicMock 模拟依赖"""
+    # 创建 mock 对象
+    mock_repository = MagicMock()
+    mock_repository.get_user.return_value = {"id": 1, "name": "Alice"}
+
+    # 使用 mock
+    user = mock_repository.get_user(1)
+    assert user["name"] == "Alice"
+
+    # 验证 mock 是否被正确调用
+    mock_repository.get_user.assert_called_once_with(1)
+
+
+def test_mock_side_effects():
+    """使用 side_effect 模拟不同场景"""
+
+    mock_db = MagicMock()
+
+    # 场景 1：返回不同的值
+    mock_db.query.side_effect = [{"id": 1}, {"id": 2}, {"id": 3}]
+    assert mock_db.query() == {"id": 1}
+    assert mock_db.query() == {"id": 2}
+
+    # 场景 2：抛出异常
+    mock_db.execute.side_effect = ConnectionError("Database unavailable")
+    try:
+        mock_db.execute("SELECT 1")
+        assert False, "Should have raised"
+    except ConnectionError as e:
+        assert str(e) == "Database unavailable"
+
+
+def test_mock_attributes():
+    """mock 对象的属性访问"""
+    mock_response = MagicMock()
+    mock_response.status_code = 200
+    mock_response.json.return_value = {"status": "ok"}
+
+    assert mock_response.status_code == 200
+    assert mock_response.json() == {"status": "ok"}
+```
+
+### patch：替换模块中的对象
+
+```python
+# tests/test_service.py
+import pytest
+from unittest.mock import patch, MagicMock
+
+
+class TestUserService:
+    """使用 patch 隔离外部依赖"""
+
+    @patch("mypackage.services.user_service.send_email")
+    def test_create_user_sends_welcome_email(self, mock_send_email):
+        """测试创建用户时是否发送欢迎邮件"""
+        from mypackage.services.user_service import UserService
+
+        service = UserService()
+        service.create_user("alice", "alice@example.com")
+
+        # 验证 send_email 被调用
+        mock_send_email.assert_called_once_with(
+            to="alice@example.com",
+            subject="Welcome!",
+        )
+
+    @patch("mypackage.services.user_service.requests.get")
+    def test_fetch_user_avatar(self, mock_get):
+        """测试获取用户头像（mock HTTP 请求）"""
+        # 设置 mock 返回值
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.content = b"fake-image-data"
+        mock_get.return_value = mock_response
+
+        from mypackage.services.user_service import UserService
+        service = UserService()
+        avatar = service.fetch_user_avatar("alice")
+
+        assert avatar == b"fake-image-data"
+        mock_get.assert_called_once_with("https://api.example.com/avatars/alice")
+
+    @patch("mypackage.services.user_service.requests.get")
+    def test_fetch_avatar_handles_error(self, mock_get):
+        """测试网络错误处理"""
+        mock_get.side_effect = TimeoutError("Connection timeout")
+
+        from mypackage.services.user_service import UserService
+        service = UserService()
+        avatar = service.fetch_user_avatar("alice")
+
+        # 验证错误处理逻辑：返回默认头像
+        assert avatar == service.DEFAULT_AVATAR
+```
+
+### Mock 异步函数
+
+```python
+# tests/test_async_service.py
+import pytest
+from unittest.mock import AsyncMock, patch
+
+
+@pytest.mark.asyncio
+async def test_async_user_service():
+    """测试异步服务"""
+    mock_db = AsyncMock()
+    mock_db.fetchone.return_value = {"id": 1, "name": "Alice"}
+
+    from mypackage.services.async_user_service import AsyncUserService
+    service = AsyncUserService(db=mock_db)
+
+    user = await service.get_user(1)
+    assert user["name"] == "Alice"
+
+    mock_db.fetchone.assert_awaited_once_with(
+        "SELECT * FROM users WHERE id = :id",
+        {"id": 1},
+    )
+```
+
+---
+
+## 异步测试
+
+使用 `pytest-asyncio` 测试异步代码：
+
+```python
+# tests/test_async.py
+import pytest
+from httpx import AsyncClient, ASGITransport
+
+
+# 方式 1：使用 @pytest.mark.asyncio 装饰器
+@pytest.mark.asyncio
+async def test_async_function():
+    """测试异步函数"""
+    async def fetch_data(url: str) -> dict:
+        return {"url": url, "data": "test"}
+
+    result = await fetch_data("https://example.com")
+    assert result["url"] == "https://example.com"
+
+
+# 方式 2：测试 FastAPI 应用
+@pytest.mark.asyncio
+async def test_api_endpoint():
+    """测试 FastAPI 路由"""
+    from mypackage.api.app import create_app
+
+    app = create_app()
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/api/health")
+        assert response.status_code == 200
+        assert response.json()["status"] == "ok"
+
+
+# 方式 3：使用 fixture（推荐）
+@pytest.fixture
+async def async_client():
+    """异步测试客户端 fixture"""
+    from mypackage.api.app import create_app
+
+    app = create_app()
+    transport = ASGITransport(app=app)
+
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        yield client
+
+
+@pytest.mark.asyncio
+async def test_create_user_api(async_client: AsyncClient):
+    """测试创建用户 API"""
+    response = await async_client.post(
+        "/api/users",
+        json={"username": "alice", "email": "alice@example.com"},
+    )
+    assert response.status_code == 201
+    data = response.json()
+    assert data["username"] == "alice"
+    assert "id" in data
+```
+
+---
+
+## 测试覆盖率
+
+```bash
+# 安装覆盖率工具
+uv add --dev pytest-cov
+
+# 运行测试并生成覆盖率报告
+uv run pytest --cov=src --cov-report=term-missing
+
+# 生成 HTML 报告（在 htmlcov/ 目录下）
+uv run pytest --cov=src --cov-report=html
+
+# 只看覆盖率摘要
+uv run pytest --cov=src --cov-report=term-missing:skip-covered
+```
+
+在 `pyproject.toml` 中配置覆盖率：
+
+```toml
+[tool.coverage.run]
+source = ["src"]
+branch = true  # 分支覆盖率
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "pass",
+]
+fail_under = 80  # 覆盖率低于 80% 则失败
+```
+
+### 查看覆盖率报告示例
+
+```bash
+$ uv run pytest --cov=src --cov-report=term-missing
+
+src/mypackage/services/user_service.py    85%   12-15, 23
+src/mypackage/api/routes.py               72%   8-10, 25-30
+src/mypackage/core/validators.py          100%
+
+TOTAL                                     84%
+```
+
+---
+
+## 测试目录结构
+
+```
+tests/
+├── __init__.py
+├── conftest.py              # 共享 fixture（pytest 自动发现）
+├── unit/                    # 单元测试
+│   ├── __init__.py
+│   ├── test_validators.py
+│   ├── test_models.py
+│   └── services/
+│       ├── __init__.py
+│       ├── test_user_service.py
+│       └── test_article_service.py
+├── integration/             # 集成测试
+│   ├── __init__.py
+│   ├── test_database.py
+│   └── test_api.py
+├── e2e/                     # 端到端测试
+│   ├── __init__.py
+│   └── test_user_flow.py
+└── fixtures/                # 测试数据文件
+    ├── users.json
+    └── articles.json
+```
+
+在 `pyproject.toml` 中配置测试路径：
+
+```toml
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: integration tests",
+    "e2e: end-to-end tests",
+]
+```
+
+---
+
+## 快照测试（syrupy 简介）
+
+快照测试适合"输出结构复杂但相对固定"的场景，如 API 响应、模板渲染结果：
+
+```bash
+uv add --dev syrupy
+```
+
+```python
+# tests/test_snapshots.py
+import pytest
+
+
+def test_user_response_snapshot(snapshot):
+    """快照测试：第一次运行生成快照文件，后续运行与快照比对"""
+    from mypackage.services.user_service import UserService
+
+    service = UserService()
+    user = service.get_user_detailed(1)
+
+    # 第一次运行：生成 __snapshots__/test_snapshots/test_user_response_snapshot.ambr
+    # 后续运行：与快照比对，不一致则失败
+    assert user == snapshot
+```
+
+更新快照：
+
+```bash
+# 快照不匹配时，检查后确认更新
+uv run pytest --snapshot-update
+```
+
+---
+
+## 最佳实践
+
+1. **测试命名要清晰**：`test_create_user_with_invalid_email_raises_error` 比 `test_user_2` 好得多
+2. **每个测试只测一个行为**：不要在一个测试中测太多东西
+3. **AAA 模式**：Arrange（准备）- Act（执行）- Assert（断言），三段分明
+4. **优先 mock 外部依赖**：数据库、HTTP API、文件系统都应该被 mock
+5. **不要 mock 被测对象**：你测试的是 UserService，就不要 mock UserService
+6. **测试边界条件**：空输入、极大值、None、非法类型
+7. **集成测试和单元测试分离**：单元测试要快（< 1ms/个），集成测试可以慢
+8. **持续集成中运行测试**：每次 push 都自动运行 `pytest`，覆盖率不达标则失败
+
+---
+
+## 常见问题
+
+**Q：fixture 和普通函数有什么区别？为什么需要 fixture？**
+
+A：fixture 通过 `@pytest.fixture` 注册到 pytest 的依赖注入系统中，测试函数通过参数名自动获取 fixture 实例。fixture 支持 scope（作用域）、yield cleanup、依赖其他 fixture 等高级功能，比普通函数更灵活。
+
+**Q：conftest.py 可以放在子目录中吗？**
+
+A：可以。`conftest.py` 可以放在测试目录的任意层级，它只对同级及下级目录的测试可见。这让你可以为不同模块的测试提供不同的 fixture。
+
+**Q：mock 和 patch 什么时候用哪个？**
+
+A：`MagicMock`/`AsyncMock` 用于创建模拟对象并传递给被测代码；`patch` 用于临时替换模块级别的对象（如 `requests.get`）。如果被测代码直接接收参数，用 mock 注入；如果被测代码内部 import 了外部模块，用 patch 替换。
+
+---
+
+## 总结
+
+本文覆盖了 Python 测试的核心内容：
+
+- **pytest 基础**：简洁的测试语法、丰富的运行选项
+- **fixture 机制**：scope 作用域、yield cleanup、fixture 依赖链
+- **参数化测试**：一套代码覆盖多种输入场景
+- **Mock 与 Patch**：隔离外部依赖，实现真正的单元测试
+- **异步测试**：`pytest-asyncio` 测试 async/await 代码
+- **测试覆盖率**：`pytest-cov` 确保代码质量
+- **快照测试**：syrupy 处理复杂输出比对
+
+---
+
+## 下一步
+
+下一篇我们将学习 **Python 标准库精选**，掌握高频使用的标准库模块，提升日常开发效率。

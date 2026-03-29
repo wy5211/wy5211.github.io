@@ -1,0 +1,1518 @@
+---
+title: "22 Docker 部署与生产优化"
+date: "2026-03-29"
+summary: "使用 Docker 容器化部署 FastAPI 应用，掌握多阶段构建、Docker Compose 编排、Nginx 反向代理和生产环境优化"
+tags: ["Python", "Docker", "部署", "Nginx", "FastAPI"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 渐进式学习"
+seriesOrder: 22
+---
+
+# Docker 部署与生产优化
+
+## 前言
+
+在前面 21 篇文章中，我们用 FastAPI 构建了一个完整的博客系统 API，涵盖认证、缓存、WebSocket、后台任务等功能。但到目前为止，所有内容都运行在开发环境中。要把这个应用真正推向生产，我们需要解决一系列问题：环境一致性、进程管理、反向代理、HTTPS、日志收集、健康检查...
+
+Docker 是解决这些问题的标准方案。如果你有 Java 背景，可以把它理解为"更轻量的 JVM"——一次构建，处处运行；如果你来自 Node.js 生态，Docker 的作用类似于 PM2 + 环境隔离的终极形态。
+
+**本文将带你：**
+
+1. 编写生产级多阶段 Dockerfile
+2. 使用 Docker Compose 编排完整的服务栈
+3. 配置 Gunicorn + Uvicorn 生产服务器
+4. 设置 Nginx 反向代理与安全策略
+5. 实现健康检查、日志管理和环境变量管理
+
+---
+
+## 核心概念
+
+### 容器化部署架构总览
+
+```
+                    ┌──────────────┐
+                    │   客户端      │
+                    └──────┬───────┘
+                           │ HTTPS
+                    ┌──────▼───────┐
+                    │    Nginx     │  反向代理 + 静态文件 + SSL
+                    │   :443/:80   │
+                    └──┬───────┬───┘
+                       │       │
+              ┌────────▼┐  ┌──▼────────┐
+              │  Web    │  │  Worker   │
+              │  FastAPI│  │  Celery   │
+              │  :8000  │  │           │
+              └──┬──┬───┘  └──┬──┬────┘
+                 │  │         │  │
+        ┌────────┘  │    ┌────┘  └────────┐
+        │           │    │                 │
+   ┌────▼────┐ ┌───▼────▼──┐  ┌────────────▼──┐
+   │PostgreSQL│ │   Redis   │  │   RabbitMQ    │
+   │  :5432  │ │  :6379    │  │   :5672       │
+   └─────────┘ └───────────┘  └───────────────┘
+```
+
+### Docker vs 传统部署
+
+| 维度       | 传统部署                        | Docker 部署                       |
+| ---------- | ------------------------------- | --------------------------------- |
+| 环境一致性 | 依赖系统环境，"在我机器上能跑"  | 镜像打包一切，完全一致            |
+| 部署速度   | 手动配置，容易出错              | `docker compose up` 一键启动      |
+| 扩缩容     | 需要额外配置                    | `docker compose up --scale web=3` |
+| 隔离性     | 进程共享系统资源                | 容器级别隔离                      |
+| 回滚       | 复杂，依赖运维经验              | 切换镜像版本即可                  |
+| 类比       | 直接运行 `.jar` / `node app.js` | 类似 Kubernetes Pod 的本地版本    |
+
+### 多阶段构建概念
+
+多阶段构建（Multi-stage Build）是 Docker 生产部署的核心技巧。编译型语言（Go、Rust、Java）在构建阶段需要编译器和工具链，但运行时不需要。Python 虽然是解释型语言，但同样适用这个模式：
+
+```
+阶段 1: builder —— 安装依赖（pip install）
+阶段 2: runtime —— 只复制依赖产物 + 源代码（更小的镜像）
+```
+
+---
+
+## 实战演练
+
+### 示例 1：多阶段 Dockerfile
+
+```dockerfile
+# =============================================
+# 博客系统 API - 生产级 Dockerfile
+# =============================================
+
+# ---------- 阶段 1: 构建阶段 ----------
+FROM python:3.12-slim AS builder
+
+# 设置环境变量（避免 Python 生成 .pyc，保证日志实时输出）
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
+
+# 安装系统构建依赖（编译某些 Python 包需要，如 psycopg2）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 创建并切换工作目录
+WORKDIR /build
+
+# 先复制依赖文件（利用 Docker 缓存层，依赖不变时无需重新安装）
+COPY pyproject.toml ./
+
+# 安装依赖到指定目录（不安装项目本身）
+RUN pip install --no-cache-dir --prefix=/install -r <(python -c "import tomllib; f=open('pyproject.toml','rb'); d=tomllib.load(f); print('\n'.join(d['project']['dependencies']))")
+
+# ---------- 阶段 2: 运行阶段 ----------
+FROM python:3.12-slim AS runtime
+
+# 设置标签
+LABEL maintainer="blog-team" \
+      description="Blog API Production Image" \
+      version="1.0"
+
+# 创建非 root 用户（安全最佳实践）
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
+
+# 安装运行时系统依赖（只需要 PostgreSQL 客户端库，不需要 dev 包）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# 设置环境变量
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    # Pydantic 设置
+    APP_ENV=production \
+    # Uvicorn 设置
+    UVICORN_HOST=0.0.0.0 \
+    UVICORN_PORT=8000
+
+# 从构建阶段复制已安装的 Python 依赖
+COPY --from=builder /install /opt/venv
+
+# 创建应用目录并设置权限
+WORKDIR /app
+RUN mkdir -p /app/logs /app/uploads && chown -R appuser:appuser /app
+
+# 复制应用源代码
+COPY --chown=appuser:appuser . .
+
+# 切换到非 root 用户
+USER appuser
+
+# 暴露端口
+EXPOSE 8000
+
+# 健康检查（每 30 秒检查一次，超时 5 秒，连续 3 次失败标记为不健康）
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/api/health || exit 1
+
+# 启动命令（Gunicorn + Uvicorn Worker）
+CMD ["gunicorn", "app.main:app", \
+     "--bind", "0.0.0.0:8000", \
+     "--workers", "4", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--timeout", "120", \
+     "--keep-alive", "5", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-", \
+     "--log-level", "info"]
+```
+
+如果你使用 `uv` 作为包管理器，构建阶段可以这样简化：
+
+```dockerfile
+# ---------- 阶段 1: 构建阶段（使用 uv）----------
+FROM python:3.12-slim AS builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# 安装 uv（极速包管理器）
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+
+WORKDIR /build
+
+COPY pyproject.toml uv.lock ./
+
+# 使用 uv 安装依赖到虚拟环境
+RUN uv sync --frozen --no-dev --no-install-project
+
+# ---------- 阶段 2: 运行阶段 ----------
+FROM python:3.12-slim AS runtime
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN groupadd -r appuser && useradd -r -g appuser -d /app -s /sbin/nologin appuser
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH" \
+    APP_ENV=production
+
+# 从构建阶段复制虚拟环境
+COPY --from=builder /build/.venv /opt/venv
+
+WORKDIR /app
+RUN mkdir -p /app/logs /app/uploads && chown -R appuser:appuser /app
+
+COPY --chown=appuser:appuser . .
+USER appuser
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
+    CMD curl -f http://localhost:8000/api/health || exit 1
+
+CMD ["gunicorn", "app.main:app", \
+     "--bind", "0.0.0.0:8000", \
+     "--workers", "4", \
+     "--worker-class", "uvicorn.workers.UvicornWorker", \
+     "--timeout", "120", \
+     "--keep-alive", "5", \
+     "--access-logfile", "-", \
+     "--error-logfile", "-", \
+     "--log-level", "info"]
+```
+
+### 示例 2：Gunicorn 生产配置文件
+
+```python
+# gunicorn.conf.py
+"""
+Gunicorn 生产配置
+
+类比 Java：相当于 Spring Boot 内嵌 Tomcat 的线程池配置
+类比 Node.js：相当于 cluster 模式的 worker 数量配置
+"""
+import multiprocessing
+import os
+
+# ========== 服务器绑定 ==========
+bind = f"0.0.0.0:{os.getenv('PORT', '8000')}"
+
+# ========== Worker 配置 ==========
+# Worker 数量公式：(2 x CPU 核心数) + 1
+# 这是因为 Python 有 GIL，CPU 密集型任务需要多进程
+# 但 FastAPI 主要是 I/O 密集型（异步），实际可以适当减少
+workers = int(os.getenv("WEB_CONCURRENCY", str(multiprocessing.cpu_count() * 2 + 1)))
+
+# Worker 类：使用 Uvicorn 的 ASGI Worker
+worker_class = "uvicorn.workers.UvicornWorker"
+
+# 每个 Worker 的线程数（Uvicorn Worker 下一般保持 1，由 asyncio 处理并发）
+threads = 1
+
+# Worker 启动超时
+timeout = int(os.getenv("GUNICORN_TIMEOUT", "120"))
+
+# Keep-Alive 超时（秒）
+# Nginx 和 Uvicorn 之间的长连接保持时间
+keepalive = 5
+
+# 最大请求数：Worker 处理这么多请求后自动重启（防止内存泄漏）
+max_requests = int(os.getenv("MAX_REQUESTS", "5000"))
+max_requests_jitter = 500  # 添加随机偏移，避免所有 Worker 同时重启
+
+# ========== 日志配置 ==========
+# 输出到 stdout/stderr（Docker 会自动收集）
+accesslog = "-"       # 访问日志输出到 stdout
+errorlog = "-"        # 错误日志输出到 stderr
+loglevel = os.getenv("LOG_LEVEL", "info")
+
+# 日志格式（包含请求耗时）
+access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s" %(D)s'
+
+# ========== 安全配置 ==========
+limit_request_line = 8190       # 请求行最大大小
+limit_request_fields = 100      # 请求头最大数量
+limit_request_field_size = 8190 # 单个请求头最大大小
+
+# ========== 进程命名 ==========
+proc_name = "blog_api"
+
+# ========== 预加载应用 ==========
+# 启动时预加载应用代码（节省内存，但热更新需要重启）
+preload_app = True
+
+# ========== 钩子函数 ==========
+
+def on_starting(server):
+    """Worker 启动前的回调"""
+    print(f"[Gunicorn] 启动 {workers} 个 Uvicorn Worker...")
+
+def post_fork(server, worker):
+    """Worker fork 后的回调"""
+    server.log.info(f"[Gunicorn] Worker {worker.pid} 已启动")
+
+def worker_int(worker):
+    """Worker 被中断时的回调"""
+    worker.log.info(f"[Gunicorn] Worker {worker.pid} 收到中断信号")
+
+def worker_abort(worker):
+    """Worker 异常退出时的回调"""
+    worker.log.info(f"[Gunicorn] Worker {worker.pid} 异常退出")
+```
+
+### 示例 3：FastAPI 生产入口与配置
+
+```python
+"""
+app/main.py - 生产环境入口
+"""
+import logging
+import os
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI
+from fastapi.middleware.gzip import GZipMiddleware
+
+# ========== 日志配置 ==========
+
+def setup_logging() -> None:
+    """配置生产环境日志"""
+    log_level = os.getenv("LOG_LEVEL", "INFO")
+    log_format = (
+        "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+    )
+
+    logging.basicConfig(
+        level=getattr(logging, log_level),
+        format=log_format,
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # 降低第三方库的日志级别
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("sqlalchemy.engine").setLevel(logging.WARNING)
+
+
+# ========== 应用配置 ==========
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """应用生命周期管理"""
+    setup_logging()
+    logging.getLogger(__name__).info("博客系统 API 启动中...")
+
+    # 启动时初始化连接池
+    from app.core.database import engine
+    from app.core.redis import redis_client
+
+    logging.getLogger(__name__).info("[DB] 数据库连接池已就绪")
+    logging.getLogger(__name__).info("[Redis] Redis 连接已就绪")
+
+    yield
+
+    # 关闭时清理连接
+    await engine.dispose()
+    await redis_client.close()
+    logging.getLogger(__name__).info("博客系统 API 已关闭")
+
+
+app = FastAPI(
+    title="博客系统 API",
+    docs_url="/api/docs" if os.getenv("APP_ENV") == "development" else None,
+    redoc_url="/api/redoc" if os.getenv("APP_ENV") == "development" else None,
+    lifespan=lifespan,
+)
+
+
+# ========== 中间件 ==========
+
+# Gzip 压缩（响应体 > 1KB 时启用）
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+
+# ========== 健康检查端点 ==========
+
+@app.get("/api/health")
+async def health_check():
+    """
+    健康检查端点
+
+    Docker HEALTHCHECK 和负载均衡器会调用此端点
+    """
+    return {"status": "healthy", "version": "1.0.0"}
+
+
+@app.get("/api/ready")
+async def readiness_check():
+    """
+    就绪检查端点
+
+    检查所有依赖服务是否可用
+    """
+    checks = {}
+
+    # 检查数据库连接
+    try:
+        from app.core.database import async_session
+        from sqlalchemy import text
+
+        async with async_session() as session:
+            await session.execute(text("SELECT 1"))
+        checks["database"] = "ok"
+    except Exception as e:
+        checks["database"] = f"error: {e}"
+
+    # 检查 Redis 连接
+    try:
+        from app.core.redis import redis_client
+        await redis_client.ping()
+        checks["redis"] = "ok"
+    except Exception as e:
+        checks["redis"] = f"error: {e}"
+
+    all_ok = all(v == "ok" for v in checks.values())
+    return {
+        "status": "ready" if all_ok else "not_ready",
+        "checks": checks,
+    }
+
+
+# ========== 注册路由 ==========
+
+from app.api.v1.router import api_router
+
+app.include_router(api_router, prefix="/api/v1")
+```
+
+### 示例 4：环境变量管理（Pydantic Settings）
+
+```python
+"""
+app/core/config.py - 生产环境配置
+使用 Pydantic Settings 管理环境变量，自动验证和类型转换
+"""
+from functools import lru_cache
+from pydantic import Field, field_validator, PostgresDsn, RedisDsn
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """应用配置（从环境变量读取）"""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+    )
+
+    # ========== 应用配置 ==========
+    app_env: str = Field(default="production", alias="APP_ENV")
+    app_name: str = Field(default="Blog API", alias="APP_NAME")
+    debug: bool = Field(default=False, alias="DEBUG")
+    secret_key: str = Field(..., alias="SECRET_KEY")  # 必填
+    api_v1_prefix: str = "/api/v1"
+
+    # ========== 数据库 ==========
+    database_url: PostgresDsn = Field(..., alias="DATABASE_URL")
+    database_pool_size: int = Field(default=20, alias="DB_POOL_SIZE")
+    database_max_overflow: int = Field(default=10, alias="DB_MAX_OVERFLOW")
+
+    # ========== Redis ==========
+    redis_url: RedisDsn = Field(default="redis://redis:6379/0", alias="REDIS_URL")
+
+    # ========== JWT ==========
+    jwt_algorithm: str = Field(default="HS256", alias="JWT_ALGORITHM")
+    jwt_access_token_expire_minutes: int = Field(default=30, alias="JWT_ACCESS_EXPIRE")
+    jwt_refresh_token_expire_days: int = Field(default=7, alias="JWT_REFRESH_EXPIRE")
+
+    # ========== Celery ==========
+    celery_broker_url: str = Field(default="redis://redis:6379/1", alias="CELERY_BROKER_URL")
+    celery_result_backend: str = Field(default="redis://redis:6379/2", alias="CELERY_RESULT_BACKEND")
+
+    # ========== RabbitMQ（生产环境推荐）==========
+    rabbitmq_url: str = Field(default="", alias="RABBITMQ_URL")
+
+    # ========== 文件上传 ==========
+    upload_dir: str = Field(default="/app/uploads", alias="UPLOAD_DIR")
+    max_upload_size: int = Field(default=10 * 1024 * 1024, alias="MAX_UPLOAD_SIZE")  # 10MB
+
+    # ========== CORS ==========
+    cors_origins: list[str] = Field(default=["https://myblog.com"], alias="CORS_ORIGINS")
+
+    # ========== 日志 ==========
+    log_level: str = Field(default="INFO", alias="LOG_LEVEL")
+
+    @field_validator("cors_origins", mode="before")
+    @classmethod
+    def parse_cors_origins(cls, v):
+        """解析 CORS 来源（支持逗号分隔的字符串）"""
+        if isinstance(v, str):
+            return [origin.strip() for origin in v.split(",")]
+        return v
+
+    @property
+    def is_production(self) -> bool:
+        return self.app_env == "production"
+
+    @property
+    def is_development(self) -> bool:
+        return self.app_env == "development"
+
+
+@lru_cache
+def get_settings() -> Settings:
+    """获取配置单例（lru_cache 确保只读取一次）"""
+    return Settings()
+```
+
+对应的 `.env` 文件（不要提交到 Git）：
+
+```bash
+# .env.production
+APP_ENV=production
+DEBUG=false
+SECRET_KEY=your-super-secret-key-change-in-production
+
+# 数据库
+DATABASE_URL=postgresql+asyncpg://blog_user:blog_pass@postgres:5432/blog_db
+DB_POOL_SIZE=20
+DB_MAX_OVERFLOW=10
+
+# Redis
+REDIS_URL=redis://redis:6379/0
+
+# JWT
+JWT_ALGORITHM=HS256
+JWT_ACCESS_EXPIRE=30
+JWT_REFRESH_EXPIRE=7
+
+# Celery（开发环境用 Redis，生产环境可用 RabbitMQ）
+CELERY_BROKER_URL=redis://redis:6379/1
+CELERY_RESULT_BACKEND=redis://redis:6379/2
+
+# 文件上传
+UPLOAD_DIR=/app/uploads
+MAX_UPLOAD_SIZE=10485760
+
+# CORS
+CORS_ORIGINS=https://myblog.com,https://admin.myblog.com
+
+# 日志
+LOG_LEVEL=INFO
+```
+
+### 示例 5：Docker Compose 完整编排
+
+```yaml
+# docker-compose.yml
+# 博客系统 - 完整服务编排
+#
+# 启动：docker compose up -d
+# 查看日志：docker compose logs -f
+# 停止：docker compose down
+# 重建：docker compose up -d --build
+
+version: "3.9"
+
+services:
+  # ========== Web 应用 ==========
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: blog_api_web
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      - APP_ENV=production
+    ports:
+      - "8000:8000" # 仅用于调试，生产环境通过 Nginx 代理
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - uploads:/app/uploads # 持久化上传文件
+      - logs:/app/logs # 持久化日志
+    networks:
+      - blog_network
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+        reservations:
+          cpus: "0.5"
+          memory: 256M
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+
+  # ========== Celery Worker ==========
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: blog_api_worker
+    restart: unless-stopped
+    command: >
+      celery -A app.worker.celery_app worker
+      --loglevel=info
+      --concurrency=4
+      --max-tasks-per-child=1000
+      --without-heartbeat
+    env_file:
+      - .env.production
+    environment:
+      - APP_ENV=production
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - uploads:/app/uploads
+    networks:
+      - blog_network
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1G
+
+  # ========== Celery Beat（定时任务调度器）==========
+  beat:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    container_name: blog_api_beat
+    restart: unless-stopped
+    command: >
+      celery -A app.worker.celery_app beat
+      --loglevel=info
+      --schedule=/app/celerybeat-schedule
+    env_file:
+      - .env.production
+    environment:
+      - APP_ENV=production
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - blog_network
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # ========== PostgreSQL 数据库 ==========
+  postgres:
+    image: postgres:16-alpine
+    container_name: blog_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: blog_user
+      POSTGRES_PASSWORD: blog_pass
+      POSTGRES_DB: blog_db
+      # 优化配置
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # 初始化脚本（首次启动时执行）
+      - ./docker/init-db.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432" # 仅开发环境暴露，生产环境去掉
+    networks:
+      - blog_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U blog_user -d blog_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2G
+
+  # ========== Redis 缓存 ==========
+  redis:
+    image: redis:7-alpine
+    container_name: blog_redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --appendonly yes
+      --appendfsync everysec
+      --requirepass ${REDIS_PASSWORD:-}
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379" # 仅开发环境暴露
+    networks:
+      - blog_network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512M
+
+  # ========== RabbitMQ（生产环境可选）==========
+  # 如果使用 RabbitMQ 替代 Redis 作为 Celery Broker，取消注释
+  # rabbitmq:
+  #   image: rabbitmq:3-management-alpine
+  #   container_name: blog_rabbitmq
+  #   restart: unless-stopped
+  #   environment:
+  #     RABBITMQ_DEFAULT_USER: blog_rabbit
+  #     RABBITMQ_DEFAULT_PASS: blog_rabbit_pass
+  #     RABBITMQ_DEFAULT_VHOST: blog_vhost
+  #   volumes:
+  #     - rabbitmq_data:/var/lib/rabbitmq
+  #   ports:
+  #     - "5672:5672"   # AMQP 协议
+  #     - "15672:15672" # 管理界面
+  #   networks:
+  #     - blog_network
+  #   healthcheck:
+  #     test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+  #     interval: 15s
+  #     timeout: 10s
+  #     retries: 3
+
+  # ========== Nginx 反向代理 ==========
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: blog_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./docker/nginx/ssl:/etc/nginx/ssl:ro # SSL 证书
+      - uploads:/usr/share/nginx/html/uploads:ro # 静态文件
+      - nginx_logs:/var/log/nginx
+    depends_on:
+      web:
+        condition: service_healthy
+    networks:
+      - blog_network
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 256M
+
+# ========== 持久化卷 ==========
+volumes:
+  postgres_data:
+    driver: local
+  redis_data:
+    driver: local
+  rabbitmq_data:
+    driver: local
+  uploads:
+    driver: local
+  logs:
+    driver: local
+  nginx_logs:
+    driver: local
+
+# ========== 网络 ==========
+networks:
+  blog_network:
+    driver: bridge
+```
+
+### 示例 6：Nginx 反向代理配置
+
+```nginx
+# docker/nginx/nginx.conf
+# Nginx 主配置文件
+
+# 运行用户
+user nginx;
+
+# Worker 进程数（auto = 自动匹配 CPU 核心数）
+worker_processes auto;
+
+# 错误日志
+error_log /var/log/nginx/error.log warn;
+
+# PID 文件
+pid /var/run/nginx.pid;
+
+# 单个 Worker 最大连接数
+events {
+    worker_connections 1024;
+    # 使用 epoll（Linux 高性能 I/O 模型）
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    # ========== 基础配置 ==========
+    include       mime.types;
+    default_type  application/octet-stream;
+
+    # 日志格式（包含上游响应时间，方便排查性能问题）
+    log_format main '$remote_addr - $remote_user [$time_local] '
+                    '"$request" $status $body_bytes_sent '
+                    '"$http_referer" "$http_user_agent" '
+                    'upstream_response_time=$upstream_response_time '
+                    'request_time=$request_time';
+
+    access_log /var/log/nginx/access.log main;
+
+    # ========== 性能优化 ==========
+    sendfile        on;       # 零拷贝传输文件
+    tcp_nopush      on;       # 优化大文件传输
+    tcp_nodelay     on;       # 禁用 Nagle 算法（减少延迟）
+
+    # Keep-Alive 配置
+    keepalive_timeout 65;
+    keepalive_requests 1000;
+
+    # Gzip 压缩
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_min_length 1024;
+    gzip_types
+        text/plain
+        text/css
+        text/javascript
+        application/json
+        application/javascript
+        application/xml
+        application/xml+rss
+        image/svg+xml;
+
+    # ========== 安全头部 ==========
+    # 隐藏 Nginx 版本号
+    server_tokens off;
+
+    # 包含站点配置
+    include /etc/nginx/conf.d/*.conf;
+}
+```
+
+```nginx
+# docker/nginx/conf.d/default.conf
+# 博客 API 站点配置
+
+# ========== 限流配置 ==========
+
+# 按 IP 限流：每个 IP 每秒 20 个请求
+# $binary_remote_addr 比 $remote_addr 更省内存（4 字节 vs 7~15 字节）
+limit_req_zone $binary_remote_addr zone=api_limit:10m rate=20r/s;
+
+# 并发连接数限制：每个 IP 最多 50 个并发连接
+limit_conn_zone $binary_remote_addr zone=conn_limit:10m;
+
+# ========== 上游服务 ==========
+upstream fastapi_backend {
+    # Docker Compose 的服务名会自动解析为容器 IP
+    server web:8000;
+
+    # 健康检查：如果某台服务器 3 次失败，30 秒内不再转发给它
+    # max_fails=3 fail_timeout=30s;
+
+    # Keep-Alive 连接池（减少 TCP 握手开销）
+    keepalive 32;
+}
+
+# ========== HTTP -> HTTPS 重定向 ==========
+server {
+    listen 80;
+    server_name api.myblog.com;
+
+    # Let's Encrypt ACME 验证
+    location /.well-known/acme-challenge/ {
+        root /var/www/certbot;
+    }
+
+    # 其他请求重定向到 HTTPS
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+# ========== HTTPS 服务器 ==========
+server {
+    listen 443 ssl http2;
+    server_name api.myblog.com;
+
+    # ========== SSL 配置 ==========
+    ssl_certificate     /etc/nginx/ssl/fullchain.pem;
+    ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+
+    # SSL 协议和加密套件（只允许 TLS 1.2 和 1.3）
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+
+    # SSL 会话缓存（减少 SSL 握手开销）
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+
+    # OCSP Stapling（加速证书验证）
+    ssl_stapling on;
+    ssl_stapling_verify on;
+    resolver 8.8.8.8 8.8.4.4 valid=300s;
+
+    # ========== 安全头部 ==========
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # ========== 连接限制 ==========
+    limit_req zone=api_limit burst=50 nodelay;
+    limit_conn conn_limit 50;
+
+    # ========== 请求体大小限制 ==========
+    client_max_body_size 10M;
+
+    # ========== 代理配置 ==========
+    location /api/ {
+        proxy_pass http://fastapi_backend;
+        proxy_http_version 1.1;
+
+        # 传递客户端信息
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # WebSocket 支持（如果使用 WebSocket）
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+
+        # 超时配置
+        proxy_connect_timeout 10s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 120s;
+
+        # 上游 Keep-Alive
+        proxy_set_header Connection "";
+    }
+
+    # ========== 静态文件（上传的图片等）==========
+    location /uploads/ {
+        alias /usr/share/nginx/html/uploads/;
+        expires 30d;          # 30 天缓存
+        add_header Cache-Control "public, immutable";
+        # 防止目录列表
+        autoindex off;
+    }
+
+    # ========== 健康检查（不限流）==========
+    location /api/health {
+        proxy_pass http://fastapi_backend;
+        access_log off;       # 不记录健康检查日志
+    }
+
+    # ========== 禁止访问隐藏文件 ==========
+    location ~ /\. {
+        deny all;
+        access_log off;
+        log_not_found off;
+    }
+}
+```
+
+### 示例 7：日志管理与结构化日志
+
+```python
+"""
+app/core/logging_config.py - 生产环境日志配置
+"""
+import logging
+import logging.config
+import os
+import sys
+from datetime import datetime, timezone
+
+
+# JSON 格式日志（便于 ELK/Loki 等日志系统收集）
+class JSONFormatter(logging.Formatter):
+    """结构化 JSON 日志格式化器"""
+
+    def format(self, record: logging.LogRecord) -> str:
+        import json
+
+        log_entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "module": record.module,
+            "function": record.funcName,
+            "line": record.lineno,
+        }
+
+        # 附加异常信息
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
+
+        # 附加额外字段
+        if hasattr(record, "request_id"):
+            log_entry["request_id"] = record.request_id
+        if hasattr(record, "user_id"):
+            log_entry["user_id"] = record.user_id
+        if hasattr(record, "duration_ms"):
+            log_entry["duration_ms"] = record.duration_ms
+
+        return json.dumps(log_entry, ensure_ascii=False)
+
+
+def setup_logging(log_level: str = "INFO") -> None:
+    """配置生产环境日志"""
+
+    config = {
+        "version": 1,
+        "disable_existing_loggers": False,
+
+        "formatters": {
+            # 标准文本格式（开发环境）
+            "standard": {
+                "format": (
+                    "%(asctime)s | %(levelname)-8s | %(name)s | "
+                    "%(funcName)s:%(lineno)d | %(message)s"
+                ),
+                "datefmt": "%Y-%m-%d %H:%M:%S",
+            },
+            # JSON 格式（生产环境，方便日志系统收集）
+            "json": {
+                "()": JSONFormatter,
+            },
+        },
+
+        "handlers": {
+            # 控制台输出（Docker 收集 stdout）
+            "console": {
+                "class": "logging.StreamHandler",
+                "stream": sys.stdout,
+                "formatter": "json" if os.getenv("APP_ENV") == "production" else "standard",
+            },
+        },
+
+        "loggers": {
+            # 应用日志
+            "app": {
+                "level": log_level,
+                "handlers": ["console"],
+                "propagate": False,
+            },
+            # 第三方库日志（降低级别）
+            "uvicorn": {"level": "WARNING"},
+            "uvicorn.access": {"level": "WARNING"},
+            "sqlalchemy": {"level": "WARNING"},
+            "celery": {"level": "INFO"},
+            "httpx": {"level": "WARNING"},
+            # 根日志
+            "": {
+                "level": "WARNING",
+                "handlers": ["console"],
+            },
+        },
+    }
+
+    logging.config.dictConfig(config)
+
+
+# ========== 使用示例 ==========
+
+logger = logging.getLogger("app.api.posts")
+
+# 普通日志
+logger.info("文章创建成功", extra={"user_id": 42, "post_id": 100})
+
+# 带耗时的日志
+logger.info(
+    "查询文章列表",
+    extra={"duration_ms": 23, "request_id": "req-abc123"},
+)
+
+# 错误日志（自动包含堆栈）
+try:
+    result = 1 / 0
+except ZeroDivisionError:
+    logger.exception("计算错误")
+```
+
+Docker Compose 的日志驱动配置（添加到 `docker-compose.yml` 的服务中）：
+
+```yaml
+# 在 docker-compose.yml 的 web 服务中添加
+services:
+  web:
+    # ... 其他配置 ...
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m" # 单个日志文件最大 50MB
+        max-file: "5" # 最多保留 5 个日志文件
+        tag: "blog-api" # 日志标签
+```
+
+### 示例 8：数据库初始化脚本
+
+```sql
+-- docker/init-db.sql
+-- PostgreSQL 初始化脚本（首次启动时自动执行）
+
+-- 创建扩展
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";  -- 模糊搜索
+
+-- 设置时区
+SET timezone = 'Asia/Shanghai';
+
+-- 创建只读用户（用于数据分析）
+-- CREATE ROLE blog_readonly WITH LOGIN PASSWORD 'readonly_pass';
+-- GRANT CONNECT ON DATABASE blog_db TO blog_readonly;
+-- GRANT USAGE ON SCHEMA public TO blog_readonly;
+-- GRANT SELECT ON ALL TABLES IN SCHEMA public TO blog_readonly;
+
+-- 输出初始化完成信息
+DO $$
+BEGIN
+    RAISE NOTICE 'Blog database initialized successfully';
+END
+$$;
+```
+
+### 示例 9：生产环境 Makefile
+
+```makefile
+# Makefile
+# 常用运维命令集合
+
+.PHONY: help build up down logs shell test migrate
+
+# 默认目标
+help: ## 显示帮助信息
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
+
+# ========== 开发命令 ==========
+
+build: ## 构建镜像
+	docker compose build
+
+up: ## 启动所有服务
+	docker compose up -d
+
+down: ## 停止所有服务
+	docker compose down
+
+restart: ## 重启所有服务
+	docker compose restart
+
+logs: ## 查看日志（实时）
+	docker compose logs -f --tail=100
+
+logs-web: ## 查看 Web 服务日志
+	docker compose logs -f web --tail=100
+
+logs-worker: ## 查看 Worker 日志
+	docker compose logs -f worker --tail=100
+
+# ========== 数据库 ==========
+
+migrate: ## 运行数据库迁移
+	docker compose exec web alembic upgrade head
+
+migrate-create: ## 创建迁移文件（需要传 name 参数）
+	docker compose exec web alembic revision --autogenerate -m "$(name)"
+
+rollback: ## 回滚上一个迁移
+	docker compose exec web alembic downgrade -1
+
+db-shell: ## 进入数据库 shell
+	docker compose exec postgres psql -U blog_user -d blog_db
+
+# ========== 调试 ==========
+
+shell: ## 进入 Web 容器 shell
+	docker compose exec web /bin/bash
+
+redis-cli: ## 进入 Redis CLI
+	docker compose exec redis redis-cli
+
+flower: ## 启动 Celery 监控面板
+	docker compose exec worker celery -A app.worker.celery_app flower --port=5555
+
+# ========== 测试 ==========
+
+test: ## 运行测试
+	docker compose exec web pytest tests/ -v --tb=short
+
+test-cov: ## 运行测试（含覆盖率）
+	docker compose exec web pytest tests/ -v --cov=app --cov-report=term-missing
+
+lint: ## 代码检查
+	docker compose exec web ruff check app/ tests/
+
+# ========== 生产运维 ==========
+
+ps: ## 查看服务状态
+	docker compose ps
+
+top: ## 查看容器资源使用
+	docker stats --no-stream
+
+scale-web: ## 扩展 Web 实例（参数 N）
+	docker compose up -d --scale web=$(N)
+
+clean: ## 清理未使用的镜像和容器
+	docker system prune -f
+
+backup-db: ## 备份数据库
+	docker compose exec postgres pg_dump -U blog_user blog_db > backup_$$(date +%Y%m%d_%H%M%S).sql
+
+# ========== 证书 ==========
+
+cert: ## 申请 SSL 证书（Let's Encrypt）
+	docker compose run --rm certbot certonly \
+		--webroot --webroot-path /var/www/certbot \
+		-d api.myblog.com \
+		--email admin@myblog.com \
+		--agree-tos --no-eff-email
+```
+
+### 示例 10：.dockerignore 文件
+
+```gitignore
+# .dockerignore
+# 排除不需要复制到镜像中的文件（减小构建上下文大小）
+
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info
+.eggs
+dist/
+build/
+*.egg
+
+# 虚拟环境
+.venv
+venv
+env
+ENV
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 测试
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+
+# 环境配置（不要打包到镜像中）
+.env
+.env.*
+!.env.example
+
+# 文档
+docs/
+*.md
+LICENSE
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.docker/
+
+# 上传文件和日志（使用 volume 挂载）
+uploads/
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+```
+
+---
+
+## 最佳实践
+
+### 1. Docker 镜像优化清单
+
+```dockerfile
+# 镜像优化要点总结：
+
+# 1. 使用 slim 镜像而非完整镜像
+#    好: python:3.12-slim (约 150MB)
+#    差: python:3.12 (约 1GB)
+
+# 2. 多阶段构建（减小最终镜像体积）
+#    构建阶段安装编译工具，运行阶段只复制产物
+
+# 3. 利用层缓存
+#    先 COPY 依赖文件，再 COPY 源代码
+#    依赖不变时无需重新安装
+
+# 4. 合并 RUN 指令（减少层数）
+#    好: RUN apt-get update && apt-get install -y pkg && rm -rf /var/lib/apt/lists/*
+#    差: RUN apt-get update
+#         RUN apt-get install -y pkg
+
+# 5. 使用 .dockerignore（减小构建上下文）
+
+# 6. 非特权用户运行
+#    RUN groupadd -r appuser && useradd -r -g appuser appuser
+#    USER appuser
+
+# 7. 固定基础镜像版本（避免意外更新导致的问题）
+#    好: python:3.12.2-slim
+#    差: python:3.12-slim
+```
+
+### 2. Docker Compose 健康检查策略
+
+```yaml
+# 健康检查的三层策略：
+
+# 第一层：容器级健康检查
+healthcheck:
+  test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+  interval: 30s # 每 30 秒检查一次
+  timeout: 5s # 超时 5 秒
+  start_period: 40s # 启动后等待 40 秒才开始检查
+  retries: 3 # 连续 3 次失败标记为 unhealthy
+
+# 第二层：就绪检查（检查依赖服务）
+# /api/ready 端点会检查数据库和 Redis 连接
+# 确保服务在所有依赖就绪后才接收流量
+
+# 第三层：depends_on 条件
+depends_on:
+  postgres:
+    condition: service_healthy # 等待 PostgreSQL 健康后再启动
+  redis:
+    condition: service_healthy
+```
+
+### 3. 安全加固清单
+
+```python
+"""
+生产环境安全检查清单
+"""
+
+# ========== 1. 密钥管理 ==========
+# 绝对不要把 SECRET_KEY 硬编码在代码或 Dockerfile 中
+# 使用环境变量或 Docker Secrets
+# SECRET_KEY 通过 .env 文件或 docker secrets 传入
+
+# ========== 2. 网络隔离 ==========
+# Docker Compose 默认所有服务在同一网络中
+# 生产环境可以创建多个网络隔离不同服务
+# 例如：frontend-network、backend-network、database-network
+
+# ========== 3. 不暴露内部端口 ==========
+# 数据库和 Redis 的 ports 配置只保留内部通信
+# 去掉 ports 映射，只通过 Docker 网络访问
+
+# ========== 4. 使用非 root 用户 ==========
+# Dockerfile 中创建 appuser 并切换
+
+# ========== 5. 镜像扫描 ==========
+# 定期使用 trivy 或 docker scout 扫描镜像漏洞
+# trivy image my-blog-api:latest
+
+# ========== 6. 最小权限原则 ==========
+# 数据库用户只授予必要的权限
+# Celery Worker 使用独立的数据库用户（只写特定表）
+
+# ========== 7. 依赖锁定 ==========
+# 使用 uv.lock 或 poetry.lock 锁定依赖版本
+# 定期更新依赖，修复已知漏洞
+
+# ========== 8. 日志脱敏 ==========
+# 不要在日志中输出密码、Token 等敏感信息
+# Pydantic 模型配置 extra="forbid" 防止意外暴露
+```
+
+### 4. 性能优化要点
+
+```
+性能优化层级（从外到内）：
+
+1. Nginx 层
+   ├── 启用 Gzip 压缩
+   ├── 静态文件缓存（expires 30d）
+   ├── Keep-Alive 连接复用
+   └── 限流保护（防 DDoS）
+
+2. Gunicorn 层
+   ├── Worker 数量 = 2 * CPU + 1
+   ├── max_requests 防止内存泄漏
+   └── preload_app 共享内存
+
+3. FastAPI 层
+   ├── 连接池配置（DB、Redis）
+   ├── 异步 I/O（避免阻塞事件循环）
+   ├── 缓存热点数据（Redis）
+   └── Gzip 中间件
+
+4. 数据库层
+   ├── 连接池（pool_size=20, max_overflow=10）
+   ├── 索引优化
+   ├── 查询优化（避免 N+1）
+   └── 读写分离（可选）
+
+5. Redis 层
+   ├── maxmemory-policy allkeys-lru
+   ├── AOF 持久化
+   └── 连接池
+```
+
+---
+
+## 常见问题
+
+**Q: Docker Compose 适合生产环境吗？**
+
+A: Docker Compose 适合中小型项目的单机部署。如果需要多机部署、自动扩缩容、滚动更新等高级功能，应该使用 Kubernetes。但即使是 Kubernetes，Docker Compose 的配置思路（服务定义、网络、卷）也是相通的。对于大多数博客系统来说，Docker Compose 完全够用。
+
+**Q: Gunicorn 的 Worker 数量怎么确定？**
+
+A: 官方推荐公式是 `(2 * CPU核心数) + 1`。但 FastAPI 是异步框架，I/O 密集型场景下每个 Worker 可以处理大量并发连接，所以实际可以根据负载测试调整。建议设置为环境变量 `WEB_CONCURRENCY`，方便在 K8s 中根据 Pod 资源动态调整。
+
+**Q: Uvicorn Worker 和 Uvicorn 直接启动有什么区别？**
+
+A: `uvicorn app.main:app` 启动单个进程，适合开发环境。Gunicorn + Uvicorn Worker 启动多个进程，Gunicorn 负责进程管理（启动、重启、负载均衡），Uvicorn Worker 负责 ASGI 请求处理。类比 Java：Uvicorn 相当于内嵌 Tomcat，Gunicorn 相当于 Apache + Tomcat 的组合。
+
+**Q: 如何实现零停机部署？**
+
+A: Docker Compose 的 `docker compose up -d --build` 会自动滚动更新（先启动新容器，健康检查通过后再停止旧容器）。更完善的方案是蓝绿部署或金丝雀发布，需要配合 Nginx upstream 的权重切换或 Kubernetes 的 Rolling Update。
+
+**Q: 容器内如何收集日志？**
+
+A: 生产环境推荐 JSON 格式日志输出到 stdout/stderr，由 Docker 的日志驱动收集。可以搭配 ELK（Elasticsearch + Logstash + Kibana）或 Grafana Loki 进行日志聚合和查询。Docker 自带 `json-file` 日志驱动，配合 `max-size` 和 `max-file` 选项防止磁盘写满。
+
+**Q: 如何管理 SSL 证书？**
+
+A: 推荐使用 Let's Encrypt + Certbot 自动申请和续期。Docker Compose 中可以添加一个 `certbot` 服务，通过定时任务（cron）自动续期。也可以使用 Nginx Proxy Manager 等工具简化 SSL 管理。
+
+---
+
+## 总结
+
+本系列 22 篇文章到此全部完成。下表回顾本文涉及的核心知识点：
+
+| 组件              | 用途        | 关键配置                         |
+| ----------------- | ----------- | -------------------------------- |
+| Dockerfile        | 应用容器化  | 多阶段构建、非 root 用户、层缓存 |
+| Docker Compose    | 服务编排    | 依赖管理、健康检查、资源限制     |
+| Gunicorn          | 进程管理    | Worker 数量、超时、Keep-Alive    |
+| Uvicorn Worker    | ASGI 服务器 | 异步请求处理                     |
+| Nginx             | 反向代理    | SSL、Gzip、限流、安全头部        |
+| Pydantic Settings | 配置管理    | 环境变量、类型验证               |
+| 结构化日志        | 日志管理    | JSON 格式、日志收集              |
+| 健康检查          | 服务监控    | liveness、readiness 探针         |
+
+| 命令                           | 作用           |
+| ------------------------------ | -------------- |
+| `docker compose up -d`         | 启动所有服务   |
+| `docker compose down`          | 停止所有服务   |
+| `docker compose logs -f`       | 查看实时日志   |
+| `docker compose exec web bash` | 进入容器       |
+| `docker compose up -d --build` | 重新构建并启动 |
+| `docker compose ps`            | 查看服务状态   |
+| `docker system prune`          | 清理无用资源   |
+
+至此，Python 渐进式学习系列全部完结。从语言基础到工程化，从 FastAPI 入门到 Docker 生产部署，你已具备构建生产级 Python Web 应用的完整能力。回顾整个系列的学习路径：
+
+| 阶段     | 内容                                                | 篇数 |
+| -------- | --------------------------------------------------- | ---- |
+| 语言基础 | 语法、数据结构、OOP、高级特性                       | 5 篇 |
+| 工程化   | 包管理、类型注解、错误处理、测试、标准库            | 5 篇 |
+| Web 开发 | FastAPI、SQLAlchemy、CRUD、JWT、Pydantic            | 5 篇 |
+| 进阶实战 | 异步编程、中间件、文件上传、WebSocket、缓存、Celery | 6 篇 |
+| 生产部署 | Docker 部署与生产优化                               | 1 篇 |

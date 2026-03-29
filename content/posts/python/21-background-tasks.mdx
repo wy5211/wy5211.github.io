@@ -1,0 +1,663 @@
+---
+title: "21 后台任务与 Celery"
+date: "2026-03-29"
+summary: "使用 FastAPI BackgroundTasks 和 Celery 处理耗时异步任务，掌握任务队列、定时任务和任务监控"
+tags: ["Python", "Celery", "后台任务", "RabbitMQ"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 渐进式学习"
+seriesOrder: 21
+---
+
+# 后台任务与 Celery
+
+## 前言
+
+Web 应用中很多操作不适合在请求中同步执行：发送邮件可能需要几秒、导出大量数据可能需要几分钟、图片处理可能需要更长时间。如果在 HTTP 请求中执行这些操作，会导致请求超时、用户体验差。
+
+FastAPI 提供了轻量级的 `BackgroundTasks`，而 Celery 则是 Python 生态中处理分布式任务队列的标准方案。
+
+**本文将带你：**
+
+1. 使用 FastAPI BackgroundTasks 处理简单后台任务
+2. 理解 Celery 架构和核心概念
+3. 定义和执行 Celery 任务
+4. 配置定时任务（Celery Beat）
+5. 实现任务状态追踪、重试和错误处理
+
+---
+
+## 核心概念
+
+### FastAPI BackgroundTasks vs Celery
+
+| 维度     | BackgroundTasks        | Celery           |
+| -------- | ---------------------- | ---------------- |
+| 复杂度   | 极简，内置             | 需要额外组件     |
+| 执行方式 | 请求结束后在同进程执行 | 独立 Worker 进程 |
+| 持久化   | 无                     | 消息队列持久化   |
+| 分布式   | 不支持                 | 支持多 Worker    |
+| 定时任务 | 不支持                 | Celery Beat      |
+| 适用场景 | 日志记录、缓存更新     | 邮件、导出、处理 |
+
+### Celery 架构
+
+```
+┌──────────┐     ┌──────────────┐     ┌──────────────┐
+│  FastAPI │────►│  Broker      │────►│  Celery      │
+│  (生产者) │     │  (消息队列)   │     │  Worker      │
+└──────────┘     │  Redis /     │     │  (消费者)     │
+                 │  RabbitMQ    │     └──────┬───────┘
+                 └──────────────┘            │
+                                             ▼
+                                    ┌──────────────┐
+                                    │  Result      │
+                                    │  Backend     │
+                                    │  (结果存储)   │
+                                    └──────────────┘
+```
+
+---
+
+## 实战演练
+
+### 示例 1：FastAPI BackgroundTasks（轻量级）
+
+```python
+"""
+博客系统 - BackgroundTasks 使用
+"""
+import logging
+from fastapi import FastAPI, BackgroundTasks, Depends
+from pydantic import BaseModel, EmailStr
+
+logger = logging.getLogger(__name__)
+app = FastAPI()
+
+# ========== 1. 发送邮件 ==========
+
+def send_welcome_email(to_email: str, username: str):
+    """发送欢迎邮件（后台任务）"""
+    logger.info(f"正在发送欢迎邮件到 {to_email}")
+    # 模拟发送邮件（实际使用 smtplib 或第三方 SDK）
+    import time
+    time.sleep(3)  # 模拟耗时操作
+    logger.info(f"欢迎邮件已发送到 {to_email}")
+
+@app.post("/api/users/register")
+async def register(
+    username: str,
+    email: EmailStr,
+    background_tasks: BackgroundTasks,
+):
+    """用户注册（邮件在后台发送）"""
+    # 1. 保存用户到数据库（同步执行）
+    user_id = 1  # 模拟
+    logger.info(f"用户 {username} 注册成功，ID: {user_id}")
+
+    # 2. 添加后台任务（注册完成后自动执行）
+    background_tasks.add_task(send_welcome_email, email, username)
+
+    # 3. 立即返回响应（不等待邮件发送完成）
+    return {
+        "message": "注册成功",
+        "user_id": user_id,
+        "email_sent": "scheduled",  # 邮件已安排发送
+    }
+
+
+# ========== 2. 缓存更新 ==========
+
+async def refresh_post_cache(post_id: int):
+    """刷新文章缓存（后台任务）"""
+    logger.info(f"开始刷新文章 {post_id} 的缓存")
+    await asyncio.sleep(2)  # 模拟耗时操作
+    await cache.set(f"post:{post_id}", {"id": post_id, "cached": True}, ttl=300)
+    logger.info(f"文章 {post_id} 缓存刷新完成")
+
+@app.put("/api/posts/{post_id}")
+async def update_post(
+    post_id: int,
+    background_tasks: BackgroundTasks,
+):
+    """更新文章（缓存异步刷新）"""
+    # 1. 更新数据库
+    logger.info(f"文章 {post_id} 已更新")
+
+    # 2. 后台刷新缓存
+    background_tasks.add_task(refresh_post_cache, post_id)
+
+    return {"message": "更新成功"}
+
+
+# ========== 3. 依赖注入 + 后台任务 ==========
+
+def get_db_session():
+    """获取数据库会话"""
+    session = {"connection": "active"}
+    try:
+        yield session
+    finally:
+        session["connection"] = "closed"
+
+def cleanup_after_request(db_session: dict, user_id: int):
+    """请求后的清理工作（使用依赖注入的结果）"""
+    logger.info(f"清理用户 {user_id} 的临时数据")
+    # db_session 参数来自依赖注入的结果
+
+@app.post("/api/posts/{post_id}/publish")
+async def publish_post(
+    post_id: int,
+    background_tasks: BackgroundTasks,
+    db_session: dict = Depends(get_db_session),
+):
+    """发布文章"""
+    # 依赖注入的结果可以传递给后台任务
+    background_tasks.add_task(cleanup_after_request, db_session, user_id=1)
+    return {"message": "文章已发布"}
+```
+
+### 示例 2：Celery 配置与任务定义
+
+```python
+"""
+博客系统 - Celery 配置
+"""
+from celery import Celery
+from celery.schedules import crontab
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ========== Celery 实例 ==========
+
+celery_app = Celery(
+    "blog_worker",
+    broker="redis://localhost:6379/1",          # 消息代理
+    backend="redis://localhost:6379/2",          # 结果存储
+)
+
+# ========== Celery 配置 ==========
+
+celery_app.conf.update(
+    # 序列化格式
+    task_serializer="json",
+    result_serializer="json",
+    accept_content=["json"],
+
+    # 时区
+    timezone="Asia/Shanghai",
+    enable_utc=True,
+
+    # 任务结果过期时间（秒）
+    result_expires=3600,
+
+    # 任务限流
+    task_annotations={
+        "tasks.send_email": {"rate_limit": "10/m"},       # 每分钟最多 10 封
+        "tasks.process_image": {"rate_limit": "5/m"},     # 每分钟最多 5 张
+    },
+
+    # 任务路由
+    task_routes={
+        "tasks.send_email": {"queue": "emails"},           # 邮件队列
+        "tasks.process_image": {"queue": "media"},         # 媒体处理队列
+        "tasks.*": {"queue": "default"},                   # 默认队列
+    },
+
+    # Worker 配置
+    worker_prefetch_multiplier=1,   # 每次只取一个任务（避免长任务阻塞）
+    worker_max_tasks_per_child=1000, # Worker 执行 1000 个任务后重启（防止内存泄漏）
+)
+
+
+# ========== 任务定义 ==========
+
+@celery_app.task(
+    name="tasks.send_email",
+    bind=True,           # 允许访问 task 实例（self）
+    max_retries=3,       # 最大重试次数
+    retry_backoff=60,    # 重试间隔：60s, 120s, 240s
+    retry_backoff_max=600,
+    retry_jitter=True,   # 添加随机偏移避免惊群效应
+)
+def send_email_task(self, to_email: str, subject: str, body: str):
+    """
+    发送邮件任务
+
+    Args:
+        self: Celery Task 实例（bind=True 时可用）
+        to_email: 收件人邮箱
+        subject: 邮件主题
+        body: 邮件内容
+    """
+    try:
+        logger.info(f"开始发送邮件: {subject} -> {to_email}")
+        import smtplib
+        from email.mime.text import MIMEText
+        from email.header import Header
+
+        # 构造邮件
+        msg = MIMEText(body, "html", "utf-8")
+        msg["Subject"] = Header(subject, "utf-8")
+        msg["From"] = "noreply@myblog.com"
+        msg["To"] = to_email
+
+        # 发送邮件（实际项目使用 SMTP 配置）
+        # with smtplib.SMTP("smtp.example.com", 587) as server:
+        #     server.starttls()
+        #     server.login("user", "password")
+        #     server.send_message(msg)
+
+        logger.info(f"邮件发送成功: {to_email}")
+        return {"status": "sent", "to": to_email}
+
+    except Exception as exc:
+        logger.error(f"邮件发送失败: {exc}")
+        # 重试
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(name="tasks.process_image", bind=True, max_retries=2)
+def process_image_task(self, image_path: str, operations: list[dict]):
+    """
+    图片处理任务
+    operations: [{"type": "resize", "width": 800}, {"type": "watermark"}]
+    """
+    try:
+        from PIL import Image
+        import io
+
+        logger.info(f"开始处理图片: {image_path}")
+
+        image = Image.open(image_path)
+
+        for op in operations:
+            if op["type"] == "resize":
+                w = op["width"]
+                ratio = w / image.width
+                image = image.resize((w, int(image.height * ratio)))
+            elif op["type"] == "watermark":
+                # 添加水印...
+                pass
+
+        # 保存处理后的图片
+        output_path = image_path.replace(".", "_processed.")
+        image.save(output_path, quality=85, optimize=True)
+
+        logger.info(f"图片处理完成: {output_path}")
+        return {"status": "completed", "output": output_path}
+
+    except Exception as exc:
+        logger.error(f"图片处理失败: {exc}")
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(name="tasks.export_data", bind=True)
+def export_user_data_task(self, user_id: int, export_format: str = "csv"):
+    """
+    导出用户数据任务
+    """
+    try:
+        logger.info(f"开始导出用户 {user_id} 的数据（{export_format} 格式）")
+
+        import csv
+        import tempfile
+        import os
+
+        # 模拟数据查询
+        posts = [{"id": i, "title": f"文章 {i}", "views": i * 100} for i in range(1, 101)]
+
+        # 创建临时文件
+        output_dir = tempfile.mkdtemp()
+        filename = f"user_{user_id}_export.{export_format}"
+        filepath = os.path.join(output_dir, filename)
+
+        if export_format == "csv":
+            with open(filepath, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=["id", "title", "views"])
+                writer.writeheader()
+                writer.writerows(posts)
+
+        # 更新任务进度
+        self.update_state(
+            state="PROGRESS",
+            meta={"current": 100, "total": 100, "status": "导出完成"},
+        )
+
+        logger.info(f"数据导出完成: {filepath}")
+        return {
+            "status": "completed",
+            "file": filename,
+            "records": len(posts),
+        }
+
+    except Exception as exc:
+        logger.error(f"数据导出失败: {exc}")
+        raise self.retry(exc=exc, countdown=30)
+```
+
+### 示例 3：FastAPI 集成 Celery
+
+```python
+"""
+博客系统 - FastAPI + Celery 集成
+"""
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from pydantic import BaseModel
+
+app = FastAPI()
+
+# ========== API 路由 ==========
+
+class EmailRequest(BaseModel):
+    to_email: str
+    subject: str
+    body: str
+
+class ExportRequest(BaseModel):
+    export_format: str = "csv"
+
+@app.post("/api/tasks/send-email")
+async def send_email(request: EmailRequest):
+    """发送邮件（异步任务）"""
+    # 将任务提交到 Celery
+    task = send_email_task.delay(request.to_email, request.subject, request.body)
+
+    return {
+        "message": "邮件任务已提交",
+        "task_id": task.id,
+        "status": "pending",
+    }
+
+@app.post("/api/users/{user_id}/export")
+async def export_user_data(user_id: int, request: ExportRequest = ExportRequest()):
+    """导出用户数据（异步任务）"""
+    task = export_user_data_task.delay(user_id, request.export_format)
+
+    return {
+        "message": "导出任务已提交",
+        "task_id": task.id,
+        "status": "pending",
+        "check_url": f"/api/tasks/{task.id}/status",
+    }
+
+@app.get("/api/tasks/{task_id}/status")
+async def get_task_status(task_id: str):
+    """查询任务状态"""
+    from celery.result import AsyncResult
+
+    result = AsyncResult(task_id, app=celery_app)
+
+    response = {
+        "task_id": task_id,
+        "status": result.status,
+    }
+
+    if result.ready():
+        if result.successful():
+            response["result"] = result.result
+        else:
+            response["error"] = str(result.result)
+
+    return response
+```
+
+### 示例 4：Celery Beat 定时任务
+
+```python
+"""
+博客系统 - Celery Beat 定时任务配置
+"""
+
+celery_app.conf.beat_schedule = {
+    # 每天凌晨 3 点清理过期会话
+    "cleanup-expired-sessions": {
+        "task": "tasks.cleanup_expired_sessions",
+        "schedule": crontab(hour=3, minute=0),
+    },
+
+    # 每小时更新热门文章排行
+    "update-hot-posts": {
+        "task": "tasks.update_hot_posts",
+        "schedule": crontab(minute=0),  # 每小时整点
+    },
+
+    # 每 5 分钟刷新缓存
+    "refresh-cache": {
+        "task": "tasks.refresh_cache",
+        "schedule": 300.0,  # 每 300 秒
+    },
+
+    # 每周一早上 9 点发送周报邮件
+    "weekly-report": {
+        "task": "tasks.send_weekly_report",
+        "schedule": crontab(hour=9, minute=0, day_of_week=1),
+    },
+
+    # 每天凌晨 2 点数据库备份
+    "database-backup": {
+        "task": "tasks.database_backup",
+        "schedule": crontab(hour=2, minute=0),
+    },
+}
+
+
+# ========== 定时任务实现 ==========
+
+@celery_app.task(name="tasks.cleanup_expired_sessions")
+def cleanup_expired_sessions():
+    """清理过期会话"""
+    logger.info("开始清理过期会话...")
+    # 实际实现：查询并删除过期的 refresh_token
+    # expired = db.query(RefreshToken).filter(
+    #     RefreshToken.expires_at < datetime.utcnow()
+    # ).delete()
+    logger.info("过期会话清理完成")
+    return {"status": "completed"}
+
+
+@celery_app.task(name="tasks.update_hot_posts")
+def update_hot_posts():
+    """更新热门文章排行"""
+    logger.info("开始更新热门文章排行...")
+    # 实际实现：统计浏览量，更新 Redis Sorted Set
+    logger.info("热门文章排行更新完成")
+    return {"status": "completed"}
+
+
+@celery_app.task(name="tasks.refresh_cache")
+def refresh_cache():
+    """刷新缓存"""
+    logger.info("开始刷新缓存...")
+    # 预加载热点数据
+    logger.info("缓存刷新完成")
+    return {"status": "completed"}
+
+
+@celery_app.task(name="tasks.send_weekly_report")
+def send_weekly_report():
+    """发送周报邮件"""
+    logger.info("开始生成周报...")
+    # 1. 查询本周数据
+    # 2. 生成报告
+    # 3. 发送给管理员
+    logger.info("周报已发送")
+    return {"status": "completed"}
+```
+
+### 示例 5：任务优先级与链式调用
+
+```python
+"""
+Celery 高级特性：优先级、链式调用、分组
+"""
+
+# ========== 1. 任务优先级 ==========
+
+@app.post("/api/tasks/priority-email")
+async def send_priority_email(request: EmailRequest, priority: int = 5):
+    """
+    发送邮件（带优先级）
+
+    优先级范围：0（最高）~ 9（最低）
+    """
+    task = send_email_task.apply_async(
+        args=[request.to_email, request.subject, request.body],
+        priority=priority,
+    )
+    return {"task_id": task.id, "priority": priority}
+
+
+# ========== 2. 链式任务（Chord）==========
+
+@celery_app.task(name="tasks.generate_report")
+def generate_report(user_id: int):
+    """生成报告（链式任务的最后一步）"""
+    logger.info(f"生成用户 {user_id} 的报告")
+    return {"status": "report_generated"}
+
+
+async def export_and_notify(user_id: int):
+    """
+    链式任务：导出数据 -> 生成报告 -> 发送通知
+
+    使用 Chord: 并行执行多个任务，全部完成后执行回调
+    """
+    from celery import chord
+
+    # Step 1: 并行导出多种格式
+    callback = generate_report.s(user_id)
+
+    # Chord: 先并行执行，完成后执行回调
+    result = chord(
+        [
+            export_user_data_task.s(user_id, "csv"),
+            export_user_data_task.s(user_id, "json"),
+            export_user_data_task.s(user_id, "xlsx"),
+        ],
+        callback,
+    ).apply_async()
+
+    return {"chord_id": result.id}
+
+
+# ========== 3. 任务分组（Group）==========
+
+async def batch_process_images(image_paths: list[str]):
+    """
+    批量处理图片（并行执行）
+
+    使用 Group: 并行执行多个独立任务
+    """
+    from celery import group
+
+    # 创建任务组
+    tasks = group(
+        process_image_task.s(path, [{"type": "resize", "width": 800}])
+        for path in image_paths
+    )
+
+    # 执行并等待结果
+    result = tasks.apply_async()
+    results = result.get(timeout=300)  # 等待最多 5 分钟
+
+    return {"total": len(results), "completed": len(results)}
+```
+
+---
+
+## 最佳实践
+
+### 1. Celery 启动命令
+
+```bash
+# 启动 Worker（默认队列）
+celery -A tasks.celery_app worker --loglevel=info
+
+# 启动 Worker（指定队列）
+celery -A tasks.celery_app worker -Q emails,media --loglevel=info --concurrency=4
+
+# 启动 Beat（定时任务调度器）
+celery -A tasks.celery_app beat --loglevel=info
+
+# 同时启动 Worker + Beat
+celery -A tasks.celery_app worker --beat --loglevel=info
+
+# 启动 Flower（任务监控面板）
+celery -A tasks.celery_app flower --port=5555
+```
+
+### 2. 任务设计原则
+
+```python
+# 好的任务设计：
+# 1. 任务函数应该是幂等的（重复执行结果一致）
+# 2. 任务参数应该是可序列化的（JSON 兼容）
+# 3. 任务应该有合理的超时和重试策略
+# 4. 大任务应该拆分为小任务
+
+# 不好的做法：
+@celery_app.task
+def bad_task():
+    # 传递不可序列化的对象（数据库连接、文件对象等）
+    db_session = get_session()  # 不可序列化！
+    ...
+
+# 好的做法：
+@celery_app.task
+def good_task(user_id: int):  # 只传递 ID，任务内部重建连接
+    db_session = get_session()  # 在任务内部创建连接
+    ...
+```
+
+### 3. 消息中间件选择
+
+| 中间件   | 优点           | 缺点         | 适用场景 |
+| -------- | -------------- | ------------ | -------- |
+| Redis    | 简单、已在使用 | 消息可能丢失 | 中小项目 |
+| RabbitMQ | 可靠、功能丰富 | 运维复杂     | 生产环境 |
+
+---
+
+## 常见问题
+
+**Q: BackgroundTasks 和 Celery 该选哪个？**
+
+A: 简单场景（日志、缓存更新、简单通知）用 BackgroundTasks。需要持久化、重试、定时、分布式处理的场景用 Celery。两者可以共存：FastAPI 中同时使用 BackgroundTasks（轻量）和 Celery（重任务）。
+
+**Q: Celery 任务中可以使用 async 函数吗？**
+
+A: 原生 Celery 不支持 async 任务。如果需要在任务中使用异步库，可以创建新的事件循环：`asyncio.run(async_function())`。或者使用 `celery[asyncio]` 扩展。
+
+**Q: 如何避免任务重复执行？**
+
+A: 使用 `task_id` 去重。提交任务前检查是否已有相同任务在执行。也可以使用 Redis 锁（见上一篇的分布式锁）确保同一任务不会重复执行。
+
+**Q: 任务执行失败怎么处理？**
+
+A: 配置 `max_retries` 和 `retry_backoff` 实现自动重试。设置 `acks_late=True` 确保 Worker 崩溃时任务不会丢失。使用 Flower 监控任务状态，配置告警。
+
+---
+
+## 总结
+
+| 工具            | 用途           | 特点               |
+| --------------- | -------------- | ------------------ |
+| BackgroundTasks | 简单后台操作   | 轻量、同进程       |
+| Celery          | 分布式任务队列 | 持久化、重试、定时 |
+| Celery Beat     | 定时任务调度   | crontab 语法       |
+| Celery Chord    | 链式/并行任务  | 多任务编排         |
+| Flower          | 任务监控       | Web 管理面板       |
+
+| 命令                 | 作用                     |
+| -------------------- | ------------------------ |
+| `celery worker`      | 启动任务消费者           |
+| `celery beat`        | 启动定时调度器           |
+| `celery flower`      | 启动监控面板             |
+| `task.delay()`       | 异步提交任务             |
+| `task.apply_async()` | 提交任务（可配置优先级） |
+| `AsyncResult(id)`    | 查询任务状态             |
+
+下一篇将学习 Docker 部署与生产优化，将整个博客系统容器化并部署到生产环境。

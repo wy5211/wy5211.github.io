@@ -1,0 +1,967 @@
+---
+title: "08. NestJS 集成实战：博客 API"
+date: "2026-03-29"
+summary: "在 NestJS 中完整实现博客 API，掌握 TypeOrmModule 配置、Service 层 CRUD、Controller 路由设计、DTO 验证和统一响应格式。"
+tags: ["TypeORM", "NestJS", "REST API", "DTO", "博客系统"]
+category: "typeorm"
+draft: false
+series: "TypeORM 实战：NestJS 数据库开发"
+seriesOrder: 8
+---
+
+## 前言
+
+前面我们学习了 TypeORM 的核心概念和 API，现在让我们将所学知识整合到 NestJS 框架中，构建一个完整的博客 REST API。
+
+**本篇你将学到**：
+
+- `TypeOrmModule` 的配置（`forRoot` / `forFeature`）
+- 完整的 Posts 模块实现（Entity → DTO → Service → Controller）
+- DTO 验证（class-validator + class-transformer）
+- 统一响应格式（拦截器）
+- 异常过滤器
+
+---
+
+## 项目搭建
+
+### 创建 NestJS 项目
+
+```bash
+# 创建项目
+nest new typeorm-blog-api
+
+# 安装 TypeORM 相关依赖
+npm install @nestjs/typeorm typeorm pg
+npm install reflect-metadata
+
+# 安装验证和转换
+npm install class-validator class-transformer
+
+# 安装配置管理
+npm install @nestjs/config
+```
+
+### 项目结构
+
+```
+src/
+├── app.module.ts
+├── main.ts
+├── common/
+│   ├── filters/
+│   │   └── http-exception.filter.ts
+│   ├── interceptors/
+│   │   └── transform.interceptor.ts
+│   └── dto/
+│       └── pagination.dto.ts
+├── config/
+│   └── typeorm.config.ts
+├── modules/
+│   └── posts/
+│       ├── posts.module.ts
+│       ├── posts.controller.ts
+│       ├── posts.service.ts
+│       ├── entities/
+│       │   ├── post.entity.ts
+│       │   ├── category.entity.ts
+│       │   └── tag.entity.ts
+│       └── dto/
+│           ├── create-post.dto.ts
+│           └── update-post.dto.ts
+```
+
+---
+
+## TypeOrmModule 配置
+
+### app.module.ts
+
+```typescript
+// src/app.module.ts
+import { Module } from "@nestjs/common";
+import { ConfigModule, ConfigService } from "@nestjs/config";
+import { TypeOrmModule } from "@nestjs/typeorm";
+import { PostsModule } from "./modules/posts/posts.module";
+
+@Module({
+  imports: [
+    // 配置模块
+    ConfigModule.forRoot({
+      isGlobal: true,
+      envFilePath: `.env.${process.env.NODE_ENV || "development"}`,
+    }),
+
+    // TypeORM 配置
+    TypeOrmModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService) => ({
+        type: "postgres",
+        host: configService.get("DB_HOST", "localhost"),
+        port: configService.get<number>("DB_PORT", 5432),
+        username: configService.get("DB_USERNAME", "postgres"),
+        password: configService.get("DB_PASSWORD", "postgres"),
+        database: configService.get("DB_DATABASE", "typeorm_demo"),
+        entities: [__dirname + "/**/*.entity{.ts,.js}"],
+        synchronize: configService.get("NODE_ENV") === "development",
+        logging: configService.get("NODE_ENV") === "development",
+        autoLoadEntities: true,
+      }),
+    }),
+
+    PostsModule,
+  ],
+})
+export class AppModule {}
+```
+
+### 环境配置
+
+```bash
+# .env.development
+DB_HOST=localhost
+DB_PORT=5432
+DB_USERNAME=postgres
+DB_PASSWORD=postgres
+DB_DATABASE=typeorm_demo
+NODE_ENV=development
+```
+
+---
+
+## 实体定义
+
+### Post 实体
+
+```typescript
+// src/modules/posts/entities/post.entity.ts
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  CreateDateColumn,
+  UpdateDateColumn,
+  DeleteDateColumn,
+  ManyToOne,
+  ManyToMany,
+  JoinTable,
+  Index,
+} from "typeorm";
+import { Category } from "./category.entity";
+import { Tag } from "./tag.entity";
+
+export enum PostStatus {
+  DRAFT = "DRAFT",
+  PUBLISHED = "PUBLISHED",
+  ARCHIVED = "ARCHIVED",
+}
+
+@Entity("posts")
+@Index(["status", "publishedAt"])
+export class Post {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column({ length: 255 })
+  title: string;
+
+  @Column({ unique: true, length: 255 })
+  slug: string;
+
+  @Column({ nullable: true, length: 500 })
+  excerpt: string;
+
+  @Column({ type: "text" })
+  content: string;
+
+  @Column({ nullable: true, name: "cover_image", length: 500 })
+  coverImage: string;
+
+  @Column({ name: "author_id" })
+  authorId: number;
+
+  @ManyToOne(() => Category, { nullable: true, onDelete: "SET NULL" })
+  category: Category;
+
+  @Column({ nullable: true })
+  categoryId: number;
+
+  @ManyToMany(() => Tag, (tag) => tag.posts, { eager: true })
+  @JoinTable({
+    name: "post_tags",
+    joinColumn: { name: "post_id", referencedColumnName: "id" },
+    inverseJoinColumn: { name: "tag_id", referencedColumnName: "id" },
+  })
+  tags: Tag[];
+
+  @Column({
+    type: "enum",
+    enum: PostStatus,
+    default: PostStatus.DRAFT,
+  })
+  status: PostStatus;
+
+  @Column({ default: 0, name: "view_count" })
+  viewCount: number;
+
+  @Column({ default: false, name: "is_featured" })
+  isFeatured: boolean;
+
+  @Column({ nullable: true, name: "published_at", type: "timestamptz" })
+  publishedAt: Date;
+
+  @CreateDateColumn({ name: "created_at" })
+  createdAt: Date;
+
+  @UpdateDateColumn({ name: "updated_at" })
+  updatedAt: Date;
+
+  @DeleteDateColumn({ name: "deleted_at" })
+  deletedAt: Date;
+}
+```
+
+### Category 实体
+
+```typescript
+// src/modules/posts/entities/category.entity.ts
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  CreateDateColumn,
+  OneToMany,
+} from "typeorm";
+import { Post } from "./post.entity";
+
+@Entity("categories")
+export class Category {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column({ length: 100, unique: true })
+  name: string;
+
+  @Column({ length: 100, unique: true })
+  slug: string;
+
+  @Column({ type: "text", nullable: true })
+  description: string;
+
+  @OneToMany(() => Post, (post) => post.category)
+  posts: Post[];
+
+  @CreateDateColumn({ name: "created_at" })
+  createdAt: Date;
+}
+```
+
+### Tag 实体
+
+```typescript
+// src/modules/posts/entities/tag.entity.ts
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  CreateDateColumn,
+  ManyToMany,
+} from "typeorm";
+import { Post } from "./post.entity";
+
+@Entity("tags")
+export class Tag {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column({ length: 50, unique: true })
+  name: string;
+
+  @Column({ length: 50, unique: true })
+  slug: string;
+
+  @ManyToMany(() => Post, (post) => post.tags)
+  posts: Post[];
+
+  @CreateDateColumn({ name: "created_at" })
+  createdAt: Date;
+}
+```
+
+---
+
+## DTO 验证
+
+### 分页 DTO
+
+```typescript
+// src/common/dto/pagination.dto.ts
+import { IsOptional, IsInt, Min, Max } from "class-validator";
+import { Type } from "class-transformer";
+import { ApiPropertyOptional } from "@nestjs/swagger";
+
+export class PaginationDto {
+  @ApiPropertyOptional({ default: 1 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  page: number = 1;
+
+  @ApiPropertyOptional({ default: 10 })
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit: number = 10;
+
+  @ApiPropertyOptional()
+  @IsOptional()
+  orderBy: string = "createdAt";
+
+  @ApiPropertyOptional({ enum: ["ASC", "DESC"] })
+  @IsOptional()
+  orderDirection: "ASC" | "DESC" = "DESC";
+
+  get skip(): number {
+    return (this.page - 1) * this.limit;
+  }
+}
+```
+
+### 创建文章 DTO
+
+```typescript
+// src/modules/posts/dto/create-post.dto.ts
+import {
+  IsString,
+  IsOptional,
+  IsEnum,
+  IsArray,
+  IsInt,
+  IsBoolean,
+  MaxLength,
+  IsNotEmpty,
+} from "class-validator";
+
+export class CreatePostDto {
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(255)
+  title: string;
+
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(255)
+  slug: string;
+
+  @IsString()
+  @IsOptional()
+  @MaxLength(500)
+  excerpt?: string;
+
+  @IsString()
+  @IsNotEmpty()
+  content: string;
+
+  @IsString()
+  @IsOptional()
+  coverImage?: string;
+
+  @IsInt()
+  authorId: number;
+
+  @IsInt()
+  @IsOptional()
+  categoryId?: number;
+
+  @IsArray()
+  @IsInt({ each: true })
+  @IsOptional()
+  tagIds?: number[];
+
+  @IsEnum(["DRAFT", "PUBLISHED", "ARCHIVED"])
+  @IsOptional()
+  status?: string;
+
+  @IsBoolean()
+  @IsOptional()
+  isFeatured?: boolean;
+}
+```
+
+### 更新文章 DTO
+
+```typescript
+// src/modules/posts/dto/update-post.dto.ts
+import { PartialType } from "@nestjs/swagger";
+import { CreatePostDto } from "./create-post.dto";
+
+export class UpdatePostDto extends PartialType(CreatePostDto) {}
+```
+
+---
+
+## Service 层
+
+```typescript
+// src/modules/posts/posts.service.ts
+import {
+  Injectable,
+  NotFoundException,
+  ConflictException,
+} from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { Repository, Like, ILike, In } from "typeorm";
+import { Post, PostStatus } from "./entities/post.entity";
+import { CreatePostDto } from "./dto/create-post.dto";
+import { UpdatePostDto } from "./dto/update-post.dto";
+import { PaginationDto } from "../../common/dto/pagination.dto";
+
+@Injectable()
+export class PostsService {
+  constructor(
+    @InjectRepository(Post)
+    private postRepo: Repository<Post>
+  ) {}
+
+  // 创建文章
+  async create(createPostDto: CreatePostDto): Promise<Post> {
+    // 检查 slug 是否已存在
+    const existing = await this.postRepo.findOneBy({
+      slug: createPostDto.slug,
+    });
+    if (existing) {
+      throw new ConflictException(`Slug "${createPostDto.slug}" 已被使用`);
+    }
+
+    const post = this.postRepo.create({
+      ...createPostDto,
+      status: (createPostDto.status as PostStatus) || PostStatus.DRAFT,
+      tags: createPostDto.tagIds?.map((id) => ({ id })),
+    });
+
+    // 如果发布，设置发布时间
+    if (post.status === PostStatus.PUBLISHED) {
+      post.publishedAt = new Date();
+    }
+
+    return this.postRepo.save(post);
+  }
+
+  // 查询文章列表（分页）
+  async findAll(pagination: PaginationDto) {
+    const { page, limit, skip, orderBy, orderDirection } = pagination;
+
+    const [data, total] = await this.postRepo.findAndCount({
+      skip,
+      take: limit,
+      order: { [orderBy]: orderDirection },
+      relations: ["category"],
+    });
+
+    return {
+      data,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+
+  // 查询已发布文章
+  async findPublished(pagination: PaginationDto) {
+    const { page, limit, skip, orderBy, orderDirection } = pagination;
+
+    const [data, total] = await this.postRepo.findAndCount({
+      where: { status: PostStatus.PUBLISHED },
+      skip,
+      take: limit,
+      order: { [orderBy]: orderDirection },
+      relations: ["category"],
+    });
+
+    return {
+      data,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+
+  // 搜索文章
+  async search(keyword: string, pagination: PaginationDto) {
+    const { page, limit, skip } = pagination;
+
+    const qb = this.postRepo
+      .createQueryBuilder("post")
+      .leftJoinAndSelect("post.category", "category")
+      .leftJoinAndSelect("post.tags", "tag")
+      .where("post.status = :status", { status: PostStatus.PUBLISHED })
+      .andWhere(
+        "(post.title ILIKE :kw OR post.content ILIKE :kw OR post.excerpt ILIKE :kw)",
+        { kw: `%${keyword}%` }
+      )
+      .orderBy("post.publishedAt", "DESC")
+      .skip(skip)
+      .take(limit);
+
+    const [data, total] = await qb.getManyAndCount();
+
+    return {
+      data,
+      total,
+      page,
+      limit,
+      totalPages: Math.ceil(total / limit),
+    };
+  }
+
+  // 查询单篇文章
+  async findOne(id: number): Promise<Post> {
+    const post = await this.postRepo.findOne({
+      where: { id },
+      relations: ["category", "tags"],
+    });
+
+    if (!post) {
+      throw new NotFoundException(`文章 #${id} 不存在`);
+    }
+
+    return post;
+  }
+
+  // 通过 slug 查询
+  async findBySlug(slug: string): Promise<Post> {
+    const post = await this.postRepo.findOne({
+      where: { slug },
+      relations: ["category", "tags"],
+    });
+
+    if (!post) {
+      throw new NotFoundException(`文章 "${slug}" 不存在`);
+    }
+
+    return post;
+  }
+
+  // 更新文章
+  async update(id: number, updatePostDto: UpdatePostDto): Promise<Post> {
+    const post = await this.findOne(id);
+
+    // 如果 slug 被修改，检查唯一性
+    if (updatePostDto.slug && updatePostDto.slug !== post.slug) {
+      const existing = await this.postRepo.findOneBy({
+        slug: updatePostDto.slug,
+      });
+      if (existing) {
+        throw new ConflictException(`Slug "${updatePostDto.slug}" 已被使用`);
+      }
+    }
+
+    // 更新标签
+    if (updatePostDto.tagIds) {
+      post.tags = updatePostDto.tagIds.map((id) => ({ id })) as any;
+    }
+
+    // 如果从草稿变为发布，设置发布时间
+    if (
+      updatePostDto.status === PostStatus.PUBLISHED &&
+      post.status !== PostStatus.PUBLISHED &&
+      !post.publishedAt
+    ) {
+      post.publishedAt = new Date();
+    }
+
+    Object.assign(post, {
+      ...updatePostDto,
+      tags: post.tags,
+      publishedAt: post.publishedAt,
+    });
+
+    return this.postRepo.save(post);
+  }
+
+  // 增加浏览量
+  async incrementViewCount(id: number): Promise<void> {
+    await this.postRepo.increment({ id }, "viewCount", 1);
+  }
+
+  // 软删除文章
+  async remove(id: number): Promise<void> {
+    const post = await this.findOne(id);
+    await this.postRepo.softRemove(post);
+  }
+}
+```
+
+---
+
+## Controller 层
+
+```typescript
+// src/modules/posts/posts.controller.ts
+import {
+  Controller,
+  Get,
+  Post,
+  Put,
+  Delete,
+  Body,
+  Param,
+  Query,
+  ParseIntPipe,
+  HttpCode,
+  HttpStatus,
+} from "@nestjs/common";
+import { PostsService } from "./posts.service";
+import { CreatePostDto } from "./dto/create-post.dto";
+import { UpdatePostDto } from "./dto/update-post.dto";
+import { PaginationDto } from "../../common/dto/pagination.dto";
+
+@Controller("posts")
+export class PostsController {
+  constructor(private readonly postsService: PostsService) {}
+
+  // POST /posts - 创建文章
+  @Post()
+  @HttpCode(HttpStatus.CREATED)
+  async create(@Body() createPostDto: CreatePostDto) {
+    const post = await this.postsService.create(createPostDto);
+    return {
+      success: true,
+      data: post,
+      message: "文章创建成功",
+    };
+  }
+
+  // GET /posts - 查询所有文章（管理用）
+  @Get()
+  async findAll(@Query() pagination: PaginationDto) {
+    const result = await this.postsService.findAll(pagination);
+    return {
+      success: true,
+      data: result,
+    };
+  }
+
+  // GET /posts/published - 查询已发布文章
+  @Get("published")
+  async findPublished(@Query() pagination: PaginationDto) {
+    const result = await this.postsService.findPublished(pagination);
+    return {
+      success: true,
+      data: result,
+    };
+  }
+
+  // GET /posts/search?keyword=xxx - 搜索文章
+  @Get("search")
+  async search(
+    @Query("keyword") keyword: string,
+    @Query() pagination: PaginationDto
+  ) {
+    const result = await this.postsService.search(keyword, pagination);
+    return {
+      success: true,
+      data: result,
+    };
+  }
+
+  // GET /posts/slug/:slug - 通过 slug 查询
+  @Get("slug/:slug")
+  async findBySlug(@Param("slug") slug: string) {
+    const post = await this.postsService.findBySlug(slug);
+    // 增加浏览量（异步执行，不阻塞响应）
+    this.postsService.incrementViewCount(post.id);
+    return {
+      success: true,
+      data: post,
+    };
+  }
+
+  // GET /posts/:id - 查询单篇文章
+  @Get(":id")
+  async findOne(@Param("id", ParseIntPipe) id: number) {
+    const post = await this.postsService.findOne(id);
+    return {
+      success: true,
+      data: post,
+    };
+  }
+
+  // PUT /posts/:id - 更新文章
+  @Put(":id")
+  async update(
+    @Param("id", ParseIntPipe) id: number,
+    @Body() updatePostDto: UpdatePostDto
+  ) {
+    const post = await this.postsService.update(id, updatePostDto);
+    return {
+      success: true,
+      data: post,
+      message: "文章更新成功",
+    };
+  }
+
+  // DELETE /posts/:id - 删除文章
+  @Delete(":id")
+  @HttpCode(HttpStatus.NO_CONTENT)
+  async remove(@Param("id", ParseIntPipe) id: number) {
+    await this.postsService.remove(id);
+  }
+}
+```
+
+---
+
+## 统一响应格式
+
+### 响应拦截器
+
+```typescript
+// src/common/interceptors/transform.interceptor.ts
+import {
+  Injectable,
+  NestInterceptor,
+  ExecutionContext,
+  CallHandler,
+} from "@nestjs/common";
+import { Observable, map } from "rxjs";
+
+export interface Response<T> {
+  success: boolean;
+  data: T;
+  message?: string;
+}
+
+@Injectable()
+export class TransformInterceptor<T> implements NestInterceptor<
+  T,
+  Response<T>
+> {
+  intercept(
+    context: ExecutionContext,
+    next: CallHandler
+  ): Observable<Response<T>> {
+    return next.handle().pipe(
+      map((data) => {
+        // 如果已经是标准格式，直接返回
+        if (data?.success !== undefined) {
+          return data;
+        }
+        return {
+          success: true,
+          data,
+        };
+      })
+    );
+  }
+}
+```
+
+### 异常过滤器
+
+```typescript
+// src/common/filters/http-exception.filter.ts
+import {
+  ExceptionFilter,
+  Catch,
+  ArgumentsHost,
+  HttpException,
+  HttpStatus,
+} from "@nestjs/common";
+import { Response } from "express";
+
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  catch(exception: unknown, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse<Response>();
+
+    let status = HttpStatus.INTERNAL_SERVER_ERROR;
+    let message = "服务器内部错误";
+
+    if (exception instanceof HttpException) {
+      status = exception.getStatus();
+      const exceptionResponse = exception.getResponse();
+      message =
+        typeof exceptionResponse === "string"
+          ? exceptionResponse
+          : (exceptionResponse as any).message || exception.message;
+    }
+
+    response.status(status).json({
+      success: false,
+      statusCode: status,
+      message: Array.isArray(message) ? message : [message],
+      timestamp: new Date().toISOString(),
+    });
+  }
+}
+```
+
+### main.ts 配置
+
+```typescript
+// src/main.ts
+import { NestFactory } from "@nestjs/core";
+import { ValidationPipe } from "@nestjs/common";
+import { AppModule } from "./app.module";
+import { TransformInterceptor } from "./common/interceptors/transform.interceptor";
+import { AllExceptionsFilter } from "./common/filters/http-exception.filter";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  // 全局验证管道
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true, // 过滤掉 DTO 中没有的属性
+      forbidNonWhitelisted: true, // 禁止传入 DTO 中没有的属性
+      transform: true, // 自动类型转换
+      transformOptions: {
+        enableImplicitConversion: true,
+      },
+    })
+  );
+
+  // 全局响应拦截器
+  app.useGlobalInterceptors(new TransformInterceptor());
+
+  // 全局异常过滤器
+  app.useGlobalFilters(new AllExceptionsFilter());
+
+  // CORS
+  app.enableCors();
+
+  // API 前缀
+  app.setGlobalPrefix("api");
+
+  await app.listen(3000);
+  console.log("应用已启动：http://localhost:3000/api");
+}
+bootstrap();
+```
+
+---
+
+## Posts 模块注册
+
+```typescript
+// src/modules/posts/posts.module.ts
+import { Module } from "@nestjs/common";
+import { TypeOrmModule } from "@nestjs/typeorm";
+import { PostsController } from "./posts.controller";
+import { PostsService } from "./posts.service";
+import { Post } from "./entities/post.entity";
+import { Category } from "./entities/category.entity";
+import { Tag } from "./entities/tag.entity";
+
+@Module({
+  imports: [TypeOrmModule.forFeature([Post, Category, Tag])],
+  controllers: [PostsController],
+  providers: [PostsService],
+  exports: [PostsService],
+})
+export class PostsModule {}
+```
+
+---
+
+## API 接口测试
+
+```bash
+# 创建文章
+curl -X POST http://localhost:3000/api/posts \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "TypeORM 入门",
+    "slug": "typeorm-introduction",
+    "content": "这是一篇关于 TypeORM 的入门文章...",
+    "authorId": 1,
+    "categoryId": 1,
+    "tagIds": [1, 2],
+    "status": "PUBLISHED"
+  }'
+
+# 响应
+# {
+#   "success": true,
+#   "data": { "id": 1, "title": "TypeORM 入门", ... },
+#   "message": "文章创建成功"
+# }
+
+# 查询文章列表
+curl http://localhost:3000/api/posts?page=1&limit=10
+
+# 搜索文章
+curl http://localhost:3000/api/posts/search?keyword=TypeORM
+
+# 通过 slug 查询
+curl http://localhost:3000/api/posts/slug/typeorm-introduction
+
+# 更新文章
+curl -X PUT http://localhost:3000/api/posts/1 \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "TypeORM 入门（已更新）",
+    "content": "更新后的内容..."
+  }'
+
+# 删除文章
+curl -X DELETE http://localhost:3000/api/posts/1
+```
+
+---
+
+## 总结
+
+### 核心要点
+
+1. **TypeOrmModule 配置**
+   - `forRoot()`：全局数据库连接
+   - `forFeature()`：模块级 Repository 注册
+   - 使用 `ConfigService` 管理环境变量
+
+2. **完整模块结构**
+   - Entity：数据模型
+   - DTO：数据验证
+   - Service：业务逻辑
+   - Controller：路由处理
+
+3. **DTO 验证**
+   - `class-validator`：字段验证
+   - `class-transformer`：类型转换
+   - `ValidationPipe`：全局验证管道
+
+4. **统一响应**
+   - 拦截器：包装成功响应
+   - 异常过滤器：统一错误格式
+
+### 下一步
+
+在下一篇文章中，我们将学习：
+
+- **JWT 认证与授权**
+- User 和 RefreshToken 实体设计
+- Passport + JWT 策略
+- 角色权限和资源级访问控制
+
+敬请期待！
+
+---
+
+## 参考资源
+
+- [NestJS TypeORM 文档](https://docs.nestjs.com/techniques/database)
+- [NestJS Validation 文档](https://docs.nestjs.com/techniques/validation)
+- [class-validator 文档](https://github.com/typestack/class-validator)
+
+---
+
+**上一篇**：[07. 事务处理](./07-transactions.mdx)
+**下一篇**：[09. JWT 认证与授权](./09-auth-typeorm.mdx)

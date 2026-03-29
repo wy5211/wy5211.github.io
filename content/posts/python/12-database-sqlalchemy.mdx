@@ -1,0 +1,693 @@
+---
+title: "12 数据库与 SQLAlchemy 2.0"
+date: "2026-03-29"
+summary: "掌握 SQLAlchemy 2.0 新特性，学习声明式映射、关系定义、查询操作和 Alembic 数据库迁移"
+tags: ["Python", "SQLAlchemy", "Alembic", "PostgreSQL"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 渐进式学习"
+seriesOrder: 12
+---
+
+## 前言
+
+在上一篇中，我们使用内存列表模拟了数据存储。真实的生产应用需要持久化到数据库。Python 生态中最成熟的 ORM 框架就是 **SQLAlchemy**，而 2.0 版本带来了全面现代化的 API。
+
+如果你有数据库操作经验，本文会帮助你快速理解 SQLAlchemy 2.0 的设计哲学：
+
+- **Prisma 开发者**：SQLAlchemy 的 ORM 模式类似于 Prisma，但更灵活，支持原生 SQL
+- **TypeORM 开发者**：概念非常接近，都有 Entity、Repository、Relation 等概念
+- **MyBatis 开发者**：SQLAlchemy Core 模式可以满足你对 SQL 的完全控制需求
+
+**本文将带你：**
+
+1. 理解 SQLAlchemy 2.0 的 ORM 与 Core 两种模式
+2. 使用声明式映射定义数据模型
+3. 建立模型之间的关系（一对一、一对多、多对多）
+4. 使用 Alembic 管理数据库迁移
+5. 掌握各种查询操作
+
+---
+
+## 核心概念
+
+### 为什么选择 SQLAlchemy 2.0？
+
+| 特性           | SQLAlchemy 2.0 | Django ORM | Tortoise ORM |
+| -------------- | -------------- | ---------- | ------------ |
+| **异步支持**   | 原生支持       | 3.1+ 支持  | 原生支持     |
+| **类型提示**   | 全面集成       | 部分支持   | 支持         |
+| **SQL 控制**   | 完全控制       | 有限       | 有限         |
+| **学习曲线**   | 较陡           | 平缓       | 平缓         |
+| **生态成熟度** | 非常成熟       | 成熟       | 较新         |
+| **复杂查询**   | 非常强大       | 中等       | 中等         |
+
+### ORM vs Core 模式
+
+SQLAlchemy 提供两种使用方式：
+
+```python
+# --- Core 模式：面向表和 SQL 表达式 ---
+# 类似 MyBatis，直接写 SQL 构建表达式
+from sqlalchemy import select, insert, Table, Column, Integer, String
+from sqlalchemy import MetaData
+
+metadata = MetaData()
+users_table = Table(
+    "users", metadata,
+    Column("id", Integer, primary_key=True),
+    Column("name", String(50)),
+    Column("email", String(100)),
+)
+
+stmt = select(users_table).where(users_table.c.name == "Alice")
+
+
+# --- ORM 模式：面向对象和模型类 ---
+# 类似 Prisma / TypeORM，使用 Python 类映射数据库表
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+class Base(DeclarativeBase):
+    pass
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+    email: Mapped[str] = mapped_column(String(100))
+
+stmt = select(User).where(User.name == "Alice")
+```
+
+> **建议**：日常开发使用 **ORM 模式**，复杂报表查询可以混合使用 **Core 模式**。
+
+---
+
+## 实战演练
+
+### 示例 1：安装与基础配置
+
+```bash
+# 安装 SQLAlchemy 和数据库驱动
+uv add sqlalchemy asyncpg alembic
+
+# 如果使用 SQLite（开发环境）
+# uv add aiosqlite
+```
+
+### 示例 2：声明式映射定义模型
+
+SQLAlchemy 2.0 使用全新的类型注解风格：
+
+```python
+# models/base.py
+from datetime import datetime
+from sqlalchemy import DateTime, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+
+
+class Base(DeclarativeBase):
+    """所有模型的基类"""
+    pass
+
+
+class TimestampMixin:
+    """时间戳混入类 -- 自动管理 created_at 和 updated_at"""
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+    )
+```
+
+```python
+# models/user.py
+from datetime import datetime
+from sqlalchemy import String, Boolean
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from models.base import Base, TimestampMixin
+
+
+class User(Base, TimestampMixin):
+    """用户模型"""
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(50), unique=True, index=True)
+    email: Mapped[str] = mapped_column(String(200), unique=True, index=True)
+    hashed_password: Mapped[str] = mapped_column(String(200))
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    is_superuser: Mapped[bool] = mapped_column(Boolean, default=False)
+
+    # 关系定义
+    posts: Mapped[list["Post"]] = relationship(back_populates="author", lazy="selectin")
+    comments: Mapped[list["Comment"]] = relationship(back_populates="user", lazy="selectin")
+
+    def __repr__(self) -> str:
+        return f"<User(id={self.id}, username='{self.username}')>"
+```
+
+```python
+# models/post.py
+from sqlalchemy import String, Text, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from models.base import Base, TimestampMixin
+
+
+class Post(Base, TimestampMixin):
+    """文章模型"""
+    __tablename__ = "posts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    content: Mapped[str] = mapped_column(Text)
+    is_published: Mapped[bool] = mapped_column(default=False)
+    author_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+
+    # 关系
+    author: Mapped["User"] = relationship(back_populates="posts")
+    comments: Mapped[list["Comment"]] = relationship(back_populates="post", lazy="selectin")
+    tags: Mapped[list["Tag"]] = relationship(
+        secondary="post_tags",  # 多对多关联表
+        back_populates="posts",
+        lazy="selectin",
+    )
+
+    def __repr__(self) -> str:
+        return f"<Post(id={self.id}, title='{self.title}')>"
+```
+
+```python
+# models/comment.py
+from sqlalchemy import String, Text, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from models.base import Base, TimestampMixin
+
+
+class Comment(Base, TimestampMixin):
+    """评论模型"""
+    __tablename__ = "comments"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    content: Mapped[str] = mapped_column(Text)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    post_id: Mapped[int] = mapped_column(ForeignKey("posts.id"))
+
+    # 关系
+    user: Mapped["User"] = relationship(back_populates="comments")
+    post: Mapped["Post"] = relationship(back_populates="comments")
+
+    def __repr__(self) -> str:
+        return f"<Comment(id={self.id})>"
+```
+
+```python
+# models/tag.py
+from sqlalchemy import String, Table, Column, ForeignKey
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from models.base import Base
+
+
+# 多对多关联表
+post_tags = Table(
+    "post_tags",
+    Base.metadata,
+    Column("post_id", ForeignKey("posts.id"), primary_key=True),
+    Column("tag_id", ForeignKey("tags.id"), primary_key=True),
+)
+
+
+class Tag(Base):
+    """标签模型"""
+    __tablename__ = "tags"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50), unique=True)
+
+    # 关系
+    posts: Mapped[list["Post"]] = relationship(
+        secondary="post_tags",
+        back_populates="tags",
+        lazy="selectin",
+    )
+
+    def __repr__(self) -> str:
+        return f"<Tag(id={self.id}, name='{self.name}')>"
+```
+
+```python
+# models/__init__.py
+from models.base import Base
+from models.user import User
+from models.post import Post
+from models.comment import Comment
+from models.tag import Tag, post_tags
+
+__all__ = ["Base", "User", "Post", "Comment", "Tag", "post_tags"]
+```
+
+**代码解释**：
+
+- `Mapped[int]` 是 SQLAlchemy 2.0 的新语法，取代了旧版的 `Column(Integer)`
+- `mapped_column()` 用于配置列属性（类型、约束、默认值等）
+- `relationship()` 定义模型之间的关系，`back_populates` 确保双向关系
+- `lazy="selectin"` 使用 SELECT IN 加载策略，避免 N+1 查询问题
+- `ForeignKey("users.id")` 定义外键约束
+
+### 示例 3：关系类型详解
+
+```python
+# --- 一对一关系 ---
+# 例如：用户和用户资料
+class UserProfile(Base):
+    __tablename__ = "user_profiles"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    bio: Mapped[str | None] = mapped_column(Text)
+    avatar_url: Mapped[str | None] = mapped_column(String(500))
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True)  # unique 确保一对一
+
+    user: Mapped["User"] = relationship(back_populates="profile")
+
+
+# --- 一对多关系 ---
+# User 1 -- N Post（已在上面定义）
+# author_id 外键在 Post 端
+# User 端使用 relationship：posts: Mapped[list["Post"]]
+# Post 端使用 relationship：author: Mapped["User"]
+
+
+# --- 多对多关系 ---
+# Post M -- N Tag（已使用关联表实现）
+# post_tags 关联表定义了中间关系
+# 两端都使用 secondary="post_tags" 指向关联表
+```
+
+### 示例 4：会话管理
+
+```python
+# database.py
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
+
+# 数据库连接 URL
+DATABASE_URL = "postgresql://user:password@localhost:5432/blog_db"
+
+# 创建同步引擎
+engine = create_engine(DATABASE_URL, echo=True)
+
+# 创建会话工厂
+SessionLocal = sessionmaker(bind=engine)
+
+
+def get_db() -> Session:
+    """获取数据库会话（依赖注入用）"""
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# 异步版本（推荐生产使用）
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+ASYNC_DATABASE_URL = "postgresql+asyncpg://user:password@localhost:5432/blog_db"
+
+async_engine = create_async_engine(ASYNC_DATABASE_URL, echo=True)
+AsyncSessionLocal = async_sessionmaker(async_engine, class_=AsyncSession)
+
+
+async def get_async_db() -> AsyncSession:
+    """获取异步数据库会话"""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+```
+
+### 示例 5：Alembic 数据库迁移
+
+Alembic 是 SQLAlchemy 的官方迁移工具，类似于 Prisma Migrate 或 Flyway：
+
+```bash
+# 初始化 Alembic
+alembic init alembic
+
+# 配置 alembic.ini 中的数据库连接
+# 编辑 alembic/env.py，导入你的 Base.metadata
+```
+
+```python
+# alembic/env.py -- 关键配置
+from logging.config import fileConfig
+from sqlalchemy import engine_from_config, pool
+from alembic import context
+
+# 导入所有模型，确保 Base.metadata 包含所有表
+from models import Base
+from models.user import User
+from models.post import Post
+from models.comment import Comment
+from models.tag import Tag
+
+config = context.config
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+target_metadata = Base.metadata
+
+
+def run_migrations_offline() -> None:
+    """离线模式生成迁移 SQL"""
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    """在线模式直接执行迁移"""
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+```
+
+常用迁移命令：
+
+```bash
+# 自动生成迁移脚本（检测模型变更）
+alembic revision --autogenerate -m "create users and posts tables"
+
+# 执行迁移（升级到最新版本）
+alembic upgrade head
+
+# 回滚一个版本
+alembic downgrade -1
+
+# 查看当前版本
+alembic current
+
+# 查看迁移历史
+alembic history
+```
+
+### 示例 6：查询操作
+
+```python
+from sqlalchemy import select, desc, or_, and_, func
+from models import User, Post, Comment, Tag
+from database import SessionLocal
+
+
+def query_examples():
+    db = SessionLocal()
+
+    try:
+        # --- 基础查询 ---
+        # 查询所有用户
+        all_users = db.execute(select(User)).scalars().all()
+
+        # 按 ID 查询单个用户
+        user = db.execute(select(User).where(User.id == 1)).scalar_one_or_none()
+
+        # --- 条件查询 ---
+        # WHERE 子句
+        published_posts = db.execute(
+            select(Post).where(Post.is_published == True)
+        ).scalars().all()
+
+        # 多条件（AND / OR）
+        posts = db.execute(
+            select(Post).where(
+                and_(
+                    Post.is_published == True,
+                    Post.author_id == 1,
+                )
+            )
+        ).scalars().all()
+
+        # LIKE 模糊搜索
+        search_posts = db.execute(
+            select(Post).where(Post.title.ilike("%Python%"))
+        ).scalars().all()
+
+        # --- 排序 ---
+        # 按创建时间降序
+        recent_posts = db.execute(
+            select(Post).order_by(desc(Post.created_at))
+        ).scalars().all()
+
+        # --- 分页 ---
+        page = 1
+        page_size = 10
+        offset = (page - 1) * page_size
+
+        paginated_posts = db.execute(
+            select(Post)
+            .order_by(desc(Post.created_at))
+            .offset(offset)
+            .limit(page_size)
+        ).scalars().all()
+
+        # 获取总数
+        total = db.execute(select(func.count(Post.id))).scalar()
+
+        # --- 关联查询 ---
+        # JOIN 查询：获取文章及其作者
+        posts_with_author = db.execute(
+            select(Post, User.username)
+            .join(User, Post.author_id == User.id)
+            .where(Post.is_published == True)
+        ).all()
+
+        # 通过关系加载关联数据
+        post = db.execute(
+            select(Post).where(Post.id == 1)
+        ).scalar_one()
+        # 由于 lazy="selectin"，post.comments 会自动加载
+        print(post.comments)
+
+        # --- 聚合查询 ---
+        # 统计每个用户的文章数
+        user_post_counts = db.execute(
+            select(User.username, func.count(Post.id).label("post_count"))
+            .join(Post, User.id == Post.author_id)
+            .group_by(User.id)
+            .having(func.count(Post.id) > 0)
+        ).all()
+
+        # --- 创建 ---
+        new_user = User(
+            username="alice",
+            email="alice@example.com",
+            hashed_password="hashed_password_here",
+        )
+        db.add(new_user)
+        db.commit()
+        db.refresh(new_user)  # 刷新以获取自动生成的 id
+
+        # --- 更新 ---
+        user = db.execute(select(User).where(User.id == 1)).scalar_one()
+        user.username = "new_alice"
+        db.commit()
+
+        # --- 删除 ---
+        db.delete(user)
+        db.commit()
+
+    finally:
+        db.close()
+```
+
+### 示例 7：事务处理
+
+```python
+from sqlalchemy.exc import IntegrityError
+
+
+def transfer_post_author(post_id: int, new_author_id: int):
+    """事务处理示例：转移文章作者"""
+    db = SessionLocal()
+    try:
+        # 检查新作者是否存在
+        author = db.execute(
+            select(User).where(User.id == new_author_id)
+        ).scalar_one_or_none()
+
+        if not author:
+            raise ValueError(f"User {new_author_id} not found")
+
+        # 更新文章作者
+        post = db.execute(
+            select(Post).where(Post.id == post_id)
+        ).scalar_one_or_none()
+
+        if not post:
+            raise ValueError(f"Post {post_id} not found")
+
+        post.author_id = new_author_id
+        db.commit()  # 所有操作成功后提交
+
+    except IntegrityError:
+        db.rollback()  # 约束冲突时回滚
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+# 使用上下文管理器自动处理事务
+def create_user_with_post():
+    db = SessionLocal()
+    try:
+        with db.begin():  # 自动提交或回滚
+            user = User(
+                username="bob",
+                email="bob@example.com",
+                hashed_password="hashed",
+            )
+            db.add(user)
+            db.flush()  # 获取 user.id，但不提交
+
+            post = Post(
+                title="Bob's First Post",
+                content="Hello World!",
+                author_id=user.id,
+            )
+            db.add(post)
+        # with 块结束时自动 commit
+    except Exception:
+        # 自动 rollback
+        raise
+    finally:
+        db.close()
+```
+
+---
+
+## 最佳实践
+
+### 1. 使用 Mapped 类型注解
+
+```python
+# SQLAlchemy 2.0 推荐写法
+class User(Base):
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(50))
+    email: Mapped[str | None] = mapped_column(String(200), default=None)  # 可选字段
+
+# 旧版写法（不推荐）
+class User(Base):
+    id = Column(Integer, primary_key=True)
+    name = Column(String(50))
+```
+
+### 2. 合理选择加载策略
+
+```python
+# lazy="selectin" -- 推荐用于列表数据，避免 N+1
+posts: Mapped[list["Post"]] = relationship(lazy="selectin")
+
+# lazy="joined" -- 适合一对一或少量关联数据
+profile: Mapped["Profile"] = relationship(lazy="joined")
+
+# lazy="raise" -- 需要时手动加载，防止意外查询
+posts: Mapped[list["Post"]] = relationship(lazy="raise")
+```
+
+### 3. 迁移脚本要审查
+
+```bash
+# 自动生成的迁移脚本一定要人工审查
+alembic revision --autogenerate -m "add user avatar"
+
+# 检查生成的文件，确认：
+# 1. 没有误删表
+# 2. 列类型正确
+# 3. 索引合理
+```
+
+### 4. 使用环境变量管理数据库连接
+
+```python
+# 不要硬编码数据库 URL
+# DATABASE_URL = "postgresql://user:pass@localhost/blog"  # 错误
+
+# 使用 pydantic-settings 管理
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    database_url: str
+
+    model_config = {"env_file": ".env"}
+
+settings = Settings()
+engine = create_engine(settings.database_url)
+```
+
+---
+
+## 常见问题
+
+**Q: SQLAlchemy 2.0 和 1.4 有什么区别？**
+
+A: 2.0 是一次重大升级，主要变化包括：使用 `Mapped` 和 `mapped_column` 替代 `Column`，移除了 `Query` API（改用 `select()`），更好的类型提示支持。新项目务必使用 2.0。
+
+**Q: lazy="selectin" 和 lazy="joined" 怎么选？**
+
+A: `selectin` 使用 `WHERE id IN (...)` 加载关联数据，适合一对多关系。`joined` 使用 `JOIN` 加载，适合一对一或少量数据。避免使用默认的 `lazy="select"`（会导致 N+1 问题）。
+
+**Q: Alembic 和 Django Migrations 有什么区别？**
+
+A: 功能类似。Alembic 更灵活，可以自定义迁移逻辑，但需要更多手动操作。Django Migrations 与 Django 深度集成，开箱即用但灵活性较低。
+
+**Q: 什么时候用同步，什么时候用异步？**
+
+A: 如果你的项目是纯 API 服务（如 FastAPI），推荐异步模式配合 `asyncpg`。如果有大量同步库依赖（如 pandas、scikit-learn），使用同步模式更简单。
+
+---
+
+## 总结
+
+本文我们系统学习了 SQLAlchemy 2.0 的核心功能：
+
+1. **ORM vs Core**：两种模式各有适用场景，日常开发以 ORM 为主
+2. **声明式映射**：使用 `Mapped` + `mapped_column` 定义现代风格的模型
+3. **关系定义**：通过 `ForeignKey` 和 `relationship` 建立一对一、一对多、多对多关系
+4. **会话管理**：`sessionmaker` 管理数据库连接和事务
+5. **Alembic 迁移**：自动检测模型变更，生成迁移脚本
+6. **查询操作**：`select()`、`where()`、`join()`、聚合、分页
+7. **事务处理**：手动管理或使用 `with db.begin()` 自动管理
+
+## 下一步
+
+下一篇我们将把 FastAPI 和 SQLAlchemy 结合起来，构建完整的博客系统 CRUD API。

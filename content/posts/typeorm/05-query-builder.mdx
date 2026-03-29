@@ -1,0 +1,924 @@
+---
+title: "05. QueryBuilder 高级查询"
+date: "2026-03-28"
+summary: "掌握 TypeORM QueryBuilder 的全部用法，学会联表查询、子查询、分组聚合、原始 SQL，实现生产级的搜索和统计功能。"
+tags: ["TypeORM", "QueryBuilder", "SQL", "查询优化", "数据库"]
+category: "typeorm"
+draft: false
+series: "TypeORM 实战：NestJS 数据库开发"
+seriesOrder: 5
+---
+
+## 前言
+
+当 `Repository.find()` 无法满足复杂的查询需求时，**QueryBuilder** 就派上用场了。它提供了类似 SQL 的链式 API，让你可以构建任意复杂的查询，同时保持类型安全。
+
+**本篇你将学到**：
+
+- QueryBuilder 基础和链式调用
+- 联表查询（JOIN）
+- 子查询
+- 分组聚合（GROUP BY / HAVING）
+- 原始 SQL 查询
+- 搜索功能的实现
+
+---
+
+## QueryBuilder 基础
+
+### 创建 QueryBuilder
+
+```typescript
+import { DataSource } from "typeorm";
+
+// 方式 1：通过 Repository
+const qb = userRepo.createQueryBuilder("user");
+
+// 方式 2：通过 DataSource
+const qb = dataSource.createQueryBuilder(User, "user");
+
+// 方式 3：通过 EntityManager
+const qb = entityManager.createQueryBuilder(User, "user");
+```
+
+### 基本查询
+
+```typescript
+// SELECT 查询
+const users = await userRepo.createQueryBuilder("user").getMany();
+// SELECT * FROM users user
+
+// 查询单条
+const user = await userRepo
+  .createQueryBuilder("user")
+  .where("user.id = :id", { id: 1 })
+  .getOne();
+// SELECT * FROM users user WHERE user.id = 1
+
+// 查询数量
+const count = await userRepo
+  .createQueryBuilder("user")
+  .where("user.isActive = :active", { active: true })
+  .getCount();
+// SELECT COUNT(*) FROM users user WHERE user.is_active = true
+```
+
+### 选择字段
+
+```typescript
+// 选择所有字段
+const users = await userRepo.createQueryBuilder("user").select().getMany();
+
+// 选择指定字段
+const users = await userRepo
+  .createQueryBuilder("user")
+  .select(["user.id", "user.name", "user.email"])
+  .getMany();
+// SELECT user.id, user.name, user.email FROM users user
+
+// 使用 addSelect 追加字段
+const users = await userRepo
+  .createQueryBuilder("user")
+  .select("user.id")
+  .addSelect("user.name")
+  .getMany();
+
+// 使用别名
+const result = await userRepo
+  .createQueryBuilder("user")
+  .select("user.name", "userName")
+  .addSelect("user.email", "userEmail")
+  .getRawMany();
+// SELECT user.name AS "userName", user.email AS "userEmail" FROM users user
+```
+
+### WHERE 条件
+
+```typescript
+// 等值条件
+qb.where("user.id = :id", { id: 1 });
+// WHERE user.id = 1
+
+// 多个条件（AND）
+qb.where("user.isActive = :active", { active: true }).andWhere(
+  "user.role = :role",
+  { role: "ADMIN" }
+);
+// WHERE user.is_active = true AND user.role = 'ADMIN'
+
+// OR 条件
+qb.where("user.role = :admin", { admin: "ADMIN" }).orWhere(
+  "user.role = :editor",
+  { editor: "EDITOR" }
+);
+// WHERE user.role = 'ADMIN' OR user.role = 'EDITOR'
+
+// 复杂条件组合
+qb.where(
+  new Brackets((qb) => {
+    qb.where("user.role = :admin", { admin: "ADMIN" }).orWhere(
+      "user.role = :editor",
+      { editor: "EDITOR" }
+    );
+  })
+).andWhere("user.isActive = :active", { active: true });
+// WHERE (user.role = 'ADMIN' OR user.role = 'EDITOR') AND user.is_active = true
+
+// IN 条件
+qb.where("user.role IN (:...roles)", { roles: ["ADMIN", "EDITOR"] });
+// WHERE user.role IN ('ADMIN', 'EDITOR')
+
+// LIKE 条件
+qb.where("user.name LIKE :name", { name: "%张%" });
+// WHERE user.name LIKE '%张%'
+
+// BETWEEN 条件
+qb.where("user.createdAt BETWEEN :start AND :end", {
+  start: new Date("2026-01-01"),
+  end: new Date("2026-12-31"),
+});
+// WHERE user.created_at BETWEEN '2026-01-01' AND '2026-12-31'
+
+// IS NULL
+qb.where("user.deletedAt IS NULL");
+```
+
+### 排序和分页
+
+```typescript
+// 排序
+const users = await userRepo
+  .createQueryBuilder("user")
+  .orderBy("user.createdAt", "DESC")
+  .addOrderBy("user.name", "ASC")
+  .getMany();
+
+// 分页
+const users = await userRepo
+  .createQueryBuilder("user")
+  .skip(10) // 跳过 10 条
+  .take(10) // 取 10 条
+  .getMany();
+
+// 或使用 offset/limit
+const users = await userRepo
+  .createQueryBuilder("user")
+  .offset(10)
+  .limit(10)
+  .getMany();
+```
+
+### 分组
+
+```typescript
+// GROUP BY
+const result = await userRepo
+  .createQueryBuilder("user")
+  .select("user.role", "role")
+  .addSelect("COUNT(*)", "count")
+  .groupBy("user.role")
+  .getRawMany();
+// SELECT user.role AS "role", COUNT(*) AS "count" FROM users user GROUP BY user.role
+// 结果：[{ role: 'ADMIN', count: '5' }, { role: 'EDITOR', count: '12' }]
+
+// HAVING
+const result = await userRepo
+  .createQueryBuilder("user")
+  .select("user.role", "role")
+  .addSelect("COUNT(*)", "count")
+  .groupBy("user.role")
+  .having("COUNT(*) > :min", { min: 5 })
+  .getRawMany();
+// SELECT user.role, COUNT(*) FROM users GROUP BY user.role HAVING COUNT(*) > 5
+```
+
+---
+
+## 联表查询（JOIN）
+
+### LEFT JOIN
+
+```typescript
+// 查询用户及其文章（左连接）
+const users = await userRepo
+  .createQueryBuilder("user")
+  .leftJoinAndSelect("user.posts", "post")
+  .getMany();
+// SELECT user.*, post.* FROM users user
+// LEFT JOIN posts post ON post.author_id = user.id
+// 结果包含没有文章的用户（posts 为空数组）
+
+// 不 select 关联表数据（仅用于条件过滤）
+const users = await userRepo
+  .createQueryBuilder("user")
+  .leftJoin("user.posts", "post")
+  .where("post.status = :status", { status: "PUBLISHED" })
+  .getMany();
+// 只返回有已发布文章的用户，但不包含文章数据
+```
+
+### INNER JOIN
+
+```typescript
+// 内连接：只返回有匹配记录的行
+const users = await userRepo
+  .createQueryBuilder("user")
+  .innerJoinAndSelect("user.posts", "post")
+  .getMany();
+// 只返回有文章的用户
+
+// 带条件的内连接
+const users = await userRepo
+  .createQueryBuilder("user")
+  .innerJoinAndSelect("user.posts", "post", "post.status = :status", {
+    status: "PUBLISHED",
+  })
+  .getMany();
+// 只返回有已发布文章的用户，且只加载已发布的文章
+```
+
+### 多表关联
+
+```typescript
+// 三层关联：用户 → 文章 → 标签
+const users = await userRepo
+  .createQueryBuilder("user")
+  .leftJoinAndSelect("user.posts", "post")
+  .leftJoinAndSelect("post.tags", "tag")
+  .leftJoinAndSelect("post.comments", "comment")
+  .where("user.isActive = :active", { active: true })
+  .orderBy("post.createdAt", "DESC")
+  .getMany();
+```
+
+### 选择关联表字段
+
+```typescript
+// 只选择关联表的部分字段
+const users = await userRepo
+  .createQueryBuilder("user")
+  .leftJoin("user.posts", "post")
+  .select(["user.id", "user.name", "post.id", "post.title"])
+  .getMany();
+// SELECT user.id, user.name, post.id, post.title FROM ...
+```
+
+---
+
+## 子查询
+
+子查询在复杂查询中非常有用，例如"查询发布文章最多的用户"。
+
+### WHERE 中的子查询
+
+```typescript
+// 查询有已发布文章的用户
+const users = await userRepo
+  .createQueryBuilder("user")
+  .where((qb) => {
+    const subQuery = qb
+      .subQuery()
+      .select("post.authorId")
+      .from(Post, "post")
+      .where("post.status = :status")
+      .getQuery();
+    return "user.id IN " + subQuery;
+  })
+  .setParameter("status", "PUBLISHED")
+  .getMany();
+// SELECT * FROM users user
+// WHERE user.id IN (
+//   SELECT post.author_id FROM posts post WHERE post.status = 'PUBLISHED'
+// )
+```
+
+### FROM 中的子查询
+
+```typescript
+// 统计每个用户的文章数量
+const result = await dataSource
+  .createQueryBuilder()
+  .select("summary.authorId", "authorId")
+  .addSelect("summary.postCount", "postCount")
+  .addSelect("user.name", "authorName")
+  .from((subQuery) => {
+    return subQuery
+      .select("post.authorId", "authorId")
+      .addSelect("COUNT(*)", "postCount")
+      .from(Post, "post")
+      .where("post.status = :status", { status: "PUBLISHED" })
+      .groupBy("post.authorId");
+  }, "summary")
+  .innerJoin(User, "user", "user.id = summary.authorId")
+  .orderBy("summary.postCount", "DESC")
+  .getRawMany();
+```
+
+### SELECT 中的子查询
+
+```typescript
+// 查询用户及其文章数量
+const users = await userRepo
+  .createQueryBuilder("user")
+  .leftJoin("user.posts", "post")
+  .select(["user.id", "user.name"])
+  .addSelect(
+    (subQuery) =>
+      subQuery.select("COUNT(*)").from(Post, "p").where("p.authorId = user.id"),
+    "postCount"
+  )
+  .getRawMany();
+// SELECT user.id, user.name,
+//   (SELECT COUNT(*) FROM posts p WHERE p.author_id = user.id) AS "postCount"
+// FROM users user
+```
+
+### EXISTS 子查询
+
+```typescript
+// 查询有评论的用户
+const users = await userRepo
+  .createQueryBuilder("user")
+  .where((qb) => {
+    const subQuery = qb
+      .subQuery()
+      .select("1")
+      .from(Comment, "c")
+      .where("c.authorId = user.id")
+      .getQuery();
+    return `EXISTS ${subQuery}`;
+  })
+  .getMany();
+// SELECT * FROM users user
+// WHERE EXISTS (SELECT 1 FROM comments c WHERE c.author_id = user.id)
+```
+
+---
+
+## 分组聚合
+
+### 基本聚合函数
+
+```typescript
+import { Raw } from "typeorm";
+
+// 统计各角色的用户数量
+const roleStats = await userRepo
+  .createQueryBuilder("user")
+  .select("user.role", "role")
+  .addSelect("COUNT(*)", "count")
+  .addSelect("MAX(user.createdAt)", "latestJoined")
+  .addSelect("MIN(user.createdAt)", "earliestJoined")
+  .groupBy("user.role")
+  .getRawMany();
+// 结果：[
+//   { role: 'ADMIN', count: '3', latestJoined: '...', earliestJoined: '...' },
+//   { role: 'EDITOR', count: '8', ... }
+// ]
+```
+
+### 文章统计
+
+```typescript
+// 每月文章发布统计
+const monthlyStats = await postRepo
+  .createQueryBuilder("post")
+  .select("DATE_TRUNC('month', post.publishedAt)", "month")
+  .addSelect("COUNT(*)", "postCount")
+  .addSelect("SUM(post.viewCount)", "totalViews")
+  .addSelect("AVG(post.viewCount)", "avgViews")
+  .where("post.status = :status", { status: "PUBLISHED" })
+  .groupBy("DATE_TRUNC('month', post.publishedAt)")
+  .having("COUNT(*) > :min", { min: 0 })
+  .orderBy("month", "DESC")
+  .getRawMany();
+// 结果：[
+//   { month: '2026-03-01', postCount: '15', totalViews: '12500', avgViews: '833' },
+//   { month: '2026-02-01', postCount: '12', ... }
+// ]
+```
+
+### 使用 loadRelationCountAndMap
+
+```typescript
+// 查询用户及其文章数量
+const users = await userRepo
+  .createQueryBuilder("user")
+  .leftJoin("user.posts", "post")
+  .loadRelationCountAndMap("user.postCount", "user.posts")
+  .loadRelationCountAndMap("user.publishedCount", "user.posts", "post", (qb) =>
+    qb.where("post.status = :status", { status: "PUBLISHED" })
+  )
+  .getMany();
+// 结果：[
+//   { id: 1, name: '张三', postCount: 5, publishedCount: 3 },
+//   ...
+// ]
+```
+
+---
+
+## 原始 SQL 查询
+
+### getRawMany / getRawOne
+
+```typescript
+// 获取原始数据（不映射到实体）
+const rawUsers = await userRepo
+  .createQueryBuilder("user")
+  .select(["user.id", "user.name"])
+  .getRawMany();
+// 结果：[{ user_id: 1, user_name: '张三' }, ...]
+// 注意：字段名是 别名_列名 格式
+
+// 使用 AS 自定义字段名
+const result = await userRepo
+  .createQueryBuilder("user")
+  .select("user.name", "name")
+  .addSelect("user.email", "email")
+  .getRawMany();
+// 结果：[{ name: '张三', email: 'zhangsan@example.com' }, ...]
+```
+
+### 使用 DataSource 执行原始 SQL
+
+```typescript
+// 执行原始 SQL 查询
+const result = await dataSource.query(
+  "SELECT * FROM users WHERE is_active = $1",
+  [true]
+);
+
+// 执行原始 SQL（带类型）
+import { Raw } from "typeorm";
+
+const result = await dataSource
+  .createQueryBuilder()
+  .select("*")
+  .from(User, "user")
+  .where("user.isActive = :active", { active: true })
+  .getRawMany();
+
+// 使用 sql tag
+import { Sql } from "typeorm";
+
+const result = await dataSource.query(
+  `SELECT u.name, COUNT(p.id) as post_count
+   FROM users u
+   LEFT JOIN posts p ON p.author_id = u.id
+   GROUP BY u.name
+   HAVING COUNT(p.id) > $1`,
+  [5]
+);
+```
+
+---
+
+## 搜索功能实现
+
+### 基础搜索
+
+```typescript
+// 简单关键字搜索
+async function searchPosts(keyword: string) {
+  return postRepo
+    .createQueryBuilder("post")
+    .leftJoinAndSelect("post.author", "author")
+    .where("post.title ILIKE :keyword", { keyword: `%${keyword}%` })
+    .orWhere("post.content ILIKE :keyword", { keyword: `%${keyword}%` })
+    .orderBy("post.createdAt", "DESC")
+    .getMany();
+}
+```
+
+### 多字段搜索
+
+```typescript
+// 多字段加权搜索
+async function searchPostsWithScore(keyword: string) {
+  return postRepo
+    .createQueryBuilder("post")
+    .leftJoinAndSelect("post.author", "author")
+    .select([
+      "post.id",
+      "post.title",
+      "post.excerpt",
+      "post.publishedAt",
+      "author.id",
+      "author.name",
+    ])
+    .addSelect(
+      `
+      CASE
+        WHEN post.title ILIKE :keyword THEN 3
+        WHEN post.excerpt ILIKE :keyword THEN 2
+        WHEN post.content ILIKE :keyword THEN 1
+        ELSE 0
+      END`,
+      "searchScore"
+    )
+    .where(
+      new Brackets((qb) => {
+        qb.where("post.title ILIKE :keyword", { keyword: `%${keyword}%` })
+          .orWhere("post.excerpt ILIKE :keyword", { keyword: `%${keyword}%` })
+          .orWhere("post.content ILIKE :keyword", { keyword: `%${keyword}%` });
+      })
+    )
+    .andWhere("post.status = :status", { status: "PUBLISHED" })
+    .orderBy("searchScore", "DESC")
+    .addOrderBy("post.publishedAt", "DESC")
+    .limit(20)
+    .getRawMany();
+}
+```
+
+### PostgreSQL 全文搜索
+
+```typescript
+// 使用 PostgreSQL 全文搜索
+async function fullTextSearch(keyword: string) {
+  return postRepo
+    .createQueryBuilder("post")
+    .select(["post.id", "post.title", "post.excerpt", "post.publishedAt"])
+    .addSelect(
+      `ts_headline('simple', post.content,
+        websearch_to_tsquery('simple', :keyword),
+        'MaxWords=50, MinWords=20')`,
+      "highlight"
+    )
+    .addSelect(
+      `ts_rank(
+        to_tsvector('simple', post.title || ' ' || post.content),
+        websearch_to_tsquery('simple', :keyword)
+      )`,
+      "rank"
+    )
+    .where(
+      `to_tsvector('simple', post.title || ' ' || post.content)
+       @@ websearch_to_tsquery('simple', :keyword)`
+    )
+    .andWhere("post.status = :status", { status: "PUBLISHED" })
+    .orderBy("rank", "DESC")
+    .limit(20)
+    .getRawMany();
+}
+```
+
+---
+
+## INSERT / UPDATE / DELETE
+
+### INSERT
+
+```typescript
+// 使用 QueryBuilder 插入
+await dataSource
+  .createQueryBuilder()
+  .insert()
+  .into(User)
+  .values([
+    { name: "张三", email: "zhangsan@example.com" },
+    { name: "李四", email: "lisi@example.com" },
+  ])
+  .execute();
+
+// 带冲突处理（UPSERT）
+await dataSource
+  .createQueryBuilder()
+  .insert()
+  .into(User)
+  .values({ email: "test@example.com", name: "Test" })
+  .orUpdate(["name"], ["email"]) // 冲突时更新 name
+  .execute();
+// INSERT INTO users (email, name) VALUES (...)
+// ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
+```
+
+### UPDATE
+
+```typescript
+// 使用 QueryBuilder 更新
+await dataSource
+  .createQueryBuilder()
+  .update(Post)
+  .set({ status: "PUBLISHED", publishedAt: new Date() })
+  .where("authorId = :authorId", { authorId: 1 })
+  .andWhere("status = :status", { status: "DRAFT" })
+  .execute();
+
+// 使用表达式更新
+await dataSource
+  .createQueryBuilder()
+  .update(Post)
+  .set({ viewCount: () => "view_count + 1" })
+  .where("id = :id", { id: 1 })
+  .execute();
+// UPDATE posts SET view_count = view_count + 1 WHERE id = 1
+```
+
+### DELETE
+
+```typescript
+// 使用 QueryBuilder 删除
+await dataSource
+  .createQueryBuilder()
+  .delete()
+  .from(Post)
+  .where("authorId = :authorId", { authorId: 1 })
+  .andWhere("status = :status", { status: "DRAFT" })
+  .execute();
+
+// 软删除
+await dataSource
+  .createQueryBuilder()
+  .softDelete()
+  .from(Post)
+  .where("id = :id", { id: 1 })
+  .execute();
+
+// 恢复
+await dataSource
+  .createQueryBuilder()
+  .restore()
+  .from(Post)
+  .where("id = :id", { id: 1 })
+  .execute();
+```
+
+---
+
+## 查询结果映射
+
+### getMany vs getRawMany
+
+```typescript
+// getMany：映射到实体对象
+const users = await userRepo
+  .createQueryBuilder("user")
+  .leftJoinAndSelect("user.posts", "post")
+  .getMany();
+// [{ id: 1, name: '张三', posts: [{ id: 1, title: '...' }] }]
+
+// getRawMany：返回原始数据
+const rawResults = await userRepo
+  .createQueryBuilder("user")
+  .leftJoin("user.posts", "post")
+  .select(["user.id", "user.name", "post.title"])
+  .getRawMany();
+// [{ user_id: 1, user_name: '张三', post_title: '...' }]
+```
+
+### 自定义映射
+
+```typescript
+// 使用 getRawAndEntities
+const { raw, entities } = await userRepo
+  .createQueryBuilder("user")
+  .leftJoinAndSelect("user.posts", "post")
+  .addSelect("COUNT(post.id)", "postCount")
+  .groupBy("user.id")
+  .getRawAndEntities();
+// entities: 实体数组
+// raw: 原始数据数组（包含聚合字段）
+
+// 手动映射
+interface PostWithStats {
+  id: number;
+  title: string;
+  authorName: string;
+  commentCount: number;
+  tagNames: string[];
+}
+
+const posts: PostWithStats[] = await postRepo
+  .createQueryBuilder("post")
+  .leftJoin("post.author", "author")
+  .leftJoin("post.comments", "comment")
+  .select(["post.id AS id", "post.title AS title", "author.name AS authorName"])
+  .addSelect("COUNT(DISTINCT comment.id)", "commentCount")
+  .groupBy("post.id, author.name")
+  .getRawMany();
+```
+
+---
+
+## 实战：文章搜索和统计 API
+
+```typescript
+@Injectable()
+export class PostQueryService {
+  constructor(
+    @InjectRepository(Post)
+    private postRepo: Repository<Post>
+  ) {}
+
+  // 搜索文章
+  async search(params: {
+    keyword?: string;
+    status?: PostStatus;
+    authorId?: number;
+    tagId?: number;
+    page: number;
+    limit: number;
+  }) {
+    const { keyword, status, authorId, tagId, page, limit } = params;
+
+    const qb = this.postRepo
+      .createQueryBuilder("post")
+      .leftJoinAndSelect("post.author", "author")
+      .leftJoinAndSelect("post.tags", "tag");
+
+    // 关键字搜索
+    if (keyword) {
+      qb.andWhere(
+        new Brackets((subQb) => {
+          subQb
+            .where("post.title ILIKE :kw", { kw: `%${keyword}%` })
+            .orWhere("post.content ILIKE :kw", { kw: `%${keyword}%` });
+        })
+      );
+    }
+
+    // 状态过滤
+    if (status) {
+      qb.andWhere("post.status = :status", { status });
+    }
+
+    // 作者过滤
+    if (authorId) {
+      qb.andWhere("post.authorId = :authorId", { authorId });
+    }
+
+    // 标签过滤
+    if (tagId) {
+      qb.andWhere("tag.id = :tagId", { tagId });
+    }
+
+    // 分页
+    qb.orderBy("post.createdAt", "DESC")
+      .skip((page - 1) * limit)
+      .take(limit);
+
+    const [data, total] = await qb.getManyAndCount();
+    return { data, total, page, limit };
+  }
+
+  // 文章统计
+  async getStats() {
+    // 总览统计
+    const overview = await this.postRepo
+      .createQueryBuilder("post")
+      .select("post.status", "status")
+      .addSelect("COUNT(*)", "count")
+      .addSelect("SUM(post.viewCount)", "totalViews")
+      .groupBy("post.status")
+      .getRawMany();
+
+    // 热门文章
+    const topPosts = await this.postRepo
+      .createQueryBuilder("post")
+      .leftJoinAndSelect("post.author", "author")
+      .where("post.status = :status", { status: "PUBLISHED" })
+      .orderBy("post.viewCount", "DESC")
+      .limit(10)
+      .getMany();
+
+    // 月度发布趋势
+    const monthlyTrend = await this.postRepo
+      .createQueryBuilder("post")
+      .select("DATE_TRUNC('month', post.publishedAt)", "month")
+      .addSelect("COUNT(*)", "count")
+      .where("post.status = :status", { status: "PUBLISHED" })
+      .groupBy("DATE_TRUNC('month', post.publishedAt)")
+      .orderBy("month", "DESC")
+      .limit(12)
+      .getRawMany();
+
+    return { overview, topPosts, monthlyTrend };
+  }
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 始终使用参数绑定
+
+```typescript
+// ✅ 安全：使用参数绑定
+qb.where("user.email = :email", { email: userInput });
+
+// ❌ 危险：SQL 注入风险
+qb.where(`user.email = '${userInput}'`);
+```
+
+### 2. 合理使用 JOIN
+
+```typescript
+// ✅ 需要关联数据时使用 leftJoinAndSelect
+const users = await userRepo
+  .createQueryBuilder("user")
+  .leftJoinAndSelect("user.posts", "post")
+  .getMany();
+
+// ✅ 仅用于条件过滤时使用 leftJoin
+const users = await userRepo
+  .createQueryBuilder("user")
+  .leftJoin("user.posts", "post")
+  .where("post.status = :status", { status: "PUBLISHED" })
+  .getMany();
+```
+
+### 3. 避免笛卡尔积
+
+```typescript
+// ❌ 多个 one-to-many JOIN 会产生笛卡尔积
+qb.leftJoinAndSelect("user.posts", "post").leftJoinAndSelect(
+  "user.comments",
+  "comment"
+);
+// 如果用户有 10 篇文章和 20 条评论，结果会有 200 行
+
+// ✅ 分开查询或使用子查询
+const users = await userRepo
+  .createQueryBuilder("user")
+  .loadRelationCountAndMap("user.postCount", "user.posts")
+  .loadRelationCountAndMap("user.commentCount", "user.comments")
+  .getMany();
+```
+
+### 4. 调试技巧
+
+```typescript
+// 打印生成的 SQL
+const sql = qb.getSql();
+console.log(sql);
+
+// 打印带参数的 SQL
+console.log(qb.getQueryAndParameters());
+
+// 启用 SQL 日志
+const dataSource = new DataSource({
+  // ...
+  logging: true, // 打印所有 SQL
+  // 或只打印特定类型
+  // logging: ["query", "error"],
+});
+```
+
+---
+
+## 总结
+
+### 核心要点
+
+1. **QueryBuilder 基础**
+   - 链式 API：`select` → `where` → `orderBy` → `getMany`
+   - 参数绑定防止 SQL 注入
+   - `Brackets` 用于复杂条件组合
+
+2. **JOIN 操作**
+   - `leftJoinAndSelect`：左连接并加载数据
+   - `innerJoinAndSelect`：内连接并加载数据
+   - `leftJoin` / `innerJoin`：仅用于条件过滤
+
+3. **子查询**
+   - WHERE 子查询：过滤条件
+   - FROM 子查询：派生表
+   - SELECT 子查询：计算字段
+
+4. **聚合统计**
+   - `groupBy` + `having`
+   - `loadRelationCountAndMap`
+   - 常用函数：COUNT、SUM、AVG、MAX、MIN
+
+5. **搜索实现**
+   - LIKE / ILIKE 模糊搜索
+   - PostgreSQL 全文搜索
+   - 加权排序
+
+### 下一步
+
+在下一篇文章中，我们将学习：
+
+- **数据库迁移**
+- TypeORM CLI 配置
+- 迁移文件结构
+- 生成、执行、回滚迁移
+- 数据种子（seeding）
+
+敬请期待！
+
+---
+
+## 参考资源
+
+- [TypeORM QueryBuilder 文档](https://typeorm.io/select-query-builder)
+- [TypeORM JOIN 文档](https://typeorm.io/join-query-builder)
+- [PostgreSQL 全文搜索](https://www.postgresql.org/docs/current/textsearch.html)
+
+---
+
+**上一篇**：[04. Repository 模式与 CRUD](./04-repository-crud.mdx)
+**下一篇**：[06. 数据库迁移](./06-migrations.mdx)

@@ -1,0 +1,765 @@
+---
+title: "04. 关系查询和联表操作"
+date: "2026-03-25"
+summary: "深入掌握 Drizzle ORM 的关系查询，学习一对一、一对多、多对多关系，掌握 JOIN 操作和查询优化。"
+tags: ["Drizzle ORM", "JOIN", "关系查询", "PostgreSQL", "联表操作"]
+category: "drizzle"
+draft: false
+series: "Drizzle ORM 类型安全的数据库访问实战"
+seriesOrder: 4
+---
+
+## 前言
+
+现实世界的数据是相互关联的。Drizzle ORM 提供了强大的**关系查询**能力，让你可以轻松处理表与表之间的关系。
+
+**本文核心内容**：
+
+- ✅ 一对一关系
+- ✅ 一对多关系
+- ✅ 多对多关系
+- ✅ JOIN 操作（INNER、LEFT、RIGHT、FULL）
+- ✅ 聚合查询
+- ✅ N+1 问题优化
+
+---
+
+## 一、关系定义
+
+### 1.1 一对一关系
+
+**场景**：用户和用户资料
+
+```typescript
+import { pgTable, serial, varchar, text, integer } from 'drizzle-orm/pg-core';
+
+// 用户表
+export const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  email: varchar('email', { length: 255 }).notNull().unique(),
+  name: text('name'),
+});
+
+// 用户资料表（一对一）
+export const profiles = pgTable('profiles', {
+  id: serial('id').primaryKey(),
+  userId: integer('user_id')
+    .references(() => users.id, { onDelete: 'cascade' })
+    .notNull()
+    .unique(), // 唯一约束确保一对一
+  bio: text('bio'),
+  avatar: text('avatar'),
+  location: text('location'),
+});
+
+// 类型：InsertProfile
+{
+  userId: number;
+  bio?: string;
+  avatar?: string;
+  location?: string;
+}
+```
+
+### 1.2 一对多关系
+
+**场景**：用户和文章
+
+```typescript
+// 用户表
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  email: varchar("email", { length: 255 }).notNull().unique(),
+  name: text("name"),
+});
+
+// 文章表（一对多：一个用户可以有多篇文章）
+export const posts = pgTable("posts", {
+  id: serial("id").primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  content: text("content").notNull(),
+  authorId: integer("author_id")
+    .references(() => users.id, { onDelete: "cascade" })
+    .notNull(),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+// 一个用户可以有多篇文章
+// 一篇文章只能有一个作者
+```
+
+### 1.3 多对多关系
+
+**场景**：文章和标签
+
+```typescript
+// 文章表
+export const posts = pgTable("posts", {
+  id: serial("id").primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+});
+
+// 标签表
+export const tags = pgTable("tags", {
+  id: serial("id").primaryKey(),
+  name: varchar("name", { length: 50 }).notNull().unique(),
+});
+
+// 关联表（多对多）
+export const postsToTags = pgTable("posts_to_tags", {
+  postId: integer("post_id")
+    .references(() => posts.id, { onDelete: "cascade" })
+    .notNull(),
+  tagId: integer("tag_id")
+    .references(() => tags.id, { onDelete: "cascade" })
+    .notNull(),
+});
+
+// 一篇文章可以有多个标签
+// 一个标签可以用于多篇文章
+```
+
+---
+
+## 二、JOIN 操作
+
+### 2.1 INNER JOIN - 内连接
+
+只返回匹配的记录。
+
+```typescript
+import { eq } from "drizzle-orm";
+
+// 查询有资料的用户
+const result = await db
+  .select({
+    userId: users.id,
+    userName: users.name,
+    userEmail: users.email,
+    bio: profiles.bio,
+    avatar: profiles.avatar,
+  })
+  .from(users)
+  .innerJoin(profiles, eq(users.id, profiles.userId));
+
+// SQL：
+// SELECT users.id, users.name, users.email, profiles.bio, profiles.avatar
+// FROM users
+// INNER JOIN profiles ON users.id = profiles.user_id
+
+// 返回类型：
+// {
+//   userId: number;
+//   userName: string | null;
+//   userEmail: string;
+//   bio: string | null;
+//   avatar: string | null;
+// }[]
+```
+
+### 2.2 LEFT JOIN - 左连接
+
+返回左表所有记录，即使右表没有匹配。
+
+```typescript
+// 查询所有用户及其资料（没有资料的用户也会返回）
+const result = await db
+  .select({
+    userId: users.id,
+    userName: users.name,
+    userEmail: users.email,
+    bio: profiles.bio,
+    avatar: profiles.avatar,
+  })
+  .from(users)
+  .leftJoin(profiles, eq(users.id, profiles.userId));
+
+// SQL：
+// SELECT users.id, users.name, users.email, profiles.bio, profiles.avatar
+// FROM users
+// LEFT JOIN profiles ON users.id = profiles.user_id
+
+// 没有资料的用户：
+// { userId: 1, userName: 'John', userEmail: 'john@example.com', bio: null, avatar: null }
+```
+
+### 2.3 RIGHT JOIN - 右连接
+
+返回右表所有记录，即使左表没有匹配。
+
+```typescript
+// 查询所有资料及其用户
+const result = await db
+  .select({
+    userId: users.id,
+    userName: users.name,
+    userEmail: users.email,
+    bio: profiles.bio,
+    avatar: profiles.avatar,
+  })
+  .from(users)
+  .rightJoin(profiles, eq(users.id, profiles.userId));
+
+// SQL：
+// SELECT users.id, users.name, users.email, profiles.bio, profiles.avatar
+// FROM users
+// RIGHT JOIN profiles ON users.id = profiles.user_id
+```
+
+### 2.4 FULL JOIN - 全连接
+
+返回两表所有记录，无论是否匹配。
+
+```typescript
+const result = await db
+  .select({
+    userId: users.id,
+    userName: users.name,
+    bio: profiles.bio,
+  })
+  .from(users)
+  .fullJoin(profiles, eq(users.id, profiles.userId));
+
+// SQL：
+// SELECT users.id, users.name, profiles.bio
+// FROM users
+// FULL JOIN profiles ON users.id = profiles.user_id
+```
+
+---
+
+## 三、一对多关系查询
+
+### 3.1 查询用户及其文章
+
+```typescript
+import { eq, desc } from "drizzle-orm";
+
+// 获取用户及其所有文章
+const result = await db
+  .select({
+    userId: users.id,
+    userName: users.name,
+    postId: posts.id,
+    postTitle: posts.title,
+    postContent: posts.content,
+  })
+  .from(users)
+  .innerJoin(posts, eq(users.id, posts.authorId))
+  .where(eq(users.id, 1));
+
+// 返回（扁平化）：
+// [
+//   { userId: 1, userName: 'John', postId: 1, postTitle: 'Hello', postContent: '...' },
+//   { userId: 1, userName: 'John', postId: 2, postTitle: 'World', postContent: '...' },
+// ]
+```
+
+### 3.2 查询用户和文章数量
+
+```typescript
+import { count, sql } from "drizzle-orm";
+
+const result = await db
+  .select({
+    userId: users.id,
+    userName: users.name,
+    postCount: count(posts.id).as("post_count"),
+  })
+  .from(users)
+  .leftJoin(posts, eq(users.id, posts.authorId))
+  .groupBy(users.id)
+  .having(sql`count(${posts.id}) > 0`);
+
+// SQL：
+// SELECT users.id, users.name, COUNT(posts.id) as post_count
+// FROM users
+// LEFT JOIN posts ON users.id = posts.author_id
+// GROUP BY users.id
+// HAVING COUNT(posts.id) > 0
+
+// 返回：
+// [
+//   { userId: 1, userName: 'John', postCount: 5 },
+//   { userId: 2, userName: 'Jane', postCount: 3 },
+// ]
+```
+
+### 3.3 获取最新文章
+
+```typescript
+const usersWithLatestPost = await db
+  .select({
+    userId: users.id,
+    userName: users.name,
+    latestPostTitle: posts.title,
+    latestPostDate: posts.createdAt,
+  })
+  .from(users)
+  .leftJoin(posts, eq(users.id, posts.authorId))
+  .orderBy(desc(posts.createdAt));
+
+// 然后在应用层处理，获取每个用户的最新文章
+```
+
+---
+
+## 四、多对多关系查询
+
+### 4.1 查询文章及其标签
+
+```typescript
+import { eq } from "drizzle-orm";
+
+const postsWithTags = await db
+  .select({
+    postId: posts.id,
+    postTitle: posts.title,
+    tagId: tags.id,
+    tagName: tags.name,
+  })
+  .from(posts)
+  .innerJoin(postsToTags, eq(posts.id, postsToTags.postId))
+  .innerJoin(tags, eq(postsToTags.tagId, tags.id))
+  .where(eq(posts.id, 1));
+
+// SQL：
+// SELECT posts.id, posts.title, tags.id, tags.name
+// FROM posts
+// INNER JOIN posts_to_tags ON posts.id = posts_to_tags.post_id
+// INNER JOIN tags ON posts_to_tags.tag_id = tags.id
+// WHERE posts.id = 1
+
+// 返回（扁平化）：
+// [
+//   { postId: 1, postTitle: 'Hello World', tagId: 1, tagName: 'JavaScript' },
+//   { postId: 1, postTitle: 'Hello World', tagId: 2, tagName: 'TypeScript' },
+// ]
+```
+
+### 4.2 查询标签及其文章
+
+```typescript
+const tagsWithPosts = await db
+  .select({
+    tagId: tags.id,
+    tagName: tags.name,
+    postId: posts.id,
+    postTitle: posts.title,
+  })
+  .from(tags)
+  .innerJoin(postsToTags, eq(tags.id, postsToTags.tagId))
+  .innerJoin(posts, eq(postsToTags.postId, posts.id))
+  .where(eq(tags.id, 1));
+
+// 返回：
+// [
+//   { tagId: 1, tagName: 'JavaScript', postId: 1, postTitle: 'Hello World' },
+//   { tagId: 1, tagName: 'JavaScript', postId: 3, postTitle: 'JS Tips' },
+// ]
+```
+
+### 4.3 添加标签到文章
+
+```typescript
+async function addTagToPost(postId: number, tagId: number) {
+  await db.insert(postsToTags).values({
+    postId,
+    tagId,
+  });
+
+  // 检查是否已存在（避免重复）
+  const existing = await db
+    .select()
+    .from(postsToTags)
+    .where(and(eq(postsToTags.postId, postId), eq(postsToTags.tagId, tagId)))
+    .limit(1);
+
+  if (existing.length > 0) {
+    throw new Error("Tag already added to post");
+  }
+
+  await db.insert(postsToTags).values({ postId, tagId });
+}
+```
+
+### 4.4 移除文章标签
+
+```typescript
+async function removeTagFromPost(postId: number, tagId: number) {
+  await db
+    .delete(postsToTags)
+    .where(and(eq(postsToTags.postId, postId), eq(postsToTags.tagId, tagId)));
+}
+```
+
+---
+
+## 五、复杂查询示例
+
+### 5.1 获取用户及其所有文章和标签
+
+```typescript
+const result = await db
+  .select({
+    userId: users.id,
+    userName: users.name,
+    postId: posts.id,
+    postTitle: posts.title,
+    tagId: tags.id,
+    tagName: tags.name,
+  })
+  .from(users)
+  .leftJoin(posts, eq(users.id, posts.authorId))
+  .leftJoin(postsToTags, eq(posts.id, postsToTags.postId))
+  .leftJoin(tags, eq(postsToTags.tagId, tags.id))
+  .where(eq(users.id, 1))
+  .orderBy(desc(posts.createdAt));
+
+// SQL：
+// SELECT users.id, users.name, posts.id, posts.title, tags.id, tags.name
+// FROM users
+// LEFT JOIN posts ON users.id = posts.author_id
+// LEFT JOIN posts_to_tags ON posts.id = posts_to_tags.post_id
+// LEFT JOIN tags ON posts_to_tags.tag_id = tags.id
+// WHERE users.id = 1
+// ORDER BY posts.created_at DESC
+```
+
+### 5.2 统计每个分类的文章数
+
+```typescript
+export const categories = pgTable("categories", {
+  id: serial("id").primaryKey(),
+  name: varchar("name", { length: 100 }).notNull(),
+});
+
+export const posts = pgTable("posts", {
+  id: serial("id").primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  categoryId: integer("category_id").references(() => categories.id),
+});
+
+const categoryStats = await db
+  .select({
+    categoryId: categories.id,
+    categoryName: categories.name,
+    postCount: count(posts.id).as("post_count"),
+  })
+  .from(categories)
+  .leftJoin(posts, eq(categories.id, posts.categoryId))
+  .groupBy(categories.id)
+  .orderBy(desc(count(posts.id)));
+
+// 返回：
+// [
+//   { categoryId: 1, categoryName: 'JavaScript', postCount: 15 },
+//   { categoryId: 2, categoryName: 'TypeScript', postCount: 8 },
+// ]
+```
+
+### 5.3 查找没有文章的用户
+
+```typescript
+const usersWithoutPosts = await db
+  .select({
+    userId: users.id,
+    userName: users.name,
+    userEmail: users.email,
+  })
+  .from(users)
+  .leftJoin(posts, eq(users.id, posts.authorId))
+  .where(sql`${posts.id} IS NULL`);
+
+// 或者使用 NOT EXISTS
+const usersWithoutPosts2 = await db
+  .select({
+    userId: users.id,
+    userName: users.name,
+  })
+  .from(users)
+  .where(
+    sql`NOT EXISTS (
+      SELECT 1 FROM posts WHERE posts.author_id = users.id
+    )`
+  );
+```
+
+---
+
+## 六、处理 N+1 问题
+
+### 6.1 什么是 N+1 问题？
+
+```typescript
+// ❌ N+1 问题示例
+const users = await db.select().from(usersTable);
+
+for (const user of users) {
+  // 每个用户都执行一次查询
+  const posts = await db
+    .select()
+    .from(postsTable)
+    .where(eq(postsTable.authorId, user.id));
+
+  user.posts = posts;
+}
+
+// 执行 1 + N 次查询（N 是用户数量）
+// 1 次查询用户 + N 次查询每个用户的文章
+```
+
+### 6.2 使用 JOIN 解决
+
+```typescript
+// ✅ 使用 JOIN 一次查询
+const result = await db
+  .select({
+    userId: users.id,
+    userName: users.name,
+    postId: posts.id,
+    postTitle: posts.title,
+  })
+  .from(users)
+  .leftJoin(posts, eq(users.id, posts.authorId))
+  .where(eq(users.role, "active"));
+
+// 在应用层组装数据
+const usersMap = new Map();
+
+for (const row of result) {
+  if (!usersMap.has(row.userId)) {
+    usersMap.set(row.userId, {
+      id: row.userId,
+      name: row.userName,
+      posts: [],
+    });
+  }
+
+  if (row.postId) {
+    usersMap.get(row.userId).posts.push({
+      id: row.postId,
+      title: row.postTitle,
+    });
+  }
+}
+
+const users = Array.from(usersMap.values());
+```
+
+### 6.3 使用 IN 查询
+
+```typescript
+// ✅ 先查询用户，再用 IN 查询所有文章
+const users = await db.select().from(usersTable);
+
+const userIds = users.map((u) => u.id);
+
+const allPosts = await db
+  .select()
+  .from(postsTable)
+  .where(sql`${postsTable.authorId} = ANY(${userIds})`);
+
+// 在应用层组装
+const postsByUser = new Map();
+
+for (const post of allPosts) {
+  if (!postsByUser.has(post.authorId)) {
+    postsByUser.set(post.authorId, []);
+  }
+  postsByUser.get(post.authorId).push(post);
+}
+
+for (const user of users) {
+  user.posts = postsByUser.get(user.id) || [];
+}
+```
+
+---
+
+## 七、实战示例
+
+### 7.1 博客系统完整查询
+
+```typescript
+import { eq, and, desc, count, sql } from "drizzle-orm";
+
+// 获取文章详情（包含作者和标签）
+async function getPostDetail(postId: number) {
+  // 获取文章和作者
+  const [post] = await db
+    .select({
+      postId: posts.id,
+      postTitle: posts.title,
+      postContent: posts.content,
+      postCreatedAt: posts.createdAt,
+      authorId: users.id,
+      authorName: users.name,
+      authorEmail: users.email,
+    })
+    .from(posts)
+    .innerJoin(users, eq(posts.authorId, users.id))
+    .where(eq(posts.id, postId))
+    .limit(1);
+
+  if (!post) {
+    throw new Error("Post not found");
+  }
+
+  // 获取文章标签
+  const tags = await db
+    .select({
+      tagId: tags.id,
+      tagName: tags.name,
+    })
+    .from(postsToTags)
+    .innerJoin(tags, eq(postsToTags.tagId, tags.id))
+    .where(eq(postsToTags.postId, postId));
+
+  // 获取评论数
+  const [commentCount] = await db
+    .select({
+      count: count(comments.id).as("count"),
+    })
+    .from(comments)
+    .where(eq(comments.postId, postId));
+
+  return {
+    ...post,
+    tags,
+    commentCount: commentCount?.count || 0,
+  };
+}
+```
+
+### 7.2 电商系统查询
+
+```typescript
+// 订单和商品
+export const orders = pgTable("orders", {
+  id: serial("id").primaryKey(),
+  userId: integer("user_id").references(() => users.id),
+  status: varchar("status", { length: 50 }).notNull(),
+  total: integer("total").notNull(),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const orderItems = pgTable("order_items", {
+  id: serial("id").primaryKey(),
+  orderId: integer("order_id").references(() => orders.id),
+  productId: integer("product_id").references(() => products.id),
+  quantity: integer("quantity").notNull(),
+  price: integer("price").notNull(),
+});
+
+// 获取订单详情
+async function getOrderDetail(orderId: number) {
+  // 获取订单
+  const [order] = await db
+    .select()
+    .from(orders)
+    .where(eq(orders.id, orderId))
+    .limit(1);
+
+  if (!order) {
+    throw new Error("Order not found");
+  }
+
+  // 获取订单商品
+  const items = await db
+    .select({
+      productId: products.id,
+      productName: products.name,
+      productImage: products.image,
+      quantity: orderItems.quantity,
+      price: orderItems.price,
+      subtotal: sql<number>`${orderItems.quantity} * ${orderItems.price}`.as(
+        "subtotal"
+      ),
+    })
+    .from(orderItems)
+    .innerJoin(products, eq(orderItems.productId, products.id))
+    .where(eq(orderItems.orderId, orderId));
+
+  return {
+    ...order,
+    items,
+  };
+}
+```
+
+---
+
+## 八、最佳实践
+
+### 8.1 选择合适的 JOIN 类型
+
+```typescript
+// ✅ 确定需要的数据关系
+// INNER JOIN：只需要匹配的记录
+// LEFT JOIN：需要左表所有记录
+// RIGHT JOIN：需要右表所有记录
+// FULL JOIN：需要所有记录
+```
+
+### 8.2 使用索引优化
+
+```typescript
+export const posts = pgTable(
+  "posts",
+  {
+    id: serial("id").primaryKey(),
+    title: varchar("title", { length: 255 }).notNull(),
+    authorId: integer("author_id").references(() => users.id),
+  },
+  (table) => ({
+    // 为外键创建索引
+    authorIdx: index("posts_author_id_idx").on(table.authorId),
+  })
+);
+```
+
+### 8.3 限制返回字段
+
+```typescript
+// ✅ 只选择需要的字段
+await db
+  .select({
+    userId: users.id,
+    userName: users.name,
+  })
+  .from(users);
+
+// ❌ 避免选择所有字段
+await db.select().from(users);
+```
+
+---
+
+## 九、总结
+
+**本文我们学习了**：
+
+✅ **关系定义** - 一对一、一对多、多对多
+✅ **JOIN 操作** - INNER、LEFT、RIGHT、FULL
+✅ **聚合查询** - count、sum、avg
+✅ **N+1 问题** - 使用 JOIN 和 IN 查询优化
+
+**关键要点**：
+
+1. 使用 `references()` 定义外键关系
+2. 选择正确的 JOIN 类型
+3. 注意 N+1 查询问题
+4. 为外键和常用查询字段创建索引
+
+**下一步**：
+
+在下一篇文章《事务、迁移和数据完整性》中，我们将学习：
+
+- 数据库事务
+- 迁移管理
+- 数据完整性约束
+
+---
+
+**相关代码**：[04-relations-joins](https://github.com/yourname/drizzle-examples/tree/04-relations-joins)

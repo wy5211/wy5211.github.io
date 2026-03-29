@@ -1,0 +1,944 @@
+---
+title: "10. 实战项目 - 全球博客系统"
+date: "2026-03-31"
+summary: "综合运用 Drizzle ORM 的全部知识，构建一个基于 Cloudflare Workers 的全球分布式博客系统，实现边缘计算的最佳实践。"
+tags: ["Drizzle ORM", "Cloudflare Workers", "实战项目", "边缘计算", "博客系统"]
+category: "drizzle"
+draft: false
+series: "Drizzle ORM 类型安全的数据库访问实战"
+seriesOrder: 10
+---
+
+## 前言
+
+欢迎来到 Drizzle ORM 系列的**最后一篇文章**！
+
+我们将综合运用前面学到的所有知识，构建一个**全球分布式博客系统**，展示 Drizzle ORM 在边缘计算环境中的强大能力。
+
+---
+
+## 项目概述
+
+### 技术栈
+
+```
+前端：Next.js 14 + TailwindCSS + tRPC
+后端：Cloudflare Workers + Drizzle ORM
+数据库：Cloudflare D1（SQLite at Edge）
+缓存：Cloudflare KV
+存储：Cloudflare R2
+API：tRPC
+```
+
+### 核心功能
+
+- ✅ 文章管理（CRUD、发布、草稿）
+- ✅ 用户系统（注册、登录、资料）
+- ✅ 评论系统（实时、审核）
+- ✅ 标签分类
+- ✅ 图片上传（R2）
+- ✅ 搜索功能
+- ✅ SEO 优化
+
+---
+
+## 一、项目结构
+
+```
+global-blog/
+├── apps/
+│   ├── web/                          # Next.js 前端
+│   │   ├── app/
+│   │   │   ├── (main)/
+│   │   │   │   ├── page.tsx          # 首页
+│   │   │   │   ├── blog/
+│   │   │   │   │   └── [slug]/
+│   │   │   │   │       └── page.tsx  # 文章详情
+│   │   │   │   └── layout.tsx
+│   │   │   └── api/
+│   │   │       └── trpc/
+│   │   │           └── [...trpc]/
+│   │   │               └── route.ts
+│   │   ├── components/
+│   │   │   ├── blog-card.tsx
+│   │   │   ├── comment-form.tsx
+│   │   │   └── markdown.tsx
+│   │   └── lib/
+│   │       ├── trpc/
+│   │       │   └── client.ts
+│   │       └── utils.ts
+│   │
+│   └── worker/                       # Cloudflare Workers
+│       ├── src/
+│       │   ├── db/
+│       │   │   ├── schema/
+│       │   │   │   ├── users.ts
+│       │   │   │   ├── posts.ts
+│       │   │   │   ├── comments.ts
+│       │   │   │   └── index.ts
+│       │   │   └── migrations/
+│       │   ├── routers/
+│       │   │   ├── posts.ts
+│       │   │   ├── comments.ts
+│       │   │   └── index.ts
+│       │   ├── middleware/
+│       │   │   ├── auth.ts
+│       │   │   └── cache.ts
+│       │   └── index.ts
+│       └── wrangler.toml
+│
+├── packages/
+│   ├── database/                     # 共享数据库 Schema
+│   ├── trpc/                         # 共享 tRPC 定义
+│   └── ui/                           # 共享 UI 组件
+│
+├── package.json
+├── pnpm-workspace.yaml
+└── turbo.json
+```
+
+---
+
+## 二、数据库 Schema
+
+### 2.1 用户表
+
+```typescript
+// packages/database/src/schema/users.ts
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+
+export const users = sqliteTable("users", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  email: text("email").notNull().unique(),
+  username: text("username").notNull().unique(),
+  name: text("name"),
+  bio: text("bio"),
+  avatar: text("avatar"),
+  role: text("role", { enum: ["admin", "author", "reader"] }).default("reader"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+});
+
+export type User = typeof users.$inferSelect;
+export type NewUser = typeof users.$inferInsert;
+```
+
+### 2.2 文章表
+
+```typescript
+// packages/database/src/schema/posts.ts
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { users } from "./users";
+
+export const posts = sqliteTable("posts", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  title: text("title").notNull(),
+  slug: text("slug").notNull().unique(),
+  content: text("content").notNull(),
+  excerpt: text("excerpt"),
+  coverImage: text("cover_image"),
+  published: integer("published", { mode: "boolean" }).default(false),
+  authorId: integer("author_id")
+    .references(() => users.id, { onDelete: "cascade" })
+    .notNull(),
+  viewCount: integer("view_count").default(0),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+  publishedAt: integer("published_at", { mode: "timestamp" }),
+});
+
+export type Post = typeof posts.$inferSelect;
+export type NewPost = typeof posts.$inferInsert;
+```
+
+### 2.3 评论表
+
+```typescript
+// packages/database/src/schema/comments.ts
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { users } from "./users";
+import { posts } from "./posts";
+
+export const comments = sqliteTable("comments", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  content: text("content").notNull(),
+  authorId: integer("author_id")
+    .references(() => users.id, { onDelete: "cascade" })
+    .notNull(),
+  postId: integer("post_id")
+    .references(() => posts.id, { onDelete: "cascade" })
+    .notNull(),
+  parentId: integer("parent_id"), // 回复评论
+  status: text("status", { enum: ["pending", "approved", "rejected"] }).default(
+    "pending"
+  ),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+});
+
+export type Comment = typeof comments.$inferSelect;
+```
+
+### 2.4 标签和关联表
+
+```typescript
+// packages/database/src/schema/tags.ts
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { posts } from "./posts";
+
+export const tags = sqliteTable("tags", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull().unique(),
+  slug: text("slug").notNull().unique(),
+});
+
+export const postsToTags = sqliteTable("posts_to_tags", {
+  postId: integer("post_id")
+    .references(() => posts.id, { onDelete: "cascade" })
+    .notNull(),
+  tagId: integer("tag_id")
+    .references(() => tags.id, { onDelete: "cascade" })
+    .notNull(),
+});
+
+export type Tag = typeof tags.$inferSelect;
+```
+
+---
+
+## 三、Cloudflare Workers API
+
+### 3.1 主入口
+
+```typescript
+// apps/worker/src/index.ts
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { trpcServer } from "@hono/trpc-server";
+import { appRouter } from "./routers";
+import { createContext } from "./context";
+
+interface Env {
+  DB: D1Database;
+  CACHE: KVNamespace;
+  STORAGE: R2Bucket;
+  JWT_SECRET: string;
+}
+
+const app = new Hono<{ Bindings: Env }>();
+
+// CORS
+app.use(
+  "*",
+  cors({
+    origin: "*",
+    allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+  })
+);
+
+// tRPC
+app.use(
+  "/trpc/*",
+  trpcServer({
+    router: appRouter,
+    createContext: async (c, next) => {
+      return createContext(c.env, c.req.raw);
+    },
+  })
+);
+
+// 健康检查
+app.get("/health", (c) => {
+  return c.json({ status: "ok", timestamp: Date.now() });
+});
+
+export default app;
+```
+
+### 3.2 Context 创建
+
+```typescript
+// apps/worker/src/context.ts
+import { drizzle } from "drizzle-orm/d1";
+import { eq } from "drizzle-orm";
+import { users } from "@global-blog/database";
+import { verifyJwt } from "./lib/jwt";
+
+export interface Context {
+  db: ReturnType<typeof drizzle>;
+  cache: KVNamespace;
+  storage: R2Bucket;
+  userId?: number;
+  user?: User;
+}
+
+export async function createContext(
+  env: Env,
+  request: Request
+): Promise<Context> {
+  const db = drizzle(env.DB, { schema });
+
+  // 获取用户信息
+  let userId: number | undefined;
+  let user: User | undefined;
+
+  try {
+    const authHeader = request.headers.get("Authorization");
+    if (authHeader?.startsWith("Bearer ")) {
+      const token = authHeader.slice(7);
+      const payload = verifyJwt(token, env.JWT_SECRET);
+      userId = payload.userId;
+
+      if (userId) {
+        const [userRecord] = await db
+          .select()
+          .from(users)
+          .where(eq(users.id, userId))
+          .limit(1);
+
+        user = userRecord;
+      }
+    }
+  } catch {
+    // 忽略认证错误
+  }
+
+  return {
+    db,
+    cache: env.CACHE,
+    storage: env.STORAGE,
+    userId,
+    user,
+  };
+}
+```
+
+### 3.3 文章 Router
+
+```typescript
+// apps/worker/src/routers/posts.ts
+import { z } from "zod";
+import { eq, desc, sql } from "drizzle-orm";
+import { posts, users, tags, postsToTags } from "@global-blog/database";
+import { t } from "../trpc";
+import { invalidateCache } from "../lib/cache";
+
+export const postsRouter = t.router({
+  // 获取文章列表（分页）
+  list: t.procedure
+    .input(
+      z.object({
+        page: z.number().min(1).default(1),
+        limit: z.number().min(1).max(100).default(10),
+        published: z.boolean().optional(),
+        tag: z.string().optional(),
+      })
+    )
+    .query(async ({ input, ctx }) => {
+      const { page, limit, published, tag } = input;
+
+      // 尝试从缓存读取
+      const cacheKey = `posts:${page}:${limit}:${published}:${tag || "all"}`;
+      const cached = await ctx.cache.get(cacheKey, "json");
+      if (cached) {
+        return cached;
+      }
+
+      // 构建查询
+      const where = [];
+
+      if (published !== undefined) {
+        where.push(sql`${posts.published} = ${published ? 1 : 0}`);
+      }
+
+      if (tag) {
+        where.push(
+          sql`${posts.id} IN (SELECT post_id FROM posts_to_tags WHERE tag_id = (SELECT id FROM tags WHERE slug = ${tag}))`
+        );
+      }
+
+      // 查询文章
+      const items = await ctx.db
+        .select({
+          id: posts.id,
+          title: posts.title,
+          slug: posts.slug,
+          excerpt: posts.excerpt,
+          coverImage: posts.coverImage,
+          published: posts.published,
+          viewCount: posts.viewCount,
+          createdAt: posts.createdAt,
+          author: {
+            id: users.id,
+            name: users.name,
+            username: users.username,
+            avatar: users.avatar,
+          },
+        })
+        .from(posts)
+        .innerJoin(users, eq(posts.authorId, users.id))
+        .where(
+          where.length > 0 ? sql`${sql.join(where, sql` AND `)}` : undefined
+        )
+        .orderBy(desc(posts.createdAt))
+        .limit(limit)
+        .offset((page - 1) * limit);
+
+      // 查询总数
+      const [totalResult] = await ctx.db
+        .select({ count: sql<number>`count(*)` })
+        .from(posts)
+        .where(
+          where.length > 0 ? sql`${sql.join(where, sql` AND `)}` : undefined
+        );
+
+      const result = {
+        items,
+        total: totalResult?.count || 0,
+        page,
+        limit,
+        totalPages: Math.ceil((totalResult?.count || 0) / limit),
+      };
+
+      // 写入缓存（5 分钟）
+      await ctx.cache.put(cacheKey, JSON.stringify(result), {
+        expirationTtl: 300,
+      });
+
+      return result;
+    }),
+
+  // 根据 slug 获取文章
+  bySlug: t.procedure
+    .input(z.object({ slug: z.string() }))
+    .query(async ({ input, ctx }) => {
+      const { slug } = input;
+
+      // 尝试从缓存读取
+      const cached = await ctx.cache.get(`post:${slug}`, "json");
+      if (cached) {
+        // 增加浏览量（异步）
+        ctx.db
+          .update(posts)
+          .set({ viewCount: sql`${posts.viewCount} + 1` })
+          .where(eq(posts.slug, slug))
+          .run();
+
+        return cached;
+      }
+
+      // 查询文章
+      const [post] = await ctx.db
+        .select({
+          id: posts.id,
+          title: posts.title,
+          slug: posts.slug,
+          content: posts.content,
+          excerpt: posts.excerpt,
+          coverImage: posts.coverImage,
+          published: posts.published,
+          viewCount: posts.viewCount,
+          createdAt: posts.createdAt,
+          updatedAt: posts.updatedAt,
+          publishedAt: posts.publishedAt,
+          author: {
+            id: users.id,
+            name: users.name,
+            username: users.username,
+            avatar: users.avatar,
+            bio: users.bio,
+          },
+        })
+        .from(posts)
+        .innerJoin(users, eq(posts.authorId, users.id))
+        .where(eq(posts.slug, slug))
+        .limit(1);
+
+      if (!post) {
+        throw new Error("Post not found");
+      }
+
+      // 查询标签
+      const postTags = await ctx.db
+        .select({
+          id: tags.id,
+          name: tags.name,
+          slug: tags.slug,
+        })
+        .from(tags)
+        .innerJoin(postsToTags, eq(tags.id, postsToTags.tagId))
+        .where(eq(postsToTags.postId, post.id));
+
+      const result = { ...post, tags: postTags };
+
+      // 写入缓存（10 分钟）
+      await ctx.cache.put(`post:${slug}`, JSON.stringify(result), {
+        expirationTtl: 600,
+      });
+
+      // 增加浏览量
+      await ctx.db
+        .update(posts)
+        .set({ viewCount: sql`${posts.viewCount} + 1` })
+        .where(eq(posts.slug, slug))
+        .run();
+
+      return result;
+    }),
+
+  // 创建文章
+  create: t.procedure
+    .input(
+      z.object({
+        title: z.string().min(1),
+        content: z.string().min(1),
+        excerpt: z.string().optional(),
+        coverImage: z.string().optional(),
+        tagIds: z.array(z.number()).optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      if (!ctx.userId) {
+        throw new Error("Unauthorized");
+      }
+
+      const slug = input.title
+        .toLowerCase()
+        .replace(/\s+/g, "-")
+        .replace(/[^\w-]+/g, "");
+
+      // 创建文章
+      const [post] = await ctx.db
+        .insert(posts)
+        .values({
+          ...input,
+          slug,
+          authorId: ctx.userId,
+          published: false,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        })
+        .returning();
+
+      // 关联标签
+      if (input.tagIds && input.tagIds.length > 0) {
+        await ctx.db.insert(postsToTags).values(
+          input.tagIds.map((tagId) => ({
+            postId: post.id,
+            tagId,
+          }))
+        );
+      }
+
+      // 删除缓存
+      await invalidateCache(ctx.cache, "posts");
+
+      return post;
+    }),
+
+  // 更新文章
+  update: t.procedure
+    .input(
+      z.object({
+        id: z.number(),
+        title: z.string().min(1).optional(),
+        content: z.string().min(1).optional(),
+        excerpt: z.string().optional(),
+        coverImage: z.string().optional(),
+        published: z.boolean().optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const { id, ...data } = input;
+
+      // 检查权限
+      const [post] = await ctx.db
+        .select()
+        .from(posts)
+        .where(eq(posts.id, id))
+        .limit(1);
+
+      if (!post) {
+        throw new Error("Post not found");
+      }
+
+      if (post.authorId !== ctx.userId && ctx.user?.role !== "admin") {
+        throw new Error("Forbidden");
+      }
+
+      // 更新文章
+      const [updated] = await ctx.db
+        .update(posts)
+        .set({
+          ...data,
+          updatedAt: new Date(),
+          publishedAt: data.published ? new Date() : post.publishedAt,
+        })
+        .where(eq(posts.id, id))
+        .returning();
+
+      // 删除缓存
+      await invalidateCache(ctx.cache, "posts");
+      await ctx.cache.delete(`post:${post.slug}`);
+
+      return updated;
+    }),
+
+  // 删除文章
+  delete: t.procedure
+    .input(z.object({ id: z.number() }))
+    .mutation(async ({ input, ctx }) => {
+      const { id } = input;
+
+      // 检查权限
+      const [post] = await ctx.db
+        .select()
+        .from(posts)
+        .where(eq(posts.id, id))
+        .limit(1);
+
+      if (!post) {
+        throw new Error("Post not found");
+      }
+
+      if (post.authorId !== ctx.userId && ctx.user?.role !== "admin") {
+        throw new Error("Forbidden");
+      }
+
+      // 删除文章
+      await ctx.db.delete(posts).where(eq(posts.id, id));
+
+      // 删除缓存
+      await invalidateCache(ctx.cache, "posts");
+      await ctx.cache.delete(`post:${post.slug}`);
+
+      return { success: true };
+    }),
+});
+```
+
+---
+
+## 四、Next.js 前端
+
+### 4.1 文章列表页
+
+```typescript
+// apps/web/src/app/(main)/blog/page.tsx
+import { db } from '@/lib/db';
+import { posts, users } from '@/lib/db/schema';
+import { eq, desc } from 'drizzle-orm';
+import { BlogCard } from '@/components/blog-card';
+
+export const revalidate = 300; // 5 分钟
+
+export default async function BlogPage() {
+  const latestPosts = await db
+    .select({
+      id: posts.id,
+      title: posts.title,
+      slug: posts.slug,
+      excerpt: posts.excerpt,
+      coverImage: posts.coverImage,
+      createdAt: posts.createdAt,
+      author: {
+        name: users.name,
+        avatar: users.avatar,
+      },
+    })
+    .from(posts)
+    .innerJoin(users, eq(posts.authorId, users.id))
+    .where(eq(posts.published, true))
+    .orderBy(desc(posts.createdAt))
+    .limit(12);
+
+  return (
+    <div className="container mx-auto py-12">
+      <h1 className="text-4xl font-bold mb-8">Blog</h1>
+
+      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+        {latestPosts.map((post) => (
+          <BlogCard key={post.id} post={post} />
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+### 4.2 文章详情页
+
+```typescript
+// apps/web/src/app/(main)/blog/[slug]/page.tsx
+import { notFound } from 'next/navigation';
+import { db } from '@/lib/db';
+import { posts, users, tags, postsToTags } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
+import { Markdown } from '@/components/markdown';
+import { CommentSection } from '@/components/comment-section';
+
+export default async function PostPage({
+  params,
+}: {
+  params: { slug: string }
+}) {
+  // 获取文章
+  const [post] = await db
+    .select({
+      id: posts.id,
+      title: posts.title,
+      content: posts.content,
+      excerpt: posts.excerpt,
+      coverImage: posts.coverImage,
+      createdAt: posts.createdAt,
+      author: {
+        id: users.id,
+        name: users.name,
+        avatar: users.avatar,
+        bio: users.bio,
+      },
+    })
+    .from(posts)
+    .innerJoin(users, eq(posts.authorId, users.id))
+    .where(eq(posts.slug, params.slug))
+    .limit(1);
+
+  if (!post) {
+    notFound();
+  }
+
+  // 获取标签
+  const postTags = await db
+    .select({
+      id: tags.id,
+      name: tags.name,
+      slug: tags.slug,
+    })
+    .from(tags)
+    .innerJoin(postsToTags, eq(tags.id, postsToTags.tagId))
+    .where(eq(postsToTags.postId, post.id));
+
+  return (
+    <article className="max-w-4xl mx-auto py-12">
+      {post.coverImage && (
+        <img
+          src={post.coverImage}
+          alt={post.title}
+          className="w-full h-96 object-cover rounded-xl mb-8"
+        />
+      )}
+
+      <h1 className="text-5xl font-bold mb-4">{post.title}</h1>
+
+      <div className="flex items-center gap-4 mb-8">
+        <img
+          src={post.author.avatar || '/default-avatar.png'}
+          alt={post.author.name || ''}
+          className="w-12 h-12 rounded-full"
+        />
+        <div>
+          <p className="font-semibold">{post.author.name}</p>
+          <p className="text-gray-500">
+            {post.createdAt.toLocaleDateString()}
+          </p>
+        </div>
+      </div>
+
+      <div className="flex gap-2 mb-8">
+        {postTags.map((tag) => (
+          <span
+            key={tag.id}
+            className="px-3 py-1 bg-gray-100 rounded-full text-sm"
+          >
+            {tag.name}
+          </span>
+        ))}
+      </div>
+
+      <Markdown content={post.content} />
+
+      <CommentSection postId={post.id} />
+    </article>
+  );
+}
+```
+
+### 4.3 tRPC 集成
+
+```typescript
+// apps/web/src/lib/trpc/server.ts
+import { createTRPCReact } from "@trpc/react-query";
+import type { AppRouter } from "@global-blog/worker";
+
+export const trpc = createTRPCReact<AppRouter>();
+```
+
+```typescript
+// apps/web/src/app/providers.tsx
+'use client';
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { httpBatchLink } from '@trpc/client';
+import { useState } from 'react';
+import { trpc } from '@/lib/trpc/server';
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  const [queryClient] = useState(() => new QueryClient());
+  const [trpcClient] = useState(() =>
+    trpc.createClient({
+      links: [
+        httpBatchLink({
+          url: '/api/trpc',
+        }),
+      ],
+    })
+  );
+
+  return (
+    <trpc.Provider client={trpcClient} queryClient={queryClient}>
+      <QueryClientProvider client={queryClient}>
+        {children}
+      </QueryClientProvider>
+    </trpc.Provider>
+  );
+}
+```
+
+---
+
+## 五、部署配置
+
+### 5.1 wrangler.toml
+
+```toml
+name = "global-blog-api"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# D1 数据库
+[[d1_databases]]
+binding = "DB"
+database_name = "global-blog"
+database_id = "your-database-id"
+
+# KV 缓存
+[[kv_namespaces]]
+binding = "CACHE"
+id = "your-kv-id"
+
+# R2 存储
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "global-blog-images"
+
+# 环境变量
+[vars]
+ENVIRONMENT = "production"
+
+# 密钥（使用 wrangler secret 设置）
+# wrangler secret put JWT_SECRET
+```
+
+### 5.2 部署步骤
+
+```bash
+# 1. 创建 D1 数据库
+wrangler d1 create global-blog
+
+# 2. 创建 KV 命名空间
+wrangler kv:namespace create CACHE
+
+# 3. 创建 R2 存储
+wrangler r2 bucket create global-blog-images
+
+# 4. 设置密钥
+wrangler secret put JWT_SECRET
+
+# 5. 运行迁移
+wrangler d1 execute global-blog --file=./drizzle/0001.sql
+
+# 6. 部署 Worker
+wrangler deploy
+
+# 7. 部署 Next.js（到 Vercel）
+vercel --prod
+```
+
+---
+
+## 六、性能指标
+
+### 6.1 目标指标
+
+```
+全球延迟：< 50ms（95%）
+冷启动：< 10ms
+并发请求：10000+ QPS
+缓存命中率：> 80%
+Bundle 大小：~100KB
+成本：$5-10/月
+```
+
+### 6.2 监控
+
+```typescript
+// apps/worker/src/middleware/analytics.ts
+export async function analytics(c: Context, next: Next) {
+  const start = Date.now();
+
+  await next();
+
+  const duration = Date.now() - start;
+
+  // 发送到分析服务
+  await c.env.CACHE.put(
+    `analytics:${Date.now()}`,
+    JSON.stringify({
+      path: c.req.path,
+      method: c.req.method,
+      duration,
+      status: c.res.status,
+    }),
+    {
+      expirationTtl: 60 * 60 * 24 * 7, // 7 天
+    }
+  );
+}
+```
+
+---
+
+## 七、总结
+
+**恭喜你完成了 Drizzle ORM 系列的全部学习！**
+
+### 你已经掌握了：
+
+✅ **Drizzle ORM 基础** - Schema 定义、CRUD 操作
+✅ **关系查询** - JOIN、关联、聚合
+✅ **事务迁移** - 数据完整性、版本管理
+✅ **tRPC 集成** - 端到端类型安全
+✅ **框架集成** - Next.js、Nuxt、Server Components
+✅ **边缘计算** - Cloudflare Workers、D1、KV
+✅ **性能优化** - 索引、缓存、批量操作
+✅ **实战项目** - 全球分布式博客系统
+
+### 下一步建议：
+
+1. **深入学习 PostgreSQL** - 索引优化、查询计划
+2. **学习 GraphQL** - 与 Drizzle 结合使用
+3. **探索微服务** - Drizzle 在微服务中的应用
+4. **性能调优** - 更深入的性能优化技巧
+5. **监控告警** - 完善的监控体系
+
+### 继续学习：
+
+- [Drizzle ORM 官方文档](https://orm.drizzle.team/)
+- [Cloudflare Workers 文档](https://developers.cloudflare.com/workers/)
+- [tRPC 文档](https://trpc.io/)
+- [Next.js 文档](https://nextjs.org/docs)
+
+**感谢你的学习！祝你在开发之路上越走越远！🚀**
+
+---
+
+**相关代码**：[10-project-global-blog](https://github.com/yourname/drizzle-examples/tree/10-project-global-blog)

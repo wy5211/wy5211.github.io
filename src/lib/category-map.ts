@@ -19,6 +19,9 @@ export const categoryToDirMap: Record<string, string> = {
   redis: "redis",
   mybatis: "mybatis",
   trpc: "trpc",
+  typeorm: "typeorm",
+  python: "python",
+  agent: "agent",
 };
 
 // 目录名到中文分类名的反向映射
@@ -40,4 +43,7 @@ export const dirToCategoryMap: Record<string, string> = {
   redis: "redis",
   mybatis: "mybatis",
   trpc: "trpc",
+  typeorm: "typeorm",
+  python: "python",
+  agent: "agent",
 };

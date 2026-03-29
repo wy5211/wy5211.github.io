@@ -1,0 +1,763 @@
+---
+title: "08 错误处理与日志"
+date: "2026-03-29"
+summary: "构建健壮的 Python 错误处理和日志系统，掌握自定义异常、logging 模块和结构化日志"
+tags: ["Python", "异常处理", "日志", "logging"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 渐进式学习"
+seriesOrder: 8
+---
+
+# 错误处理与日志
+
+## 前言
+
+在生产环境中，程序不可能永远按预期运行。网络超时、数据库连接失败、用户输入非法——这些异常情况都需要妥善处理。同时，日志是排查问题的第一手资料，没有日志的系统就像没有仪表盘的飞机。
+
+Python 的异常处理体系设计精巧，logging 模块功能强大但配置繁琐。本文将带你构建一套生产级的错误处理和日志系统。
+
+---
+
+## 异常层次结构
+
+Python 内置了丰富的异常类，它们构成了一棵继承树：
+
+```
+BaseException
+├── SystemExit                # sys.exit()
+├── KeyboardInterrupt         # Ctrl+C
+├── GeneratorExit             # 生成器关闭
+└── Exception                 # 所有常规异常的基类
+    ├── StopIteration
+    ├── StopAsyncIteration
+    ├── ArithmeticError
+    │   ├── ZeroDivisionError
+    │   └── OverflowError
+    ├── LookupError
+    │   ├── IndexError
+    │   └── KeyError
+    ├── TypeError
+    ├── ValueError
+    ├── AttributeError
+    ├── RuntimeError
+    │   ├── NotImplementedError
+    │   └── RecursionError
+    ├── OSError
+    │   ├── FileNotFoundError
+    │   ├── PermissionError
+    │   └── ConnectionError
+    │       ├── ConnectionRefusedError
+    │       └── TimeoutError
+    └── ImportError
+        └── ModuleNotFoundError
+```
+
+**重要原则**：捕获异常时，应该尽量精确，避免使用裸 `except:` 或笼统的 `except Exception`。
+
+---
+
+## try/except/else/finally
+
+Python 异常处理的完整语法：
+
+```python
+def read_config(file_path: str) -> dict:
+    """
+    完整的异常处理示例：
+    - try：可能抛出异常的代码
+    - except：捕获特定异常
+    - else：没有异常时执行
+    - finally：无论如何都执行
+    """
+    config = {}
+    try:
+        with open(file_path, "r") as f:
+            config = __import__("json").loads(f.read())
+    except FileNotFoundError:
+        # 文件不存在：使用默认配置
+        print(f"配置文件 {file_path} 不存在，使用默认配置")
+        config = {"debug": False, "port": 8000}
+    except json.JSONDecodeError as e:
+        # JSON 解析失败
+        print(f"配置文件格式错误: {e}")
+        raise ValueError(f"Invalid config file: {file_path}") from e
+    except Exception as e:
+        # 其他未知异常（应该记录日志，而不是吞掉）
+        print(f"读取配置文件时发生未知错误: {e}")
+        raise  # 重新抛出，不要吞掉未知异常
+    else:
+        # 只有没有异常时才执行
+        print(f"成功读取配置文件: {file_path}")
+    finally:
+        # 无论如何都执行（如关闭资源）
+        pass
+
+    return config
+```
+
+### 异常处理的最佳实践
+
+```python
+import json
+
+# 1. 只捕获预期的异常
+def get_user_name(user_id: int) -> str:
+    users = {1: "Alice", 2: "Bob"}
+    try:
+        return users[user_id]
+    except KeyError:
+        raise ValueError(f"User {user_id} not found") from None
+
+
+# 2. 使用 else 分离"可能出错"和"出错后"的逻辑
+def process_data(data: str) -> dict:
+    try:
+        result = json.loads(data)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e}") from e
+    else:
+        # result 已经是合法的 dict，这里可以安全使用
+        return result
+
+
+# 3. finally 用于清理资源（但推荐使用 with 语句）
+def read_file_safely(path: str) -> str:
+    f = None
+    try:
+        f = open(path, "r")
+        return f.read()
+    finally:
+        if f:
+            f.close()  # 无论如何都关闭文件
+    # 更推荐的方式：with open(path) as f: ...
+```
+
+---
+
+## 自定义异常类设计
+
+自定义异常是构建业务错误体系的基础：
+
+```python
+# src/mypackage/core/exceptions.py
+
+from typing import Any
+
+
+class AppError(Exception):
+    """应用异常基类"""
+
+    def __init__(
+        self,
+        message: str = "An application error occurred",
+        code: str = "INTERNAL_ERROR",
+        status_code: int = 500,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        self.message = message
+        self.code = code
+        self.status_code = status_code
+        self.details = details or {}
+        super().__init__(self.message)
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为字典（用于 API 响应）"""
+        return {
+            "error": {
+                "code": self.code,
+                "message": self.message,
+                "details": self.details,
+            }
+        }
+
+
+# ==================== 业务异常 ====================
+
+class NotFoundError(AppError):
+    """资源未找到（404）"""
+
+    def __init__(self, resource: str, resource_id: int | str) -> None:
+        super().__init__(
+            message=f"{resource} with id '{resource_id}' not found",
+            code="NOT_FOUND",
+            status_code=404,
+            details={"resource": resource, "id": resource_id},
+        )
+
+
+class ValidationError(AppError):
+    """数据验证失败（400）"""
+
+    def __init__(self, message: str, fields: dict[str, str] | None = None) -> None:
+        super().__init__(
+            message=message,
+            code="VALIDATION_ERROR",
+            status_code=400,
+            details={"fields": fields or {}},
+        )
+
+
+class AuthenticationError(AppError):
+    """认证失败（401）"""
+
+    def __init__(self, message: str = "Authentication failed") -> None:
+        super().__init__(
+            message=message,
+            code="AUTHENTICATION_ERROR",
+            status_code=401,
+        )
+
+
+class PermissionDeniedError(AppError):
+    """权限不足（403）"""
+
+    def __init__(self, message: str = "Permission denied") -> None:
+        super().__init__(
+            message=message,
+            code="PERMISSION_DENIED",
+            status_code=403,
+        )
+
+
+class ConflictError(AppError):
+    """资源冲突（409）"""
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        super().__init__(
+            message=message,
+            code="CONFLICT",
+            status_code=409,
+            details=details,
+        )
+
+
+class RateLimitError(AppError):
+    """请求频率超限（429）"""
+
+    def __init__(self, retry_after: int = 60) -> None:
+        super().__init__(
+            message=f"Rate limit exceeded. Retry after {retry_after} seconds.",
+            code="RATE_LIMIT_EXCEEDED",
+            status_code=429,
+            details={"retry_after": retry_after},
+        )
+```
+
+### 使用自定义异常
+
+```python
+# src/mypacket/services/user_service.py
+from mypackage.core.exceptions import (
+    NotFoundError,
+    ValidationError,
+    ConflictError,
+)
+
+
+class UserService:
+    def __init__(self) -> None:
+        self._users: dict[int, dict] = {}
+
+    def get_user(self, user_id: int) -> dict:
+        user = self._users.get(user_id)
+        if not user:
+            raise NotFoundError("User", user_id)
+        return user
+
+    def create_user(self, username: str, email: str) -> dict:
+        # 检查用户名是否已存在
+        for user in self._users.values():
+            if user["username"] == username:
+                raise ConflictError(
+                    message=f"Username '{username}' already exists",
+                    details={"field": "username"},
+                )
+
+        # 验证邮箱格式
+        if "@" not in email:
+            raise ValidationError(
+                message="Invalid email format",
+                fields={"email": "Must contain @ symbol"},
+            )
+
+        user_id = len(self._users) + 1
+        user = {"id": user_id, "username": username, "email": email}
+        self._users[user_id] = user
+        return user
+
+
+# 使用示例
+service = UserService()
+
+try:
+    user = service.create_user("alice", "alice@example.com")
+    print(f"Created: {user}")
+    service.create_user("alice", "alice2@example.com")  # 用户名冲突
+except ConflictError as e:
+    print(f"Conflict: {e.to_dict()}")
+except ValidationError as e:
+    print(f"Validation: {e.to_dict()}")
+```
+
+---
+
+## 异常链（raise from）
+
+`raise from` 用于保留异常的原始上下文，便于排查问题：
+
+```python
+import json
+
+class UserRepository:
+    """用户数据仓库（模拟数据库操作）"""
+
+    def load_users(self, file_path: str) -> list[dict]:
+        """从文件加载用户数据"""
+        try:
+            with open(file_path, "r") as f:
+                return json.loads(f.read())
+        except FileNotFoundError as e:
+            # raise from：保留原始异常链
+            raise FileNotFoundError(
+                f"User data file not found: {file_path}"
+            ) from e
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"User data file is not valid JSON: {file_path}"
+            ) from e
+
+    def save_users(self, file_path: str, users: list[dict]) -> None:
+        """保存用户数据到文件"""
+        try:
+            with open(file_path, "w") as f:
+                f.write(json.dumps(users, indent=2))
+        except OSError as e:
+            raise IOError(f"Failed to save user data to {file_path}") from e
+
+
+# 使用
+repo = UserRepository()
+try:
+    users = repo.load_users("nonexistent.json")
+except FileNotFoundError as e:
+    # e.__cause__ 指向原始的 FileNotFoundError
+    # e.__context__ 包含完整的异常链
+    print(f"Error: {e}")
+    print(f"Caused by: {e.__cause__}")
+```
+
+`raise from None` 可以显式地断开异常链（当你不希望暴露内部细节时）：
+
+```python
+def get_api_data() -> dict:
+    try:
+        # 内部实现细节
+        result = internal_http_call()
+    except ConnectionError:
+        # 不暴露内部实现细节
+        raise ServiceUnavailableError("API is temporarily unavailable") from None
+```
+
+---
+
+## logging 模块
+
+Python 标准库的 `logging` 模块是企业级日志的基石。
+
+### 核心组件
+
+```
+Logger（记录器）
+  ├── Handler（处理器）  → 输出到哪里
+  │   ├── StreamHandler    → 控制台
+  │   ├── FileHandler      → 文件
+  │   ├── RotatingFileHandler → 按大小轮转
+  │   └── TimedRotatingFileHandler → 按时间轮转
+  ├── Formatter（格式化器） → 输出什么格式
+  └── Filter（过滤器）     → 过滤哪些日志
+```
+
+### 日志级别
+
+```python
+import logging
+
+# 日志级别（从低到高）
+logging.DEBUG    # 10 - 调试信息，开发时使用
+logging.INFO     # 20 - 一般信息，如请求日志
+logging.WARNING  # 30 - 警告，如使用废弃的 API
+logging.ERROR    # 40 - 错误，如数据库连接失败
+logging.CRITICAL # 50 - 严重错误，如服务无法启动
+```
+
+### 生产级日志配置
+
+```python
+# src/mypackage/core/logging_config.py
+import logging
+import logging.handlers
+import sys
+from pathlib import Path
+
+
+def setup_logging(
+    log_level: str = "INFO",
+    log_dir: str = "logs",
+    app_name: str = "myapp",
+) -> None:
+    """配置应用日志系统"""
+
+    log_path = Path(log_dir)
+    log_path.mkdir(exist_ok=True)
+
+    # 日志格式
+    standard_formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # 详细格式（包含文件名和行号，用于 DEBUG）
+    detailed_formatter = logging.Formatter(
+        fmt="%(asctime)s | %(levelname)-8s | %(name)s:%(lineno)d | %(funcName)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    # 根日志器
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)  # 最低级别，由 Handler 控制实际输出
+
+    # 清除已有 Handler（防止重复添加）
+    root_logger.handlers.clear()
+
+    # ---- 控制台 Handler ----
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(logging.DEBUG if log_level == "DEBUG" else logging.INFO)
+    console_handler.setFormatter(detailed_formatter if log_level == "DEBUG" else standard_formatter)
+    root_logger.addHandler(console_handler)
+
+    # ---- 文件 Handler（按大小轮转） ----
+    file_handler = logging.handlers.RotatingFileHandler(
+        filename=log_path / f"{app_name}.log",
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=5,               # 保留 5 个备份
+        encoding="utf-8",
+    )
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(standard_formatter)
+    root_logger.addHandler(file_handler)
+
+    # ---- 错误日志文件 ----
+    error_handler = logging.handlers.RotatingFileHandler(
+        filename=log_path / f"{app_name}-error.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    error_handler.setLevel(logging.ERROR)
+    error_handler.setFormatter(standard_formatter)
+    root_logger.addHandler(error_handler)
+
+    # 降低第三方库的日志级别
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+# 使用 dictConfig 配置（适合在 pyproject.toml 或配置文件中使用）
+LOGGING_CONFIG = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "standard": {
+            "format": "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+        "detailed": {
+            "format": "%(asctime)s | %(levelname)-8s | %(name)s:%(lineno)d | %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "standard",
+            "stream": "ext://sys.stdout",
+        },
+        "file": {
+            "class": "logging.handlers.RotatingFileHandler",
+            "formatter": "standard",
+            "filename": "logs/app.log",
+            "maxBytes": 10485760,
+            "backupCount": 5,
+            "encoding": "utf-8",
+        },
+    },
+    "root": {
+        "level": "INFO",
+        "handlers": ["console", "file"],
+    },
+    "loggers": {
+        "uvicorn": {"level": "WARNING"},
+        "httpx": {"level": "WARNING"},
+    },
+}
+```
+
+### 在业务代码中使用日志
+
+```python
+# src/mypackage/services/user_service.py
+import logging
+
+logger = logging.getLogger(__name__)  # 使用模块名作为 logger 名称
+
+
+class UserService:
+    def __init__(self) -> None:
+        self._users: dict[int, dict] = {}
+        logger.info("UserService initialized")
+
+    def get_user(self, user_id: int) -> dict:
+        logger.debug("Getting user: user_id=%d", user_id)
+        user = self._users.get(user_id)
+        if not user:
+            logger.warning("User not found: user_id=%d", user_id)
+            raise NotFoundError("User", user_id)
+        logger.debug("User found: user_id=%d, username=%s", user_id, user["username"])
+        return user
+
+    def create_user(self, username: str, email: str) -> dict:
+        logger.info("Creating user: username=%s", username)
+        try:
+            # 业务逻辑
+            user_id = len(self._users) + 1
+            user = {"id": user_id, "username": username, "email": email}
+            self._users[user_id] = user
+            logger.info("User created: user_id=%d", user_id)
+            return user
+        except Exception as e:
+            logger.error("Failed to create user: username=%s, error=%s", username, e)
+            raise
+
+    def batch_import(self, users_data: list[dict]) -> int:
+        """批量导入用户"""
+        logger.info("Starting batch import: count=%d", len(users_data))
+        success_count = 0
+        for i, data in enumerate(users_data):
+            try:
+                self.create_user(data["username"], data["email"])
+                success_count += 1
+            except Exception as e:
+                logger.error("Import failed at row %d: %s", i, e)
+        logger.info("Batch import completed: success=%d/%d", success_count, len(users_data))
+        return success_count
+```
+
+---
+
+## 结构化日志（structlog 简介）
+
+传统日志是纯文本，难以被日志系统（如 ELK）解析。结构化日志输出 JSON 格式，便于检索和分析：
+
+```python
+# pip install structlog
+import structlog
+
+# 基础配置
+structlog.configure(
+    processors=[
+        # 添加日志级别、时间戳等
+        structlog.contextvars.merge_contextvars,
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.StackInfoRenderer(),
+        structlog.processors.format_exc_info,
+        # 输出格式：控制台用彩色文本，文件用 JSON
+        structlog.dev.ConsoleRenderer(),
+        # structlog.processors.JSONRenderer(),  # 生产环境用 JSON
+    ],
+    wrapper_class=structlog.stdlib.BoundLogger,
+    context_class=dict,
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    cache_logger_on_first_use=True,
+)
+
+# 使用
+logger = structlog.get_logger()
+
+# 绑定上下文：后续所有日志都会带上 request_id
+logger = logger.bind(request_id="abc-123", user_id=42)
+
+logger.info("user_login", ip="192.168.1.1", user_agent="Mozilla/5.0")
+# 输出：2026-03-29 10:00:00 [info] user_login request_id=abc-123 user_id=42 ip=192.168.1.1 user_agent=Mozilla/5.0
+
+logger.error("database_connection_failed", host="localhost", port=5432, retry_count=3)
+```
+
+---
+
+## traceback 处理
+
+```python
+import logging
+import traceback
+from mypackage.core.exceptions import AppError
+
+logger = logging.getLogger(__name__)
+
+
+def safe_execute(func, *args, **kwargs):
+    """安全执行函数，捕获所有异常并记录完整 traceback"""
+    try:
+        return func(*args, **kwargs)
+    except AppError as e:
+        # 业务异常：只记录消息，不需要完整 traceback
+        logger.warning("Business error: code=%s, message=%s", e.code, e.message)
+        raise
+    except Exception as e:
+        # 未知异常：记录完整 traceback
+        logger.error(
+            "Unexpected error in %s: %s\n%s",
+            func.__name__,
+            e,
+            traceback.format_exc(),  # 完整的堆栈信息
+        )
+        raise
+
+
+# traceback.format_exc() vs traceback.format_tb()
+try:
+    1 / 0
+except ZeroDivisionError:
+    # format_exc：包含异常类型和消息
+    tb_str = traceback.format_exc()
+    print(tb_str)
+    # ZeroDivisionError: division by zero
+    #   File "example.py", line X, in <module>
+    #     1 / 0
+```
+
+---
+
+## contextvars 上下文变量
+
+`contextvars` 是 Python 3.7 引入的，用于在异步环境中安全地传递上下文信息（如请求 ID、用户 ID），实现链路追踪。
+
+```python
+# src/mypackage/core/context.py
+import uuid
+from contextvars import ContextVar
+
+# 定义上下文变量
+request_id_var: ContextVar[str] = ContextVar("request_id", default="")
+user_id_var: ContextVar[int | None] = ContextVar("user_id", default=None)
+
+
+def set_request_id(rid: str | None = None) -> str:
+    """设置当前请求 ID"""
+    request_id = rid or str(uuid.uuid4())[:8]
+    request_id_var.set(request_id)
+    return request_id
+
+
+def get_request_id() -> str:
+    """获取当前请求 ID"""
+    return request_id_var.get()
+
+
+# ==================== 日志集成 ====================
+import logging
+
+class ContextFilter(logging.Filter):
+    """将 contextvars 注入到日志记录中"""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = request_id_var.get("")
+        record.user_id = user_id_var.get("")
+        return True
+
+
+# 配置日志格式
+formatter = logging.Formatter(
+    fmt="%(asctime)s | %(request_id)s | %(levelname)-8s | %(name)s | %(message)s",
+)
+```
+
+### 在 Web 应用中使用
+
+```python
+# 模拟 FastAPI 中间件
+import logging
+from mypackage.core.context import set_request_id, get_request_id
+
+logger = logging.getLogger(__name__)
+
+
+async def request_middleware(request, call_next):
+    """请求中间件：为每个请求设置 context"""
+    # 从请求头获取或生成 request_id
+    rid = request.headers.get("X-Request-ID")
+    request_id = set_request_id(rid)
+
+    logger.info("Request started: %s %s", request.method, request.url)
+
+    try:
+        response = await call_next(request)
+        logger.info("Request completed: status=%d", response.status_code)
+        return response
+    except Exception as e:
+        logger.error("Request failed: %s", e)
+        raise
+    finally:
+        logger.info("Request ended: request_id=%s", get_request_id())
+```
+
+---
+
+## 最佳实践
+
+1. **不要吞掉异常**：如果你捕获了异常但不处理，至少要用 `raise` 重新抛出或 `logger.error()` 记录
+2. **精确捕获**：`except FileNotFoundError` 而不是 `except Exception`
+3. **使用 `raise from`**：保留异常链，便于排查问题
+4. **日志级别要正确**：DEBUG 用于调试、INFO 用于业务流程、WARNING 用于可恢复的异常、ERROR 用于需要关注的错误
+5. **使用 `__name__` 作为 logger 名称**：自动获取模块路径，方便定位日志来源
+6. **不要在日志中打印敏感信息**：密码、token、信用卡号等不要出现在日志中
+7. **结构化日志**：生产环境推荐使用 JSON 格式，便于 ELK 等日志系统检索
+
+---
+
+## 常见问题
+
+**Q：`except Exception` 和 `except BaseException` 有什么区别？**
+
+A：`Exception` 包含所有"常规"异常（ValueError、TypeError 等），而 `BaseException` 还包含 `KeyboardInterrupt`、`SystemExit`、`GeneratorExit`。通常应该捕获 `Exception`，而不是 `BaseException`，否则 Ctrl+C 也可能被吞掉。
+
+**Q：logging 和 print 应该怎么选？**
+
+A：在库代码和业务代码中，永远使用 `logging`。`print` 只适合命令行工具的最终输出。`logging` 的优势：可以控制级别、输出到文件、按大小轮转、异步写入等。
+
+**Q：contextvars 和 threading.local 有什么区别？**
+
+A：`threading.local` 是线程级别的隔离，每个线程有自己的副本；`contextvars` 是协程级别的隔离，在 `asyncio` 中更安全。Python 3.12+ 推荐使用 `contextvars`。
+
+---
+
+## 总结
+
+本文构建了完整的错误处理和日志体系：
+
+- **异常层次结构**：了解 Python 内置异常类的继承关系
+- **try/except/else/finally**：完整的异常处理语法
+- **自定义异常**：构建业务异常体系（NotFoundError、ValidationError 等）
+- **异常链**：`raise from` 保留异常上下文
+- **logging 模块**：Logger、Handler、Formatter、Filter 的完整配置
+- **结构化日志**：structlog 输出 JSON 格式，便于日志检索
+- **contextvars**：在异步环境中安全传递请求上下文
+
+---
+
+## 下一步
+
+下一篇我们将学习 **测试策略**，掌握 pytest 框架编写可靠的自动化测试。

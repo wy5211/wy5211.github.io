@@ -1,0 +1,601 @@
+---
+title: "12. 生产部署与综合项目"
+date: "2026-03-29"
+summary: "掌握 TypeORM 应用的生产部署全流程，包括 Docker 容器化、CI/CD 自动迁移、健康检查，以及全系列知识回顾和进阶方向。"
+tags: ["TypeORM", "Docker", "部署", "CI/CD", "NestJS"]
+category: "typeorm"
+draft: false
+series: "TypeORM 实战：NestJS 数据库开发"
+seriesOrder: 12
+---
+
+## 前言
+
+经过前面 11 篇的学习，我们已经掌握了 TypeORM 的核心知识。最后一篇，我们将把博客系统部署到生产环境，并回顾全系列的知识要点。
+
+**本篇你将学到**：
+
+- Docker 容器化（多阶段构建）
+- Docker Compose 编排
+- CI/CD 自动迁移
+- 健康检查
+- 全系列知识回顾
+
+---
+
+## Docker 容器化
+
+### 多阶段构建 Dockerfile
+
+```dockerfile
+# Dockerfile
+
+# ========== 构建阶段 ==========
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# 安装依赖
+COPY package*.json ./
+RUN npm ci
+
+# 复制源代码
+COPY . .
+
+# 构建 TypeScript
+RUN npm run build
+
+# ========== 生产阶段 ==========
+FROM node:20-alpine AS production
+
+WORKDIR /app
+
+# 设置环境变量
+ENV NODE_ENV=production
+
+# 只安装生产依赖
+COPY package*.json ./
+RUN npm ci --only=production
+
+# 从构建阶段复制编译后的代码
+COPY --from=builder /app/dist ./dist
+
+# 暴露端口
+EXPOSE 3000
+
+# 启动应用
+CMD ["node", "dist/main.js"]
+```
+
+### .dockerignore
+
+```
+node_modules
+dist
+.git
+.env
+*.md
+test
+coverage
+```
+
+---
+
+## Docker Compose 编排
+
+### 开发环境
+
+```yaml
+# docker-compose.dev.yml
+version: "3.8"
+
+services:
+  # PostgreSQL 数据库
+  postgres:
+    image: postgres:16-alpine
+    container_name: typeorm_blog_db
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: typeorm_blog
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # NestJS 应用
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: builder
+    container_name: typeorm_blog_app
+    command: npm run start:dev
+    ports:
+      - "3000:3000"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      DB_DATABASE: typeorm_blog
+      NODE_ENV: development
+      JWT_SECRET: dev-secret-key
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - .:/app
+      - /app/node_modules
+
+volumes:
+  pg_data:
+```
+
+### 生产环境
+
+```yaml
+# docker-compose.prod.yml
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: typeorm_blog_db_prod
+    environment:
+      POSTGRES_USER: ${DB_USERNAME}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_DATABASE}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: always
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: typeorm_blog_app_prod
+    ports:
+      - "3000:3000"
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USERNAME: ${DB_USERNAME}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_DATABASE: ${DB_DATABASE}
+      NODE_ENV: production
+      JWT_SECRET: ${JWT_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: always
+    networks:
+      - app-network
+
+  # Nginx 反向代理
+  nginx:
+    image: nginx:alpine
+    container_name: typeorm_blog_nginx
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - app
+    restart: always
+    networks:
+      - app-network
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  pg_data:
+```
+
+### Nginx 配置
+
+```nginx
+# nginx.conf
+events {
+    worker_connections 1024;
+}
+
+http {
+    upstream app {
+        server app:3000;
+    }
+
+    server {
+        listen 80;
+        server_name localhost;
+
+        # API 代理
+        location /api/ {
+            proxy_pass http://app;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
+        # 健康检查
+        location /health {
+            proxy_pass http://app;
+        }
+    }
+}
+```
+
+---
+
+## CI/CD 自动迁移
+
+### GitHub Actions 配置
+
+```yaml
+# .github/workflows/deploy.yml
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Run unit tests
+        run: npm run test:cov
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USERNAME: postgres
+          DB_PASSWORD: postgres
+          DB_DATABASE: test_db
+
+      - name: Run E2E tests
+        run: npm run test:e2e
+        env:
+          DB_HOST: localhost
+          DB_PORT: 5432
+          DB_USERNAME: postgres
+          DB_PASSWORD: postgres
+          DB_DATABASE: test_db
+
+  migrate:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Run migrations
+        run: npm run migration:run
+        env:
+          DB_HOST: ${{ secrets.DB_HOST }}
+          DB_PORT: ${{ secrets.DB_PORT }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          DB_DATABASE: ${{ secrets.DB_DATABASE }}
+
+  deploy:
+    needs: migrate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and push Docker image
+        run: |
+          docker build -t typeorm-blog:latest .
+          docker tag typeorm-blog:latest typeorm-blog:${{ github.sha }}
+
+      # 推送到容器仓库并部署
+      # ...
+```
+
+---
+
+## 健康检查
+
+### 健康检查模块
+
+```typescript
+// src/modules/health/health.module.ts
+import { Module } from "@nestjs/common";
+import { TerminusModule } from "@nestjs/terminus";
+import { TypeOrmModule } from "@nestjs/typeorm";
+import { HealthController } from "./health.controller";
+import { TypeOrmHealthIndicator } from "@nestjs/terminus";
+
+@Module({
+  imports: [TerminusModule],
+  controllers: [HealthController],
+})
+export class HealthModule {}
+```
+
+```typescript
+// src/modules/health/health.controller.ts
+import { Controller, Get } from "@nestjs/common";
+import {
+  HealthCheck,
+  HealthCheckService,
+  HealthCheckResult,
+  TypeOrmHealthIndicator,
+  MemoryHealthIndicator,
+  DiskHealthIndicator,
+} from "@nestjs/terminus";
+
+@Controller("health")
+export class HealthController {
+  constructor(
+    private health: HealthCheckService,
+    private db: TypeOrmHealthIndicator,
+    private memory: MemoryHealthIndicator,
+    private disk: DiskHealthIndicator
+  ) {}
+
+  @Get()
+  @HealthCheck()
+  async check(): Promise<HealthCheckResult> {
+    return this.health.check([
+      // 数据库连接检查
+      () => this.db.pingCheck("database", { timeout: 3000 }),
+
+      // 内存检查（堆内存不超过 150MB）
+      () => this.memory.checkHeap("memory_heap", 150 * 1024 * 1024),
+
+      // RSS 内存检查
+      () => this.memory.checkRSS("memory_rss", 150 * 1024 * 1024),
+    ]);
+  }
+}
+```
+
+### 健康检查响应
+
+```json
+// GET /health
+{
+  "status": "ok",
+  "info": {
+    "database": {
+      "status": "up"
+    },
+    "memory_heap": {
+      "status": "up"
+    },
+    "memory_rss": {
+      "status": "up"
+    }
+  },
+  "error": {},
+  "details": {
+    "database": {
+      "status": "up"
+    },
+    "memory_heap": {
+      "status": "up"
+    },
+    "memory_rss": {
+      "status": "up"
+    }
+  }
+}
+```
+
+---
+
+## 全系列回顾
+
+### 架构总结
+
+```
+┌─────────────────────────────────────────────────┐
+│                   NestJS 应用                     │
+├─────────────────────────────────────────────────┤
+│  Controller (路由)                               │
+│    ├── DTO 验证（class-validator）               │
+│    ├── Guards（认证授权）                         │
+│    ├── Interceptors（响应转换）                   │
+│    └── Filters（异常处理）                        │
+├─────────────────────────────────────────────────┤
+│  Service (业务逻辑)                              │
+│    ├── 事务管理                                   │
+│    ├── 业务规则                                   │
+│    └── 数据转换                                   │
+├─────────────────────────────────────────────────┤
+│  Repository (数据访问)                            │
+│    ├── find / findOne (简单查询)                  │
+│    ├── QueryBuilder (复杂查询)                    │
+│    ├── save / insert (创建)                       │
+│    ├── update (更新)                              │
+│    └── delete / softDelete (删除)                │
+├─────────────────────────────────────────────────┤
+│  Entity (数据模型)                                │
+│    ├── @Entity (表定义)                           │
+│    ├── @Column (列定义)                           │
+│    ├── @ManyToOne / @OneToMany (关系)             │
+│    ├── @Index (索引)                              │
+│    └── @BeforeInsert (生命周期钩子)               │
+├─────────────────────────────────────────────────┤
+│  Database (PostgreSQL)                           │
+│    ├── 迁移管理                                    │
+│    ├── 连接池                                      │
+│    └── 查询缓存                                    │
+└─────────────────────────────────────────────────┘
+```
+
+### 知识点回顾
+
+| 篇章 | 主题            | 核心知识点                                         |
+| ---- | --------------- | -------------------------------------------------- |
+| 01   | 快速入门        | DataSource、Active Record vs Data Mapper、环境搭建 |
+| 02   | 实体定义        | @Entity、@Column、主键策略、索引、软删除、监听器   |
+| 03   | 关系映射        | @OneToOne、@ManyToOne、@ManyToMany、级联、加载策略 |
+| 04   | Repository CRUD | FindOptions、FindOperator、分页封装                |
+| 05   | QueryBuilder    | JOIN、子查询、分组聚合、搜索、原始 SQL             |
+| 06   | 数据库迁移      | CLI 配置、QueryRunner API、种子数据、CI/CD         |
+| 07   | 事务处理        | DataSource.transaction、QueryRunner、隔离级别、锁  |
+| 08   | NestJS 集成     | TypeOrmModule、Service/Controller、DTO 验证        |
+| 09   | JWT 认证        | User 实体、Passport JWT、角色权限、资源级控制      |
+| 10   | 性能优化        | N+1 解决、连接池、批量操作、缓存、索引策略         |
+| 11   | 测试策略        | 内存数据库、Mock、单元/集成/E2E 测试               |
+| 12   | 生产部署        | Docker、CI/CD、健康检查                            |
+
+### 最佳实践清单
+
+**实体设计**：
+
+- 使用 Data Mapper 模式
+- snake_case 数据库列名
+- 敏感字段 `select: false`
+- 使用枚举而非魔法字符串
+- 实体监听器处理密码加密等逻辑
+
+**查询优化**：
+
+- 避免 N+1 查询
+- 只查询需要的字段（select）
+- 合理使用 JOIN 和索引
+- 使用分页限制结果集
+
+**事务管理**：
+
+- 事务保持简短
+- 不在事务中执行耗时操作
+- 选择合适的锁策略
+- 正确处理冲突
+
+**部署运维**：
+
+- 生产环境禁用 synchronize
+- 使用迁移管理表结构
+- 配置连接池和缓存
+- 设置健康检查和监控
+
+---
+
+## 进阶学习方向
+
+### 1. 深入数据库
+
+- PostgreSQL 高级特性（窗口函数、CTE、物化视图）
+- 数据库分库分表
+- 读写分离
+
+### 2. 微服务架构
+
+- TypeORM 在微服务中的使用
+- 分布式事务（Saga 模式）
+- 事件驱动架构
+
+### 3. 其他 ORM 对比
+
+- Prisma 深入学习
+- Drizzle ORM（Edge Computing）
+- Kysely（类型安全查询构建器）
+
+### 4. 周边工具
+
+- TypeORM Schema Viewer（可视化 ER 图）
+- TypeORM Schema to GraphQL
+- TypeORM View Entity（数据库视图映射）
+
+### 5. 实战项目建议
+
+- CMS 内容管理系统
+- 电商后台（复杂事务）
+- SaaS 多租户系统
+- 实时聊天应用（WebSocket + TypeORM）
+
+---
+
+## 总结
+
+恭喜你完成了 **TypeORM 实战：NestJS 数据库开发** 全系列的学习！
+
+通过 12 篇文章，我们从零开始学习了：
+
+1. TypeORM 的核心概念和环境搭建
+2. 实体定义的完整体系
+3. 关系映射的四种类型
+4. Repository API 的 CRUD 操作
+5. QueryBuilder 的高级查询能力
+6. 数据库迁移的版本管理
+7. 事务处理的并发控制
+8. NestJS 的深度集成
+9. JWT 认证授权系统
+10. 性能优化策略
+11. 完整的测试体系
+12. 生产部署和运维
+
+希望这个系列能帮助你在 NestJS + TypeORM 的开发中游刃有余。继续实践，不断精进！
+
+---
+
+## 参考资源
+
+- [TypeORM 官方文档](https://typeorm.io)
+- [NestJS 官方文档](https://docs.nestjs.com)
+- [PostgreSQL 官方文档](https://www.postgresql.org/docs/)
+- [Docker 官方文档](https://docs.docker.com/)
+- [GitHub Actions 文档](https://docs.github.com/actions)
+
+---
+
+**上一篇**：[11. 测试策略](./11-testing.mdx)

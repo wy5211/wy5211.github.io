@@ -1,0 +1,922 @@
+---
+title: "07. 与 Next.js/Nuxt 深度集成"
+date: "2026-03-28"
+summary: "深入掌握 Drizzle ORM 与现代前端框架的深度集成，学习 Next.js App Router、Server Components、Server Actions 等最佳实践。"
+tags: ["Drizzle ORM", "Next.js", "Nuxt", "Server Components", "全栈开发"]
+category: "drizzle"
+draft: false
+series: "Drizzle ORM 类型安全的数据库访问实战"
+seriesOrder: 7
+---
+
+## 前言
+
+Drizzle ORM 与现代前端框架的**无缝集成**是其一大优势。无论是 Next.js 的 Server Components，还是 Nuxt 的 Server Routes，Drizzle 都能完美适配。
+
+**本文核心内容**：
+
+- ✅ Next.js App Router 集成
+- ✅ Server Components 中的 Drizzle
+- ✅ Server Actions 使用
+- ✅ Client Components 数据获取
+- ✅ Nuxt 3 集成
+- ✅ 连接池管理
+- ✅ 环境变量配置
+
+---
+
+## 一、Next.js 14 集成
+
+### 1.1 项目初始化
+
+```bash
+# 创建 Next.js 项目
+pnpm create next-app@latest my-app --typescript --tailwind --app
+
+cd my-app
+
+# 安装 Drizzle
+pnpm add drizzle-orm postgres
+pnpm add -D drizzle-kit @types/pg
+
+# 初始化数据库
+mkdir -p src/lib/db
+```
+
+### 1.2 数据库连接配置
+
+**src/lib/db/index.ts**：
+
+```typescript
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+
+const connectionString = process.env.POSTGRES_URL!;
+
+// 创建连接池
+let client: postgres.Sql<{}>;
+
+if (process.env.NODE_ENV === "production") {
+  // 生产环境：连接池
+  client = postgres(connectionString, {
+    max: 10,
+    idle_timeout: 20,
+    connect_timeout: 10,
+  });
+} else {
+  // 开发环境：单连接（避免热重载问题）
+  client = postgres(connectionString);
+}
+
+export const db = drizzle(client, { schema });
+```
+
+### 1.3 Schema 定义
+
+**src/lib/db/schema/users.ts**：
+
+```typescript
+import { pgTable, serial, varchar, text, timestamp } from "drizzle-orm/pg-core";
+
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  email: varchar("email", { length: 255 }).notNull().unique(),
+  name: text("name"),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+```
+
+**src/lib/db/schema/index.ts**：
+
+```typescript
+export * from "./users";
+```
+
+---
+
+## 二、Server Components
+
+### 2.1 基础 Server Component
+
+```typescript
+// src/app/users/page.tsx
+import { db } from '@/lib/db';
+import { users } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
+import Link from 'next/link';
+
+// Server Component：直接在服务器端查询数据库
+export default async function UsersPage() {
+  // 在服务器端执行查询
+  const allUsers = await db.select().from(users);
+
+  return (
+    <div className="container mx-auto py-8">
+      <h1 className="text-3xl font-bold mb-6">Users</h1>
+
+      <ul className="space-y-2">
+        {allUsers.map((user) => (
+          <li key={user.id}>
+            <Link href={`/users/${user.id}`}>
+              {user.name || user.email}
+            </Link>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+```
+
+### 2.2 动态路由 Server Component
+
+```typescript
+// src/app/users/[id]/page.tsx
+import { db } from '@/lib/db';
+import { users } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
+import { notFound } from 'next/navigation';
+
+export default async function UserPage({
+  params,
+}: {
+  params: { id: string }
+}) {
+  const userId = parseInt(params.id);
+
+  const [user] = await db
+    .select()
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  if (!user) {
+    notFound();
+  }
+
+  return (
+    <div className="container mx-auto py-8">
+      <h1 className="text-3xl font-bold">{user.name}</h1>
+      <p className="text-gray-600">{user.email}</p>
+    </div>
+  );
+}
+```
+
+### 2.3 带关联查询的 Server Component
+
+```typescript
+// src/app/posts/[slug]/page.tsx
+import { db } from '@/lib/db';
+import { posts, users, comments } from '@/lib/db/schema';
+import { eq } from 'drizzle-orm';
+import { notFound } from 'next/navigation';
+
+export default async function PostPage({
+  params,
+}: {
+  params: { slug: string }
+}) {
+  // 获取文章和作者
+  const [post] = await db
+    .select({
+      id: posts.id,
+      title: posts.title,
+      content: posts.content,
+      createdAt: posts.createdAt,
+      author: {
+        id: users.id,
+        name: users.name,
+        email: users.email,
+      },
+    })
+    .from(posts)
+    .innerJoin(users, eq(posts.authorId, users.id))
+    .where(eq(posts.slug, params.slug))
+    .limit(1);
+
+  if (!post) {
+    notFound();
+  }
+
+  // 获取评论
+  const postComments = await db
+    .select({
+      id: comments.id,
+      content: comments.content,
+      author: {
+        name: users.name,
+      },
+    })
+    .from(comments)
+    .innerJoin(users, eq(comments.authorId, users.id))
+    .where(eq(comments.postId, post.id));
+
+  return (
+    <article className="max-w-4xl mx-auto py-8">
+      <h1 className="text-4xl font-bold mb-4">{post.title}</h1>
+      <p className="text-gray-500 mb-8">
+        By {post.author.name} · {post.createdAt.toLocaleDateString()}
+      </p>
+
+      <div className="prose max-w-none">
+        {post.content}
+      </div>
+
+      <section className="mt-12">
+        <h2 className="text-2xl font-bold mb-4">Comments</h2>
+        <ul className="space-y-4">
+          {postComments.map((comment) => (
+            <li key={comment.id}>
+              <span className="font-semibold">{comment.author.name}: </span>
+              {comment.content}
+            </li>
+          ))}
+        </ul>
+      </section>
+    </article>
+  );
+}
+```
+
+---
+
+## 三、Server Actions
+
+### 3.1 定义 Server Actions
+
+```typescript
+// src/app/actions/users.ts
+"use server";
+
+import { db } from "@/lib/db";
+import { users } from "@/lib/db/schema";
+import { eq } from "drizzle-orm";
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+
+export async function createUser(formData: FormData) {
+  const email = formData.get("email") as string;
+  const name = formData.get("name") as string;
+
+  // 验证
+  if (!email || !name) {
+    return { error: "Email and name are required" };
+  }
+
+  try {
+    const [user] = await db.insert(users).values({ email, name }).returning();
+
+    // 重新验证缓存
+    revalidatePath("/users");
+
+    return { success: true, user };
+  } catch (error) {
+    return { error: "Failed to create user" };
+  }
+}
+
+export async function updateUser(userId: number, formData: FormData) {
+  const name = formData.get("name") as string;
+
+  await db.update(users).set({ name }).where(eq(users.id, userId));
+
+  revalidatePath(`/users/${userId}`);
+  redirect(`/users/${userId}`);
+}
+
+export async function deleteUser(userId: number) {
+  await db.delete(users).where(eq(users.id, userId));
+
+  revalidatePath("/users");
+  redirect("/users");
+}
+```
+
+### 3.2 使用 Server Actions
+
+```typescript
+// src/app/users/create/page.tsx
+import { createUser } from '@/app/actions/users';
+
+export default function CreateUserPage() {
+  return (
+    <form action={createUser}>
+      <div className="space-y-4">
+        <div>
+          <label htmlFor="email">Email</label>
+          <input
+            id="email"
+            name="email"
+            type="email"
+            required
+            className="block w-full border rounded px-3 py-2"
+          />
+        </div>
+
+        <div>
+          <label htmlFor="name">Name</label>
+          <input
+            id="name"
+            name="name"
+            type="text"
+            required
+            className="block w-full border rounded px-3 py-2"
+          />
+        </div>
+
+        <button
+          type="submit"
+          className="bg-blue-500 text-white px-4 py-2 rounded"
+        >
+          Create User
+        </button>
+      </div>
+    </form>
+  );
+}
+```
+
+### 3.3 带错误处理的 Server Actions
+
+```typescript
+// src/app/actions/posts.ts
+"use server";
+
+import { db } from "@/lib/db";
+import { posts } from "@/lib/db/schema";
+import { revalidatePath } from "next/cache";
+
+export async function createPost(prevState: any, formData: FormData) {
+  const title = formData.get("title") as string;
+  const content = formData.get("content") as string;
+
+  // 验证
+  if (!title || title.length < 3) {
+    return {
+      success: false,
+      error: "Title must be at least 3 characters",
+    };
+  }
+
+  if (!content || content.length < 10) {
+    return {
+      success: false,
+      error: "Content must be at least 10 characters",
+    };
+  }
+
+  try {
+    const [post] = await db
+      .insert(posts)
+      .values({
+        title,
+        content,
+        slug: title.toLowerCase().replace(/\s+/g, "-"),
+        published: false,
+      })
+      .returning();
+
+    revalidatePath("/posts");
+    revalidatePath("/drafts");
+
+    return {
+      success: true,
+      post,
+    };
+  } catch (error) {
+    return {
+      success: false,
+      error: "Failed to create post",
+    };
+  }
+}
+```
+
+```typescript
+// 使用 useActionState
+'use client';
+
+import { useActionState } from 'react';
+import { createPost } from '@/app/actions/posts';
+
+export function CreatePostForm() {
+  const [state, formAction, isPending] = useActionState(createPost, null);
+
+  return (
+    <form action={formAction}>
+      <input name="title" placeholder="Title" />
+      <textarea name="content" placeholder="Content" />
+
+      {state?.error && (
+        <p className="text-red-500">{state.error}</p>
+      )}
+
+      <button disabled={isPending}>
+        {isPending ? 'Creating...' : 'Create Post'}
+      </button>
+    </form>
+  );
+}
+```
+
+---
+
+## 四、Client Components 数据获取
+
+### 4.1 使用 Route Handlers
+
+```typescript
+// src/app/api/users/route.ts
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { users } from "@/lib/db/schema";
+
+export async function GET() {
+  const allUsers = await db.select().from(users);
+
+  return NextResponse.json(allUsers);
+}
+
+export async function POST(request: Request) {
+  const body = await request.json();
+
+  const [user] = await db.insert(users).values(body).returning();
+
+  return NextResponse.json(user, { status: 201 });
+}
+```
+
+```typescript
+// src/app/api/users/[id]/route.ts
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { users } from "@/lib/db/schema";
+import { eq } from "drizzle-orm";
+
+export async function GET(
+  request: Request,
+  { params }: { params: { id: string } }
+) {
+  const userId = parseInt(params.id);
+
+  const [user] = await db
+    .select()
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  if (!user) {
+    return NextResponse.json({ error: "Not found" }, { status: 404 });
+  }
+
+  return NextResponse.json(user);
+}
+```
+
+### 4.2 Client Component 调用
+
+```typescript
+// src/components/users-list.tsx
+'use client';
+
+import { useEffect, useState } from 'react';
+
+interface User {
+  id: number;
+  email: string;
+  name: string | null;
+}
+
+export function UsersList() {
+  const [users, setUsers] = useState<User[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    async function fetchUsers() {
+      try {
+        const response = await fetch('/api/users');
+        const data = await response.json();
+        setUsers(data);
+      } catch (error) {
+        console.error('Failed to fetch users:', error);
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    fetchUsers();
+  }, []);
+
+  if (loading) return <div>Loading...</div>;
+
+  return (
+    <ul>
+      {users.map((user) => (
+        <li key={user.id}>{user.name || user.email}</li>
+      ))}
+    </ul>
+  );
+}
+```
+
+### 4.3 使用 SWR 或 React Query
+
+```typescript
+// src/lib/hooks/use-users.ts
+import useSWR from 'swr';
+
+const fetcher = (url: string) => fetch(url).then((r) => r.json());
+
+export function useUsers() {
+  const { data, error, isLoading } = useSWR<User[]>('/api/users', fetcher);
+
+  return {
+    users: data ?? [],
+    isLoading,
+    error,
+  };
+}
+
+// 使用
+import { useUsers } from '@/lib/hooks/use-users';
+
+export function UsersList() {
+  const { users, isLoading, error } = useUsers();
+
+  if (isLoading) return <div>Loading...</div>;
+  if (error) return <div>Error loading users</div>;
+
+  return <ul>{users.map((user) => <li key={user.id}>{user.name}</li>)}</ul>;
+}
+```
+
+---
+
+## 五、Nuxt 3 集成
+
+### 5.1 项目初始化
+
+```bash
+# 创建 Nuxt 项目
+pnpm nuxi init my-nuxt-app
+cd my-nuxt-app
+
+# 安装 Drizzle
+pnpm add drizzle-orm postgres
+pnpm add -D drizzle-kit @types/pg
+```
+
+### 5.2 数据库连接
+
+```typescript
+// server/utils/db.ts
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+import * as schema from "~/server/db/schema";
+
+const connectionString = process.env.DATABASE_URL!;
+
+const client = postgres(connectionString);
+
+export const db = drizzle(client, { schema });
+```
+
+### 5.3 Server Routes
+
+```typescript
+// server/api/users.get.ts
+import { db } from "~/server/utils/db";
+import { users } from "~/server/db/schema";
+
+export default defineEventHandler(async (event) => {
+  const allUsers = await db.select().from(users);
+
+  return allUsers;
+});
+```
+
+```typescript
+// server/api/users/[id].get.ts
+import { db } from "~/server/utils/db";
+import { users } from "~/server/db/schema";
+import { eq } from "drizzle-orm";
+
+export default defineEventHandler(async (event) => {
+  const userId = parseInt(getRouterParam(event, "id")!);
+
+  const [user] = await db
+    .select()
+    .from(users)
+    .where(eq(users.id, userId))
+    .limit(1);
+
+  if (!user) {
+    throw createError({
+      statusCode: 404,
+      message: "User not found",
+    });
+  }
+
+  return user;
+});
+```
+
+### 5.4 使用 Composables
+
+```typescript
+// composables/useUsers.ts
+export const useUsers = () => {
+  const users = ref<User[]>([]);
+  const loading = ref(false);
+  const error = ref<string | null>(null);
+
+  async function fetchUsers() {
+    loading.value = true;
+    error.value = null;
+
+    try {
+      const data = await $fetch<User[]>("/api/users");
+      users.value = data;
+    } catch (e) {
+      error.value = "Failed to fetch users";
+    } finally {
+      loading.value = false;
+    }
+  }
+
+  return {
+    users,
+    loading,
+    error,
+    fetchUsers,
+  };
+};
+```
+
+---
+
+## 六、连接池管理
+
+### 6.1 生产环境配置
+
+```typescript
+// src/lib/db/index.ts
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+
+const connectionString = process.env.POSTGRES_URL!;
+
+export const db = drizzle(
+  postgres(connectionString, {
+    // 最大连接数
+    max: 10,
+
+    // 空闲连接超时（秒）
+    idle_timeout: 20,
+
+    // 连接超时（秒）
+    connect_timeout: 10,
+
+    // 最大连接生命周期（秒）
+    max_lifetime: 60 * 30,
+
+    // 启用 prepared statements
+    prepare: true,
+
+    // 连接空闲时发送 ping 检查
+    idle_in_transaction_session_timeout: 60,
+
+    // 命前缀（用于监控）
+    onnotice: (notice) => console.log(notice),
+  }),
+  { schema }
+);
+```
+
+### 6.2 Serverless 环境配置
+
+```typescript
+// Vercel / Netlify 等无服务器环境
+import { drizzle } from "drizzle-orm/neon-http";
+import { neon } from "@neondatabase/serverless";
+
+const sql = neon(process.env.DATABASE_URL!);
+export const db = drizzle(sql, { schema });
+```
+
+---
+
+## 七、环境变量配置
+
+### 7.1 .env 文件
+
+```env
+# .env.local
+DATABASE_URL=postgresql://user:password@localhost:5432/mydb
+
+# 或者使用连接池
+POSTGRES_URL=postgresql://user:password@localhost:5432/mydb?pgbouncer=true
+POSTGRES_PRISMA_URL=postgresql://user:password@localhost:5432/mydb?pgbouncer=true
+POSTGRES_URL_NON_POOLING=postgresql://user:password@localhost:5432/mydb
+```
+
+### 7.2 环境变量验证
+
+```typescript
+// src/lib/env.ts
+import { z } from "zod";
+
+const envSchema = z.object({
+  DATABASE_URL: z.string().url(),
+  NODE_ENV: z
+    .enum(["development", "production", "test"])
+    .default("development"),
+});
+
+export const env = envSchema.parse(process.env);
+```
+
+### 7.3 使用环境变量
+
+```typescript
+// src/lib/db/index.ts
+import { env } from "@/lib/env";
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+
+export const db = drizzle(
+  postgres(env.DATABASE_URL, {
+    max: env.NODE_ENV === "production" ? 10 : 1,
+  }),
+  { schema }
+);
+```
+
+---
+
+## 八、实战示例
+
+### 8.1 博客系统 API
+
+```typescript
+// src/app/api/posts/route.ts
+import { NextResponse } from "next/server";
+import { db } from "@/lib/db";
+import { posts, users } from "@/lib/db/schema";
+import { eq, desc } from "drizzle-orm";
+
+export async function GET(request: Request) {
+  const { searchParams } = new URL(request.url);
+  const published = searchParams.get("published");
+
+  const query = db
+    .select({
+      id: posts.id,
+      title: posts.title,
+      slug: posts.slug,
+      excerpt: posts.excerpt,
+      createdAt: posts.createdAt,
+      author: {
+        id: users.id,
+        name: users.name,
+      },
+    })
+    .from(posts)
+    .innerJoin(users, eq(posts.authorId, users.id));
+
+  if (published === "true") {
+    query.where(eq(posts.published, true));
+  }
+
+  const items = await query.orderBy(desc(posts.createdAt)).limit(20);
+
+  return NextResponse.json(items);
+}
+```
+
+### 8.2 文件上传处理
+
+```typescript
+// src/app/api/upload/route.ts
+import { NextResponse } from "next/server";
+import { writeFile } from "fs/promises";
+import { db } from "@/lib/db";
+import { attachments } from "@/lib/db/schema";
+
+export async function POST(request: Request) {
+  const formData = await request.formData();
+  const file = formData.get("file") as File;
+  const userId = parseInt(formData.get("userId") as string);
+
+  // 保存文件
+  const bytes = await file.arrayBuffer();
+  const buffer = Buffer.from(bytes);
+  const filename = `${Date.now()}-${file.name}`;
+  await writeFile(`./public/uploads/${filename}`, buffer);
+
+  // 保存记录到数据库
+  const [attachment] = await db
+    .insert(attachments)
+    .values({
+      filename,
+      originalName: file.name,
+      mimeType: file.type,
+      size: file.size,
+      uploadedById: userId,
+    })
+    .returning();
+
+  return NextResponse.json(attachment);
+}
+```
+
+---
+
+## 九、最佳实践
+
+### 9.1 Server vs Client 选择
+
+```typescript
+// ✅ 使用 Server Components：初始数据加载
+export default async function Page() {
+  const data = await db.select().from(users);
+  return <UsersList data={data} />;
+}
+
+// ✅ 使用 Client Components：交互功能
+'use client';
+export function UsersList({ data }: { data: User[] }) {
+  const [search, setSearch] = useState('');
+  // 交互逻辑
+}
+
+// ✅ 使用 Server Actions：表单提交
+'use server';
+export async function updateUser(formData: FormData) {
+  await db.update(users).set({ name: formData.get('name') });
+}
+```
+
+### 9.2 数据缓存
+
+```typescript
+// 使用 Next.js 缓存
+export const revalidate = 3600; // 1 小时
+
+export default async function Page() {
+  const users = await db.select().from(users());
+
+  return <div>{/* ... */}</div>;
+}
+```
+
+### 9.3 错误处理
+
+```typescript
+// src/lib/db/error-handler.ts
+export function handleDbError(error: unknown) {
+  if (error instanceof Error) {
+    // 记录错误
+    console.error("Database error:", error);
+
+    // 返回用户友好的消息
+    return {
+      error: "An error occurred while processing your request",
+    };
+  }
+
+  return { error: "Unknown error" };
+}
+```
+
+---
+
+## 十、总结
+
+**本文我们学习了**：
+
+✅ **Next.js App Router** - Server Components、Server Actions
+✅ **Nuxt 3 集成** - Server Routes、Composables
+✅ **连接池管理** - 生产环境、Serverless 配置
+✅ **环境变量** - 配置、验证、使用
+
+**关键要点**：
+
+1. 优先使用 Server Components
+2. Server Actions 用于数据修改
+3. 配置合适的连接池大小
+4. 做好错误处理和日志
+
+**下一步**：
+
+在下一篇文章《Edge Computing 实战》中，我们将学习：
+
+- Cloudflare Workers + Drizzle
+- Cloudflare D1 数据库
+- 边缘性能优化
+- Deno Deploy、Bun 集成
+
+---
+
+**相关代码**：[07-framework-integration](https://github.com/yourname/drizzle-examples/tree/07-framework-integration)

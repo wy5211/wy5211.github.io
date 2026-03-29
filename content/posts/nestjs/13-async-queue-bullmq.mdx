@@ -1,7 +1,7 @@
 ---
 title: "13 NestJS 异步任务队列：BullMQ 实战指南"
 date: "2026-03-19"
-summary: "使用 BullMQ 实现异步任务队列，处理邮件发送、图片处理等耗时操作，提升应用性能"
+summary: "使用 BullMQ 实现异步任务队列，将耗时操作从请求中剥离，让接口秒回，打造高响应的后端服务"
 tags: ["NestJS", "BullMQ", "任务队列", "异步处理", "Redis"]
 category: "nestjs"
 cover: ""
@@ -12,53 +12,178 @@ seriesOrder: 13
 
 ## 前言
 
-当应用需要处理耗时操作（如发送邮件、生成报表）时，使用同步方式会阻塞请求。异步任务队列是解决方案。
+在前面的文章中，我们实现了用户注册、JWT 认证、文件上传等功能。但你有没有想过一个问题：**用户注册成功后，系统要发送一封欢迎邮件，这封邮件可能需要 2-3 秒才能发出去**。如果同步处理，用户注册接口就要等 2-3 秒才能返回结果，体验很差。
+
+类似的耗时操作还有很多：生成数据报表、压缩图片、批量发送通知……这些任务如果都在请求中同步完成，接口会变得很慢。
+
+**本文将解决什么问题？**
+
+- 用户注册后发送欢迎邮件，接口为什么要等 2 秒才能返回？
+- 如何让接口「秒回」，同时又能可靠地完成耗时操作？
+- 如果发送邮件失败了怎么办？需要用户重新注册吗？
+- 如何控制并发任务的数量，避免服务器被压垮？
 
 **本文将带你：**
 
-1. 理解任务队列的概念
-2. 配置 BullMQ + Redis
-3. 创建任务处理器
-4. 实现邮件发送队列
-5. 任务重试和错误处理
+1. 理解任务队列的核心思想：把"等着做完"变成"排队去做"
+2. 搭建 BullMQ + Redis 环境
+3. 实现邮件发送的异步化
+4. 掌握任务重试、优先级、延迟执行等高级功能
+5. 集成任务监控面板，直观查看队列状态
 
 ---
 
-## 一、安装依赖
+## 一、什么是任务队列？为什么需要它？
+
+### 1.1 一个生活中的例子
+
+想象一家奶茶店：
+
+- **没有排队系统**：顾客点单后，店员直接做奶茶，下一个顾客必须等前一个顾客的奶茶做完才能点单。如果前一个人点了 10 杯，后面的人就要等很久。
+- **有排队系统**：顾客点完单，拿到一个号码牌就可以离开。店员按号码顺序做奶茶，做好了发短信通知顾客来取。
+
+任务队列就是软件世界里的"取号排队系统"。
+
+### 1.2 对比：同步 vs 异步
+
+```typescript
+// ❌ 同步方式：用户注册时直接发送邮件
+// 用户要等邮件发完才能看到注册成功
+@Post('register')
+async register(@Body() dto: RegisterDto) {
+  const user = await this.userService.create(dto);
+
+  // 这里会阻塞！发送邮件需要 2-3 秒
+  // 如果邮件服务挂了，注册接口也会报错
+  await this.emailService.sendWelcome(user.email);
+
+  return { message: '注册成功' }; // 用户等了 3 秒才看到这个
+}
+
+// ✅ 异步方式：把发邮件的任务丢进队列，立刻返回
+// 用户瞬间看到注册成功，邮件在后台慢慢发
+@Post('register')
+async register(@Body() dto: RegisterDto) {
+  const user = await this.userService.create(dto);
+
+  // 把"发送欢迎邮件"这个任务扔进队列，不等它完成
+  // 就像奶茶店给了你号码牌，你可以走了
+  await this.emailQueue.add('welcome', { email: user.email });
+
+  return { message: '注册成功' }; // 用户瞬间看到这个！
+}
+```
+
+### 1.3 任务队列解决了哪些问题？
+
+| 问题         | 没有队列               | 有队列                               |
+| ------------ | ---------------------- | ------------------------------------ |
+| 接口响应速度 | 慢（等待耗时操作完成） | 快（任务丢进队列就返回）             |
+| 失败处理     | 操作失败，用户需要重试 | 自动重试，用户无感知                 |
+| 并发控制     | 高峰期服务器可能崩     | 按能力消费，不会过载                 |
+| 服务解耦     | 邮件服务挂了，注册也挂 | 邮件服务挂了，注册正常，邮件稍后重试 |
+
+### 1.4 BullMQ 核心概念
+
+BullMQ 有三个核心角色，就像奶茶店的三个环节：
+
+```
+任务队列的工作流程：
+
+用户请求                        BullMQ                       Worker（消费者）
+   │                             │                             │
+   │  1. 把任务扔进队列           │                             │
+   ├─────────── add() ──────────►│                             │
+   │  2. 立刻返回响应             │   3. 按顺序取出任务          │
+   │◄─────────── ok ────────────┤◄──── fetch ─────────────────┤
+   │                             │                             │
+   │                             │   4. Worker 处理任务          │
+   │                             │   （发送邮件、压缩图片...）    │
+   │                             │                             │
+   │                             │   5. 处理完成                │
+   │                             │◄──── done ─────────────────┤
+```
+
+- **Queue（队列）**：存放任务的容器，就像奶茶店的"待制作列表"
+- **Worker（工人）**：从队列中取出任务并执行，就像奶茶店的"制作员工"
+- **Job（任务）**：队列中的每一条任务，就像"一杯原味奶茶，少糖"
+
+---
+
+## 二、环境搭建
+
+### 2.1 安装依赖
 
 ```bash
+# 安装 NestJS 的 BullMQ 集成包 + BullMQ 本体
 pnpm add @nestjs/bullmq bullmq ioredis
 ```
 
----
+**这三个包分别做什么？**
 
-## 二、配置 Redis
+- `@nestjs/bullmq`：NestJS 的 BullMQ 模块，把 BullMQ 包装成 NestJS 熟悉的 Module 形式
+- `bullmq`：BullMQ 核心库，实际的任务队列逻辑
+- `ioredis`：Redis 客户端，BullMQ 依赖 Redis 来存储任务数据
 
-使用 Docker 启动 Redis：
+### 2.2 启动 Redis
+
+BullMQ 需要 Redis 来存储任务数据。使用 Docker 启动：
 
 ```yaml
-# docker-compose.yml 添加
-redis:
-  image: redis:7-alpine
-  ports:
-    - "6379:6379"
+# docker-compose.yml 添加 Redis 服务
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    # 持久化数据，防止重启丢失队列中的任务
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+volumes:
+  redis_data:
+```
+
+```bash
+# 启动 Redis
+docker compose up -d redis
+
+# 验证 Redis 是否正常运行
+docker compose exec redis redis-cli ping
+# 应该返回 PONG
 ```
 
 ---
 
-## 三、创建 BullMQ 模块
+## 三、配置 BullMQ 模块
 
-### 3.1 配置 BullMQ
+### 3.1 在 AppModule 中注册 BullMQ
 
 ```typescript
+// src/app.module.ts
+import { Module } from "@nestjs/common";
 import { BullMQModule } from "@nestjs/bullmq";
 
 @Module({
   imports: [
+    // 第一步：全局配置 BullMQ，告诉它 Redis 在哪里
     BullMQModule.forRoot({
       connection: {
-        host: "localhost",
-        port: 6379,
+        host: process.env.REDIS_HOST || "localhost", // Redis 地址
+        port: Number(process.env.REDIS_PORT) || 6379, // Redis 端口
+      },
+      // 默认任务配置（每个队列可以单独覆盖）
+      defaultJobOptions: {
+        // 任务失败后的重试策略
+        attempts: 3, // 最多重试 3 次
+        backoff: {
+          type: "exponential", // 指数退避：每次等待时间翻倍
+          delay: 1000, // 第一次重试等 1 秒，第二次 2 秒，第三次 4 秒
+        },
+        // 任务在队列中最多保留 24 小时（超时自动删除）
+        removeOnComplete: { count: 1000 }, // 保留最近 1000 个已完成任务
+        removeOnFail: { count: 5000 }, // 保留最近 5000 个失败任务
       },
     }),
   ],
@@ -66,100 +191,657 @@ import { BullMQModule } from "@nestjs/bullmq";
 export class AppModule {}
 ```
 
-### 3.2 创建队列
+**这段代码做了什么？**
+
+1. `BullMQModule.forRoot()` - 全局注册 BullMQ，整个应用共享一个 Redis 连接
+2. `connection` - 配置 Redis 的连接信息，建议通过环境变量注入
+3. `attempts: 3` - 任务失败后最多重试 3 次，避免因为临时网络问题导致任务丢失
+4. `backoff: exponential` - 指数退避策略，避免频繁重试加重系统负担
+5. `removeOnComplete/removeOnFail` - 自动清理已完成/失败的任务记录，防止 Redis 内存溢出
+
+### 3.2 创建专门的队列模块
 
 ```typescript
+// src/queue/queue.module.ts
 import { Module } from "@nestjs/common";
 import { BullMQModule } from "@nestjs/bullmq";
 
 @Module({
   imports: [
+    // 注册一个名为 "email" 的队列
     BullMQModule.registerQueue({
-      name: "email",
-      defaultJobOptions: {
-        attempts: 3,
-        backoff: {
-          type: "exponential",
-          delay: 1000,
-        },
-      },
+      name: "email", // 队列名称，后面添加任务和消费任务都用这个名字
     }),
   ],
+  exports: [BullMQModule], // 导出，让其他模块也能注入这个队列
 })
 export class QueueModule {}
 ```
 
 ---
 
-## 四、创建任务处理器
+## 四、实现邮件发送队列
 
-### 4.1 邮件处理器
+现在我们把邮件发送改造成异步方式。完整的流程是：
+
+```
+用户注册 → 创建用户 → 把"发邮件"任务丢进队列 → 立刻返回注册成功
+                                                    ↓
+                                          Worker 从队列取出任务
+                                                    ↓
+                                              执行发邮件逻辑
+                                                    ↓
+                                              发送成功 / 失败重试
+```
+
+### 4.1 定义任务数据类型
 
 ```typescript
-import { Processor, Process } from "@nestjs/bullmq";
+// src/queue/types/email.types.ts
+
+// 欢迎邮件的任务数据
+export interface WelcomeEmailJobData {
+  email: string;
+  username: string;
+}
+
+// 密码重置邮件的任务数据
+export interface ResetPasswordEmailJobData {
+  email: string;
+  username: string;
+  resetToken: string;
+}
+```
+
+### 4.2 创建邮件处理器（Worker）
+
+处理器就是"工人"，它监听队列，有任务进来就执行。
+
+```typescript
+// src/queue/processors/email.processor.ts
+import {
+  Processor,
+  Process,
+  OnQueueActive,
+  OnQueueCompleted,
+  OnQueueFailed,
+} from "@nestjs/bullmq";
 import { Job } from "bullmq";
 import { Logger } from "@nestjs/common";
 
-@Processor("email")
+@Processor("email") // 监听名为 "email" 的队列
 export class EmailProcessor {
   private readonly logger = new Logger(EmailProcessor.name);
 
+  /**
+   * 处理欢迎邮件任务
+   * 当有任务 name 为 'welcome' 时，这个方法会被自动调用
+   */
   @Process("welcome")
-  async handleWelcomeEmail(job: Job<any>) {
-    this.logger.log(`发送欢迎邮件给: ${job.data.email}`);
+  async handleWelcomeEmail(job: Job<WelcomeEmailJobData>) {
+    const { email, username } = job.data; // 从任务中取出数据
+
+    this.logger.log(`开始发送欢迎邮件给: ${email}`);
+
+    // 模拟发送邮件（实际项目中替换为真实的邮件服务调用）
+    // 比如：await this.nodemailerService.sendMail({ to: email, ... })
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    this.logger.log(`欢迎邮件发送成功: ${email}，用户名: ${username}`);
+    return { success: true, email }; // 返回处理结果
+  }
+
+  /**
+   * 处理密码重置邮件任务
+   */
+  @Process("reset-password")
+  async handleResetPasswordEmail(job: Job<ResetPasswordEmailJobData>) {
+    const { email, username, resetToken } = job.data;
+
+    this.logger.log(`开始发送密码重置邮件给: ${email}`);
 
     // 模拟发送邮件
     await new Promise((resolve) => setTimeout(resolve, 2000));
 
-    this.logger.log(`邮件发送成功: ${job.data.email}`);
-    return { success: true };
+    this.logger.log(`密码重置邮件发送成功: ${email}`);
+    return { success: true, email };
   }
 
-  @Process("reset-password")
-  async handleResetPasswordEmail(job: Job<any>) {
-    this.logger.log(`发送密码重置邮件给: ${job.data.email}`);
+  // ========== 生命周期钩子：监听任务状态变化 ==========
 
-    await new Promise((resolve) => setTimeout(resolve, 2000));
+  /**
+   * 任务开始执行时触发
+   * 可以用来记录日志、更新数据库状态等
+   */
+  @OnQueueActive()
+  onActive(job: Job) {
+    this.logger.log(`任务开始执行 [${job.id}]: ${job.name}`);
+  }
 
-    return { success: true };
+  /**
+   * 任务执行成功时触发
+   */
+  @OnQueueCompleted()
+  onCompleted(job: Job, result: any) {
+    this.logger.log(
+      `任务执行成功 [${job.id}]: ${job.name}，耗时 ${job.duration}ms`
+    );
+  }
+
+  /**
+   * 任务执行失败时触发
+   * 注意：这里不会阻止自动重试，只是记录失败信息
+   */
+  @OnQueueFailed()
+  onFailed(job: Job, error: Error) {
+    this.logger.warn(
+      `任务执行失败 [${job.id}]: ${job.name}，第 ${job.attemptsMade} 次尝试，错误: ${error.message}`
+    );
   }
 }
 ```
 
----
+**这段代码做了什么？**
 
-## 五、添加任务
+1. `@Processor('email')` - 声明这是一个 Worker，监听 "email" 队列
+2. `@Process('welcome')` - 当队列中有 name 为 'welcome' 的任务时，自动调用这个方法
+3. `job.data` - 获取添加任务时传入的数据
+4. `@OnQueueActive/Completed/Failed` - 生命周期钩子，可以在任务不同阶段执行额外逻辑
+
+### 4.3 把处理器注册到模块
 
 ```typescript
+// src/queue/queue.module.ts
+import { Module } from "@nestjs/common";
+import { BullMQModule } from "@nestjs/bullmq";
+import { EmailProcessor } from "./processors/email.processor";
+
+@Module({
+  imports: [BullMQModule.registerQueue({ name: "email" })],
+  providers: [EmailProcessor], // 注册邮件处理器
+  exports: [BullMQModule],
+})
+export class QueueModule {}
+```
+
+### 4.4 在业务代码中添加任务
+
+现在修改用户注册的逻辑，把发邮件改为异步：
+
+```typescript
+// src/users/users.service.ts
+import { Injectable } from "@nestjs/common";
+import { InjectQueue } from "@nestjs/bullmq";
+import { Queue } from "bullmq";
+import { PrismaService } from "../prisma/prisma.service";
+
+@Injectable()
+export class UserService {
+  constructor(
+    private prisma: PrismaService,
+    @InjectQueue("email") private emailQueue: Queue // 注入 email 队列
+  ) {}
+
+  async register(email: string, password: string, name: string) {
+    // 1. 创建用户
+    const user = await this.prisma.user.create({
+      data: { email, password, name },
+    });
+
+    // 2. 把"发送欢迎邮件"这个任务扔进队列
+    // add() 方法会立即返回，不会等待邮件实际发送完成
+    await this.emailQueue.add(
+      "welcome", // 任务名称，对应 @Process('welcome') 处理器
+      { email: user.email, username: user.name }, // 传递给处理器的数据
+      {
+        // 这个任务的专属配置（可选，会覆盖全局默认配置）
+        attempts: 3, // 最多重试 3 次
+        delay: 0, // 不延迟，立即执行
+      }
+    );
+
+    // 3. 立刻返回，用户不用等邮件发完
+    return user;
+  }
+
+  async requestPasswordReset(email: string) {
+    const user = await this.prisma.user.findUnique({ where: { email } });
+    if (!user) {
+      return null;
+    }
+
+    const resetToken = "generated-reset-token"; // 实际项目中生成真实的 token
+
+    // 把密码重置邮件任务扔进队列
+    await this.emailQueue.add("reset-password", {
+      email: user.email,
+      username: user.name,
+      resetToken,
+    });
+
+    return { message: "重置邮件已发送，请检查邮箱" };
+  }
+}
+```
+
+**这段代码做了什么？**
+
+1. `@InjectQueue('email')` - 注入名为 "email" 的队列实例
+2. `this.emailQueue.add('welcome', data)` - 向队列添加一个任务，第一个参数是任务名，第二个是数据
+3. `add()` 返回 Promise，但只是"任务入队成功"，不是"邮件发送成功"
+4. 注册流程瞬间完成，邮件在后台由 Worker 异步处理
+
+---
+
+## 五、高级功能
+
+### 5.1 任务优先级
+
+有些任务比其他任务更重要。比如密码重置邮件比欢迎邮件更紧急：
+
+```typescript
+// 密码重置邮件 —— 高优先级，优先处理
+await this.emailQueue.add("reset-password", data, {
+  priority: 1, // 数字越小优先级越高，1 最高
+});
+
+// 欢迎邮件 —— 低优先级，空闲时再处理
+await this.emailQueue.add("welcome", data, {
+  priority: 5, // 优先级较低
+});
+```
+
+**注意**：使用优先级功能需要确保队列注册时开启了优先级：
+
+```typescript
+BullMQModule.registerQueue({
+  name: 'email',
+  defaultJobOptions: {
+    priority: 5, // 默认优先级
+  },
+}),
+```
+
+### 5.2 延迟执行
+
+有些任务不需要立刻执行，可以延迟到指定时间：
+
+```typescript
+import { addHours } from "date-fns";
+
+// 用户注册 1 小时后发送"完善资料"提醒邮件
+await this.emailQueue.add(
+  "profile-reminder",
+  { email: user.email },
+  {
+    delay: addHours(new Date(), 1).getTime() - Date.now(), // 延迟 1 小时
+  }
+);
+
+// 另一种写法：直接指定毫秒数
+await this.emailQueue.add("scheduled-report", data, {
+  delay: 60 * 60 * 1000, // 延迟 1 小时（单位：毫秒）
+});
+```
+
+### 5.3 任务重试策略
+
+任务失败是常态，BullMQ 提供了完善的自动重试机制：
+
+```typescript
+await this.emailQueue.add("welcome", data, {
+  attempts: 5, // 最多重试 5 次
+  backoff: {
+    type: "exponential", // 指数退避
+    delay: 2000, // 初始延迟 2 秒
+  },
+  // 重试时间线：
+  // 第 1 次失败 → 等 2 秒后重试
+  // 第 2 次失败 → 等 4 秒后重试
+  // 第 3 次失败 → 等 8 秒后重试
+  // 第 4 次失败 → 等 16 秒后重试
+  // 第 5 次失败 → 放弃，标记为 failed
+});
+```
+
+**不同的退避策略**：
+
+| 策略          | 说明                              | 适用场景                       |
+| ------------- | --------------------------------- | ------------------------------ |
+| `exponential` | 每次等待时间翻倍（2s, 4s, 8s...） | 调用外部 API，网络可能临时故障 |
+| `fixed`       | 每次等待固定时间                  | 数据库连接超时等可预测的错误   |
+| `custom`      | 自定义重试逻辑                    | 需要根据错误类型决定等待时间   |
+
+### 5.4 在处理器中获取重试次数
+
+有时候你想根据是第几次重试来决定行为：
+
+```typescript
+@Process('welcome')
+async handleWelcomeEmail(job: Job) {
+  // job.attemptsMade 表示当前是第几次尝试（从 1 开始）
+  if (job.attemptsMade > 1) {
+    // 如果是重试，记录一条警告日志
+    this.logger.warn(
+      `欢迎邮件第 ${job.attemptsMade} 次重试，目标: ${job.data.email}`,
+    );
+  }
+
+  try {
+    await this.sendEmail(job.data);
+  } catch (error) {
+    // 手动抛出错误，BullMQ 会自动捕获并重试
+    // 不需要在这里手动重试！
+    throw error;
+  }
+}
+```
+
+### 5.5 任务的定时清理
+
+大量历史任务会占用 Redis 内存，需要定期清理：
+
+```typescript
+// 在 QueueModule 中注册队列时配置清理策略
+BullMQModule.registerQueue({
+  name: 'email',
+  defaultJobOptions: {
+    // 已完成的任务只保留最近 1000 条
+    removeOnComplete: { count: 1000 },
+    // 失败的任务只保留最近 500 条
+    removeOnFail: { count: 500 },
+    // 或者按时间清理：保留最近 24 小时的
+    // removeOnComplete: { age: 24 * 60 * 60 },
+  },
+}),
+```
+
+---
+
+## 六、添加更多队列：图片处理
+
+在实际项目中，往往需要多个队列处理不同类型的任务。我们再加一个图片处理队列：
+
+### 6.1 注册新队列
+
+```typescript
+// src/queue/queue.module.ts
+import { Module } from "@nestjs/common";
+import { BullMQModule } from "@nestjs/bullmq";
+import { EmailProcessor } from "./processors/email.processor";
+import { ImageProcessor } from "./processors/image.processor";
+
+@Module({
+  imports: [
+    // 邮件队列
+    BullMQModule.registerQueue({
+      name: "email",
+      defaultJobOptions: {
+        attempts: 3,
+        backoff: { type: "exponential", delay: 1000 },
+      },
+    }),
+    // 图片处理队列
+    BullMQModule.registerQueue({
+      name: "image",
+      defaultJobOptions: {
+        attempts: 2,
+        // 图片处理比较耗时，设置更长的超时
+        timeout: 30_000, // 30 秒超时
+      },
+    }),
+  ],
+  providers: [EmailProcessor, ImageProcessor],
+  exports: [BullMQModule],
+})
+export class QueueModule {}
+```
+
+### 6.2 图片处理器
+
+```typescript
+// src/queue/processors/image.processor.ts
+import { Processor, Process } from "@nestjs/bullmq";
+import { Job } from "bullmq";
+import { Logger } from "@nestjs/common";
+
+interface ImageJobData {
+  filePath: string;
+  width: number;
+  height: number;
+}
+
+@Processor("image")
+export class ImageProcessor {
+  private readonly logger = new Logger(ImageProcessor.name);
+
+  /**
+   * 压缩图片
+   * 用户上传图片后，把压缩任务扔进队列，避免阻塞上传接口
+   */
+  @Process("compress")
+  async handleCompress(job: Job<ImageJobData>) {
+    const { filePath, width, height } = job.data;
+
+    this.logger.log(`开始压缩图片: ${filePath}，目标尺寸: ${width}x${height}`);
+
+    // 模拟图片压缩（实际项目中使用 sharp 等库）
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    this.logger.log(`图片压缩完成: ${filePath}`);
+    return { success: true, filePath };
+  }
+
+  /**
+   * 生成缩略图
+   */
+  @Process("thumbnail")
+  async handleThumbnail(job: Job<ImageJobData>) {
+    const { filePath } = job.data;
+
+    this.logger.log(`开始生成缩略图: ${filePath}`);
+
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+
+    this.logger.log(`缩略图生成完成: ${filePath}`);
+    return { success: true, thumbnailPath: `thumbnails/${filePath}` };
+  }
+}
+```
+
+### 6.3 在文件上传中使用
+
+```typescript
+// src/upload/upload.service.ts
 import { InjectQueue } from "@nestjs/bullmq";
 import { Queue } from "bullmq";
 
 @Injectable()
-export class EmailService {
-  constructor(@InjectQueue("email") private emailQueue: Queue) {}
+export class UploadService {
+  constructor(
+    @InjectQueue("image") private imageQueue: Queue // 注入图片队列
+  ) {}
 
-  async sendWelcomeEmail(email: string) {
-    await this.emailQueue.add("welcome", { email });
-  }
+  async uploadImage(file: Express.Multer.File) {
+    // 1. 保存原始文件
+    const filePath = await this.saveFile(file);
 
-  async sendResetPasswordEmail(email: string, token: string) {
-    await this.emailQueue.add("reset-password", { email, token });
+    // 2. 把压缩和缩略图生成任务丢进队列
+    // 两个任务互不依赖，可以并行执行
+    await Promise.all([
+      this.imageQueue.add("compress", {
+        filePath,
+        width: 800,
+        height: 600,
+      }),
+      this.imageQueue.add("thumbnail", {
+        filePath,
+        width: 200,
+        height: 150,
+      }),
+    ]);
+
+    // 3. 立刻返回，用户不用等图片处理完
+    return { filePath, message: "图片上传成功，正在后台处理中" };
   }
 }
 ```
 
 ---
 
-## 六、总结
+## 七、并发控制
 
-**核心要点**：
+默认情况下，每个 Worker 每次只处理一个任务。如果你的任务可以并行处理，可以调高并发数：
 
-1. **BullMQ** - 任务队列
-2. **Redis** - 消息存储
-3. **Processor** - 任务处理器
-4. **Queue** - 任务队列
-5. **重试** - 自动重试失败任务
+```typescript
+@Processor("email", {
+  // 每个 Worker 同时处理最多 5 个任务
+  // 就像奶茶店同时雇佣了 5 个员工
+  concurrency: 5,
+})
+export class EmailProcessor {
+  // ...
+}
+```
 
-**下一步**：《缓存策略（Redis）》
+**如何选择并发数？**
+
+- CPU 密集型任务（图片压缩）：设为 CPU 核心数，避免过多上下文切换
+- I/O 密集型任务（发邮件、调 API）：可以设高一些，比如 10-20
+- 不确定时：从 5 开始，根据监控数据调整
 
 ---
+
+## 八、任务监控面板
+
+BullMQ 提供了官方监控面板，可以直观地看到队列的运行状态。
+
+### 8.1 安装 Bull Board
+
+```bash
+pnpm add @bull-board/api @bull-board/nestjs
+```
+
+### 8.2 配置监控面板
+
+```typescript
+// src/queue/queue.module.ts
+import { Module } from "@nestjs/common";
+import { BullMQAdapter } from "@bull-board/api/bullMQAdapter";
+import { createBullBoard } from "@bull-board/api";
+import { BullBoardModule } from "@bull-board/nestjs";
+import { BullMQModule } from "@nestjs/bullmq";
+
+@Module({
+  imports: [
+    // Bull Board 监控面板
+    BullBoardModule.forRoot({
+      route: "/admin/queues", // 访问地址：http://localhost:3000/admin/queues
+      adapter: BullMQAdapter, // 使用 BullMQ 适配器
+    }),
+    // 注册需要监控的队列
+    BullBoardModule.forFeature({
+      name: "email",
+      adapter: BullMQAdapter,
+    }),
+    BullBoardModule.forFeature({
+      name: "image",
+      adapter: BullMQAdapter,
+    }),
+  ],
+})
+export class QueueModule {}
+```
+
+启动项目后，访问 `http://localhost:3000/admin/queues`，你可以看到：
+
+- 队列中有多少任务在等待
+- 有多少任务正在执行
+- 成功和失败的任务列表
+- 可以手动重试失败的任务
+- 可以手动添加测试任务
+
+> **生产环境注意**：监控面板应该添加认证保护，不要暴露在公网。可以用前面学过的 Guard 来保护 `/admin/queues` 路由。
+
+---
+
+## 九、完整的项目结构
+
+```
+src/
+├── queue/
+│   ├── queue.module.ts              # 队列模块，注册所有队列
+│   ├── processors/
+│   │   ├── email.processor.ts       # 邮件处理器
+│   │   └── image.processor.ts       # 图片处理器
+│   └── types/
+│       └── email.types.ts           # 任务数据类型定义
+├── users/
+│   ├── users.module.ts
+│   └── users.service.ts             # 注入队列，添加任务
+├── upload/
+│   ├── upload.module.ts
+│   └── upload.service.ts            # 注入图片队列
+└── app.module.ts                    # 全局 BullMQ 配置
+```
+
+---
+
+## 常见问题
+
+### Q1: Redis 挂了怎么办？队列中的任务会丢吗？
+
+**A**: 这取决于 Redis 的持久化配置。本文中我们使用了 `appendonly yes`（AOF 持久化），Redis 会把写操作记录到磁盘文件中。Redis 重启后，会从磁盘恢复数据，任务不会丢失。
+
+如果 Redis 数据确实丢了，可以通过数据库中的记录重新生成任务。比如用户注册时，在数据库中记录 `emailSent: false`，然后写一个定时任务扫描未发送的邮件重新入队。
+
+### Q2: Worker 崩溃了，正在处理的任务怎么办？
+
+**A**: BullMQ 会自动检测 Worker 是否还活着。如果 Worker 在处理任务的过程中崩溃，BullMQ 会在一段时间后把任务重新放回队列，由其他 Worker 接手处理。这个过程是自动的，不需要额外配置。
+
+### Q3: 什么时候该用队列，什么时候不该用？
+
+**A**: 简单的判断标准是：**这个操作是否需要用户等待结果？**
+
+- **需要用队列**：发邮件、发短信、生成报表、压缩图片、推送通知 —— 用户不需要立刻看到结果
+- **不需要用队列**：查询用户信息、创建文章、更新密码 —— 用户需要立刻看到结果
+- **灰色地带**：数据导出 —— 如果导出很快（< 1 秒）可以同步，如果很慢就应该异步，先返回一个"导出中"的状态
+
+---
+
+## 总结
+
+**本文我们完成了：**
+
+- ✅ 理解了任务队列的核心思想：把耗时操作从请求中剥离
+- ✅ 搭建了 BullMQ + Redis 环境
+- ✅ 实现了邮件发送的异步化
+- ✅ 掌握了任务重试、优先级、延迟执行等高级功能
+- ✅ 添加了图片处理队列和任务监控面板
+
+**核心要点回顾**：
+
+1. **Queue（队列）** - 任务的容器，生产者往里放任务，消费者从里取任务
+2. **Processor（处理器）** - 消费者，用 `@Processor` 和 `@Process` 装饰器定义
+3. **Job（任务）** - 队列中的一个工作单元，包含数据、状态、重试信息
+4. **重试机制** - 通过 `attempts` + `backoff` 配置自动重试策略
+5. **生命周期钩子** - `@OnQueueActive/Completed/Failed` 监听任务状态变化
+
+**最佳实践**：
+
+- ✅ 所有外部调用（邮件、短信、第三方 API）都应通过队列异步处理
+- ✅ 合理设置重试次数和退避策略，避免雪崩
+- ✅ 为每个队列配置 `removeOnComplete` 和 `removeOnFail`，防止 Redis 内存溢出
+- ✅ 使用类型定义任务数据结构（`interface JobData`），避免拼写错误
+- ✅ 生产环境中监控面板需要添加认证保护
+
+**下一步**：在下一篇文章《缓存策略（Redis）》中，我们将学习如何使用 Redis 缓存热点数据，让接口响应更快，减轻数据库压力。
+
+---
+
+**相关代码**：
+
+- 完整项目示例：[nestjs-blog-example](https://github.com/wy5211/nestjs-blog-example)
+- 本篇代码示例：[feat/bullmq](https://github.com/wy5211/nestjs-blog-example/tree/feat/bullmq)
+
+**有问题？** 欢迎在评论区留言，我会尽快回复！

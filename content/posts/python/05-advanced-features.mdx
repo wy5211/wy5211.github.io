@@ -1,0 +1,808 @@
+---
+title: "05 高级特性"
+date: "2026-03-29"
+summary: "掌握 Python 独有的高级特性：装饰器、生成器、迭代器和上下文管理器，提升代码的优雅度和可维护性"
+tags: ["Python", "装饰器", "生成器", "上下文管理器"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 渐进式学习"
+seriesOrder: 5
+---
+
+# 高级特性
+
+## 前言
+
+如果你用过 Java 的注解（Annotation）或 TypeScript 的装饰器（Decorator），你会发现 Python 的装饰器更强大、更灵活。除了装饰器，Python 还有生成器（Generator）和上下文管理器（Context Manager）这两个独特的语言特性。它们不是语法糖的堆砌，而是构建优雅、高效代码的核心工具。FastAPI 的路由注册、Flask 的请求处理、Django 的中间件，都大量依赖这些特性。
+
+---
+
+## 装饰器（Decorator）
+
+装饰器的本质是一个**高阶函数**——接收一个函数作为参数，返回一个增强后的新函数。它让你在不修改原函数代码的前提下，扩展函数的功能。
+
+### 函数装饰器
+
+```python
+import time
+import functools
+
+
+def timer(func):
+    """计时装饰器 — 测量函数执行时间"""
+    @functools.wraps(func)  # 保留原函数的元信息（__name__、__doc__）
+    def wrapper(*args, **kwargs):
+        start = time.perf_counter()
+        result = func(*args, **kwargs)
+        elapsed = time.perf_counter() - start
+        print(f"[{func.__name__}] 执行耗时: {elapsed:.4f}s")
+        return result
+    return wrapper
+
+
+@timer  # 等价于 slow_function = timer(slow_function)
+def slow_function():
+    """模拟耗时操作"""
+    time.sleep(0.5)
+    return "done"
+
+
+print(slow_function())     # [slow_function] 执行耗时: 0.5001s
+print(slow_function.__name__)  # slow_function — 因为 @functools.wraps
+```
+
+> **关键点**：始终使用 `@functools.wraps(func)` 来包装内部函数，否则被装饰的函数会丢失 `__name__`、`__doc__` 等元信息，给调试带来困难。
+
+### 带参数的装饰器
+
+```python
+def retry(max_retries: int = 3, delay: float = 1.0, exceptions: tuple = (Exception,)):
+    """重试装饰器 — 函数失败时自动重试"""
+    def decorator(func):
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, max_retries + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    if attempt == max_retries:
+                        print(f"[{func.__name__}] 重试 {max_retries} 次后仍然失败: {e}")
+                        raise
+                    print(f"[{func.__name__}] 第 {attempt} 次失败: {e}, {delay}s 后重试...")
+                    time.sleep(delay)
+        return wrapper
+    return decorator
+
+
+@retry(max_retries=3, delay=0.5, exceptions=(ConnectionError, TimeoutError))
+def fetch_data(url: str) -> str:
+    """模拟网络请求（可能失败）"""
+    import random
+    if random.random() < 0.7:
+        raise ConnectionError("Connection refused")
+    return f"Data from {url}"
+```
+
+### 类装饰器
+
+```python
+class CountCalls:
+    """统计函数调用次数的类装饰器"""
+
+    def __init__(self, func):
+        self.func = func
+        self.count = 0
+        functools.update_wrapper(self, func)
+
+    def __call__(self, *args, **kwargs):
+        self.count += 1
+        print(f"[Call #{self.count}] {self.func.__name__}")
+        return self.func(*args, **kwargs)
+
+
+@CountCalls
+def say_hello(name: str):
+    print(f"Hello, {name}!")
+
+
+say_hello("Alice")  # [Call #1] say_hello \n Hello, Alice!
+say_hello("Bob")    # [Call #2] say_hello \n Hello, Bob!
+print(f"Total calls: {say_hello.count}")  # Total calls: 2
+```
+
+### 叠加装饰器
+
+```python
+@timer
+@retry(max_retries=2, delay=0.1)
+def complex_operation():
+    """先重试，再计时"""
+    time.sleep(0.1)
+    return "success"
+
+# 执行顺序：timer(retry(complex_operation))
+# 外层 timer 先包装，内层 retry 后包装
+# 调用时：timer.wrapper -> retry.wrapper -> complex_operation
+```
+
+---
+
+## functools 实用工具
+
+`functools` 模块提供了几个非常实用的工具：
+
+### lru_cache — 缓存
+
+```python
+from functools import lru_cache
+
+
+@lru_cache(maxsize=128)
+def fibonacci(n: int) -> int:
+    """斐波那契数列 — 使用缓存避免重复计算"""
+    if n < 2:
+        return n
+    return fibonacci(n - 1) + fibonacci(n - 2)
+
+
+# 没有缓存：O(2^n) 指数时间复杂度
+# 有缓存：O(n) 线性时间复杂度
+print(fibonacci(100))  # 354224848179261915075 — 瞬间完成
+
+# 查看缓存信息
+print(fibonacci.cache_info())
+# CacheInfo(hits=98, misses=101, maxsize=128, currsize=101)
+```
+
+### singledispatch — 泛型函数
+
+```python
+from functools import singledispatch
+
+
+@singledispatch
+def process(data):
+    """处理数据的泛型函数"""
+    raise NotImplementedError(f"不支持的数据类型: {type(data)}")
+
+
+@process.register(int)
+def _(data: int):
+    print(f"处理整数: {data * 2}")
+
+
+@process.register(str)
+def _(data: str):
+    print(f"处理字符串: {data.upper()}")
+
+
+@process.register(list)
+def _(data: list):
+    print(f"处理列表: 共 {len(data)} 个元素")
+
+
+@process.register(dict)
+def _(data: dict):
+    print(f"处理字典: {list(data.keys())}")
+
+
+process(42)           # 处理整数: 84
+process("hello")      # 处理字符串: HELLO
+process([1, 2, 3])    # 处理列表: 共 3 个元素
+process({"a": 1})     # 处理字典: ['a']
+```
+
+### partial — 偏函数
+
+```python
+from functools import partial
+
+
+# 固定部分参数，创建新函数
+def power(base: float, exp: float) -> float:
+    return base ** exp
+
+square = partial(power, exp=2)
+cube = partial(power, exp=3)
+
+print(square(5))  # 25.0
+print(cube(3))    # 27.0
+
+# 实际应用：固定 HTTP 请求的公共参数
+import urllib.request
+
+get = partial(urllib.request.urlopen, timeout=10)
+# 现在 get(url) 自动带上 timeout=10
+```
+
+---
+
+## 生成器（Generator）
+
+生成器是 Python 中最优雅的特性之一。它允许你用函数的方式定义一个**惰性序列**——只在需要时才生成下一个值，而不是一次性创建所有数据。
+
+### yield 基础
+
+```python
+def count_up_to(n: int):
+    """生成 0 到 n-1 的数字"""
+    i = 0
+    while i < n:
+        yield i
+        i += 1
+
+
+# 使用生成器
+counter = count_up_to(5)
+print(next(counter))  # 0
+print(next(counter))  # 1
+print(next(counter))  # 2
+
+# 用 for 循环消费
+for num in count_up_to(5):
+    print(num, end=" ")  # 0 1 2 3 4
+```
+
+### 生成器处理大文件
+
+```python
+def read_large_file(file_path: str, chunk_size: int = 8192):
+    """逐块读取大文件 — 不会一次性加载到内存"""
+    with open(file_path, "r", encoding="utf-8") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            yield chunk
+
+
+def read_lines(file_path: str):
+    """逐行读取文件 — 惰性迭代"""
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            yield line.strip()
+
+
+def parse_csv(file_path: str, delimiter: str = ","):
+    """惰性解析 CSV 文件"""
+    with open(file_path, "r", encoding="utf-8") as f:
+        header = f.readline().strip().split(delimiter)
+        for line in f:
+            values = line.strip().split(delimiter)
+            yield dict(zip(header, values))
+
+
+# 使用 — 处理 GB 级文件也不会内存溢出
+for record in parse_csv("large_file.csv"):
+    name = record.get("name", "")
+    if name.startswith("A"):
+        print(name)
+```
+
+### yield from — 委托生成器
+
+```python
+def flatten(nested):
+    """展平嵌套的可迭代对象"""
+    for item in nested:
+        if isinstance(item, (list, tuple)):
+            yield from flatten(item)  # 委托给子生成器
+        else:
+            yield item
+
+
+data = [1, [2, 3], [4, [5, 6]], 7, [8, [9, [10]]]]
+print(list(flatten(data)))  # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+
+
+def chain(*iterables):
+    """连接多个可迭代对象 — 类似 itertools.chain"""
+    for it in iterables:
+        yield from it
+
+
+print(list(chain([1, 2], [3, 4], [5, 6])))  # [1, 2, 3, 4, 5, 6]
+```
+
+### 生成器表达式
+
+```python
+# 列表推导式 — 立即计算，占用内存
+squares_list = [x ** 2 for x in range(1000000)]  # 创建完整列表
+
+# 生成器表达式 — 惰性计算，节省内存
+squares_gen = (x ** 2 for x in range(1000000))   # 不创建列表
+
+# 生成器表达式常用于函数参数
+total = sum(x ** 2 for x in range(1000000))
+max_value = max(x ** 2 for x in range(1000000))
+
+# 管道式数据处理
+def pipeline():
+    data = (line.strip() for line in open("data.txt"))
+    filtered = (line for line in data if line)
+    transformed = (line.upper() for line in filtered)
+    result = list(transformed)
+    return result
+```
+
+---
+
+## 迭代器协议
+
+理解迭代器协议是掌握生成器的基础：
+
+```python
+class Countdown:
+    """自定义迭代器 — 倒计时"""
+
+    def __init__(self, start: int):
+        self.current = start
+
+    def __iter__(self):
+        """返回迭代器对象（通常是 self）"""
+        return self
+
+    def __next__(self):
+        """返回下一个值，没有更多值时抛出 StopIteration"""
+        if self.current <= 0:
+            raise StopIteration
+        value = self.current
+        self.current -= 1
+        return value
+
+
+# 使用
+for num in Countdown(5):
+    print(num, end=" ")  # 5 4 3 2 1
+
+# 等价于
+it = iter(Countdown(5))  # 调用 __iter__
+while True:
+    try:
+        num = next(it)    # 调用 __next__
+        print(num)
+    except StopIteration:
+        break
+```
+
+> **生成器就是迭代器**：`yield` 自动实现了 `__iter__` 和 `__next__` 方法，所以生成器函数更简洁。
+
+---
+
+## 上下文管理器
+
+上下文管理器通过 `with` 语句管理资源的获取和释放，确保即使发生异常也能正确清理资源。
+
+### 自定义上下文管理器
+
+```python
+class DatabaseConnection:
+    """数据库连接上下文管理器"""
+
+    def __init__(self, host: str, port: int):
+        self.host = host
+        self.port = port
+        self.conn = None
+
+    def __enter__(self):
+        """进入 with 块时调用 — 获取资源"""
+        print(f"连接数据库 {self.host}:{self.port}")
+        self.conn = f"Connection({self.host}:{self.port})"
+        return self.conn  # 返回值赋给 as 后的变量
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """退出 with 块时调用 — 释放资源"""
+        print(f"关闭数据库连接")
+        self.conn = None
+        if exc_type is not None:
+            print(f"发生异常: {exc_val}")
+        return False  # 不抑制异常（设为 True 则异常会被忽略）
+
+
+# 使用
+with DatabaseConnection("localhost", 5432) as conn:
+    print(f"使用连接: {conn}")
+    # 即使这里抛出异常，__exit__ 也会被调用
+# 自动调用 __exit__ 关闭连接
+```
+
+### contextlib.contextmanager
+
+对于简单的场景，可以用 `contextlib.contextmanager` 装饰器把生成器函数变成上下文管理器：
+
+```python
+from contextlib import contextmanager
+import time
+
+
+@contextmanager
+def timer_context(name: str):
+    """计时上下文管理器"""
+    start = time.perf_counter()
+    print(f"[{name}] 开始")
+    try:
+        yield  # yield 之前的代码是 __enter__，之后是 __exit__
+    finally:
+        elapsed = time.perf_counter() - start
+        print(f"[{name}] 结束, 耗时: {elapsed:.4f}s")
+
+
+@contextmanager
+def temporary_file(content: str):
+    """临时文件上下文管理器"""
+    from pathlib import Path
+    tmp_file = Path("/tmp/temp_data.txt")
+    tmp_file.write_text(content, encoding="utf-8")
+    try:
+        yield tmp_file  # 把临时文件路径传给调用者
+    finally:
+        tmp_file.unlink()  # 确保删除临时文件
+
+
+# 使用
+with timer_context("数据处理"):
+    time.sleep(0.5)
+    # ... 数据处理逻辑 ...
+
+with temporary_file("Hello, World!") as tmp:
+    print(f"临时文件: {tmp}")
+    print(f"内容: {tmp.read_text()}")
+# 临时文件已被自动删除
+```
+
+### suppress — 抑制异常
+
+```python
+from contextlib import suppress
+
+# suppress 相当于 try/except 但不处理异常
+with suppress(FileNotFoundError):
+    Path("nonexistent.txt").read_text()
+# 如果文件不存在，不会抛出异常
+
+# 传统写法
+try:
+    Path("nonexistent.txt").read_text()
+except FileNotFoundError:
+    pass
+```
+
+---
+
+## 描述符（Descriptor Protocol）简介
+
+描述符是 Python 中最底层的特性之一，`@property`、classmethod、staticmethod 都是基于描述符实现的。
+
+```python
+class ValidatedField:
+    """带验证的描述符"""
+
+    def __init__(self, name: str, type_hint: type, min_value=None, max_value=None):
+        self.name = name
+        self.type_hint = type_hint
+        self.min_value = min_value
+        self.max_value = max_value
+
+    def __set_name__(self, owner, name):
+        """自动获取属性名"""
+        self.public_name = name
+        self.private_name = f"_{name}"
+
+    def __get__(self, obj, objtype=None):
+        if obj is None:
+            return self
+        return getattr(obj, self.private_name, None)
+
+    def __set__(self, obj, value):
+        # 类型验证
+        if not isinstance(value, self.type_hint):
+            raise TypeError(f"{self.public_name} 必须是 {self.type_hint.__name__} 类型")
+        # 范围验证
+        if self.min_value is not None and value < self.min_value:
+            raise ValueError(f"{self.public_name} 不能小于 {self.min_value}")
+        if self.max_value is not None and value > self.max_value:
+            raise ValueError(f"{self.public_name} 不能大于 {self.max_value}")
+        setattr(obj, self.private_name, value)
+
+
+class Product:
+    """使用描述符的数据模型"""
+    name = ValidatedField("name", str)
+    price = ValidatedField("price", (int, float), min_value=0)
+    stock = ValidatedField("stock", int, min_value=0)
+
+    def __init__(self, name: str, price: float, stock: int):
+        self.name = name
+        self.price = price
+        self.stock = stock
+
+
+# 使用
+product = Product("Laptop", 9999.0, 100)
+print(product.name)   # Laptop
+
+try:
+    product.price = -100  # ValueError: price 不能小于 0
+except ValueError as e:
+    print(f"验证失败: {e}")
+
+try:
+    product.name = 123    # TypeError: name 必须是 str 类型
+except TypeError as e:
+    print(f"类型错误: {e}")
+```
+
+> **描述符 vs property**：`@property` 适合单个类的简单属性验证。描述符适合需要**复用**到多个类的验证逻辑。ORM 框架（如 SQLAlchemy、Django ORM）的字段系统就是基于描述符实现的。
+
+---
+
+## 协程基础（async/await 预览）
+
+Python 3.5+ 引入了原生协程支持。这里只做简单预览，后续会有专门的文章深入讲解。
+
+```python
+import asyncio
+
+
+async def fetch_data(delay: float, name: str) -> str:
+    """模拟异步数据获取"""
+    print(f"[{name}] 开始获取数据...")
+    await asyncio.sleep(delay)  # 异步等待，不阻塞线程
+    print(f"[{name}] 数据获取完成")
+    return f"{name} 的数据"
+
+
+async def main():
+    """并发执行多个异步任务"""
+    # 同时启动三个任务
+    results = await asyncio.gather(
+        fetch_data(2, "API-1"),
+        fetch_data(1, "API-2"),
+        fetch_data(3, "DB"),
+    )
+    for result in results:
+        print(result)
+
+
+# 运行异步程序
+asyncio.run(main())
+# [API-1] 开始获取数据...
+# [API-2] 开始获取数据...
+# [DB] 开始获取数据...
+# [API-2] 数据获取完成
+# [API-1] 数据获取完成
+# [DB] 数据获取完成
+# 总耗时约 3 秒（而非 6 秒）
+```
+
+---
+
+## 实战演练
+
+### 示例 1：带过期时间的缓存装饰器
+
+```python
+import time
+import functools
+from typing import Any, Callable
+
+
+def timed_cache(max_age: float = 60.0):
+    """带过期时间的缓存装饰器"""
+    def decorator(func: Callable) -> Callable:
+        cache: dict[str, tuple[float, Any]] = {}
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            # 生成缓存 key（基于参数）
+            key = f"{args}-{sorted(kwargs.items())}"
+
+            # 检查缓存是否命中且未过期
+            if key in cache:
+                timestamp, result = cache[key]
+                if time.time() - timestamp < max_age:
+                    print(f"[Cache HIT] {func.__name__}{args}")
+                    return result
+                else:
+                    del cache[key]  # 过期，删除
+
+            # 缓存未命中，执行函数
+            print(f"[Cache MISS] {func.__name__}{args}")
+            result = func(*args, **kwargs)
+            cache[key] = (time.time(), result)
+            return result
+
+        # 添加缓存管理方法
+        def clear_cache():
+            cache.clear()
+
+        def cache_info():
+            return {
+                "size": len(cache),
+                "max_age": max_age,
+                "keys": list(cache.keys()),
+            }
+
+        wrapper.clear_cache = clear_cache
+        wrapper.cache_info = cache_info
+        return wrapper
+
+    return decorator
+
+
+# 使用
+@timed_cache(max_age=5.0)  # 缓存 5 秒
+def get_user_info(user_id: int) -> dict:
+    """模拟获取用户信息（耗时操作）"""
+    time.sleep(0.1)
+    users = {
+        1: {"name": "Alice", "role": "admin"},
+        2: {"name": "Bob", "role": "user"},
+    }
+    return users.get(user_id, {"name": "Unknown"})
+
+print(get_user_info(1))   # Cache MISS
+print(get_user_info(1))   # Cache HIT — 从缓存返回
+print(get_user_info(1))   # Cache HIT
+time.sleep(5)
+print(get_user_info(1))   # Cache MISS — 缓存已过期
+```
+
+### 示例 2：生成器管道处理日志
+
+```python
+from pathlib import Path
+from datetime import datetime
+from collections import Counter
+
+
+def read_log_lines(file_path: str):
+    """逐行读取日志文件"""
+    with open(file_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                yield line
+
+
+def parse_log(lines):
+    """解析日志行"""
+    for line in lines:
+        try:
+            parts = line.split(" ", 3)
+            timestamp = datetime.strptime(parts[0], "%Y-%m-%d")
+            level = parts[1]
+            message = parts[2] if len(parts) > 2 else ""
+            yield {
+                "timestamp": timestamp,
+                "level": level,
+                "message": message,
+            }
+        except (ValueError, IndexError):
+            continue
+
+
+def filter_by_level(entries, level: str):
+    """按日志级别过滤"""
+    for entry in entries:
+        if entry["level"] == level:
+            yield entry
+
+
+def count_messages(entries):
+    """统计消息出现频率"""
+    messages = (entry["message"] for entry in entries)
+    return Counter(messages)
+
+
+# 使用管道
+log_file = "app.log"
+pipeline = parse_log(read_log_lines(log_file))
+
+# 统计 ERROR 级别日志
+errors = count_messages(filter_by_level(pipeline, "ERROR"))
+print("ERROR 日志统计:")
+for msg, count in errors.most_common(10):
+    print(f"  [{count}] {msg}")
+```
+
+### 示例 3：自定义上下文管理器管理数据库连接池
+
+```python
+from contextlib import contextmanager
+import threading
+
+
+class ConnectionPool:
+    """简单的连接池实现"""
+
+    def __init__(self, max_connections: int = 5):
+        self.max_connections = max_connections
+        self._pool: list[str] = [f"conn-{i}" for i in range(max_connections)]
+        self._available = list(self._pool)
+        self._lock = threading.Lock()
+
+    @contextmanager
+    def acquire(self, timeout: float = 5.0):
+        """获取连接的上下文管理器"""
+        import time
+        start = time.time()
+
+        while True:
+            with self._lock:
+                if self._available:
+                    conn = self._available.pop()
+                    print(f"获取连接: {conn} (剩余: {len(self._available)})")
+                    try:
+                        yield conn
+                    finally:
+                        self._available.append(conn)
+                        print(f"归还连接: {conn} (剩余: {len(self._available)})")
+                    return
+
+            if time.time() - start > timeout:
+                raise TimeoutError("等待连接超时")
+            time.sleep(0.1)  # 等待连接可用
+
+
+# 使用
+pool = ConnectionPool(max_connections=3)
+
+with pool.acquire() as conn1:
+    print(f"使用连接: {conn1}")
+    with pool.acquire() as conn2:
+        print(f"使用连接: {conn2}")
+        with pool.acquire() as conn3:
+            print(f"使用连接: {conn3}")
+            # conn4 = pool.acquire()  # 这里会等待（或超时）
+    # conn2 自动归还
+# conn1 自动归还
+```
+
+---
+
+## 最佳实践
+
+1. **装饰器始终使用 `@functools.wraps`**：保留被装饰函数的元信息
+2. **大文件用生成器处理**：避免将整个文件读入内存，逐行或分块处理
+3. **资源管理用上下文管理器**：文件、网络连接、数据库连接等资源都用 `with` 语句管理
+4. **缓存用 `lru_cache`**：Python 内置的缓存方案，无需自己实现
+5. **避免过度使用装饰器**：装饰器增加了间接性，当装饰器叠加超过 3 层时，考虑重构
+
+---
+
+## 常见问题
+
+**Q: 装饰器和 Java 的注解有什么区别？**
+
+A: Java 的注解（Annotation）主要是**元数据**，需要通过反射在运行时读取，注解本身不执行逻辑。Python 的装饰器是**真正执行的代码**，它在函数定义时就被调用，可以修改函数的行为。Python 的装饰器更像 Java 的代理模式（Proxy Pattern）+ AOP（面向切面编程）。
+
+**Q: 生成器和列表推导式怎么选？**
+
+A: 如果结果集较小（几百个元素），用列表推导式更直观。如果结果集可能很大（上万或更多），或者你只需要遍历一次，用生成器更节省内存。一个简单的判断标准：如果你需要随机访问（按索引取值），用列表；如果只需要顺序遍历，用生成器。
+
+**Q: async/await 和生成器有什么关系？**
+
+A: `async def` 定义的协程函数内部可以使用 `await`，而 `await` 底层使用了和生成器类似的机制（都是基于 `__iter__`/`__next__` 协议的变体）。实际上，Python 的协程最初就是从生成器（`yield`）演化而来的。
+
+---
+
+## 总结
+
+本文掌握了 Python 的核心高级特性：
+
+- **装饰器**：函数装饰器、带参数装饰器、类装饰器、叠加装饰器
+- **functools**：`wraps`、`lru_cache`、`partial`、`singledispatch`
+- **生成器**：`yield`、`yield from`、生成器表达式、惰性求值
+- **迭代器协议**：`__iter__`、`__next__`、生成器与迭代器的关系
+- **上下文管理器**：`with` 语句、`contextlib.contextmanager`、资源管理
+- **描述符**：`__get__`、`__set__`、属性验证的底层机制
+- **协程基础**：`async def`、`await`、异步并发
+
+---
+
+## 下一步
+
+在下一篇文章中，我们将学习 Python 的项目结构与工程化实践——如何组织一个规范的 Python 项目、配置测试环境、使用代码质量工具，以及构建 CLI 工具和打包发布。这些知识是将 Python 从"脚本语言"提升到"工程语言"的关键一步。

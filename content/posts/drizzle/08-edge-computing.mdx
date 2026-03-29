@@ -1,0 +1,992 @@
+---
+title: "08. Edge Computing 实战"
+date: "2026-03-29"
+summary: "深入掌握 Drizzle ORM 在边缘计算环境的应用，学习 Cloudflare Workers、D1 数据库、Deno Deploy 等边缘平台的实战开发。"
+tags: ["Drizzle ORM", "Cloudflare Workers", "Edge Computing", "D1", "Deno"]
+category: "drizzle"
+draft: false
+series: "Drizzle ORM 类型安全的数据库访问实战"
+seriesOrder: 8
+---
+
+## 前言
+
+**Edge Computing** 是现代 Web 应用的未来。Drizzle ORM 是少数完美支持边缘运行时的 ORM，这使其成为构建边缘应用的首选。
+
+**本文核心内容**：
+
+- ✅ 为什么选择 Edge Computing
+- ✅ Cloudflare Workers + Drizzle
+- ✅ Cloudflare D1 数据库
+- ✅ Cloudflare KV 缓存
+- ✅ Deno Deploy + Drizzle
+- ✅ Bun + Drizzle
+- ✅ 边缘性能优化
+
+---
+
+## 一、为什么选择 Edge Computing？
+
+### 1.1 边缘 vs 传统服务器
+
+| 特性   | 传统服务器 | Edge Computing |
+| ------ | ---------- | -------------- |
+| 延迟   | 100-500ms  | < 50ms         |
+| 位置   | 单一区域   | 全球分布       |
+| 扩展性 | 需要配置   | 自动扩展       |
+| 冷启动 | 较长       | 毫秒级         |
+| 成本   | 较高       | 较低           |
+
+### 1.2 Drizzle 的边缘优势
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Drizzle Edge 优势                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                               │
+│  ✅ 零运行时依赖 - 不依赖 Node.js 特性                       │
+│  ✅ 极小 Bundle - ~50KB vs Prisma ~2MB                       │
+│  ✅ Web Standard - 使用 Fetch API、Web Crypto 等             │
+│  ✅ 多平台支持 - Workers、Deno、Bun                          │
+│  ✅ 类型安全 - 100% TypeScript 支持                         │
+│                                                               │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 二、Cloudflare Workers + Drizzle
+
+### 2.1 项目初始化
+
+```bash
+# 安装 Wrangler
+pnpm add -D wrangler
+
+# 初始化项目
+pnpm wrangler init edge-api
+
+# 安装 Drizzle
+cd edge-api
+pnpm add drizzle-orm
+```
+
+### 2.2 wrangler.toml 配置
+
+```toml
+name = "edge-api"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "my-database"
+database_id = "your-database-id"
+
+# KV 命名空间绑定
+[[kv_namespaces]]
+binding = "CACHE"
+id = "your-kv-namespace-id"
+
+# R2 存储绑定
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "my-storage"
+
+# 环境变量
+[vars]
+ENVIRONMENT = "production"
+
+# 密钥配置（使用 wrangler secret）
+# wrangler secret put API_KEY
+```
+
+### 2.3 创建 Worker
+
+**src/index.ts**：
+
+```typescript
+import { drizzle } from "drizzle-orm/d1";
+import { eq } from "drizzle-orm";
+import * as schema from "./db/schema";
+
+export interface Env {
+  DB: D1Database;
+  CACHE: KVNamespace;
+  STORAGE: R2Bucket;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const db = drizzle(env.DB, { schema });
+
+    // 路由处理
+    if (url.pathname === "/api/users") {
+      if (request.method === "GET") {
+        return await getUsers(db);
+      }
+      if (request.method === "POST") {
+        return await createUser(request, db);
+      }
+    }
+
+    if (url.pathname.startsWith("/api/users/")) {
+      const id = parseInt(url.pathname.split("/")[3]);
+      return await getUser(db, id);
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+};
+
+async function getUsers(db: DrizzleDB) {
+  const users = await db.select().from(schema.users);
+  return Response.json(users);
+}
+
+async function getUser(db: DrizzleDB, id: number) {
+  const [user] = await db
+    .select()
+    .from(schema.users)
+    .where(eq(schema.users.id, id))
+    .limit(1);
+
+  if (!user) {
+    return new Response("User not found", { status: 404 });
+  }
+
+  return Response.json(user);
+}
+
+async function createUser(request: Request, db: DrizzleDB) {
+  const body = await request.json();
+
+  const [user] = await db.insert(schema.users).values(body).returning();
+
+  return Response.json(user, { status: 201 });
+}
+```
+
+### 2.4 Schema 定义
+
+**src/db/schema/users.ts**：
+
+```typescript
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+
+export const users = sqliteTable("users", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  email: text("email").notNull().unique(),
+  name: text("name"),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
+});
+
+export type User = typeof users.$inferSelect;
+export type NewUser = typeof users.$inferInsert;
+```
+
+**src/db/schema/index.ts**：
+
+```typescript
+export * from "./users";
+```
+
+---
+
+## 三、Cloudflare D1 数据库
+
+### 3.1 D1 简介
+
+D1 是 Cloudflare 提供的**边缘 SQLite 数据库**：
+
+- 🌍 **全球分布**：数据复制到全球边缘节点
+- ⚡ **低延迟**：< 10ms 查询响应
+- 🔒 **ACID 事务**：完整的事务支持
+- 💰 **免费额度**：5GB 存储，2500 万次读取/月
+
+### 3.2 创建 D1 数据库
+
+```bash
+# 创建数据库
+wrangler d1 create my-database
+
+# 会返回：
+# database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+# database_name = "my-database"
+
+# 更新 wrangler.toml 中的 database_id
+```
+
+### 3.3 本地开发
+
+```bash
+# 启动本地开发服务器（支持本地 D1）
+wrangler dev
+
+# 使用远程 D1
+wrangler dev --remote
+```
+
+### 3.4 迁移
+
+**drizzle.config.ts**：
+
+```typescript
+import type { Config } from "drizzle-kit";
+
+export default {
+  schema: "./src/db/schema/**/*.ts",
+  out: "./drizzle",
+  driver: "d1",
+  dbCredentials: {
+    wranglerConfigPath: "wrangler.toml",
+    dbName: "my-database",
+  },
+} satisfies Config;
+```
+
+```bash
+# 生成迁移
+pnpm drizzle-kit generate
+
+# 在本地执行迁移
+wrangler d1 execute my-database --local --file=./drizzle/0001.sql
+
+# 在远程执行迁移
+wrangler d1 execute my-database --file=./drizzle/0001.sql
+```
+
+### 3.5 完整的 CRUD 示例
+
+```typescript
+import { drizzle } from "drizzle-orm/d1";
+import { eq, desc } from "drizzle-orm";
+import * as schema from "./db/schema";
+
+interface Env {
+  DB: D1Database;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const db = drizzle(env.DB, { schema });
+
+    if (url.pathname === "/api/posts" && request.method === "GET") {
+      return getPosts(db);
+    }
+
+    if (url.pathname === "/api/posts" && request.method === "POST") {
+      return createPost(request, db);
+    }
+
+    if (url.pathname.match(/^\/api\/posts\/\d+$/) && request.method === "GET") {
+      const id = parseInt(url.pathname.split("/")[3]);
+      return getPost(db, id);
+    }
+
+    if (
+      url.pathname.match(/^\/api\/posts\/\d+$/) &&
+      request.method === "PATCH"
+    ) {
+      const id = parseInt(url.pathname.split("/")[3]);
+      return updatePost(request, db, id);
+    }
+
+    if (
+      url.pathname.match(/^\/api\/posts\/\d+$/) &&
+      request.method === "DELETE"
+    ) {
+      const id = parseInt(url.pathname.split("/")[3]);
+      return deletePost(db, id);
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+};
+
+async function getPosts(db: DrizzleDB) {
+  const posts = await db
+    .select()
+    .from(schema.posts)
+    .orderBy(desc(schema.posts.createdAt));
+
+  return Response.json(posts);
+}
+
+async function getPost(db: DrizzleDB, id: number) {
+  const [post] = await db
+    .select()
+    .from(schema.posts)
+    .where(eq(schema.posts.id, id))
+    .limit(1);
+
+  if (!post) {
+    return new Response("Post not found", { status: 404 });
+  }
+
+  return Response.json(post);
+}
+
+async function createPost(request: Request, db: DrizzleDB) {
+  const body = await request.json();
+
+  const [post] = await db
+    .insert(schema.posts)
+    .values({
+      ...body,
+      createdAt: new Date(),
+    })
+    .returning();
+
+  return Response.json(post, { status: 201 });
+}
+
+async function updatePost(request: Request, db: DrizzleDB, id: number) {
+  const body = await request.json();
+
+  const [post] = await db
+    .update(schema.posts)
+    .set({
+      ...body,
+      updatedAt: new Date(),
+    })
+    .where(eq(schema.posts.id, id))
+    .returning();
+
+  if (!post) {
+    return new Response("Post not found", { status: 404 });
+  }
+
+  return Response.json(post);
+}
+
+async function deletePost(db: DrizzleDB, id: number) {
+  await db.delete(schema.posts).where(eq(schema.posts.id, id));
+
+  return new Response(null, { status: 204 });
+}
+```
+
+---
+
+## 四、Cloudflare KV 缓存
+
+### 4.1 KV 简介
+
+KV 是 Cloudflare 的**全球分布式键值存储**：
+
+- 🌍 **全球复制**：数据自动复制到所有边缘节点
+- ⚡ **极低延迟**：< 1ms 读取延迟
+- 💾 **最终一致性**：数据在 60 秒内全球同步
+
+### 4.2 创建 KV 命名空间
+
+```bash
+# 创建 KV 命名空间
+wrangler kv:namespace create CACHE
+
+# 更新 wrangler.toml 中的 id
+```
+
+### 4.3 使用 KV 缓存
+
+```typescript
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const db = drizzle(env.DB, { schema });
+
+    if (url.pathname === "/api/users") {
+      return getUsersWithCache(db, env.CACHE);
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+};
+
+async function getUsersWithCache(db: DrizzleDB, cache: KVNamespace) {
+  // 1. 尝试从缓存读取
+  const cached = await cache.get("users", "json");
+  if (cached) {
+    return Response.json(cached, {
+      headers: {
+        "X-Cache": "HIT",
+      },
+    });
+  }
+
+  // 2. 从数据库查询
+  const users = await db.select().from(schema.users);
+
+  // 3. 写入缓存（60 秒过期）
+  await cache.put("users", JSON.stringify(users), {
+    expirationTtl: 60,
+  });
+
+  return Response.json(users, {
+    headers: {
+      "X-Cache": "MISS",
+    },
+  });
+}
+```
+
+### 4.4 缓存失效
+
+```typescript
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const db = drizzle(env.DB, { schema });
+
+    if (url.pathname === "/api/users" && request.method === "POST") {
+      return await createUser(request, db, env.CACHE);
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+};
+
+async function createUser(request: Request, db: DrizzleDB, cache: KVNamespace) {
+  const body = await request.json();
+
+  // 1. 创建用户
+  const [user] = await db.insert(schema.users).values(body).returning();
+
+  // 2. 删除缓存
+  await cache.delete("users");
+
+  // 3. 重新预热缓存
+  const users = await db.select().from(schema.users);
+  await cache.put("users", JSON.stringify(users), {
+    expirationTtl: 60,
+  });
+
+  return Response.json(user, { status: 201 });
+}
+```
+
+### 4.5 高级缓存策略
+
+```typescript
+// 按用户 ID 缓存
+async function getUserWithCache(
+  db: DrizzleDB,
+  cache: KVNamespace,
+  userId: number
+) {
+  const cacheKey = `user:${userId}`;
+
+  // 尝试从缓存读取
+  const cached = await cache.get(cacheKey, "json");
+  if (cached) {
+    return Response.json(cached, { headers: { "X-Cache": "HIT" } });
+  }
+
+  // 从数据库查询
+  const [user] = await db
+    .select()
+    .from(schema.users)
+    .where(eq(schema.users.id, userId))
+    .limit(1);
+
+  if (!user) {
+    return new Response("User not found", { status: 404 });
+  }
+
+  // 写入缓存（5 分钟）
+  await cache.put(cacheKey, JSON.stringify(user), {
+    expirationTtl: 300,
+  });
+
+  return Response.json(user, { headers: { "X-Cache": "MISS" } });
+}
+
+// 缓存标签（手动实现）
+async function invalidateUserCache(cache: KVNamespace, userId: number) {
+  await cache.delete(`user:${userId}`);
+  await cache.delete("users");
+  await cache.delete("users:stats");
+}
+```
+
+---
+
+## 五、Deno Deploy + Drizzle
+
+### 5.1 Deno 简介
+
+Deno 是一个**现代的 JavaScript/TypeScript 运行时**，原生支持边缘部署。
+
+### 5.2 创建 Deno 应用
+
+```typescript
+// main.ts
+import { drizzle } from "https://esm.sh/drizzle-orm/postgres-js";
+import postgres from "https://esm.sh/postgres";
+import { eq } from "https://esm.sh/drizzle-orm";
+import * as schema from "./schema.ts";
+
+const query = postgres(Deno.env.get("DATABASE_URL")!);
+const db = drizzle(query, { schema });
+
+Deno.serve(async (req) => {
+  const url = new URL(req.url);
+
+  if (url.pathname === "/api/users" && req.method === "GET") {
+    const users = await db.select().from(schema.users);
+    return Response.json(users);
+  }
+
+  if (url.pathname === "/api/users" && req.method === "POST") {
+    const body = await req.json();
+    const [user] = await db.insert(schema.users).values(body).returning();
+    return Response.json(user, { status: 201 });
+  }
+
+  return new Response("Not found", { status: 404 });
+});
+```
+
+### 5.3 部署到 Deno Deploy
+
+1. 将代码推送到 GitHub
+2. 在 Deno Deploy 创建新项目
+3. 连接 GitHub 仓库
+4. 设置环境变量 `DATABASE_URL`
+5. 部署
+
+### 5.4 Deno KV
+
+```typescript
+const kv = await Deno.openKv();
+
+// 设置值
+await kv.set(["user", userId], userData);
+
+// 获取值
+const user = await kv.get(["user", userId]);
+
+// 删除值
+await kv.delete(["user", userId]);
+
+// 列出所有键
+const entries = kv.list({ prefix: ["user"] });
+```
+
+---
+
+## 六、Bun + Drizzle
+
+### 6.1 Bun 简介
+
+Bun 是一个**快速的 JavaScript 运行时**，内置打包器和测试框架。
+
+### 6.2 创建 Bun 应用
+
+```bash
+# 创建 Bun 项目
+bun init my-bun-app
+cd my-bun-app
+
+# 安装 Drizzle
+bun add drizzle-orm postgres
+bun add -d drizzle-kit @types/pg
+```
+
+```typescript
+// src/index.ts
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+import { eq } from "drizzle-orm";
+import * as schema from "./schema";
+
+const query = postgres(process.env.DATABASE_URL!);
+const db = drizzle(query, { schema });
+
+const server = Bun.serve({
+  port: 3000,
+  async fetch(req) {
+    const url = new URL(req.url);
+
+    if (url.pathname === "/api/users" && req.method === "GET") {
+      const users = await db.select().from(schema.users);
+      return Response.json(users);
+    }
+
+    if (url.pathname === "/api/users" && req.method === "POST") {
+      const body = await req.json();
+      const [user] = await db.insert(schema.users).values(body).returning();
+      return Response.json(user, { status: 201 });
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+});
+
+console.log(`Server running on ${server.url}`);
+```
+
+### 6.3 运行和部署
+
+```bash
+# 开发
+bun run src/index.ts
+
+# 生产
+bun run src/index.ts
+
+# 部署到各种平台
+# - Docker
+# - Railway
+# - Render
+# - Fly.io
+```
+
+---
+
+## 七、边缘性能优化
+
+### 7.1 减少 Bundle 大小
+
+```typescript
+// ✅ 好的做法：按需导入
+import { drizzle } from "drizzle-orm/d1"; // 只导入 D1 驱动
+
+// ❌ 不好的做法：导入全部
+import { drizzle } from "drizzle-orm"; // 包含所有驱动
+```
+
+### 7.2 使用 Prepared Statements
+
+```typescript
+const stmt = db
+  .select()
+  .from(schema.users)
+  .where(eq(schema.users.id, sql.placeholder("id")))
+  .prepare();
+
+// 使用预编译语句
+const user = await stmt.execute({ id: 1 });
+```
+
+### 7.3 批量操作
+
+```typescript
+// 批量插入
+await db
+  .insert(schema.users)
+  .values([
+    { email: "user1@example.com" },
+    { email: "user2@example.com" },
+    { email: "user3@example.com" },
+  ]);
+
+// 批量更新
+for (const user of users) {
+  await db.update(schema.users).set(data).where(eq(schema.users.id, user.id));
+}
+```
+
+### 7.4 边缘缓存策略
+
+```typescript
+// 使用 Cache API
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const cache = caches.default;
+
+    // 尝试从缓存读取
+    let response = await cache.match(request);
+    if (response) {
+      return response;
+    }
+
+    // 生成响应
+    response = await handleRequest(request, env);
+
+    // 缓存响应（5 分钟）
+    response.headers.set("Cache-Control", "public, max-age=300");
+    await cache.put(request, response.clone());
+
+    return response;
+  },
+};
+```
+
+---
+
+## 八、实战示例
+
+### 8.1 边缘 API 服务
+
+```typescript
+import { drizzle } from "drizzle-orm/d1";
+import { eq, desc, sql } from "drizzle-orm";
+import * as schema from "./db/schema";
+
+interface Env {
+  DB: D1Database;
+  CACHE: KVNamespace;
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+    const db = drizzle(env.DB, { schema });
+
+    // CORS
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
+          "Access-Control-Allow-Headers": "Content-Type, Authorization",
+        },
+      });
+    }
+
+    // API 路由
+    if (url.pathname === "/api/posts" && request.method === "GET") {
+      return getPosts(db, env.CACHE);
+    }
+
+    if (url.pathname === "/api/posts" && request.method === "POST") {
+      return createPost(request, db, env.CACHE);
+    }
+
+    if (url.pathname === "/api/posts/stats" && request.method === "GET") {
+      return getPostsStats(db, env.CACHE);
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+};
+
+async function getPosts(db: DrizzleDB, cache: KVNamespace) {
+  const cached = await cache.get("posts", "json");
+  if (cached) {
+    return Response.json(cached);
+  }
+
+  const posts = await db
+    .select()
+    .from(schema.posts)
+    .orderBy(desc(schema.posts.createdAt))
+    .limit(20);
+
+  await cache.put("posts", JSON.stringify(posts), {
+    expirationTtl: 60,
+  });
+
+  return Response.json(posts);
+}
+
+async function createPost(request: Request, db: DrizzleDB, cache: KVNamespace) {
+  const body = await request.json();
+
+  const [post] = await db
+    .insert(schema.posts)
+    .values({
+      ...body,
+      createdAt: new Date(),
+    })
+    .returning();
+
+  // 删除相关缓存
+  await cache.delete("posts");
+  await cache.delete("posts:stats");
+
+  return Response.json(post, { status: 201 });
+}
+
+async function getPostsStats(db: DrizzleDB, cache: KVNamespace) {
+  const cached = await cache.get("posts:stats", "json");
+  if (cached) {
+    return Response.json(cached);
+  }
+
+  const [stats] = await db
+    .select({
+      total: sql<number>`count(*)`,
+      published: sql<number>`count(*) filter (where ${schema.posts.published} = true)`,
+    })
+    .from(schema.posts);
+
+  await cache.put("posts:stats", JSON.stringify(stats), {
+    expirationTtl: 300,
+  });
+
+  return Response.json(stats);
+}
+```
+
+### 8.2 边缘图片处理
+
+```typescript
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname.startsWith("/images/") && request.method === "GET") {
+      return getImage(request, env);
+    }
+
+    if (url.pathname === "/upload" && request.method === "POST") {
+      return uploadImage(request, env);
+    }
+
+    return new Response("Not found", { status: 404 });
+  },
+};
+
+async function getImage(request: Request, env: Env) {
+  const url = new URL(request.url);
+  const key = url.pathname.slice(1);
+
+  // 从 R2 获取图片
+  const object = await env.STORAGE.get(key);
+
+  if (!object) {
+    return new Response("Not found", { status: 404 });
+  }
+
+  // 检查缓存
+  const cache = caches.default;
+  let response = await cache.match(request);
+
+  if (!response) {
+    // 设置缓存头
+    const headers = new Headers();
+    object.writeHttpMetadata(headers);
+    headers.set("Cache-Control", "public, max-age=31536000");
+    headers.append("Vary", "Accept-Encoding");
+
+    response = new Response(object.body, { headers });
+    await cache.put(request, response.clone());
+  }
+
+  return response;
+}
+
+async function uploadImage(request: Request, env: Env) {
+  const formData = await request.formData();
+  const file = formData.get("file") as File;
+
+  const key = `images/${Date.now()}-${file.name}`;
+
+  await env.STORAGE.put(key, file);
+
+  return Response.json({
+    url: `https://your-domain.com/${key}`,
+  });
+}
+```
+
+---
+
+## 九、最佳实践
+
+### 9.1 冷启动优化
+
+```typescript
+// ✅ 好的做法：懒加载初始化
+let dbInstance: DrizzleDB | null = null;
+
+function getDb(env: Env) {
+  if (!dbInstance) {
+    dbInstance = drizzle(env.DB, { schema });
+  }
+  return dbInstance;
+}
+
+// ❌ 不好的做法：全局初始化
+const db = drizzle(env.DB, { schema }); // 每次冷启动都会执行
+```
+
+### 9.2 连接复用
+
+```typescript
+// ✅ 使用单个连接实例
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const db = drizzle(env.DB, { schema });
+    // 使用 db...
+  },
+};
+
+// ❌ 每次请求创建新连接
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const db1 = drizzle(env.DB, { schema });
+    const db2 = drizzle(env.DB, { schema }); // 重复连接
+  },
+};
+```
+
+### 9.3 错误处理
+
+```typescript
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    try {
+      return await handleRequest(request, env);
+    } catch (error) {
+      console.error("Error:", error);
+
+      return new Response(
+        JSON.stringify({
+          error: "Internal server error",
+          message: error instanceof Error ? error.message : "Unknown error",
+        }),
+        {
+          status: 500,
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    }
+  },
+};
+```
+
+---
+
+## 十、总结
+
+**本文我们学习了**：
+
+✅ **Edge Computing** - 边缘计算的优势和应用场景
+✅ **Cloudflare Workers** - 无服务器边缘函数
+✅ **Cloudflare D1** - 边缘 SQLite 数据库
+✅ **Cloudflare KV** - 全球分布式缓存
+✅ **Deno Deploy** - Deno 运行时部署
+✅ **Bun** - 高性能运行时
+
+**关键要点**：
+
+1. Drizzle 是少数支持边缘的 ORM
+2. 使用 KV 缓存提升性能
+3. 注意冷启动优化
+4. 做好错误处理
+
+**平台选择建议**：
+
+- **Cloudflare Workers**：最成熟的边缘平台
+- **Deno Deploy**：TypeScript 原生支持
+- **Bun**：高性能，适合计算密集型任务
+
+**下一步**：
+
+在下一篇文章《性能优化和最佳实践》中，我们将学习：
+
+- 查询性能优化
+- 索引策略
+- 连接池配置
+- 监控和日志
+
+---
+
+**相关代码**：[08-edge-computing](https://github.com/yourname/drizzle-examples/tree/08-edge-computing)

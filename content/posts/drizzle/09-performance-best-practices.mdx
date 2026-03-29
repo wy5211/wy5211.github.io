@@ -1,0 +1,840 @@
+---
+title: "09. 性能优化和最佳实践"
+date: "2026-03-30"
+summary: "深入掌握 Drizzle ORM 的性能优化技巧，学习索引策略、查询优化、缓存方案等生产级最佳实践。"
+tags: ["Drizzle ORM", "性能优化", "索引", "缓存", "监控"]
+category: "drizzle"
+draft: false
+series: "Drizzle ORM 类型安全的数据库访问实战"
+seriesOrder: 9
+---
+
+## 前言
+
+在生产环境中，**性能优化**是确保应用流畅运行的关键。Drizzle ORM 提供了多种优化手段，让我们可以充分发挥数据库性能。
+
+**本文核心内容**：
+
+- ✅ 查询性能优化
+- ✅ 索引策略
+- ✅ 连接池配置
+- ✅ 预编译语句
+- ✅ 批量操作优化
+- ✅ 缓存策略
+- ✅ 监控和日志
+
+---
+
+## 一、查询性能优化
+
+### 1.1 只查询需要的字段
+
+```typescript
+// ❌ 不好的做法：查询所有字段
+const users = await db.select().from(users);
+
+// ✅ 好的做法：只查询需要的字段
+const users = await db
+  .select({
+    id: users.id,
+    name: users.name,
+  })
+  .from(users);
+
+// SQL：SELECT id, name FROM users
+```
+
+### 1.2 使用索引字段过滤
+
+```typescript
+// ❌ 不好的做法：在非索引字段上过滤
+const users = await db.select().from(users).where(ilike(users.name, "%John%")); // 无法使用索引
+
+// ✅ 好的做法：在索引字段上过滤
+const users = await db
+  .select()
+  .from(users)
+  .where(eq(users.email, "john@example.com")); // 使用索引
+```
+
+### 1.3 避免 SELECT \*
+
+```typescript
+// ❌ 不好的做法：SELECT *
+const posts = await db.select().from(posts);
+
+// ✅ 好的做法：明确字段
+const posts = await db
+  .select({
+    id: posts.id,
+    title: posts.title,
+    slug: posts.slug,
+  })
+  .from(posts);
+
+// 如果确实需要所有字段，至少排除大字段
+const posts = await db
+  .select({
+    id: posts.id,
+    title: posts.title,
+    // content 很大，不查询
+  })
+  .from(posts);
+```
+
+### 1.4 使用 LIMIT
+
+```typescript
+// ✅ 好的做法：限制结果数量
+const users = await db.select().from(users).limit(100);
+
+// 分页
+const page = 1;
+const pageSize = 20;
+const users = await db
+  .select()
+  .from(users)
+  .limit(pageSize)
+  .offset((page - 1) * pageSize);
+```
+
+---
+
+## 二、索引策略
+
+### 2.1 创建索引
+
+```typescript
+import {
+  pgTable,
+  serial,
+  varchar,
+  text,
+  index,
+  uniqueIndex,
+} from "drizzle-orm/pg-core";
+
+export const users = pgTable(
+  "users",
+  {
+    id: serial("id").primaryKey(),
+    email: varchar("email", { length: 255 }).notNull(),
+    name: text("name"),
+    username: varchar("username", { length: 50 }).notNull(),
+    role: varchar("role", { length: 50 }),
+    status: varchar("status", { length: 50 }),
+    createdAt: timestamp("created_at").defaultNow(),
+  },
+  (table) => ({
+    // 单列索引
+    emailIdx: index("users_email_idx").on(table.email),
+    usernameIdx: uniqueIndex("users_username_idx").on(table.username),
+
+    // 复合索引
+    roleStatusIdx: index("users_role_status_idx").on(table.role, table.status),
+
+    // 用于排序的索引
+    createdAtIdx: index("users_created_at_idx").on(table.createdAt),
+  })
+);
+```
+
+### 2.2 索引类型选择
+
+```typescript
+import { pgTable, index, uniqueIndex, ginIndex } from 'drizzle-orm/pg-core';
+
+// B-tree 索引（默认）
+emailIdx: index('idx').on(table.email),
+
+// 唯一索引
+usernameIdx: uniqueIndex('idx').on(table.username),
+
+// GIN 索引（用于 JSONB）
+searchIdx: ginIndex('idx').on(table.metadata),
+
+// 复合索引（注意列顺序）
+// 查询时，第一列必须存在才能使用索引
+roleStatusIdx: index('idx').on(table.role, table.status),
+// ✅ WHERE role = 'admin'
+// ✅ WHERE role = 'admin' AND status = 'active'
+// ❌ WHERE status = 'active'（第一列不存在）
+```
+
+### 2.3 部分索引
+
+```typescript
+import { pgTable, index, sql } from "drizzle-orm/pg-core";
+
+export const orders = pgTable(
+  "orders",
+  {
+    id: serial("id").primaryKey(),
+    status: varchar("status", { length: 50 }).notNull(),
+    createdAt: timestamp("created_at").defaultNow(),
+  },
+  (table) => ({
+    // 只索引未完成的订单
+    activeOrdersIdx: index("active_orders_idx")
+      .on(table.createdAt)
+      .where(sql`${table.status} != 'completed'`),
+  })
+);
+```
+
+### 2.4 索引最佳实践
+
+```typescript
+// ✅ 好的做法：为 WHERE 子句创建索引
+export const posts = pgTable(
+  "posts",
+  {
+    authorId: integer("author_id"),
+    published: boolean("published"),
+  },
+  (table) => ({
+    // 用于 WHERE authorId = ?
+    authorIdx: index("idx").on(table.authorId),
+
+    // 用于 WHERE authorId = ? AND published = ?
+    authorPublishedIdx: index("idx").on(table.authorId, table.published),
+  })
+);
+
+// 查询
+await db
+  .select()
+  .from(posts)
+  .where(and(eq(posts.authorId, 1), eq(posts.published, true)));
+// 使用 authorPublishedIdx 索引
+```
+
+### 2.5 查看索引使用情况
+
+```sql
+-- PostgreSQL 查看索引使用统计
+SELECT
+  schemaname,
+  tablename,
+  indexname,
+  idx_scan as index_scans,
+  idx_tup_read as tuples_read,
+  idx_tup_fetch as tuples_fetched
+FROM pg_stat_user_indexes
+WHERE tablename = 'users'
+ORDER BY idx_scan ASC;
+
+-- 查看未使用的索引
+SELECT
+  schemaname,
+  tablename,
+  indexname
+FROM pg_stat_user_indexes
+WHERE idx_scan = 0
+  AND indexname NOT LIKE '%_pkey';
+```
+
+---
+
+## 三、连接池配置
+
+### 3.1 生产环境配置
+
+```typescript
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+
+export const db = drizzle(
+  postgres(process.env.DATABASE_URL!, {
+    // 最大连接数
+    max: 10,
+
+    // 空闲连接超时（秒）
+    idle_timeout: 20,
+
+    // 连接超时（秒）
+    connect_timeout: 10,
+
+    // 最大连接生命周期（秒，30 分钟）
+    max_lifetime: 60 * 30,
+
+    // 启用 prepared statements 缓存
+    prepare: true,
+
+    // 懒加载连接
+    lazy: true,
+
+    // 连接空闲时发送 ping
+    idle_in_transaction_session_timeout: 60,
+
+    // onnotice 回调
+    onnotice: (notice) => console.log("PostgreSQL notice:", notice),
+  }),
+  { schema }
+);
+```
+
+### 3.2 不同环境的配置
+
+```typescript
+const isDev = process.env.NODE_ENV === "development";
+const isTest = process.env.NODE_ENV === "test";
+const isProd = process.env.NODE_ENV === "production";
+
+export const db = drizzle(
+  postgres(process.env.DATABASE_URL!, {
+    // 开发环境：单连接（避免热重载问题）
+    max: isDev ? 1 : isProd ? 10 : 1,
+
+    // 测试环境：快速超时
+    idle_timeout: isTest ? 1 : 20,
+
+    // 生产环境：较长生命周期
+    max_lifetime: isProd ? 60 * 30 : 60 * 5,
+
+    // 是否 prepared statements
+    prepare: !isDev,
+  }),
+  { schema }
+);
+```
+
+### 3.3 Serverless 环境
+
+```typescript
+// Vercel / Netlify / Cloudflare Workers
+// 使用无状态连接
+import { drizzle } from "drizzle-orm/neon-http";
+import { neon } from "@neondatabase/serverless";
+
+const sql = neon(process.env.DATABASE_URL!);
+export const db = drizzle(sql, { schema });
+```
+
+---
+
+## 四、预编译语句
+
+### 4.1 使用 Prepare
+
+```typescript
+// ✅ 好的做法：使用预编译语句
+const getUserById = db
+  .select()
+  .from(users)
+  .where(eq(users.id, sql.placeholder("id")))
+  .prepare();
+
+// 多次使用
+const user1 = await getUserById.execute({ id: 1 });
+const user2 = await getUserById.execute({ id: 2 });
+const user3 = await getUserById.execute({ id: 3 });
+
+// SQL 只编译一次，然后复用
+```
+
+### 4.2 带参数的预编译语句
+
+```typescript
+// 复杂查询预编译
+const getActiveUsers = db
+  .select({
+    id: users.id,
+    name: users.name,
+    email: users.email,
+  })
+  .from(users)
+  .where(
+    and(
+      eq(users.status, sql.placeholder("status")),
+      gt(users.createdAt, sql.placeholder("since"))
+    )
+  )
+  .orderBy(desc(users.createdAt))
+  .limit(sql.placeholder("limit"))
+  .prepare();
+
+// 使用
+const activeUsers = await getActiveUsers.execute({
+  status: "active",
+  since: new Date("2024-01-01"),
+  limit: 50,
+});
+```
+
+### 4.3 预编译语句缓存
+
+```typescript
+// 创建预编译语句缓存
+const statementCache = new Map<string, PreparedQuery>();
+
+function getCachedStatement(
+  db: DrizzleDB,
+  key: string,
+  builder: () => PreparedQuery
+) {
+  if (!statementCache.has(key)) {
+    statementCache.set(key, builder());
+  }
+  return statementCache.get(key)!;
+}
+
+// 使用
+const getUserStmt = getCachedStatement(db, "getUserById", () =>
+  db
+    .select()
+    .from(users)
+    .where(eq(users.id, sql.placeholder("id")))
+    .prepare()
+);
+```
+
+---
+
+## 五、批量操作优化
+
+### 5.1 批量插入
+
+```typescript
+// ❌ 不好的做法：循环插入
+for (const user of users) {
+  await db.insert(usersTable).values(user);
+}
+
+// ✅ 好的做法：批量插入
+await db.insert(usersTable).values(users);
+```
+
+### 5.2 批量更新
+
+```typescript
+import { sql } from "drizzle-orm";
+
+// ❌ 不好的做法：循环更新
+for (const user of users) {
+  await db
+    .update(usersTable)
+    .set({ lastLoginAt: new Date() })
+    .where(eq(usersTable.id, user.id));
+}
+
+// ✅ 好的做法 1：使用 CASE WHEN
+await db.execute(sql`
+  UPDATE users
+  SET last_login_at = CASE id
+    ${sql.join(
+      users.map((u) => sql`WHEN ${u.id} THEN ${new Date()}`),
+      sql` `
+    )}
+    ELSE last_login_at
+  END
+  WHERE id = ANY(${users.map((u) => u.id)})
+`);
+
+// ✅ 好的做法 2：使用事务批量更新
+await db.transaction(async (tx) => {
+  for (const user of users) {
+    await tx
+      .update(usersTable)
+      .set({ lastLoginAt: new Date() })
+      .where(eq(usersTable.id, user.id));
+  }
+});
+```
+
+### 5.3 批量删除
+
+```typescript
+// ❌ 不好的做法
+for (const id of ids) {
+  await db.delete(usersTable).where(eq(usersTable.id, id));
+}
+
+// ✅ 好的做法：使用 IN
+import { sql } from "drizzle-orm";
+
+await db.delete(usersTable).where(sql`${usersTable.id} = ANY(${ids})`);
+```
+
+---
+
+## 六、缓存策略
+
+### 6.1 应用层缓存
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis(process.env.REDIS_URL!);
+
+export async function getCachedUser(id: number) {
+  // 1. 尝试从 Redis 读取
+  const cached = await redis.get(`user:${id}`);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+
+  // 2. 从数据库查询
+  const [user] = await db.select().from(users).where(eq(users.id, id)).limit(1);
+
+  if (!user) {
+    return null;
+  }
+
+  // 3. 写入缓存（5 分钟）
+  await redis.setex(`user:${id}`, 300, JSON.stringify(user));
+
+  return user;
+}
+
+export async function invalidateUserCache(id: number) {
+  await redis.del(`user:${id}`);
+  await redis.del("users:all");
+  await redis.del("users:active");
+}
+```
+
+### 6.2 查询结果缓存
+
+```typescript
+import LRUCache from "lru-cache";
+
+const queryCache = new LRUCache<string, any>({
+  max: 500, // 最大缓存数量
+  ttl: 1000 * 60 * 5, // 5 分钟过期
+});
+
+export async function getPopularPosts() {
+  const cacheKey = "posts:popular";
+
+  // 检查缓存
+  const cached = queryCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  // 查询数据库
+  const posts = await db
+    .select()
+    .from(postsTable)
+    .where(eq(postsTable.published, true))
+    .orderBy(desc(postsTable.views))
+    .limit(10);
+
+  // 写入缓存
+  queryCache.set(cacheKey, posts);
+
+  return posts;
+}
+```
+
+### 6.3 HTTP 缓存
+
+```typescript
+// Next.js API 路由
+import { NextResponse } from "next/server";
+
+export async function GET() {
+  const posts = await db.select().from(postsTable);
+
+  return NextResponse.json(posts, {
+    headers: {
+      // 强缓存 5 分钟
+      "Cache-Control": "public, max-age=300, s-maxage=300",
+
+      // 协商缓存
+      ETag: JSON.stringify(posts).toString(),
+    },
+  });
+}
+```
+
+---
+
+## 七、监控和日志
+
+### 7.1 查询日志
+
+```typescript
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+
+export const db = drizzle(
+  postgres(process.env.DATABASE_URL!, {
+    // 查询日志
+    onnotice: (notice) => {
+      console.log("PostgreSQL notice:", notice);
+    },
+
+    // 连接日志
+    connect: () => {
+      console.log("New database connection established");
+    },
+
+    // 查询前日志
+    debug: (connection_id, query, params) => {
+      console.log("Query:", query, "Params:", params);
+    },
+  }),
+  { schema }
+);
+```
+
+### 7.2 性能监控
+
+```typescript
+import { drizzle } from "drizzle-orm/postgres-js";
+
+export const db = drizzle(client, {
+  schema,
+  logger: {
+    logQuery: (query, params) => {
+      const start = Date.now();
+
+      return async () => {
+        const duration = Date.now() - start;
+
+        // 记录慢查询
+        if (duration > 100) {
+          console.warn(`Slow query (${duration}ms):`, query, params);
+        }
+
+        // 发送到监控系统
+        // await metricsService.recordQuery({ query, duration, params });
+      };
+    },
+  },
+});
+```
+
+### 7.3 健康检查
+
+```typescript
+export async function healthCheck() {
+  try {
+    const start = Date.now();
+
+    await db.execute(sql`SELECT 1`);
+
+    const duration = Date.now() - start;
+
+    return {
+      status: "healthy",
+      database: {
+        connected: true,
+        latency: `${duration}ms`,
+      },
+    };
+  } catch (error) {
+    return {
+      status: "unhealthy",
+      database: {
+        connected: false,
+        error: error instanceof Error ? error.message : "Unknown error",
+      },
+    };
+  }
+}
+
+// API 路由
+export async function GET() {
+  const health = await healthCheck();
+
+  return Response.json(health, {
+    status: health.status === "healthy" ? 200 : 503,
+  });
+}
+```
+
+---
+
+## 八、实战优化案例
+
+### 8.1 优化 N+1 查询
+
+```typescript
+// ❌ N+1 问题
+const posts = await db.select().from(postsTable);
+
+for (const post of posts) {
+  const [author] = await db
+    .select()
+    .from(users)
+    .where(eq(users.id, post.authorId))
+    .limit(1);
+
+  post.author = author;
+}
+
+// ✅ 使用 JOIN
+const posts = await db
+  .select({
+    id: postsTable.id,
+    title: postsTable.title,
+    author: {
+      id: users.id,
+      name: users.name,
+      email: users.email,
+    },
+  })
+  .from(postsTable)
+  .innerJoin(users, eq(postsTable.authorId, users.id));
+```
+
+### 8.2 优化分页查询
+
+```typescript
+// ❌ 使用 OFFSET（慢）
+const page = 1000;
+const pageSize = 20;
+
+const posts = await db
+  .select()
+  .from(postsTable)
+  .limit(pageSize)
+  .offset((page - 1) * pageSize);
+// 需要扫描前 1000 + 20 条记录
+
+// ✅ 使用游标分页（快）
+const lastId = 20000; // 上一页最后一条记录的 ID
+
+const posts = await db
+  .select()
+  .from(postsTable)
+  .where(gt(postsTable.id, lastId))
+  .orderBy(postsTable.id)
+  .limit(pageSize);
+// 只扫描需要的记录
+```
+
+### 8.3 优化计数查询
+
+```typescript
+// ❌ 不好的做法：每次都查询计数
+const [countResult] = await db
+  .select({ count: sql<number>`count(*)` })
+  .from(postsTable);
+
+const posts = await db.select().from(postsTable).limit(20);
+
+// ✅ 好的做法：缓存计数或使用元数据
+const posts = await db.select().from(postsTable).limit(21); // 多查一条
+
+const hasMore = posts.length === 21;
+const items = posts.slice(0, 20);
+
+return { items, hasMore };
+```
+
+---
+
+## 九、最佳实践清单
+
+### 9.1 查询优化
+
+```typescript
+// ✅ 只查询需要的字段
+await db.select({ id: users.id, name: users.name }).from(users);
+
+// ✅ 使用索引字段过滤
+await db.select().from(users).where(eq(users.email, "test@example.com"));
+
+// ✅ 使用 LIMIT
+await db.select().from(users).limit(100);
+
+// ✅ 使用预编译语句
+const stmt = db
+  .select()
+  .from(users)
+  .where(eq(users.id, sql.placeholder("id")))
+  .prepare();
+await stmt.execute({ id: 1 });
+```
+
+### 9.2 索引优化
+
+```typescript
+// ✅ 为常用查询条件创建索引
+export const users = pgTable(
+  "users",
+  {
+    email: varchar("email").notNull(),
+  },
+  (table) => ({
+    emailIdx: index("idx").on(table.email),
+  })
+);
+
+// ✅ 使用复合索引
+export const posts = pgTable(
+  "posts",
+  {
+    authorId: integer("author_id"),
+    published: boolean("published"),
+  },
+  (table) => ({
+    authorPublishedIdx: index("idx").on(table.authorId, table.published),
+  })
+);
+```
+
+### 9.3 缓存优化
+
+```typescript
+// ✅ 使用 Redis 缓存热点数据
+const cached = await redis.get("key");
+if (cached) return JSON.parse(cached);
+
+// ✅ 设置合理的过期时间
+await redis.setex("key", 300, value); // 5 分钟
+
+// ✅ 正确失效缓存
+await redis.del("key");
+```
+
+### 9.4 错误处理
+
+```typescript
+// ✅ 正确处理数据库错误
+try {
+  const user = await db.select().from(users).where(eq(users.id, id));
+} catch (error) {
+  if (error instanceof PostgresError) {
+    if (error.code === "23505") {
+      // 唯一约束冲突
+      throw new ConflictError("Email already exists");
+    }
+  }
+  throw error;
+}
+```
+
+---
+
+## 十、总结
+
+**本文我们学习了**：
+
+✅ **查询优化** - 只查需要的字段、使用索引、LIMIT
+✅ **索引策略** - 单列、复合、部分、GIN 索引
+✅ **连接池配置** - 生产环境、Serverless 配置
+✅ **预编译语句** - Prepare、缓存
+✅ **批量操作** - 批量插入、更新、删除
+✅ **缓存策略** - Redis、LRU、HTTP 缓存
+✅ **监控日志** - 查询日志、性能监控、健康检查
+
+**性能优化要点**：
+
+1. 始终只查询需要的字段
+2. 为常用查询条件创建索引
+3. 使用批量操作减少往返
+4. 合理使用缓存减少数据库压力
+5. 监控慢查询并优化
+
+**下一步**：
+
+在最后一篇文章《实战项目 - 全球博客系统》中，我们将综合运用所学知识，构建一个完整的边缘分布式博客系统。
+
+---
+
+**相关代码**：[09-performance-best-practices](https://github.com/yourname/drizzle-examples/tree/09-performance-best-practices)

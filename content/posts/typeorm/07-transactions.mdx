@@ -1,0 +1,771 @@
+---
+title: "07. 事务处理"
+date: "2026-03-29"
+summary: "深入掌握 TypeORM 的事务机制，学会使用 DataSource.transaction、QueryRunner、EntityManager 管理事务，理解隔离级别、乐观锁和悲观锁。"
+tags: ["TypeORM", "事务", "数据库", "并发控制", "锁"]
+category: "typeorm"
+draft: false
+series: "TypeORM 实战：NestJS 数据库开发"
+seriesOrder: 7
+---
+
+## 前言
+
+事务（Transaction）是保证数据库操作**原子性**的关键机制。当多个操作需要作为一个整体执行时，事务确保要么全部成功，要么全部回滚。在涉及资金转账、库存管理等场景中，事务是不可或缺的。
+
+**本篇你将学到**：
+
+- TypeORM 的三种事务使用方式
+- 事务隔离级别
+- 乐观锁（@Version）
+- 悲观锁（Pessimistic Lock）
+- 嵌套事务（SAVEPOINT）
+
+---
+
+## 为什么需要事务？
+
+### 没有事务时的问题
+
+```typescript
+// 场景：用户 A 向用户 B 转账 100 元
+
+// 步骤 1：A 扣除 100 元
+await userRepo.update(1, { balance: () => "balance - 100" });
+
+// 步骤 2：B 增加 100 元
+// ❌ 如果这一步失败了，A 的钱扣了但 B 没收到
+await userRepo.update(2, { balance: () => "balance + 100" });
+```
+
+### 使用事务保证一致性
+
+```typescript
+// ✅ 使用事务：要么全部成功，要么全部回滚
+await dataSource.transaction(async (manager) => {
+  await manager.update(User, 1, { balance: () => "balance - 100" });
+  await manager.update(User, 2, { balance: () => "balance + 100" });
+  // 任何一步失败，所有变更都会回滚
+});
+```
+
+### ACID 特性
+
+| 特性   | 说明                                   |
+| ------ | -------------------------------------- |
+| 原子性 | 事务中的操作要么全部成功，要么全部回滚 |
+| 一致性 | 事务前后数据保持一致                   |
+| 隔离性 | 并发事务之间互不影响                   |
+| 持久性 | 事务提交后，数据永久保存               |
+
+---
+
+## 方式一：DataSource.transaction()
+
+最常用的事务方式，推荐大多数场景使用。
+
+### 基本用法
+
+```typescript
+// 使用 EntityManager
+await dataSource.transaction(async (manager) => {
+  // 在这里执行的所有操作都在同一个事务中
+  const user = manager.create(User, {
+    name: "张三",
+    email: "zhangsan@example.com",
+  });
+  await manager.save(user);
+
+  const post = manager.create(Post, {
+    title: "第一篇文章",
+    content: "Hello World",
+    author: user,
+  });
+  await manager.save(post);
+});
+```
+
+### 自动回滚
+
+```typescript
+await dataSource.transaction(async (manager) => {
+  await manager.save(User, { name: "张三" });
+
+  // 抛出异常 → 自动回滚所有变更
+  throw new Error("出错了");
+  // 张三不会被保存
+});
+```
+
+### 事务中查询
+
+```typescript
+await dataSource.transaction(async (manager) => {
+  // 查询用户
+  const user = await manager.findOne(User, {
+    where: { id: 1 },
+    lock: { mode: "pessimistic_write" }, // 悲观写锁
+  });
+
+  // 修改余额
+  user.balance -= 100;
+  await manager.save(user);
+});
+```
+
+---
+
+## 方式二：@Transaction 装饰器（NestJS）
+
+在 NestJS 中，可以使用装饰器简化事务管理。
+
+### 使用 @TransactionEntityManager
+
+```typescript
+import { Transaction, TransactionManager } from "typeorm";
+
+@Injectable()
+export class UserService {
+  constructor(
+    @InjectRepository(User)
+    private userRepo: Repository<User>
+  ) {}
+
+  // NestJS 中推荐的方式
+  async createUserWithProfile(data: CreateUserDto) {
+    return this.userRepo.manager.transaction(async (manager) => {
+      const user = manager.create(User, {
+        name: data.name,
+        email: data.email,
+        passwordHash: "hashed",
+      });
+      await manager.save(user);
+
+      const profile = manager.create(Profile, {
+        bio: data.bio,
+        user: user,
+      });
+      await manager.save(profile);
+
+      return user;
+    });
+  }
+}
+```
+
+### 使用 DataSource 注入
+
+```typescript
+@Injectable()
+export class PostService {
+  constructor(
+    private dataSource: DataSource,
+    @InjectRepository(Post)
+    private postRepo: Repository<Post>
+  ) {}
+
+  async createPostWithTags(data: CreatePostDto) {
+    return this.dataSource.transaction(async (manager) => {
+      // 创建文章
+      const post = manager.create(Post, {
+        title: data.title,
+        content: data.content,
+        author: { id: data.authorId },
+      });
+      await manager.save(post);
+
+      // 关联标签
+      if (data.tagIds?.length) {
+        const tags = await manager.findBy(Tag, {
+          id: In(data.tagIds),
+        });
+        post.tags = tags;
+        await manager.save(post);
+      }
+
+      return post;
+    });
+  }
+}
+```
+
+---
+
+## 方式三：QueryRunner
+
+QueryRunner 提供最细粒度的事务控制，适合需要手动管理事务的场景。
+
+### 基本用法
+
+```typescript
+// 创建 QueryRunner
+const queryRunner = dataSource.createQueryRunner();
+
+// 建立连接
+await queryRunner.connect();
+
+// 开始事务
+await queryRunner.startTransaction();
+
+try {
+  // 执行操作
+  await queryRunner.manager.save(User, {
+    name: "张三",
+    email: "zhangsan@example.com",
+  });
+
+  await queryRunner.manager.save(Post, {
+    title: "第一篇文章",
+    content: "Hello World",
+    authorId: 1,
+  });
+
+  // 提交事务
+  await queryRunner.commitTransaction();
+} catch (error) {
+  // 回滚事务
+  await queryRunner.rollbackTransaction();
+  throw error;
+} finally {
+  // 释放连接
+  await queryRunner.release();
+}
+```
+
+### 手动控制事务
+
+```typescript
+async function transferMoney(fromId: number, toId: number, amount: number) {
+  const queryRunner = dataSource.createQueryRunner();
+  await queryRunner.connect();
+  await queryRunner.startTransaction();
+
+  try {
+    // 查询发送方余额（加锁）
+    const from = await queryRunner.manager.findOne(User, {
+      where: { id: fromId },
+      lock: { mode: "pessimistic_write" },
+    });
+
+    if (!from) throw new Error("发送方不存在");
+    if (from.balance < amount) throw new Error("余额不足");
+
+    // 查询接收方余额（加锁）
+    const to = await queryRunner.manager.findOne(User, {
+      where: { id: toId },
+      lock: { mode: "pessimistic_write" },
+    });
+
+    if (!to) throw new Error("接收方不存在");
+
+    // 执行转账
+    from.balance -= amount;
+    to.balance += amount;
+
+    await queryRunner.manager.save(from);
+    await queryRunner.manager.save(to);
+
+    // 记录转账日志
+    await queryRunner.manager.save(TransactionLog, {
+      fromId,
+      toId,
+      amount,
+      type: "TRANSFER",
+    });
+
+    await queryRunner.commitTransaction();
+    return { success: true };
+  } catch (error) {
+    await queryRunner.rollbackTransaction();
+    return { success: false, error: error.message };
+  } finally {
+    await queryRunner.release();
+  }
+}
+```
+
+### 三种方式对比
+
+| 特性     | DataSource.transaction() | QueryRunner   |
+| -------- | ------------------------ | ------------- |
+| 易用性   | ⭐⭐⭐⭐⭐               | ⭐⭐⭐        |
+| 控制粒度 | 自动                     | 手动          |
+| 事务管理 | 自动提交/回滚            | 手动提交/回滚 |
+| 锁控制   | 支持                     | 支持          |
+| 连接管理 | 自动                     | 手动 release  |
+| 适用场景 | 大多数场景               | 复杂业务逻辑  |
+
+---
+
+## 事务隔离级别
+
+隔离级别决定了事务之间如何互相可见。
+
+### 隔离级别类型
+
+```typescript
+import { IsolationLevel } from "typeorm";
+
+// 设置隔离级别
+await queryRunner.startTransaction(IsolationLevel.READ_COMMITTED);
+```
+
+| 隔离级别         | 脏读 | 不可重复读 | 幻读 | 性能 |
+| ---------------- | ---- | ---------- | ---- | ---- |
+| READ UNCOMMITTED | 可能 | 可能       | 可能 | 最高 |
+| READ COMMITTED   | 不会 | 可能       | 可能 | 高   |
+| REPEATABLE READ  | 不会 | 不会       | 可能 | 中   |
+| SERIALIZABLE     | 不会 | 不会       | 不会 | 最低 |
+
+### 使用示例
+
+```typescript
+// READ COMMITTED（PostgreSQL 默认）
+await dataSource.transaction(
+  { isolationLevel: "READ COMMITTED" },
+  async (manager) => {
+    // 只能读取已提交的数据
+    const user = await manager.findOneBy(User, { id: 1 });
+  }
+);
+
+// SERIALIZABLE（最严格）
+await dataSource.transaction(
+  { isolationLevel: "SERIALIZABLE" },
+  async (manager) => {
+    // 事务完全串行化，最安全但性能最低
+    const user = await manager.findOneBy(User, { id: 1 });
+  }
+);
+```
+
+---
+
+## 乐观锁
+
+乐观锁通过**版本号**检测并发冲突，不真正锁定数据行。
+
+### 使用 @Version
+
+```typescript
+import { Entity, PrimaryGeneratedColumn, Column, VersionColumn } from "typeorm";
+
+@Entity("products")
+export class Product {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column({ type: "decimal", precision: 10, scale: 2 })
+  price: string;
+
+  @Column()
+  stock: number;
+
+  @VersionColumn()
+  version: number; // 每次更新自动 +1
+}
+```
+
+### 乐观锁工作原理
+
+```typescript
+// 用户 A 和 B 同时读取商品
+const productA = await productRepo.findOneBy({ id: 1 });
+// { id: 1, price: '100.00', stock: 50, version: 1 }
+
+const productB = await productRepo.findOneBy({ id: 1 });
+// { id: 1, price: '100.00', stock: 50, version: 1 }
+
+// 用户 A 先更新
+productA.price = "99.99";
+await productRepo.save(productA);
+// UPDATE products SET price = '99.99', version = 2
+// WHERE id = 1 AND version = 1
+// ✅ 成功，version 变为 2
+
+// 用户 B 再更新
+productB.stock = 45;
+await productRepo.save(productB);
+// UPDATE products SET stock = 45, version = 2
+// WHERE id = 1 AND version = 1
+// ❌ 失败！版本号不匹配，抛出 OptimisticLockVersionMismatchError
+```
+
+### 处理乐观锁冲突
+
+```typescript
+import { OptimisticLockVersionMismatchError } from "typeorm";
+
+async function updateProductPrice(id: number, newPrice: string) {
+  const maxRetries = 3;
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const product = await productRepo.findOneBy({ id });
+      product.price = newPrice;
+      await productRepo.save(product);
+      return product; // 成功
+    } catch (error) {
+      if (error instanceof OptimisticLockVersionMismatchError) {
+        console.log(`第 ${attempt + 1} 次重试...`);
+        continue; // 重试
+      }
+      throw error; // 其他错误直接抛出
+    }
+  }
+
+  throw new Error("更新失败：并发冲突过多");
+}
+```
+
+### 使用时间戳乐观锁
+
+```typescript
+@Entity("products")
+export class Product {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  name: string;
+
+  @UpdateDateColumn()
+  @VersionColumn()
+  updatedAt: Date; // 使用更新时间作为版本号
+}
+```
+
+---
+
+## 悲观锁
+
+悲观锁在读取数据时就锁定行，防止其他事务修改。
+
+### 使用方式
+
+```typescript
+// 悲观读锁（共享锁）：允许其他事务读取，但不允许修改
+const user = await userRepo.findOne({
+  where: { id: 1 },
+  lock: { mode: "pessimistic_read" },
+});
+// SELECT * FROM users WHERE id = 1 FOR SHARE
+
+// 悲观写锁（排他锁）：其他事务不能读取也不能修改
+const user = await userRepo.findOne({
+  where: { id: 1 },
+  lock: { mode: "pessimistic_write" },
+});
+// SELECT * FROM users WHERE id = 1 FOR UPDATE
+```
+
+### 实战：库存扣减
+
+```typescript
+async function deductStock(productId: number, quantity: number) {
+  return dataSource.transaction(async (manager) => {
+    // 使用悲观写锁锁定商品行
+    const product = await manager.findOne(Product, {
+      where: { id: productId },
+      lock: { mode: "pessimistic_write" },
+    });
+
+    if (!product) throw new Error("商品不存在");
+    if (product.stock < quantity) throw new Error("库存不足");
+
+    // 扣减库存
+    product.stock -= quantity;
+    await manager.save(product);
+
+    // 创建订单
+    const order = manager.create(Order, {
+      productId,
+      quantity,
+      totalPrice: String(Number(product.price) * quantity),
+    });
+    await manager.save(order);
+
+    return order;
+  });
+}
+```
+
+### 锁与 JOIN
+
+```typescript
+// 锁定关联数据
+const post = await postRepo
+  .createQueryBuilder("post")
+  .leftJoinAndSelect("post.author", "author")
+  .setLock("pessimistic_write")
+  .where("post.id = :id", { id: 1 })
+  .getOne();
+// SELECT ... FOR UPDATE
+```
+
+### 乐观锁 vs 悲观锁
+
+| 特性     | 乐观锁         | 悲观锁                |
+| -------- | -------------- | --------------------- |
+| 锁定时机 | 更新时检查     | 读取时锁定            |
+| 冲突检测 | 版本号不匹配   | 不允许并发            |
+| 性能     | 高（不锁定行） | 较低（锁定行）        |
+| 适用场景 | 读多写少       | 写多冲突多            |
+| 实现方式 | @VersionColumn | lock: { mode: "..." } |
+
+---
+
+## 嵌套事务（SAVEPOINT）
+
+TypeORM 支持嵌套事务，内部使用数据库的 SAVEPOINT 机制。
+
+### 使用示例
+
+```typescript
+await dataSource.transaction(async (manager) => {
+  // 外层事务
+  await manager.save(User, { name: "张三" });
+
+  // 嵌套事务（创建 SAVEPOINT）
+  await manager.transaction(async (nestedManager) => {
+    await nestedManager.save(Post, { title: "文章" });
+
+    // 更深的嵌套
+    await nestedManager.transaction(async (deepManager) => {
+      await deepManager.save(Comment, { content: "评论" });
+    });
+  });
+
+  // 外层事务继续
+  await manager.save(Tag, { name: "标签" });
+});
+```
+
+### SAVEPOINT 工作原理
+
+```sql
+BEGIN; -- 外层事务
+  INSERT INTO users (name) VALUES ('张三');
+
+  SAVEPOINT savepoint_1; -- 嵌套事务
+    INSERT INTO posts (title) VALUES ('文章');
+
+    SAVEPOINT savepoint_2; -- 更深的嵌套
+      INSERT INTO comments (content) VALUES ('评论');
+    RELEASE SAVEPOINT savepoint_2; -- 提交嵌套
+  RELEASE SAVEPOINT savepoint_1; -- 提交嵌套
+
+  INSERT INTO tags (name) VALUES ('标签');
+COMMIT; -- 提交外层事务
+```
+
+---
+
+## 实战：订单系统事务
+
+```typescript
+@Injectable()
+export class OrderService {
+  constructor(private dataSource: DataSource) {}
+
+  // 创建订单（事务保证）
+  async createOrder(userId: number, items: OrderItemDto[]) {
+    return this.dataSource.transaction(async (manager) => {
+      let totalAmount = 0;
+      const orderItems: OrderItem[] = [];
+
+      // 1. 逐个处理商品
+      for (const item of items) {
+        // 悲观锁锁定商品
+        const product = await manager.findOne(Product, {
+          where: { id: item.productId },
+          lock: { mode: "pessimistic_write" },
+        });
+
+        if (!product) throw new Error(`商品 ${item.productId} 不存在`);
+        if (product.stock < item.quantity) {
+          throw new Error(`商品 ${product.name} 库存不足`);
+        }
+
+        // 扣减库存
+        product.stock -= item.quantity;
+        await manager.save(product);
+
+        // 计算金额
+        const itemTotal = Number(product.price) * item.quantity;
+        totalAmount += itemTotal;
+
+        orderItems.push(
+          manager.create(OrderItem, {
+            productId: product.id,
+            productName: product.name,
+            quantity: item.quantity,
+            unitPrice: product.price,
+            totalPrice: String(itemTotal),
+          })
+        );
+      }
+
+      // 2. 创建订单
+      const order = manager.create(Order, {
+        userId,
+        totalAmount: String(totalAmount),
+        status: "PENDING",
+        items: orderItems,
+      });
+      await manager.save(order);
+
+      // 3. 记录日志
+      await manager.save(OrderLog, {
+        orderId: order.id,
+        action: "CREATED",
+        data: { items: items.map((i) => i.productId) },
+      });
+
+      return order;
+    });
+  }
+
+  // 取消订单（回滚库存）
+  async cancelOrder(orderId: number) {
+    return this.dataSource.transaction(async (manager) => {
+      // 悲观锁锁定订单
+      const order = await manager.findOne(Order, {
+        where: { id: orderId },
+        relations: ["items"],
+        lock: { mode: "pessimistic_write" },
+      });
+
+      if (!order) throw new Error("订单不存在");
+      if (order.status === "CANCELLED") throw new Error("订单已取消");
+
+      // 恢复库存
+      for (const item of order.items) {
+        await manager.increment(
+          Product,
+          { id: item.productId },
+          "stock",
+          item.quantity
+        );
+      }
+
+      // 更新订单状态
+      order.status = "CANCELLED";
+      await manager.save(order);
+
+      // 记录日志
+      await manager.save(OrderLog, {
+        orderId: order.id,
+        action: "CANCELLED",
+      });
+
+      return order;
+    });
+  }
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 保持事务简短
+
+```typescript
+// ✅ 好：事务只包含数据库操作
+await dataSource.transaction(async (manager) => {
+  await manager.save(user);
+  await manager.save(profile);
+});
+
+// ❌ 坏：事务中包含耗时操作
+await dataSource.transaction(async (manager) => {
+  await manager.save(user);
+  await sendWelcomeEmail(user); // ❌ 不要在事务中发邮件
+  await uploadAvatar(user); // ❌ 不要在事务中上传文件
+  await manager.save(profile);
+});
+
+// ✅ 好：事务外处理耗时操作
+const { user, profile } = await dataSource.transaction(async (manager) => {
+  const user = await manager.save(/* ... */);
+  const profile = await manager.save(/* ... */);
+  return { user, profile };
+});
+// 事务提交后再处理
+await sendWelcomeEmail(user);
+```
+
+### 2. 选择合适的锁策略
+
+```typescript
+// 读多写少 → 乐观锁
+@VersionColumn()
+version: number;
+
+// 写多冲突多 → 悲观锁
+lock: { mode: "pessimistic_write" }
+```
+
+### 3. 指定合适的隔离级别
+
+```typescript
+// 大多数场景使用默认的 READ COMMITTED 即可
+
+// 需要严格一致性（如报表统计）使用 REPEATABLE READ
+await dataSource.transaction(
+  { isolationLevel: "REPEATABLE READ" },
+  async (manager) => {
+    // 统计逻辑
+  }
+);
+```
+
+---
+
+## 总结
+
+### 核心要点
+
+1. **三种事务方式**
+   - `DataSource.transaction()`：推荐大多数场景
+   - `QueryRunner`：需要手动控制的场景
+   - NestJS 依赖注入：与框架深度集成
+
+2. **隔离级别**
+   - READ COMMITTED（默认）：适合大多数场景
+   - REPEATABLE READ：适合需要一致性读取的场景
+   - SERIALIZABLE：最严格，性能最低
+
+3. **乐观锁 vs 悲观锁**
+   - 乐观锁：@VersionColumn，读多写少
+   - 悲观锁：lock 选项，写多冲突多
+
+4. **最佳实践**
+   - 事务保持简短
+   - 避免在事务中执行耗时操作
+   - 正确处理锁冲突
+
+### 下一步
+
+在下一篇文章中，我们将学习：
+
+- **NestJS 集成实战：博客 API**
+- TypeOrmModule 配置
+- 完整的 Posts 模块实现
+- DTO 验证和统一响应格式
+
+敬请期待！
+
+---
+
+## 参考资源
+
+- [TypeORM 事务文档](https://typeorm.io/transactions)
+- [PostgreSQL 事务隔离](https://www.postgresql.org/docs/current/transaction-iso.html)
+- [数据库并发控制](https://www.postgresql.org/docs/current/mvcc.html)
+
+---
+
+**上一篇**：[06. 数据库迁移](./06-migrations.mdx)
+**下一篇**：[08. NestJS 集成实战：博客 API](./08-nestjs-blog-api.mdx)

@@ -143,7 +143,7 @@ export const techStacks: TechStack[] = [
       "使用 Node.js 生态构建高性能后端服务，涵盖 NestJS、Hono 和 Prisma",
     icon: "🟢",
     color: "from-green-500 to-emerald-500",
-    categories: ["nestjs", "hono", "prisma", "trpc"],
+    categories: ["nestjs", "hono", "prisma", "typeorm", "trpc"],
     learningPath: [
       {
         order: 1,
@@ -165,6 +165,13 @@ export const techStacks: TechStack[] = [
         category: "prisma",
         description: "数据建模、迁移、类型安全的数据库访问",
         estimatedTime: "2周",
+      },
+      {
+        order: 4,
+        title: "TypeORM 实战",
+        category: "typeorm",
+        description: "实体定义、关系映射、QueryBuilder、NestJS 集成",
+        estimatedTime: "3周",
       },
     ],
     relatedStacks: ["programming-languages", "backend-core", "database-tech"],
@@ -275,6 +282,58 @@ export const techStacks: TechStack[] = [
       "programming-languages",
       "java-fullstack",
       "nodejs-backend",
+    ],
+  },
+  {
+    id: "agent-development",
+    slug: "agent-development",
+    name: "AI Agent 开发",
+    description:
+      "掌握 AI Agent 开发技能，从概念到实战，成为新时代的 Agent 开发工程师",
+    icon: "🧠",
+    color: "from-pink-500 to-rose-500",
+    categories: ["agent"],
+    learningPath: [
+      {
+        order: 1,
+        title: "Agent 概念认知",
+        category: "agent",
+        description: "理解 Agent 定义、工作原理、与传统软件的区别",
+        estimatedTime: "1周",
+      },
+      {
+        order: 2,
+        title: "Agent 开发工程师岗位",
+        category: "agent",
+        description: "了解岗位职责、能力要求、职业发展路径",
+        estimatedTime: "1周",
+      },
+      {
+        order: 3,
+        title: "核心能力与技术栈",
+        category: "agent",
+        description: "Prompt 工程、LangChain、RAG、向量数据库",
+        estimatedTime: "2周",
+      },
+      {
+        order: 4,
+        title: "前端转型 Agent 开发",
+        category: "agent",
+        description: "利用前端技能优势，渐进式学习 Agent 开发",
+        estimatedTime: "3周",
+      },
+      {
+        order: 5,
+        title: "Agent 实战项目",
+        category: "agent",
+        description: "从零构建智能客服 Agent，完整开发流程",
+        estimatedTime: "2周",
+      },
+    ],
+    relatedStacks: [
+      "programming-languages",
+      "nodejs-backend",
+      "productivity-tools",
     ],
   },
 ];
