@@ -1,0 +1,380 @@
+---
+title: "18 微服务入门"
+date: "2026-03-30"
+summary: "Node.js 微服务和 Java 微服务有什么不同？从 CMS 评论服务拆分出发，了解 Spring Cloud 的服务注册、网关和远程调用。"
+tags: ["Spring Boot", "微服务", "Spring Cloud", "服务拆分"]
+category: "springboot"
+cover: ""
+draft: false
+series: "Spring Boot 实战"
+seriesOrder: 18
+---
+
+CMS 跑了 18 篇文章的功能——用户管理、文章 CRUD、JWT 认证、Redis 缓存、WebSocket 实时通知、Docker 部署、性能优化，全在一个应用里。到目前为止这没问题。但现在产品经理说："我们要加评论系统，而且评论量可能是文章的 100 倍。"
+
+评论量和文章量差两个数量级，意味着数据库压力、缓存策略、部署频率都不一样。文章可能一周改一次代码，评论可能一天改三次。文章的数据库表有几十个字段，评论只需要 content + created_at。把评论塞在 CMS 应用里，每次改评论都要重新部署整个 CMS，每次评论量飙升都影响文章接口的响应时间。
+
+这就是拆分的理由。不是"微服务很酷所以要用"，而是**评论和文章的变更频率、负载特征、部署需求都不一样，放在一起互相拖累。**
+
+## 单体 vs 微服务：什么时候拆
+
+先不要急着拆。微服务引入的复杂度是实实在在的——服务间通信、分布式事务、数据一致性、运维成本——这些都会显著上升。一个简单的判断标准：
+
+**继续单体的条件：**
+
+- 团队人数 < 10，一个团队就能维护整个应用
+- 模块之间的变更频率和负载特征相似
+- 部署频率低（一周一次以下）
+- 没有明确的性能瓶颈需要独立扩展某个模块
+
+**考虑拆分的信号：**
+
+- 某个模块的变更频率远高于其他模块（评论一天改三次，文章一周一次）
+- 某个模块的负载远高于其他模块（评论 QPS 是文章的 100 倍）
+- 团队按模块拆分，不同团队负责不同模块
+- 某个模块需要不同的技术栈（比如评论需要全文搜索，文章不需要）
+
+CMS 的评论功能符合后三个条件。现在来拆。
+
+## 拆分策略：按业务领域，不按技术层
+
+拆分的第一步是决定怎么切。最常见的错误是按技术层拆：把所有 Controller 放一个服务，所有 Service 放一个服务，所有 Repository 放一个服务。这种拆法没有任何意义——每次改功能还是要动三个服务。
+
+正确的拆法是按业务领域：CMS 拆成文章服务和评论服务。
+
+```
+拆分前（单体 CMS）：
+┌─────────────────────────────┐
+│         CMS Application     │
+│  ┌───────┐  ┌────────────┐  │
+│  │ Post  │  │  Comment   │  │
+│  │Controller│ │Controller │  │
+│  ├───────┤  ├────────────┤  │
+│  │ Post  │  │  Comment   │  │
+│  │Service  │  │Service    │  │
+│  ├───────┤  ├────────────┤  │
+│  │ Post  │  │  Comment   │  │
+│  │Repo    │  │Repo        │  │
+│  └───────┘  └────────────┘  │
+│       共享同一个数据库         │
+└─────────────────────────────┘
+
+拆分后（微服务）：
+┌──────────────────┐    ┌──────────────────┐
+│   CMS Service    │    │ Comment Service   │
+│  ┌────────────┐  │    │ ┌────────────┐  │
+│  │Post        │  │    │ │Comment     │  │
+│  │Controller  │  │    │ │Controller  │  │
+│  ├────────────┤  │    │ ├────────────┤  │
+│  │Post        │  │    │ │Comment     │  │
+│  │Service     │◄─┼────┼─│Service     │  │
+│  ├────────────┤  │HTTP│ ├────────────┤  │
+│  │Post Repo   │  │    │ │Comment Repo│  │
+│  └────────────┘  │    │ └────────────┘  │
+│  post_db         │    │  comment_db     │
+└──────────────────┘    └──────────────────┘
+```
+
+每个服务有自己的数据库。这是微服务的基本原则——**服务之间通过 API 通信，不共享数据库。** 如果两个服务共享同一个数据库，它们在数据层面就是耦合的，任何一方改表结构都可能影响另一方。
+
+文章服务需要显示文章的评论数怎么办？不直接查 comment_db，而是调用评论服务的 API 获取。
+
+## 服务间通信：HTTP 还是消息队列？
+
+文章服务需要评论服务提供两个能力：获取某篇文章的评论数、获取某篇文章的评论列表。这是同步需求——用户请求文章详情页时，需要同时拿到评论。用 HTTP 调用就够了。
+
+如果是"用户发表评论后，给文章作者发通知"，这是异步需求——发表评论不需要等通知发完。这种情况用消息队列（RabbitMQ / Kafka）更合适。
+
+CMS 的评论服务用 HTTP 通信就够了。用 Spring Cloud 的 OpenFeign 来做：
+
+```java
+// 在文章服务中定义评论服务的客户端
+@FeignClient(name = "comment-service", url = "${comment-service.url}")
+public interface CommentClient {
+
+    @GetMapping("/api/comments/count")
+    int getCommentCount(@RequestParam("postId") Long postId);
+
+    @GetMapping("/api/comments")
+    List<CommentResponse> getComments(@RequestParam("postId") Long postId,
+                                       @RequestParam(value = "page", defaultValue = "0") int page,
+                                       @RequestParam(value = "size", defaultValue = "20") int size);
+}
+```
+
+```java
+// 文章详情 Service 中调用评论服务
+@Service
+public class PostService {
+
+    private final PostRepository postRepository;
+    private final CommentClient commentClient;
+
+    public PostDetailResponse getPostDetail(Long id) {
+        Post post = postRepository.findById(id)
+            .orElseThrow(() -> new PostNotFoundException(id));
+
+        // 调用评论服务获取评论数
+        int commentCount = commentClient.getCommentCount(id);
+
+        return new PostDetailResponse(post, commentCount);
+    }
+}
+```
+
+等价的 Node.js 写法：
+
+```js
+// 直接用 fetch 或 axios 调用
+async function getPostDetail(id) {
+  const post = await Post.findByPk(id);
+  const { data: commentCount } = await axios.get(
+    `${COMMENT_SERVICE_URL}/api/comments/count?postId=${id}`
+  );
+  return { ...post.toJSON(), commentCount };
+}
+```
+
+两者功能等价。OpenFeign 的优势在于它是声明式的——你定义一个接口，注解描述 HTTP 方法和路径，框架帮你生成实现。不需要手写 HTTP 调用代码。而且 OpenFeign 和服务发现（下面讲）集成后，你不需要硬编码评论服务的 URL，直接用服务名就行。
+
+## Spring Cloud 的三个核心组件
+
+微服务拆分后，你需要解决三个问题：服务怎么找到彼此（服务发现）、外部请求怎么路由到正确的服务（API 网关）、服务之间怎么通信（远程调用）。Spring Cloud 提供了对应的组件：
+
+```
+用户请求
+  │
+  ▼
+┌──────────────────────────────┐
+│      API Gateway (网关)       │
+│      Spring Cloud Gateway     │
+│  /api/posts/** → 文章服务     │
+│  /api/comments/** → 评论服务   │
+└──────────┬───────────────────┘
+           │
+     ┌─────┴──────┐
+     ▼            ▼
+┌─────────┐  ┌──────────┐
+│ 文章服务  │  │ 评论服务   │
+│ :8081    │  │ :8082     │
+└─────────┘  └──────────┘
+     │            │
+     ▼            ▼
+┌─────────┐  ┌──────────┐
+│ post_db │  │comment_db│
+└─────────┘  └──────────┘
+```
+
+### 服务注册与发现：Eureka
+
+没有服务发现时，文章服务调用评论服务需要硬编码 URL：
+
+```java
+// 硬编码，脆弱
+@FeignClient(name = "comment-service", url = "http://192.168.1.100:8082")
+```
+
+评论服务扩容到 3 个实例后呢？手动维护 IP 列表？服务注册中心解决的就是这个问题。每个服务启动时把自己的地址注册到注册中心，其他服务通过服务名查找，不用关心具体 IP。
+
+```yaml
+# 文章服务 - 注册到 Eureka
+eureka:
+  client:
+    service-url:
+      defaultZone: http://eureka:8761/eureka/
+  instance:
+    prefer-ip-address: true
+```
+
+```java
+// 注册后，Feign 直接用服务名，不用写 URL
+@FeignClient(name = "comment-service")
+public interface CommentClient {
+    // ...
+}
+```
+
+Node.js 生态没有等价的成熟方案。你通常用 Consul（HashiCorp 出品，语言无关）、etcd、或者 Kubernetes 自带的服务发现。自己做的话就是维护一个服务地址列表的 JSON 文件或者用 DNS。
+
+### API 网关：Spring Cloud Gateway
+
+网关是所有外部请求的统一入口。它负责路由转发、认证、限流、日志等横切关注点：
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: post-service
+          uri: lb://post-service # lb:// 表示负载均衡
+          predicates:
+            - Path=/api/posts/**
+          filters:
+            - StripPrefix=1 # 去掉 /api 前缀
+            - name: RequestRateLimiter # 限流
+              args:
+                redis-rate-limiter.replenishRate: 100
+                redis-rate-limiter.burstCapacity: 200
+
+        - id: comment-service
+          uri: lb://comment-service
+          predicates:
+            - Path=/api/comments/**
+          filters:
+            - StripPrefix=1
+```
+
+网关的好处：JWT 认证只需要在网关做一次，不用每个服务都配置 Spring Security。限流、CORS、日志这些横切关注点也集中管理。这和 Node.js 项目里用 Nginx 做反向代理 + API 路由的思路一样，但 Spring Cloud Gateway 是用 Java 写的，可以和 Spring 生态深度集成。
+
+### 远程调用：OpenFeign
+
+上面已经展示了 Feign 的用法。关键点在于 Feign 和服务发现集成后，调用远程服务就像调用本地方法一样。加上 `@LoadBalanced` 后，Feign 自动在多个服务实例之间做负载均衡（轮询、随机等策略可配）。
+
+## Node.js 微服务 vs Java 微服务
+
+| 维度       | Node.js 微服务                | Java 微服务 (Spring Cloud)         |
+| ---------- | ----------------------------- | ---------------------------------- |
+| 服务发现   | Consul / etcd / 自建          | Eureka / Nacos / Consul            |
+| API 网关   | Nginx / Kong / Express 中间件 | Spring Cloud Gateway               |
+| 远程调用   | axios / fetch（手写 HTTP）    | OpenFeign（声明式，自动实现）      |
+| 配置中心   | etcd / 环境变量 / 自建        | Spring Cloud Config / Nacos        |
+| 负载均衡   | Nginx / Kubernetes Service    | Ribbon / Spring Cloud LoadBalancer |
+| 熔断降级   | 自己实现 / circuit-breaker    | Resilience4j / Sentinel            |
+| 消息队列   | Bull / RabbitMQ 客户端        | Spring AMQP / Spring Kafka         |
+| 分布式追踪 | OpenTelemetry / Jaeger        | Micrometer Tracing + Zipkin        |
+| 生态成熟度 | 需要自己组装                  | Spring Cloud 一站式                |
+
+Node.js 的微服务方案更像"自己组装电脑"——你从各个地方选组件（Consul 做发现、Kong 做网关、axios 做调用），自己粘合在一起。灵活度极高，但每个项目的组装方式不同，团队之间知识迁移成本高。
+
+Java 的 Spring Cloud 更像"买品牌机"——Eureka + Gateway + Feign + Config 是一套经过验证的组合，开箱即用。但你被绑定了 Spring Cloud 的版本和升级节奏（Spring Cloud 版本和 Spring Boot 版本有严格的对应关系）。
+
+对于 CMS 这种规模的项目，如果拆微服务，Node.js 和 Java 的选择取决于团队背景。Java 团队用 Spring Cloud 省心，Node.js 团队用 Consul + Kong + axios 也完全够用。技术栈不是决定因素，团队的熟悉度才是。
+
+## CMS 评论服务拆分示例
+
+最后，用代码展示评论服务的基本结构：
+
+```java
+@Entity
+@Table(name = "comments")
+public class Comment {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, columnDefinition = "TEXT")
+    private String content;
+
+    @Column(name = "post_id", nullable = false)
+    private Long postId;           // 不用 @ManyToOne，跨服务不直接引用
+
+    @Column(name = "author_id", nullable = false)
+    private Long authorId;         // 同理，存 ID 不存关联
+
+    private String authorName;     // 冗余存储，避免每次都调用户服务
+
+    @Column(name = "created_at", nullable = false, updatable = false)
+    private LocalDateTime createdAt;
+}
+```
+
+注意 `postId` 和 `authorId` 是 `Long` 类型而不是实体关联。跨服务不用 JPA 的 `@ManyToOne`——评论服务不依赖文章服务的数据库。如果需要文章标题，从文章服务的 API 获取或者冗余存储。
+
+```java
+@RestController
+@RequestMapping("/api/comments")
+public class CommentController {
+
+    private final CommentService commentService;
+
+    public CommentController(CommentService commentService) {
+        this.commentService = commentService;
+    }
+
+    @GetMapping("/count")
+    public int getCommentCount(@RequestParam Long postId) {
+        return commentService.countByPostId(postId);
+    }
+
+    @GetMapping
+    public Page<CommentResponse> getComments(
+        @RequestParam Long postId,
+        @RequestParam(defaultValue = "0") int page,
+        @RequestParam(defaultValue = "20") int size
+    ) {
+        return commentService.findByPostId(postId, PageRequest.of(page, size));
+    }
+
+    @PostMapping
+    @ResponseStatus(HttpStatus.CREATED)
+    public CommentResponse createComment(
+        @RequestParam Long postId,
+        @RequestBody @Valid CommentCreateRequest request,
+        @AuthenticationPrincipal JwtUser user
+    ) {
+        return commentService.create(postId, user.getId(), user.getUsername(), request);
+    }
+}
+```
+
+## 全系列回顾
+
+18 篇文章，从 Spring Boot 的第一个 Hello World 到微服务拆分，整个系列的核心对比点：
+
+**第 1-3 篇：基础**
+
+- Spring Boot 的 IoC 容器和自动配置 vs Node.js 的手动 `require()` 和 `app.use()`
+- 依赖注入让对象之间的依赖关系显式化，比 Node.js 的隐式模块依赖更容易测试和维护
+
+**第 4-5 篇：API 和数据**
+
+- Spring Data JPA 的 Repository 抽象 vs Sequelize/TypeORM 的 Model
+- JPA 的 `@Entity` + `@ManyToOne` 声明式关联 vs Node.js ORM 的 `belongsTo` / `hasMany`
+
+**第 6-8 篇：校验、异常、AOP**
+
+- `@Valid` + Bean Validation 的声明式校验 vs 手写 if-else 或 joi/zod schema
+- `@ControllerAdvice` 集中异常处理 vs Express 的 error middleware
+- Spring AOP 的横切关注点分离 vs Node.js 装饰器或 middleware
+
+**第 9-10 篇：安全**
+
+- Spring Security 的 Servlet Filter 链 vs Express middleware 链
+- `SecurityFilterChain` 集中配置 vs 分散在路由中的 middleware
+- `UserDetailsService` + `@PreAuthorize` vs passport.js + 自定义 middleware
+
+**第 11-13 篇：Redis、异步、WebSocket**
+
+- Spring Cache 注解声明式缓存 vs 手动 `redis.get/set`
+- `@Async` + `@Scheduled` vs `setTimeout/setInterval` + worker_threads
+- Spring WebSocket vs `ws` / `socket.io`
+
+**第 14 篇：日志和监控**
+
+- Logback + Actuator vs Winston + pm2
+- Actuator 的标准化端点 vs 自定义 /health 和 /metrics 路由
+
+**第 15 篇：测试**
+
+- `@SpringBootTest` / `@WebMvcTest` / `@MockBean` 分层测试 vs Jest 统一测试
+- 框架保障的测试隔离 vs 开发者自觉的测试隔离
+
+**第 16 篇：Docker**
+
+- JVM 镜像 ~200MB vs Node 镜像 ~50MB
+- 需要配置 JVM 参数 vs 开箱即用
+
+**第 17 篇：性能**
+
+- 同步 JDBC 让 N+1 后果更严重 vs 异步 I/O 天然缓解
+- JVM 需要手动调优（堆大小、GC） vs V8 自动管理
+- `@EntityGraph` 声明式优化 vs Sequelize `include` 命令式查询
+
+**第 18 篇（本篇）：微服务**
+
+- Spring Cloud 一站式组件 vs Node.js 自己组装
+- OpenFeign 声明式远程调用 vs axios 手写 HTTP
+- 服务注册、网关、配置中心都有成熟方案 vs 需要从社区选型
+
+整个系列的底层脉络：**Spring Boot 用注解和约定减少了大量样板代码，代价是需要理解框架的抽象层次。Node.js 给你最大的自由度，代价是很多基础设施需要自己搭建。** 没有绝对的好坏——选择取决于团队规模、项目复杂度和团队的 Java/JavaScript 熟悉度。
+
+如果你一路读到这里，应该对 Spring Boot 的核心机制有了体系化的理解，也能在自己的 Node.js 经验基础上快速判断"这个功能在 Java 里怎么做、为什么这么做、和 Node.js 有什么区别"。这比记住某个注解的用法有价值得多——框架会变，API 会变，但"理解两种技术栈的设计取舍"这个能力不会过时。
