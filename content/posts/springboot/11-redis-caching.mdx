@@ -1,20 +1,36 @@
 ---
-title: "11 Redis 缓存集成"
-date: "2026-03-23"
-summary: "掌握 Spring Cache 抽象和 Redis 缓存的使用，提升应用性能。"
-tags: ["SpringBoot", "Redis", "缓存", "性能优化"]
+title: "11 Redis 缓存"
+date: "2026-03-30"
+summary: "ioredis 和 Spring Cache 有什么不同？给 CMS 加上 Redis 缓存，对比手动缓存和 @Cacheable 注解缓存的差异。"
+tags: ["Spring Boot", "Redis", "缓存", "@Cacheable"]
 category: "springboot"
 cover: ""
 draft: false
-series: "SpringBoot 渐进式学习指南"
+series: "Spring Boot 实战"
 seriesOrder: 11
 ---
 
-## 前言
+CMS 首页的文章列表接口，每次请求都要查一次数据库。一篇已发布的文章内容几乎不会变，但每个访客的请求都在重复执行同一条 SQL。当并发量上去之后，数据库的压力会先于业务逻辑成为瓶颈。
 
-缓存是提升应用性能的有效手段。SpringBoot 提供了统一的 Cache 抽象，支持多种缓存实现。
+在 Node.js 里你会怎么做？引入 `ioredis`，手动在 Service 层写 `redis.get` / `redis.set`。缓存逻辑和业务逻辑混在一起——先查缓存，命中就返回，没命中就查数据库再写缓存。这种方式完全可控，但当缓存操作散落在十几个方法中时，代码重复度会急剧上升。
 
-## 添加依赖
+Spring Boot 提供了另一条路：**Spring Cache 抽象 + 注解驱动缓存**。你只需要在方法上加 `@Cacheable`，框架自动处理"查缓存、回填缓存"的逻辑。理解这两种方式的差异，是从 Express 转到 Spring Boot 后做缓存设计的第一步。
+
+## Spring Cache 抽象：缓存无关的统一接口
+
+Spring Cache 不是一个具体的缓存实现，而是一套抽象层。它的核心接口是 `CacheManager` 和 `Cache`，具体的存储可以是 Redis、Caffeine（本地缓存）、Ehcache 或者简单的 ConcurrentHashMap。你写的缓存逻辑不依赖任何特定的存储——切换底层实现只需要改配置，不用改业务代码。
+
+这和 Node.js 生态形成鲜明对比。Node.js 没有类似的缓存抽象层——你直接用 `ioredis` 的 API，缓存代码和 Redis 强绑定。想从 Redis 换成 Memcached，需要改所有调用点。
+
+Spring Cache 提供的核心注解只有三个，覆盖了缓存的全部生命周期：
+
+- **`@Cacheable`** —— 方法执行前查缓存，命中直接返回，没命中才执行方法并将结果写入缓存
+- **`@CachePut`** —— 无论缓存是否存在，都执行方法并用返回值更新缓存（适合更新场景）
+- **`@CacheEvict`** —— 删除缓存中的数据（适合删除或更新后的失效场景）
+
+## Redis 连接配置
+
+先添加依赖和配置。Spring Boot 3.x 默认使用 Lettuce 作为 Redis 客户端（替代了旧版的 Jedis），它是基于 Netty 的非阻塞客户端，线程安全，单连接就能处理高并发：
 
 ```xml
 <dependency>
@@ -23,231 +39,337 @@ seriesOrder: 11
 </dependency>
 ```
 
-## Redis 配置
-
-### application.yml
-
 ```yaml
 spring:
   data:
     redis:
       host: localhost
       port: 6379
-      password:
       database: 0
-      timeout: 3000
+      timeout: 3000ms
       lettuce:
         pool:
           max-active: 8
           max-idle: 8
-          min-idle: 0
+          min-idle: 2
 ```
 
-### RedisConfig
+接下来配置 `RedisCacheManager`，让 Spring Cache 使用 Redis 作为底层存储：
 
 ```java
 @Configuration
 @EnableCaching
-public class RedisConfig {
+public class RedisCacheConfig {
 
     @Bean
     public RedisCacheManager cacheManager(RedisConnectionFactory factory) {
-        RedisCacheConfiguration config = RedisCacheConfiguration.defaultCacheConfig()
-                .entryTtl(Duration.ofMinutes(10))
-                .serializeKeysWith(
-                    RedisSerializationContext.SerializationPair
-                        .fromSerializer(new StringRedisSerializer())
-                )
-                .serializeValuesWith(
-                    RedisSerializationContext.SerializationPair
-                        .fromSerializer(new GenericJackson2JsonRedisSerializer())
-                );
+        RedisCacheConfiguration defaultConfig = RedisCacheConfiguration.defaultCacheConfig()
+            .entryTtl(Duration.ofMinutes(30))
+            .serializeKeysWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new StringRedisSerializer()))
+            .serializeValuesWith(RedisSerializationContext.SerializationPair
+                .fromSerializer(new GenericJackson2JsonRedisSerializer()));
+
+        // 为不同缓存设置不同的 TTL
+        Map<String, RedisCacheConfiguration> cacheConfigs = new HashMap<>();
+        cacheConfigs.put("posts", defaultConfig.entryTtl(Duration.ofMinutes(10)));
+        cacheConfigs.put("hotPosts", defaultConfig.entryTtl(Duration.ofMinutes(5)));
+        cacheConfigs.put("tags", defaultConfig.entryTtl(Duration.ofHours(1)));
 
         return RedisCacheManager.builder(factory)
-                .cacheDefaults(config)
-                .transactionAware()
-                .build();
+            .cacheDefaults(defaultConfig)
+            .withInitialCacheConfigurations(cacheConfigs)
+            .transactionAware()
+            .build();
     }
 }
 ```
 
-## 缓存注解
+`@EnableCaching` 是开关——没有它，所有 `@Cacheable` 注解都会被忽略。这个设计和 Spring Security 的 `@EnableWebSecurity` 思路一致：框架提供了能力，但默认不启用，你需要显式声明。
 
-### @Cacheable
+注意 `GenericJackson2JsonRedisSerializer`——它会把缓存值序列化成 JSON，并在 JSON 中嵌入类型信息（`@class` 字段）。这意味着反序列化时不需要你指定目标类型，框架能自动还原。但代价是存储体积稍大，且如果实体类结构变更，旧缓存数据可能反序列化失败。
+
+## 注解缓存：CMS 文章列表实战
+
+给 CMS 的文章查询接口加上缓存。先看最直接的方式：
 
 ```java
 @Service
-public class UserService {
+public class PostService {
 
-    @Cacheable(value = "users", key = "#id")
-    public User findById(Long id) {
-        return userRepository.findById(id).orElse(null);
+    private final PostRepository postRepository;
+
+    public PostService(PostRepository postRepository) {
+        this.postRepository = postRepository;
     }
 
-    @Cacheable(value = "users", key = "#username")
-    public User findByUsername(String username) {
-        return userRepository.findByUsername(username).orElse(null);
+    // 缓存文章列表，key 为 "posts::page:1:size:10"
+    @Cacheable(value = "posts", key = "'page:' + #page + ':size:' + #size")
+    public Page<Post> getPublishedPosts(int page, int size) {
+        return postRepository.findByStatusOrderByCreatedAtDesc(
+            PostStatus.PUBLISHED, PageRequest.of(page, size));
+    }
+
+    // 缓存单篇文章，key 为 "posts::id:42"
+    @Cacheable(value = "posts", key = "'id:' + #id")
+    public Optional<Post> getPostById(Long id) {
+        return postRepository.findById(id);
     }
 }
 ```
 
-### @CachePut
+`@Cacheable` 的工作流程：调用 `getPublishedPosts(0, 10)` 时，Spring 先用 key `"posts::page:0:size:10"` 去 Redis 查。如果命中，直接返回缓存值，方法体不执行。如果没命中，执行方法体拿到数据库结果，然后将结果序列化后写入 Redis，key 就是上面那个字符串。
+
+更新和删除时需要让缓存失效：
 
 ```java
 @Service
-public class UserService {
+public class PostService {
 
-    @CachePut(value = "users", key = "#user.id")
-    public User update(User user) {
-        return userRepository.save(user);
+    @CacheEvict(value = "posts", key = "'id:' + #id")
+    public void deletePost(Long id) {
+        postRepository.deleteById(id);
+    }
+
+    // 更新文章时，先删缓存再更新数据
+    @CacheEvict(value = "posts", key = "'id:' + #post.id")
+    public Post updatePost(Post post) {
+        return postRepository.save(post);
+    }
+
+    // 文章发布后，清空列表缓存（列表缓存包含分页 key，逐一清除不现实）
+    @CacheEvict(value = "posts", allEntries = true)
+    public Post publishPost(Long id) {
+        Post post = postRepository.findById(id).orElseThrow();
+        post.setStatus(PostStatus.PUBLISHED);
+        return postRepository.save(post);
     }
 }
 ```
 
-### @CacheEvict
+`allEntries = true` 会清除 `posts` 缓存下的所有 key。这是一个"暴力但有效"的策略——在文章发布后，所有分页列表的缓存都失效。代价是下次请求会重新查数据库，但考虑到文章发布不是高频操作，这个代价可以接受。
+
+## 手动缓存：RedisTemplate 的灵活控制
+
+注解缓存覆盖了大部分场景，但有些情况下你需要更细粒度的控制——比如批量更新缓存、设置随机 TTL 防雪崩、或者缓存结构化数据（Hash、Set）。这时候用 `RedisTemplate` 手动操作：
 
 ```java
 @Service
-public class UserService {
+public class HotPostCacheService {
 
-    @CacheEvict(value = "users", key = "#id")
-    public void delete(Long id) {
-        userRepository.deleteById(id);
+    private final RedisTemplate<String, Object> redisTemplate;
+    private final PostRepository postRepository;
+
+    public HotPostCacheService(RedisTemplate<String, Object> redisTemplate,
+                                PostRepository postRepository) {
+        this.redisTemplate = redisTemplate;
+        this.postRepository = postRepository;
     }
 
-    @CacheEvict(value = "users", allEntries = true)
-    public void deleteAll() {
-        userRepository.deleteAll();
-    }
-}
-```
+    private static final String HOT_POSTS_KEY = "cms:hot:posts";
 
-### @Caching
+    // 手动缓存热点文章列表
+    public List<Post> getHotPosts() {
+        List<Object> cached = redisTemplate.opsForList().range(HOT_POSTS_KEY, 0, -1);
+        if (cached != null && !cached.isEmpty()) {
+            return cached.stream()
+                .map(obj -> (Post) obj)
+                .collect(Collectors.toList());
+        }
 
-```java
-@Service
-public class UserService {
+        // 缓存未命中，查数据库
+        List<Post> hotPosts = postRepository.findTop10ByStatusAndViewCountGreaterThanOrderByViewCountDesc(
+            PostStatus.PUBLISHED, 100);
 
-    @Caching(evict = @CacheEvict(value = "users", key = "#id"),
-               put = @CachePut(value = "users", key = "#user.id"))
-    public User updateAndRefresh(User user) {
-        return userRepository.save(user);
-    }
-}
-```
+        // 写入缓存，使用 List 结构
+        if (!hotPosts.isEmpty()) {
+            redisTemplate.opsForList().rightPushAll(HOT_POSTS_KEY, hotPosts.toArray());
+            // 随机 TTL（300-600 秒），防止缓存雪崩
+            int ttl = 300 + ThreadLocalRandom.current().nextInt(300);
+            redisTemplate.expire(HOT_POSTS_KEY, ttl, TimeUnit.SECONDS);
+        }
 
-## RedisTemplate
-
-```java
-@Service
-public class CacheService {
-
-    @Autowired
-    private RedisTemplate<String, Object> redisTemplate;
-
-    // 设置缓存
-    public void set(String key, Object value) {
-        redisTemplate.opsForValue().set(key, value);
+        return hotPosts;
     }
 
-    // 设置带过期时间
-    public void set(String key, Object value, long timeout, TimeUnit unit) {
-        redisTemplate.opsForValue().set(key, value, timeout, unit);
-    }
-
-    // 获取缓存
-    public Object get(String key) {
-        return redisTemplate.opsForValue().get(key);
-    }
-
-    // 删除缓存
-    public void delete(String key) {
-        redisTemplate.delete(key);
-    }
-
-    // 检查是否存在
-    public boolean exists(String key) {
-        return Boolean.TRUE.equals(redisTemplate.hasKey(key));
+    // 手动清除
+    public void evictHotPosts() {
+        redisTemplate.delete(HOT_POSTS_KEY);
     }
 }
 ```
 
-## 缓存策略
+这段代码做的事情和 `@Cacheable` 一样——查缓存、回填缓存。但你能控制数据结构（用 Redis List 而不是简单 key-value）、TTL 策略（随机过期时间）和回填逻辑。这就是手动缓存的灵活之处。
 
-### 缓存穿透
+## 缓存穿透、雪崩、击穿：三个经典问题
+
+这三个问题是任何缓存系统都会遇到的，和语言无关。
+
+**缓存穿透**——查询一个不存在的数据，缓存永远不命中，每次都打到数据库。恶意攻击者可以利用这个漏洞压垮数据库。
 
 ```java
-@Service
-public class UserService {
-
-    @Cacheable(value = "users", key = "#id", unless = "#result == null")
-    public User findById(Long id) {
-        return userRepository.findById(id).orElse(null);
-    }
-
-    // 或使用缓存空对象
-    @Cacheable(value = "users", key = "#id", cacheManager = "cacheManager")
-    public User findById(Long id) {
-        return userRepository.findById(id).orElse(null);
-    }
+// 方案一：缓存空结果，设置短 TTL
+@Cacheable(value = "posts", key = "'id:' + #id", unless = "#result == null")
+public Optional<Post> getPostById(Long id) {
+    return postRepository.findById(id);
 }
 ```
 
-### 缓存雪崩
+`unless = "#result == null"` 的意思是：如果方法返回 null，就不缓存。这反而会加剧穿透问题。更实用的做法是在 Service 层手动缓存一个空标记：
 
 ```java
-// 随机过期时间
-@Service
-public class UserService {
+public Post getPostById(Long id) {
+    String cacheKey = "posts::id:" + id;
+    Post cached = (Post) redisTemplate.opsForValue().get(cacheKey);
 
-    @Cacheable(value = "users", key = "#id")
-    public User findById(Long id) {
-        return userRepository.findById(id).orElse(null);
+    if (cached != null) {
+        return cached;  // 包括空标记也会返回
     }
+
+    Post post = postRepository.findById(id).orElse(null);
+
+    if (post == null) {
+        // 缓存空标记，TTL 设短一点（5 分钟）
+        redisTemplate.opsForValue().set(cacheKey, new Post(), 5, TimeUnit.MINUTES);
+    } else {
+        redisTemplate.opsForValue().set(cacheKey, post, 30, TimeUnit.MINUTES);
+    }
+
+    return post;
 }
 ```
 
-## 最佳实践
+**缓存雪崩**——大量缓存 key 在同一时间过期，请求全部涌向数据库。上面热点文章的随机 TTL 就是解决方案。
 
-### 1. 合理设置过期时间
-
-```java
-// ✅ 推荐：根据数据变化频率设置
-@Cacheable(value = "users", key = "#id")
-// 用户信息：10分钟
-// 热点数据：5分钟
-// 配置信息：1小时
-```
-
-### 2. 避免缓存大对象
+**缓存击穿**——一个热点 key 过期的瞬间，大量并发请求同时打到数据库。解决方案是互斥锁：
 
 ```java
-// ✅ 推荐：缓存 ID 或关键字
-@Cacheable(value = "users", key = "#id")
+public Post getHotPost(Long id) {
+    String cacheKey = "posts::id:" + id;
+    String lockKey = "lock:" + cacheKey;
 
-// ❌ 避免：缓存整个列表
-@Cacheable(value = "users", key = "'all'")
+    Post cached = (Post) redisTemplate.opsForValue().get(cacheKey);
+    if (cached != null) return cached;
+
+    // 尝试获取分布式锁
+    Boolean locked = redisTemplate.opsForValue().setIfAbsent(lockKey, "1", 10, TimeUnit.SECONDS);
+    if (Boolean.TRUE.equals(locked)) {
+        try {
+            // 再次检查缓存（double-check）
+            cached = (Post) redisTemplate.opsForValue().get(cacheKey);
+            if (cached != null) return cached;
+
+            Post post = postRepository.findById(id).orElse(null);
+            if (post != null) {
+                redisTemplate.opsForValue().set(cacheKey, post, 30, TimeUnit.MINUTES);
+            }
+            return post;
+        } finally {
+            redisTemplate.delete(lockKey);
+        }
+    }
+
+    // 获取锁失败，短暂等待后重试
+    Thread.sleep(100);
+    return getHotPost(id);
+}
 ```
 
-## 总结
+注意：注解缓存（`@Cacheable`）无法直接实现这种互斥锁逻辑。这就是为什么在需要精细化控制的场景下，手动缓存仍然是必要的选择。
 
-本文介绍了 Redis 缓存集成，主要内容：
+## Node.js ioredis 的等价写法
 
-- ✅ Spring Cache 抽象
-- ✅ Redis 配置
-- ✅ 缓存注解
-- ✅ RedisTemplate
+同样的缓存逻辑在 Node.js 里用 `ioredis` 实现：
 
-接下来我们将学习异步任务和定时任务。
+```js
+const Redis = require("ioredis");
+const redis = new Redis();
 
-## 下一步
+// 手动缓存——Node.js 里没有 @Cacheable，只能手动写
+async function getPostById(id) {
+  const cacheKey = `posts::id:${id}`;
+  const cached = await redis.get(cacheKey);
 
-在下一篇文章《12 异步任务与定时任务》中，我们将学习：
+  if (cached) {
+    return JSON.parse(cached);
+  }
 
-- @EnableAsync 异步方法
-- 自定义线程池
-- @Scheduled 定时任务
-- Cron 表达式
-- 异步异常处理
+  const post = await Post.findByPk(id);
 
----
+  if (post) {
+    await redis.set(cacheKey, JSON.stringify(post), "EX", 1800); // 30 分钟
+  } else {
+    // 缓存空标记防穿透
+    await redis.set(cacheKey, JSON.stringify({ _empty: true }), "EX", 300);
+  }
+
+  return post;
+}
+```
+
+ioredis 的 API 简洁直接——`get` / `set` / `del`，没有 Spring Cache 的抽象层。优点是控制力强，你能精确控制每个操作；缺点是缓存逻辑和业务代码耦合，项目中会大量出现 `redis.get` / `redis.set` 的样板代码。
+
+如果你想减少重复代码，通常需要自己封装一个 CacheService：
+
+```js
+class CacheService {
+  async getOrSet(key, fetchFn, ttl = 1800) {
+    const cached = await redis.get(key);
+    if (cached) return JSON.parse(cached);
+
+    const value = await fetchFn();
+    if (value !== null && value !== undefined) {
+      await redis.set(key, JSON.stringify(value), "EX", ttl);
+    }
+    return value;
+  }
+}
+
+// 使用
+const post = await cache.getOrSet(`posts::id:${id}`, () => Post.findByPk(id));
+```
+
+这个 `getOrSet` 方法和 Spring Cache 的 `@Cacheable` 功能等价。但它是你自己实现的，不是框架提供的。Node.js 生态也有一些缓存库（如 `cache-manager`）提供了类似抽象，但使用率和成熟度远不如 Spring Cache。
+
+## 完整对比
+
+| 维度       | Node.js + ioredis                | Spring Cache + Redis                             |
+| ---------- | -------------------------------- | ------------------------------------------------ |
+| 缓存抽象层 | 无（直接操作 Redis API）         | Spring Cache 统一接口，可切换实现                |
+| 代码侵入性 | 手动 get/set，业务和缓存逻辑耦合 | 注解声明，业务代码不感知缓存                     |
+| 灵活度     | 高，完全控制每个 Redis 操作      | 中，注解只能声明式使用；复杂逻辑需 RedisTemplate |
+| 序列化     | 手动 JSON.stringify/parse        | 自动，可配置（JSON、JDK 序列化等）               |
+| 分布式锁   | 手动实现（SETNX）                | 手动实现（注解不支持）                           |
+| 缓存失效   | 手动删除                         | `@CacheEvict` 注解 + allEntries                  |
+| 多级缓存   | 需自行封装                       | 可配置多个 CacheManager                          |
+| 学习成本   | 低，Redis 命令即 API             | 中，需理解 Cache 抽象 + SpEL key + 序列化        |
+
+## Trade-off 分析
+
+**注解缓存的收益：**
+
+- 业务代码保持干净。`@Cacheable` 只是一行注解，方法内部不需要任何缓存相关代码。当你给十几个查询方法加缓存时，这个优势尤其明显
+- 切换缓存实现零成本。今天用 Redis，明天想加一层本地缓存（Caffeine），只需要配置 CompositeCacheManager，不用改任何业务代码
+- Spring Cache 是企业级标准。团队协作时，统一的缓存注解比每个人自己封装 CacheService 更容易维护
+
+**注解缓存的代价：**
+
+- 黑盒。`@Cacheable` 内部的"查缓存 -> 回填"逻辑你看不到也改不了。出了缓存相关的问题（比如序列化失败、key 冲突），排查链路比手动缓存长
+- SpEL key 表达式有学习成本。`key = "'page:' + #page + ':size:' + #size"` 这种写法对不熟悉 SpEL 的开发者来说不直观
+- 无法处理复杂场景。互斥锁、随机 TTL、条件回填——这些都需要退回到手动缓存
+- `@Cacheable` 基于代理实现。同一个类内部的方法调用（`this.methodA()`）不会触发缓存，这是一个常见的坑
+
+**实际建议：** 简单的查询缓存用 `@Cacheable`，复杂场景（分布式锁、随机 TTL、批量操作）用 `RedisTemplate`。两者可以共存——Spring Cache 和 RedisTemplate 用的是同一个 Redis 连接，不会冲突。
+
+## 回顾与预告
+
+到这篇为止，CMS 的缓存层已经搭好：
+
+- 理解了 Spring Cache 抽象和 Redis 的关系——前者是接口，后者是实现
+- `@Cacheable` / `@CachePut` / `@CacheEvict` 三个注解覆盖了缓存的读写删
+- `RedisTemplate` 提供了手动控制的灵活性，适合注解无法覆盖的复杂场景
+- 缓存穿透、雪崩、击穿三个经典问题及其解决方案
+
+但缓存只是优化读性能的手段。有些操作天生就不适合同步等待——比如文章发布后给所有订阅者发通知邮件、定时清理超过 30 天的草稿。这些任务应该放到后台异步执行，不阻塞用户的 HTTP 请求。
+
+下一篇讲异步任务和定时任务——`@Async` 怎么把一个同步方法变成异步执行，`@Scheduled` 怎么实现定时调度，以及它们和 Node.js 事件循环的本质区别。
