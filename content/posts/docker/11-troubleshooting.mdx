@@ -1,0 +1,324 @@
+---
+title: "11 故障排查：真实生产环境的排坑指南"
+date: "2025-03-30"
+summary: "容器启动失败、数据库连不上、内存泄漏 OOM——用真实案例讲清楚容器问题的排查思路和常用工具。"
+tags: ["Docker", "故障排查", "调试", "OOM"]
+category: "docker"
+cover: ""
+draft: false
+series: "Docker 从入门到实战"
+seriesOrder: 11
+---
+
+凌晨两点，运维同学打电话过来说订单 API 挂了。你睡眼惺忪地打开电脑，SSH 到服务器上，面对一堆 Docker 容器，不知道从哪下手。
+
+这篇文章整理了我们在生产环境遇到过的真实问题（有些确实是凌晨两点触发的），按照排查思路组织，希望下次遇到类似问题时你不用再翻文档。
+
+## 排查思路：先日志，再状态，最后进容器
+
+不管什么问题，排查顺序都是一样的：
+
+```
+1. docker compose logs    → 看报错信息
+2. docker compose ps      → 看服务状态（运行中？重启了？退出码是什么？）
+3. docker inspect         → 看详细配置（环境变量对不对？Volume 挂载了没？）
+4. docker exec            → 进容器内部排查
+```
+
+大部分问题在前两步就能定位。不要一上来就 `docker exec` 进容器，先看日志和状态，往往能省很多时间。
+
+## 场景一：容器启动失败
+
+最常见的问题。`docker compose up -d` 之后服务没有跑起来。
+
+```bash
+docker compose ps
+# NAME           STATUS
+# order-api-1    Exited (1) 5 seconds ago
+# order-db-1     Up 3 seconds
+```
+
+`STATUS` 列显示容器已经退出了，退出码是 1（非零退出码表示异常）。看日志：
+
+```bash
+docker compose logs api
+# Error: Cannot find module '/app/src/index.js'
+```
+
+模块找不到。可能的原因：
+
+**原因一：Dockerfile 里的 COPY 路径不对。** 比如你把源代码从 `src/` 移到了 `app/`，但 Dockerfile 里还是 `COPY . .` + `CMD ["node", "src/index.js"]`。检查 Dockerfile 和项目结构是否匹配。
+
+**原因二：`.dockerignore` 排除了需要的文件。** 如果你把 `src/` 加到了 `.dockerignore`，镜像里就没有源代码了。检查 `.dockerignore` 文件。
+
+**原因三：多阶段构建的 COPY 路径不对。** `COPY --from=builder /app/dist ./dist`，如果构建阶段没有产出 `dist/` 目录（比如 TypeScript 编译失败了），运行阶段就找不到文件。
+
+再来看一个常见的启动失败：
+
+```bash
+docker compose logs api
+# Error: listen EADDRINUSE: address already in use :::3000
+```
+
+端口被占用。可能是上一个 API 容器没有完全退出，3000 端口还被占用着。
+
+```bash
+# 检查谁占用了 3000 端口
+docker compose ps    # 看看有没有残留的旧容器
+docker ps -a         # 看看有没有其他服务占了 3000
+
+# 停掉旧容器
+docker compose down
+docker compose up -d
+```
+
+## 场景二：数据库连接超时
+
+API 容器在运行，但日志里全是连接失败的报错：
+
+```bash
+docker compose logs api --tail 50
+# Error: connect ETIMEDOUT 172.18.0.2:5432
+# Error: connect ETIMEDOUT 172.18.0.2:5432
+# Error: connect ETIMEDOUT 172.18.0.2:5432
+```
+
+按顺序排查：
+
+**第一步：确认两个容器在同一个网络里。**
+
+```bash
+docker inspect order-api-1 --format '{{json .NetworkSettings.Networks}}' | python3 -m json.tool
+# 看输出里有没有 order-api_default 网络
+
+docker inspect order-db-1 --format '{{json .NetworkSettings.Networks}}' | python3 -m json.tool
+# 看输出里有没有同一个网络
+```
+
+如果不在同一个网络，就是 Compose 配置有问题（比如你手动 `docker run` 启动了 API，没有指定网络）。
+
+**第二步：确认数据库容器确实在运行。**
+
+```bash
+docker compose ps db
+# 如果显示 Exited 或 Restarting，说明数据库本身有问题
+```
+
+**第三步：确认 DNS 解析正常。**
+
+```bash
+docker exec order-api-1 getent hosts db
+# 172.18.0.2   db
+
+# 如果返回空，说明 DNS 解析失败
+```
+
+**第四步：确认端口连通。**
+
+```bash
+docker exec order-api-1 nc -zv db 5432
+# db (172.18.0.2:5432) open
+
+# 如果显示 Connection refused，说明 PostgreSQL 没在监听 5432
+```
+
+最常见的根因：PostgreSQL 启动慢。数据库容器虽然 "Running" 了，但 PostgreSQL 还在做初始化（恢复 WAL 日志、创建系统表），还没开始接受连接。API 先于 PostgreSQL 就绪，连接失败。
+
+解决办法：在应用里加重试逻辑，或者用上一篇讲的 `depends_on` + `condition: service_healthy`。
+
+## 场景三：容器不断重启
+
+```bash
+docker compose ps
+# NAME           STATUS                    RESTARTS
+# order-api-1    Restarting (1) 3 sec ago  15
+```
+
+容器在反复重启，已经重启了 15 次。看退出码：
+
+```bash
+docker inspect order-api-1 --format '{{.State.ExitCode}}'
+# 137
+```
+
+退出码 137 = 128 + 9 = SIGKILL。通常是被 OOM Killer 杀掉了。
+
+确认一下：
+
+```bash
+docker inspect order-api-1 --format '{{.State.OOMKilled}}'
+# true
+```
+
+确实是 OOM。看看资源限制和实际使用量：
+
+```bash
+# 看配置的资源限制
+docker inspect order-api-1 --format '{{.HostConfig.Memory}}'
+# 536870912  （= 512MB）
+
+# 看实际使用量（如果容器还在运行的话）
+docker stats order-api-1 --no-stream
+# MEM USAGE / LIMIT   MEM %
+# 498MiB / 512MiB    97.2%
+```
+
+内存使用已经接近上限了。要么加大限制（`deploy.resources.limits.memory: 1G`），要么优化应用的内存使用。
+
+如果退出码是 1，说明是应用自身报错退出的。看日志找具体原因。
+
+```bash
+# 常见退出码含义
+# 0   正常退出
+# 1   应用错误（代码 bug、配置错误）
+# 137 OOM Killed（SIGKILL）
+# 139 段错误（Segmentation Fault）
+```
+
+## 场景四：磁盘空间不足
+
+```bash
+docker compose up -d
+# Error response from daemon: no space left on device
+```
+
+磁盘满了。查看 Docker 占用的空间：
+
+```bash
+docker system df
+# TYPE            TOTAL   ACTIVE   SIZE      RECLAIMABLE
+# Images          23      8        5.2GB     3.1GB (59%)
+# Containers      12      6        245MB     52MB (21%)
+# Local Volumes   5       3        1.8GB     0B (0%)
+# Build Cache     67      0        3.4GB     3.4GB (100%)
+```
+
+Build Cache 占了 3.4GB，Images 有 3.1GB 可以回收。清理：
+
+```bash
+# 清理未使用的镜像、停止的容器、未使用的网络
+docker system prune
+
+# 如果还不够，连 Build Cache 也清理
+docker system prune -a
+
+# 查看磁盘空间
+df -h
+```
+
+预防磁盘满的措施：
+
+- 日志轮转（第 7 篇讲的 `logging.options.max-size`）。
+- 定期清理旧镜像：`docker image prune -a --filter "until=168h"`（清理 7 天前的未使用镜像）。
+- Build Cache 定期清理：`docker builder prune`。
+
+## 场景五：修改了代码但没生效
+
+开发时用 Bind Mount 挂载源代码，改了代码刷新浏览器发现没变化。
+
+```bash
+# 检查挂载是否生效
+docker inspect order-api-1 --format '{{json .Mounts}}' | python3 -m json.tool
+# 确认 Source（宿主机路径）和 Destination（容器内路径）是否正确
+```
+
+常见原因：
+
+**原因一：容器内进程没有重载。** 改了代码但 Node.js 不会自动重启。需要配合 `nodemon` 或 `pm2` 的 `--watch` 模式。
+
+**原因二：macOS 的文件系统事件延迟。** Docker Desktop for Mac 的文件系统桥接有延迟，改了文件后容器内可能要几秒钟才能感知到。这是 macOS 的固有问题，Linux 上没有这个烦恼。
+
+**原因三：Volume 覆盖了 Bind Mount。** 如果 Compose 配置里同时有匿名 Volume 和 Bind Mount，匿名 Volume 可能覆盖了 Bind Mount 的内容（第 6 篇讲过的 `/app/node_modules` 技巧）。检查 `docker compose config` 看最终的挂载配置。
+
+## 进入容器调试
+
+有时候光看日志不够，需要进入容器内部排查。
+
+```bash
+# 最常用的方式
+docker exec -it order-api-1 sh
+
+# 如果容器没有 sh，试试 ash（Alpine）或 bash
+docker exec -it order-api-1 ash
+
+# 如果连 sh 都没有（distroless），临时覆盖入口点
+docker run --rm -it --entrypoint sh order-api:latest
+```
+
+进去之后可以做什么：
+
+```bash
+# 检查文件是否存在
+ls -la /app/src/index.js
+
+# 检查环境变量
+env | grep DATABASE
+
+# 测试网络连通
+nc -zv db 5432
+
+# 检查端口监听
+netstat -tlnp   # 如果容器里有 netstat
+ss -tlnp        # Alpine 自带
+```
+
+如果容器已经退出了，你不能 `docker exec` 进入。但可以用 `docker commit` 把容器的文件系统保存为一个新镜像，然后从新镜像启动一个临时容器来检查：
+
+```bash
+# 把退出的容器保存为镜像
+docker commit order-api-1 debug-order-api
+
+# 从新镜像启动临时容器
+docker run --rm -it debug-order-api sh
+```
+
+## 常用排查命令速查
+
+```bash
+# 查看服务状态和重启次数
+docker compose ps
+
+# 查看日志（最近 100 行）
+docker compose logs --tail 100 api
+
+# 实时跟踪日志
+docker compose logs -f api
+
+# 查看容器退出码和 OOM 状态
+docker inspect <container> --format '{{.State.ExitCode}} {{.State.OOMKilled}}'
+
+# 查看容器资源使用
+docker stats --no-stream
+
+# 查看 Docker 磁盘占用
+docker system df
+
+# 查看容器挂载（Volume 和 Bind Mount）
+docker inspect <container> --format '{{json .Mounts}}'
+
+# 查看容器网络配置
+docker inspect <container> --format '{{json .NetworkSettings.Networks}}'
+
+# 查看容器环境变量
+docker inspect <container> --format '{{json .Config.Env}}'
+
+# 进入容器
+docker exec -it <container> sh
+
+# 清理无用资源
+docker system prune
+```
+
+## 回顾
+
+这篇覆盖了生产环境最常见的五类问题：
+
+- **容器启动失败**：看退出码和日志，检查文件路径和端口占用。
+- **数据库连接超时**：确认网络、DNS、端口，注意启动顺序。
+- **容器不断重启**：退出码 137 是 OOM，退出码 1 是应用错误。
+- **磁盘空间不足**：`docker system df` 查看，`docker system prune` 清理。
+- **代码修改不生效**：检查挂载配置和文件系统事件延迟。
+
+排查的核心思路不变：先日志，再状态，最后进容器。大多数问题在前两步就能定位。
+
+这是 Docker 系列的最后一篇实战内容。下一篇我们聊聊 Docker 的能力边界——什么时候单机 Docker Compose 不够了，需要考虑 Kubernetes。

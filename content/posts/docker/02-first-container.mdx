@@ -1,0 +1,286 @@
+---
+title: "02 你的第一个容器"
+date: "2025-03-30"
+summary: "安装 Docker，用几个命令跑起一个 PostgreSQL 数据库，在实操中理解镜像、容器、端口映射、环境变量等核心概念。"
+tags: ["Docker", "安装", "PostgreSQL", "入门"]
+category: "docker"
+cover: ""
+draft: false
+series: "Docker 从入门到实战"
+seriesOrder: 2
+---
+
+上一篇我们聊了 Docker 是什么以及为什么需要它。这篇开始动手。
+
+假设你要开发一个订单管理 API，需要一个 PostgreSQL 数据库。按照传统方式，你要去 PostgreSQL 官网下载安装包、配置监听地址、设端口、改密码……如果你的电脑上已经装了其他版本的 PostgreSQL，还可能起冲突。
+
+用 Docker 的话，只需要一行命令：
+
+```bash
+docker run --name order-db -e POSTGRES_PASSWORD=order_secret_2025 -p 5432:5432 -d postgres:16
+```
+
+十秒钟之后，一个完整的 PostgreSQL 16 数据库就在你本地跑起来了。不用安装、不用配置、不用操心版本冲突。用完之后 `docker rm order-db` 删掉，干干净净。
+
+下面我们来拆解这行命令，理解每个参数的含义。
+
+## 安装 Docker
+
+在动手之前，先确保你电脑上装了 Docker。不同平台的安装方式不同，但都不复杂。
+
+**macOS**：去 [Docker Desktop](https://www.docker.com/products/docker-desktop/) 下载安装包，拖到 Applications 就行。Docker Desktop 内置了 Docker Engine 和 Docker Compose。
+
+**Linux（Ubuntu/Debian）**：
+
+```bash
+# 安装 Docker 官方源
+curl -fsSL https://get.docker.com | sh
+
+# 把当前用户加入 docker 组（免 sudo）
+sudo usermod -aG docker $USER
+
+# 重新登录让用户组生效
+```
+
+**Windows**：安装 WSL2（Windows Subsystem for Linux 2），然后在 WSL2 里用上面的 Linux 安装方式。Docker Desktop for Windows 也是一个选择，但 WSL2 + 命令行的方式更轻量。
+
+安装完成后验证：
+
+```bash
+docker --version
+# Docker version 27.x.x
+
+docker compose version
+# Docker Compose version v2.x.x
+```
+
+能看到版本号就说明安装成功了。
+
+## docker run：启动容器的核心命令
+
+`docker run` 是你用得最多的命令。让我们用电商订单 API 的 PostgreSQL 数据库作为例子，一步步理解它的参数。
+
+最简形式：
+
+```bash
+docker run postgres:16
+```
+
+这会从 Docker Hub 下载 `postgres:16` 镜像（如果本地没有的话），然后启动一个 PostgreSQL 容器。但你会看到它直接在前台运行了，终端被占用。而且你无法从外部连接这个数据库。
+
+加上 `-d`（detached）让它在后台运行：
+
+```bash
+docker run -d postgres:16
+```
+
+加上 `--name` 给它起个名字，方便后续操作：
+
+```bash
+docker run -d --name order-db postgres:16
+```
+
+加上 `-e` 设置环境变量。PostgreSQL 镜像要求设置超级用户密码：
+
+```bash
+docker run -d --name order-db -e POSTGRES_PASSWORD=order_secret_2025 postgres:16
+```
+
+加上 `-p` 做端口映射，让宿主机能通过 5432 端口访问容器内的 PostgreSQL：
+
+```bash
+docker run -d --name order-db \
+  -e POSTGRES_PASSWORD=order_secret_2025 \
+  -p 5432:5432 \
+  postgres:16
+```
+
+这就是我们一开始看到的那行命令。每个参数都有明确的用途：`-d` 后台运行、`--name` 命名、`-e` 配置、`-p` 端口映射。
+
+关于 `-p 5432:5432`：冒号前面是宿主机的端口，冒号后面是容器内的端口。如果宿主机的 5432 端口已经被其他服务占用了，你可以用 `-p 5433:5432`，这样你通过宿主机的 5433 端口访问容器内的 5432 端口。
+
+## 验证数据库是否正常工作
+
+容器启动了，我们来连接试试。
+
+```bash
+# 进入容器内部，用 psql 连接
+docker exec -it order-db psql -U postgres
+
+# 进入 psql 后执行
+postgres=# CREATE DATABASE order_service;
+CREATE DATABASE
+
+postgres=# \c order_service
+You are now connected to database "order_service" as user "postgres".
+
+order_service=# CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    user_id VARCHAR(20) NOT NULL,
+    product_sku VARCHAR(50) NOT NULL,
+    quantity INTEGER NOT NULL,
+    total_amount DECIMAL(10,2) NOT NULL,
+    status VARCHAR(20) DEFAULT 'pending',
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE TABLE
+
+order_service=# INSERT INTO orders (user_id, product_sku, quantity, total_amount)
+    VALUES ('usr_a1x9k2m', 'SKU_iphone15pro_256black', 1, 8999.00);
+INSERT 0 1
+
+order_service=# SELECT * FROM orders;
+ id | user_id    | product_sku               | quantity | total_amount | status  | created_at
+----+------------+---------------------------+----------+--------------+---------+-------------------
+  1 | usr_a1x9k2m | SKU_iphone15pro_256black  |        1 |      8999.00 | pending | 2025-03-15 06:32:08
+(1 row)
+```
+
+这里用到了 `docker exec -it` 命令：`-i` 保持标准输入开启，`-t` 分配一个终端。合起来就是"以交互模式进入容器内部执行命令"。
+
+你也可以直接从宿主机连接（因为做了端口映射）：
+
+```bash
+psql -h localhost -p 5432 -U postgres -d order_service
+```
+
+## 容器的生命周期
+
+一个容器从创建到删除，经历这些状态：
+
+```
+Created → Running → Paused → Stopped → Removed
+```
+
+`docker run` 直接跳过 Created 变成 Running。其他状态的转换：
+
+```bash
+# 暂停容器（进程被冻结，不释放内存）
+docker pause order-db
+
+# 恢复暂停
+docker unpause order-db
+
+# 停止容器（发送 SIGTERM 信号，进程优雅退出）
+docker stop order-db
+
+# 启动已停止的容器
+docker start order-db
+
+# 强制停止（发送 SIGKILL，进程被直接杀掉）
+docker kill order-db
+
+# 删除已停止的容器
+docker rm order-db
+
+# 强制删除运行中的容器（先 kill 再 rm）
+docker rm -f order-db
+```
+
+一个需要注意的点：`docker rm -f` 很方便，但它会直接杀掉进程。如果容器里有正在写入数据库的事务，可能会导致数据不一致。生产环境中尽量用 `docker stop`，给进程 10 秒钟的优雅退出时间。
+
+## 常用的查看命令
+
+日常开发中，你会频繁用到这几个命令：
+
+```bash
+# 查看正在运行的容器
+docker ps
+
+# 查看所有容器（包括已停止的）
+docker ps -a
+
+# 查看容器日志（最近 100 行）
+docker logs --tail 100 order-db
+
+# 实时跟踪日志（类似 tail -f）
+docker logs -f order-db
+
+# 查看容器详细信息（IP 地址、端口映射、挂载等）
+docker inspect order-db
+
+# 查看容器占用的资源（CPU、内存、网络 I/O）
+docker stats order-db
+```
+
+`docker logs -f` 特别好用。当你的应用容器启动失败时，第一反应就是看日志。比如：
+
+```bash
+docker logs order-db
+# 输出：
+# The files belonging to this database system will be owned by user "postgres".
+# ...
+# PostgreSQL init process complete; ready for start up.
+# ...
+# LOG:  listening on IPv4 address "0.0.0.0", port 5432
+```
+
+看到 `ready for start up` 和 `listening on port 5432`，说明数据库启动正常。
+
+## 镜像标签的选择
+
+Docker Hub 上的 PostgreSQL 镜像有很多标签，选哪个？
+
+```bash
+# 官方 PostgreSQL 镜像可用的标签
+postgres:16          # 16 系列最新版本
+postgres:16.2        # 精确版本
+postgres:16-alpine   # 基于 Alpine Linux 的精简版
+postgres:latest      # 最新版本（不推荐生产使用）
+postgres:14          # 14 系列（旧版本）
+```
+
+**开发环境**可以用 `postgres:16` 或 `postgres:16-alpine`。Alpine 版本大约 80MB，普通版本大约 400MB。功能上没有区别，Alpine 只是用了更小的底层系统。
+
+**生产环境**建议用精确版本号如 `postgres:16.2`，避免某天 Docker Hub 更新了 `postgres:16` 的内容，你拉到的镜像和你测试过的不是同一个。
+
+`latest` 标签永远指向最新版本。今天拉到的是 16.2，明天可能变成 17.0。生产环境永远不要用 `latest`。
+
+## Docker Hub 上找靠谱的镜像
+
+你需要用 Redis、Nginx、MongoDB，怎么在 Docker Hub 上找到靠谱的镜像？
+
+**认准 Official Image（官方镜像）**。在 Docker Hub 上，官方镜像的命名是 `库名/镜像名`，比如 `library/postgres`（通常简写为 `postgres`），页面上有 "Official Image" 的蓝色标识。官方镜像由 Docker 官方或软件上游维护，经过了安全审查，更新及时。
+
+**社区镜像**通常以 `用户名/镜像名` 的格式出现。使用前看看几个指标：Star 数量、最近更新时间、是否有 Dockerfile 源码。一个三年没更新的社区镜像，里面可能有已知的安全漏洞。
+
+一个简单的判断方法：在 Docker Hub 搜索页面上，按 "Most Stars" 排序，排在前面的基本都有质量保证。
+
+## 容器清理
+
+Docker 用久了会积累很多无用的东西：停止的容器、未使用的镜像、 dangling 层。定期清理是好习惯：
+
+```bash
+# 删除所有已停止的容器
+docker container prune
+
+# 删除所有未被使用的镜像
+docker image prune -a
+
+# 一键清理所有无用资源（容器、镜像、网络、构建缓存）
+docker system prune
+
+# 加上 --volumes 连无用数据卷也一起清理（慎用）
+docker system prune --volumes
+```
+
+如果你想看 Docker 占用了多少磁盘空间：
+
+```bash
+docker system df
+# TYPE            TOTAL   ACTIVE   SIZE      RECLAIMABLE
+# Images          12      4        3.2GB     2.1GB (65%)
+# Containers      5       3        156MB     52MB (33%)
+# Local Volumes   3       2        412MB     0B (0%)
+# Build Cache     45      0        1.8GB     1.8GB (100%)
+```
+
+`RECLAIMABLE` 列告诉你有多少空间可以回收。
+
+## 回顾
+
+这篇我们完成了 Docker 的第一次实操：用一行命令跑起了一个 PostgreSQL 数据库，然后在容器里创建了订单表、插入了测试数据。过程中理解了 `docker run` 的核心参数（`-d`、`--name`、`-e`、`-p`）、容器的生命周期、以及镜像标签的选择。
+
+有一个问题我们暂时跳过了：容器删了之后，数据库里的订单数据也就没了。这显然不行——下一篇我们来解决数据持久化的问题。
+
+不过在此之前，还有一个更基础的能力要掌握：怎么把自己的应用（而不是别人做好的 PostgreSQL）打包成镜像。这就是下一篇 Dockerfile 的内容。

@@ -1,0 +1,181 @@
+---
+title: "12 从 Docker 到 Kubernetes"
+date: "2025-03-30"
+summary: "单机 Docker Compose 不够用了怎么办？理解 Docker 的能力边界，搞清楚什么时候该上 Kubernetes、什么时候不需要。"
+tags: ["Docker", "Kubernetes", "容器编排", "架构"]
+category: "docker"
+cover: ""
+draft: false
+series: "Docker 从入门到实战"
+seriesOrder: 12
+---
+
+订单 API 上线半年了，流量从最初的几百 QPS 增长到了三千。一台 4 核 8GB 的服务器开始有点吃力——高峰时段 API 的响应时间从 50ms 飙到了 500ms，PostgreSQL 偶尔会出现连接超时。
+
+你开始考虑加机器。但问题来了：Docker Compose 是单机工具——你可以在一台机器上 `docker compose up`，但怎么让两台机器上的容器协同工作？怎么在流量高峰时自动增加 API 实例、流量回落时自动减少？
+
+这就是 Docker Compose 的能力边界，也是 Kubernetes 要解决的问题。
+
+## Docker Compose 的边界
+
+回顾一下我们用 Compose 做了什么：定义多个服务、管理它们的网络和 Volume、控制启动顺序、配置健康检查和资源限制。
+
+这些都是单机范围内的能力。当你的需求超出单机时，Compose 的局限就暴露了：
+
+**多机部署**。Compose 只能在一台机器上管理容器。如果你有三台服务器，你要么手动在每台机器上分别 `docker compose up`，要么用更复杂的工具（比如 Ansible）来协调。不同机器上的容器之间怎么通信？怎么共享配置？怎么统一管理？Compose 不管这些。
+
+**自动扩缩容**。上一篇我们用了 `--scale api=3` 启动多个 API 实例。但这个数字是写死的。如果晚上 10 点流量暴涨、凌晨 3 点流量回落，你不可能半夜爬起来手动调整 replicas。
+
+**滚动更新**。发布新版本时，你 `docker compose up -d` 会同时重启所有实例。重启期间服务不可用（即使你只停了 1 秒，对高 QPS 的 API 来说也意味着大量请求失败）。生产环境需要的是"滚动更新"——停一个、启一个、等健康检查通过、再停下一个。
+
+**服务发现和负载均衡**。在 Compose 里，服务名就是主机名，DNS 解析由 Docker 内置的 DNS 完成。但在多机环境下，不同机器上的容器怎么互相发现？需要一个全局的服务注册和发现机制。
+
+**自愈能力**。Compose 的 `restart: unless-stopped` 能在单机上自动重启挂掉的容器。但如果整台机器宕机了呢？Compose 无能为力。
+
+## Kubernetes 是什么
+
+Kubernetes（简称 K8s）是 Google 开源的容器编排平台，专门解决上述这些问题。
+
+用 Docker 的概念来类比 K8s 的核心概念，更容易理解：
+
+| Docker Compose       | Kubernetes        | 含义                                                       |
+| -------------------- | ----------------- | ---------------------------------------------------------- |
+| `service`            | `Pod`             | 运行容器的最小单位（Pod 可以包含多个容器，共享网络和存储） |
+| `service`            | `Deployment`      | 管理多个 Pod 的副本数量、更新策略                          |
+| `depends_on`         | `Service`         | 服务发现和内部负载均衡（不是 Compose 的 service）          |
+| `docker-compose.yml` | `manifest` (YAML) | 声明式配置，但更复杂                                       |
+| `docker compose up`  | `kubectl apply`   | 应用配置                                                   |
+| `-p` (项目名)        | `namespace`       | 多环境隔离                                                 |
+
+一个 Deployment 的例子：
+
+```yaml
+# k8s/deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order-api
+spec:
+  replicas: 3 # 自动维护 3 个 Pod
+  selector:
+    matchLabels:
+      app: order-api
+  template:
+    metadata:
+      labels:
+        app: order-api
+    spec:
+      containers:
+        - name: api
+          image: yourname/order-api:abc123def456
+          ports:
+            - containerPort: 3000
+          resources:
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+```
+
+对比 Compose 的写法，K8s 的配置更啰嗦，但也更精细。关键区别在于 `replicas: 3`——K8s 会自动确保始终有 3 个 Pod 在运行。如果某个 Pod 挂了（或者所在机器宕机了），K8s 会在其他机器上自动创建新的 Pod 来替代。
+
+## Docker Swarm：Docker 自己的编排工具
+
+你可能听说过 Docker Swarm——Docker 官方提供的容器编排工具。它确实能解决多机部署的问题，而且语法和 Compose 几乎一样。
+
+```yaml
+# docker-compose.yml（Swarm 模式）
+services:
+  api:
+    image: yourname/order-api:latest
+    deploy:
+      replicas: 3
+      update_config:
+        parallelism: 1 # 每次更新 1 个
+        delay: 10s # 间隔 10 秒
+      rollback_config:
+        parallelism: 1
+```
+
+```bash
+# 初始化 Swarm 集群
+docker swarm init
+
+# 部署
+docker stack deploy -c docker-compose.yml order-api
+```
+
+Swarm 的优势是学习成本低——你已经会 Compose 了，Swarm 几乎无缝衔接。但它没有成为主流，原因有几个：
+
+- 功能远不如 K8s 丰富（没有自动扩缩容、没有复杂的服务发现、没有 ConfigMap/Secret 管理）。
+- 社区和生态远不如 K8s 活跃。
+- Docker 公司自身的战略重心已经不在 Swarm 上了（Docker Enterprise 已被卖给 Mirantis）。
+
+如果你只是需要多机部署，Swarm 能用。但如果你的项目有持续增长的需求，K8s 是更稳妥的选择。
+
+## 什么时候不需要 Kubernetes
+
+K8s 很强大，但它不是免费的午餐。引入 K8s 意味着：
+
+- **学习成本高**：K8s 的概念很多（Pod、Deployment、Service、Ingress、ConfigMap、Secret、PVC、Job、CronJob...），完全掌握需要几个月。
+- **运维成本高**：你需要管理 K8s 集群本身——升级版本、监控集群健康、处理节点故障、管理证书。
+- **资源开销大**：K8s 的控制平面（etcd、API Server、Scheduler、Controller Manager）本身就占用不少资源。对于小集群（3 台机器以下），K8s 本身的开销占比不小。
+
+以下场景不需要 K8s：
+
+- **中小项目**：几台机器、几个服务，Compose 或 Swarm 完全够用。
+- **内部工具**：流量不大、对可用性要求不高，单机 Compose 就够了。
+- **单人或小团队**：没有专门的运维人员来管理 K8s 集群。
+- **初创公司**：团队精力应该放在产品上，而不是基础设施上。
+
+什么时候该考虑 K8s：
+
+- 服务数量超过 10 个，需要精细化的编排和调度。
+- 需要跨多个可用区（AZ）部署，保证高可用。
+- 需要根据流量自动扩缩容。
+- 团队有专门的平台工程师或 SRE 来管理基础设施。
+
+一个经验法则：**如果你的团队里没有一个人能独立搭建和管理 K8s 集群，就不要上 K8s。** 否则它只会成为负担，而不是效率工具。
+
+## 云平台的托管 K8s
+
+如果你确实需要 K8s，不要自己从零搭建。各大云平台都提供了托管的 K8s 服务，你只需要管理工作节点（甚至节点也由平台管理），不用操心控制平面的运维。
+
+| 平台         | 托管 K8s 服务 | 特点                     |
+| ------------ | ------------- | ------------------------ |
+| AWS          | EKS           | 生态最成熟，配套服务多   |
+| Google Cloud | GKE           | K8s 的发源地，集成最好   |
+| 阿里云       | ACK           | 国内最主流，文档中文友好 |
+| 腾讯云       | TKE           | 和阿里云类似             |
+
+托管 K8s 大幅降低了运维门槛。你不需要自己升级 K8s 版本、不需要管理 etcd 集群、不需要处理控制平面故障。但成本也不低——三节点的 GKE 集群每月大约 $150-300（取决于配置），还不包括运行 Pod 的资源费用。
+
+## Docker 和 K8s 的关系
+
+一个常见的误解是"Docker 和 K8s 是竞争关系"。实际上它们是互补的：
+
+- **Docker** 负责构建和运行容器（镜像打包、容器生命周期）。
+- **K8s** 负责编排和管理容器（调度、扩缩容、服务发现、滚动更新）。
+
+K8s 并不绑定 Docker 作为容器运行时。事实上，K8s 1.24+ 已经移除了对 Docker 的内置支持（改用 containerd 作为运行时）。但 Docker 构建的镜像仍然可以在 K8s 上运行——因为镜像是 OCI 标准格式，和构建工具无关。
+
+所以你学 Docker 不是白学。Docker 教给你的是容器化的思维方式：怎么把应用和它的依赖打包、怎么隔离运行环境、怎么管理数据和网络。这些知识在 K8s 里完全适用。
+
+## 系列回顾
+
+十二篇文章，我们走完了从"为什么需要 Docker"到"什么时候该考虑 Kubernetes"的完整路径。
+
+回顾一下你学到的：
+
+- **Docker 的本质**：不是虚拟机，是进程级隔离 + 分层镜像 + 标准化打包。
+- **Dockerfile**：把应用打包成镜像，选择对的基础镜像、利用缓存、用多阶段构建。
+- **数据持久化**：Volume（生产）和 Bind Mount（开发）两种方式。
+- **容器网络**：自定义 bridge 网络 + DNS 解析，服务名即主机名。
+- **Docker Compose**：声明式定义多服务架构，一条命令启动一切。
+- **生产配置**：健康检查、资源限制、日志轮转、多环境配置。
+- **镜像优化**：从 468MB 到 138MB，Alpine + 多阶段构建 + 清理缓存。
+- **安全加固**：非 root 运行、漏洞扫描、敏感信息管理。
+- **CI/CD**：GitHub Actions 自动构建、扫描、部署。
+- **故障排查**：日志 → 状态 → 进容器，系统化的排查方法。
+- **Docker vs K8s**：知道 Docker 的边界，在合适的时机做合适的选择。
+
+Docker 不是终点，而是起点。掌握了容器化的思维方式，无论你之后用 Compose、Swarm 还是 Kubernetes，都能快速上手。

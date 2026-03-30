@@ -1,7 +1,7 @@
 ---
-title: "13 Node.js 调试：Inspector 协议与 Source Map"
+title: "13 调试：Inspector 与 Source Map"
 date: "2026-04-09"
-summary: "深入掌握 Node.js 调试工具，使用 Inspector 协议、Chrome DevTools、Source Map 进行远程调试和生产环境调试"
+summary: "日志服务在处理某种特殊格式的日志时崩溃，用 Chrome DevTools 和 VS Code 调试器定位到 Buffer 解析的边界条件 bug，同时搞懂 Source Map 的工作原理。"
 tags: ["Node.js", "调试", "Inspector", "Source Map"]
 category: "nodejs-core"
 cover: ""
@@ -10,38 +10,42 @@ series: "Node.js 核心概念深度解析"
 seriesOrder: 13
 ---
 
-## 前言
+日志服务在生产环境处理了三天的日志，一切正常。突然收到告警：某个服务的日志导致解析进程崩溃了。错误堆栈指向 [第 1 篇](/posts/nodejs-core/01-buffer-binary-data) 写的 Buffer 解析函数，但你只看到一堆 `parser.js:42:15` 这样的位置信息，完全对应不上你写的 TypeScript 源码。
 
-在 Node.js 后端开发中，**调试**是解决问题的核心技能。理解 Inspector 协议、Source Map、远程调试等技术对于高效开发至关重要。
+你第一反应是加 `console.log`，然后重新部署、等复现。但这个 bug 只在特定日志格式下才触发，复现条件不确定。你需要一种方法能在不修改代码的情况下深入运行中的程序。
 
-**核心内容**：
+## Node.js 的调试器：--inspect
 
-- Inspector 协议与 Chrome DevTools 集成
-- node --inspect 与调试器连接
-- Source Map 在 Node.js 中的应用
-- 实战：远程调试 Docker 容器中的 Node.js 应用
-
----
-
-## 一、Inspector 协议
-
-### 1.1 启用调试
+Node.js 内置了基于 Chrome DevTools Protocol 的调试器。启动时加上 `--inspect` 标志：
 
 ```bash
-node --inspect app.js
+node --inspect server.js
 ```
 
-### 1.2 Chrome DevTools 调试
+你会看到这样的输出：
 
-1. 打开 `chrome://inspect`
-2. 点击 "inspect"
-3. 在 DevTools 中调试
+```
+Debugger listening on ws://127.0.0.1:9229/xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+For help, see: https://nodejs.org/en/docs/inspector
+```
 
----
+然后在 Chrome 浏览器打开 `chrome://inspect`，点击你的 Node.js 进程下面的 "inspect"，就能看到和调试前端代码一样的 DevTools 界面。
 
-## 二、VSCode 调试
+`--inspect` 会等调试器连接后才执行代码。如果你想不等调试器就启动（比如生产环境排查），用 `--inspect-brk` 会在第一行代码暂停，或者干脆不加 `brk`：
 
-### 2.1 launch.json
+```bash
+# 等调试器连接后才开始执行
+node --inspect-brk server.js
+
+# 正常启动，调试器随时可以连
+node --inspect server.js
+```
+
+## VS Code 调试：大多数时候更方便
+
+如果你用 VS Code 写代码，内置的调试器比 Chrome DevTools 更好用——代码和调试在同一个窗口，不需要切换。
+
+在项目根目录创建 `.vscode/launch.json`：
 
 ```json
 {
@@ -50,79 +54,116 @@ node --inspect app.js
     {
       "type": "node",
       "request": "launch",
-      "name": "Debug",
-      "program": "${workspaceFolder}/app.js"
+      "name": "启动日志服务",
+      "program": "${workspaceFolder}/src/server.ts",
+      "runtimeArgs": ["--enable-source-maps"],
+      "envFile": "${workspaceFolder}/.env",
+      "console": "integratedTerminal"
+    },
+    {
+      "type": "node",
+      "request": "attach",
+      "name": "连接运行中的进程",
+      "port": 9229,
+      "restart": true,
+      "localRoot": "${workspaceFolder}",
+      "remoteRoot": "/app"
     }
   ]
 }
 ```
 
-### 2.2 断点调试
+两个配置的区别：`launch` 是你启动进程，`attach` 是连接一个已经在运行的进程。`attach` 的 `restart: true` 意味着进程退出后自动重新连接——对排查进程崩溃类问题很有用。
 
-```javascript
-// app.js
-const express = require("express");
+几个实用的断点技巧：
 
-const app = express();
+- **条件断点**：右键断点可以设置条件，比如 `traceId === 'trace_a1x9k2m'`，只有处理这个特定请求时才停下来。这在排查特定日志导致的崩溃时非常好用。
+- **日志断点**：不断下程序，只是在命中断点时输出一条日志。相当于不修改代码的 `console.log`。
+- **Watch 表达式**：在 Watch 面板添加表达式，每次断点命中时自动计算并显示值。可以监视 `buffer.length`、`offset` 这类关键变量。
 
-app.get("/", (req, res) => {
-  debugger; // 断点
-  res.send("Hello");
-});
+## Source Map：让调试器找到你的源码
 
-app.listen(3000);
-```
+回到开头的问题——为什么堆栈里显示的是 `parser.js:42` 而不是你的 TypeScript 文件？
 
----
+因为 TypeScript（以及任何转译工具）编译后的代码和源码的行号对不上。编译后的 `parser.js` 第 42 行可能对应源码 `parser.ts` 第 28 行。**Source Map 就是一个映射表**，告诉调试器"编译后文件的第 N 行对应源文件的第 M 行"。
 
-## 三、Source Map
+在 `tsconfig.json` 中启用：
 
-### 3.1 生成 Source Map
-
-```javascript
-// tsconfig.json
+```json
 {
   "compilerOptions": {
     "sourceMap": true
+    // 如果不想把 .map 文件发布到生产环境：
+    // "inlineSources": true  把源码内容嵌入 map 文件
   }
 }
 ```
 
-### 3.2 启用 Source Map
+编译后会生成 `.js.map` 文件。Node.js 需要加 `--enable-source-maps` 才会使用它：
 
 ```bash
-node --enable-source-map app.js
+node --enable-source-maps dist/server.js
 ```
 
----
+不加这个标志，Node.js 会忽略 Source Map，错误堆栈里显示的是编译后的文件位置。
 
-## 四、远程调试
+这里有个容易踩的坑：如果你的 `dist/` 目录只有编译后的 `.js` 文件，没有源码的 `.ts` 文件，即使加载了 Source Map，调试器也找不到源码来显示。要么把 `.ts` 文件也部署到服务器上（不太优雅），要么在编译时用 `inlineSources: true` 把源码内容直接嵌入 `.map` 文件。
 
-### 4.1 Docker 调试
+## 远程调试：连接 Docker 容器里的进程
+
+生产环境的代码跑在 Docker 容器或远程服务器上，你不能在本地 `node --inspect`。这时候需要把远程的调试端口转发到本地。
+
+**方法一：SSH 隧道**
 
 ```bash
-docker run -p 9229:9229 node --inspect=0.0.0.0:9229 app.js
+# 把远程服务器的 9229 端口转发到本地 9229
+ssh -L 9229:localhost:9229 deploy@prod-server-01
 ```
 
-### 4.2 SSH 隧道
+然后在本地的 Chrome DevTools 或 VS Code 中连接 `localhost:9229`。
+
+**方法二：Docker 端口映射**
 
 ```bash
-ssh -L 9229:localhost:9229 user@server
+# 启动容器时暴露调试端口
+docker run -p 9229:9229 -p 3000:3000 log-service:latest
+
+# 容器内用 --inspect 启动
+# node --inspect=0.0.0.0:9229 server.js
 ```
 
----
+远程调试有一个重要的安全提醒：`--inspect` 默认绑定 `127.0.0.1`，只能本机连接。如果绑定 `0.0.0.0`，网络上的任何人都能连接你的调试器——他们可以执行任意 JavaScript 代码、读取环境变量（可能包含密钥）。**永远不要在生产环境对公网暴露 9229 端口**。用 SSH 隧道或 Docker 内部网络来访问。
 
-## 五、总结
+## 生产环境调试：不是直接 --inspect
 
-**核心要点**：
+在生产环境开 `--inspect` 有风险：调试器连接时 V8 会暂停所有线程来收集信息，可能影响正在处理的请求。而且调试端口暴露增加了攻击面。
 
-1. --inspect 启用调试
-2. Chrome DevTools 可视化调试
-3. Source Map 映射源码
-4. 远程调试生产环境
+更安全的做法是用 Node.js 22 的 `--inspect-wait` 结合按需激活：
 
-**下一步**：NPM 生态系统与包管理
+```bash
+# 进程正常启动，不监听调试端口
+node server.js
 
----
+# 需要调试时，发信号激活调试器
+kill -USR1 <pid>
+# 此时才开始监听 9229 端口，调试器可以连接
+```
 
-**相关代码**：[nodejs-core-examples](https://github.com/your-repo/nodejs-core-examples)
+这样你平时不承担任何调试开销，只有需要排查问题时才激活。
+
+另外一种常用方案是**事后分析**（post-mortem debugging）：进程崩溃时自动生成 core dump 或堆快照，然后离线分析。[上一篇](/posts/nodejs-core/12-performance-profiling) 讲的 `v8.writeHeapSnapshot()` 就属于这类方法。
+
+## 调试策略总结
+
+不同场景用不同的调试方式：
+
+| 场景        | 推荐方式                             | 原因                                     |
+| ----------- | ------------------------------------ | ---------------------------------------- |
+| 本地开发    | VS Code 调试器                       | 代码和调试在同一窗口，断点、Watch 最方便 |
+| 偶现 bug    | 条件断点 + 日志断点                  | 不改代码就能捕获特定条件                 |
+| 远程服务器  | SSH 隧道 + Chrome DevTools           | 不需要在远程装 VS Code                   |
+| Docker 容器 | 端口映射或 `docker exec` + `nsenter` | 容器网络隔离需要特殊处理                 |
+| 进程崩溃    | core dump / 堆快照事后分析           | 进程都没了，只能事后分析                 |
+| 生产环境    | `kill -USR1` 按需激活                | 平时零开销，需要时再开                   |
+
+调试的本质不是工具的使用，而是思路：先缩小范围（是哪个请求、哪个函数、哪个分支），再用断点验证假设。日志服务的核心功能已经完整了，接下来看看怎么把日志解析模块抽取为独立的 npm 包，让其他团队也能复用。

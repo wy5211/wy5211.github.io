@@ -1,0 +1,231 @@
+---
+title: "09 Worker Threads：多线程编程"
+date: "2026-04-04"
+summary: "理解 Worker Threads 的内存模型和通信机制，用 SharedArrayBuffer 实现共享计数器，构建多线程日志分析引擎。"
+tags: ["Node.js", "Worker Threads", "多线程", "CPU 密集"]
+category: "nodejs-core"
+cover: ""
+draft: false
+series: "Node.js 核心概念深度解析"
+seriesOrder: 9
+---
+
+日志服务要对过去 24 小时的日志做统计分析——按小时聚合错误数量、计算 P99 响应时间。单线程处理 500MB 数据要跑 30 秒，事件循环被完全阻塞，所有查询请求都超时了。
+
+[上一篇](/posts/nodejs-core/08-process-child-process) 的子进程能解决这个问题，但创建进程的开销很大（每个进程几十 MB 内存），而且进程间通信需要序列化数据。Worker Threads 是 Node.js 提供的更轻量的多线程方案。
+
+## 为什么需要 Worker Threads
+
+Node.js 主线程是单线程的。这意味着 CPU 密集型任务（大量计算、数据排序、加密解密）会阻塞事件循环，导致所有 I/O 操作被延迟。
+
+子进程能绕过这个限制，但代价太高：
+
+| 特性     | 子进程 (fork) | Worker Threads                 |
+| -------- | ------------- | ------------------------------ |
+| 创建开销 | 大（几十 MB） | 小（几 MB）                    |
+| 启动速度 | 慢（~100ms）  | 快（~10ms）                    |
+| 通信方式 | IPC（序列化） | 结构化克隆 / SharedArrayBuffer |
+| 内存共享 | 不共享        | 可共享                         |
+| 适用场景 | 调用外部命令  | 纯 JavaScript 计算             |
+
+如果你的任务是纯 JavaScript 计算（不需要调用外部命令、不需要独立的环境隔离），Worker Threads 是更好的选择。
+
+## 基本用法
+
+```js
+// main.js
+import { Worker } from "node:worker_threads";
+
+const worker = new Worker("./analyze.js", {
+  workerData: { filePath: "logs/2026-03-15.log", startLine: 0, endLine: 10000 },
+});
+
+worker.on("message", (result) => {
+  console.log("分析结果:", result);
+});
+
+worker.on("error", (err) => {
+  console.error("Worker 出错:", err);
+});
+
+worker.on("exit", (code) => {
+  if (code !== 0) console.error(`Worker 退出码: ${code}`);
+});
+```
+
+```js
+// analyze.js
+import { workerData, parentPort } from "node:worker_threads";
+import { readFileSync } from "node:fs";
+
+const { filePath, startLine, endLine } = workerData;
+
+// 读取并分析日志文件（CPU 密集操作）
+const content = readFileSync(filePath, "utf-8");
+const lines = content.split("\n").slice(startLine, endLine);
+
+const errorCount = lines.filter((l) => l.includes('"level":"ERROR"')).length;
+const warnCount = lines.filter((l) => l.includes('"level":"WARN"')).length;
+
+// 把结果发回主线程
+parentPort.postMessage({ errorCount, warnCount, totalLines: lines.length });
+```
+
+`workerData` 是初始化时传给 Worker 的数据（只能传一次）。`parentPort` 是 Worker 和主线程通信的通道——本质上也是结构化克隆（类似 JSON 序列化），不能共享引用。
+
+## SharedArrayBuffer：共享内存
+
+`parentPort.postMessage` 每次都会复制数据。如果需要频繁地在主线程和 Worker 之间共享数据（比如一个不断更新的统计计数器），用 `SharedArrayBuffer`：
+
+```js
+// main.js
+import { Worker } from "node:worker_threads";
+
+// 创建共享内存：4 个 32 位整数（errorCount, warnCount, infoCount, debugCount）
+const sharedBuffer = new SharedArrayBuffer(16);
+const counters = new Int32Array(sharedBuffer);
+
+const worker = new Worker("./counter.js", {
+  workerData: { sharedBuffer },
+});
+
+worker.on("message", () => {
+  console.log("错误数:", counters[0]);
+  console.log("警告数:", counters[1]);
+});
+```
+
+```js
+// counter.js
+import { workerData, parentPort } from "node:worker_threads";
+
+const { sharedBuffer } = workerData;
+const counters = new Int32Array(sharedBuffer);
+
+// 直接在共享内存上修改
+counters[0] += 15; // errorCount
+counters[1] += 42; // warnCount
+
+parentPort.postMessage("done");
+```
+
+`SharedArrayBuffer` 的数据在所有 Worker 和主线程之间共享，修改是立即可见的。但这也意味着你需要处理并发问题——多个 Worker 同时写同一个位置会产生竞态条件。
+
+### Atomics：原子操作
+
+`Atomics` 提供了线程安全的读写操作：
+
+```js
+import { Atomics } from "node:atomics";
+
+// 原子递增（返回旧值）
+const oldCount = Atomics.add(counters, 0, 1); // counters[0]++
+
+// 原子加载
+const current = Atomics.load(counters, 0);
+
+// 原子存储
+Atomics.store(counters, 0, 100);
+
+// 等待某个位置变成期望的值
+Atomics.wait(counters, 2, 0); // 等 counters[2] 变成非 0
+```
+
+`Atomics.wait` 会阻塞当前线程（注意：在主线程中不能用 `wait`，只能在 Worker 中用）。这让你可以用共享内存实现简单的线程间同步。
+
+## 实战：多线程日志分析引擎
+
+把 500MB 的日志文件分片，分配给多个 Worker 并行处理：
+
+```js
+// main.js
+import { Worker, availableParallelism } from "node:worker_threads";
+import { readFileSync } from "node:fs";
+
+async function analyzeLog(filePath) {
+  const content = readFileSync(filePath, "utf-8");
+  const lines = content.split("\n");
+  const totalLines = lines.length;
+
+  const numWorkers = Math.min(availableParallelism(), 4);
+  const linesPerWorker = Math.ceil(totalLines / numWorkers);
+
+  const results = await Promise.all(
+    Array.from({ length: numWorkers }, (_, i) => {
+      const start = i * linesPerWorker;
+      const end = Math.min(start + linesPerWorker, totalLines);
+
+      return new Promise((resolve, reject) => {
+        const worker = new Worker("./analyze-worker.js", {
+          workerData: { lines: lines.slice(start, end) },
+        });
+
+        worker.on("message", resolve);
+        worker.on("error", reject);
+        worker.on("exit", (code) => {
+          if (code !== 0) reject(new Error(`Worker ${i} 退出码: ${code}`));
+        });
+      });
+    })
+  );
+
+  // 汇总所有 Worker 的结果
+  const summary = results.reduce(
+    (acc, r) => ({
+      errorCount: acc.errorCount + r.errorCount,
+      warnCount: acc.warnCount + r.warnCount,
+      totalLines: acc.totalLines + r.totalLines,
+    }),
+    { errorCount: 0, warnCount: 0, totalLines: 0 }
+  );
+
+  return summary;
+}
+```
+
+```js
+// analyze-worker.js
+import { workerData, parentPort } from "node:worker_threads";
+
+const { lines } = workerData;
+
+let errorCount = 0;
+let warnCount = 0;
+
+for (const line of lines) {
+  if (line.includes('"level":"ERROR"')) errorCount++;
+  else if (line.includes('"level":"WARN"')) warnCount++;
+}
+
+parentPort.postMessage({ errorCount, warnCount, totalLines: lines.length });
+```
+
+`availableParallelism()` 返回 CPU 逻辑核心数。在 8 核机器上，4 个 Worker 并行处理，理论上是单线程的 4 倍速度（实际可能 3 倍左右，因为有线程创建和数据传递的开销）。
+
+### Transferable 对象：零拷贝传输
+
+上面的例子中，`workerData: { lines }` 会把 lines 数组复制一份传给 Worker。对于大数据集，这个复制开销不小。用 Transferable 可以实现零拷贝：
+
+```js
+// 把 ArrayBuffer 转移给 Worker（转移后主线程就不能访问了）
+const buffer = new TextEncoder().encode(content).buffer;
+const worker = new Worker("./analyze-worker.js", {
+  workerData: { buffer },
+  transferList: [buffer],
+});
+```
+
+`transferList` 中的对象会被"转移"而不是"复制"——所有权的转移是瞬间的，不需要数据拷贝。代价是转移后原线程不能再访问这个对象。对于大文件分析场景，这个优化很有价值。
+
+## Worker Threads 的限制
+
+Worker Threads 不是万能的：
+
+- 每个 Worker 有独立的 V8 实例和事件循环，创建开销比协程大得多
+- 不能共享 DOM、原生模块（C++ addon）的部分功能
+- `SharedArrayBuffer` 需要特定的安全头（`Cross-Origin-Opener-Policy` 和 `Cross-Origin-Embedder-Policy`）才能在浏览器中使用，Node.js 中不受此限制
+- 调试 Worker 比调试主线程更复杂
+
+什么时候用 Worker Threads，什么时候用子进程？一个简单的判断标准：如果任务需要调用外部命令（`grep`、`gzip`），用子进程。如果任务是纯 JavaScript 计算（数据排序、加密、统计分析），用 Worker Threads。
+
+日志服务的分析引擎到此就完成了。下一篇我们来看安全——日志中包含敏感信息，API 接口需要认证，怎么用 Node.js 的 `crypto` 模块保护数据。

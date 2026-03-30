@@ -1,7 +1,7 @@
 ---
-title: "03 Node.js Event Loop：事件循环深度剖析"
+title: "03 Event Loop：事件循环深度剖析"
 date: "2026-03-30"
-summary: "深入理解 Node.js 事件循环的六个阶段、microtask 与 macrotask 的执行顺序、process.nextTick 与 setImmediate 的区别，掌握异步编程的核心机制"
+summary: "从 libuv 的六个阶段出发，理解微任务与宏任务的执行顺序，搞清楚 setTimeout、setImmediate、process.nextTick、Promise 之间的优先级关系。"
 tags: ["Node.js", "Event Loop", "异步编程", "libuv"]
 category: "nodejs-core"
 cover: ""
@@ -10,909 +10,221 @@ series: "Node.js 核心概念深度解析"
 seriesOrder: 3
 ---
 
-## 前言
+你写了一段代码：先读文件，再处理数据，最后返回结果。但运行发现，"返回结果"的代码在文件还没读完时就执行了。你知道这是"异步"，但具体是"怎么异步"的？
 
-Node.js 的**事件循环（Event Loop）**是其异步编程的核心机制。虽然前端开发者也知道浏览器的事件循环，但 Node.js 的事件循环有**完全不同的阶段划分**和**执行顺序**。理解事件循环对于编写高性能的 Node.js 应用、避免阻塞、优化异步操作至关重要。
+更让你困惑的是这些面试题：`setTimeout(fn, 0)` 和 `Promise.resolve().then(fn)` 谁先执行？`process.nextTick` 和 `setImmediate` 呢？为什么同样的代码，放在 `fs.readFile` 回调里执行顺序会变？
 
-**本文将解决什么问题？**
+这篇文绐绐彻底搞清楚这些问题。
 
-你可能想知道：
+## 为什么 Node.js 用单线程 + 事件循环
 
-- Node.js 的事件循环和浏览器的有什么区别？
-- `process.nextTick()` 和 `setImmediate()` 到底哪个先执行？
-- 微任务（microtask）和宏任务（macrotask）在 Node.js 中是如何执行的？
-- 为什么有时候 `setTimeout(fn, 0)` 比 `setImmediate(fn)` 先执行？
-- 如何避免阻塞事件循环？
+Java 的 Servlet 模型是"一个请求一个线程"。来 1000 个请求就开 1000 个线程，每个线程占 1MB 栈空间，光线程就吃掉 1GB 内存。再加上线程上下文切换的开销，并发一高服务器就扛不住了。
 
-**本文将带你：**
-
-1. 理解 libuv 事件循环的六个阶段
-2. 掌握 microtask 与 macrotask 的执行顺序
-3. 理解 `process.nextTick()` vs `setImmediate()` 的区别
-4. 学会检测事件循环阻塞
-5. 掌握 CPU 密集任务的分片处理技巧
-
----
-
-## 一、Event Loop 是什么？
-
-### 1.1 为什么需要事件循环？
-
-**Node.js 的特点**：单线程 + 异步 I/O
-
-```javascript
-// 伪代码：传统多线程方式
-// 线程 1：读取文件
-fs.readFile("file1.txt", (err, data) => {});
-
-// 线程 2：读取文件
-fs.readFile("file2.txt", (err, data) => {});
-
-// 线程 3：处理 HTTP 请求
-http.createServer((req, res) => {});
-
-// 问题：需要 3 个线程，资源消耗大
-```
-
-**Node.js 的事件循环方式**：
-
-```javascript
-// 单线程 + 事件循环
-// 一个线程处理所有操作
-
-const fs = require("fs");
-const http = require("http");
-
-// 异步操作不会阻塞
-fs.readFile("file1.txt", (err, data) => {
-  console.log("file1 read");
-});
-
-fs.readFile("file2.txt", (err, data) => {
-  console.log("file2 read");
-});
-
-http
-  .createServer((req, res) => {
-    res.end("Hello");
-  })
-  .listen(3000);
-
-// 事件循环不断处理回调
-```
-
-### 1.2 事件循环的工作原理
-
-**核心概念**：
+Node.js 走了另一条路：单线程 + 事件循环。主线程只负责接收请求和调度回调，真正耗时的 I/O 操作（文件读写、网络请求）交给操作系统的线程池或 libuv 的线程池去做，完成后通过事件通知主线程来处理结果。
 
 ```
-┌───────────────────────────────┐
-│                               │
-│   JavaScript 代码（同步）      │
-│                               │
-└────────────┬──────────────────┘
-             │
-             ↓
-┌───────────────────────────────┐
-│                               │
-│   异步操作（I/O、定时器）       │
-│   → 操作系统 / libuv 线程池     │
-│                               │
-└────────────┬──────────────────┘
-             │
-             ↓
-┌───────────────────────────────┐
-│                               │
-│   回调队列（等待执行）          │
-│                               │
-└────────────┬──────────────────┘
-             │
-             ↓
-┌───────────────────────────────┐
-│                               │
-│   事件循环（取出回调执行）      │
-│                               │
-└───────────────────────────────┘
+Java 模型（每请求一线程）：
+请求1 → [线程1] ── 阻塞等待 I/O ──→ 返回
+请求2 → [线程2] ── 阻塞等待 I/O ──→ 返回
+请求3 → [线程3] ── 阻塞等待 I/O ──→ 返回
+
+Node.js 模型（单线程 + 事件循环）：
+请求1 → [注册回调] → 事件循环 ← I/O 完成，执行回调1
+请求2 → [注册回调] → 事件循环 ← I/O 完成，执行回调2
+请求3 → [注册回调] → 事件循环 ← I/O 完成，执行回调3
 ```
 
-**执行流程**：
+这个模型的天然优势是：处理 I/O 密集型任务时，不需要为每个请求创建线程，内存开销极小。但代价是你不能在主线程做 CPU 密集型操作——否则事件循环被阻塞，所有请求都会卡住。
 
-1. 执行同步代码
-2. 异步操作交给操作系统或线程池
-3. 操作完成后，回调函数加入队列
-4. 事件循环从队列中取出回调执行
-5. 重复步骤 4
+## libuv 的六个阶段
 
----
-
-## 二、libuv 事件循环的六个阶段
-
-### 2.1 阶段概览
-
-Node.js 的事件循环由 **libuv** 库实现，分为**六个阶段**：
+事件循环由 libuv 实现，每次循环经过六个阶段：
 
 ```
    ┌──────────────────────────┐
-   │                          │
-   │   timers（定时器）        │ ← setTimeout、setInterval
-   │                          │
-   └──────────┬───────────────┘
-              ↓
-   ┌──────────────────────────┐
-   │                          │
-   │   pending callbacks      │ ← I/O 回调（TCP、错误）
-   │                          │
-   └──────────┬───────────────┘
-              ↓
-   ┌──────────────────────────┐
-   │                          │
-   │   idle, prepare          │ ← 内部使用
-   │                          │
-   └──────────┬───────────────┘
-              ↓
-   ┌──────────────────────────┐
-   │                          │
-   │   poll（轮询）            │ ← I/O 回调、计算新事件
-   │                          │
-   └──────────┬───────────────┘
-              ↓
-   ┌──────────────────────────┐
-   │                          │
-   │   check（检查）           │ ← setImmediate
-   │                          │
-   └──────────┬───────────────┘
-              ↓
-   ┌──────────────────────────┐
-   │                          │
-   │   close callbacks        │ ← socket.close、process.exit
-   │                          │
-   └──────────────────────────┘
-              ↓
-              (循环回 timers)
+┌─>│        timers             │  setTimeout、setInterval
+│  └────────┬─────────────────┘
+│  ┌────────▼─────────────────┐
+│  │   pending callbacks       │  上轮未执行的 I/O 回调
+│  └────────┬─────────────────┘
+│  ┌────────▼─────────────────┐
+│  │   idle, prepare           │  内部使用（可忽略）
+│  └────────┬─────────────────┘
+│  ┌────────▼─────────────────┐
+│  │        poll               │  获取新的 I/O 事件，执行 I/O 回调
+│  └────────┬─────────────────┘
+│  ┌────────▼─────────────────┐
+│  │        check              │  setImmediate 回调
+│  └────────┬─────────────────┘
+│  ┌────────▼─────────────────┐
+│  │   close callbacks         │  socket.close 等关闭回调
+│  └────────┬─────────────────┘
+└────┴────────────────────────┘
 ```
 
-### 2.2 各阶段详解
+每个阶段做什么：
 
-#### **阶段 1：timers（定时器阶段）**
+- **timers**：执行到期的 `setTimeout` 和 `setInterval` 回调。注意"到期"是指时间到了，但不保证立即执行——如果 poll 阶段正在处理 I/O，timer 回调要等 poll 完成才执行。
+- **pending callbacks**：执行上一轮循环中未完成的 I/O 回调（比如某些系统操作的延迟回调）。
+- **idle / prepare**：libuv 内部使用，Node.js 应用代码不会直接接触。
+- **poll**：核心阶段。两件事：计算应该阻塞多久（距离下一个 timer 到期还有多久），然后阻塞等待 I/O 事件。如果有到期的 timer，poll 不会一直等，会立即进入 check 阶段。
+- **check**：执行 `setImmediate` 的回调。
+- **close callbacks**：执行 `socket.on('close', ...)` 之类的关闭回调。
 
-**执行条件**：达到定时器设定的时间
+理解这个模型后，很多看似奇怪的行为就解释得通了。
 
-```javascript
-const setTimeout = require("timers").setTimeout;
+## 微任务 vs 宏任务
 
-setTimeout(() => {
-  console.log("timeout 1");
-}, 100);
+如果你了解浏览器的事件循环，可能知道微任务（microtask）和宏任务（macrotask）的概念。Node.js 也有类似机制，但细节不同。
 
-setTimeout(() => {
-  console.log("timeout 2");
-}, 50);
+Node.js 中的微任务：
 
-// 事件循环在 timers 阶段检查：
-// - 当前时间 >= 50ms → 执行 'timeout 2'
-// - 当前时间 >= 100ms → 执行 'timeout 1'
-```
+- `Promise.resolve().then()`
+- `queueMicrotask()`
+- `process.nextTick()`
 
-**注意**：
+Node.js 中的宏任务：
 
-- 定时器不是精确的（可能延迟）
-- 如果事件循环被阻塞，定时器会延迟执行
+- `setTimeout` / `setInterval`
+- `setImmediate`
+- I/O 回调（`fs.readFile` 等）
 
-```javascript
-// 示例：定时器延迟
-const start = Date.now();
+关键区别：**微任务在每个宏任务之间、以及每个阶段结束后都会被清空**。也就是说，每执行完一个回调函数，Node.js 都会检查微任务队列并执行所有微任务，然后再继续下一个回调。
 
-setTimeout(() => {
-  const delay = Date.now() - start;
-  console.log(`Actual delay: ${delay}ms`);
-}, 100);
-
-// 阻塞 200ms
-const startBlocking = Date.now();
-while (Date.now() - startBlocking < 200);
-
-// 输出：Actual delay: 200ms（不是 100ms）
-```
-
-#### **阶段 2：pending callbacks（待定回调阶段）**
-
-**执行内容**：上一轮事件循环延迟的 I/O 回调
-
-```javascript
-const fs = require("fs");
-
-// I/O 回调在这个阶段执行
-fs.readFile("file.txt", (err, data) => {
-  console.log("file read callback");
-});
-
-// 错误回调也在这里
-net.connect("http://example.com").on("error", (err) => {
-  console.log("error callback");
-});
-```
-
-#### **阶段 3：idle, prepare（空闲、准备阶段）**
-
-**执行内容**：仅 libuv 内部使用
-
-```javascript
-// 开发者通常不需要关心这个阶段
-// libuv 用于内部调度
-```
-
-#### **阶段 4：poll（轮询阶段）**
-
-**执行内容**：
-
-1. 执行 I/O 回调（文件、网络等）
-2. 计算阻塞时间（等待新事件）
-
-```javascript
-const fs = require("fs");
-
-// poll 阶段会执行这些回调
-fs.readFile("file1.txt", () => {
-  console.log("file1");
-});
-
-fs.readFile("file2.txt", () => {
-  console.log("file2");
-});
-
-// 如果没有定时器，事件循环会在这里阻塞
-// 等待新的 I/O 事件
-```
-
-**特殊情况**：
-
-- 如果有 `setImmediate()`，会跳过阻塞
-- 如果有定时器到期，会回到 timers 阶段
-
-#### **阶段 5：check（检查阶段）**
-
-**执行内容**：`setImmediate()` 的回调
-
-```javascript
-setImmediate(() => {
-  console.log("immediate 1");
-});
-
-setImmediate(() => {
-  console.log("immediate 2");
-});
-
-// 在 check 阶段执行所有 setImmediate 回调
-```
-
-#### **阶段 6：close callbacks（关闭回调阶段）**
-
-**执行内容**：关闭事件的回调
-
-```javascript
-const net = require("net");
-
-const server = net.createServer();
-
-server.on("close", () => {
-  console.log("server closed");
-});
-
-server.close();
-
-// close 回调在这个阶段执行
-```
-
-### 2.3 完整执行流程示例
-
-```javascript
-const fs = require("fs");
-
-console.log("1. 同步代码");
-
-setTimeout(() => {
-  console.log("2. timeout");
-}, 0);
-
-setImmediate(() => {
-  console.log("3. immediate");
-});
-
-fs.readFile("file.txt", () => {
-  console.log("4. I/O callback");
-});
-
-process.nextTick(() => {
-  console.log("5. nextTick");
-});
-
-console.log("6. 同步代码结束");
-
-// 执行顺序：
-// 1. 同步代码
-// 6. 同步代码结束
-// 5. nextTick（微任务，在阶段之间执行）
-// 3. immediate（check 阶段）或 2. timeout（timers 阶段）
-// 4. I/O callback（poll 阶段）
-```
-
----
-
-## 三、与前端 JS 的对比
-
-### 3.1 浏览器事件循环
-
-**浏览器事件循环**：
+执行顺序可以简化为：
 
 ```
-┌─────────────┐
-│  执行栈     │
-└──────┬──────┘
-       ↓
-┌─────────────┐
-│  微任务队列  │ ← Promise.then、MutationObserver
-└──────┬──────┘
-       ↓
-┌─────────────┐
-│  宏任务队列  │ ← setTimeout、setInterval、UI 渲染
-└─────────────┘
+同步代码 → process.nextTick → Promise.then → 宏任务回调
 ```
 
-**执行规则**：
+来看一段经典的代码：
 
-1. 执行同步代码
-2. 执行所有微任务
-3. 执行一个宏任务
-4. 重复步骤 2-3
+```js
+console.log("1");
 
-### 3.2 Node.js 事件循环
+setTimeout(() => console.log("2"), 0);
 
-**Node.js 事件循环**：
+Promise.resolve().then(() => console.log("3"));
 
-```
-┌──────────────────────────┐
-│  执行栈（同步代码）        │
-└──────────┬───────────────┘
-           ↓
-┌──────────────────────────┐
-│  微任务（nextTick、then） │ ← 每个阶段后执行
-└──────────┬───────────────┘
-           ↓
-┌──────────────────────────┐
-│  timers                  │
-├──────────────────────────┤
-│  pending callbacks       │
-├──────────────────────────┤
-│  idle, prepare           │
-├──────────────────────────┤
-│  poll                    │
-├──────────────────────────┤
-│  check                   │
-├──────────────────────────┤
-│  close callbacks         │
-└──────────────────────────┘
+process.nextTick(() => console.log("4"));
+
+console.log("5");
 ```
 
-**执行规则**：
+输出：`1 5 4 3 2`
 
-1. 执行同步代码
-2. 执行 `process.nextTick` 队列（全部）
-3. 执行 Promise 微任务队列（全部）
-4. 进入事件循环的某个阶段
-5. 执行该阶段的回调
-6. 重复步骤 2-5
+执行过程：
 
-### 3.3 关键差异
+1. 同步执行 `console.log('1')`
+2. 注册 `setTimeout` 回调到 timers 队列
+3. 注册 `Promise.then` 到微任务队列
+4. 注册 `nextTick` 到 nextTick 队列
+5. 同步执行 `console.log('5')`
+6. 清空 nextTick 队列：`console.log('4')`
+7. 清空微任务队列：`console.log('3')`
+8. 进入事件循环，timers 阶段：`console.log('2')`
 
-| 特性             | 浏览器                 | Node.js                        |
-| ---------------- | ---------------------- | ------------------------------ |
-| **阶段**         | 2 个（微任务、宏任务） | 6 个（timers、poll、check 等） |
-| **微任务执行**   | 每个宏任务后           | 每个阶段后                     |
-| **nextTick**     | 无                     | 有（优先级最高）               |
-| **setImmediate** | 无                     | 有（check 阶段）               |
-| **I/O 回调**     | 宏任务                 | poll 阶段                      |
-| **渲染**         | 有（浏览器特有）       | 无                             |
+注意 `nextTick` 比 `Promise.then` 先执行。`process.nextTick` 有自己的独立队列，优先级比 Promise 微任务更高。这个设计是有历史原因的——`nextTick` 在 Promise 被引入之前就存在了，Node.js 团队选择保持 `nextTick` 的更高优先级以向后兼容。
 
----
+## setTimeout vs setImmediate
 
-## 四、process.nextTick vs setImmediate
+`setTimeout(fn, 0)` 和 `setImmediate(fn)` 都是想"尽快执行"，但行为不同：
 
-### 4.1 process.nextTick
-
-**特点**：在当前操作完成后、事件循环下一阶段前执行
-
-```javascript
-console.log("1. start");
-
-process.nextTick(() => {
-  console.log("2. nextTick");
-});
-
-console.log("3. end");
-
-// 输出：
-// 1. start
-// 3. end
-// 2. nextTick
+```js
+// 在主模块中直接运行——顺序不确定
+setTimeout(() => console.log("timeout"), 0);
+setImmediate(() => console.log("immediate"));
 ```
 
-**使用场景**：
+你可能以为 `setTimeout(fn, 0)` 更快，但实际输出可能是 `immediate timeout`，也可能是 `timeout immediate`。
 
-```javascript
-// 1. 确保回调在当前操作后执行
-function MyEmitter() {
-  this.events = {};
-}
+原因：在主模块中，事件循环还没开始。`setTimeout` 需要进入 timers 阶段才能执行，而 `setImmediate` 在 check 阶段执行。由于主模块代码执行完毕后，事件循环先进入哪个阶段取决于进程的性能（如果 I/O 准备得快，可能先 poll 再 timers）。
 
-MyEmitter.prototype.on = function (event, callback) {
-  if (!this.events[event]) {
-    this.events[event] = [];
-  }
-  this.events[event].push(callback);
-};
+但在 I/O 回调中，顺序是确定的：
 
-MyEmitter.prototype.emit = function (event, data) {
-  const callbacks = this.events[event] || [];
+```js
+import { readFile } from "node:fs";
 
-  // 使用 nextTick 确保回调在 emit() 返回后执行
-  process.nextTick(() => {
-    callbacks.forEach((cb) => cb(data));
-  });
-};
-
-const emitter = new MyEmitter();
-emitter.on("data", (data) => {
-  console.log("Received:", data);
-});
-
-console.log("Calling emit");
-emitter.emit("data", "hello");
-console.log("emit returned");
-
-// 输出：
-// Calling emit
-// emit returned
-// Received: hello
-```
-
-### 4.2 setImmediate
-
-**特点**：在事件循环的 check 阶段执行
-
-```javascript
-console.log("1. start");
-
-setImmediate(() => {
-  console.log("2. immediate");
-});
-
-console.log("3. end");
-
-// 输出：
-// 1. start
-// 3. end
-// 2. immediate
-```
-
-**使用场景**：
-
-```javascript
-// 运行耗时任务，不阻塞事件循环
-function longRunningTask() {
-  setImmediate(() => {
-    // 执行一部分任务
-    console.log("Task part 1");
-
-    // 继续下一部分
-    setImmediate(() => {
-      console.log("Task part 2");
-    });
-  });
-}
-
-longRunningTask();
-```
-
-### 4.3 执行顺序对比
-
-```javascript
-console.log("1. start");
-
-setTimeout(() => {
-  console.log("2. timeout");
-}, 0);
-
-setImmediate(() => {
-  console.log("3. immediate");
-});
-
-process.nextTick(() => {
-  console.log("4. nextTick");
-});
-
-Promise.resolve().then(() => {
-  console.log("5. promise");
-});
-
-console.log("6. end");
-
-// 输出：
-// 1. start
-// 6. end
-// 4. nextTick（优先级最高）
-// 5. promise（微任务）
-// 2. timeout 或 3. immediate（不确定）
-```
-
-**为什么 timeout 和 immediate 顺序不确定？**
-
-```javascript
-// 取决于事件循环的启动时机
-
-// 场景 1：I/O 回调中（immediate 优先）
-fs.readFile("file.txt", () => {
+readFile("some-file.txt", () => {
   setTimeout(() => console.log("timeout"), 0);
   setImmediate(() => console.log("immediate"));
-  // 输出：immediate → timeout
+  // 输出一定是：immediate timeout
 });
-
-// 场景 2：主模块中（不确定）
-setTimeout(() => console.log("timeout"), 0);
-setImmediate(() => console.log("immediate"));
-// 可能输出：timeout → immediate 或 immediate → timeout
 ```
 
-### 4.4 优先级总结
+为什么？因为 I/O 回调在 poll 阶段执行。poll 阶段结束后，下一个阶段是 check（`setImmediate`），然后下一轮循环才到 timers（`setTimeout`）。
 
-```javascript
-console.log("sync");
+## 实战：事件循环阻塞检测
 
-process.nextTick(() => console.log("nextTick 1"));
-process.nextTick(() => console.log("nextTick 2"));
+日志服务同时做三件事：读取日志文件（I/O）、定时清理过期日志（Timer）、处理查询请求（网络 I/O）。如果某个操作阻塞了事件循环，查询请求就会变慢甚至超时。
 
-Promise.resolve().then(() => console.log("promise 1"));
-Promise.resolve().then(() => console.log("promise 2"));
+怎么检测事件循环是否被阻塞？Node.js 提供了 `monitorEventLoopDelay`：
 
-setTimeout(() => console.log("timeout"), 0);
-setImmediate(() => console.log("immediate"));
+```js
+import { monitorEventLoopDelay } from "node:perf_hooks";
 
-// 输出：
-// sync
-// nextTick 1
-// nextTick 2
-// promise 1
-// promise 2
-// immediate 或 timeout（取决于上下文）
-```
-
-**优先级**：
-
-1. **同步代码**
-2. **process.nextTick**（最高优先级微任务）
-3. **Promise.then**（微任务）
-4. **setImmediate**（check 阶段）
-5. **setTimeout**（timers 阶段）
-
----
-
-## 五、实战案例
-
-### 5.1 事件循环阻塞检测
-
-```javascript
-const { monitorEventLoopDelay } = require("perf_hooks");
-
-// 创建事件循环延迟监控器
-const histogram = monitorEventLoopDelay({
-  resolution: 10, // 采样间隔（毫秒）
-});
+const histogram = monitorEventLoopDelay({ resolution: 20 });
 
 histogram.enable();
 
+// 定期检查事件循环延迟
 setInterval(() => {
-  const delay = histogram.mean;
-  const max = histogram.max;
-  const percentile99 = histogram.percentile(99);
-
-  console.log({
-    mean: delay.toFixed(2) + "ms",
-    max: max.toFixed(2) + "ms",
-    p99: percentile99.toFixed(2) + "ms",
-  });
-
-  if (delay > 10) {
-    console.warn("Event loop blocked!");
-  }
-
-  histogram.reset();
-}, 1000);
-
-// 模拟阻塞
-setTimeout(() => {
-  const start = Date.now();
-  while (Date.now() - start < 1000) {
-    // 阻塞 1 秒
+  const delay = histogram.mean / 1e6; // 纳秒转毫秒
+  if (delay > 50) {
+    console.warn(`事件循环延迟 ${delay.toFixed(1)}ms，可能被阻塞`);
   }
 }, 5000);
 ```
 
-### 5.2 CPU 密集任务分片处理
+`monitorEventLoopDelay` 的工作原理很简单：它每隔 `resolution` 毫秒安排一个定时器，如果定时器被延迟执行了，说明事件循环在那个时间段内被阻塞了。
 
-```javascript
-// ❌ 错误：阻塞事件循环
-function heavyComputation(n) {
-  let result = 0;
-  for (let i = 0; i < n; i++) {
-    result += Math.sqrt(i);
-  }
-  return result;
-}
+### CPU 密集任务拆分
 
-// ✅ 正确：分片处理
-async function heavyComputationChunked(n, chunkSize = 10000) {
-  let result = 0;
-  let i = 0;
+如果确实有 CPU 密集的任务（比如上一篇提到的日志分析），怎么避免阻塞事件循环？
 
-  while (i < n) {
-    const end = Math.min(i + chunkSize, n);
+一种方式是用 `setImmediate` 分片：把大任务拆成小块，每块之间让出事件循环：
 
-    // 计算一个分片
-    for (; i < end; i++) {
-      result += Math.sqrt(i);
-    }
-
-    // 让出事件循环
-    await new Promise(setImmediate);
-  }
-
-  return result;
-}
-
-// 使用
-heavyComputationChunked(1000000, 10000).then((result) =>
-  console.log("Result:", result)
-);
-```
-
-### 5.3 使用 setImmediate 避免阻塞
-
-```javascript
-// 处理大量数据
-function processLargeData(data) {
+```js
+function processLargeArray(items, onProgress, onComplete) {
   let index = 0;
+  const batchSize = 1000;
 
-  function processChunk() {
-    const chunkSize = 1000;
-    const end = Math.min(index + chunkSize, data.length);
+  function processBatch() {
+    const end = Math.min(index + batchSize, items.length);
 
-    // 处理一个分片
     for (; index < end; index++) {
-      // 处理 data[index]
+      // 处理 items[index]
     }
 
-    // 如果还有数据，继续处理
-    if (index < data.length) {
-      setImmediate(processChunk);
+    if (index < items.length) {
+      // 让出事件循环，下一轮继续
+      setImmediate(processBatch);
+      onProgress(index / items.length);
     } else {
-      console.log("All data processed");
+      onComplete();
     }
   }
 
-  // 开始处理
-  setImmediate(processChunk);
-}
-
-// 使用
-const largeData = Array(100000).fill("data");
-processLargeData(largeData);
-```
-
-### 5.4 实现一个任务调度器
-
-```javascript
-class TaskScheduler {
-  constructor() {
-    this.tasks = [];
-    this.running = false;
-  }
-
-  schedule(task) {
-    this.tasks.push(task);
-    if (!this.running) {
-      this.running = true;
-      this.run();
-    }
-  }
-
-  run() {
-    if (this.tasks.length === 0) {
-      this.running = false;
-      return;
-    }
-
-    const task = this.tasks.shift();
-
-    try {
-      task();
-    } catch (err) {
-      console.error("Task error:", err);
-    }
-
-    // 使用 setImmediate 避免阻塞
-    setImmediate(() => this.run());
-  }
-}
-
-// 使用
-const scheduler = new TaskScheduler();
-
-for (let i = 0; i < 100; i++) {
-  scheduler.schedule(() => {
-    console.log(`Task ${i}`);
-  });
+  processBatch();
 }
 ```
 
-### 5.5 监控事件循环健康状态
+这种方式把一个同步的 CPU 密集任务变成了异步的，每处理 1000 条数据就让出一次事件循环，让 I/O 回调和定时器有机会执行。代价是总耗时变长了（因为每次让出都有额外开销），但事件循环不会被长时间阻塞。
 
-```javascript
-const { performance } = require("perf_hooks");
+更好的方式是用 Worker Threads（我们会在 [第 9 篇](/posts/nodejs-core/09-worker-threads-cpu-intensive) 详细讲），把 CPU 密集任务完全放到另一个线程。
 
-let lastLoopTime = performance.now();
-let lag = 0;
+## 和浏览器事件循环的区别
 
-function checkEventLoop() {
-  const now = performance.now();
-  const elapsed = now - lastLoopTime;
+如果你是从前端转过来的，可能会把浏览器的事件循环和 Node.js 的搞混。核心区别：
 
-  // 计算延迟
-  lag = Math.max(0, elapsed - 100); // 预期 100ms 执行一次
+| 特性               | 浏览器               | Node.js                          |
+| ------------------ | -------------------- | -------------------------------- |
+| 宏任务队列         | 多个（按优先级排序） | 无明确队列概念，按阶段执行       |
+| 微任务             | 在每个宏任务之后清空 | 在每个阶段结束和每个回调之后清空 |
+| `process.nextTick` | 不存在               | 独立队列，优先级高于 Promise     |
+| 渲染               | 在微任务之后         | 不存在                           |
+| I/O                | 不直接处理           | poll 阶段专门处理                |
 
-  if (lag > 100) {
-    console.warn(`Event loop lag: ${lag.toFixed(2)}ms`);
-  }
+一个重要的实践差异：在浏览器中，`Promise.then` 的微任务是在当前宏任务结束后立即执行的。在 Node.js 中，微任务是在**每个回调函数之后**执行的——这意味着一个阶段中的多个回调之间，微任务也会被执行。
 
-  lastLoopTime = now;
-
-  setImmediate(checkEventLoop);
-}
-
-checkEventLoop();
-
-// 模拟阻塞
-setTimeout(() => {
-  const start = Date.now();
-  while (Date.now() - start < 500) {
-    // 阻塞 500ms
-  }
-}, 2000);
-```
-
----
-
-## 六、常见问题
-
-### Q1: 为什么 setTimeout(fn, 0) 不立即执行？
-
-**A**: 0ms 不是立即执行，而是"尽快"：
-
-```javascript
-console.log("1");
-
-setTimeout(() => {
-  console.log("2");
-}, 0);
-
-console.log("3");
-
-// 输出：1 → 3 → 2
-// 原因：需要等待事件循环的 timers 阶段
-```
-
-### Q2: process.nextTick 会导致递归问题吗？
-
-**A**: 会，需要小心：
-
-```javascript
-// ❌ 危险：无限递归
-function recurse() {
-  process.nextTick(recurse);
-}
-recurse(); // 不会到达下一个事件循环阶段
-
-// ✅ 安全：使用 setImmediate
-function recurse() {
-  setImmediate(recurse);
-}
-recurse(); // 允许其他阶段执行
-```
-
-### Q3: 如何确保回调在下一事件循环执行？
-
-**A**: 使用 setImmediate：
-
-```javascript
-console.log("1");
-
-setImmediate(() => {
-  console.log("2");
-});
-
-console.log("3");
-
-// 输出：1 → 3 → 2
-// 保证在下一事件循环的 check 阶段执行
-```
-
-### Q4: 微任务和宏任务的执行顺序？
-
-**A**: 在 Node.js 中：
-
-```javascript
-console.log("sync");
-
-setTimeout(() => console.log("macro: setTimeout"), 0);
-setImmediate(() => console.log("macro: setImmediate"));
-
-Promise.resolve().then(() => console.log("micro: Promise"));
-process.nextTick(() => console.log("micro: nextTick"));
-
-// 输出：
-// sync
-// micro: nextTick
-// micro: Promise
-// macro: setTimeout 或 setImmediate（取决于上下文）
-```
-
----
-
-## 七、总结
-
-**本文我们完成了**：
-
-✅ 理解了 libuv 事件循环的六个阶段
-✅ 掌握了 microtask 与 macrotask 的执行顺序
-✅ 理解了 `process.nextTick()` vs `setImmediate()` 的区别
-✅ 学会了检测事件循环阻塞
-✅ 掌握了 CPU 密集任务的分片处理技巧
-
-**核心要点回顾**：
-
-1. **事件循环阶段** - timers → pending → idle/prepare → poll → check → close
-2. **nextTick vs Immediate** - nextTick 优先级最高，Immediate 在 check 阶段
-3. **微任务执行** - 每个阶段后执行 nextTick 和 Promise
-4. **避免阻塞** - 使用分片处理或 Worker Threads
-5. **监控延迟** - 使用 `monitorEventLoopDelay` 或自定义监控
-
-**最佳实践**：
-
-- ✅ 避免在 nextTick 中递归（会阻塞其他阶段）
-- ✅ CPU 密集任务使用分片或 Worker Threads
-- ✅ I/O 回调中优先使用 setImmediate（确保执行顺序）
-- ✅ 监控事件循环延迟
-- ✅ 理解不同阶段的适用场景
-
-**执行优先级**：
-
-```
-同步代码 → nextTick → Promise → Immediate → setTimeout
-```
-
-**下一步**：
-
-在下一篇文章《模块系统与 CommonJS/ESM 互操作》中，我们将深入学习：
-
-- CommonJS 的 require() 缓存机制
-- ESM 的 import() 异步加载
-- 条件导出（Conditional Exports）
-- 双包（dual package）最佳实践
-- 循环依赖的解决方案
-
----
-
-**相关代码**：
-
-- 完整示例：[nodejs-core-examples](https://github.com/your-repo/nodejs-core-examples)
-- Event Loop 可视化：[nodejs.org/en/docs/guides/event-loop-timers-and-nexttick](https://nodejs.org/en/docs/guides/event-loop-timers-and-nexttick)
-
-**有问题？** 欢迎在评论区留言，我会尽快回复！
+理解事件循环不是为了应付面试题，而是为了写出真正高效的异步代码。当你的服务出现"请求变慢"、"定时器不准"、"回调不执行"这类问题时，事件循环的知识能帮你快速定位原因。下一篇我们来看模块系统——Node.js 怎么组织代码，以及 CommonJS 和 ESM 之间那些让你头疼的兼容性问题。
