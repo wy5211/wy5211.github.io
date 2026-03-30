@@ -1,0 +1,683 @@
+---
+title: "14 Trait 特征"
+date: "2026-03-30"
+summary: "深入理解 Rust 的接口抽象机制，掌握 Trait 的定义、实现、作为参数和 trait 对象的用法"
+tags: ["Rust", "Trait", "接口", "多态", "trait 对象"]
+category: "rust"
+draft: false
+series: "Rust 渐进式学习"
+seriesOrder: 14
+---
+
+## 前言
+
+如果你熟悉 Java 或 Go，可以把 Trait 理解为**接口（Interface）**——定义一组行为规范，然后由具体类型实现。但 Rust 的 Trait 更强大，它支持默认实现、关联类型，还能作为参数实现静态分发和动态分发。
+
+Trait 是 Rust 类型系统的核心，它让泛型真正变得有用。
+
+## 什么是 Trait？
+
+Trait 定义了某个类型可以实现的**共享行为**，类似于其他语言中的接口：
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    Trait vs 接口对比                          │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  Java:                                                      │
+│  interface Drawable { void draw(); }                        │
+│  class Circle implements Drawable { ... }                   │
+│                                                             │
+│  Go:                                                        │
+│  type Drawable interface { Draw() }                         │
+│  type Circle struct { ... }                                 │
+│  func (c Circle) Draw() { ... }                             │
+│                                                             │
+│  Rust:                                                      │
+│  trait Drawable { fn draw(&self); }                         │
+│  struct Circle { ... }                                      │
+│  impl Drawable for Circle { fn draw(&self) { ... } }        │
+│                                                             │
+│  关键区别：                                                  │
+│  - Rust 需要显式声明 impl                                    │
+│  - Trait 可以有默认实现                                      │
+│  - Trait 可以有关联类型和常量                                │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 定义和实现 Trait
+
+### 基本 Trait
+
+```rust
+// 定义 Trait
+trait Summary {
+    fn summarize(&self) -> String;
+}
+
+struct Article {
+    title: String,
+    content: String,
+}
+
+struct Tweet {
+    username: String,
+    content: String,
+}
+
+// 为 Article 实现 Summary
+impl Summary for Article {
+    fn summarize(&self) -> String {
+        format!("{}: {}", self.title, &self.content[..50.min(self.content.len())])
+    }
+}
+
+// 为 Tweet 实现 Summary
+impl Summary for Tweet {
+    fn summarize(&self) -> String {
+        format!("@{}: {}", self.username, self.content)
+    }
+}
+
+fn main() {
+    let article = Article {
+        title: String::from("Rust 入门"),
+        content: String::from("Rust 是一门系统编程语言，注重安全性和性能。"),
+    };
+
+    let tweet = Tweet {
+        username: String::from("rustlang"),
+        content: String::from("Rust 连续多年最受喜爱！"),
+    };
+
+    println!("{}", article.summarize());
+    println!("{}", tweet.summarize());
+}
+```
+
+### 默认实现
+
+Trait 方法可以有默认实现，实现者可以选择覆盖：
+
+```rust
+trait Summary {
+    // 默认实现
+    fn summarize(&self) -> String {
+        String::from("(阅读更多...)")
+    }
+
+    // 没有默认实现，必须实现
+    fn author(&self) -> &str;
+}
+
+struct Article {
+    title: String,
+    author_name: String,
+}
+
+impl Summary for Article {
+    // 只实现必须的方法
+    fn author(&self) -> &str {
+        &self.author_name
+    }
+
+    // 可以覆盖默认实现
+    fn summarize(&self) -> String {
+        format!("{} by {}", self.title, self.author_name)
+    }
+}
+
+fn main() {
+    let article = Article {
+        title: String::from("Rust 入门").to_string(),
+        author_name: String::from("Alice"),
+    };
+    println!("{}", article.summarize());
+}
+```
+
+### 默认实现调用其他方法
+
+默认实现可以调用 Trait 中的其他方法，即使那些方法没有默认实现：
+
+```rust
+trait Summary {
+    fn summarize_author(&self) -> String;
+
+    // 默认实现调用了 summarize_author
+    fn summarize(&self) -> String {
+        format!("(更多来自 {}...)", self.summarize_author())
+    }
+}
+
+struct Tweet {
+    username: String,
+    content: String,
+}
+
+impl Summary for Tweet {
+    fn summarize_author(&self) -> String {
+        format!("@{}", self.username)
+    }
+    // summarize 使用默认实现
+}
+
+fn main() {
+    let tweet = Tweet {
+        username: String::from("rustlang"),
+        content: String::from("Hello!"),
+    };
+    println!("{}", tweet.summarize());  // (更多来自 @rustlang...)
+}
+```
+
+## Trait 作为参数
+
+### Trait Bound 语法
+
+```rust
+// 方式 1：impl Trait 语法（简洁）
+fn print_summary(item: &impl Summary) {
+    println!("{}", item.summarize());
+}
+
+// 方式 2：Trait Bound 语法（更灵活）
+fn print_summary_bound<T: Summary>(item: &T) {
+    println!("{}", item.summarize());
+}
+```
+
+两种写法等价，但 Trait Bound 在需要多个参数类型相同时更有用：
+
+```rust
+// impl Trait 写法：两个参数可以是不同类型
+fn notify(item1: &impl Summary, item2: &impl Summary) { }
+
+// Trait Bound 写法：两个参数必须是相同类型
+fn notify_same<T: Summary>(item1: &T, item2: &T) { }
+```
+
+### 多个 Trait 约束
+
+```rust
+use std::fmt::Display;
+
+// + 语法
+fn notify<T: Summary + Display>(item: &T) {
+    println!("{}", item.summarize());
+}
+
+// where 子句（更清晰）
+fn notify_where<T>(item: &T)
+where
+    T: Summary + Display,
+{
+    println!("{}", item.summarize());
+}
+```
+
+### 返回实现了 Trait 的类型
+
+```rust
+fn create_summary() -> impl Summary {
+    Tweet {
+        username: String::from("rustlang"),
+        content: String::from("Hello!"),
+    }
+}
+
+fn main() {
+    let summary = create_summary();
+    println!("{}", summary.summarize());
+}
+```
+
+注意：`impl Trait` 返回类型只能返回一种具体类型。如果需要返回多种类型，使用 trait 对象（后面会讲）。
+
+## 常用标准 Trait
+
+### Debug
+
+允许用 `{:?}` 格式化输出：
+
+```rust
+#[derive(Debug)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn main() {
+    let p = Point { x: 10, y: 20 };
+    println!("{:?}", p);   // Point { x: 10, y: 20 }
+    println!("{:#?}", p);  // 美化输出
+}
+```
+
+### Clone
+
+创建值的深拷贝：
+
+```rust
+#[derive(Clone)]
+struct Config {
+    name: String,
+    debug: bool,
+}
+
+fn main() {
+    let config = Config {
+        name: String::from("app"),
+        debug: true,
+    };
+
+    let config2 = config.clone();  // 深拷贝
+    println!("{} {}", config2.name, config2.debug);
+}
+```
+
+### Copy
+
+标记类型可以使用 Copy 语义（值拷贝而非移动）：
+
+```rust
+#[derive(Copy, Clone)]  // Copy 需要 Clone
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn main() {
+    let p1 = Point { x: 10, y: 20 };
+    let p2 = p1;  // Copy，不是 Move
+    println!("p1: ({}, {})", p1.x, p1.y);  // ✅ p1 仍然有效
+    println!("p2: ({}, {})", p2.x, p2.y);
+}
+```
+
+### Display
+
+自定义 `fmt::Display` 输出：
+
+```rust
+use std::fmt;
+
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+impl fmt::Display for Point {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "({}, {})", self.x, self.y)
+    }
+}
+
+fn main() {
+    let p = Point { x: 10, y: 20 };
+    println!("{}", p);  // (10, 20)
+}
+```
+
+### PartialEq 和 Eq
+
+允许使用 `==` 和 `!=` 比较：
+
+```rust
+#[derive(Debug, PartialEq)]
+struct Point {
+    x: i32,
+    y: i32,
+}
+
+fn main() {
+    let p1 = Point { x: 10, y: 20 };
+    let p2 = Point { x: 10, y: 20 };
+    let p3 = Point { x: 5, y: 10 };
+
+    println!("p1 == p2: {}", p1 == p2);  // true
+    println!("p1 == p3: {}", p1 == p3);  // false
+}
+```
+
+### PartialOrd 和 Ord
+
+允许比较大小：
+
+```rust
+use std::cmp::Ordering;
+
+#[derive(PartialOrd, PartialEq)]
+struct Score {
+    value: u32,
+}
+
+impl Score {
+    fn new(value: u32) -> Self {
+        Self { value }
+    }
+}
+
+fn main() {
+    let a = Score::new(90);
+    let b = Score::new(85);
+
+    println!("a > b: {}", a > b);  // true
+    println!("a < b: {}", a < b);  // false
+}
+```
+
+### From 和 Into
+
+类型转换：
+
+```rust
+use std::convert::From;
+
+#[derive(Debug)]
+struct Number(i32);
+
+impl From<i32> for Number {
+    fn from(value: i32) -> Self {
+        Number(value)
+    }
+}
+
+fn main() {
+    // From: 显式转换
+    let n = Number::from(42);
+
+    // Into: 反向自动实现
+    let n2: Number = 42.into();
+
+    println!("{:?}", n);
+    println!("{:?}", n2);
+}
+```
+
+## Trait 对象（动态分发）
+
+### 静态分发 vs 动态分发
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│               静态分发 vs 动态分发                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  泛型 + Trait Bound（静态分发/单态化）                       │
+│                                                             │
+│  fn print<T: Summary>(item: &T) { ... }                    │
+│                                                             │
+│  编译器为每种类型生成一份代码                                │
+│  ✅ 性能好（无虚函数调用开销）                               │
+│  ❌ 代码膨胀                                                │
+│  ❌ 不能存储不同类型的值在同一集合中                          │
+│                                                             │
+│  &dyn Trait（动态分发/trait 对象）                           │
+│                                                             │
+│  fn print(item: &dyn Summary) { ... }                      │
+│                                                             │
+│  运行时查找方法实现（类似虚函数表）                          │
+│  ✅ 可以存储不同类型                                        │
+│  ✅ 代码紧凑                                                │
+│  ❌ 有轻微性能开销                                          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 使用 trait 对象
+
+```rust
+trait Draw {
+    fn draw(&self);
+}
+
+struct Circle {
+    radius: f64,
+}
+
+struct Square {
+    side: f64,
+}
+
+impl Draw for Circle {
+    fn draw(&self) {
+        println!("画圆，半径: {}", self.radius);
+    }
+}
+
+impl Draw for Square {
+    fn draw(&self) {
+        println!("画正方形，边长: {}", self.side);
+    }
+}
+
+fn main() {
+    // trait 对象集合：可以存储不同类型
+    let shapes: Vec<Box<dyn Draw>> = vec![
+        Box::new(Circle { radius: 5.0 }),
+        Box::new(Square { side: 3.0 }),
+        Box::new(Circle { radius: 10.0 }),
+    ];
+
+    for shape in &shapes {
+        shape.draw();  // 动态分发
+    }
+}
+```
+
+### 对象安全
+
+只有满足特定条件的 Trait 才能作为 trait 对象：
+
+- 不能返回 `Self`
+- 不能有泛型方法
+- 方法接收 `&self` 或 `&mut self` 或 `self`
+
+## 实战演练
+
+### 示例 1：定义 Shape trait
+
+```rust
+use std::fmt;
+
+trait Shape {
+    fn area(&self) -> f64;
+    fn perimeter(&self) -> f64;
+
+    // 默认实现
+    fn describe(&self) -> String {
+        format!(
+            "面积: {:.2}, 周长: {:.2}",
+            self.area(),
+            self.perimeter()
+        )
+    }
+}
+
+#[derive(Debug)]
+struct Circle {
+    radius: f64,
+}
+
+impl Circle {
+    fn new(radius: f64) -> Self {
+        Self { radius }
+    }
+}
+
+impl Shape for Circle {
+    fn area(&self) -> f64 {
+        std::f64::consts::PI * self.radius * self.radius
+    }
+
+    fn perimeter(&self) -> f64 {
+        2.0 * std::f64::consts::PI * self.radius
+    }
+}
+
+struct Rectangle {
+    width: f64,
+    height: f64,
+}
+
+impl Rectangle {
+    fn new(width: f64, height: f64) -> Self {
+        Self { width, height }
+    }
+}
+
+impl Shape for Rectangle {
+    fn area(&self) -> f64 {
+        self.width * self.height
+    }
+
+    fn perimeter(&self) -> f64 {
+        2.0 * (self.width + self.height)
+    }
+}
+
+fn print_shape_info<T: Shape>(shape: &T) {
+    println!("{}", shape.describe());
+}
+
+fn main() {
+    let circle = Circle::new(5.0);
+    let rect = Rectangle::new(4.0, 6.0);
+
+    print_shape_info(&circle);
+    print_shape_info(&rect);
+
+    // 使用 trait 对象集合
+    let shapes: Vec<Box<dyn Shape>> = vec![
+        Box::new(circle),
+        Box::new(rect),
+        Box::new(Circle::new(10.0)),
+    ];
+
+    let total_area: f64 = shapes.iter().map(|s| s.area()).sum();
+    println!("总面积: {:.2}", total_area);
+}
+```
+
+### 示例 2：实现迭代器 Trait
+
+```rust
+struct Counter {
+    count: u32,
+    max: u32,
+}
+
+impl Counter {
+    fn new(max: u32) -> Self {
+        Self { count: 0, max }
+    }
+}
+
+impl Iterator for Counter {
+    type Item = u32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.count < self.max {
+            self.count += 1;
+            Some(self.count)
+        } else {
+            None
+        }
+    }
+}
+
+fn main() {
+    let counter = Counter::new(5);
+
+    // 使用 Iterator trait 的方法
+    let sum: u32 = counter.sum();
+    println!("1 到 5 的和: {}", sum);  // 15
+
+    let counter2 = Counter::new(10);
+    let evens: Vec<u32> = counter2.filter(|x| x % 2 == 0).collect();
+    println!("1 到 10 的偶数: {:?}", evens);  // [2, 4, 6, 8, 10]
+}
+```
+
+## 常见错误与修复
+
+### 错误 1：为外部类型实现外部 Trait
+
+```rust
+// ❌ 孤儿规则：不能为外部类型实现外部 trait
+// impl Display for Vec<i32> { ... }
+
+// ✅ 解决方案 1：包装新类型
+struct MyVec(Vec<i32>);
+impl std::fmt::Display for MyVec { ... }
+
+// ✅ 解决方案 2：在自己的 trait 中添加方法
+```
+
+### 错误 2：trait 对象不满足对象安全
+
+```rust
+trait Clone {
+    fn clone(&self) -> Self;  // 返回 Self，不是对象安全的
+}
+
+// ❌ 不能作为 trait 对象
+// let items: Vec<Box<dyn Clone>> = vec![];
+```
+
+## 最佳实践
+
+1. **优先使用 trait bound 而不是 trait 对象**：静态分发性能更好
+2. **需要存储多种类型时用 trait 对象**：如 UI 组件列表
+3. **善用 derive 宏**：`Debug`、`Clone`、`PartialEq` 等常用 trait
+4. **提供默认实现**：减少实现者的工作量
+5. **小而专注的 trait**：比大而全的 trait 更灵活
+
+## 常见问题
+
+**Q: Trait 和接口有什么区别？**
+
+A: 基本概念类似，但 Trait 支持默认实现、关联类型，且遵循孤儿规则（不能为外部类型实现外部 Trait）。
+
+**Q: 什么时候用 `impl Trait`，什么时候用 `dyn Trait`？**
+
+A: 只有一种具体类型时用 `impl Trait`；需要多种类型时用 `dyn Trait`。
+
+**Q: derive 宏是怎么工作的？**
+
+A: `#[derive(Debug)]` 等价于编译器自动为你编写了 `impl Debug for ...` 的代码。
+
+## 总结
+
+本文学习了 Trait——Rust 的接口抽象机制：
+
+**Trait 基础**
+
+- `trait` 定义行为
+- `impl Trait for Type` 实现行为
+- 支持默认实现
+
+**Trait 作为参数**
+
+- `impl Trait`：简洁，静态分发
+- `T: Trait`：灵活，支持多参数
+- `dyn Trait`：动态分发，可存多种类型
+
+**常用标准 Trait**
+
+- `Debug`：调试输出
+- `Clone`/`Copy`：复制语义
+- `Display`：用户友好输出
+- `PartialEq`/`Eq`：相等比较
+- `From`/`Into`：类型转换
+
+## 下一步
+
+Trait 是 Rust 类型系统的基石。下一篇文章将学习**生命周期**——Rust 如何标注引用的有效范围，确保引用始终有效。
+
+---
+
+- **上一篇**：[13 泛型](./13-generics.mdx)
+- **下一篇**：[15 生命周期](./15-lifetimes.mdx)

@@ -1,0 +1,366 @@
+---
+title: "21 Unsafe Rust"
+date: "2026-03-30"
+summary: "理解何时以及如何使用 unsafe，学会安全地封装底层代码"
+tags: ["Rust", "unsafe", "裸指针", "内存安全", "FFI"]
+category: "rust"
+draft: false
+series: "Rust 渐进式学习"
+seriesOrder: 21
+---
+
+## 前言
+
+Rust 的安全保证非常强大，但有些场景下你确实需要绕过编译器的检查：与 C 语言交互、实现某些数据结构、极致性能优化等。
+
+`unsafe` 不是关闭安全检查的开关，而是告诉编译器："**我知道我在做什么，请信任我。**" 它有五个超能力，本文将逐一介绍。
+
+## unsafe 的五个超能力
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                unsafe 的五个超能力                            │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. 解引用裸指针                                            │
+│  2. 调用 unsafe 函数或方法                                   │
+│  3. 访问或修改可变静态变量                                    │
+│  4. 实现 unsafe trait                                       │
+│  5. 访问 union 的字段                                       │
+│                                                             │
+│  注意：unsafe 只作用于标记的代码块                            │
+│  不影响块外的安全检查                                        │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+## 裸指针
+
+### 创建裸指针
+
+裸指针分为可变和不可变两种，可以绕过 Rust 的借用规则：
+
+```rust
+fn main() {
+    let mut num = 5;
+
+    // 不可变裸指针 *const T
+    let r1 = &num as *const i32;
+
+    // 可变裸指针 *mut T
+    let r2 = &mut num as *mut i32;
+
+    // 创建裸指针是安全的（在 unsafe 外）
+    // 但解引用裸指针需要 unsafe
+}
+```
+
+### 解引用裸指针
+
+```rust
+fn main() {
+    let mut num = 5;
+
+    let r1 = &num as *const i32;
+    let r2 = &mut num as *mut i32;
+
+    unsafe {
+        println!("r1: {}", *r1);  // 5
+        *r2 = 10;
+        println!("r1: {}", *r1);  // 10
+    }
+}
+```
+
+### 基于地址的裸指针
+
+```rust
+fn main() {
+    let values: [i32; 5] = [10, 20, 30, 40, 50];
+
+    unsafe {
+        let pointer = values.as_ptr();
+        println!("第一个: {}", *pointer);           // 10
+        println!("第二个: {}", *pointer.add(1));    // 20
+        println!("第三个: {}", *pointer.offset(2)); // 30
+    }
+}
+```
+
+### 空指针和悬垂指针
+
+```rust
+fn main() {
+    let raw: *const i32 = std::ptr::null();
+    let dangling: *const i32 = std::ptr::dangling();
+
+    unsafe {
+        // 空指针检查
+        if !raw.is_null() {
+            println!("{}", *raw);
+        } else {
+            println!("空指针");
+        }
+    }
+}
+```
+
+## unsafe 函数
+
+### 调用 unsafe 函数
+
+```rust
+unsafe fn dangerous() {
+    println!("这是一个 unsafe 函数");
+}
+
+fn main() {
+    unsafe {
+        dangerous();  // 必须在 unsafe 块中调用
+    }
+}
+```
+
+### 创建 safe 包装
+
+最佳实践是将 unsafe 代码封装在 safe 函数中：
+
+```rust
+/// 将字节切片分割为可变引用和剩余部分
+fn split_at_mut(values: &mut [i32], mid: usize) -> (&mut [i32], &mut [i32]) {
+    let len = values.len();
+    let ptr = values.as_mut_ptr();
+
+    assert!(mid <= len);
+
+    unsafe {
+        (
+            std::slice::from_raw_parts_mut(ptr, mid),
+            std::slice::from_raw_parts_mut(ptr.add(mid), len - mid),
+        )
+    }
+}
+
+fn main() {
+    let mut v = vec![1, 2, 3, 4, 5];
+    let (left, right) = split_at_mut(&mut v, 2);
+    println!("左: {:?}, 右: {:?}", left, right);
+}
+```
+
+## 可变静态变量
+
+```rust
+static mut COUNTER: u32 = 0;
+
+fn increment() {
+    unsafe {
+        COUNTER += 1;
+    }
+}
+
+fn get_count() -> u32 {
+    unsafe { COUNTER }
+}
+
+fn main() {
+    increment();
+    increment();
+    increment();
+
+    unsafe {
+        println!("计数: {}", COUNTER);  // 3
+    }
+}
+```
+
+**注意**：访问可变静态变量是不安全的，因为可能存在数据竞争。多线程场景下应该使用 `Mutex` 或原子类型。
+
+## 实现 unsafe trait
+
+某些 trait 是 unsafe 的，因为实现它们需要保证特定的安全条件：
+
+```rust
+// Send 和 Sync 是自动实现的
+// 但在某些情况下需要手动实现（需要 unsafe impl）
+
+struct MyBox<T>(T);
+
+// 如果 T 是 Send，则 MyBox<T> 也是 Send（这通常自动推导）
+unsafe impl<T: Send> Send for MyBox<T> {}
+unsafe impl<T: Sync> Sync for MyBox<T> {}
+```
+
+## 实战演练
+
+### 示例 1：安全封装 unsafe 代码
+
+```rust
+/// 一个简易的缓冲区
+pub struct Buffer {
+    data: Vec<u8>,
+    position: usize,
+}
+
+impl Buffer {
+    pub fn new(size: usize) -> Self {
+        Self {
+            data: vec![0; size],
+            position: 0,
+        }
+    }
+
+    /// 写入数据到缓冲区
+    pub fn write(&mut self, bytes: &[u8]) {
+        let remaining = &mut self.data[self.position..];
+        let len = bytes.len().min(remaining.len());
+        remaining[..len].copy_from_slice(&bytes[..len]);
+        self.position += len;
+    }
+
+    /// 从缓冲区读取到可变引用
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.data[..self.position]
+    }
+
+    /// 使用裸指针高效处理
+    pub fn process_with_ptr<F>(&mut self, f: F)
+    where
+        F: FnOnce(*mut u8, usize),
+    {
+        let ptr = self.data.as_mut_ptr();
+        let len = self.position;
+        unsafe {
+            f(ptr, len);
+        }
+    }
+}
+
+fn main() {
+    let mut buf = Buffer::new(100);
+    buf.write(b"Hello, Rust!");
+
+    println!("{:?}", String::from_utf8_lossy(buf.as_mut_slice()));
+
+    // 使用裸指针操作
+    buf.process_with_ptr(|ptr, len| {
+        unsafe {
+            for i in 0..len {
+                *ptr.add(i) = (*ptr.add(i)).to_ascii_uppercase();
+            }
+        }
+    });
+
+    println!("{:?}", String::from_utf8_lossy(buf.as_mut_slice()));
+}
+```
+
+### 示例 2：FFI 前置知识
+
+```rust
+use std::ffi::{CString, CStr};
+
+extern "C" {
+    /// C 标准库的 abs 函数
+    fn abs(x: i32) -> i32;
+
+    /// C 标准库的 strlen 函数
+    fn strlen(s: *const i8) -> usize;
+}
+
+fn main() {
+    unsafe {
+        // 调用 C 的 abs
+        println!("abs(-42) = {}", abs(-42));  // 42
+
+        // 调用 C 的 strlen
+        let c_str = CString::new("hello").unwrap();
+        let len = strlen(c_str.as_ptr());
+        println!("strlen(\"hello\") = {}", len);  // 5
+    }
+
+    // CStr → Rust String
+    let c_str = unsafe { CStr::from_ptr(CString::new("world").unwrap().as_ptr()) };
+    println!("{}", c_str.to_str().unwrap());
+}
+```
+
+## 常见错误与修复
+
+### 错误 1：忘记 unsafe 块
+
+```rust
+fn main() {
+    let raw: *const i32 = std::ptr::null();
+    // println!("{}", *raw);  // ❌ 解引用裸指针需要 unsafe
+
+    unsafe {
+        // ✅ 在 unsafe 块中
+        if !raw.is_null() {
+            println!("{}", *raw);
+        }
+    }
+}
+```
+
+### 错误 2：数据竞争
+
+```rust
+use std::thread;
+use std::sync::atomic::{AtomicI32, Ordering};
+
+static COUNTER: AtomicI32 = AtomicI32::new(0);
+
+fn main() {
+    let mut handles = vec![];
+
+    for _ in 0..10 {
+        let handle = thread::spawn(|| {
+            // ✅ 使用原子类型代替 unsafe 静态变量
+            COUNTER.fetch_add(1, Ordering::SeqCst);
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().unwrap();
+    }
+
+    println!("结果: {}", COUNTER.load(Ordering::SeqCst));
+}
+```
+
+## 最佳实践
+
+1. **最小化 unsafe 范围**：只把必要的代码放在 unsafe 块中
+2. **封装为 safe API**：不要让 unsafe 泄漏到模块外部
+3. **充分注释**：解释为什么 unsafe 是安全的
+4. **优先使用 safe 替代方案**：原子类型、`Mutex` 等
+5. **审查 unsafe 代码**：确保不违反 Rust 的安全保证
+
+## 总结
+
+本文学习了 Unsafe Rust：
+
+**unsafe 的五个超能力**
+
+- 解引用裸指针
+- 调用 unsafe 函数
+- 访问可变静态变量
+- 实现 unsafe trait
+- 访问 union 字段
+
+**最佳实践**
+
+- 最小化 unsafe 范围
+- 封装为 safe API
+- 优先使用 safe 替代方案
+
+## 下一步
+
+下一篇文章将学习**与 C 语言交互（FFI）**——更深入地了解 Rust 和 C 的互操作。
+
+---
+
+- **上一篇**：[20 测试](./20-testing.mdx)
+- **下一篇**：[22 与 C 语言交互](./22-ffi.mdx)

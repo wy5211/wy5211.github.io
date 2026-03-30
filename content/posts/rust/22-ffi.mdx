@@ -1,0 +1,459 @@
+---
+title: "22 与 C 语言交互"
+date: "2026-03-30"
+summary: "学会 Rust 调用 C 代码和被 C 调用，掌握 FFI 的核心概念和工具"
+tags: ["Rust", "FFI", "C语言", "extern", "bindgen", "cbindgen"]
+category: "rust"
+draft: false
+series: "Rust 渐进式学习"
+seriesOrder: 22
+---
+
+## 前言
+
+Rust 的一个重要优势是能够与现有的 C 代码库无缝交互。通过 **FFI（Foreign Function Interface，外部函数接口）**，你可以：
+
+- 在 Rust 中调用 C 函数
+- 将 Rust 代码编译为 C 可调用的库
+- 重用成熟的 C 生态系统
+
+## extern "C"
+
+### 声明外部 C 函数
+
+使用 `extern "C"` 声明和调用 C 函数：
+
+```rust
+extern "C" {
+    // 声明 C 标准库函数
+    fn abs(x: i32) -> i32;
+    fn puts(s: *const i8) -> i32;
+    fn atoi(s: *const i8) -> i32;
+    fn malloc(size: usize) -> *mut u8;
+    fn free(ptr: *mut u8);
+}
+
+fn main() {
+    unsafe {
+        println!("abs(-42) = {}", abs(-42));
+
+        // atoi: 字符串转整数
+        let s = std::ffi::CString::new("123").unwrap();
+        let n = atoi(s.as_ptr());
+        println!("atoi(\"123\") = {}", n);
+
+        // malloc + free
+        let ptr = malloc(100);
+        if !ptr.is_null() {
+            println!("分配了 100 字节");
+            free(ptr);
+        }
+    }
+}
+```
+
+### 从 Rust 导出函数给 C
+
+使用 `#[no_mangle]` 和 `extern "C"` 导出函数：
+
+```rust
+#[no_mangle]
+pub extern "C" fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+
+#[no_mangle]
+pub extern "C" fn greet(name: *const i8) {
+    unsafe {
+        if !name.is_null() {
+            let c_str = std::ffi::CStr::from_ptr(name);
+            if let Ok(s) = c_str.to_str() {
+                println!("Hello, {}!", s);
+            }
+        }
+    }
+}
+```
+
+编译为动态库：
+
+```bash
+cargo build --release
+# 生成 libmy_ffi.dylib (macOS) 或 libmy_ffi.so (Linux)
+```
+
+C 调用：
+
+```c
+// main.c
+#include <stdio.h>
+
+extern int add(int a, int b);
+extern void greet(const char *name);
+
+int main() {
+    printf("3 + 4 = %d\n", add(3, 4));
+    greet("Rust");
+    return 0;
+}
+```
+
+编译链接：
+
+```bash
+gcc main.c -L target/release -lmy_ffi -o main
+```
+
+## CString 和 CStr
+
+### Rust String → C 字符串
+
+```rust
+use std::ffi::CString;
+
+fn main() {
+    // 创建 CString
+    let c_str = CString::new("hello").unwrap();
+    let ptr = c_str.as_ptr();
+
+    unsafe {
+        println!("C 字符串指针: {:p}", ptr);
+    }
+}
+```
+
+### C 字符串 → Rust String
+
+```rust
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+
+fn c_to_rust_string(c_str: *const c_char) -> Option<String> {
+    unsafe {
+        if c_str.is_null() {
+            return None;
+        }
+        CStr::from_ptr(c_str).to_str().ok().map(String::from)
+    }
+}
+
+fn rust_to_c_string(s: &str) -> CString {
+    CString::new(s).expect("包含空字节的字符串")
+}
+
+fn main() {
+    let rust_str = "Hello from Rust";
+    let c_str = rust_to_c_string(rust_str);
+
+    // C → Rust
+    let back = c_to_rust_string(c_str.as_ptr());
+    println!("{:?}", back);
+}
+```
+
+### 注意事项
+
+```rust
+use std::ffi::CString;
+
+fn main() {
+    // ❌ CString 不能包含空字节
+    // CString::new("hello\0world").unwrap();  // panic
+
+    // ✅ 正确处理
+    match CString::new("hello\0world") {
+        Ok(c) => println!("OK: {:?}", c),
+        Err(e) => println!("错误: 包含空字节在位置 {}", e.nul_position()),
+    }
+}
+```
+
+## repr(C) 类型表示
+
+使用 `#[repr(C)]` 确保 Rust 结构体在内存中的布局与 C 兼容：
+
+```rust
+#[repr(C)]
+pub struct Point {
+    pub x: f64,
+    pub y: f64,
+}
+
+#[repr(C)]
+pub struct Rectangle {
+    pub origin: Point,
+    pub width: f64,
+    pub height: f64,
+}
+
+#[no_mangle]
+pub extern "C" fn create_point(x: f64, y: f64) -> Point {
+    Point { x, y }
+}
+
+#[no_mangle]
+pub extern "C" fn point_distance(p1: Point, p2: Point) -> f64 {
+    let dx = p2.x - p1.x;
+    let dy = p2.y - p1.y;
+    (dx * dx + dy * dy).sqrt()
+}
+```
+
+### repr(C) 的常见用法
+
+```rust
+#[repr(C)]
+pub enum Status {
+    Ok = 0,
+    Error = 1,
+    NotFound = 2,
+}
+
+#[repr(C)]
+pub struct Result {
+    pub status: Status,
+    pub value: i32,
+}
+
+#[repr(C, packed)]
+pub struct PackedData {
+    a: u8,
+    b: u32,  // 紧凑排列，无填充
+}
+```
+
+## bindgen：自动生成 Rust 绑定
+
+`bindgen` 工具可以从 C 头文件自动生成 Rust 的 FFI 绑定：
+
+```bash
+cargo install bindgen
+```
+
+假设有一个 C 头文件 `mylib.h`：
+
+```c
+// mylib.h
+typedef struct {
+    int x;
+    int y;
+} Point;
+
+int point_distance(Point a, Point b);
+void print_point(Point p);
+```
+
+使用 bindgen 生成绑定：
+
+```bash
+bindgen mylib.h -o bindings.rs
+```
+
+生成的 `bindings.rs` 包含了所有类型和函数声明，直接在 Rust 中使用：
+
+```rust
+include!("bindings.rs");
+
+fn main() {
+    let p1 = Point { x: 0, y: 0 };
+    let p2 = Point { x: 3, y: 4 };
+
+    unsafe {
+        let dist = point_distance(p1, p2);
+        println!("距离: {}", dist);
+    }
+}
+```
+
+## cbindgen：生成 C 头文件
+
+`cbindgen` 从 Rust 代码生成 C 头文件：
+
+```bash
+cargo install cbindgen
+```
+
+```bash
+cbindgen --crate my_crate --output my_crate.h
+```
+
+## 实战演练
+
+### 示例：调用 C 数学库
+
+```rust
+extern "C" {
+    fn sqrt(x: f64) -> f64;
+    fn pow(base: f64, exp: f64) -> f64;
+    fn sin(x: f64) -> f64;
+    fn cos(x: f64) -> f64;
+}
+
+fn main() {
+    unsafe {
+        println!("sqrt(16) = {}", sqrt(16.0));     // 4.0
+        println!("pow(2, 10) = {}", pow(2.0, 10.0)); // 1024.0
+        println!("sin(0) = {}", sin(0.0));          // 0.0
+        println!("cos(0) = {}", cos(0.0));          // 1.0
+    }
+}
+```
+
+### 示例：完整的 C 互操作库
+
+```rust
+use std::ffi::{CStr, CString};
+use std::os::raw::c_char;
+use std::ptr;
+
+/// 自定义数据结构
+#[repr(C)]
+pub struct User {
+    id: u64,
+    name: *mut c_char,
+    age: u32,
+}
+
+/// 创建用户
+#[no_mangle]
+pub extern "C" fn user_create(id: u64, name: *const c_char, age: u32) -> *mut User {
+    let name_copy = if name.is_null() {
+        ptr::null_mut()
+    } else {
+        unsafe { CString::from(CStr::from_ptr(name)) }.into_raw()
+    };
+
+    Box::into_raw(Box::new(User {
+        id,
+        name: name_copy,
+        age,
+    }))
+}
+
+/// 获取用户信息
+#[no_mangle]
+pub extern "C" fn user_info(user: *const User) -> *const c_char {
+    if user.is_null() {
+        return ptr::null();
+    }
+
+    unsafe {
+        let user = &*user;
+        let name = if user.name.is_null() {
+            "unknown"
+        } else {
+            match CStr::from_ptr(user.name).to_str() {
+                Ok(s) => s,
+                Err(_) => "invalid",
+            }
+        };
+        let info = format!("User(id={}, name={}, age={})", user.id, name, user.age);
+        CString::new(info).unwrap().into_raw()
+    }
+}
+
+/// 释放用户（重要！）
+#[no_mangle]
+pub extern "C" fn user_free(user: *mut User) {
+    if !user.is_null() {
+        unsafe {
+            let user = Box::from_raw(user);
+            if !user.name.is_null() {
+                drop(CString::from_raw(user.name));
+            }
+        }
+    }
+}
+
+fn main() {
+    unsafe {
+        let name = CString::new("Alice").unwrap();
+        let user = user_create(1, name.as_ptr(), 30);
+
+        let info = user_info(user);
+        if !info.is_null() {
+            println!("{}", CStr::from_ptr(info).to_str().unwrap());
+        }
+
+        // 释放（实践中需要 C 端调用 user_free）
+        user_free(user);
+    }
+}
+```
+
+## 常见错误与修复
+
+### 错误 1：空指针未检查
+
+```rust
+#[no_mangle]
+pub extern "C" fn process(data: *const u8) {
+    // ❌ 没有检查空指针
+    // let byte = *data;
+
+    // ✅ 安全处理
+    if !data.is_null() {
+        unsafe {
+            let byte = *data;
+            println!("{}", byte);
+        }
+    }
+}
+```
+
+### 错误 2：内存泄漏
+
+```rust
+// ❌ CString::into_raw 转移了所有权，需要手动释放
+let c_str = CString::new("hello").unwrap();
+let ptr = c_str.into_raw();
+// 忘记调用 CString::from_raw(ptr) 释放
+
+// ✅ 配对使用
+let ptr = CString::new("hello").unwrap().into_raw();
+// ... 使用 ptr
+unsafe { drop(CString::from_raw(ptr)); }  // 释放
+```
+
+## 最佳实践
+
+1. **最小化 unsafe 代码**：封装为 safe API
+2. **检查所有指针**：使用前检查是否为 null
+3. **配对内存操作**：`into_raw` 和 `from_raw` 配对
+4. **使用 `repr(C)`**：确保 C 兼容的内存布局
+5. **用 bindgen 自动生成绑定**：避免手写错误
+
+## 总结
+
+本文学习了 Rust 与 C 语言的交互：
+
+**extern "C"**
+
+- 声明外部 C 函数
+- 导出 Rust 函数给 C
+- `#[no_mangle]` 保持函数名不变
+
+**字符串转换**
+
+- `CString`：Rust → C
+- `CStr`：C → Rust
+- 注意空字节处理
+
+**类型兼容**
+
+- `#[repr(C)]`：C 兼容的内存布局
+- 基本类型自动映射
+
+**工具**
+
+- `bindgen`：C 头文件 → Rust 绑定
+- `cbindgen`：Rust → C 头文件
+
+## 下一步
+
+掌握了 FFI，你已经能和 C 生态系统无缝对接。下一篇文章将进入实战阶段，学习如何用 **Axum 框架构建 Web 服务器**。
+
+---
+
+- **上一篇**：[21 Unsafe Rust](./21-unsafe-rust.mdx)
+- **下一篇**：[23 实战：Web 服务器](./23-web-server-axum.mdx)

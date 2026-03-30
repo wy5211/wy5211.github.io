@@ -1,0 +1,432 @@
+---
+title: "24 实战：命令行工具"
+date: "2026-03-30"
+summary: "使用 clap 库开发一个完整的 CLI 文件搜索工具，综合运用 Rust 所学知识"
+tags: ["Rust", "CLI", "clap", "命令行", "实战"]
+category: "rust"
+draft: false
+series: "Rust 渐进式学习"
+seriesOrder: 24
+---
+
+## 前言
+
+恭喜你来到了 Rust 学习系列的最后一篇！
+
+Rust 非常适合开发命令行工具（CLI）——编译为单一二进制文件、无需运行时、启动速度快、内存占用小。本文将使用 `clap` 库开发一个类似 `grep` 的文件搜索工具，综合运用前面学到的所有知识。
+
+## 项目搭建
+
+```bash
+cargo new rfind
+cd rfind
+```
+
+### 添加依赖
+
+```toml
+# Cargo.toml
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+colored = "2"
+walkdir = "2"
+```
+
+## clap 基础
+
+### 定义命令行参数
+
+```rust
+use clap::{Parser, Subcommand};
+
+#[derive(Parser)]
+#[command(name = "rfind")]
+#[command(author = "Your Name")]
+#[command(version = "1.0")]
+#[command(about = "一个简单的文件搜索工具", long_about = None)]
+struct Cli {
+    /// 要搜索的模式
+    pattern: String,
+
+    /// 搜索的目录
+    #[arg(short, long, default_value = ".")]
+    path: String,
+
+    /// 是否区分大小写
+    #[arg(short = 'i', long)]
+    ignore_case: bool,
+
+    /// 只显示文件名，不显示匹配内容
+    #[arg(short, long)]
+    files_only: bool,
+
+    /// 显示行号
+    #[arg(short = 'n', long)]
+    line_number: bool,
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    println!("搜索模式: {}", cli.pattern);
+    println!("搜索目录: {}", cli.path);
+    println!("忽略大小写: {}", cli.ignore_case);
+}
+```
+
+### 子命令
+
+```rust
+#[derive(Parser)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// 搜索文件内容
+    Search {
+        pattern: String,
+        #[arg(short, long, default_value = ".")]
+        path: String,
+    },
+    /// 统计文件信息
+    Stats {
+        path: String,
+    },
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Search { pattern, path } => {
+            println!("搜索 '{}' 在 '{}'", pattern, path);
+        }
+        Commands::Stats { path } => {
+            println!("统计 '{}'", path);
+        }
+    }
+}
+```
+
+## 完整实现：文件搜索工具
+
+### 核心逻辑
+
+```rust
+use clap::Parser;
+use colored::*;
+use std::fs;
+use std::path::Path;
+use walkdir::WalkDir;
+
+#[derive(Parser)]
+#[command(name = "rfind")]
+#[command(version = "1.0")]
+#[command(about = "在文件中搜索文本")]
+struct Cli {
+    /// 搜索模式
+    pattern: String,
+
+    /// 搜索目录
+    #[arg(short, long, default_value = ".")]
+    path: String,
+
+    /// 忽略大小写
+    #[arg(short = 'i', long)]
+    ignore_case: bool,
+
+    /// 显示行号
+    #[arg(short, long, default_value_t = true)]
+    line_number: bool,
+
+    /// 文件扩展名过滤
+    #[arg(short, long)]
+    extension: Option<String>,
+
+    /// 最大搜索深度
+    #[arg(short = 'd', long)]
+    max_depth: Option<usize>,
+}
+
+struct SearchOptions {
+    pattern: String,
+    ignore_case: bool,
+    show_line_number: bool,
+    extension: Option<String>,
+    max_depth: Option<usize>,
+}
+
+struct MatchResult {
+    file_path: String,
+    line_number: usize,
+    line: String,
+}
+
+fn search_file(path: &Path, options: &SearchOptions) -> Result<Vec<MatchResult>, String> {
+    let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let mut results = Vec::new();
+
+    let pattern = if options.ignore_case {
+        options.pattern.to_lowercase()
+    } else {
+        options.pattern.clone()
+    };
+
+    for (i, line) in content.lines().enumerate() {
+        let line_to_check = if options.ignore_case {
+            line.to_lowercase()
+        } else {
+            line.to_string()
+        };
+
+        if line_to_check.contains(&pattern) {
+            results.push(MatchResult {
+                file_path: path.display().to_string(),
+                line_number: i + 1,
+                line: line.to_string(),
+            });
+        }
+    }
+
+    Ok(results)
+}
+
+fn should_search(path: &Path, options: &SearchOptions) -> bool {
+    if !path.is_file() {
+        return false;
+    }
+
+    // 跳过隐藏文件
+    if let Some(name) = path.file_name() {
+        if name.to_string_lossy().starts_with('.') {
+            return false;
+        }
+    }
+
+    // 跳过二进制文件（通过扩展名过滤）
+    if let Some(ext) = path.extension() {
+        let ext = ext.to_string_lossy().to_lowercase();
+        let binary_exts = ["png", "jpg", "jpeg", "gif", "ico", "pdf", "zip", "gz"];
+        if binary_exts.contains(&ext.as_str()) {
+            return false;
+        }
+
+        // 扩展名过滤
+        if let Some(ref target_ext) = options.extension {
+            if ext != target_ext.to_lowercase() {
+                return false;
+            }
+        }
+    }
+
+    true
+}
+
+fn search_dir(path: &Path, options: &SearchOptions) -> Vec<MatchResult> {
+    let mut all_results = Vec::new();
+
+    let mut walker = WalkDir::new(path);
+    if let Some(max_depth) = options.max_depth {
+        walker = walker.max_depth(max_depth);
+    }
+
+    for entry in walker.into_iter().filter_map(|e| e.ok()) {
+        let entry_path = entry.path();
+
+        if !should_search(entry_path, options) {
+            continue;
+        }
+
+        if let Ok(results) = search_file(entry_path, options) {
+            all_results.extend(results);
+        }
+    }
+
+    all_results
+}
+
+fn print_results(results: &[MatchResult], options: &SearchOptions) {
+    let mut current_file = String::new();
+
+    for result in results {
+        // 文件名变化时打印文件名
+        if result.file_path != current_file {
+            current_file = result.file_path.clone();
+            println!();
+            println!("{}", current_file.green().bold());
+        }
+
+        if options.show_line_number {
+            let line_num = format!("{:>4}: ", result.line_number).cyan();
+            let highlighted = highlight_match(&result.line, &options.pattern, options.ignore_case);
+            println!("  {}{}", line_num, highlighted);
+        } else {
+            let highlighted = highlight_match(&result.line, &options.pattern, options.ignore_case);
+            println!("  {}", highlighted);
+        }
+    }
+}
+
+fn highlight_match(line: &str, pattern: &str, ignore_case: bool) -> ColoredString {
+    let (line_lower, pattern_lower) = if ignore_case {
+        (line.to_lowercase(), pattern.to_lowercase())
+    } else {
+        (line.to_string(), pattern.to_string())
+    };
+
+    if let Some(pos) = line_lower.find(&pattern_lower) {
+        let before = &line[..pos];
+        let match_str = &line[pos..pos + pattern.len()];
+        let after = &line[pos + pattern.len()..];
+
+        let mut result = String::new();
+        result.push_str(before);
+        result.push_str(&format!("{}", match_str.red().bold()));
+        result.push_str(after);
+        result.normal()
+    } else {
+        line.normal()
+    }
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    let options = SearchOptions {
+        pattern: cli.pattern,
+        ignore_case: cli.ignore_case,
+        show_line_number: cli.line_number,
+        extension: cli.extension,
+        max_depth: cli.max_depth,
+    };
+
+    let path = Path::new(&cli.path);
+
+    if !path.exists() {
+        eprintln!("错误: 路径 '{}' 不存在", cli.path);
+        std::process::exit(1);
+    }
+
+    let results = search_dir(path, &options);
+
+    if results.is_empty() {
+        println!("没有找到匹配 '{}'", options.pattern);
+    } else {
+        println!("找到 {} 个匹配", results.len().to_string().yellow().bold());
+        print_results(&results, &options);
+    }
+}
+```
+
+### 使用示例
+
+```bash
+# 基本搜索
+cargo run -- "TODO" src/
+
+# 忽略大小写
+cargo run -- "rust" --ignore-case src/
+
+# 只搜索 .rs 文件
+cargo run -- "async" --extension rs
+
+# 不显示行号
+cargo run -- "error" --no-line-number
+
+# 限制搜索深度
+cargo run -- "test" --max-depth 2
+
+# 编译为二进制
+cargo build --release
+./target/release/rfind "pattern" /path/to/search
+```
+
+## 发布到 crates.io（简介）
+
+如果你想把自己的 CLI 工具分享给社区：
+
+```bash
+# 注册账号
+cargo login <API_TOKEN>
+
+# 发布
+cargo publish
+```
+
+在 `Cargo.toml` 中添加必要的元信息：
+
+```toml
+[package]
+name = "rfind"
+version = "0.1.0"
+edition = "2021"
+description = "一个简单的文件搜索工具"
+license = "MIT"
+repository = "https://github.com/yourname/rfind"
+
+[[bin]]
+name = "rfind"
+path = "src/main.rs"
+```
+
+## 系列总结
+
+恭喜你完成了整个 Rust 渐进式学习系列！
+
+回顾一下你学到的内容：
+
+```
+入门基础（01-04）
+  ✅ 理解了 Rust 的价值和设计理念
+  ✅ 搭建了开发环境
+  ✅ 掌握了基本语法
+
+核心概念（05-07）
+  ✅ 所有权系统 —— Rust 的灵魂
+  ✅ 引用与借用 —— 灵活使用数据
+  ✅ 切片与字符串 —— 深入理解字符串
+
+数据结构（08-11）
+  ✅ 结构体 —— 自定义数据类型
+  ✅ 枚举与模式匹配 —— 强大的类型系统
+  ✅ 模块与包管理 —— 代码组织
+  ✅ 常用集合 —— Vec、HashMap、HashSet
+
+类型系统（12-15）
+  ✅ 错误处理 —— Result 和 Option
+  ✅ 泛型 —— 代码复用
+  ✅ Trait —— 接口抽象
+  ✅ 生命周期 —— 引用的有效范围
+
+函数式特性（16-17）
+  ✅ 闭包与迭代器 —— 函数式编程
+  ✅ 智能指针 —— Box、Rc、RefCell
+
+并发与异步（18-19）
+  ✅ 并发编程 —— 线程与消息传递
+  ✅ 异步编程 —— async/await
+
+进阶与实战（20-24）
+  ✅ 测试 —— 保证代码质量
+  ✅ Unsafe Rust —— 打破安全限制
+  ✅ FFI —— 与 C 语言交互
+  ✅ Web 服务器 —— Axum 框架
+  ✅ CLI 工具 —— clap 库
+```
+
+### 下一步建议
+
+1. **阅读优秀开源代码**：推荐阅读 `ripgrep`、`fd`、`bat` 等 CLI 工具的源码
+2. **参与开源项目**：在 GitHub 上找 Rust 项目贡献代码
+3. **写自己的项目**：Web 服务、CLI 工具、数据库客户端等
+4. **阅读《Rust Programming Language》**：官方推荐的学习资源
+5. **关注 Rust Weekly**：每周的 Rust 社区动态
+
+Rust 的学习曲线虽然陡峭，但一旦理解了所有权和生命周期，你会发现它是一门非常优雅和强大的语言。祝你 Rust 之旅愉快！
+
+---
+
+- **上一篇**：[22 与 C 语言交互](./22-ffi.mdx)
