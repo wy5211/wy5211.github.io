@@ -8,23 +8,31 @@
 blog/
 ├─ content/
 │  └─ posts/
-│     └─ hello-world.mdx
+│     └─ <category>/
+│        └─ NN-slug.mdx
 ├─ docs/
 │  └─ 开发文档.md
 ├─ src/
 │  ├─ app/
 │  │  ├─ posts/
-│  │  │  └─ [slug]/
-│  │  │     └─ page.tsx
+│  │  │  └─ [category]/
+│  │  │     └─ [slug]/
+│  │  │        └─ page.tsx
 │  │  ├─ globals.css
 │  │  ├─ layout.tsx
 │  │  └─ page.tsx
+│  ├─ components/
+│  │  ├─ layout/
+│  │  │  ├─ Header.tsx
+│  │  │  └─ Footer.tsx
+│  │  └─ PostList.tsx
 │  └─ lib/
-│     └─ posts.ts
-├─ next-env.d.ts
+│     ├─ posts.ts
+│     ├─ category-map.ts
+│     └─ category-colors.ts
 ├─ next.config.js
-├─ package-lock.json
 ├─ package.json
+├─ pnpm-lock.yaml
 ├─ postcss.config.js
 ├─ tailwind.config.ts
 └─ tsconfig.json
@@ -33,7 +41,7 @@ blog/
 ## 目录与文件职责
 
 - `content/posts/`
-  - 存放博客文章源文件（`.mdx`）。
+  - 存放博客文章源文件（`.mdx`），按分类目录组织。
   - 每篇文章通过 Frontmatter 管理标题、日期、标签、摘要等元数据。
 
 - `docs/开发文档.md`
@@ -42,56 +50,54 @@ blog/
 - `src/app/page.tsx`
   - 首页，负责读取文章列表并展示卡片。
 
-- `src/app/posts/[slug]/page.tsx`
-  - 文章详情页，基于动态路由按 slug 渲染对应文章。
+- `src/app/posts/[category]/[slug]/page.tsx`
+  - 文章详情页，基于动态路由按分类和 slug 渲染对应文章。
 
 - `src/app/layout.tsx`
   - 全局布局文件，定义站点级元数据与基础页面骨架。
 
-- `src/app/globals.css`
-  - 全局样式入口，包含 Tailwind 指令与基础样式变量。
+- `src/components/PostList.tsx`
+  - 文章列表组件，支持分类筛选和搜索。
+
+- `src/components/layout/Header.tsx` / `Footer.tsx`
+  - 页头和页脚布局组件。
 
 - `src/lib/posts.ts`
-  - 内容读取与解析逻辑：
-  - 读取 `content/posts` 下的文章文件。
-  - 解析 Frontmatter。
-  - 提供文章列表与详情数据给页面使用。
+  - 内容读取与解析逻辑：读取 `content/posts` 下的文章文件，解析 Frontmatter。
+
+- `src/lib/category-map.ts`
+  - 分类名与目录名的双向映射。
+
+- `src/lib/category-colors.ts`
+  - 分类标签颜色映射。
 
 - `next.config.js`
   - Next.js 配置，已设置静态导出（`output: 'export'`），适配 GitHub Pages。
-
-- `tailwind.config.ts` + `postcss.config.js`
-  - Tailwind 与 PostCSS 配置文件，负责样式构建流程。
-
-- `package.json`
-  - 项目依赖与脚本入口（`dev`、`build`、`start`、`lint`）。
-
-- `tsconfig.json`
-  - TypeScript 编译配置与路径别名（`@/* -> src/*`）。
 
 ## 运行与构建
 
 安装依赖：
 
 ```bash
-npm install
+pnpm install
 ```
 
 本地开发：
 
 ```bash
-npm run dev
+pnpm dev
 ```
 
 生产构建：
 
 ```bash
-npm run build
+pnpm build
 ```
 
 ## 当前已实现能力
 
 - 基于 MDX 的文章管理（文件即内容）。
-- 首页文章列表展示。
-- 文章详情页渲染。
+- 首页文章列表展示，支持分类筛选。
+- 文章详情页渲染，支持下一篇导航。
 - 静态导出构建（SSG）。
+- 深色模式支持。

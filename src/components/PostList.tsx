@@ -5,6 +5,7 @@ import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { PostMeta } from "@/lib/posts";
 import { categoryToDirMap, dirToCategoryMap } from "@/lib/category-map";
+import { getCategoryColor } from "@/lib/category-colors";
 
 interface PostListProps {
   posts: PostMeta[];
@@ -33,14 +34,31 @@ export default function PostList({ posts }: PostListProps) {
   const categories = useMemo(() => {
     // 获取所有分类（按预定义顺序）
     const categoryOrder = [
-      "前端",
       "后端",
       "nestjs",
-      "全栈",
-      "测试",
       "运维",
-      "大模型",
       "数据库",
+      "python",
+      "rust",
+      "java",
+      "golang",
+      "hono",
+      "docker",
+      "redis",
+      "mysql",
+      "prisma",
+      "mongoose",
+      "typeorm",
+      "mybatis",
+      "drizzle",
+      "springboot",
+      "trpc",
+      "typescript",
+      "vite",
+      "nextjs",
+      "nodejs-core",
+      "claude-code",
+      "agent",
     ];
 
     // 获取文章中实际存在的分类
@@ -67,26 +85,6 @@ export default function PostList({ posts }: PostListProps) {
     return posts.filter((post) => post.category === normalizedCategory);
   }, [posts, normalizedCategory]);
 
-  // 获取分类对应的颜色
-  const getCategoryColor = (category: string) => {
-    const colors: Record<string, string> = {
-      前端: "bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-400",
-      后端: "bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400",
-      nestjs: "bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-400",
-      全栈: "bg-purple-100 text-purple-700 dark:bg-purple-900/30 dark:text-purple-400",
-      测试: "bg-yellow-100 text-yellow-700 dark:bg-yellow-900/30 dark:text-yellow-400",
-      运维: "bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400",
-      大模型:
-        "bg-pink-100 text-pink-700 dark:bg-pink-900/30 dark:text-pink-400",
-      数据库:
-        "bg-teal-100 text-teal-700 dark:bg-teal-900/30 dark:text-teal-400",
-    };
-    return (
-      colors[category] ||
-      "bg-gray-100 text-gray-700 dark:bg-neutral-700 dark:text-gray-400"
-    );
-  };
-
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 pb-12">
       {/* 分类按钮栏 */}
@@ -99,7 +97,7 @@ export default function PostList({ posts }: PostListProps) {
               className={`px-5 py-2 rounded-lg font-medium text-sm transition-all ${
                 normalizedCategory === category
                   ? "bg-gradient-to-r from-blue-500 to-purple-600 text-white shadow-md scale-105"
-                  : "bg-white dark:bg-neutral-800 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-neutral-700 hover:scale-102"
+                  : "bg-white dark:bg-neutral-800 text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-neutral-700 hover:scale-[1.02]"
               }`}
             >
               {category}

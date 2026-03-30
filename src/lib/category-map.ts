@@ -22,6 +22,11 @@ export const categoryToDirMap: Record<string, string> = {
   typeorm: "typeorm",
   python: "python",
   agent: "agent",
+  drizzle: "drizzle",
+  rust: "rust",
+  springboot: "springboot",
+  vite: "vite",
+  "nodejs-core": "nodejs-core",
 };
 
 // 目录名到中文分类名的反向映射
@@ -46,4 +51,9 @@ export const dirToCategoryMap: Record<string, string> = {
   typeorm: "typeorm",
   python: "python",
   agent: "agent",
+  drizzle: "drizzle",
+  rust: "rust",
+  springboot: "springboot",
+  vite: "vite",
+  "nodejs-core": "nodejs-core",
 };
