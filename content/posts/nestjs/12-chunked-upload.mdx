@@ -1,0 +1,668 @@
+---
+title: "12 500MB 视频怎么传？NestJS 大文件切片上传实战"
+date: "2026-03-30"
+summary: "大文件直接上传会超时、占内存、断了从头来。切片上传把文件拆成小块逐个传，支持断点续传和秒传。"
+tags: ["NestJS", "切片上传", "断点续传", "秒传", "SparkMD5", "大文件"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式学习"
+seriesOrder: 12
+---
+
+## 先看看问题有多严重
+
+zhang_wei 刚录了一个 500MB 的视频教程，想传到博客后台。他点了上传，进度条走了一半，网络抖了一下，页面显示上传失败。他再点一次，又从头开始。
+
+500MB 的文件意味着什么？在 10Mbps 的上传带宽下，大概需要 7 分钟。这 7 分钟里，任何一个网络波动都会导致整个请求失败。而且 Node.js 处理这个请求时，如果用内存存储，Buffer 会占用 500MB 内存——两个用户同时上传，进程直接 OOM。
+
+传统上传方式处理不了这个场景。解决方案是**切片上传**（chunked upload）：把大文件切成多个小块（比如每块 2MB），逐个上传，最后在服务端合并。某个分片上传失败了，只需要重传那个分片，不用从头来。
+
+## 切片上传的完整流程
+
+先理清楚整个交互流程，再写代码。前端和后端一共需要三个接口：
+
+```
+第一步：前端计算文件哈希（SparkMD5，分片读取避免内存溢出）
+    ↓
+第二步：GET /upload/chunked/check?fileHash=xxx&fileName=xxx
+    后端检查：哈希已存在？→ 秒传，直接返回 URL
+    哈希不存在？→ 查已上传的分片列表，返回断点续传信息
+    ↓
+第三步：前端切片，跳过已上传的分片，逐片上传
+    POST /upload/chunked/chunk（每个分片一次请求）
+    ↓
+第四步：所有分片上传完成
+    POST /upload/chunked/merge
+    后端按顺序合并分片，校验文件大小，返回最终 URL
+```
+
+为什么先算哈希？因为哈希是文件的唯一标识。相同内容的文件，哈希一定相同。这个特性直接解决了两个问题：
+
+- **秒传**：服务器发现这个哈希已经存在，说明文件之前已经传过了，直接返回 URL，0 字节传输。
+- **断点续传**：服务器用哈希做目录名，把分片存在对应目录下。下次请求时检查这个目录里有几个分片，告诉前端跳过已经传过的。
+
+500MB 的文件按 2MB 切片，分成 250 个分片。如果传到第 150 个时断网了，恢复后只需要传剩余的 100 个——前面 150 个分片还在服务器上。
+
+## 后端：数据模型
+
+需要一张表记录已完成的上传，用于秒传判断：
+
+```prisma
+model UploadedFile {
+  id        String   @id @default(uuid())
+  hash      String   @unique
+  fileName  String
+  url       String
+  size      Int
+  createdAt DateTime @default(now())
+  @@map("uploaded_files")
+}
+```
+
+分片不需要存数据库——直接存在文件系统里就行。用哈希值做目录名，分片索引做文件名：
+
+```
+uploads/
+├── chunks/
+│   └── a1b2c3d4e5f6.../    ← 文件哈希
+│       ├── 0                ← 第 0 个分片
+│       ├── 1
+│       ├── 2
+│       └── ...
+└── files/
+    └── a1b2c3d4e5f6....mp4  ← 合并后的最终文件
+```
+
+为什么不用数据库存分片记录？因为分片是临时数据——合并完成后就删除了。文件系统操作（检查文件是否存在、读写文件）比数据库操作快得多，而且分片的唯一标识就是文件名（索引号），天然不需要额外查询。
+
+DTO 设计很直接，校验文件哈希、文件名、分片数量和文件大小：
+
+```typescript
+// src/upload/dto/merge-chunked.dto.ts
+import { IsString, IsInt, IsNumber, Min, IsNotEmpty } from "class-validator";
+
+export class MergeChunkedDto {
+  @IsString()
+  @IsNotEmpty()
+  fileHash: string;
+
+  @IsString()
+  @IsNotEmpty()
+  fileName: string;
+
+  @IsInt()
+  @Min(1)
+  totalChunks: number;
+
+  @IsNumber()
+  @Min(1)
+  fileSize: number;
+}
+```
+
+## 后端：核心服务
+
+三个核心方法：`check`（秒传 + 断点续传检查）、`saveChunk`（保存单个分片）、`merge`（合并所有分片）。
+
+`check` 方法的逻辑分两步。先查数据库——如果哈希已存在，说明文件之前完整上传过，直接返回 URL，前端拿到 URL 就完成了（这就是秒传）。如果数据库里没有，再查文件系统——看看有没有以这个哈希命名的目录，目录里有哪些文件，那就是已上传的分片。
+
+```typescript
+async check(fileHash: string, fileName: string) {
+  // 秒传：查数据库
+  const existing = await this.prisma.uploadedFile.findUnique({
+    where: { hash: fileHash },
+  });
+  if (existing) {
+    return { uploaded: true, url: existing.url };
+  }
+
+  // 断点续传：查文件系统
+  const chunkDir = path.join(CHUNK_DIR, fileHash);
+  let uploadedChunks: number[] = [];
+
+  if (fs.existsSync(chunkDir)) {
+    uploadedChunks = fs.readdirSync(chunkDir)
+      .filter(f => /^\d+$/.test(f))   // 只取纯数字文件名
+      .map(f => Number(f))
+      .sort((a, b) => a - b);
+  }
+
+  return {
+    uploaded: false,
+    uploadedChunks,
+    message: uploadedChunks.length > 0
+      ? `已上传 ${uploadedChunks.length} 个分片，可断点续传`
+      : '新文件',
+  };
+}
+```
+
+注意 `filter(f => /^\d+$/.test(f))` 这个过滤——目录里可能有 `.DS_Store` 或其他杂七杂八的文件，只取纯数字文件名才是分片。
+
+`saveChunk` 方法非常简单：把分片 buffer 写到对应的目录下，文件名就是分片索引。如果分片已存在，直接跳过——这就是幂等性。前端重试上传同一个分片不会导致数据错误。
+
+```typescript
+saveChunk(fileHash: string, chunkIndex: number, buffer: Buffer) {
+  const chunkDir = path.join(CHUNK_DIR, fileHash);
+
+  if (!fs.existsSync(chunkDir)) {
+    fs.mkdirSync(chunkDir, { recursive: true });
+  }
+
+  const chunkPath = path.join(chunkDir, String(chunkIndex));
+
+  // 幂等：分片已存在则跳过
+  if (fs.existsSync(chunkPath)) {
+    return;
+  }
+
+  fs.writeFileSync(chunkPath, buffer);
+}
+```
+
+`merge` 方法是最复杂的。它要做五件事：检查分片完整性、合并分片、校验文件大小、写入数据库记录、清理分片文件。
+
+```typescript
+async merge(
+  fileHash: string,
+  fileName: string,
+  totalChunks: number,
+  fileSize: number,
+) {
+  const chunkDir = path.join(CHUNK_DIR, fileHash);
+
+  if (!fs.existsSync(chunkDir)) {
+    throw new BadRequestException('分片目录不存在，请重新上传');
+  }
+
+  // 1. 检查分片数量
+  const existingChunks = fs.readdirSync(chunkDir)
+    .filter(f => /^\d+$/.test(f));
+
+  if (existingChunks.length !== totalChunks) {
+    throw new BadRequestException(
+      `分片不完整：需要 ${totalChunks} 个，实际 ${existingChunks.length} 个`,
+    );
+  }
+
+  // 2. 生成最终文件路径
+  const ext = path.extname(fileName);
+  const finalFileName = `${fileHash}${ext}`;
+  const finalPath = path.join(FILES_DIR, finalFileName);
+
+  // 3. 并发场景：文件已存在
+  if (fs.existsSync(finalPath)) {
+    const record = await this.prisma.uploadedFile.findUnique({
+      where: { hash: fileHash },
+    });
+    if (record) {
+      this.cleanChunks(chunkDir);
+      return { url: record.url, fileName: finalFileName };
+    }
+  }
+
+  // 4. 流式合并（不全部读入内存）
+  await this.streamMerge(chunkDir, totalChunks, finalPath);
+
+  // 5. 校验文件大小
+  const stats = fs.statSync(finalPath);
+  if (stats.size !== fileSize) {
+    fs.unlinkSync(finalPath);
+    throw new BadRequestException(
+      `文件大小不匹配：期望 ${fileSize}，实际 ${stats.size}`,
+    );
+  }
+
+  const fileUrl = `/uploads/files/${finalFileName}`;
+
+  // 6. 写入数据库（用于秒传）
+  await this.prisma.uploadedFile.upsert({
+    where: { hash: fileHash },
+    update: { url: fileUrl, size: fileSize, fileName },
+    create: { hash: fileHash, url: fileUrl, size: fileSize, fileName },
+  });
+
+  // 7. 清理分片
+  this.cleanChunks(chunkDir);
+
+  return { url: fileUrl, fileName: finalFileName, size: stats.size };
+}
+```
+
+合并后校验文件大小这一步容易被忽略。如果不校验，某个分片上传不完整（比如网络中断导致 buffer 不完整），合并出来的文件就是损坏的。前端传来的 `fileSize` 是原始文件的大小（`file.size`），和合并后的文件大小对比，不一致就说明有问题。
+
+## 流式合并：为什么不能用 readFileSync
+
+合并 500MB 的文件，如果用 `readFileSync` 把所有分片读进内存再写，内存峰值会很高。假设每个分片 2MB，250 个分片，虽然 Node.js 的垃圾回收会在写完一个分片后回收它的 buffer，但 `readFileSync` 是同步的——在合并过程中，内存里同时存在写入流缓冲区 + 当前分片 buffer。
+
+用流式合并，每次只在内存中保持一个分片（2MB）：
+
+```typescript
+private streamMerge(
+  chunkDir: string,
+  totalChunks: number,
+  finalPath: string,
+): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const writeStream = fs.createWriteStream(finalPath);
+    let currentIndex = 0;
+
+    const appendNext = () => {
+      if (currentIndex >= totalChunks) {
+        writeStream.end();
+        return;
+      }
+
+      const chunkPath = path.join(chunkDir, String(currentIndex));
+      const readStream = fs.createReadStream(chunkPath);
+
+      readStream.on('end', () => {
+        currentIndex++;
+        appendNext();
+      });
+
+      readStream.on('error', reject);
+      readStream.pipe(writeStream, { end: false });
+    };
+
+    writeStream.on('finish', resolve);
+    writeStream.on('error', reject);
+
+    appendNext();
+  });
+}
+```
+
+这里有两个关键细节：
+
+第一，`pipe(writeStream, { end: false })`。`end: false` 告诉 pipe 不要在读完第一个分片后关闭写入流。因为后面还有 249 个分片要写。所有分片写完后，手动调用 `writeStream.end()`。
+
+第二，顺序很重要。分片必须按 0、1、2 的顺序合并，不能乱序。因为 `file.slice(0, 2MB)` 是文件的第 0-2MB，`file.slice(2MB, 4MB)` 是第 2-4MB。乱序合并出来的文件是乱的。
+
+## Controller
+
+三个接口对应三个方法：
+
+```typescript
+// src/upload/chunked-upload.controller.ts
+import {
+  Controller,
+  Get,
+  Post,
+  Body,
+  Query,
+  UseInterceptors,
+  UploadedFile,
+} from "@nestjs/common";
+import { FileInterceptor } from "@nestjs/platform-express";
+import { memoryStorage } from "multer";
+import { ChunkedUploadService } from "./chunked-upload.service";
+import { CheckChunkedDto } from "./dto/check-chunked.dto";
+import { MergeChunkedDto } from "./dto/merge-chunked.dto";
+
+@Controller("upload/chunked")
+export class ChunkedUploadController {
+  constructor(private chunkedUploadService: ChunkedUploadService) {}
+
+  @Get("check")
+  async check(@Query() dto: CheckChunkedDto) {
+    return this.chunkedUploadService.check(dto.fileHash, dto.fileName);
+  }
+
+  @Post("chunk")
+  @UseInterceptors(
+    FileInterceptor("chunk", {
+      storage: memoryStorage(),
+      limits: { fileSize: 10 * 1024 * 1024 }, // 单个分片最大 10MB
+    })
+  )
+  async uploadChunk(
+    @UploadedFile() file: Express.Multer.File,
+    @Body("fileHash") fileHash: string,
+    @Body("chunkIndex") chunkIndex: string
+  ) {
+    this.chunkedUploadService.saveChunk(
+      fileHash,
+      parseInt(chunkIndex, 10),
+      file.buffer
+    );
+    return { success: true, chunkIndex: parseInt(chunkIndex, 10) };
+  }
+
+  @Post("merge")
+  async merge(@Body() dto: MergeChunkedDto) {
+    return this.chunkedUploadService.merge(
+      dto.fileHash,
+      dto.fileName,
+      dto.totalChunks,
+      dto.fileSize
+    );
+  }
+}
+```
+
+注意分片上传接口不需要手动加 `@UseGuards(JwtAuthGuard)`——上一篇已经把 JWT Guard 注册为全局的了。所有 `/upload/chunked/*` 的请求都必须带有效 token。
+
+分片上传接口的 Multer 配置用 `memoryStorage()`——单个分片最大 10MB，内存完全够用。如果分片大小超过 10MB，Multer 会直接拒绝，不会把文件读进内存。
+
+## 前端：切片和哈希计算
+
+后端只负责接收和合并，切片和哈希计算都在前端完成。
+
+### 文件切片
+
+`File` 对象继承自 `Blob`，可以直接调用 `slice()` 切割。这是浏览器原生 API，不需要任何库：
+
+```typescript
+function createChunks(file: File, chunkSize = 2 * 1024 * 1024): Blob[] {
+  const chunks: Blob[] = [];
+  let offset = 0;
+  while (offset < file.size) {
+    chunks.push(file.slice(offset, offset + chunkSize));
+    offset += chunkSize;
+  }
+  return chunks;
+}
+```
+
+2MB 一块，500MB 的文件分成 250 块。`file.slice()` 不会复制文件数据——它返回一个引用原始数据的 Blob 视图，所以切片操作本身几乎零开销。
+
+### 哈希计算：分片读取
+
+计算 500MB 文件的哈希，不能用 `file.arrayBuffer()` 一次性读入内存。用 `FileReader` 分片读取，逐步喂给 SparkMD5：
+
+```typescript
+import SparkMD5 from "spark-md5";
+
+async function calculateHash(
+  file: File,
+  chunkSize = 2 * 1024 * 1024
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const spark = new SparkMD5.ArrayBuffer();
+    const reader = new FileReader();
+    const totalChunks = Math.ceil(file.size / chunkSize);
+    let current = 0;
+
+    reader.onload = (e) => {
+      if (!e.target?.result) return;
+      spark.append(e.target.result as ArrayBuffer);
+      current++;
+
+      if (current < totalChunks) {
+        loadNext();
+      } else {
+        resolve(spark.end());
+      }
+    };
+
+    reader.onerror = () => reject(new Error("文件读取失败"));
+
+    function loadNext() {
+      const start = current * chunkSize;
+      const end = Math.min(start + chunkSize, file.size);
+      reader.readAsArrayBuffer(file.slice(start, end));
+    }
+
+    loadNext();
+  });
+}
+```
+
+关键点：`file.slice(start, end)` 切的是原始 `File` 对象，不是之前 `createChunks` 产生的 Blob 数组。这样保证哈希结果和完整文件一致——你把所有分片按顺序拼起来，算出来的哈希应该和直接对完整文件算的一样。
+
+为什么用 MD5 而不是 SHA-256？因为 MD5 计算更快，对于文件去重场景足够用。SHA-256 更安全，但这里的目的是标识文件，不是做安全校验。
+
+### 并发控制
+
+250 个分片如果逐个上传（串行），每个分片假设 200ms，总耗时 50 秒。如果 3 个并发，耗时约 17 秒。但并发太高也不好——浏览器对同一域名有 6 个 TCP 连接的限制，而且服务器也可能限流。
+
+一个简单的并发池：
+
+```typescript
+class ConcurrencyPool {
+  private running = 0;
+  private queue: (() => void)[] = [];
+
+  constructor(private max: number) {}
+
+  async run<T>(fn: () => Promise<T>): Promise<T> {
+    while (this.running >= this.max) {
+      await new Promise<void>((r) => this.queue.push(r));
+    }
+    this.running++;
+    try {
+      return await fn();
+    } finally {
+      this.running--;
+      this.queue.shift()?.();
+    }
+  }
+}
+```
+
+原理很简单：维护一个计数器 `running`，每次执行任务前检查是否达到上限。达到上限时，把回调函数推入队列。任务完成后，从队列取出下一个回调执行。
+
+### 完整上传流程
+
+把上面的组件组装起来。这段代码展示完整的上传流程，注意每个步骤的注释：
+
+```typescript
+async function uploadLargeFile(file: File, onProgress?: (pct: number) => void) {
+  const CHUNK_SIZE = 2 * 1024 * 1024;
+  const MAX_CONCURRENCY = 3;
+
+  // 1. 计算哈希（可能需要几秒）
+  const fileHash = await calculateHash(file, CHUNK_SIZE);
+
+  // 2. 检查秒传/断点续传
+  const check = await fetch(
+    `/upload/chunked/check?fileHash=${fileHash}&fileName=${encodeURIComponent(file.name)}`
+  ).then((r) => r.json());
+
+  if (check.uploaded) {
+    onProgress?.(100);
+    return check.url; // 秒传
+  }
+
+  // 3. 切片
+  const chunks = createChunks(file, CHUNK_SIZE);
+  const uploadedSet = new Set(check.uploadedChunks || []);
+  const pool = new ConcurrencyPool(MAX_CONCURRENCY);
+
+  // 4. 并发上传（跳过已上传的）
+  let completed = uploadedSet.size;
+
+  await Promise.all(
+    chunks.map(async (chunk, index) => {
+      if (uploadedSet.has(index)) return;
+
+      await pool.run(async () => {
+        const formData = new FormData();
+        formData.append("chunk", chunk);
+        formData.append("fileHash", fileHash);
+        formData.append("chunkIndex", String(index));
+
+        await fetch("/upload/chunked/chunk", {
+          method: "POST",
+          body: formData,
+        });
+
+        completed++;
+        onProgress?.(Math.round((completed / chunks.length) * 100));
+      });
+    })
+  );
+
+  // 5. 合并
+  const merge = await fetch("/upload/chunked/merge", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      fileHash,
+      fileName: file.name,
+      totalChunks: chunks.length,
+      fileSize: file.size,
+    }),
+  }).then((r) => r.json());
+
+  return merge.url;
+}
+```
+
+## Web Worker：不阻塞 UI
+
+哈希计算是 CPU 密集型任务。500MB 的文件，主线程算哈希可能要好几秒，期间页面完全卡死——按钮点不了，动画不动的。
+
+把哈希计算移到 Web Worker，在后台线程计算，主线程保持响应：
+
+```typescript
+// workers/hash.worker.ts
+import SparkMD5 from "spark-md5";
+
+self.onmessage = (e: MessageEvent) => {
+  const { fileChunkList } = e.data;
+  const spark = new SparkMD5.ArrayBuffer();
+  let count = 0;
+
+  const loadNext = (index: number) => {
+    const reader = new FileReader();
+    reader.readAsArrayBuffer(fileChunkList[index]);
+
+    reader.onload = (event) => {
+      count++;
+      spark.append(event.target!.result as ArrayBuffer);
+
+      if (count === fileChunkList.length) {
+        self.postMessage({ hash: spark.end() });
+        self.close();
+      } else {
+        loadNext(count);
+      }
+    };
+  };
+
+  loadNext(0);
+};
+```
+
+主线程调用：
+
+```typescript
+function calculateHashInWorker(file: File, chunkSize: number): Promise<string> {
+  return new Promise((resolve, reject) => {
+    // Worker 不能接收 File 对象，但能接收 Blob
+    const chunks: Blob[] = [];
+    let offset = 0;
+    while (offset < file.size) {
+      chunks.push(file.slice(offset, offset + chunkSize));
+      offset += chunkSize;
+    }
+
+    const worker = new Worker(
+      new URL("../workers/hash.worker.ts", import.meta.url)
+    );
+
+    worker.onmessage = (e) => {
+      if (e.data.hash) resolve(e.data.hash);
+    };
+
+    worker.onerror = (e) => reject(new Error(`Worker error: ${e.message}`));
+    worker.postMessage({ fileChunkList: chunks });
+  });
+}
+```
+
+Worker 接收的是 `Blob` 数组。`File` 对象不能跨线程传递（它是主线程的资源），但 `Blob` 可以——`file.slice()` 返回的 Blob 包含对原始数据的引用，Worker 里可以用 `FileReader` 读取。
+
+## 定时清理过期分片
+
+用户上传到一半关了浏览器，分片会一直留在服务器上。假设每天有 100 个用户开始上传但没完成，每个分片目录 2MB，一个月就是 6GB 的垃圾数据。需要一个定时任务清理超过 24 小时未合并的分片目录。
+
+```typescript
+import { Cron } from '@nestjs/schedule';
+
+// 在 ChunkedUploadService 中添加
+@Cron('0 2 * * *') // 每天凌晨 2 点执行
+cleanExpiredChunks() {
+  if (!fs.existsSync(CHUNK_DIR)) return;
+
+  const dirs = fs.readdirSync(CHUNK_DIR);
+  const now = Date.now();
+  const maxAge = 24 * 60 * 60 * 1000; // 24 小时
+  let cleaned = 0;
+
+  for (const dir of dirs) {
+    const dirPath = path.join(CHUNK_DIR, dir);
+    const stat = fs.statSync(dirPath);
+
+    if (now - stat.mtimeMs > maxAge) {
+      fs.rmSync(dirPath, { recursive: true, force: true });
+      cleaned++;
+    }
+  }
+
+  if (cleaned > 0) {
+    this.logger.log(`清理了 ${cleaned} 个过期分片目录`);
+  }
+}
+```
+
+清理的判断依据是目录的修改时间（`mtime`）。每次写入新分片时，目录的 `mtime` 会更新。如果一个目录 24 小时没有被修改过，说明上传要么已经完成（分片已被合并时删除），要么已经放弃。
+
+需要在 `AppModule` 里引入 `ScheduleModule`：
+
+```typescript
+import { ScheduleModule } from "@nestjs/schedule";
+
+@Module({
+  imports: [ScheduleModule.forRoot()],
+})
+export class AppModule {}
+```
+
+## 分片大小怎么选
+
+不是越小越好，也不是越大越好。太小，请求数太多，HTTP 开销大；太大，单个分片失败时重传代价高。
+
+| 文件大小     | 推荐分片大小 | 分片数量（500MB 文件） |
+| ------------ | ------------ | ---------------------- |
+| < 50MB       | 不切片       | 1                      |
+| 50MB - 500MB | 2MB          | 250                    |
+| 500MB - 2GB  | 5MB          | 100                    |
+| > 2GB        | 10MB         | 50+                    |
+
+2MB 是一个经验值——在大多数网络环境下，一个 2MB 的分片能在 1-2 秒内传完，失败重传代价低，同时请求数不会太多。如果你的用户主要在移动网络环境下使用，可以考虑减小到 1MB。
+
+## 和上一篇的关系
+
+上一篇的普通上传接口和这一篇的切片上传接口可以共存。Controller 路径不同：`/upload/avatar` 和 `/upload/cover` 走普通上传，`/upload/chunked/*` 走切片上传。
+
+它们共用同一个 `StorageService` 接口——普通上传处理后的文件存本地，切片上传合并后的文件也存本地。如果以后迁移到 OSS，两边一起迁移，不需要改业务代码。
+
+前端的判断逻辑也很简单：文件小于 50MB 走普通上传（一个请求搞定），大于 50MB 走切片上传（多个请求 + 合并）。
+
+## 秒传的边界情况
+
+秒传有个边界情况需要考虑：zhang_wei 上传了一个 500MB 的视频，秒传成功。后来他发现上传错了，想删掉重新上传一个同名但不同内容的视频。但新文件的哈希不一样（内容不同），所以不会被误判为秒传——这是对的。
+
+但如果 zhang_wei 上传了视频 A，管理员也上传了同一个视频 A（相同内容），数据库里只有一条记录。两个人都能通过秒传拿到 URL，指向同一个文件。这是正确的行为——既然文件内容完全一样，没必要存两份。
+
+如果需求是"即使内容相同，也要存两份"（比如每个用户有独立的文件配额），那秒传就不能只查哈希，还要查用户 ID。这种情况下 `UploadedFile` 表需要加 `userId` 字段，查询条件变成 `where: { hash: fileHash, userId: userId }`。
+
+## Trade-off 小结
+
+**切片上传 vs 普通上传**：小文件（< 50MB）用普通上传，大文件用切片。切片上传增加了前后端复杂度（三个接口、哈希计算、分片管理），但对大文件是必须的。
+
+**MD5 vs SHA-256**：MD5 计算更快，对于文件去重场景足够。SHA-256 更安全但更慢。这里选 MD5，因为目的是去重和标识，不是安全校验。
+
+**文件系统存分片 vs Redis 存分片**：文件系统简单直接，不需要额外依赖。Redis 更适合分布式部署（多个后端实例共享分片状态）。单机部署选文件系统。
+
+**流式合并 vs 全量读入合并**：流式合并内存占用恒定（一个分片大小），全量读入内存峰值等于文件大小。500MB 文件必须用流式。
+
+**清理策略**：24 小时是一个合理的过期时间。太短，用户暂停上传后可能来不及恢复；太长，磁盘空间浪费。如果磁盘紧张，可以缩短到 12 小时。
+
+---
+
+文件上传（普通 + 切片）都搞定了。但 zhang_wei 发布文章后，系统需要给所有订阅者发邮件通知。同步发邮件，一个请求要等好几秒；用户越多，等得越久。下一篇用任务队列解决这个问题。

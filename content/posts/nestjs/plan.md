@@ -1,808 +1,527 @@
-# NestJS 渐进式博客系统学习计划
+# NestJS 渐进式学习计划
 
 ## 背景
 
-本计划旨在通过一系列结构化的博客文章，帮助读者从零开始掌握 NestJS 后端开发。文章采用渐进式设计，从基础概念到生产级应用，每篇文章都包含丰富的代码示例和实战演练。
+你是一个有 Express 或 Spring Boot 经验的后端开发者，最近团队决定新项目用 NestJS。你打开官网看了一圈，发现概念很多——模块、装饰器、依赖注入、管道、守卫、拦截器……一时不知道从哪下手。
 
-**技术栈选择标准**：
+这个系列就是为你准备的。我们不会把 NestJS 的每个 API 翻译一遍，而是从"为什么需要它"出发，带你逐步构建一个**技术博客平台**的后端 API。每解决一个真实问题，你就自然掌握了一个 NestJS 特性。
 
-- ✅ 市场热门、社区活跃
-- ✅ 长期维护、文档完善
-- ✅ 企业级应用首选
-- ✅ 与 NestJS 生态完美集成
+### 技术栈选择
 
-**核心栈**：
+| 技术            | 版本  | 为什么选它                                                   |
+| --------------- | ----- | ------------------------------------------------------------ |
+| NestJS          | 10.x  | 企业级 Node.js 框架，Angular 风格的架构设计，内置 DI、模块化 |
+| TypeORM         | 0.3.x | NestJS 官方推荐 ORM，装饰器语法和 NestJS 一脉相承            |
+| PostgreSQL      | 16    | 功能最全的开源关系型数据库，JSON 支持好                      |
+| class-validator | 0.14  | NestJS 验证管道的标准搭配                                    |
+| Passport + JWT  | -     | NestJS 认证的官方方案                                        |
+| BullMQ          | 5.x   | 基于 Redis 的任务队列，替代已停止维护的 Bull                 |
+| Redis           | 7.x   | 缓存 + 队列 + 会话存储，一套服务多用                         |
+| Docker + Nginx  | -     | 生产部署标准方案                                             |
 
-- **框架**：NestJS 10.x
-- **语言**：TypeScript 5.x
-- **数据库**：PostgreSQL 16
-- **ORM**：Prisma 5.x
-- **验证**：class-validator + class-transformer
-- **测试**：Jest
-- **文档**：Swagger/OpenAPI
-- **容器化**：Docker + Docker Compose
-- **缓存**：Redis 7
-- **消息队列**：BullMQ
-- **部署**：Docker + Nginx
+> Prisma 也是 NestJS 生态中很受欢迎的 ORM 选择，本系列选择 TypeORM 是因为它和 NestJS 的装饰器风格更统一，DI 集成更原生。如果你想了解 Prisma，可以参考我们的 [Prisma 独立系列](/posts/prisma/01-getting-started)。
+
+---
+
+## 主线案例：技术博客平台
+
+整个系列围绕一个**技术博客平台**的后端 API 展开，从零构建到部署上线。
+
+**案例场景**：一个类似掘金/SegmentFault 的技术博客平台，支持用户注册登录、文章发布管理、评论互动、标签分类、邮件通知、实时评论等功能。
+
+**案例数据示例**（贯穿全系列使用）：
+
+```
+用户：zhang_wei (usr_a1x9k2m)，前端工程师，2025年3月注册
+文章：「从 Express 迁移到 NestJS 的踩坑记录」，浏览量 3842，12 条评论
+标签：Node.js、后端架构、NestJS
+评论：「同意作者说的 DI 部分，我们项目也遇到了循环依赖问题」
+```
+
+---
+
+## 系列节奏
+
+```
+基础篇（01-03）：独立小案例，快速上手 NestJS
+  → 每篇一个独立场景，降低入门门槛
+
+核心篇（04-08）：引入博客平台案例，建立项目骨架
+  → 设计数据模型、实现核心 CRUD、加上验证和错误处理
+
+进阶篇（09-15）：案例持续演进，接近生产环境
+  → 认证授权、文件上传、任务队列、缓存、实时通信
+
+部署篇（16-18）：生产化收尾
+  → 测试、文档、容器化部署
+```
 
 ---
 
 ## 博客目录结构
 
 ```
-content/nestjs/
-├── plan.md                          # 本计划文件
-├── 01-getting-started.mdx           # 环境搭建与第一个项目
-├── 02-modules-dependency-injection.mdx  # 模块与依赖注入
-├── 03-controllers-routing.mdx       # 控制器与路由
-├── 04-providers-services.mdx        # 提供者与服务
-├── 05-postgresql-prisma-setup.mdx   # 数据库与 ORM
-├── 06-crud-operations.mdx           # CRUD 实战
-├── 07-validation-pipes.mdx          # 数据验证与管道
-├── 08-authentication-jwt.mdx        # JWT 认证
-├── 09-authorization-guards.mdx      # 授权与守卫
-├── 10-interceptors-logging.mdx      # 拦截器与日志
-├── 11-exception-filters.mdx         # 异常处理
-├── 12-file-upload.mdx               # 文件上传
-├── 13-email-queue-bullmq.mdx        # 异步任务队列
-├── 14-caching-redis.mdx             # 缓存策略
-├── 15-websocket-gateway.mdx         # WebSocket 实时通信
-├── 16-testing-unit-e2e.mdx          # 测试策略
-├── 17-swagger-documentation.mdx     # API 文档
-├── 18-docker-deployment.mdx         # Docker 部署
-├── 19-chunked-upload.mdx            # 大文件切片上传
-└── README.mdx                       # 系列索引
+content/posts/nestjs/
+├── plan.md                              # 本计划文件
+├── 01-getting-started.mdx               # 从零搭建：为什么选 NestJS
+├── 02-modules-dependency-injection.mdx  # 模块与依赖注入：NestJS 的骨架
+├── 03-controllers-routing.mdx           # 控制器与路由：设计你的第一个 API
+├── 04-providers-services.mdx            # 服务层：把业务逻辑从控制器中抽离
+├── 05-postgresql-typeorm-setup.mdx      # 数据库接入：PostgreSQL + TypeORM
+├── 06-crud-operations.mdx               # CRUD 实战：博客文章管理 API
+├── 07-validation-pipes.mdx              # 别让脏数据进来：数据验证
+├── 08-exception-interceptor.mdx         # 统一错误处理与响应格式
+├── 09-jwt-authentication.mdx            # 用户认证：注册、登录与 JWT
+├── 10-authorization-guards.mdx          # 谁能干什么：基于角色的授权
+├── 11-file-upload.mdx                   # 文件上传：封面图与用户头像
+├── 12-chunked-upload.mdx                # 大文件上传：切片、秒传与断点续传
+├── 13-email-queue-bullmq.mdx            # 别让用户等：异步任务队列
+├── 14-caching-redis.mdx                 # 让接口快起来：Redis 缓存策略
+├── 15-websocket-realtime.mdx            # 实时评论与在线通知：WebSocket
+├── 16-testing.mdx                       # 给核心模块写测试
+├── 17-swagger-documentation.mdx         # API 文档自动生成
+└── 18-docker-deployment.mdx             # Docker 容器化部署
 ```
 
 ---
 
-## 第一阶段：基础入门（2-3篇）
+## 基础篇：独立小案例（01-03）
 
-### 01. 环境搭建与第一个项目
+目标：用 3 篇文章帮你建立对 NestJS 的直觉，每篇一个独立场景。
 
-**目标**：搭建开发环境，创建第一个 NestJS 项目，理解基本架构
+---
+
+### 01. 从零搭建：为什么选 NestJS
+
+**核心问题**：团队要选后端框架，Express 太自由、Spring Boot 太重，有没有一个既规范又不臃肿的选择？
+
+**主线案例**：搭建一个简单的 API 健康检查服务（Health Check API），返回服务状态、数据库连接状态、内存使用情况。
 
 **内容要点**：
 
-- 为什么选择 NestJS（与 Express、Fastify 对比）
-- NestJS 核心概念概述（模块、控制器、服务）
-- 使用 Nest CLI 创建项目
-- 项目结构详解
-- 第一个 API：Hello World
-- 热重载与开发体验优化
+- Express vs Fastify vs NestJS 的本质区别（NestJS 是架构，不是框架）
+- NestJS 的设计哲学：Angular 团队把前端架构思维带到了后端
+- 用 Nest CLI 创建项目，理解项目结构（为什么是这样组织的）
+- `main.ts` 里到底发生了什么
+- 热重载的原理（不是 nodemon 那么简单）
+- Health Check API 实现：为什么生产环境必须有一个
 
-**实战示例**：
-
-```typescript
-// 创建简单的 REST API
-// GET /hello
-// GET /hello/:name
-// POST /hello
-```
+**与前篇关联**：系列第一篇，无前篇。
 
 ---
 
-### 02. 模块与依赖注入
+### 02. 模块与依赖注入：NestJS 的骨架
 
-**目标**：理解 NestJS 的模块化架构和依赖注入机制
+**核心问题**：你的 Express 项目写了半年，所有逻辑堆在 `app.js` 里，路由文件互相 require 形成意大利面条。NestJS 怎么解决这个问题？
+
+**主线案例**：把上一篇的健康检查服务拆分为 `HealthModule`、`DatabaseModule`、`ConfigModule`，用依赖注入管理配置和数据库连接。
 
 **内容要点**：
 
-- 模块（Module）的作用与组织方式
-- @Module 装饰器详解（imports、providers、exports、controllers）
-- 依赖注入（DI）原理
-- 单例模式与请求作用域
-- 循环依赖问题与解决
-- 最佳实践：如何组织大型项目模块
+- 为什么需要模块化（从 Express 项目的痛点出发）
+- `@Module` 装饰器的四个属性：imports / providers / exports / controllers
+- 依赖注入不是黑魔法：NestJS 的 IoC 容器做了什么
+- `useFactory` vs `useValue` vs `useClass` 什么时候用哪个
+- 循环依赖：为什么会出现、怎么解决（`forwardRef`）、更好的架构如何避免它
+- 全局模块（`@Global`）什么时候该用、什么时候不该用
 
-**实战示例**：
-
-```typescript
-// 创建 UsersModule、AuthModule
-// 模块间依赖与共享服务
-// 使用 forwardRef 解决循环依赖
-```
+**与前篇关联**：上一篇搭好了项目骨架，这一篇把它拆成合理的模块结构。
 
 ---
 
-## 第二阶段：核心功能（3-4篇）
+### 03. 控制器与路由：设计你的第一个 API
 
-### 03. 控制器与路由
+**核心问题**：你设计了一个 RESTful API，但参数从哪来、响应怎么控制、版本号怎么管理？NestJS 的装饰器路由和 Express 的 `app.get()` 有什么区别？
 
-**目标**：掌握控制器创建和路由设计
+**主线案例**：设计一个文章摘要 API——`GET /api/v1/articles/snippets` 返回最新发布的文章摘要列表，支持分页和标签筛选。
 
 **内容要点**：
 
-- @Controller 装饰器
-- 路由参数（@Param、@Query、@Body）
-- 请求方法（GET、POST、PUT、PATCH、DELETE）
-- 请求头与 Cookie（@Headers、@Ip）
-- 响应状态码与响应头
-- 路由通配符与参数验证
-- 路由前缀与版本控制
+- `@Controller` 路由前缀 vs Express 的 `app.use('/prefix')`
+- 参数提取装饰器：`@Param` / `@Query` / `@Body` / `@Headers`
+- `@HttpCode` / `@Header` / `@Redirect` 什么时候用
+- 路由参数验证：为什么 `@Param('id')` 拿到的是 string 而不是 number
+- API 版本控制的三种方式（URI / Header / Query String），NestJS 怎么实现
+- `ParseIntPipe`：NestJS 管道的第一次接触
 
-**实战示例**：
-
-```typescript
-// 设计 RESTful API：/api/v1/users
-// GET /users
-// GET /users/:id
-// POST /users
-// PUT /users/:id
-// DELETE /users/:id
-```
+**与前篇关联**：上一篇搭好了模块结构，这一篇在 `ArticlesModule` 里写第一个真正的控制器。
 
 ---
 
-### 04. 提供者与服务
+## 核心篇：博客平台起步（04-08）
 
-**目标**：理解服务层设计，分离业务逻辑
+目标：引入博客平台作为贯穿案例，设计数据模型，实现核心 CRUD，加上验证和错误处理。从这一篇开始，所有文章都在构建同一个项目。
+
+---
+
+### 04. 服务层：把业务逻辑从控制器中抽离
+
+**核心问题**：你的控制器里塞满了数据库查询、数据转换、业务判断。改一个需求要改三个控制器，因为它们复制了同样的逻辑。怎么办？
+
+**主线案例**：为博客平台设计 `ArticleService` 和 `UserService`，把文章列表查询（含分页、排序、筛选）和用户信息获取从控制器抽到服务层。
 
 **内容要点**：
 
-- @Injectable 装饰器
-- 服务（Service）的作用
-- Provider 类型（服务、仓库、工厂等）
-- 自定义 Provider（useClass、useValue、useFactory、useExisting）
-- 可选注入（@Optional）
-- 基于属性的注入
+- 为什么需要 Service 层（从控制器的"胖"问题出发）
+- `@Injectable` 装饰器和 NestJS 的依赖注入
+- Service 之间如何互相调用（ArticleService 需要 UserService 查作者信息）
+- 自定义 Provider：`useFactory` 动态配置数据库连接
+- 请求作用域 Provider（`scope: Scope.REQUEST`）什么时候需要
+- Service 的可测试性：为什么抽离后单元测试变得简单
 
-**实战示例**：
-
-```typescript
-// 创建 UserService、AuthService
-// 实现用户注册、登录逻辑
-// 使用 useFactory 配置数据库连接
-```
+**与前篇关联**：上一篇在 `ArticlesController` 里写了文章查询逻辑，这一篇把它抽到 `ArticleService`，让控制器只负责"接收请求、返回响应"。
 
 ---
 
-## 第三阶段：数据持久化（2篇）
+### 05. 数据库接入：PostgreSQL + TypeORM
 
-### 05. PostgreSQL + Prisma 完整指南
+**核心问题**：项目要存数据了。NestJS 生态里有 TypeORM、Prisma、Sequelize、Mongoose……为什么选 TypeORM？它和 NestJS 的关系是什么？
 
-**目标**：掌握数据库设计和 ORM 使用
+**主线案例**：为博客平台设计完整的数据模型——User、Post、Comment、Tag 四张表及其关联关系，用 TypeORM 装饰器定义 Entity，通过 Migration 管理数据库变更。
 
 **内容要点**：
 
-- 为什么选择 PostgreSQL（特性对比）
-- 为什么选择 Prisma（vs TypeORM、Sequelize）
-- Prisma Schema 设计
-- 数据模型关系（一对一、一对多、多对多）
-- Migration 管理
-- Seeding 数据填充
-- Prisma Client 使用
-- 事务处理
+- TypeORM vs Prisma vs Sequelize：选型的关键考量（不是"哪个更好"，是"哪个更适合"）
+- TypeORM 的 `@Entity` / `@Column` / `@PrimaryGeneratedColumn` 装饰器
+- 关系映射：`@OneToOne` / `@OneToMany` / `@ManyToOne` / `@ManyToMany`
+- 为什么博客平台用 `@ManyToOne` 表示文章和作者的关系，而不是 `@OneToOne`
+- Migration 的工作原理和最佳实践（为什么不要用 `synchronize: true`）
+- DataSource 配置：NestJS 的 `TypeOrmModule.forRootAsync()` + `useFactory`
+- Seeding：用初始数据让开发更顺畅
 
-**实战示例**：
-
-```prisma
-// schema.prisma
-model User {
-  id        String   @id @default(uuid())
-  email     String   @unique
-  password  String
-  name      String?
-  posts     Post[]
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-}
-
-model Post {
-  id        String   @id @default(uuid())
-  title     String
-  content   String?
-  published Boolean  @default(false)
-  author    User     @relation(fields: [authorId], references: [id])
-  authorId  String
-}
-```
-
-**Docker Compose 配置**：
-
-```yaml
-services:
-  postgres:
-    image: postgres:16-alpine
-    environment:
-      POSTGRES_USER: nestjs
-      POSTGRES_PASSWORD: nestjs
-      POSTGRES_DB: nestjs_blog
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-
-volumes:
-  postgres_data:
-```
+**与前篇关联**：上一篇的 `ArticleService` 用假数据返回文章列表，这一篇接入 PostgreSQL，让数据持久化。
 
 ---
 
-### 06. CRUD 实战：构建博客文章 API
+### 06. CRUD 实战：博客文章管理 API
 
-**目标**：将前面知识整合，实现完整的 CRUD 功能
+**核心问题**：数据库接好了，但实现一个"像样"的 CRUD 比你想象中复杂——分页怎么做？软删除怎么处理？关联数据怎么一起查？
+
+**主线案例**：实现博客文章的完整 CRUD API——创建草稿、发布文章、分页列表（含作者信息和标签）、文章详情、编辑、软删除。
 
 **内容要点**：
 
-- 完整的 CRUD 操作实现
-- Prisma 查询进阶（where、include、select、orderBy、pagination）
-- 软删除设计
-- 数据转换与序列化
-- 错误处理策略
+- Repository 模式：`InjectRepository` 和 `Repository<T>` 的用法
+- 分页查询：`skip` + `take` vs `findAndCount` 的区别
+- 关联查询：`relations` 选项、`eager` 模式、什么时候该用 Join
+- 软删除：`@DeleteDateColumn` 的原理和注意事项
+- 事务处理：为什么"发布文章 + 创建标签关联"需要事务
+- DTO 与 Entity 的转换：为什么不应该直接把 Entity 返回给前端
 
-**实战示例**：
-
-```typescript
-// 完整的 PostsController + PostsService
-// GET /posts - 分页查询
-// GET /posts/:id - 详情（包含作者信息）
-// POST /posts - 创建
-// PATCH /posts/:id - 更新
-// DELETE /posts/:id - 删除（软删除）
-```
+**与前篇关联**：上一篇定义好了数据模型，这一篇基于模型实现完整的业务接口。
 
 ---
 
-## 第四阶段：进阶特性（4-5篇）
+### 07. 别让脏数据进来：数据验证
 
-### 07. 数据验证与管道
+**核心问题**：用户在注册表单里输入邮箱 `hello`、密码 `123`、用户名一个 emoji。你的 API 照单全收，数据库里存了一堆垃圾数据。怎么在入口就把脏数据拦住？
 
-**目标**：掌握数据验证机制
+**主线案例**：给博客平台的注册接口和发布文章接口加数据验证——邮箱格式、密码强度（8位+大小写+数字）、标题长度、内容非空。
 
 **内容要点**：
 
-- 为什么需要验证
-- ValidationPipe 内置管道
-- DTO（Data Transfer Object）设计
-- class-validator 装饰器详解
-- class-transformer 类型转换
-- 自定义验证规则
-- 自定义管道
-- 全局 vs 局部管道配置
+- 为什么在管道层验证，而不是在 Service 里验证（职责分离 + 统一拦截）
+- `ValidationPipe` + `class-validator` + `class-transformer` 三件套
+- 常用验证装饰器实战：`@IsEmail` / `@MinLength` / `@Matches` / `@IsOptional`
+- 自定义验证器：密码强度规则用正则不够用怎么办
+- `transform: true` 为什么很重要（`"123"` → `123` 的类型转换）
+- 自定义 Pipe vs 内置 Pipe：什么时候该自己写
+- 全局管道 vs 局部管道：验证规则不同时怎么处理
 
-**实战示例**：
-
-```typescript
-class CreateUserDto {
-  @IsEmail()
-  email: string;
-
-  @IsString()
-  @MinLength(8)
-  @Matches(/^(?=.*\d)(?=.*[a-z])(?=.*[A-Z])/)
-  password: string;
-
-  @IsString()
-  @MinLength(2)
-  @MaxLength(50)
-  name: string;
-}
-```
+**与前篇关联**：上一篇的 CRUD 接口没有任何验证，用户可以提交任意数据。这一篇给所有入口加上校验。
 
 ---
 
-### 08. JWT 认证完整实现
+### 08. 统一错误处理与响应格式
 
-**目标**：实现用户认证系统
+**核心问题**：你的 API 返回格式五花八门——成功时返回 `{ data: ... }`，失败时返回 `{ error: ... }`，数据库挂了返回一个 HTML 错误页。前端同学已经崩溃了。
+
+**主线案例**：为博客平台实现统一的响应格式 `{ code, message, data }` 和全局异常过滤器，让所有接口返回一致的格式。
 
 **内容要点**：
 
-- 认证 vs 授权
-- JWT 原理与结构
-- Passport 策略
-- @UseGuards 装饰器
-- JWT 策略实现
-- 自定义装饰器（@CurrentUser、@Public）
-- Refresh Token 机制
-- Token 黑名单（Redis）
+- 为什么需要统一响应格式（从前后端协作的痛点出发）
+- `NestInterceptor` 实现 `TransformInterceptor`：自动包装成功响应
+- `ExceptionFilter` 实现 `AllExceptionsFilter`：捕获所有异常并格式化
+- 自定义业务异常：`BusinessException` vs 内置 `HttpException`
+- 错误码设计：不要只返回 HTTP 状态码，业务错误码更重要
+- 日志拦截器：记录每个请求的方法、路径、耗时、状态码
+- 三者的执行顺序：Guard → Interceptor（前）→ Pipe → Controller → Interceptor（后）→ Filter
 
-**实战示例**：
-
-```typescript
-// POST /auth/register
-// POST /auth/login
-// POST /auth/refresh
-// POST /auth/logout
-// GET /auth/me
-
-// 实现完整的认证流程
-```
+**与前篇关联**：上一篇加了验证，验证失败会抛出错误。这一篇确保所有错误都以统一格式返回给前端。
 
 ---
 
-### 09. 授权与守卫
+## 进阶篇：案例持续演进（09-15）
 
-**目标**：实现基于角色的访问控制
+目标：在博客平台案例上叠加认证、授权、文件上传、队列、缓存、实时通信，逐步接近生产环境。
+
+---
+
+### 09. 用户认证：注册、登录与 JWT
+
+**核心问题**：博客平台需要用户系统。用户注册后怎么保持登录状态？Session、Cookie、Token、JWT……这么多方案选哪个？JWT 到底安全吗？
+
+**主线案例**：为博客平台实现完整的用户认证流程——注册（密码 bcrypt 加盐哈希）、登录（返回 access token + refresh token）、刷新 token、退出登录、获取当前用户信息。
 
 **内容要点**：
 
-- 守卫（Guard）的作用
-- RolesGuard 实现
-- @Roles 装饰器
-- 基于资源的权限控制（PBAC）
-- ACL（访问控制列表）
-- Casbin 集成（可选）
-- 权限缓存优化
+- Session vs JWT vs OAuth2：选型的关键考量
+- JWT 的结构（Header.Payload.Signature）和原理
+- 为什么需要 refresh token（access token 短期有效 + refresh token 长期有效）
+- NestJS + Passport + JWT 的集成方式（策略模式）
+- `@UseGuards(AuthGuard('jwt'))` 怎么工作
+- 自定义装饰器 `@CurrentUser()`：从请求中提取用户信息
+- 密码存储：为什么明文不行、为什么 MD5 不行、bcrypt 怎么工作
+- Token 黑名单：用户退出登录后如何让 token 立即失效
 
-**实战示例**：
-
-```typescript
-@Roles(Role.ADMIN)
-@UseGuards(JwtAuthGuard, RolesGuard)
-@Delete('/users/:id')
-remove(@Param('id') id: string) {
-  return this.usersService.remove(id)
-}
-```
+**与前篇关联**：上一篇统一了错误处理，这一篇在认证模块里复用统一的错误格式。注册接口复用第 07 篇的数据验证。
 
 ---
 
-### 10. 拦截器与日志
+### 10. 谁能干什么：基于角色的授权
 
-**目标**：掌握 AOP 编程思想
+**核心问题**：认证（你是谁）和授权（你能干什么）是两回事。普通用户能发文章，管理员能删文章，作者能编辑自己的文章。怎么用代码表达这些规则？
+
+**主线案例**：为博客平台实现三种角色——普通用户（reader）、作者（author）、管理员（admin），控制不同接口的访问权限。作者只能编辑/删除自己的文章，管理员可以操作所有内容。
 
 **内容要点**：
 
-- 拦截器（Interceptor）的作用
-- NestInterceptor 接口
-- 日志拦截器实现
-- 响应数据转换
-- 请求超时处理
-- 缓存拦截器
-- 执行时间统计
+- 认证 vs 授权：为什么它们是两个独立的问题
+- `@UseGuards` + 自定义 `RolesGuard` 实现
+- `@Roles()` 自定义装饰器 + `Reflector` 读取元数据
+- 资源级别权限：作者只能操作自己的文章（在 Service 层判断，不是 Guard 层）
+- RBAC 的局限性：当权限规则复杂时（如"编辑自己或同团队成员的文章"），简单的角色判断不够用
+- `@Public()` 装饰器：部分接口不需要认证（如文章列表）
 
-**实战示例**：
-
-```typescript
-// LoggingInterceptor：记录所有请求
-// TransformInterceptor：统一响应格式
-// TimeoutInterceptor：超时处理
-// CacheInterceptor：自动缓存
-```
+**与前篇关联**：上一篇实现了 JWT 认证，这一篇在认证的基础上叠加权限控制。认证 Guard 和授权 Guard 可以链式组合。
 
 ---
 
-### 11. 异常处理
+### 11. 文件上传：封面图与用户头像
 
-**目标**：统一错误处理机制
+**核心问题**：用户想给文章加封面图、上传头像。直接存本地目录？那服务器挂了图片就没了。用云存储？怎么和 NestJS 集成？
+
+**主线案例**：实现用户头像上传（裁剪 + 压缩）和文章封面图上传（支持多种格式、限制大小），本地存储 + 抽象存储接口方便切换到 S3/OSS。
 
 **内容要点**：
 
-- HTTP 异常内置类
-- ExceptionFilter 接口
-- 全局异常过滤器
-- 自定义业务异常
-- 错误码设计
-- 错误日志记录
-- 友好的错误响应
+- `@UseInterceptors(FilesInterceptor)` 的工作原理
+- 文件类型验证：为什么不信任前端传的 Content-Type
+- 文件大小限制：为什么不能只靠前端校验
+- 图片处理（Sharp）：裁剪、压缩、格式转换
+- 存储策略抽象：定义 `StorageService` 接口，本地/S3/OSS 可切换
+- 上传文件的命名规则：为什么不能用用户原始文件名
+- 文件路径设计：按日期分目录，避免单目录文件过多
 
-**实战示例**：
-
-```typescript
-// BusinessException
-// 全局 HttpExceptionFilter
-// 统一响应格式：
-// { success: false, code: 'USER_NOT_FOUND', message: '用户不存在' }
-```
+**与前篇关联**：认证完成后，用户才能上传头像和封面图。文件上传接口需要 JWT 认证 Guard。
 
 ---
 
-## 第五阶段：实战功能（3-4篇）
+### 12. 大文件上传：切片、秒传与断点续传
 
-### 12. 文件上传
+**核心问题**：用户想上传一个 500MB 的视频附件作为文章附件。直接上传？浏览器超时了。切片上传？怎么切、怎么合并、网络断了怎么办？
 
-**目标**：实现文件上传功能
+**主线案例**：为博客平台实现大文件上传——前端切片 + 并发上传 + 秒传检测 + 断点续传 + 后端分片存储与合并。
 
 **内容要点**：
 
-- FileInterceptor 单文件上传
-- FilesInterceptor 多文件上传
-- FileFieldsInterceptor 字段上传
-- 文件类型验证
-- 文件大小限制
-- 存储策略（本地、OSS、S3）
-- 图片处理（Sharp）
+- 传统上传 vs 切片上传：为什么大文件必须切片
+- 文件哈希计算：SparkMD5 的分片读取原理（为什么不能一次性读整个文件）
+- 秒传：通过文件哈希判断服务器是否已有相同文件
+- 断点续传：记录已上传的分片序号，恢复时跳过已上传部分
+- 后端分片存储：按哈希值建目录，临时分片存放
+- 流式合并：为什么不要把所有分片读到内存再合并
+- 定时清理：过期未完成的上传任务怎么清理
+- Web Worker：为什么哈希计算不能在主线程做
 
-**实战示例**：
-
-```typescript
-// POST /upload/avatar
-// POST /upload/gallery
-// 实现用户头像上传、图片压缩
-```
+**与前篇关联**：上一篇实现了普通文件上传，这一篇处理大文件场景。两者共用同一个存储服务接口。
 
 ---
 
-### 13. 异步任务队列（BullMQ）
+### 13. 别让用户等：异步任务队列
 
-**目标**：处理耗时任务
+**核心问题**：用户发布了一篇文章，你的 API 要发三封邮件通知（关注者、管理员、作者自己）、生成文章摘要、更新搜索索引。每个操作 2 秒，用户等了 6 秒才看到"发布成功"。体验极差。
+
+**主线案例**：为博客平台实现异步任务——文章发布后通过 BullMQ 异步发送邮件通知、生成文章摘要，用户发布后立即返回。
 
 **内容要点**：
 
-- 为什么需要消息队列
-- Bull vs BullMQ
-- Queue、Worker、Processor
-- 任务优先级与延迟
-- 任务重试策略
-- 失败处理与死信队列
-- 进度追踪
-- UI 面板集成
+- 为什么需要消息队列（从同步操作的阻塞问题出发）
+- Bull vs BullMQ：为什么要迁移（Bull 依赖 Redis 4.x，BullMQ 支持 Redis 5+）
+- Queue / Worker / Processor 的关系
+- 任务优先级：邮件通知比摘要生成更紧急
+- 重试策略：邮件发送失败怎么办（指数退避）
+- 死信队列：重试 3 次还是失败的任务怎么处理
+- BullMQ Board：可视化的任务管理面板
+- 并发控制：Worker 开多少个并发合适
 
-**实战示例**：
-
-```typescript
-// 邮件发送队列
-// 图片处理队列
-// 数据导出任务
-// 实现邮件发送异步化
-```
+**与前篇关联**：上一篇处理了文件上传，这一篇处理耗时任务。两者都是"用户不应该等待"的场景。
 
 ---
 
-### 14. 缓存策略（Redis）
+### 14. 让接口快起来：Redis 缓存策略
 
-**目标**：提升应用性能
+**核心问题**：博客首页的文章列表接口每次都要查数据库，热门文章的浏览量更新频繁导致缓存频繁失效。怎么设计一个既快又准的缓存方案？
+
+**主线案例**：为博客平台实现缓存——热门文章列表缓存（定时刷新）、文章详情缓存（读写分离策略）、用户信息缓存。
 
 **内容要点**：
 
-- 缓存的应用场景
-- @Cacheable 装饰器
-- @CacheEvict 清除缓存
-- 手动缓存管理
-- 缓存过期策略
-- 缓存穿透、击穿、雪崩
-- 分布式缓存
-- 缓存序列化
+- 缓存的本质：用空间换时间，但不是所有数据都该缓存
+- NestJS `@nestjs/cache-manager` + Redis 的集成
+- `@CacheKey` / `@CacheTTL` 装饰器的使用
+- 手动缓存管理：什么时候用装饰器，什么时候手动控制
+- 缓存穿透：查询不存在的数据怎么办（布隆过滤器 / 缓存空值）
+- 缓存击穿：热点 key 过期瞬间大量请求打到数据库
+- 缓存雪崩：大量 key 同时过期怎么办（随机过期时间）
+- 什么时候不该用缓存：写频繁的数据、强一致性的数据
 
-**实战示例**：
-
-```typescript
-// 用户信息缓存
-// 文章列表缓存
-// 热点数据缓存预热
-```
+**与前篇关联**：上一篇用 BullMQ 处理异步任务，BullMQ 本身就依赖 Redis。这一篇复用同一个 Redis 实例做缓存。
 
 ---
 
-### 15. WebSocket 实时通信
+### 15. 实时评论与在线通知：WebSocket
 
-**目标**：实现实时功能
+**核心问题**：用户在看一篇文章，另一个用户发了一条评论。第一个用户要刷新页面才能看到新评论。能不能做到实时推送？
+
+**主线案例**：为博客平台实现实时功能——文章下的实时评论推送、在线阅读人数统计、新评论通知。
 
 **内容要点**：
 
-- WebSocket 原理
-- @WebSocketGateway
-- @SubscribeMessage
-- @MessageBody
-- Connected/Disconnected 生命周期
-- 广播与定向推送
-- 房间（Room）机制
-- Socket.io 集成
+- HTTP 轮询 vs Server-Sent Events vs WebSocket：为什么实时场景选 WebSocket
+- `@WebSocketGateway` 的工作原理
+- `@SubscribeMessage` / `@MessageBody` 处理客户端消息
+- Room 机制：每个文章是一个房间，只给看这篇文章的人推送
+- 身份认证：WebSocket 连接怎么验证用户身份（从 HTTP 握手传递 token）
+- 在线人数统计：`connected` / `disconnected` 生命周期
+- Socket.io vs 原生 WebSocket：为什么生产环境通常选 Socket.io（自动重连、房间、命名空间）
+- WebSocket 的局限性：不适合做什么（大文件传输、高频率数据流）
 
-**实战示例**：
-
-```typescript
-// 实时聊天室
-// 在线用户列表
-// 实时通知
-// 实现简单聊天应用
-```
+**与前篇关联**：上一篇的评论是普通 HTTP 接口，这一篇加上实时推送。评论数据还是走 HTTP 存储，WebSocket 只负责推送。
 
 ---
 
-### 19. 大文件切片上传（全链路）
+## 部署篇：生产化收尾（16-18）
 
-**目标**：实现前后端完整的大文件切片上传方案
+目标：测试核心模块、生成 API 文档、容器化部署，让博客平台可以真正上线。
+
+---
+
+### 16. 给核心模块写测试
+
+**核心问题**：项目上线前，你怎么确定改了认证逻辑不会搞坏文章管理？靠手动测试？每次部署前都手动过一遍所有接口？这不现实。
+
+**主线案例**：为博客平台的核心模块写测试——UserService 单元测试（Mock 数据库）、AuthModule 集成测试（测试数据库）、文章发布 E2E 测试（完整请求链路）。
 
 **内容要点**：
 
-- 切片上传 vs 传统上传的对比
-- 文件哈希计算（SparkMD5 分片读取）
-- 前端文件切片、并发控制、进度追踪
-- 后端分片接收、存储、合并
-- 秒传（相同文件瞬间完成）
-- 断点续传（网络中断后从断点继续）
-- Web Worker 后台计算哈希
-- 流式合并优化内存占用
-- 定时清理过期分片
+- 单元测试 vs 集成测试 vs E2E 测试：测什么、不测什么
+- Jest 基础配置和 NestJS 的测试工具
+- 单元测试 Service：`@nestjs/testing` 的 `Test.createTestingModule()` + Mock Repository
+- 集成测试 Controller：用 `supertest` 发送真实 HTTP 请求
+- E2E 测试：启动完整应用，测试完整链路（创建用户 → 登录 → 发文章 → 查文章）
+- 测试覆盖率：关注覆盖率数字不如关注关键路径是否被覆盖
+- 测试的投入产出比：哪些模块值得写测试、哪些可以跳过
 
-**实战示例**：
-
-```typescript
-// 前端：文件切片 + 哈希 + 并发上传
-// 后端：/upload/check（秒传/断点续传检查）
-//       /upload/chunk（分片上传）
-//       /upload/merge（合并分片）
-```
+**与前篇关联**：前面 15 篇构建了完整功能，这一篇为核心功能加上测试保障。
 
 ---
 
-## 第六阶段：生产部署（2-3篇）
+### 17. API 文档自动生成
 
-### 16. 测试策略
+**核心问题**：前端同学问你"注册接口需要传什么参数"，你翻了半天代码告诉他。每改一个接口，都要手动更新文档。能不能让文档自动跟着代码走？
 
-**目标**：编写可靠的测试
+**主线案例**：为博客平台的所有 API 生成 Swagger 文档，包括认证接口、文章 CRUD、文件上传等，让前端可以直接在 Swagger UI 上调试。
 
 **内容要点**：
 
-- 单元测试 vs 集成测试 vs E2E 测试
-- Jest 配置
-- 测试工具链（supertest）
-- Controller 测试
-- Service 测试
-- Repository 测试
-- 测试覆盖率
-- Mock 策略
+- OpenAPI / Swagger 规范简介
+- `@nestjs/swagger` 的 `SwaggerModule` 配置
+- DTO 文档化：`@ApiProperty` / `@ApiPropertyOptional` / `@ApiHideProperty`
+- 响应类型定义：`@ApiResponse` / `@ApiOkResponse` / `@ApiBadRequestResponse`
+- 认证配置：在 Swagger UI 中输入 JWT token
+- API 分组：按模块组织文档
+- 文档和代码同步：为什么自动生成的文档比手写的更可靠
+- 什么时候 Swagger 不够用（GraphQL、WebSocket、复杂的权限逻辑）
 
-**实战示例**：
-
-```typescript
-// UserService 单元测试
-// UsersController 集成测试
-// Auth E2E 测试
-```
+**与前篇关联**：博客平台有 20+ 个 API 接口，这一篇统一生成文档，方便前后端协作。
 
 ---
 
-### 17. API 文档（Swagger）
+### 18. Docker 容器化部署
 
-**目标**：自动生成 API 文档
+**核心问题**：你的博客平台在本地跑得好好的，部署到服务器上就出问题——Node 版本不对、PostgreSQL 没装、Redis 配置不同。怎么保证开发和生产环境一致？
+
+**主线案例**：为博客平台编写 Dockerfile（多阶段构建）和 Docker Compose（App + PostgreSQL + Redis + Nginx），一键启动完整环境。
 
 **内容要点**：
 
-- Swagger/OpenAPI 规范
-- @nestjs/swagger 配置
-- @ApiProperty 装饰器
-- DTO 文档化
-- API 分组
-- 认证配置
-- 响应示例
-- 文档部署
+- 为什么需要容器化（从"在我机器上能跑"的痛点出发）
+- 多阶段 Dockerfile：构建阶段用完整 Node 镜像，运行阶段用精简 Alpine 镜像
+- Docker Compose 编排：App + PostgreSQL + Redis 三个服务的配置
+- Nginx 反向代理：为什么不能直接暴露 Node.js 端口
+- 环境变量管理：`.env` 文件 + `ConfigModule` + Docker 环境变量
+- 健康检查：`HEALTHCHECK` 指令和 NestJS 的健康检查端点
+- 生产安全：CORS、Helmet、Rate Limiting
+- 日志管理：为什么 `console.log` 在生产环境不够用
 
-**实战示例**：
-
-```typescript
-// 完整的 Swagger 文档配置
-// 访问 /api-docs 查看文档
-```
-
----
-
-### 18. Docker 部署与生产优化
-
-**目标**：容器化部署
-
-**内容要点**：
-
-- Dockerfile 最佳实践
-- 多阶段构建
-- Docker Compose 完整配置
-- 环境变量管理
-- Nginx 反向代理配置
-- 健康检查
-- 日志管理
-- 安全配置
-
-**实战示例**：
-
-```dockerfile
-# 多阶段 Dockerfile
-# Docker Compose（App + PostgreSQL + Redis）
-# Nginx 配置
-```
-
-**生产优化**：
-
-- PM2 部署（替代方案）
-- 环境变量验证
-- 安全头部配置
-- Rate Limiting
-- CORS 配置
-- Helmet 安全
-- 压缩中间件
-
----
-
-## 附录
-
-### A. 开发工具推荐
-
-- **IDE**：VSCode + NestJS Helper Extension
-- **API 测试**：Postman / Insomnia / Thunder Client
-- **数据库管理**：TablePlus / DBeaver / Prisma Studio
-- **Redis 客户端**：RedisInsight
-- **监控**：NestJS DevTools
-
-### B. 常见问题与解决方案
-
-1. **循环依赖**：使用 forwardRef() 解决
-2. **启动慢**：使用动态模块懒加载
-3. **内存泄漏**：注意定时器和连接管理
-4. **并发问题**：使用数据库事务和锁
-
-### C. 进阶主题（可选扩展）
-
-- GraphQL 集成
-- 微服务架构（NestJS Microservices）
-- gRPC 通信
-- Event Sourcing + CQRS
-- MongoDB 替代方案
-- CI/CD 配置
-- 监控与告警（Prometheus + Grafana）
-
----
-
-## 写作规范
-
-### 每篇文章结构
-
-````markdown
----
-title: "文章标题"
-date: "YYYY-MM-DD"
-summary: "一句话总结（100字以内）"
-tags: ["NestJS", "相关标签"]
-category: "nestjs"
-cover: ""
-draft: false
-series: "NestJS 渐进式博客系统"
-seriesOrder: N
----
-
-## 前言/背景
-
-解释为什么需要学习这个主题，它解决了什么问题。
-
-## 核心概念
-
-用通俗易懂的语言解释核心概念，配合图示。
-
-## 实战演练
-
-### 示例 1：标题
-
-```typescript
-// 完整可运行的代码
-```
-````
-
-**代码解释**：
-
-- 详细说明每行代码的作用
-- 为什么要这样写
-
-### 示例 2：标题
-
-...
-
-## 最佳实践
-
-总结 3-5 个关键要点
-
-## 常见问题
-
-Q&A 格式
-
-## 总结
-
-用 3-5 个要点回顾本文核心内容
-
-## 下一步
-
-预告下一篇文章的内容
-
-```
-
-### 代码示例要求
-
-1. **完整性**：每个示例都是可独立运行的代码
-2. **渐进式**：从简单到复杂，逐步深入
-3. **注释**：关键代码添加中文注释
-4. **错误处理**：展示正确的错误处理方式
-5. **TypeScript**：充分利用类型系统
-
-### 实战项目贯穿
-
-所有文章围绕一个统一的实战项目展开：**博客系统 API**
-
-**功能模块**：
-- 用户管理（注册、登录、资料）
-- 文章管理（CRUD、发布、草稿）
-- 评论系统
-- 标签分类
-- 文件上传
-- 邮件通知
-- 实时聊天
-
-这样读者可以在学习过程中逐步构建出一个完整的应用。
+**与前篇关联**：博客平台功能开发完成、测试通过、文档齐全，最后一步是容器化部署上线。
 
 ---
 
 ## 学习路径图
 
 ```
-
-┌─────────────────────────────────────────────────────────────┐
-│ NestJS 学习路径 │
-├─────────────────────────────────────────────────────────────┤
-│ │
-│ 第一阶段：基础入门 │
-│ ┌──────────────────┐ ┌──────────────────┐ │
-│ │ 01. 环境搭建 │ ───► │ 02. 模块与DI │ │
-│ └──────────────────┘ └──────────────────┘ │
-│ │ │ │
-│ ▼ ▼ │
-│ 第二阶段：核心功能 │
-│ ┌──────────────────┐ ┌──────────────────┐ │
-│ │ 03. 控制器路由 │ ───► │ 04. 提供者服务 │ │
-│ └──────────────────┘ └──────────────────┘ │
-│ │ │ │
-│ ▼ ▼ │
-│ 第三阶段：数据持久化 │
-│ ┌──────────────────┐ ┌──────────────────┐ │
-│ │ 05. PostgreSQL │ ───► │ 06. CRUD 实战 │ │
-│ │ + Prisma │ └──────────────────┘ │
-│ └──────────────────┘ │ │
-│ │ │ │
-│ ▼ ▼ │
-│ 第四阶段：进阶特性 │
-│ ┌─────────────────────────────────────────────┐ │
-│ │ 07. 验证管道 │ 08. JWT认证 │ 09. 授权守卫 │ │
-│ ├─────────────────────────────────────────────┤ │
-│ │ 10. 拦截器 │ 11. 异常处理 │ │
-│ └─────────────────────────────────────────────┘ │
-│ │ │ │
-│ ▼ ▼ │
-│ 第五阶段：实战功能 │
-│ ┌─────────────────────────────────────────────┐ │
-│ │ 12. 文件上传 │ 13. 消息队列 │ 14. 缓存 │ │
-│ ├─────────────────────────────────────────────┤ │
-│ │ 15. WebSocket │ 19. 切片上传 │ │
-│ └─────────────────────────────────────────────┘ │
-│ │ │ │
-│ ▼ ▼ │
-│ 第六阶段：生产部署 │
-│ ┌──────────────────┐ ┌──────────────────┐ │
-│ │ 16. 测试 │ ───► │ 17. API文档 │ │
-│ └──────────────────┘ └──────────────────┘ │
-│ │ │ │
-│ ▼ ▼ │
-│ ┌──────────────────────────────────────────────┐ │
-│ │ 18. Docker 部署与生产优化 │ │
-│ └──────────────────────────────────────────────┘ │
-│ │
-└─────────────────────────────────────────────────────────────┘
-
+基础篇 ──────────────────────────────────────────
+  01 从零搭建 ──► 02 模块与DI ──► 03 控制器与路由
+                                              │
+核心篇 ──────────────────────────────────────────
+           04 服务层 ──► 05 数据库 + TypeORM
+                            │
+                     06 CRUD 实战
+                            │
+                     07 数据验证
+                            │
+                     08 错误处理与响应格式
+                                          │
+进阶篇 ──────────────────────────────────────────
+       09 JWT认证 ──► 10 角色授权 ──► 11 文件上传
+                                         │
+                                    12 大文件上传
+                                         │
+                                    13 异步任务队列
+                                         │
+                                    14 Redis 缓存
+                                         │
+                                    15 WebSocket 实时
+                                                   │
+部署篇 ──────────────────────────────────────────
+        16 测试 ──► 17 API 文档 ──► 18 Docker 部署
 ```
 
 ---
 
 ## 预期效果
 
-完成本系列学习后，读者将能够：
+完成本系列后，你将能够：
 
-1. ✅ 独立搭建 NestJS 项目
-2. ✅ 设计 RESTful API
-3. ✅ 实现完整的认证授权系统
-4. ✅ 熟练使用 Prisma 操作数据库
-5. ✅ 处理文件上传、异步任务等常见需求
-6. ✅ 编写单元测试和 E2E 测试
-7. ✅ 使用 Docker 容器化部署
-8. ✅ 具备企业级后端开发能力
+- 理解 NestJS 的设计哲学，知道它解决了 Express 的什么问题
+- 独立搭建一个模块化、可测试的 NestJS 项目
+- 用 TypeORM 设计数据模型并实现 CRUD
+- 实现完整的 JWT 认证和角色授权
+- 处理文件上传、大文件切片、异步任务等生产常见需求
+- 用 Redis 做缓存，用 WebSocket 做实时推送
+- 用 Docker 容器化部署一个包含数据库和缓存的全栈后端
 
 ---
 
 ## 版本信息
 
-- **NestJS**：10.x（LTS）
+- **NestJS**：10.x
 - **Node.js**：20.x LTS
 - **TypeScript**：5.x
-- **Prisma**：5.x
+- **TypeORM**：0.3.x
 - **PostgreSQL**：16
 - **Redis**：7.x
 - **BullMQ**：5.x
-
-*计划创建日期：2026-03-19*
-*预计完成时间：3-4个月（每周 1-2 篇）*
-```
