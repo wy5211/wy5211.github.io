@@ -1,0 +1,453 @@
+---
+title: "07 全局异常处理"
+date: "2026-03-30"
+summary: "Express error middleware 和 @ControllerAdvice 有什么区别？给 CMS 建立统一的异常处理体系，不再在每个 Controller 里写 try-catch。"
+tags: ["Spring Boot", "异常处理", "ControllerAdvice"]
+category: "springboot"
+cover: ""
+draft: false
+series: "Spring Boot 实战"
+seriesOrder: 7
+---
+
+上一篇给 CMS 的文章创建接口加上了参数校验。校验失败时 Spring 会抛出 `MethodArgumentNotValidException`，当时在 ControllerAdvice 里临时写了一个 handler 来处理它，让错误信息稍微好看了一点。但 CMS 的异常处理远不止于此——用户访问一个不存在的文章 ID、slug 重复、数据库连接超时、JSON 格式错误，这些情况各自抛出不同的异常类型，如果不统一处理，返回给前端的错误格式五花八门。
+
+在 Express 里，你会在路由处理函数里写 try-catch，然后在最底层的 error middleware 里兜底：
+
+```typescript
+// Express 的做法：每个路由手动 catch，error middleware 兜底
+app.get("/api/posts/:id", async (req, res, next) => {
+  try {
+    const post = await postRepo.findOne(req.params.id);
+    if (!post) {
+      return res.status(404).json({ code: 404, message: "文章不存在" });
+    }
+    res.json(post);
+  } catch (err) {
+    next(err); // 传递给 error middleware
+  }
+});
+
+// error middleware 放在所有路由最后
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(err.status || 500).json({
+    code: err.status || 500,
+    message: err.message || "服务器内部错误",
+  });
+});
+```
+
+问题在于：try-catch 分散在每一个路由函数里，而且 `if (!post)` 这种错误处理逻辑和业务代码混在一起。如果有 20 个路由，就有 20 处 try-catch 和无数个 `if (!entity)` 判断。
+
+Spring Boot 的 `@RestControllerAdvice` + `@ExceptionHandler` 解决的是同一个问题，但方式完全不同——异常处理逻辑集中在一个类里，Controller 里只需要抛异常，不用关心怎么处理。
+
+## @RestControllerAdvice：集中式异常处理器
+
+先看一个最小可用的全局异常处理器：
+
+```java
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleNotFound(
+            ResourceNotFoundException ex) {
+        return ResponseEntity
+                .status(HttpStatus.NOT_FOUND)
+                .body(ApiResponse.error(404, ex.getMessage()));
+    }
+
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ApiResponse<Map<String, String>>> handleValidation(
+            MethodArgumentNotValidException ex) {
+        Map<String, String> errors = new LinkedHashMap<>();
+        ex.getBindingResult().getFieldErrors().forEach(error ->
+            errors.put(error.getField(), error.getDefaultMessage())
+        );
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error(400, "参数校验失败", errors));
+    }
+
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse<Void>> handleGeneral(Exception ex) {
+        log.error("未处理的异常", ex);
+        return ResponseEntity
+                .status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiResponse.error(500, "服务器内部错误"));
+    }
+}
+```
+
+三个 `@ExceptionHandler` 方法，分别处理三种异常。Controller 里不需要任何 try-catch：
+
+```java
+@GetMapping("/{id}")
+public Post getPost(@PathVariable Long id) {
+    return postService.findById(id)
+            .orElseThrow(() -> new ResourceNotFoundException("文章不存在"));
+}
+```
+
+找不到文章时抛出 `ResourceNotFoundException`，Spring MVC 拦截到这个异常，匹配到 `handleNotFound` 方法，返回 404 + 结构化 JSON。Controller 只管"抛"，ExceptionHandler 只管"接"，职责完全分离。
+
+和 Express 的 error middleware 对比一下执行流程：
+
+```
+Express:
+  请求 → 路由函数(try-catch) → next(err) → error middleware → 响应
+
+Spring Boot:
+  请求 → Controller(throw) → DispatcherServlet → @ExceptionHandler → 响应
+```
+
+Express 需要手动 `next(err)` 把异常传到 error middleware，Spring Boot 不需要——只要异常从 Controller 抛出来，DispatcherServlet 就会自动寻找匹配的 `@ExceptionHandler`。
+
+## 自定义业务异常体系
+
+CMS 需要处理的异常可以按 HTTP 语义分成几类。先定义一个基类：
+
+```java
+public abstract class BaseException extends RuntimeException {
+
+    private final int statusCode;
+
+    protected BaseException(int statusCode, String message) {
+        super(message);
+        this.statusCode = statusCode;
+    }
+
+    public int getStatusCode() {
+        return statusCode;
+    }
+}
+```
+
+然后按 HTTP 状态码派生子类：
+
+```java
+// 404 — 资源不存在
+public class ResourceNotFoundException extends BaseException {
+    public ResourceNotFoundException(String message) {
+        super(404, message);
+    }
+
+    public static ResourceNotFoundException post(Long id) {
+        return new ResourceNotFoundException("文章 [id=" + id + "] 不存在");
+    }
+
+    public static ResourceNotFoundException user(Long id) {
+        return new ResourceNotFoundException("用户 [id=" + id + "] 不存在");
+    }
+}
+
+// 409 — 业务冲突（slug 重复、用户名已存在）
+public class ConflictException extends BaseException {
+    public ConflictException(String message) {
+        super(409, message);
+    }
+}
+
+// 400 — 参数不合法（非 Bean Validation 场景的手动校验）
+public class BadRequestException extends BaseException {
+    public BadRequestException(String message) {
+        super(400, message);
+    }
+}
+```
+
+静态工厂方法（`post(Long id)`、`user(Long id)`）的好处是错误信息格式统一，不用在 Service 层拼字符串。在 Express 里你可能会用自定义 Error 类做类似的事：
+
+```typescript
+class AppError extends Error {
+  constructor(
+    public statusCode: number,
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+throw new AppError(404, `文章 [id=${id}] 不存在`);
+```
+
+结构一样，区别在于 Spring Boot 的异常体系可以通过 `@ExceptionHandler` 的类型匹配来路由，Express 的 error middleware 只能靠 `instanceof` 判断或者 `err.statusCode` 字段来分发。
+
+## 统一错误响应格式
+
+上一篇提到 CMS 的所有接口统一用 `ApiResponse<T>` 包装响应。错误响应也应该用同样的结构：
+
+```java
+public class ApiResponse<T> {
+
+    private int code;
+    private String message;
+    private T data;
+
+    private ApiResponse(int code, String message, T data) {
+        this.code = code;
+        this.message = message;
+        this.data = data;
+    }
+
+    public static <T> ApiResponse<T> success(T data) {
+        return new ApiResponse<>(200, "success", data);
+    }
+
+    public static <T> ApiResponse<T> error(int code, String message) {
+        return new ApiResponse<>(code, message, null);
+    }
+
+    public static <T> ApiResponse<T> error(int code, String message, T data) {
+        return new ApiResponse<>(code, message, data);
+    }
+}
+```
+
+这样无论成功还是失败，前端拿到的 JSON 结构都是 `{ code, message, data }`。成功时 `code` 是 200，失败时 `code` 是对应的 HTTP 状态码。`data` 在成功时是业务数据，在失败时可以是校验错误的字段详情（`Map<String, String>`）。
+
+一个典型的 404 响应：
+
+```json
+{
+  "code": 404,
+  "message": "文章 [id=999] 不存在",
+  "data": null
+}
+```
+
+一个典型的 400 校验错误响应：
+
+```json
+{
+  "code": 400,
+  "message": "参数校验失败",
+  "data": {
+    "title": "标题不能为空",
+    "slug": "slug 格式不合法，只允许小写字母、数字和连字符"
+  }
+}
+```
+
+## 完整的异常处理器
+
+把 CMS 需要处理的所有异常类型汇总起来：
+
+```java
+@RestControllerAdvice
+@Slf4j
+public class GlobalExceptionHandler {
+
+    // 业务异常 — 404/409/400
+    @ExceptionHandler(ResourceNotFoundException.class)
+    public ResponseEntity<ApiResponse<Void>> handleNotFound(
+            ResourceNotFoundException ex) {
+        log.warn("资源不存在: {}", ex.getMessage());
+        return ResponseEntity
+                .status(HttpStatus.NOT_FOUND)
+                .body(ApiResponse.error(404, ex.getMessage()));
+    }
+
+    @ExceptionHandler(ConflictException.class)
+    public ResponseEntity<ApiResponse<Void>> handleConflict(
+            ConflictException ex) {
+        log.warn("业务冲突: {}", ex.getMessage());
+        return ResponseEntity
+                .status(HttpStatus.CONFLICT)
+                .body(ApiResponse.error(409, ex.getMessage()));
+    }
+
+    @ExceptionHandler(BadRequestException.class)
+    public ResponseEntity<ApiResponse<Void>> handleBadRequest(
+            BadRequestException ex) {
+        log.warn("参数错误: {}", ex.getMessage());
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error(400, ex.getMessage()));
+    }
+
+    // 参数校验异常 — 400
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<ApiResponse<Map<String, String>>> handleValidation(
+            MethodArgumentNotValidException ex) {
+        Map<String, String> errors = new LinkedHashMap<>();
+        ex.getBindingResult().getFieldErrors().forEach(error ->
+            errors.put(error.getField(), error.getDefaultMessage())
+        );
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error(400, "参数校验失败", errors));
+    }
+
+    // JSON 解析异常 — 请求体不是合法 JSON
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<ApiResponse<Void>> handleJsonParseError(
+            HttpMessageNotReadableException ex) {
+        log.warn("JSON 解析失败: {}", ex.getMessage());
+        return ResponseEntity
+                .status(HttpStatus.BAD_REQUEST)
+                .body(ApiResponse.error(400, "请求体不是合法的 JSON 格式"));
+    }
+
+    // 请求方法不支持 — 比如对 POST 接口发 GET 请求
+    @ExceptionHandler(HttpRequestMethodNotSupportedException.class)
+    public ResponseEntity<ApiResponse<Void>> handleMethodNotSupported(
+            HttpRequestMethodNotSupportedException ex) {
+        return ResponseEntity
+                .status(HttpStatus.METHOD_NOT_ALLOWED)
+                .body(ApiResponse.error(405, "请求方法 " + ex.getMethod() + " 不被允许"));
+    }
+
+    // 兜底 — 所有未被上面处理的异常
+    @ExceptionHandler(Exception.class)
+    public ResponseEntity<ApiResponse<Void>> handleUnhandled(Exception ex) {
+        log.error("未处理的异常", ex);
+        return ResponseEntity
+                .status(HttpStatus.INTERNAL_SERVER_ERROR)
+                .body(ApiResponse.error(500, "服务器内部错误"));
+    }
+}
+```
+
+有几个值得注意的设计决策：
+
+**`@ExceptionHandler` 的匹配顺序。** Spring 按异常类型的继承关系匹配，最具体的优先。`ResourceNotFoundException` 和 `Exception` 都能匹配 `ResourceNotFoundException` 的实例，但 Spring 会选择更具体的那个。所以把 `Exception.class` 放最后作为兜底是对的——如果反过来，所有异常都会被 `handleUnhandled` 拦截。
+
+**日志级别。** 业务异常（404、409）用 `log.warn`，因为它们是客户端错误，不是系统故障。未处理的异常用 `log.error`，因为它们可能代表 bug 或基础设施问题。这个区分在生产环境很重要——如果 404 也用 `log.error`，错误监控系统会被大量"文章不存在"的日志淹没，真正的错误反而被掩盖。
+
+**不要吞掉异常栈。** 兜底的 `handleUnhandled` 里调了 `log.error("未处理的异常", ex)`，`ex` 作为第二个参数传入，Slf4j 会打印完整的异常栈。如果把异常信息只放在 `log.error` 的字符串里（`log.error("异常: " + ex.getMessage())`），栈信息就丢失了，排查问题时只能看到一行错误消息，不知道是哪里抛出来的。
+
+## 在 Service 层使用异常
+
+有了异常体系和全局处理器，Service 层的代码变得非常干净：
+
+```java
+@Service
+public class PostService {
+
+    private final PostRepository postRepository;
+
+    public PostService(PostRepository postRepository) {
+        this.postRepository = postRepository;
+    }
+
+    public Post getById(Long id) {
+        return postRepository.findById(id)
+                .orElseThrow(() -> ResourceNotFoundException.post(id));
+    }
+
+    public Post create(PostCreateRequest request) {
+        if (postRepository.existsBySlug(request.getSlug())) {
+            throw new ConflictException(
+                "slug '" + request.getSlug() + "' 已被使用");
+        }
+        Post post = new Post();
+        post.setTitle(request.getTitle());
+        post.setSlug(request.getSlug());
+        post.setContent(request.getContent());
+        post.setStatus(PostStatus.DRAFT);
+        return postRepository.save(post);
+    }
+}
+```
+
+对比没有全局异常处理时的写法：
+
+```java
+// 没有全局异常处理——每个方法里都是 if + throw
+public Post getById(Long id) {
+    Post post = postRepository.findById(id).orElse(null);
+    if (post == null) {
+        throw new ResponseStatusException(HttpStatus.NOT_FOUND, "文章不存在");
+    }
+    return post;
+}
+
+// 有了全局异常处理——一行 orElseThrow 搞定
+public Post getById(Long id) {
+    return postRepository.findById(id)
+            .orElseThrow(() -> ResourceNotFoundException.post(id));
+}
+```
+
+`ResponseStatusException` 是 Spring 提供的一种快捷方式，可以设置 HTTP 状态码和错误信息，但它只能携带一个 message 字符串。如果需要返回结构化的错误响应（比如校验错误的字段详情），或者需要对不同类型的异常做不同的日志处理，`@ExceptionHandler` 是更合适的方案。
+
+## ExceptionHandler 匹配机制
+
+`@ExceptionHandler` 的匹配规则和 Express error middleware 有一个根本区别。Express 的 error middleware 是一个链——请求按注册顺序依次经过每个 middleware，第一个不调用 `next()` 的 middleware 处理响应。Spring 的 `@ExceptionHandler` 是基于类型匹配的——Spring 找到最具体的匹配方法，直接调用。
+
+这意味着在 Express 里，middleware 的注册顺序很重要：
+
+```typescript
+// Express：顺序敏感，第一个匹配的 middleware 处理
+app.use((err, req, res, next) => {
+  if (err instanceof ValidationError) {
+    // 必须在通用 error handler 之前
+    res.status(400).json({ message: err.message });
+  } else {
+    next(err);
+  }
+});
+
+app.use((err, req, res, next) => {
+  // 兜底
+  res.status(500).json({ message: "服务器错误" });
+});
+```
+
+Spring 不存在顺序问题——它根据异常类型的继承关系自动选择最具体的 handler。`ResourceNotFoundException` extends `BaseException` extends `RuntimeException` extends `Exception`，当抛出 `ResourceNotFoundException` 时，Spring 会选择标注了 `@ExceptionHandler(ResourceNotFoundException.class)` 的方法，而不是 `@ExceptionHandler(Exception.class)` 的方法。
+
+## Express error middleware vs @ControllerAdvice
+
+| 维度               | Express error middleware                   | @RestControllerAdvice + @ExceptionHandler                                             |
+| ------------------ | ------------------------------------------ | ------------------------------------------------------------------------------------- |
+| **注册方式**       | `app.use((err, req, res, next) => {})`     | 一个类加 `@RestControllerAdvice` 注解                                                 |
+| **匹配机制**       | 注册顺序 + `instanceof` 判断               | 异常类型自动匹配（最具体优先）                                                        |
+| **传递方式**       | 手动 `next(err)`                           | 自动，抛出即可                                                                        |
+| **路由级 handler** | 可以定义多个 error middleware 处理不同路由 | 用 `@ControllerAdvice(basePackages)` 或 `@ControllerAdvice(assignableTypes)` 限定范围 |
+| **响应控制**       | 直接操作 `res`                             | 返回 `ResponseEntity`                                                                 |
+| **覆盖范围**       | 只能捕获传递到 middleware 的异常           | 可以捕获 Controller 层所有异常，包括参数绑定、JSON 解析等框架级异常                   |
+| **切面能力**       | 无，纯粹的错误处理                         | 可以用 `@ExceptionHandler` + `@ResponseStatus` 等组合                                 |
+| **AOP 集成**       | 不适用                                     | 可以和 Spring AOP 联动，捕获 Service 层抛出的异常                                     |
+
+最核心的区别是**覆盖范围**。Express 的 error middleware 只能处理通过 `next(err)` 传递过来的异常。如果 Jackson 反序列化 JSON 时失败（请求体不是合法 JSON），这个错误发生在 Express 路由函数执行之前，你的 error middleware 可能根本捕获不到——具体取决于 body-parser 的版本和配置。Spring Boot 的 `@ExceptionHandler` 能捕获整个请求处理链路中的异常，包括参数绑定失败、JSON 解析失败、请求方法不支持等框架层面的错误。
+
+## Trade-off 分析
+
+**@RestControllerAdvice 的收益：**
+
+- 异常处理逻辑集中在一个类里，不会分散到 20 个 Controller 方法中
+- 基于类型的自动匹配比 Express 的注册顺序更可靠，不会因为 middleware 顺序写错导致异常被错误处理
+- 能覆盖框架级异常（参数绑定、JSON 解析、请求方法不支持），不需要额外配置
+- 和 `ApiResponse<T>` 统一响应格式配合，前端只需要处理一种错误结构
+
+**代价：**
+
+- 异常类多了之后，异常体系本身需要维护。`ResourceNotFoundException`、`ConflictException`、`BadRequestException` 这些类看似简单，但项目大了之后会不断膨胀（比如加上 `RateLimitExceededException`、`PaymentRequiredException`），需要一个清晰的分类标准
+- `@ExceptionHandler(Exception.class)` 兜底 handler 会隐藏 bug——如果某个 Service 方法抛出了 `NullPointerException`，它会被兜底 handler 吃掉变成一个通用的 500 错误，你在日志里才能看到真正的异常。开发阶段可以考虑让兜底 handler 返回更详细的错误信息
+- 异常流不如返回值直观。`return post` 和 `throw new NotFoundException()` 表达的是同一个"结果不存在"的语义，但异常流是隐式的控制流转移——读代码时需要知道这个异常会被哪个 handler 处理，才能理解最终的响应是什么
+
+## 回顾与预告
+
+到这篇为止，CMS 的请求处理链路已经完整了：
+
+- **参数校验**：`@Valid` + Hibernate Validator 在请求进入 Controller 时拦截非法数据（第 06 篇）
+- **异常处理**：`@RestControllerAdvice` 统一捕获所有异常，返回结构化的错误响应（本篇）
+
+一个典型的请求现在经历的流程是：
+
+```
+HTTP 请求
+  → DispatcherServlet
+  → 参数绑定 + @Valid 校验
+    → 校验失败：MethodArgumentNotValidException → @ExceptionHandler → 400
+  → Controller 方法执行
+    → Service 抛出业务异常 → @ExceptionHandler → 404/409
+    → 框架级异常 → @ExceptionHandler → 400/405
+    → 未预期异常 → @ExceptionHandler → 500
+  → 返回 ApiResponse<T>
+```
+
+还有一个问题没解决：CMS 的文章详情页需要一个阅读量统计功能——每次 `GET /api/posts/{id}` 时 viewCount +1。这个逻辑放在哪里合适？放在 Controller 里会和查询逻辑耦合，放在 Service 里会让 `getById` 方法产生副作用（查询不应该修改数据）。你需要一个"在请求处理前后自动执行某些逻辑"的机制，这就是下一篇要讲的拦截器和 AOP。
