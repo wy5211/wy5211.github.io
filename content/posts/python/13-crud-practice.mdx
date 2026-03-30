@@ -1,0 +1,410 @@
+---
+title: "13 CRUD 实战"
+date: "2026-03-30"
+summary: "用 Python 重做 CMS 的文章 API。Pydantic Schema 分离请求和响应，FastAPI Depends 实现依赖注入，对比 Spring Boot 的分层架构。"
+tags: ["Python", "FastAPI", "CRUD", "SQLAlchemy"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 实战"
+seriesOrder: 13
+---
+
+在 Spring Boot 系列第 4 篇里，我们给 CMS 的文章 API 套上了 RESTful 规范——统一响应格式、分页参数、正确的状态码。第 5 篇引入 Spring Data JPA，把数据从内存的 `ConcurrentHashMap` 搬进了 MySQL。整个过程是分层推进的：Controller 处理 HTTP，Service 处理业务逻辑，Repository 处理数据访问。
+
+用 Python 重做同样的事，分层结构几乎一样：Router 对应 Controller，Service 对应 Service，SQLAlchemy Session 对应 JPA Repository。但实现细节上有不少差异——比如 Pydantic Schema 怎么替代 Java 的 DTO 和 Bean Validation，FastAPI 的 `Depends` 怎么替代 Spring 的 `@Autowired`。
+
+这篇用完整的代码把 CMS 文章 CRUD 串起来。
+
+## 分层结构
+
+```
+cms-api/
+├── app/
+│   ├── main.py
+│   ├── config.py
+│   ├── database.py          # get_db() 依赖
+│   ├── models/              # SQLAlchemy 模型
+│   │   ├── base.py
+│   │   ├── user.py
+│   │   ├── post.py
+│   │   ├── tag.py
+│   │   └── comment.py
+│   ├── schemas/             # Pydantic Schema
+│   │   ├── post.py
+│   │   └── common.py
+│   ├── services/            # 业务逻辑
+│   │   └── post_service.py
+│   └── routers/             # 路由
+│       └── posts.py
+└── alembic/
+```
+
+对比 Spring Boot 的标准结构（controller/service/repository/entity/dto），FastAPI 的分层少了 repository 这一层。这不是因为 Python 不需要数据访问层，而是 SQLAlchemy 本身已经提供了足够强大的查询 API，没有必要再抽象一层 Repository 接口。JPA 的 Repository 抽象之所以有意义，是因为它能在接口签名上推导 SQL（`findByStatus` -> `SELECT * FROM posts WHERE status = ?`），省去了你写查询的麻烦。SQLAlchemy 的 `select(Post).where(Post.status == "published")` 已经足够简洁，再包一层反而多余。
+
+## Pydantic Schema：请求和响应分离
+
+Spring Boot 里你通常写两组 DTO：`CreatePostRequest`（接收请求）和 `PostResponse`（返回响应），有时候还有 `UpdatePostRequest`。FastAPI 里用 Pydantic 做同样的事：
+
+```python
+# app/schemas/post.py
+from datetime import datetime
+from pydantic import BaseModel, Field
+
+
+class PostCreate(BaseModel):
+    """创建文章的请求 Schema"""
+    title: str = Field(..., min_length=1, max_length=200)
+    slug: str = Field(..., min_length=1, max_length=200, pattern=r"^[a-z0-9-]+$")
+    content: str = Field(..., min_length=1)
+    status: str = Field(default="draft")
+    tag_ids: list[int] = Field(default_factory=list, description="关联标签 ID")
+
+
+class PostUpdate(BaseModel):
+    """更新文章的请求 Schema——所有字段可选"""
+    title: str | None = Field(None, min_length=1, max_length=200)
+    slug: str | None = Field(None, min_length=1, max_length=200, pattern=r"^[a-z0-9-]+$")
+    content: str | None = Field(None, min_length=1)
+    status: str | None = Field(None)
+    tag_ids: list[int] | None = None
+
+
+class PostBrief(BaseModel):
+    """列表项的精简响应"""
+    id: int
+    title: str
+    slug: str
+    status: str
+    view_count: int
+    created_at: datetime
+    published_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class PostDetail(BaseModel):
+    """详情的完整响应"""
+    id: int
+    title: str
+    slug: str
+    content: str
+    status: str
+    author_id: int
+    view_count: int
+    created_at: datetime
+    published_at: datetime | None = None
+    tags: list["TagBrief"] = []
+
+    model_config = {"from_attributes": True}
+
+
+class TagBrief(BaseModel):
+    id: int
+    name: str
+    slug: str
+    color: str
+
+    model_config = {"from_attributes": True}
+```
+
+`PostUpdate` 里所有字段都是 `Optional`，这对应 Spring Boot 里用 `@PatchMapping` + 部分字段更新的做法。FastAPI 用 `model_dump(exclude_unset=True)` 来区分"用户传了"和"用户没传"——只有实际传入的字段会被更新。Spring Boot 的做法更粗暴，`@RequestBody` 反序列化后 null 字段和"没传"字段无法区分，你需要在 Service 层做额外处理。
+
+把列表响应（`PostBrief`）和详情响应（`PostDetail`）分开是实际项目中的常见做法。列表接口不需要返回文章全文，能减少数据库查询量和网络传输量。Spring Boot 里可以用 `@JsonIgnore` 或 `@JsonProperty(access = WRITE_ONLY)` 控制，但不够灵活——同一个 Entity 在不同接口需要不同的字段子集时，你还是得写多个 DTO。Pydantic 天然支持多个 Schema 映射同一个 ORM 模型。
+
+## 通用分页响应
+
+```python
+# app/schemas/common.py
+from typing import TypeVar, Generic
+from pydantic import BaseModel
+
+T = TypeVar("T")
+
+
+class PaginatedResponse(BaseModel, Generic[T]):
+    """分页响应"""
+    items: list[T]
+    total: int
+    page: int
+    size: int
+    pages: int
+```
+
+Spring Boot 系列第 4 篇里我们用了 Spring Data 的 `Page<T>` 来包装分页结果。Python 没有内置的泛型分页类型，用 Pydantic 的 `Generic[T]` 手写一个。用法是 `PaginatedResponse[PostBrief]`，IDE 能正确推断 `items` 的元素类型。
+
+## Service 层：业务逻辑
+
+```python
+# app/services/post_service.py
+from sqlalchemy import select, func, desc
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.models.post import Post
+from app.models.tag import Tag
+from app.schemas.post import PostCreate, PostUpdate
+
+
+class PostService:
+
+    @staticmethod
+    async def create(db: AsyncSession, data: PostCreate, author_id: int) -> Post:
+        """创建文章"""
+        post = Post(
+            title=data.title,
+            slug=data.slug,
+            content=data.content,
+            status=data.status,
+            author_id=author_id,
+        )
+        # 处理标签关联
+        if data.tag_ids:
+            result = await db.execute(
+                select(Tag).where(Tag.id.in_(data.tag_ids))
+            )
+            post.tags = list(result.scalars().all())
+
+        db.add(post)
+        await db.flush()
+        await db.refresh(post)
+        return post
+
+    @staticmethod
+    async def get_by_id(db: AsyncSession, post_id: int) -> Post | None:
+        """根据 ID 获取文章"""
+        result = await db.execute(
+            select(Post).where(Post.id == post_id)
+        )
+        return result.scalar_one_or_none()
+
+    @staticmethod
+    async def get_list(
+        db: AsyncSession,
+        page: int = 1,
+        size: int = 10,
+        status: str | None = None,
+    ) -> tuple[list[Post], int]:
+        """获取文章列表（分页 + 过滤）"""
+        query = select(Post)
+        count_query = select(func.count(Post.id))
+
+        if status:
+            query = query.where(Post.status == status)
+            count_query = count_query.where(Post.status == status)
+
+        total = (await db.execute(count_query)).scalar()
+
+        offset = (page - 1) * size
+        result = await db.execute(
+            query.order_by(desc(Post.created_at))
+            .offset(offset)
+            .limit(size)
+        )
+        posts = list(result.scalars().all())
+        return posts, total
+
+    @staticmethod
+    async def update(
+        db: AsyncSession, post_id: int, data: PostUpdate
+    ) -> Post | None:
+        """更新文章"""
+        post = await PostService.get_by_id(db, post_id)
+        if not post:
+            return None
+
+        update_data = data.model_dump(exclude_unset=True)
+
+        # 标签需要单独处理
+        if "tag_ids" in update_data:
+            tag_ids = update_data.pop("tag_ids")
+            if tag_ids is not None:
+                result = await db.execute(
+                    select(Tag).where(Tag.id.in_(tag_ids))
+                )
+                post.tags = list(result.scalars().all())
+
+        for field, value in update_data.items():
+            setattr(post, field, value)
+
+        await db.flush()
+        await db.refresh(post)
+        return post
+
+    @staticmethod
+    async def delete(db: AsyncSession, post_id: int) -> bool:
+        """删除文章"""
+        post = await PostService.get_by_id(db, post_id)
+        if not post:
+            return False
+        await db.delete(post)
+        await db.flush()
+        return True
+```
+
+注意 Service 层不导入任何 FastAPI 的对象。它只接收 `AsyncSession` 和 Pydantic Schema 作为参数，返回 SQLAlchemy ORM 对象。这种隔离意味着 Service 层可以在 FastAPI 之外独立测试和复用。Spring Boot 的 Service 层也遵循同样的原则——不依赖 `HttpServletRequest` 或 `HttpServletResponse`。
+
+`flush()` 和 `commit()` 的区别在这里很关键：`flush()` 把变更发送到数据库（比如获取自动生成的 ID），但不提交事务。`commit()` 在 `get_db()` 依赖里统一处理——请求成功自动 commit，异常自动 rollback。Spring Boot 的 `@Transactional` 做的事本质上一样，只是用注解代替了显式代码。
+
+## Router 层：依赖注入
+
+```python
+# app/routers/posts.py
+from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.database import get_db
+from app.schemas.post import PostCreate, PostUpdate, PostBrief, PostDetail
+from app.schemas.common import PaginatedResponse
+from app.services.post_service import PostService
+
+router = APIRouter(prefix="/api/posts", tags=["文章"])
+
+
+@router.post("/", response_model=PostDetail, status_code=201)
+async def create_post(
+    data: PostCreate,
+    db: AsyncSession = Depends(get_db),
+):
+    """创建文章"""
+    # TODO: 第 14 篇加入 JWT 认证后，从 token 获取 author_id
+    post = await PostService.create(db, data, author_id=1)
+    return post
+
+
+@router.get("/", response_model=PaginatedResponse[PostBrief])
+async def list_posts(
+    page: int = Query(1, ge=1),
+    size: int = Query(10, ge=1, le=100),
+    status: str | None = Query(None),
+    db: AsyncSession = Depends(get_db),
+):
+    """获取文章列表"""
+    posts, total = await PostService.get_list(db, page, size, status)
+    return PaginatedResponse(
+        items=posts,
+        total=total,
+        page=page,
+        size=size,
+        pages=(total + size - 1) // size,
+    )
+
+
+@router.get("/{post_id}", response_model=PostDetail)
+async def get_post(
+    post_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """获取文章详情"""
+    post = await PostService.get_by_id(db, post_id)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return post
+
+
+@router.put("/{post_id}", response_model=PostDetail)
+async def update_post(
+    post_id: int,
+    data: PostUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    """更新文章"""
+    post = await PostService.update(db, post_id, data)
+    if not post:
+        raise HTTPException(status_code=404, detail="Post not found")
+    return post
+
+
+@router.delete("/{post_id}", status_code=204)
+async def delete_post(
+    post_id: int,
+    db: AsyncSession = Depends(get_db),
+):
+    """删除文章"""
+    success = await PostService.delete(db, post_id)
+    if not success:
+        raise HTTPException(status_code=404, detail="Post not found")
+```
+
+`db: AsyncSession = Depends(get_db)` 是 FastAPI 依赖注入的核心用法。每个请求进来时，FastAPI 调用 `get_db()` 生成一个数据库会话，请求结束后自动 commit 或 rollback。这和 Spring Boot 的 `@Transactional` 效果相同，但实现机制不同：Spring 用 AOP 代理在方法前后织入事务管理，FastAPI 用 Python 的生成器（`yield`）在请求前后执行代码。
+
+`response_model=PostDetail` 做了两件事：第一，用 `PostDetail` 的字段定义过滤响应，确保不会泄漏不该返回的字段；第二，在 Swagger 文档中展示正确的响应结构。Spring Boot 的 `@ResponseBody` 只做序列化，字段过滤需要额外处理。
+
+## 应用入口
+
+```python
+# app/main.py
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.routers import posts
+
+# 未来还会注册 users、tags、comments 路由
+# from app.routers import users, tags, comments
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("CMS API starting...")
+    yield
+    print("CMS API shutting down...")
+
+
+app = FastAPI(
+    title="CMS API",
+    description="FastAPI + SQLAlchemy CMS 系统",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(posts.router)
+```
+
+## 依赖注入对比
+
+FastAPI 的 `Depends` 和 Spring Boot 的 `@Autowired` 解决同一个问题：把依赖的创建和使用解耦。但实现方式有本质区别：
+
+```python
+# FastAPI：函数即依赖
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        yield session
+
+# 使用
+async def list_posts(db: AsyncSession = Depends(get_db)):
+    ...
+```
+
+```java
+// Spring Boot：注解 + 容器
+@Service
+public class PostService {
+    private final PostRepository postRepository;
+
+    @Autowired  // 或构造器注入
+    public PostService(PostRepository postRepository) {
+        this.postRepository = postRepository;
+    }
+}
+```
+
+Spring 的 DI 是"容器管理单例"——`PostService` 在应用启动时创建一次，之后所有请求复用同一个实例。FastAPI 的 `Depends` 是"每次请求创建"——每个请求都会调用 `get_db()` 生成一个新的 Session。对于数据库会话来说，"每次请求创建"是正确的行为。Spring Boot 里 `EntityManager` 也是每次事务创建一个，但这个细节被 `@Transactional` 隐藏了。
+
+FastAPI 的依赖注入还有一个 Spring 没有的能力：**依赖可以返回生成器**。`get_db()` 里的 `yield` 把执行分成"请求前"和"请求后"两段，非常适合管理资源生命周期。Spring 里要实现同样的效果需要用 `@Scope("request")` 或 `Filter/Interceptor`，代码复杂度明显更高。
+
+## 回顾
+
+这篇用 FastAPI + SQLAlchemy 实现了 CMS 文章的完整 CRUD：
+
+- **分层架构**和 Spring Boot 一致：Router -> Service -> Model，每一层职责明确
+- **Pydantic Schema** 同时承担 DTO 和 Bean Validation 的角色，`PostCreate`/`PostUpdate`/`PostBrief`/`PostDetail` 四个 Schema 对应不同的 API 场景
+- **`model_dump(exclude_unset=True)`** 区分"用户传了"和"用户没传"，实现精确的部分更新
+- **`Depends(get_db)`** 用生成器管理 Session 生命周期，等价于 Spring 的 `@Transactional`
+- **`response_model`** 同时做响应过滤和文档生成，比 Spring Boot 的 `@ResponseBody` + springdoc 更省事
+
+CMS 的文章 API 已经能跑了，但还有一个关键问题没解决：任何人都能创建、修改、删除文章。下一篇给 CMS 加上 JWT 认证和基于角色的权限控制，你会看到 FastAPI 的依赖注入在鉴权场景下的威力。
