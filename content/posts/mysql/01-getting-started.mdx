@@ -1,0 +1,424 @@
+---
+title: "01 MySQL 快速入门"
+date: "2026-03-23"
+tags: ["MySQL"]
+category: "mysql"
+cover: ""
+draft: false
+series: "MySQL 渐进式学习指南"
+seriesOrder: 1
+---
+
+## 一个现实中的问题
+
+你的团队要做一个任务管理应用，需要存任务数据。领导说用 MySQL，你打开终端敲了 `SELECT * FROM tasks`，能查出数据了。但问题是：数据库怎么建的？表怎么创建的？为什么 INSERT 的时候报错？UPDATE 忘了写 WHERE，整个表的数据全被改了——这种事在生产环境发生过不止一次。
+
+MySQL 不难，但它的坑很多。与其碰到一个踩一个，不如花一个小时把基础打扎实。这篇文章会带你从零开始：用 Docker 启动一个 MySQL 实例，创建一个任务管理数据库，完成基本的增删改查，并理解 SQL 语言的分类和命名规范。
+
+## 选型：为什么是 MySQL
+
+在动手之前，先回答一个更根本的问题：项目选数据库，为什么选 MySQL 而不是 PostgreSQL 或 MongoDB？
+
+这三者不是互相替代的关系，而是适用于不同的场景：
+
+| 考量维度   | MySQL                | PostgreSQL         | MongoDB        |
+| ---------- | -------------------- | ------------------ | -------------- |
+| 数据模型   | 关系型（表格）       | 关系型（表格）     | 文档型（JSON） |
+| 学习曲线   | 低                   | 中                 | 低             |
+| JSON 支持  | 支持（8.0 增强）     | 原生且强大         | 原生           |
+| 扩展性     | 读写分离、分库分表   | 丰富的扩展系统     | 原生分片       |
+| 生态成熟度 | 极高（国内主流）     | 高                 | 高             |
+| 适合场景   | Web 应用、电商、CRUD | 复杂查询、数据分析 | 内容管理、日志 |
+
+**选 MySQL 的理由通常有三个**：第一，国内企业使用最广泛，找工作、接项目、看别人代码时遇到 MySQL 的概率最高；第二，SQL 语法和核心概念（索引、事务、锁）与其他关系型数据库通用，学会了可以平滑迁移到 PostgreSQL；第三，MySQL 8.0 已经补齐了 CTE、窗口函数、JSON 等现代特性，不再是"功能简陋"的代名词。
+
+**什么时候选 PostgreSQL**：需要复杂的地理查询（PostGIS）、强一致性要求高、或者团队有 PostgreSQL 经验。
+
+**什么时候选 MongoDB**：数据结构不固定、频繁变更 schema、或者需要存储大量非结构化数据（如日志、埋点）。
+
+本系列选择 MySQL，重点不在"哪个数据库更好"，而是把关系型数据库的核心概念讲透。掌握了这些，切换到其他数据库并不困难。
+
+## Docker 一行命令启动 MySQL
+
+以前装 MySQL 要下载安装包、配置环境变量、处理依赖冲突，现在有了 Docker，一行命令搞定。
+
+假设你已经安装了 Docker（[下载地址](https://www.docker.com)），直接运行：
+
+```bash
+docker run -d \
+  --name mysql-dev \
+  -p 3306:3306 \
+  -e MYSQL_ROOT_PASSWORD=root123 \
+  -e MYSQL_DATABASE=task_manager \
+  -v mysql-data:/var/lib/mysql \
+  mysql:8.0 \
+  --character-set-server=utf8mb4 \
+  --collation-server=utf8mb4_unicode_ci
+```
+
+这条命令做了几件事：拉取 MySQL 8.0 镜像，创建一个名为 `mysql-dev` 的容器，将 3306 端口映射到本机，设置 root 密码为 `root123`，自动创建名为 `task_manager` 的数据库，用数据卷 `mysql-data` 持久化数据（容器删除后数据不会丢），并将字符集设为 `utf8mb4`（支持中文和 emoji）。
+
+启动后，用以下命令验证：
+
+```bash
+# 查看容器运行状态
+docker ps
+
+# 进入 MySQL 命令行
+docker exec -it mysql-dev mysql -uroot -proot123
+```
+
+看到 `mysql>` 提示符，说明 MySQL 已经就绪。
+
+如果你更习惯用 Docker Compose，效果是一样的：
+
+```yaml
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: mysql-dev
+    environment:
+      MYSQL_ROOT_PASSWORD: root123
+      MYSQL_DATABASE: task_manager
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+
+volumes:
+  mysql-data:
+```
+
+运行 `docker compose up -d` 即可启动。
+
+## 客户端工具
+
+虽然 MySQL 自带的命令行客户端完全够用，但图形化工具在查看表结构、编辑数据时更直观。这里推荐两个：
+
+**DBeaver**（免费开源）：支持 MySQL、PostgreSQL、SQLite 等几乎所有数据库，有智能补全和 ER 图生成功能，适合日常开发。下载地址：[dbeaver.io](https://dbeaver.io/)。
+
+**MySQL Shell**（官方工具）：MySQL 8.0 自带，支持 SQL 和 JavaScript/Python 两种模式，适合批量操作和脚本化场景。安装 MySQL 后直接运行 `mysqlsh` 即可启动。
+
+对于本系列的学习，命令行客户端就足够了。如果你习惯图形界面，DBeaver 是一个不错的选择。
+
+## SQL 语言分类：搞清楚你写的 SQL 属于哪一类
+
+在动手写 SQL 之前，有必要先理解 SQL 语言的分类。很多人学了几年 SQL，写过的语句全部归为"查询"，其实 SQL 按功能分为四类，各管各的事：
+
+**DDL（Data Definition Language，数据定义语言）**——管"结构"。创建、修改、删除数据库和表，关键字包括 `CREATE`、`DROP`、`ALTER`、`TRUNCATE`。DDL 操作的是数据库的骨架，不是数据本身。
+
+**DML（Data Manipulation Language，数据操作语言）**——管"数据"。往表里插入数据、修改数据、删除数据，关键字包括 `INSERT`、`UPDATE`、`DELETE`。DML 改变的是表里的行。
+
+**DQL（Data Query Language，数据查询语言）**——管"查询"。从表里取数据，关键字是 `SELECT`。DQL 不改变任何数据，只是读取。
+
+**DCL（Data Control Language，数据控制语言）**——管"权限"。决定谁能访问什么数据，关键字包括 `GRANT`、`REVOKE`。DCL 通常由 DBA 操作。
+
+还有一个经常被单独拎出来的 **TCL（Transaction Control Language，事务控制语言）**，包括 `COMMIT`、`ROLLBACK`、`SAVEPOINT`，用于管理事务的提交和回滚。它和 DCL 关系密切，但关注点不同——TCL 管的是"操作的原子性"，DCL 管的是"访问的权限"。
+
+为什么要区分这些？因为实际开发中，你大部分时间在写 DML 和 DQL（增删改查），偶尔需要 DDL（建表改表），几乎不碰 DCL（除非你负责数据库管理）。知道每条 SQL 属于哪一类，能帮你更快定位问题。
+
+## 创建数据库和表
+
+### 创建数据库
+
+进入 MySQL 命令行后，先看看当前有哪些数据库：
+
+```sql
+-- 查看所有数据库
+SHOW DATABASES;
+```
+
+你会看到 MySQL 自带的几个数据库：`information_schema`（存储元数据）、`mysql`（存储用户和权限）、`performance_schema`（性能监控）、`sys`（系统视图）。这些是 MySQL 的系统库，不要动它们。
+
+现在创建我们自己的数据库：
+
+```sql
+-- 创建任务管理数据库，指定字符集和排序规则
+CREATE DATABASE IF NOT EXISTS task_manager
+  CHARACTER SET utf8mb4
+  COLLATE utf8mb4_unicode_ci;
+
+-- 切换到这个数据库
+USE task_manager;
+
+-- 确认当前使用的数据库
+SELECT DATABASE();
+```
+
+`IF NOT EXISTS` 是一个好习惯——如果数据库已经存在，不会报错，而是静默跳过。`CHARACTER SET utf8mb4` 指定字符集为 utf8mb4，`COLLATE utf8mb4_unicode_ci` 指定排序规则（`ci` 表示 case-insensitive，即不区分大小写）。
+
+如果需要查看数据库的创建信息：
+
+```sql
+-- 查看数据库的完整定义
+SHOW CREATE DATABASE task_manager;
+```
+
+### 创建任务表
+
+有了数据库，接下来创建表。我们先建一个简单的任务表，用于存储任务管理应用的数据：
+
+```sql
+-- 创建任务表
+CREATE TABLE IF NOT EXISTS tasks (
+  id          BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT COMMENT '任务ID',
+  title       VARCHAR(200) NOT NULL COMMENT '任务标题',
+  description TEXT COMMENT '任务详细描述',
+  status      ENUM('todo', 'in_progress', 'done') DEFAULT 'todo' COMMENT '任务状态',
+  priority    TINYINT UNSIGNED DEFAULT 0 COMMENT '优先级：0普通 1重要 2紧急',
+  created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
+  updated_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci COMMENT='任务表';
+```
+
+逐行解读：
+
+- `id` 用 `BIGINT UNSIGNED`（无符号大整数）做主键，`AUTO_INCREMENT` 让 MySQL 自动生成递增的 ID，不需要手动指定。
+- `title` 用 `VARCHAR(200)` 存储任务标题，`NOT NULL` 表示不允许为空。
+- `description` 用 `TEXT` 存储可能很长的描述内容。
+- `status` 用 `ENUM` 限制只能取三个值，避免写入无效状态。
+- `priority` 用 `TINYINT UNSIGNED` 存优先级，`DEFAULT 0` 设置默认值为普通。
+- `created_at` 和 `updated_at` 用 `TIMESTAMP`，`DEFAULT CURRENT_TIMESTAMP` 让创建时自动填入当前时间，`ON UPDATE CURRENT_TIMESTAMP` 让每次更新时自动刷新。
+- 每个字段后面的 `COMMENT` 是字段注释——这是给团队看的文档，也是给未来的自己看的备忘录。
+- 表级别的 `COMMENT='任务表'` 说明这张表的用途。
+
+建好之后，验证一下：
+
+```sql
+-- 查看表结构
+DESC tasks;
+
+-- 查看完整的建表语句
+SHOW CREATE TABLE tasks;
+```
+
+`DESC` 是 `DESCRIBE` 的简写，会显示每个字段的名称、类型、是否允许 NULL、键信息、默认值和额外属性。
+
+## 第一个 CRUD：增删改查
+
+表建好了，现在往里面放数据。这里我们用一个任务管理场景贯穿后续所有操作。
+
+### INSERT：插入数据
+
+```sql
+-- 插入一条任务
+INSERT INTO tasks (title, description, status, priority)
+VALUES ('完成项目方案', '编写 Q2 项目方案文档，包含时间线和资源需求', 'in_progress', 2);
+```
+
+`id`、`created_at`、`updated_at` 三个字段没有指定值，因为它们有默认值或自动生成机制。MySQL 会自动为 `id` 分配 1，为两个时间字段填入当前时间。
+
+批量插入更高效——一次 INSERT 比多次 INSERT 快得多：
+
+```sql
+-- 批量插入多条任务
+INSERT INTO tasks (title, description, status, priority) VALUES
+  ('设计数据库 ER 图', '根据需求文档设计数据库表结构和关系', 'todo', 1),
+  ('代码评审', '评审前端团队提交的用户模块 PR', 'todo', 1),
+  ('修复登录 Bug', '用户反馈在 Safari 上无法正常登录', 'in_progress', 2),
+  ('编写单元测试', '为订单模块补充单元测试，覆盖率达到 80%', 'todo', 0),
+  ('部署测试环境', '将最新代码部署到测试服务器并验证', 'done', 0);
+```
+
+### SELECT：查询数据
+
+查询是最常用的操作。先看看所有任务：
+
+```sql
+-- 查询所有任务
+SELECT * FROM tasks;
+```
+
+`SELECT *` 会返回所有列，写起来方便，但在生产环境中不建议使用——只查需要的列性能更好，意图也更清晰：
+
+```sql
+-- 只查询需要的列
+SELECT id, title, status, priority, created_at FROM tasks;
+```
+
+加条件筛选：
+
+```sql
+-- 查询所有"待办"任务
+SELECT title, priority FROM tasks WHERE status = 'todo';
+
+-- 查询高优先级任务
+SELECT title, status FROM tasks WHERE priority >= 1;
+```
+
+排序和限制结果数量：
+
+```sql
+-- 按优先级从高到低，创建时间从新到旧排序
+SELECT title, priority, created_at FROM tasks
+  ORDER BY priority DESC, created_at DESC;
+
+-- 只取前 3 条（适合"最新任务"之类的场景）
+SELECT title FROM tasks ORDER BY created_at DESC LIMIT 3;
+```
+
+### UPDATE：更新数据
+
+更新数据时，**永远不要忘记写 WHERE 条件**。没有 WHERE 的 UPDATE 会修改表中所有行，这在生产环境是灾难级的操作：
+
+```sql
+-- 将"设计数据库 ER 图"的状态改为"进行中"
+UPDATE tasks
+  SET status = 'in_progress'
+  WHERE title = '设计数据库 ER 图';
+
+-- 将所有"进行中"的任务优先级提升为紧急
+UPDATE tasks
+  SET priority = 2
+  WHERE status = 'in_progress';
+```
+
+`SET` 后面可以同时更新多个字段：
+
+```sql
+-- 同时更新状态和描述
+UPDATE tasks
+  SET status = 'done',
+      description = CONCAT(description, '（已完成）')
+  WHERE title = '部署测试环境';
+```
+
+### DELETE：删除数据
+
+和 UPDATE 一样，**WHERE 条件是必须的**：
+
+```sql
+-- 删除指定任务
+DELETE FROM tasks WHERE title = '修复登录 Bug';
+```
+
+如果想清空整张表的数据，有两种方式：
+
+```sql
+-- 方式一：DELETE FROM tasks;
+-- 逐行删除，速度慢，可以通过 WHERE 筛选，可回滚，不重置自增 ID
+
+-- 方式二：TRUNCATE TABLE tasks;
+-- 直接清空整张表，速度快，不可回滚，重置自增 ID
+```
+
+TRUNCATE 本质上是 DROP TABLE + CREATE TABLE，所以比 DELETE 快得多，但也更危险——它是 DDL 操作，不能回滚。
+
+## 查看和管理表
+
+操作过程中，经常需要查看数据库和表的状态：
+
+```sql
+-- 查看当前数据库的所有表
+SHOW TABLES;
+
+-- 查看表结构（字段名、类型、是否为空、键信息、默认值）
+DESC tasks;
+
+-- 查看完整的建表语句（包含引擎、字符集、索引等所有信息）
+SHOW CREATE TABLE tasks;
+
+-- 查看表的索引
+SHOW INDEX FROM tasks;
+
+-- 查看表的状态（行数、大小、引擎等）
+SHOW TABLE STATUS LIKE 'tasks';
+```
+
+如果需要修改表结构，使用 `ALTER TABLE`：
+
+```sql
+-- 添加新字段
+ALTER TABLE tasks
+  ADD COLUMN assignee VARCHAR(50) COMMENT '负责人'
+  AFTER priority;
+
+-- 修改字段类型
+ALTER TABLE tasks
+  MODIFY COLUMN priority TINYINT UNSIGNED DEFAULT 0 COMMENT '优先级：0普通 1重要 2紧急';
+
+-- 删除字段
+ALTER TABLE tasks
+  DROP COLUMN assignee;
+```
+
+删除表和数据库要格外谨慎：
+
+```sql
+-- 删除表（数据和结构都会被删除）
+DROP TABLE IF EXISTS tasks;
+
+-- 删除数据库（所有表和数据都会被删除）
+DROP DATABASE IF EXISTS task_manager;
+```
+
+`IF EXISTS` 防止表或数据库不存在时报错，但删除操作本身是不可逆的。生产环境中，执行 DROP 之前务必确认已备份。
+
+## 命名规范和注释：写别人能看懂的 SQL
+
+SQL 代码不只写给机器执行，更是写给人看的。命名规范和注释决定了你的 SQL 是"三周后自己都看不懂"还是"新同事一眼就明白"。
+
+### 命名规范
+
+```sql
+-- 数据库名：小写、下划线分隔、有业务含义
+CREATE DATABASE task_manager;       -- 好
+CREATE DATABASE TaskManager;        -- 不好：Windows 下不区分大小写，Linux 下区分，会出问题
+
+-- 表名：小写、下划线分隔、使用复数
+CREATE TABLE tasks;                 -- 好
+CREATE TABLE task;                  -- 不好：单数形式不符合惯例
+CREATE TABLE tb_tasks;              -- 不好：无意义的前缀
+
+-- 字段名：小写、下划线分隔
+title, created_at, assignee_id      -- 好
+title, createdAt, assigneeId        -- 不好：驼峰命名在 SQL 中不常见
+
+-- 索引名：idx_ 开头，包含字段名
+CREATE INDEX idx_status ON tasks(status);              -- 好：一眼看出索引的字段
+CREATE INDEX idx_status_created ON tasks(status, created_at);  -- 复合索引用下划线连接字段名
+CREATE INDEX index1 ON tasks(status);                  -- 不好：index1 没有任何信息量
+```
+
+核心原则就一条：**小写 + 下划线**。MySQL 在不同操作系统下对大小写的处理方式不一致（Windows 不区分、Linux 区分），统一用小写可以避免跨平台问题。
+
+### 注释
+
+SQL 支持三种注释方式：
+
+```sql
+-- 单行注释：两个横线加空格（最常用）
+
+# 单行注释：MySQL 特有风格
+
+/*
+  多行注释
+  适合解释复杂的业务逻辑
+*/
+
+-- 字段注释和表注释用 COMMENT
+CREATE TABLE tasks (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT COMMENT '任务ID'
+) COMMENT='任务表';
+```
+
+字段注释是数据库级别的文档。DBeaver、MySQL Workbench 等工具会直接显示 COMMENT 内容，比单独维护一份文档更可靠——因为代码和文档在同一个地方，不会出现"文档和实际不一致"的情况。
+
+## Trade-off：入门阶段需要知道的取舍
+
+这篇文章覆盖了 MySQL 入门的方方面面，但有几个取舍值得你提前知道：
+
+**Docker vs 本地安装**：Docker 方便、干净、环境一致，但多了 Docker 这一层抽象。如果你在调试网络问题或性能问题，本地安装更容易排查。对于学习阶段，Docker 是更好的选择。
+
+**命令行 vs 图形化工具**：命令行强迫你理解每一条 SQL，图形化工具让你更快完成操作。建议学习阶段用命令行，熟练后再用 DBeaver 提效。
+
+**ENUM vs VARCHAR 存状态**：ENUM 限制了可选值，防止写入无效数据，但新增状态需要 `ALTER TABLE`。VARCHAR 灵活，但没有数据库级别的约束。数据量小、状态变化少时用 ENUM，状态频繁变化时考虑用 VARCHAR 加应用层校验，或者用一张独立的字典表。
+
+**TRUNCATE vs DELETE**：TRUNCATE 快但不可回滚，DELETE 慢但灵活安全。清空大表时用 TRUNCATE，需要条件删除或事务回滚时用 DELETE。
+
+**utf8 vs utf8mb4**：MySQL 的 `utf8` 不是真正的 UTF-8（最多 3 字节），`utf8mb4` 才是完整的 UTF-8（最多 4 字节）。选 `utf8mb4` 几乎没有代价，但能避免 emoji 和生僻字的存储问题。新项目不要犹豫，直接用 `utf8mb4`。
+
+这些都是入门阶段就值得建立的认知。后面几篇文章会在这个基础上，深入表设计、复杂查询、索引优化等更核心的话题。
