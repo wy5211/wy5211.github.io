@@ -1,0 +1,256 @@
+---
+title: "14 JWT 认证"
+date: "2026-03-30"
+summary: "Python 的 JWT 和 Java 的有什么不同？用 PyJWT 和 FastAPI Depends 实现 CMS 的用户认证，对比 Spring Security JWT 的方案。"
+tags: ["Python", "FastAPI", "JWT", "认证"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 实战"
+seriesOrder: 14
+---
+
+## 一个真实的问题
+
+上一篇我们完成了博客 CMS 的 CRUD API，但所有接口都是裸奔的。你可能会问：为什么不直接把 Spring Security 的那一套搬过来？答案是没有必要 -- Python 生态的 JWT 认证方式有本质区别。
+
+在 Spring Boot 中，JWT 认证通常依赖 `spring-security-oauth2-resource-server`，通过一系列 Filter、Provider、Configurer 组装，配置类动辄上百行。而 Python 的做法更直接：用 PyJWT 库生成和验证 Token，用 FastAPI 的 `Depends` 机制做依赖注入式的认证守卫。两种方式最终效果一样，但思维模型完全不同。
+
+本文会用 CMS 系统的用户注册、登录、Token 认证场景，把两种方案的差异讲清楚。
+
+---
+
+## JWT 认证的整体流程
+
+不管是 Python 还是 Java，JWT 认证的流程是相同的：
+
+```
+用户注册 -> 密码哈希存库
+用户登录 -> 验证密码 -> 签发 Access Token + Refresh Token
+请求 API  -> 携带 Bearer Token -> 服务端验证 -> 放行或拒绝
+Token 过期 -> 用 Refresh Token 换新 Token
+```
+
+区别在于**实现方式**：Spring Boot 用 Filter Chain + Provider，Python 用函数 + `Depends`。
+
+---
+
+## 密码哈希：passlib vs BCryptPasswordEncoder
+
+密码存储永远是明文禁忌。Spring Boot 中通常用 `BCryptPasswordEncoder`，Python 生态对应的是 `passlib`。
+
+```python
+# app/core/security.py
+from passlib.context import CryptContext
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+```
+
+对应 Spring Boot 的写法：
+
+```java
+// Java / Spring Security
+PasswordEncoder encoder = new BCryptPasswordEncoder();
+String hashed = encoder.encode(rawPassword);
+boolean match = encoder.matches(rawPassword, hashedPassword);
+```
+
+行为完全一致，都使用 bcrypt 算法，加盐存储。区别在于 Java 把编码器作为 Spring Bean 注入，Python 直接实例化模块级对象。Python 的方式更简洁，因为 `CryptContext` 本身就是线程安全的，不需要容器管理。
+
+---
+
+## Token 管理：PyJWT vs jjwt
+
+Spring Boot 常用的 JWT 库是 `jjwt` 或 `nimbus-jose-jwt`，Python 生态最主流的是 `PyJWT`。
+
+```python
+# app/core/jwt.py
+from datetime import datetime, timedelta, timezone
+from jose import jwt, JWTError
+from app.config import settings
+
+def create_access_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=settings.access_token_expire)
+    to_encode.update({"exp": expire, "type": "access"})
+    return jwt.encode(to_encode, settings.secret_key, algorithm=settings.algorithm)
+
+def decode_token(token: str) -> dict | None:
+    try:
+        return jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+    except JWTError:
+        return None
+```
+
+这里的 `jose` 库（全称 `python-jose`）是 Python JWT 领域最成熟的方案，相当于 Java 的 `jjwt`。编码、解码各一行调用，不需要像 Java 那样构建 `JwtParserBuilder` 或配置 `Jws<Claims>`。
+
+配置方面，Spring Boot 通常在 `application.yml` 中配置 JWT 参数，Python 用 Pydantic Settings：
+
+```python
+# app/config.py
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    secret_key: str = "change-me-in-production"
+    algorithm: str = "HS256"
+    access_token_expire: int = 30       # 分钟
+    refresh_token_expire: int = 7        # 天
+    model_config = {"env_file": ".env"}
+
+settings = Settings()
+```
+
+---
+
+## 认证守卫：Depends vs @PreAuthorize
+
+这是 Python 和 Java 在认证实现上差异最大的地方。
+
+Spring Security 的认证逻辑藏在 Filter Chain 里，通过 `SecurityFilterChain` 配置，再用 `@PreAuthorize("hasRole('ADMIN')")` 注解控制权限。开发者需要理解 Filter 的执行顺序、Provider 的加载机制，调试时链路很长。
+
+FastAPI 的做法完全不同 -- 认证就是一个普通函数，通过 `Depends` 注入到路由参数中：
+
+```python
+# app/core/deps.py
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.database import get_db
+from app.core.jwt import decode_token
+from app.services.user_service import UserService
+from app.models.user import User
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db),
+) -> User:
+    payload = decode_token(token)
+    if payload is None or payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Invalid token")
+    user_id = payload.get("sub")
+    user = await UserService.get_by_id(db, int(user_id))
+    if not user or not user.is_active:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+class RoleChecker:
+    """基于角色的权限检查 -- 类似 @PreAuthorize("hasRole('ADMIN')")"""
+    def __init__(self, *allowed_roles: str):
+        self.allowed_roles = allowed_roles
+
+    def __call__(self, user: User = Depends(get_current_user)) -> User:
+        if user.is_superuser:
+            return user
+        if user.role not in self.allowed_roles:
+            raise HTTPException(status_code=403, detail="Permission denied")
+        return user
+```
+
+使用时，在路由参数中声明即可：
+
+```python
+from app.core.deps import get_current_user, RoleChecker
+
+@router.post("/")
+async def create_post(
+    post_data: PostCreate,
+    user: User = Depends(get_current_user),        # 需要登录
+    db: AsyncSession = Depends(get_db),
+):
+    return await PostService.create(db, post_data, author_id=user.id)
+
+@router.delete("/{post_id}")
+async def delete_post(
+    post_id: int,
+    user: User = Depends(RoleChecker("admin")),     # 需要管理员权限
+    db: AsyncSession = Depends(get_db),
+):
+    await PostService.delete(db, post_id, user.id)
+```
+
+没有 Filter Chain，没有 `WebSecurityConfigurerAdapter`，没有 `@EnableWebSecurity`。认证逻辑就是一个函数，权限检查就是一个可调用对象，通过 `Depends` 组合。
+
+---
+
+## 注册与登录接口
+
+有了上面的基础设施，注册和登录接口就很简洁：
+
+```python
+# app/routers/auth.py
+from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy.ext.asyncio import AsyncSession
+from app.database import get_db
+from app.core.security import hash_password, verify_password
+from app.core.jwt import create_access_token, create_refresh_token
+from app.core.deps import get_current_user
+from app.services.user_service import UserService
+from app.schemas.auth import RegisterRequest, TokenResponse, UserMeResponse
+from app.models.user import User
+
+router = APIRouter(prefix="/auth", tags=["认证"])
+
+@router.post("/register", response_model=UserMeResponse, status_code=201)
+async def register(data: RegisterRequest, db: AsyncSession = Depends(get_db)):
+    existing = await UserService.get_by_username(db, data.username)
+    if existing:
+        raise HTTPException(status_code=400, detail="Username already exists")
+    user = await UserService.create(db, data, hashed_password=hash_password(data.password))
+    return user
+
+@router.post("/login", response_model=TokenResponse)
+async def login(form: OAuth2PasswordRequestForm = Depends(), db: AsyncSession = Depends(get_db)):
+    user = await UserService.get_by_username(db, form.username)
+    if not user or not verify_password(form.password, user.hashed_password):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    token_data = {"sub": str(user.id), "username": user.username, "role": user.role}
+    return TokenResponse(
+        access_token=create_access_token(token_data),
+        refresh_token=create_refresh_token(token_data),
+    )
+
+@router.get("/me", response_model=UserMeResponse)
+async def get_me(user: User = Depends(get_current_user)):
+    return user
+```
+
+`OAuth2PasswordRequestForm` 让 Swagger UI 的 Authorize 按钮直接可用，这一点和 Spring Security 的 OAuth2 配置效果一样，但不需要写任何 `SecurityFilterChain` 配置。
+
+---
+
+## 对比总结
+
+| 维度       | Spring Boot                                | FastAPI / Python                   |
+| ---------- | ------------------------------------------ | ---------------------------------- |
+| JWT 库     | jjwt / nimbus-jose-jwt                     | python-jose / PyJWT                |
+| 密码哈希   | BCryptPasswordEncoder (Bean)               | passlib.CryptContext (模块级)      |
+| Token 提取 | 自定义 Filter 或 OncePerRequestFilter      | OAuth2PasswordBearer (自动提取)    |
+| 认证守卫   | @PreAuthorize 注解 + SecurityFilterChain   | Depends(get_current_user) 函数参数 |
+| 权限控制   | hasRole('ADMIN') 表达式                    | RoleChecker("admin") 可调用对象    |
+| 配置方式   | application.yml + @ConfigurationProperties | Pydantic Settings + .env           |
+| 学习曲线   | 需要理解 Filter Chain、Provider 机制       | 认证就是一个普通函数               |
+
+Spring Security 的优势在于它的体系化 -- Filter Chain 可以统一处理认证、CORS、CSRF 等安全关切，适合大型企业应用。FastAPI 的优势在于透明性 -- 认证逻辑就是代码，读一个函数就知道做了什么，调试链路短。
+
+---
+
+## Trade-off
+
+选择 FastAPI 的 JWT 方案，你获得的是**简洁和透明**：认证逻辑是一个可读的函数，权限控制是一个可组合的依赖，整个链路不超过 50 行代码。代价是缺少 Spring Security 那样的开箱即用的安全基础设施（CSRF 防护、Session 管理、LDAP 集成等），这些在 Python 中需要自己组装。
+
+对于 CMS 这种中等规模的应用，FastAPI 的方案完全够用，而且开发效率明显更高。
+
+---
+
+## 回顾与预告
+
+到目前为止，我们已经完成了 CMS 的核心功能链路：数据建模（第 12 篇）-> CRUD API（第 13 篇）-> JWT 认证（本篇）。下一步的问题是：如何确保 API 接收到的数据是合法的？下一篇将深入 Pydantic v2 的数据验证进阶，从 CMS 文章创建的复杂验证场景出发，对比 Java Bean Validation 的方案。

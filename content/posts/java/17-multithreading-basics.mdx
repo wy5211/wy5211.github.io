@@ -1,0 +1,373 @@
+---
+title: "17 多线程基础"
+date: "2026-03-30"
+summary: "JS 是单线程的，Java 呢？从 CMS 批量生成文章摘要出发，理解 Thread、Runnable 和线程池的使用场景。"
+tags: ["Java", "多线程", "线程池", "并发"]
+category: "java"
+cover: ""
+draft: false
+series: "Java 渐进式实战"
+seriesOrder: 17
+---
+
+CMS 需要一个"批量生成摘要"功能：用户点了按钮，系统对 50 篇文章逐一调用 AI 接口生成摘要，然后更新数据库。假设每次 AI 调用耗时 2 秒，串行处理需要 100 秒——用户盯着进度条等了快两分钟，体验很差。
+
+在 Node.js 里，你会用 `Promise.all()` 并发请求：
+
+```js
+const summaries = await Promise.all(
+  posts.map((post) => generateSummary(post.content))
+);
+```
+
+Node.js 虽然是单线程，但通过事件循环和异步 IO 实现了并发——在等待 AI 接口响应的时间里，事件循环可以去发下一个请求。50 个请求几乎同时发出，总耗时约 2 秒（而不是 100 秒）。
+
+Java 没有事件循环（至少在标准库层面没有）。Java 的并发模型是**多线程**——直接创建多个操作系统线程，每个线程独立执行。这是 Java 和 JS 在并发处理上最根本的区别。
+
+## JS 的事件循环 vs Java 的多线程
+
+先理清两种模型的核心差异。
+
+**JS（Node.js）**：单线程 + 事件循环。所有代码在一个线程里运行，遇到异步操作（IO、网络请求、定时器）时，把回调注册到事件队列，线程继续执行后续代码。当异步操作完成，回调被放入队列，事件循环在空闲时取出执行。IO 操作由操作系统的底层线程处理，JS 线程本身不阻塞。
+
+```
+JS 线程: [执行代码] -> [注册回调] -> [执行代码] -> [注册回调]
+                          ↓                      ↓
+事件队列:              [回调A]                [回调B]
+                          ↓                      ↓
+JS 线程:            [执行回调A]            [执行回调B]
+```
+
+CPU 密集型任务（大量计算、加密、压缩）会阻塞事件循环，导致整个程序卡住。这就是 Node.js 需要 Worker Threads 的原因。
+
+**Java**：多线程。主线程可以创建新线程，新线程拥有独立的调用栈和程序计数器，和主线程并行运行。操作系统调度线程在 CPU 核心上执行，多核 CPU 上多个线程真正同时运行。
+
+```
+主线程:     [启动线程1] [启动线程2] [等待完成]
+线程1:          [生成摘要1] [生成摘要2] [生成摘要3]
+线程2:          [生成摘要4] [生成摘要5] [生成摘要6]
+```
+
+Java 的多线程是真正的并行——两个线程在两个 CPU 核心上同时执行 CPU 密集型任务，不需要"让出控制权"的概念。代价是多线程带来了共享数据的同步问题（下一篇会讲）。
+
+## Thread：最原始的线程创建
+
+Java 创建线程最直接的方式是继承 `Thread` 类：
+
+```java
+public class SummaryGenerator extends Thread {
+
+    private final Post post;
+
+    public SummaryGenerator(Post post) {
+        this.post = post;
+    }
+
+    @Override
+    public void run() {
+        String summary = generateSummary(post.getContent());
+        post.setSummary(summary);
+        System.out.println(getName() + " 完成: " + post.getTitle());
+    }
+
+    private String generateSummary(String content) {
+        try {
+            Thread.sleep(2000); // 模拟 AI 调用耗时
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return content.substring(0, Math.min(100, content.length())) + "...";
+    }
+}
+```
+
+使用：
+
+```java
+SummaryGenerator t1 = new SummaryGenerator(post1);
+SummaryGenerator t2 = new SummaryGenerator(post2);
+
+t1.start();  // 启动新线程，执行 run()
+t2.start();  // t1 和 t2 并行运行
+
+t1.join();   // 主线程等待 t1 完成
+t2.join();   // 主线程等待 t2 完成
+```
+
+注意 `start()` 和 `run()` 的区别。`start()` 创建一个新的操作系统线程并执行 `run()` 方法；直接调用 `run()` 只是在当前线程里执行方法体，不会创建新线程。这是一个常见的错误。
+
+`join()` 让当前线程等待目标线程结束。主线程调用 `t1.join()` 后会阻塞，直到 t1 的 `run()` 执行完毕。这和 JS 的 `await promise` 概念类似——"等这个东西做完再继续"。
+
+## Runnable：更好的方式
+
+继承 `Thread` 有一个问题——Java 只支持单继承。如果 `SummaryGenerator` 已经继承了其他类（比如某个基类），就不能再继承 `Thread`。更推荐的方式是实现 `Runnable` 接口：
+
+```java
+public class SummaryTask implements Runnable {
+
+    private final Post post;
+
+    public SummaryTask(Post post) {
+        this.post = post;
+    }
+
+    @Override
+    public void run() {
+        String summary = generateSummary(post.getContent());
+        post.setSummary(summary);
+        System.out.println(Thread.currentThread().getName()
+            + " 完成: " + post.getTitle());
+    }
+
+    private String generateSummary(String content) {
+        try {
+            Thread.sleep(2000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return content.substring(0, Math.min(100, content.length())) + "...";
+    }
+}
+```
+
+使用时把 `Runnable` 传给 `Thread`：
+
+```java
+Thread t1 = new Thread(new SummaryTask(post1), "摘要线程-1");
+Thread t2 = new Thread(new SummaryTask(post2), "摘要线程-2");
+
+t1.start();
+t2.start();
+
+t1.join();
+t2.join();
+```
+
+第二个参数是线程名称，方便调试时在日志中区分线程。
+
+有了 Lambda 表达式，`Runnable` 的写法可以更简洁——`Runnable` 是一个函数式接口，只有一个 `run()` 方法：
+
+```java
+new Thread(() -> {
+    String summary = generateSummary(post.getContent());
+    post.setSummary(summary);
+    System.out.println("完成: " + post.getTitle());
+}, "摘要线程-1").start();
+```
+
+对比 JS 的并发写法，概念类似但语法不同：
+
+```js
+// JS：Promise + 事件循环
+const promise = generateSummary(post.content) // 返回 Promise，不阻塞
+
+// Java：Thread + 多线程
+new Thread(() -> generateSummary(post)).start() // 创建新线程，不阻塞
+```
+
+两者都是"发起任务，不等待完成"。区别在于底层实现：JS 的 Promise 依赖事件循环调度，Java 的 Thread 直接创建操作系统线程。
+
+## 线程的生命周期
+
+Java 线程有 6 种状态，定义在 `Thread.State` 枚举中：
+
+```
+NEW → RUNNABLE → (BLOCKED / WAITING / TIMED_WAITING) → TERMINATED
+```
+
+- **NEW**：线程对象已创建，但 `start()` 还没调用
+- **RUNNABLE**：已调用 `start()`，线程可以运行（可能在等待 CPU 调度）
+- **BLOCKED**：等待获取 synchronized 锁
+- **WAITING**：调用 `Object.wait()` 或 `Thread.join()` 无限期等待
+- **TIMED_WAITING**：调用 `Thread.sleep()` 或 `Object.wait(timeout)` 有时限等待
+- **TERMINATED**：`run()` 执行完毕或抛出未捕获的异常
+
+你可以通过 `thread.getState()` 查看线程当前状态：
+
+```java
+Thread thread = new Thread(() -> {
+    try {
+        Thread.sleep(1000);
+    } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+    }
+});
+
+System.out.println(thread.getState()); // NEW
+
+thread.start();
+System.out.println(thread.getState()); // RUNNABLE
+
+Thread.sleep(100);
+System.out.println(thread.getState()); // TIMED_WAITING（sleep 中）
+
+thread.join();
+System.out.println(thread.getState()); // TERMINATED
+```
+
+JS 没有对应的概念——JS 只有一个主线程，没有"线程状态"可言。Worker Threads 有 `running`、`exited` 等状态，但 API 层面不暴露 `BLOCKED`、`WAITING` 这些细粒度状态。
+
+## 线程的 sleep 和 interrupt
+
+`Thread.sleep()` 让当前线程暂停指定毫秒数。它抛出 `InterruptedException`——如果线程在 sleep 期间被其他线程调用 `interrupt()`，sleep 会立刻中断并抛出异常。
+
+```java
+Thread worker = new Thread(() -> {
+    for (int i = 0; i < 10; i++) {
+        if (Thread.currentThread().isInterrupted()) {
+            System.out.println("收到中断信号，退出");
+            return;
+        }
+        System.out.println("处理中: " + i);
+        try {
+            Thread.sleep(1000);
+        } catch (InterruptedException e) {
+            System.out.println("sleep 被中断");
+            Thread.currentThread().interrupt(); // 恢复中断标志
+            return;
+        }
+    }
+});
+
+worker.start();
+Thread.sleep(3000);
+worker.interrupt(); // 3 秒后中断 worker
+```
+
+Java 没有 `Thread.stop()`（已废弃，不安全）。中断线程的标准做法是调用 `interrupt()`，线程内部通过检查 `isInterrupted()` 或捕获 `InterruptedException` 来响应。这是一种协作式中断——你请求线程停止，但线程自己决定什么时候停止。
+
+JS 的 `AbortController` 概念类似——你发信号请求取消，Promise 内部检查信号并提前退出。但 JS 没有语言级别的中断机制，取消 Promise 靠的是库层面的约定（比如 `fetch` 的 `AbortSignal`）。
+
+## ExecutorService：线程池
+
+CMS 有 50 篇文章需要生成摘要。如果每篇文章创建一个线程，就是 50 个线程。操作系统线程是昂贵资源——每个线程默认栈大小约 1MB，50 个线程就是 50MB 栈内存，加上线程创建和销毁的开销。如果文章数量增加到 500 篇，500 个线程同时运行，系统可能扛不住。
+
+线程池解决的是"线程复用"问题——预先创建固定数量的线程，任务提交到池中排队执行，线程执行完一个任务后接着执行下一个，不会频繁创建和销毁。
+
+```java
+import java.util.concurrent.*;
+
+public class BatchSummaryGenerator {
+
+    public static void generateSummaries(List<Post> posts) throws InterruptedException {
+        // 创建固定大小为 5 的线程池
+        ExecutorService executor = Executors.newFixedThreadPool(5);
+
+        for (Post post : posts) {
+            executor.submit(() -> {
+                String summary = generateSummary(post.getContent());
+                post.setSummary(summary);
+                System.out.println(Thread.currentThread().getName()
+                    + " 完成: " + post.getTitle());
+            });
+        }
+
+        // 关闭线程池，等待所有任务完成
+        executor.shutdown();
+        executor.awaitTermination(10, TimeUnit.MINUTES);
+    }
+
+    private static String generateSummary(String content) {
+        try {
+            Thread.sleep(2000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return content.substring(0, Math.min(100, content.length())) + "...";
+    }
+}
+```
+
+`Executors.newFixedThreadPool(5)` 创建一个包含 5 个线程的池。50 个任务提交后，5 个线程同时执行，每个线程串行处理 10 个任务。总耗时约 20 秒（50 / 5 \* 2），比串行的 100 秒快了 5 倍。
+
+线程池的大小怎么选？一个经验公式：**CPU 密集型任务用 `Runtime.getRuntime().availableProcessors()` 个线程，IO 密集型任务用更大的线程数**。AI 摘要生成是 IO 密集型（大部分时间在等网络响应），线程数可以设大一些（比如 10-20）。CPU 密集型任务（比如图片压缩）线程数不宜超过 CPU 核心数，因为更多线程也不会带来加速，反而增加上下文切换的开销。
+
+JS 没有线程池的概念——事件循环本身就是"单线程池"。但 Node.js 的 `worker_threads` 模块可以创建 Worker 线程池，用于 CPU 密集型任务：
+
+```js
+const { Worker } = require("worker_threads");
+
+// JS 的 Worker 线程池需要自己实现或用第三方库
+// worker_threads 的开销比 Java 线程大得多
+// 通常用于少量 CPU 密集型任务，不适合像 Java 线程池那样大规模复用
+```
+
+## CMS 场景：带结果收集的批量处理
+
+上面的例子中，每个线程直接修改了 `Post` 对象。在真实项目中，你可能需要收集每个任务的结果。`Callable` 和 `Future` 提供了返回值的能力：
+
+```java
+public static Map<Long, String> generateSummaries(List<Post> posts)
+        throws InterruptedException, ExecutionException {
+
+    ExecutorService executor = Executors.newFixedThreadPool(5);
+    Map<Long, Future<String>> futures = new HashMap<>();
+
+    for (Post post : posts) {
+        Future<String> future = executor.submit(() -> {
+            return generateSummary(post.getContent());
+        });
+        futures.put(post.getId(), future);
+    }
+
+    // 收集结果
+    Map<Long, String> results = new HashMap<>();
+    for (Map.Entry<Long, Future<String>> entry : futures.entrySet()) {
+        results.put(entry.getKey(), entry.getValue().get());
+    }
+
+    executor.shutdown();
+    return results;
+}
+```
+
+`executor.submit(Callable)` 返回 `Future<T>`，调用 `future.get()` 会阻塞直到任务完成并返回结果。这和 JS 的 `await promise` 行为一致——"等这个异步任务返回结果"。
+
+区别在于 Java 的 `Future.get()` 是阻塞调用，会冻结当前线程；JS 的 `await` 不阻塞——它把后续代码注册为回调，当前线程（事件循环）继续处理其他任务。如果你在 Java 的主线程里连续调用 50 个 `future.get()`，虽然线程池里的 5 个线程在并行工作，但主线程在逐个等待，看起来像是串行的。
+
+更好的做法是用 `invokeAll()` 一次性提交所有任务，它会在所有任务完成后返回：
+
+```java
+List<Callable<String>> tasks = posts.stream()
+    .map(post -> (Callable<String>) () -> generateSummary(post.getContent()))
+    .collect(Collectors.toList());
+
+List<Future<String>> results = executor.invokeAll(tasks);
+// 所有任务完成后才会到达这里
+```
+
+## JS vs Java 并发模型对比
+
+| 特性                | Node.js                      | Java                                      |
+| ------------------- | ---------------------------- | ----------------------------------------- |
+| 并发模型            | 单线程 + 事件循环            | 多线程                                    |
+| 创建并发单元        | `Promise` / `async function` | `Thread` / `Runnable` / `Callable`        |
+| 等待结果            | `await promise`（不阻塞）    | `future.get()`（阻塞） / `join()`（阻塞） |
+| 并行 CPU 密集型任务 | Worker Threads（开销大）     | 多线程（原生支持，开销小）                |
+| 并行 IO 密集型任务  | 事件循环天然支持             | 多线程 / 线程池                           |
+| 线程池              | 无内置支持，需自己实现       | `ExecutorService`（内置）                 |
+| 共享数据            | 不需要同步（单线程）         | 需要 synchronized / Lock（下一篇讲）      |
+| 线程安全            | 不存在线程安全问题           | 是核心挑战                                |
+| 取消任务            | AbortController              | Thread.interrupt()                        |
+
+两种模型各有适用场景。IO 密集型（网络请求、文件读写、数据库查询）是 Node.js 的强项——事件循环在等待 IO 时不浪费 CPU，单线程也意味着没有同步问题。CPU 密集型（图片处理、加密、大规模计算）是 Java 多线程的优势——多个线程在多核 CPU 上真正并行执行，没有"阻塞事件循环"的风险。
+
+CMS 的 AI 摘要生成是 IO 密集型任务（等网络响应），两种模型都能高效处理。但如果 CMS 还需要做图片压缩（CPU 密集型），Java 的多线程模型更合适。
+
+## Trade-off
+
+Java 多线程的代价首先是复杂度。多线程共享数据需要同步，同步不当会导致竞态条件（race condition）、死锁（deadlock）、可见性问题（visibility）等并发 bug。这类 bug 很难复现和调试——它们只在特定的线程调度时序下才会出现。下一篇会专门讲同步机制。
+
+其次是资源开销。操作系统线程不是免费的——每个线程消耗栈内存（默认约 1MB）、线程创建和销毁需要系统调用、上下文切换有 CPU 开销。线程池缓解了这个问题，但线程数量仍然有上限。
+
+还有一个容易被忽略的代价：`Thread.sleep()`、`join()`、`future.get()` 都是阻塞调用。在 Java 的 Web 框架（如 Spring Boot）中，Servlet 线程池的线程数有限（默认 200），如果每个请求都阻塞等待某个耗时操作，线程池很快会被耗尽。这就是为什么现代 Java Web 框架开始引入响应式编程（WebFlux）——用类似事件循环的非阻塞模型替代传统的阻塞模型。
+
+但多线程的优势也很明显：真正的 CPU 并行、成熟的线程池机制、丰富的并发工具类（下一篇的 CountDownLatch、Semaphore 等）。对于 CMS 这种既有 IO 操作（AI 调用、数据库读写）又有 CPU 操作（Markdown 解析、HTML 生成）的应用，多线程是自然的选择。
+
+## 回顾与预告
+
+上一篇讲了 IO 操作——从 CMS 的 Markdown 文件读写出发，理解了字节流与字符流、Reader/Writer 的分层设计，以及 try-with-resources 自动资源管理。本篇讲了多线程基础——从 CMS 批量生成文章摘要出发，理解了 Java 多线程与 JS 事件循环的根本差异：Java 用多线程实现真正的 CPU 并行，JS 用事件循环实现 IO 并发。
+
+`Thread` + `Runnable` 是创建线程的基本方式，`ExecutorService` 线程池是生产环境的标准做法。`Callable` + `Future` 提供了带返回值的异步任务。但多线程共享数据带来的同步问题，本篇只是提及，没有深入——因为那是下一篇的主题。
+
+下一篇讲同步机制——`synchronized` 关键字、`Lock` 接口、以及 volatile 的可见性保证。理解同步，才能安全地使用多线程。
