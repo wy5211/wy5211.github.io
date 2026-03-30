@@ -1,0 +1,853 @@
+---
+title: "05. 数据获取与 API 设计"
+date: "2026-03-23"
+summary: "Server Components 里直接 async/await 获取数据，Server Actions 处理表单提交。但如果你需要给第三方系统提供 Webhook 接口呢？这篇文章帮你理清 Next.js 中数据获取和 API 设计的完整思路。"
+tags: ["Next.js", "API Routes", "Server Actions", "数据获取", "REST API"]
+category: "nextjs"
+cover: ""
+draft: false
+series: "Next.js 渐进式全栈开发"
+seriesOrder: 5
+---
+
+上一篇我们聊了 Server Actions，它让表单提交和数据修改变得异常简洁 -- 写一个 `"use server"` 的函数，直接绑到表单上就行了。但我们的团队任务管理平台不可能只有表单。用户打开项目列表页，数据从哪来？第三方工具（比如 Slack、GitHub）要往你的系统推 Webhook，你怎么接收？这些场景 Server Actions 搞不定，需要另一套思路。
+
+这篇文章就把 Next.js 里"数据怎么进、怎么出"这件事彻底理清楚。
+
+## Server Component 里的数据获取：async/await 直接上
+
+在 App Router 下，Server Component 默认就是异步的。这意味着你可以直接在组件里写 async/await，不需要 useEffect，不需要 SWR，不需要任何客户端数据获取库。
+
+回到我们的团队任务管理平台，项目列表页的数据获取是这样的：
+
+```tsx
+// app/(dashboard)/projects/page.tsx
+// 这是一个 Server Component，可以直接 async
+import { prisma } from "@/lib/prisma";
+import { auth } from "@/lib/auth";
+import { notFound } from "next/navigation";
+import { ProjectCard } from "@/components/projects/project-card";
+
+export default async function ProjectsPage() {
+  // 1. 先确认当前用户身份
+  const session = await auth();
+  if (!session?.user) {
+    // 未登录用户重定向到登录页
+    notFound();
+  }
+
+  // 2. 直接在组件里查数据库，拿到该用户所属团队的所有项目
+  const projects = await prisma.project.findMany({
+    where: {
+      // 只查用户所在团队的项目
+      team: {
+        members: {
+          some: { userId: session.user.id },
+        },
+      },
+    },
+    // 按更新时间倒序
+    orderBy: { updatedAt: "desc" },
+    // 同时查出每个项目的任务计数和成员数
+    include: {
+      _count: {
+        select: { tasks: true, members: true },
+      },
+      members: {
+        select: {
+          user: { select: { id: true, name: true, avatar: true } },
+          role: true,
+        },
+        // 只取前 4 个成员做头像展示
+        take: 4,
+      },
+    },
+  });
+
+  // 3. 直接渲染，数据已经在服务器端准备好了
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <h1 className="text-2xl font-semibold">我的项目</h1>
+        <span className="text-sm text-gray-500">
+          共 {projects.length} 个项目
+        </span>
+      </div>
+
+      {projects.length === 0 ? (
+        <EmptyState />
+      ) : (
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+          {projects.map((project) => (
+            <ProjectCard key={project.id} project={project} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function EmptyState() {
+  return (
+    <div className="text-center py-20">
+      <p className="text-gray-500">还没有项目，点击右上角创建一个吧</p>
+    </div>
+  );
+}
+```
+
+注意这里的关键点：整个组件在服务器执行，数据库查询结果不会发送到客户端的 JS bundle 里。客户端收到的是已经渲染好的 HTML，以及 ProjectCard 这个客户端组件的引用。这种模式下，首屏加载速度会非常快，因为不需要先下载 JS 再发请求再渲染。
+
+## 并行数据获取：别让请求串行等待
+
+假设任务详情页需要同时展示任务信息、关联的评论、以及当前项目的成员列表。如果串行获取，三个请求依次执行，总耗时是三者的加总。用 `Promise.all` 并行获取，总耗时只取决于最慢的那个：
+
+```tsx
+// app/(dashboard)/projects/[projectId]/tasks/[taskId]/page.tsx
+import { prisma } from "@/lib/prisma";
+import { auth } from "@/lib/auth";
+import { notFound } from "next/navigation";
+import { TaskDetail } from "@/components/tasks/task-detail";
+import { CommentSection } from "@/components/comments/comment-section";
+import { MemberList } from "@/components/members/member-list";
+
+export default async function TaskDetailPage({
+  params,
+}: {
+  params: Promise<{ projectId: string; taskId: string }>;
+}) {
+  const session = await auth();
+  if (!session?.user) notFound();
+
+  // params 在 Next.js 15 中是 Promise，需要 await
+  const { projectId, taskId } = await params;
+
+  // 三个查询并行执行，而不是 await 一个再 await 下一个
+  // 这样总耗时 = max(任务查询, 评论查询, 成员查询)
+  // 而不是 任务查询 + 评论查询 + 成员查询
+  const [task, comments, members] = await Promise.all([
+    // 查询任务详情，包含子任务和标签
+    prisma.task.findUnique({
+      where: { id: taskId, projectId },
+      include: {
+        assignee: { select: { id: true, name: true, avatar: true } },
+        reporter: { select: { id: true, name: true, avatar: true } },
+        labels: true,
+        subtasks: {
+          orderBy: { createdAt: "asc" },
+        },
+      },
+    }),
+
+    // 查询任务的评论，按时间正序排列
+    prisma.comment.findMany({
+      where: { taskId },
+      orderBy: { createdAt: "asc" },
+      include: {
+        author: { select: { id: true, name: true, avatar: true } },
+      },
+      take: 50, // 先加载最近 50 条评论
+    }),
+
+    // 查询项目成员列表，用于 @提及 功能
+    prisma.teamMember.findMany({
+      where: { projectId },
+      include: {
+        user: { select: { id: true, name: true, avatar: true } },
+      },
+    }),
+  ]);
+
+  if (!task) notFound();
+
+  return (
+    <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+      {/* 左侧：任务详情和评论，占 2/3 宽度 */}
+      <div className="lg:col-span-2 space-y-8">
+        <TaskDetail task={task} />
+        <CommentSection taskId={taskId} initialComments={comments} />
+      </div>
+
+      {/* 右侧：侧边栏，成员列表 */}
+      <div>
+        <MemberList members={members} />
+      </div>
+    </div>
+  );
+}
+```
+
+`Promise.all` 看起来简单，但实际项目中经常被忽略。一个页面如果有 5 个串行查询，每个 200ms，总耗时就是 1 秒。改成并行后，通常 200-300ms 就能搞定。在数据获取这个环节，这可能是性价比最高的优化。
+
+## fetch 的缓存选项：Next.js 扩展了原生 fetch
+
+如果你的数据不是来自本地数据库，而是调用外部 API（比如 GitHub、Slack），你用的是原生 `fetch`。Next.js 对 `fetch` 做了扩展，加了 `cache` 和 `next.revalidate` 两个选项来控制缓存行为。
+
+在我们的任务管理平台里，假设项目描述里引用了 GitHub Issue 的状态，我们需要从 GitHub API 获取这个信息：
+
+```tsx
+// lib/github.ts
+import { cache } from "react";
+
+// 用 React 的 cache 函数包装，同一请求周期内相同参数只查一次
+// 即使多个组件都调用了这个函数，也只会发一次请求
+export const getGitHubIssue = cache(
+  async (owner: string, repo: string, issueNumber: number) => {
+    // no-store：每次请求都拿最新数据，不缓存
+    // 适合实时性要求高的数据（比如 GitHub Issue 状态）
+    const res = await fetch(
+      `https://api.github.com/repos/${owner}/${repo}/issues/${issueNumber}`,
+      {
+        headers: {
+          Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+          Accept: "application/vnd.github.v3+json",
+        },
+        cache: "no-store",
+      }
+    );
+
+    if (!res.ok) {
+      throw new Error(`GitHub API error: ${res.status}`);
+    }
+
+    return res.json();
+  }
+);
+```
+
+Next.js 扩展的 `fetch` 有三种缓存模式，选择的标准很直观：
+
+**`cache: "no-store"`** -- 每次请求都重新获取。适用于实时数据，比如任务状态、在线人数、库存数量。代价是每次访问都会触发真实的数据库查询或 API 调用。
+
+**`next: { revalidate: N }`** -- N 秒内用缓存，超过 N 秒后台刷新。这是最常用的模式。比如项目列表页数据变化不频繁，设置 60 秒的 revalidate 就很合适：用户 60 秒内看到的是缓存（响应极快），超过 60 秒后 Next.js 会在后台重新生成，下次请求就能看到新数据。
+
+**默认（不传任何选项）** -- 永久缓存，直到手动调用 `revalidatePath` 或 `revalidateTag`。适合几乎不变的数据，比如团队成员的角色配置、项目分类列表。
+
+这里要特别提一个容易踩的坑：Prisma 的查询不是 `fetch`，所以上述缓存选项对 Prisma 不生效。如果你需要对 Prisma 查询做缓存，要用 React 的 `cache()` 函数来包装（就像上面 GitHub 例子中的做法），或者等下一篇聊缓存策略时再深入。
+
+## Route Handlers：什么时候需要传统 API
+
+Server Components 解决了"页面渲染时拿数据"的问题，Server Actions 解决了"用户操作时改数据"的问题。但有些场景，这两者都覆盖不了：
+
+1. **第三方系统需要调用你的接口** -- Slack 要往你的系统推事件通知，GitHub Webhook 要通知你 PR 状态变更，这些第三方系统可不知道什么是 Server Actions，它们只会往一个 URL 发 HTTP 请求。
+
+2. **移动端或桌面端需要独立 API** -- 如果你的任务管理平台以后要做移动 App，App 需要一个纯数据接口，它不关心 HTML 怎么渲染。
+
+3. **需要处理非标准 HTTP 方法** -- 比如你要支持 WebDAV 协议的 PROPFIND 方法，Server Actions 做不到。
+
+这些场景下，Route Handlers（也就是 API Routes）就派上用场了。在 App Router 里，Route Handlers 写在 `app/api/` 目录下：
+
+```ts
+// app/api/projects/route.ts
+import { NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { auth } from "@/lib/auth";
+import { z } from "zod";
+
+// GET /api/projects?teamId=xxx&page=1&limit=20
+// 获取项目列表，供移动端或第三方集成调用
+export async function GET(request: Request) {
+  try {
+    // 1. 验证调用者身份
+    const session = await auth();
+    if (!session?.user) {
+      return NextResponse.json(
+        { error: "未授权访问", code: "UNAUTHORIZED" },
+        { status: 401 }
+      );
+    }
+
+    // 2. 解析查询参数
+    const { searchParams } = new URL(request.url);
+    const teamId = searchParams.get("teamId");
+    const page = Math.max(1, parseInt(searchParams.get("page") || "1"));
+    const limit = Math.min(
+      50,
+      Math.max(1, parseInt(searchParams.get("limit") || "20"))
+    );
+    const status = searchParams.get("status"); // "active" | "archived"
+
+    if (!teamId) {
+      return NextResponse.json(
+        { error: "缺少 teamId 参数", code: "MISSING_PARAM" },
+        { status: 400 }
+      );
+    }
+
+    // 3. 构建查询条件
+    const where = {
+      teamId,
+      ...(status && { status }), // 如果传了 status 就按 status 过滤
+      team: {
+        members: {
+          some: { userId: session.user.id }, // 确保用户是该团队成员
+        },
+      },
+    };
+
+    // 4. 并行查询数据和总数（用于分页）
+    const [projects, total] = await Promise.all([
+      prisma.project.findMany({
+        where,
+        orderBy: { updatedAt: "desc" },
+        skip: (page - 1) * limit,
+        take: limit,
+        select: {
+          id: true,
+          name: true,
+          description: true,
+          status: true,
+          updatedAt: true,
+          _count: { select: { tasks: true, members: true } },
+        },
+      }),
+      prisma.project.count({ where }),
+    ]);
+
+    // 5. 返回标准化响应，附带分页元信息
+    return NextResponse.json({
+      data: projects,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+        hasNext: page * limit < total,
+      },
+    });
+  } catch (error) {
+    // 生产环境应该用结构化日志，不要把错误详情暴露给调用方
+    console.error("获取项目列表失败:", error);
+    return NextResponse.json(
+      { error: "服务器内部错误", code: "INTERNAL_ERROR" },
+      { status: 500 }
+    );
+  }
+}
+
+// POST /api/projects
+// 创建新项目
+export async function POST(request: Request) {
+  try {
+    const session = await auth();
+    if (!session?.user) {
+      return NextResponse.json(
+        { error: "未授权访问", code: "UNAUTHORIZED" },
+        { status: 401 }
+      );
+    }
+
+    const body = await request.json();
+
+    // 用 Zod 验证请求体，和 Server Actions 里的做法一致
+    const schema = z.object({
+      teamId: z.string().uuid(),
+      name: z.string().min(1).max(100),
+      description: z.string().max(500).optional(),
+    });
+
+    const result = schema.safeParse(body);
+    if (!result.success) {
+      return NextResponse.json(
+        {
+          error: "参数验证失败",
+          code: "VALIDATION_ERROR",
+          details: result.error.flatten(),
+        },
+        { status: 422 }
+      );
+    }
+
+    // 验证用户是否有权限在该团队创建项目
+    const membership = await prisma.teamMember.findUnique({
+      where: {
+        userId_teamId: { userId: session.user.id, teamId: result.data.teamId },
+      },
+    });
+
+    if (!membership || membership.role === "VIEWER") {
+      return NextResponse.json(
+        { error: "无权限在该团队创建项目", code: "FORBIDDEN" },
+        { status: 403 }
+      );
+    }
+
+    const project = await prisma.project.create({
+      data: {
+        ...result.data,
+        // 创建者自动成为项目 Owner
+        members: {
+          create: {
+            userId: session.user.id,
+            role: "OWNER",
+          },
+        },
+      },
+    });
+
+    return NextResponse.json({ data: project }, { status: 201 });
+  } catch (error) {
+    console.error("创建项目失败:", error);
+    return NextResponse.json(
+      { error: "服务器内部错误", code: "INTERNAL_ERROR" },
+      { status: 500 }
+    );
+  }
+}
+```
+
+动态路由参数的写法也值得提一下。比如获取单个项目的详情：
+
+```ts
+// app/api/projects/[projectId]/route.ts
+import { NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { auth } from "@/lib/auth";
+
+// GET /api/projects/:projectId
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ projectId: string }> }
+) {
+  const session = await auth();
+  if (!session?.user) {
+    return NextResponse.json(
+      { error: "未授权访问", code: "UNAUTHORIZED" },
+      { status: 401 }
+    );
+  }
+
+  const { projectId } = await params;
+
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    include: {
+      _count: { select: { tasks: true, members: true } },
+      members: {
+        include: {
+          user: { select: { id: true, name: true, avatar: true } },
+        },
+      },
+    },
+  });
+
+  if (!project) {
+    return NextResponse.json(
+      { error: "项目不存在", code: "NOT_FOUND" },
+      { status: 404 }
+    );
+  }
+
+  // 确认用户有权限查看该项目
+  const isMember = project.members.some((m) => m.userId === session.user.id);
+  if (!isMember) {
+    return NextResponse.json(
+      { error: "无权限查看该项目", code: "FORBIDDEN" },
+      { status: 403 }
+    );
+  }
+
+  return NextResponse.json({ data: project });
+}
+```
+
+## Route Handlers vs Server Actions：别再纠结选哪个了
+
+这两者的选型标准其实很清晰，核心区别只有一个：**调用者是谁**。
+
+| 判断标准                       | 选 Server Actions | 选 Route Handlers |
+| ------------------------------ | ----------------- | ----------------- |
+| 调用者是浏览器里的用户         | 是                | 不一定            |
+| 需要类型安全                   | 是，自动推断      | 需要额外维护      |
+| 是用户触发的操作（表单、按钮） | 是                | 否                |
+| 需要被第三方系统调用           | 否                | 是                |
+| 需要 RESTful 风格的接口        | 否                | 是                |
+| 需要处理 Webhook               | 否                | 是                |
+| 移动端/桌面端要调用            | 否                | 是                |
+
+用一句话总结：**能 Server Actions 的就 Server Actions，需要对外暴露 HTTP 接口的才上 Route Handlers**。
+
+在我们的任务管理平台里，具体的分配是这样的：
+
+- 创建项目、更新任务状态、添加评论 -- 这些都是用户在页面上操作，用 Server Actions
+- Slack 通知集成、GitHub Webhook 接收 -- 第三方系统回调，用 Route Handlers
+- 移动端 App 获取项目列表 -- 需要纯数据接口，用 Route Handlers
+- 公开的 API 给企业客户使用 -- 需要认证、限流、版本管理，用 Route Handlers
+
+## Webhook 接口：用 Route Handler 接收第三方回调
+
+Webhook 是一个典型的"只能用 Route Handlers"的场景。我们的任务管理平台需要和 Slack 集成：当任务状态变更时，自动往 Slack 频道发通知；反过来，Slack 里的消息也能创建任务。后者就需要接收 Slack 的 Event Subscription 回调。
+
+```ts
+// app/api/webhooks/slack/route.ts
+import { NextResponse } from "next/server";
+import crypto from "crypto";
+import { prisma } from "@/lib/prisma";
+
+// Slack 发送事件时会带签名，我们需要验证签名确保请求真的来自 Slack
+function verifySlackSignature(
+  body: string,
+  timestamp: string,
+  signature: string
+): boolean {
+  const slackSigningSecret = process.env.SLACK_SIGNING_SECRET;
+  if (!slackSigningSecret) return false;
+
+  // 检查时间戳，防止重放攻击（超过 5 分钟的请求拒绝）
+  const fiveMinutesAgo = Math.floor(Date.now() / 1000) - 300;
+  if (parseInt(timestamp) < fiveMinutesAgo) {
+    return false;
+  }
+
+  // 按照 Slack 的签名算法计算 HMAC
+  const basestring = `v0:${timestamp}:${body}`;
+  const hmac = crypto
+    .createHmac("sha256", slackSigningSecret)
+    .update(basestring)
+    .digest("hex");
+  const computedSignature = `v0=${hmac}`;
+
+  // 用恒定时间比较，防止时序攻击
+  return crypto.timingSafeEqual(
+    Buffer.from(computedSignature),
+    Buffer.from(signature)
+  );
+}
+
+// Slack 的 URL Verification 机制：首次配置 Webhook 时 Slack 会发一个 challenge
+export async function POST(request: Request) {
+  const body = await request.text();
+  const timestamp = request.headers.get("x-slack-request-timestamp") || "";
+  const signature = request.headers.get("x-slack-signature") || "";
+
+  // 第一步：验证签名，不验证直接处理是极其危险的
+  if (!verifySlackSignature(body, timestamp, signature)) {
+    return NextResponse.json(
+      { error: "签名验证失败", code: "INVALID_SIGNATURE" },
+      { status: 401 }
+    );
+  }
+
+  const payload = JSON.parse(body);
+
+  // 第二步：处理 Slack 的 URL Verification
+  // 这是 Slack 配置 Webhook 时的握手流程，只需要返回 challenge 字段
+  if (payload.type === "url_verification") {
+    return NextResponse.json({ challenge: payload.challenge });
+  }
+
+  // 第三步：处理事件回调
+  // Slack 的事件回调会包裹在 event 字段里
+  if (payload.type === "event_callback") {
+    const event = payload.event;
+
+    // 根据事件类型分发处理
+    switch (event.type) {
+      case "message":
+        // Slack 频道里有人发了消息，检查是否包含创建任务的指令
+        // 比如消息格式为 "/task 创建一个新任务 @张三"
+        if (event.text?.startsWith("/task")) {
+          await handleSlackTaskCommand(event);
+        }
+        break;
+
+      case "reaction_added":
+        // 有人给消息添加了 emoji 反应，可以用来快速标记任务状态
+        // 比如 :eyes: 表示"正在看"，:white_check_mark: 表示"已完成"
+        await handleReactionAdded(event);
+        break;
+
+      default:
+        // 收到不认识的事件类型，记录日志但不报错
+        console.log(`收到未处理的 Slack 事件类型: ${event.type}`);
+    }
+  }
+
+  // Slack 要求 3 秒内响应，所以如果处理逻辑较重，应该返回 200 后异步处理
+  return NextResponse.json({ received: true });
+}
+
+// 处理 Slack 中的任务创建指令
+async function handleSlackTaskCommand(event: Record<string, unknown>) {
+  const text = event.text as string;
+  const channel = event.channel as string;
+  const userId = event.user as string;
+
+  // 解析指令：/task 任务描述 @提及人
+  // 例如："/task 修复登录页面的验证码问题 @zhangsan"
+  const description = text.replace(/^\/task\s*/, "").trim();
+  const mentions = (event.text as string).match(/<@(\w+)>/g) || [];
+
+  // 查找该 Slack 频道关联的项目
+  const integration = await prisma.slackIntegration.findUnique({
+    where: { channelId: channel },
+    include: { project: true },
+  });
+
+  if (!integration?.projectId) {
+    console.log(`频道 ${channel} 未关联项目，忽略任务创建指令`);
+    return;
+  }
+
+  // 创建任务
+  const task = await prisma.task.create({
+    data: {
+      title: description.slice(0, 100), // Slack 消息可能很长，截取前 100 字符作为标题
+      description,
+      projectId: integration.projectId,
+      reporterSlackId: userId,
+      status: "TODO",
+      source: "SLACK", // 标记来源，方便追溯
+    },
+  });
+
+  console.log(`通过 Slack 创建了任务 ${task.id}: ${task.title}`);
+}
+
+// 处理 emoji 反应
+async function handleReactionAdded(event: Record<string, unknown>) {
+  const reaction = event.reaction as string;
+  const messageTs = event.item?.ts as string;
+
+  // 根据不同的 emoji 执行不同的操作
+  if (reaction === "white_check_mark") {
+    // :white_check_mark: 反应 -> 将对应任务标记为已完成
+    await prisma.task.updateMany({
+      where: { slackMessageTs: messageTs },
+      data: { status: "DONE" },
+    });
+  }
+}
+```
+
+再看一个 GitHub Webhook 的例子。很多团队用 GitHub 管理代码，当 PR 被合并时，自动把关联的任务标记为已完成：
+
+```ts
+// app/api/webhooks/github/route.ts
+import { NextResponse } from "next/server";
+import crypto from "crypto";
+
+function verifyGitHubSignature(body: string, signature: string): boolean {
+  const secret = process.env.GITHUB_WEBHOOK_SECRET;
+  if (!secret) return false;
+
+  // GitHub 使用 HMAC-SHA256 签名，格式为 sha256=<hex>
+  const expectedSignature =
+    "sha256=" + crypto.createHmac("sha256", secret).update(body).digest("hex");
+
+  return crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(expectedSignature)
+  );
+}
+
+export async function POST(request: Request) {
+  const body = await request.text();
+  const signature = request.headers.get("x-hub-signature-256") || "";
+
+  if (!verifyGitHubSignature(body, signature)) {
+    return NextResponse.json({ error: "签名验证失败" }, { status: 401 });
+  }
+
+  const event = request.headers.get("x-github-event") || "";
+  const payload = JSON.parse(body);
+
+  switch (event) {
+    case "pull_request":
+      // 只处理 PR 被合并的情况
+      if (payload.action === "closed" && payload.pull_request.merged) {
+        await handlePRMerged(payload);
+      }
+      break;
+
+    case "issues":
+      // GitHub Issue 状态变更
+      if (payload.action === "closed") {
+        await handleIssueClosed(payload);
+      }
+      break;
+
+    default:
+      console.log(`收到未处理的 GitHub 事件: ${event}`);
+  }
+
+  return NextResponse.json({ received: true });
+}
+
+// PR 合并后，自动关闭关联的任务
+async function handlePRMerged(payload: Record<string, unknown>) {
+  const pr = payload.pull_request as Record<string, unknown>;
+  const prTitle = pr.title as string;
+  const prBody = (pr.body as string) || "";
+
+  // 从 PR 描述中提取关联的任务 ID
+  // 约定格式：Fixes #TASK-123 或 Closes TASK-123
+  const taskMatch = prBody.match(
+    /(?:Fixes|Closes|Resolves)\s+(?:#?)(TASK-\d+)/i
+  );
+
+  if (!taskMatch) {
+    return; // PR 没有关联任务，跳过
+  }
+
+  const taskKey = taskMatch[1]; // 例如 "TASK-123"
+
+  await prisma.task.updateMany({
+    where: { key: taskKey },
+    data: {
+      status: "DONE",
+      completedAt: new Date(),
+      githubPrUrl: pr.html_url,
+    },
+  });
+
+  console.log(`PR 合并，任务 ${taskKey} 已自动标记为完成`);
+}
+
+// GitHub Issue 关闭时同步更新关联任务
+async function handleIssueClosed(payload: Record<string, unknown>) {
+  const issue = payload.issue as Record<string, unknown>;
+
+  await prisma.task.updateMany({
+    where: { githubIssueUrl: issue.html_url as string },
+    data: {
+      status: "DONE",
+      completedAt: new Date(),
+    },
+  });
+}
+```
+
+Webhook 处理有一个非常重要的原则：**始终先验证签名**。没有验证签名的 Webhook 接口，任何人都可以伪造请求往你的系统写数据。上面两个例子都用了恒定时间比较（`timingSafeEqual`），而不是简单的 `===`，这是为了防止时序攻击 -- 攻击者通过测量比较耗时来逐字符猜出密钥。
+
+## Prisma 与 Next.js 的配合
+
+前面所有代码里的数据库操作都用了 Prisma，这里专门说一下它在 Next.js 环境下的注意事项。
+
+首先是开发环境的热重载问题。Next.js 开发模式下，每次文件变更会重新加载模块。如果不做处理，每次热重载都会创建一个新的 Prisma Client 实例，很快就会把数据库连接池撑爆：
+
+```ts
+// lib/prisma.ts
+import { PrismaClient } from "@prisma/client";
+
+// 在全局对象上缓存 Prisma Client 实例
+// 开发环境下防止热重载创建多个实例
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+export const prisma =
+  globalForPrisma.prisma ??
+  new PrismaClient({
+    log:
+      process.env.NODE_ENV === "development"
+        ? ["query", "error", "warn"] // 开发环境打印 SQL 查询，方便调试
+        : ["error"], // 生产环境只记录错误
+  });
+
+// 开发环境下，把实例挂到全局对象上，热重载时复用
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+```
+
+其次是 Server Component 中的数据获取层，建议抽成独立的函数而不是直接写在组件里。这样做有几个好处：可以复用、可以单独测试、可以加缓存：
+
+```ts
+// lib/data-access/projects.ts
+import { prisma } from "@/lib/prisma";
+import { cache } from "react";
+
+// 用 React cache() 包装，同一请求中相同参数只查一次数据库
+// 注意：这和 fetch 的缓存不同，cache() 只在单次请求周期内去重
+export const getProjectList = cache(async (userId: string) => {
+  return prisma.project.findMany({
+    where: {
+      team: {
+        members: {
+          some: { userId },
+        },
+      },
+    },
+    orderBy: { updatedAt: "desc" },
+    include: {
+      _count: {
+        select: { tasks: true, members: true },
+      },
+    },
+  });
+});
+
+export const getProjectById = cache(
+  async (projectId: string, userId: string) => {
+    const project = await prisma.project.findUnique({
+      where: { id: projectId },
+      include: {
+        members: {
+          include: {
+            user: { select: { id: true, name: true, avatar: true } },
+          },
+        },
+        _count: { select: { tasks: true } },
+      },
+    });
+
+    if (!project) return null;
+
+    // 权限检查也放数据层，组件不需要关心
+    const isMember = project.members.some((m) => m.userId === userId);
+    if (!isMember) return null;
+
+    return project;
+  }
+);
+```
+
+组件里用起来就非常干净了：
+
+```tsx
+// app/(dashboard)/projects/page.tsx
+import { auth } from "@/lib/auth";
+import { getProjectList } from "@/lib/data-access/projects";
+
+export default async function ProjectsPage() {
+  const session = await auth();
+  const projects = await getProjectList(session.user.id);
+
+  return <ProjectList projects={projects} />;
+}
+```
+
+## Trade-off 分析
+
+最后，对这篇文章涉及的核心决策做一个权衡分析。
+
+**Server Component 直接查数据库 vs 通过 API 获取数据**
+
+Server Component 直接查数据库是最简单的方案，零网络开销，类型安全，代码最少。但代价是组件和数据层耦合在一起，如果你的数据源以后要切换（比如从 Prisma 换成 GraphQL API），改动面会比较大。对于大多数项目来说，这个代价完全可以接受，除非你明确知道数据层会频繁变动。
+
+**Route Handlers vs Server Actions**
+
+Route Handlers 更灵活（支持所有 HTTP 方法、能被任何客户端调用），但也更繁琐（需要手动处理请求解析、响应序列化、错误码）。Server Actions 更简洁（自动类型推断、和表单天然集成），但只能被你的 Next.js 应用调用。在实际项目中，两者通常是配合使用的，而不是二选一。
+
+**并行获取 vs 串行获取**
+
+`Promise.all` 并行获取几乎是免费的性能优化，唯一的代价是代码稍复杂。但要注意，并行查询会增加数据库的并发连接数，如果并行查询非常多（比如 10 个以上），反而可能压垮数据库。实践中，3-5 个并行查询是合理的上限。
+
+**Webhook 同步处理 vs 异步处理**
+
+上面的 Webhook 示例是同步处理的，意味着请求要等所有逻辑执行完才返回。Slack 要求 3 秒内响应，GitHub 给了 10 秒。如果你的处理逻辑可能超时（比如要调外部 API、做大量数据库操作），应该先返回 200，然后用消息队列异步处理。不过这已经超出了 Next.js 本身的范畴，属于架构层面的决策。
+
+## 小结
+
+这篇文章覆盖了 Next.js 中数据获取和 API 设计的几个核心场景：
+
+- **Server Component 数据获取**：直接 async/await，最简单也最快的方式
+- **并行获取**：Promise.all 是性价比最高的优化手段
+- **fetch 缓存选项**：no-store、revalidate、默认缓存，按数据时效性选
+- **Route Handlers**：对外暴露 HTTP 接口的唯一选择
+- **Route Handlers vs Server Actions**：看调用者是谁，能 Actions 就 Actions
+- **Webhook 接口**：签名验证是底线，恒定时间比较是标配
+- **Prisma 配合**：全局单例防连接泄漏，数据访问层抽离保持组件干净
+
+到目前为止，我们讨论的缓存策略还是比较粗的。`no-store` 就是完全不缓存，`revalidate: 60` 就是 60 秒刷新一次。但实际生产环境中的缓存策略远比这复杂 -- 有的数据需要按标签精准失效，有的数据需要在构建时就生成好，有的数据需要在用户触发操作后才刷新。下一篇文章我们就专门聊缓存策略，看看 Next.js 的缓存系统到底有多强大。

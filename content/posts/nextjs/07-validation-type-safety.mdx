@@ -1,7 +1,7 @@
 ---
 title: "07. 数据验证与类型安全"
 date: "2026-03-23"
-summary: "掌握 Next.js 应用中的数据验证和类型安全，学习使用 Zod 进行数据验证，实现端到端的类型安全，以及错误处理模式。"
+summary: "标题为空？优先级是 'super urgent'？截止日期是 2020 年？用户提交的数据什么情况都可能出现。用 Zod 在前后端共享同一套验证规则，一份 schema 搞定两端的类型安全。"
 tags: ["Next.js", "数据验证", "Zod", "类型安全", "TypeScript"]
 category: "nextjs"
 cover: ""
@@ -10,938 +10,803 @@ series: "Next.js 渐进式全栈开发"
 seriesOrder: 7
 ---
 
-## 前言
+上一篇我们聊了缓存策略 -- revalidate、tag、ISR 这些机制让你的数据获取既快又新鲜。但有一个前提条件一直没展开讲：从客户端到服务端的数据流，我们默认它是"可信"的。
 
-在全栈应用中，数据验证和类型安全是确保应用稳定性和安全性的关键。Next.js 结合 TypeScript 和 Zod，提供了强大的端到端类型安全保障。
+现实情况远不是这样。
 
-**学习目标**：
+## 一个真实的翻车现场
 
-- ✅ 掌握 Zod 验证库的使用
-- ✅ 实现 Server Actions 数据验证
-- ✅ 实现 API Routes 数据验证
-- ✅ 达到端到端类型安全
-- ✅ 学习错误处理模式
+假设你的团队任务管理平台上线了，用户可以创建任务。前端表单做了限制：标题必填、优先级只能选 low/medium/high、截止日期不能是过去。看起来很完善。
 
----
+然后某天你打开数据库一看：
 
-## Zod 验证库
-
-### 基础验证
-
-```typescript
-// lib/schemas.ts
-import { z } from "zod";
-
-// 简单字符串验证
-const nameSchema = z.string();
-
-// 带约束的字符串
-const titleSchema = z
-  .string()
-  .min(5, "标题至少需要 5 个字符")
-  .max(100, "标题不能超过 100 个字符");
-
-// 数字验证
-const ageSchema = z.number().min(18, "必须年满 18 岁").max(120, "无效的年龄");
-
-// 布尔值
-const subscribedSchema = z.boolean();
-
-// 枚举
-const categorySchema = z.enum(["tech", "life", "tutorial"]);
-
-// 可选字段
-const bioSchema = z.string().optional();
-
-// 可空字段
-const nicknameSchema = z.string().nullable();
-
-// 默认值
-const roleSchema = z.enum(["admin", "user"]).default("user");
-
-// 转换
-const countSchema = z.string().transform((val) => parseInt(val));
+```sql
+-- 这都是真实存在的脏数据
+SELECT * FROM tasks WHERE title = '';                              -- 空标题
+SELECT * FROM tasks WHERE priority = 'super urgent';               -- 自定义优先级
+SELECT * FROM tasks WHERE due_date < '2020-01-01';                 -- 过去的时间
+SELECT * FROM tasks WHERE description_length > 50000;              -- 5万字的描述
+SELECT * FROM tasks WHERE assignee_id = 'DROP TABLE users;--';     -- SQL 注入尝试
 ```
 
-### 对象验证
+为什么会这样？因为前端验证对用户来说是"建议"，不是"法律"。用户可以关掉 JavaScript、用 Postman 发请求、或者直接在浏览器 DevTools 里改表单值。只要你的服务端没做验证，这些数据就会原封不动地写进数据库。
+
+更麻烦的是，TypeScript 的类型检查只在编译时生效。`formData.get("priority")` 返回的是 `FormDataEntryValue | null`，你用 `as string` 强转一下，TypeScript 就闭嘴了 -- 但运行时的值可能仍然是 `"super urgent"`。
+
+这就是为什么我们需要一个运行时验证层。Zod 就是干这个的。
+
+## Zod：一份 schema，两端的契约
+
+Zod 的核心思路很简单：你用代码定义一份"数据长什么样"的声明，Zod 既能在运行时校验数据，又能让 TypeScript 自动推导出对应的类型。一份 schema，同时解决运行时安全和编译时类型两个问题。
+
+先装依赖：
+
+```bash
+npm install zod
+```
+
+### 定义第一份 schema
+
+拿我们的任务管理平台来说，创建任务的 schema 大概长这样：
 
 ```typescript
-// 创建文章 Schema
-const createPostSchema = z.object({
+// lib/schemas/task.ts
+import { z } from "zod";
+
+// 任务的优先级枚举 -- 只允许这四个值
+const PriorityEnum = z.enum(["none", "low", "medium", "high", "critical"]);
+
+// 创建任务时的输入 schema
+export const createTaskSchema = z.object({
+  // 标题：1-120 个字符，前后自动 trim
   title: z
     .string()
-    .min(5, "标题至少需要 5 个字符")
-    .max(100, "标题不能超过 100 个字符"),
+    .min(1, "标题不能为空")
+    .max(120, "标题不能超过 120 个字符")
+    .transform((val) => val.trim()),
 
-  content: z
+  // 描述：可选，但如果有值则不超过 2000 字符
+  description: z
     .string()
-    .min(50, "内容至少需要 50 个字符")
-    .max(5000, "内容不能超过 5000 个字符"),
+    .max(2000, "描述不能超过 2000 个字符")
+    .transform((val) => val.trim())
+    .optional()
+    .or(z.literal("")),
 
-  excerpt: z.string().max(200, "摘要不能超过 200 个字符").optional(),
+  // 优先级：必须是预定义的枚举值之一，默认为 none
+  priority: PriorityEnum.default("none"),
 
-  category: z.enum(["tech", "life", "tutorial"]),
+  // 截止日期：必须是今天或之后的日期，可选
+  dueDate: z
+    .string()
+    .transform((val, ctx) => {
+      // 将字符串解析为 Date 对象
+      const date = new Date(val);
+      if (isNaN(date.getTime())) {
+        // 解析失败时，向 Zod 的错误上下文添加自定义消息
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "日期格式无效",
+        });
+        return z.NEVER; // 返回 NEVER 让 Zod 知道这里出错了
+      }
+      // 检查日期不能是过去的时间
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      if (date < today) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "截止日期不能是过去的时间",
+        });
+        return z.NEVER;
+      }
+      return date; // 返回转换后的 Date 对象
+    })
+    .optional(),
 
-  tags: z.array(z.string()).min(1, "至少需要一个标签").max(5, "最多 5 个标签"),
+  // 指派人 ID：必须是 UUID 格式，可选
+  assigneeId: z
+    .string()
+    .uuid("指派人 ID 格式无效")
+    .optional()
+    .or(z.literal("")),
 
-  published: z.boolean().default(false),
-
-  publishDate: z.coerce.date().optional(),
+  // 标签：字符串数组，最多 5 个
+  tags: z
+    .array(z.string().max(30, "单个标签不能超过 30 个字符"))
+    .max(5, "最多添加 5 个标签")
+    .default([]),
 });
+```
 
-// 使用 Schema
-const result = createPostSchema.safeParse({
-  title: "我的文章",
-  content: "这是一篇关于 Next.js 的文章...",
-  category: "tech",
-  tags: ["nextjs", "react"],
-  published: true,
+注意几个细节：`transform` 会在验证通过后对值做转换（比如 trim 空格、把字符串转成 Date），`z.NEVER` 是 Zod 提供的特殊标记，表示"这个分支验证失败，不要继续"。这两个配合使用可以实现非常灵活的自定义验证。
+
+### 解析和校验
+
+有了 schema，怎么用？Zod 提供两种解析方式：
+
+```typescript
+// 方式一：parse -- 验证失败直接抛异常
+try {
+  const task = createTaskSchema.parse({
+    title: "重构用户认证模块",
+    priority: "high",
+    tags: ["后端", "安全"],
+  });
+  // task 的类型已经被 TypeScript 推导为：
+  // { title: string; description?: string; priority: Priority; dueDate?: Date; ... }
+} catch (error) {
+  if (error instanceof z.ZodError) {
+    // error.issues 是一个数组，包含所有验证错误
+    console.log(error.issues);
+  }
+}
+
+// 方式二：safeParse -- 验证失败不抛异常，返回结果对象（推荐在服务端使用）
+const result = createTaskSchema.safeParse({
+  title: "",
+  priority: "super urgent", // 不合法的值
 });
 
 if (result.success) {
-  // 数据有效
+  // result.data 是经过验证和转换后的安全数据
   console.log(result.data);
 } else {
-  // 验证失败
-  console.log(result.error.flatten());
+  // result.error 是 ZodError 对象
+  // flatten() 把错误按字段分组，方便展示给用户
+  const fieldErrors = result.error.flatten().fieldErrors;
+  // { title: ["标题不能为空"], priority: ["无效的枚举值..."] }
 }
 ```
 
-### 嵌套对象
+实际项目中几乎都用 `safeParse`，因为你可以精确控制错误怎么返回给前端，而不是靠 try-catch 去兜底。
+
+## 与 Server Actions 集成
+
+在 Server Actions 中验证数据是最常见的场景。还记得我们前面写的 Server Action 直接从 FormData 取值就往数据库写吗？加上 Zod 验证，整个过程就变成了：取值 -> 验证 -> 写库。
 
 ```typescript
-// 用户注册 Schema
-const registerSchema = z.object({
-  email: z.string().email("无效的邮箱地址"),
-  password: z
-    .string()
-    .min(8, "密码至少需要 8 个字符")
-    .regex(/[A-Z]/, "密码必须包含大写字母")
-    .regex(/[a-z]/, "密码必须包含小写字母")
-    .regex(/[0-9]/, "密码必须包含数字"),
-
-  profile: z.object({
-    name: z.string().min(2, "姓名至少需要 2 个字符"),
-    bio: z.string().max(500).optional(),
-    avatar: z.string().url("无效的图片 URL").optional(),
-  }),
-
-  preferences: z
-    .object({
-      newsletter: z.boolean().default(false),
-      notifications: z.boolean().default(true),
-    })
-    .optional(),
-});
-```
-
-### 数组和元组
-
-```typescript
-// 数组验证
-const tagsSchema = z.array(z.string()).min(1).max(5);
-
-// 固定长度数组（元组）
-const coordinateSchema = z.tuple([
-  z.number(), // x
-  z.number(), // y
-  z.number(), // z
-]);
-
-// 示例
-const result = tagsSchema.parse(["nextjs", "react"]); // ✅
-const result = tagsSchema.parse([]); // ❌ Error
-```
-
-### 自定义验证
-
-```typescript
-// 自定义验证器
-const passwordSchema = z
-  .string()
-  .min(8, "密码至少需要 8 个字符")
-  .refine((val) => /[A-Z]/.test(val), "密码必须包含大写字母")
-  .refine((val) => /[a-z]/.test(val), "密码必须包含小写字母")
-  .refine((val) => /[0-9]/.test(val), "密码必须包含数字")
-  .refine((val) => /[!@#$%^&*]/.test(val), "密码必须包含特殊字符");
-
-// 自定义错误消息
-const usernameSchema = z
-  .string()
-  .min(3, "用户名至少需要 3 个字符")
-  .refine(
-    async (username) => {
-      // 检查用户名是否已存在
-      const user = await db.user.findUnique({
-        where: { username },
-      });
-      return !user;
-    },
-    { message: "用户名已被占用" }
-  );
-```
-
----
-
-## Server Actions 验证
-
-### 基础验证
-
-```typescript
-// app/actions.ts
+// app/(dashboard)/projects/[projectId]/actions.ts
 "use server";
 
 import { z } from "zod";
 import { db } from "@/lib/db";
 import { revalidatePath } from "next/cache";
+import { createTaskSchema } from "@/lib/schemas/task";
+import { getCurrentUser } from "@/lib/auth";
 
-// 定义 Schema
-const createPostSchema = z.object({
-  title: z.string().min(5).max(100),
-  content: z.string().min(50),
-  category: z.enum(["tech", "life", "tutorial"]),
-});
+// 定义 Server Action 的返回类型，前端拿到的就是这个结构
+type ActionResult<T = void> =
+  | { success: true; data: T }
+  | { success: false; errors: Record<string, string[]> };
 
-export async function createPost(formData: FormData) {
-  // 提取数据
+export async function createTask(
+  _prevState: ActionResult,
+  formData: FormData
+): Promise<ActionResult> {
+  // 1. 从 FormData 中提取原始数据
+  // FormData 的所有值都是 string | null，需要交给 Zod 来验证和转换
   const rawData = {
     title: formData.get("title"),
-    content: formData.get("content"),
-    category: formData.get("category"),
+    description: formData.get("description"),
+    priority: formData.get("priority"),
+    dueDate: formData.get("dueDate"),
+    assigneeId: formData.get("assigneeId"),
+    tags: formData.get("tags"), // 前端可以用 JSON.stringify 传数组
   };
 
-  // 验证
-  const result = createPostSchema.safeParse(rawData);
+  // 2. 用 Zod 验证数据
+  // safeParse 不会抛异常，返回 { success, data?, error? }
+  const result = createTaskSchema.safeParse({
+    ...rawData,
+    // tags 如果从前端以 JSON 字符串传过来，需要解析
+    tags: rawData.tags ? JSON.parse(rawData.tags as string) : [],
+  });
 
+  // 3. 验证失败，把错误信息按字段返回给前端
   if (!result.success) {
+    // flatten() 把嵌套的错误结构扁平化，fieldErrors 格式为 { fieldName: [msg1, msg2] }
     return {
-      error: "验证失败",
-      fieldErrors: result.error.flatten().fieldErrors,
+      success: false,
+      errors: result.error.flatten().fieldErrors,
     };
   }
 
-  // 保存到数据库
-  const post = await db.posts.create({
-    data: result.data,
+  // 4. 验证通过，执行业务逻辑
+  const currentUser = await getCurrentUser();
+  if (!currentUser) {
+    return { success: false, errors: { _form: ["请先登录"] } };
+  }
+
+  // result.data 的类型已经被 Zod 推导好了，可以直接安全地传给数据库
+  const task = await db.task.create({
+    data: {
+      ...result.data,
+      // 数据库需要 Date 类型，而 Zod 的 transform 已经帮我们转好了
+      dueDate: result.data.dueDate ?? null,
+      assigneeId: result.data.assigneeId ?? null,
+      projectId: "current-project-id", // 实际从路由参数获取
+      createdById: currentUser.id,
+    },
   });
 
-  revalidatePath("/blog");
+  // 5. 重新验证相关页面的缓存
+  revalidatePath(`/projects/${task.projectId}`);
 
-  return { success: true, post };
+  return { success: true, data: task };
 }
 ```
 
-### 类型推断
+这个模式你会在几乎所有 Server Action 中用到：`safeParse` 验证 -> 失败返回错误 -> 成功执行业务逻辑。形成肌肉记忆之后，写起来非常快。
+
+## 与 Route Handlers 集成
+
+Route Handlers（API 路由）的验证逻辑和 Server Actions 类似，区别在于数据来源是 `request.json()` 而不是 FormData，而且你需要自己构造 HTTP 响应。
+
+拿任务列表的搜索过滤接口举例，查询参数的验证尤其重要，因为你不能信任 URL 里的任何东西：
 
 ```typescript
-// app/actions.ts
-import { z } from "zod";
-
-const createPostSchema = z.object({
-  title: z.string().min(5),
-  content: z.string().min(50),
-});
-
-// 推断类型
-type CreatePostInput = z.infer<typeof createPostSchema>;
-// 等价于:
-// type CreatePostInput = {
-//   title: string;
-//   content: string;
-// }
-
-export async function createPost(data: CreatePostInput) {
-  // data 是完全类型安全的
-  const post = await db.posts.create({ data });
-  return post;
-}
-```
-
-### 显示验证错误
-
-```typescript
-// components/PostForm.tsx
-"use client";
-
-import { useFormState } from 'react-dom';
-import { createPost } from '@/app/actions';
-
-const initialState = {
-  error: '',
-  fieldErrors: {} as Record<string, string[]>,
-  success: false,
-};
-
-export function PostForm() {
-  const [state, formAction] = useFormState(createPost, initialState);
-
-  return (
-    <form action={formAction}>
-      <div>
-        <label htmlFor="title">标题</label>
-        <input
-          id="title"
-          name="title"
-          type="text"
-          aria-invalid={!!state.fieldErrors?.title}
-        />
-        {state.fieldErrors?.title && (
-          <span className="error">
-            {state.fieldErrors.title[0]}
-          </span>
-        )}
-      </div>
-
-      <div>
-        <label htmlFor="content">内容</label>
-        <textarea
-          id="content"
-          name="content"
-          rows={10}
-          aria-invalid={!!state.fieldErrors?.content}
-        />
-        {state.fieldErrors?.content && (
-          <span className="error">
-            {state.fieldErrors.content[0]}
-          </span>
-        )}
-      </div>
-
-      <button type="submit">发布</button>
-
-      {state.error && !state.fieldErrors && (
-        <div className="error">
-          {state.error}
-        </div>
-      )}
-    </form>
-  );
-}
-```
-
----
-
-## API Routes 验证
-
-### 请求体验证
-
-```typescript
-// app/api/posts/route.ts
-import { NextResponse } from "next/server";
+// app/api/projects/[projectId]/tasks/route.ts
+import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { db } from "@/lib/db";
 
-const createPostSchema = z.object({
-  title: z.string().min(5).max(100),
-  content: z.string().min(50),
-  category: z.enum(["tech", "life", "tutorial"]),
-  tags: z.array(z.string()).min(1).max(5),
+// 搜索过滤的 schema
+// z.coerce 会自动尝试将字符串转换为对应类型（比如 "1" -> 1）
+const listTasksQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  pageSize: z.coerce.number().int().min(1).max(100).default(20),
+  status: z.enum(["todo", "in_progress", "done", "archived"]).optional(),
+  priority: z.enum(["none", "low", "medium", "high", "critical"]).optional(),
+  assigneeId: z.string().uuid().optional(),
+  search: z.string().max(200).optional(),
+  sortBy: z
+    .enum(["createdAt", "dueDate", "priority", "title"])
+    .default("createdAt"),
+  sortOrder: z.enum(["asc", "desc"]).default("desc"),
 });
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-
-    // 验证
-    const result = createPostSchema.safeParse(body);
-
-    if (!result.success) {
-      return NextResponse.json(
-        {
-          error: "验证失败",
-          details: result.error.flatten(),
-        },
-        { status: 400 }
-      );
-    }
-
-    // 创建文章
-    const post = await db.posts.create({
-      data: result.data,
-    });
-
-    return NextResponse.json(post, { status: 201 });
-  } catch (error) {
-    return NextResponse.json({ error: "服务器错误" }, { status: 500 });
+export async function GET(
+  request: NextRequest,
+  { params }: { params: { projectId: string } }
+) {
+  // 1. 验证路径参数
+  const projectId = z.string().uuid().safeParse(params.projectId);
+  if (!projectId.success) {
+    return NextResponse.json({ error: "项目 ID 格式无效" }, { status: 400 });
   }
-}
-```
 
-### 查询参数验证
+  // 2. 验证查询参数
+  // URLSearchParams 转 plain object，然后交给 Zod 验证
+  const queryParams = Object.fromEntries(request.nextUrl.searchParams);
+  const queryResult = listTasksQuerySchema.safeParse(queryParams);
 
-```typescript
-// app/api/posts/route.ts
-const querySchema = z.object({
-  page: z.coerce.number().min(1).default(1),
-  limit: z.coerce.number().min(1).max(100).default(10),
-  category: z.enum(["tech", "life", "tutorial"]).optional(),
-  search: z.string().optional(),
-});
-
-export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url);
-
-  // 验证查询参数
-  const query = querySchema.safeParse(Object.fromEntries(searchParams));
-
-  if (!query.success) {
+  if (!queryResult.success) {
     return NextResponse.json(
-      { error: "无效的查询参数", details: query.error.flatten() },
+      {
+        error: "查询参数无效",
+        // 把具体的字段错误也返回，方便前端调试
+        details: queryResult.error.flatten().fieldErrors,
+      },
       { status: 400 }
     );
   }
 
-  const { page, limit, category, search } = query.data;
+  // 3. queryResult.data 现在是完全类型安全的
+  const {
+    page,
+    pageSize,
+    status,
+    priority,
+    assigneeId,
+    search,
+    sortBy,
+    sortOrder,
+  } = queryResult.data;
 
-  // 构建查询
+  // 4. 构建数据库查询条件
+  // 因为查询参数已经过验证，这里可以直接安全使用
   const where = {
-    ...(category && { category }),
+    projectId: projectId.data,
+    ...(status && { status }),
+    ...(priority && { priority }),
+    ...(assigneeId && { assigneeId }),
     ...(search && {
-      OR: [{ title: { contains: search } }, { content: { contains: search } }],
+      OR: [
+        { title: { contains: search, mode: "insensitive" as const } },
+        { description: { contains: search, mode: "insensitive" as const } },
+      ],
     }),
   };
 
-  const [posts, total] = await Promise.all([
-    db.posts.findMany({
+  // 5. 并行执行查询和计数，减少等待时间
+  const [tasks, total] = await Promise.all([
+    db.task.findMany({
       where,
-      take: limit,
-      skip: (page - 1) * limit,
-      orderBy: { createdAt: "desc" },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+      orderBy: { [sortBy]: sortOrder },
+      include: {
+        assignee: { select: { id: true, name: true, avatar: true } },
+        creator: { select: { id: true, name: true } },
+      },
     }),
-    db.posts.count({ where }),
+    db.task.count({ where }),
   ]);
 
   return NextResponse.json({
-    posts,
+    tasks,
     pagination: {
       page,
-      limit,
+      pageSize,
       total,
-      totalPages: Math.ceil(total / limit),
+      totalPages: Math.ceil(total / pageSize),
     },
   });
 }
 ```
 
----
+注意这里用了 `z.coerce` -- 查询参数从 URL 过来全是字符串，`page=1` 到了 JavaScript 里是 `"1"` 而不是 `1`。`z.coerce.number()` 会自动帮你做类型转换，省得手动 `parseInt`。
 
-## 端到端类型安全
+## 前端表单验证：共享同一份 schema
 
-### 共享类型
+这是 Zod 最有价值的特性之一：你在服务端定义的 schema，可以直接在前端复用，保证验证规则完全一致。再也不用"后端验证一次，前端再写一套不一样的规则"了。
+
+### 用 react-hook-form 集成
+
+react-hook-form 是 React 生态中表单处理的事实标准，它原生支持 Zod 作为验证器：
+
+```bash
+npm install react-hook-form @hookform/resolvers
+```
 
 ```typescript
-// types/post.ts
-import { z } from "zod";
+// app/(dashboard)/projects/[projectId]/tasks/create-task-form.tsx
+"use client";
 
-export const postSchema = z.object({
+import { useForm } from "react-hook-form";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { createTaskSchema, type CreateTaskInput } from "@/lib/schemas/task";
+import { useActionState } from "react";
+import { createTask } from "../actions";
+
+// z.infer 从 schema 自动推导出 TypeScript 类型
+// CreateTaskInput 等价于手动定义：
+// { title: string; description?: string; priority: Priority; ... }
+type FormValues = z.infer<typeof createTaskSchema>;
+
+export function CreateTaskForm({ projectId }: { projectId: string }) {
+  // zodResolver 把 Zod schema 桥接到 react-hook-form 的验证系统
+  // 这样 react-hook-form 就能在用户输入时实时验证
+  const {
+    register,
+    handleSubmit,
+    formState: { errors, isSubmitting },
+    reset,
+  } = useForm<FormValues>({
+    resolver: zodResolver(createTaskSchema),
+    defaultValues: {
+      title: "",
+      description: "",
+      priority: "none",
+      dueDate: "",
+      assigneeId: "",
+      tags: [],
+    },
+  });
+
+  // Server Action 的状态管理
+  const [actionState, formAction, isPending] = useActionState(
+    createTask,
+    { success: false, errors: {} } as never
+  );
+
+  const onSubmit = handleSubmit(async (data) => {
+    // 这里的 data 已经通过了 react-hook-form + Zod 的前端验证
+    // 但服务端仍然会再做一次验证（因为前端验证可以绕过）
+    const formData = new FormData();
+    formData.append("title", data.title);
+    formData.append("description", data.description ?? "");
+    formData.append("priority", data.priority);
+    formData.append("dueDate", data.dueDate?.toISOString() ?? "");
+    formData.append("assigneeId", data.assigneeId ?? "");
+    formData.append("tags", JSON.stringify(data.tags));
+
+    // 调用 Server Action
+    const result = await formAction(formData);
+    if (result.success) {
+      reset(); // 创建成功后重置表单
+    }
+  });
+
+  return (
+    <form onSubmit={onSubmit}>
+      {/* 标题字段 */}
+      <div>
+        <label htmlFor="title">任务标题</label>
+        <input
+          id="title"
+          {...register("title")}
+          // aria-invalid 让屏幕阅读器知道这个字段有错误
+          aria-invalid={!!errors.title}
+          aria-describedby={errors.title ? "title-error" : undefined}
+        />
+        {/* react-hook-form + Zod 的错误信息会自动出现在 errors 对象中 */}
+        {errors.title && (
+          <p id="title-error" role="alert">
+            {errors.title.message}
+          </p>
+        )}
+      </div>
+
+      {/* 优先级选择器 */}
+      <div>
+        <label htmlFor="priority">优先级</label>
+        <select id="priority" {...register("priority")}>
+          <option value="none">无优先级</option>
+          <option value="low">低</option>
+          <option value="medium">中</option>
+          <option value="high">高</option>
+          <option value="critical">紧急</option>
+        </select>
+      </div>
+
+      {/* 截止日期 */}
+      <div>
+        <label htmlFor="dueDate">截止日期</label>
+        <input
+          id="dueDate"
+          type="date"
+          {...register("dueDate")}
+          // 设置今天为最小可选日期
+          min={new Date().toISOString().split("T")[0]}
+        />
+        {errors.dueDate && (
+          <p role="alert">{errors.dueDate.message}</p>
+        )}
+      </div>
+
+      {/* 服务端返回的错误（前端验证通过但服务端验证失败的情况） */}
+      {actionState && !actionState.success && actionState.errors._form && (
+        <div role="alert">
+          {actionState.errors._form.map((msg) => (
+            <p key={msg}>{msg}</p>
+          ))}
+        </div>
+      )}
+
+      <button type="submit" disabled={isSubmitting || isPending}>
+        {isSubmitting || isPending ? "创建中..." : "创建任务"}
+      </button>
+    </form>
+  );
+}
+```
+
+这里有一个很重要的架构原则：前端验证是为了用户体验（即时反馈），服务端验证是为了安全。两套验证用同一份 schema，但前端验证绝不能替代服务端验证。
+
+## 类型推导：z.infer 的威力
+
+`z.infer` 是 Zod 和 TypeScript 之间的桥梁。它从 schema 中提取出 TypeScript 类型，这样你只需要维护一份 schema，类型定义自动跟着走。
+
+```typescript
+// lib/schemas/task.ts
+
+// 基础任务 schema（包含所有字段，包括数据库自动生成的）
+export const taskSchema = z.object({
   id: z.string().uuid(),
   title: z.string(),
-  content: z.string(),
-  excerpt: z.string().nullable(),
-  category: z.enum(["tech", "life", "tutorial"]),
+  description: z.string().nullable(),
+  priority: z.enum(["none", "low", "medium", "high", "critical"]),
+  status: z.enum(["todo", "in_progress", "done", "archived"]),
+  dueDate: z.date().nullable(),
+  assigneeId: z.string().uuid().nullable(),
   tags: z.array(z.string()),
-  published: z.boolean(),
   createdAt: z.date(),
   updatedAt: z.date(),
 });
 
-// 推断类型
-export type Post = z.infer<typeof postSchema>;
+// 从 taskSchema 推导出完整类型 -- 对应数据库中的一行
+export type Task = z.infer<typeof taskSchema>;
 
-// 输入类型
-export const createPostInputSchema = postSchema.omit({
-  id: true,
-  createdAt: true,
-  updatedAt: true,
+// 创建任务：从完整 schema 中去掉数据库自动生成的字段
+export const createTaskSchema = taskSchema
+  .pick({
+    title: true,
+    description: true,
+    priority: true,
+    dueDate: true,
+    assigneeId: true,
+    tags: true,
+  })
+  .extend({
+    // 覆盖某些字段，加上输入时的验证规则
+    title: z.string().min(1, "标题不能为空").max(120),
+    priority: z
+      .enum(["none", "low", "medium", "high", "critical"])
+      .default("none"),
+    tags: z.array(z.string().max(30)).max(5).default([]),
+  });
+
+// 创建任务的输入类型
+export type CreateTaskInput = z.infer<typeof createTaskSchema>;
+
+// 更新任务：所有字段都是可选的，但至少要传一个
+export const updateTaskSchema = taskSchema
+  .pick({
+    title: true,
+    description: true,
+    priority: true,
+    status: true,
+    dueDate: true,
+    assigneeId: true,
+    tags: true,
+  })
+  .partial(); // 所有字段变为可选
+
+// 更新任务的输入类型
+export type UpdateTaskInput = z.infer<typeof updateTaskSchema>;
+
+// 状态变更：只需要传目标状态
+export const changeStatusSchema = z.object({
+  status: z.enum(["todo", "in_progress", "done", "archived"]),
+  // 可选的备注说明
+  comment: z.string().max(500).optional(),
 });
 
-export type CreatePostInput = z.infer<typeof createPostInputSchema>;
-
-// 更新类型
-export const updatePostInputSchema = postSchema.partial().required({
-  id: true,
-});
-
-export type UpdatePostInput = z.infer<typeof updatePostInputSchema>;
+export type ChangeStatusInput = z.infer<typeof changeStatusSchema>;
 ```
 
-### API 路由类型
+Zod 提供了一组 schema 操作方法来从基础 schema 派生出不同的变体：
+
+- `pick` -- 只保留指定的字段
+- `omit` -- 去掉指定的字段
+- `partial` -- 所有字段变为可选
+- `required` -- 所有字段变为必填
+- `extend` -- 在已有字段基础上添加新字段
+- `merge` -- 合并两个 schema
+
+这些操作的结果仍然是 Zod schema，可以继续链式调用，也可以继续用 `z.infer` 推导类型。
+
+## 错误消息设计
+
+错误消息看起来是个小细节，但它直接影响用户体验。好的错误消息应该告诉用户三件事：什么字段出错了、为什么错、怎么改。
 
 ```typescript
-// app/api/posts/route.ts
+// lib/schemas/shared.ts
+import { z } from "zod";
+
+// 通用的字符串验证，可以复用
+export const nonEmptyString = (fieldName: string) =>
+  z
+    .string()
+    .min(1, `${fieldName}不能为空`)
+    .transform((val) => val.trim())
+    .pipe(
+      // pipe 会将上一个 transform 的输出作为下一个验证的输入
+      z.string().min(1, `${fieldName}不能只包含空格`)
+    );
+
+// 通用的分页参数验证
+export const paginationSchema = z.object({
+  page: z.coerce
+    .number()
+    .int("页码必须是整数")
+    .min(1, "页码最小为 1")
+    .default(1),
+  pageSize: z.coerce
+    .number()
+    .int("每页条数必须是整数")
+    .min(1, "每页至少 1 条")
+    .max(100, "每页最多 100 条")
+    .default(20),
+});
+
+// 任务状态变更的错误消息设计
+export const changeStatusSchema = z
+  .object({
+    targetStatus: z.enum(["todo", "in_progress", "done", "archived"], {
+      errorMap: () => ({ message: "无效的任务状态" }),
+    }),
+    comment: z.string().max(500, "备注不能超过 500 个字符").optional(),
+  })
+  // 跨字段验证：使用 refine 检查状态流转是否合法
+  // 比如不能从 "archived" 直接变回 "todo"
+  .refine(
+    (data) => {
+      // 这里可以加入业务规则校验
+      // 实际项目中通常需要查询数据库获取当前状态
+      return true; // 简化示例
+    },
+    { message: "不允许从当前状态变更为目标状态", path: ["targetStatus"] }
+  );
+```
+
+关于错误消息的几条实践建议：
+
+第一，用用户能听懂的语言。`"Expected string, received number"` 对开发者有用，对用户就是天书。写成 `"优先级请从列表中选择"` 才是合格的错误消息。
+
+第二，`errorMap` 可以自定义某个验证规则失败时的消息。上面的枚举验证用了 `errorMap` 替代默认的 `"Invalid enum value"`。
+
+第三，`refine` 和 `superRefine` 用于跨字段验证。`refine` 返回布尔值，`superRefine` 可以调用 `ctx.addIssue` 添加多条错误。当你的验证逻辑涉及多个字段之间的关系时（比如"截止日期不能早于开始日期"），就用这两个。
+
+## 验证的性能考量
+
+Zod 的解析速度在同类库中是最快的之一，但在高并发场景下仍然值得注意几点：
+
+**避免在 refine 中做数据库查询。** 这是一个常见的性能陷阱。Zod 的 `refine` 支持异步验证（比如检查邮箱是否已注册），但每次验证都会发起一次数据库查询。如果 schema 里有两个这样的异步验证，就是两次额外的数据库往返。
+
+```typescript
+// 不推荐：每次验证都查数据库
+const emailSchema = z
+  .string()
+  .email()
+  .refine(
+    async (email) => {
+      const user = await db.user.findUnique({ where: { email } });
+      return !user;
+    },
+    { message: "邮箱已被注册" }
+  );
+
+// 推荐：在 Server Action 中，先验证格式，再查数据库
+export async function register(formData: FormData) {
+  // 第一步：纯 Zod 验证（同步，无 IO）
+  const formatResult = registerFormatSchema.safeParse(rawData);
+  if (!formatResult.success) {
+    return { success: false, errors: formatResult.error.flatten().fieldErrors };
+  }
+
+  // 第二步：业务规则验证（涉及数据库）
+  const [existingEmail, existingUsername] = await Promise.all([
+    db.user.findUnique({ where: { email: formatResult.data.email } }),
+    db.user.findUnique({ where: { username: formatResult.data.username } }),
+  ]);
+
+  const businessErrors: Record<string, string[]> = {};
+  if (existingEmail) {
+    businessErrors.email = ["邮箱已被注册"];
+  }
+  if (existingUsername) {
+    businessErrors.username = ["用户名已被占用"];
+  }
+  if (Object.keys(businessErrors).length > 0) {
+    return { success: false, errors: businessErrors };
+  }
+
+  // 第三步：执行业务逻辑
+  // ...
+}
+```
+
+**Schema 放在模块顶层。** 不要每次请求都重新创建 schema 对象。把 schema 定义在文件顶层（模块作用域），Zod 在内部会做缓存和优化。放在函数内部每次调用都 `z.object({...})` 是在浪费 CPU。
+
+**按需验证。** 不需要把整个 schema 一次性塞进去。比如更新任务时，客户端只传了 `status` 字段，你就只验证 `status`，不需要对整个任务对象跑一遍验证。用 `partial()` 做一个"所有字段可选"的 schema 就是为了这个场景。
+
+## 更新任务：部分更新的验证模式
+
+实际业务中，更新操作通常只改一两个字段。用 `partial()` 可以轻松应对：
+
+```typescript
+// app/(dashboard)/tasks/[taskId]/actions.ts
+"use server";
+
+import { z } from "zod";
+import { db } from "@/lib/db";
+import { updateTaskSchema } from "@/lib/schemas/task";
+import { getCurrentUser } from "@/lib/auth";
+import { revalidatePath } from "next/cache";
+
+export async function updateTask(
+  taskId: string,
+  updates: unknown // 从客户端来的数据，类型未知，必须验证
+) {
+  // 1. 验证 taskId
+  const idResult = z.string().uuid().safeParse(taskId);
+  if (!idResult.success) {
+    return { success: false as const, error: "任务 ID 无效" };
+  }
+
+  // 2. 验证更新数据
+  // updateTaskSchema 是用 partial() 生成的，所有字段可选
+  const result = updateTaskSchema.safeParse(updates);
+  if (!result.success) {
+    return {
+      success: false as const,
+      errors: result.error.flatten().fieldErrors,
+    };
+  }
+
+  // 3. 确保至少传了一个字段（不能空更新）
+  if (Object.keys(result.data).length === 0) {
+    return { success: false as const, error: "请至少提供一个要更新的字段" };
+  }
+
+  // 4. 检查任务是否存在
+  const existingTask = await db.task.findUnique({
+    where: { id: idResult.data },
+  });
+  if (!existingTask) {
+    return { success: false as const, error: "任务不存在" };
+  }
+
+  // 5. 执行更新 -- result.data 只有传了的字段
+  const updated = await db.task.update({
+    where: { id: idResult.data },
+    data: result.data,
+  });
+
+  revalidatePath(`/tasks/${idResult.data}`);
+  return { success: true as const, data: updated };
+}
+```
+
+这里 `updates` 参数的类型声明为 `unknown` 而不是某个具体类型，是有意为之的。当服务端的函数参数声明为 `unknown` 时，TypeScript 会强制你在使用之前做类型检查（也就是调用 `safeParse`），防止你"忘记验证"。
+
+## 整洁的错误处理模式
+
+当你的项目大了之后，每个 Route Handler 都写一遍 `safeParse -> 判断 -> 返回 400` 会非常啰嗦。可以封装一个通用的验证工具：
+
+```typescript
+// lib/validate.ts
+import { z, ZodSchema } from "zod";
 import { NextResponse } from "next/server";
-import { createPostInputSchema, Post } from "@/types/post";
+
+// 类型安全的验证函数
+// 泛型 T 让 TypeScript 知道验证通过后的数据类型
+export function validate<T>(schema: ZodSchema<T>, data: unknown) {
+  const result = schema.safeParse(data);
+
+  if (!result.success) {
+    // 把 Zod 的错误格式化成前端友好的结构
+    const errors = result.error.flatten().fieldErrors;
+    return {
+      success: false as const,
+      error: NextResponse.json(
+        { error: "数据验证失败", fields: errors },
+        { status: 400 }
+      ),
+    };
+  }
+
+  return { success: true as const, data: result.data };
+}
+```
+
+用起来就简洁多了：
+
+```typescript
+// app/api/tasks/route.ts
+import { validate } from "@/lib/validate";
+import { createTaskSchema } from "@/lib/schemas/task";
 
 export async function POST(request: Request) {
   const body = await request.json();
 
-  // 类型安全的验证
-  const result = createPostInputSchema.safeParse(body);
-
-  if (!result.success) {
-    return NextResponse.json(
-      { error: result.error.flatten() },
-      { status: 400 }
-    );
+  // 一行验证，类型安全
+  const validation = validate(createTaskSchema, body);
+  if (!validation.success) {
+    return validation.error; // 已经是 NextResponse 了，直接返回
   }
 
-  // result.data 是完全类型安全的
-  const post: Post = await db.posts.create({
-    data: result.data,
-  });
-
-  return NextResponse.json(post);
+  // validation.data 类型已经被推导为 CreateTaskInput
+  const task = await db.task.create({ data: validation.data });
+  return NextResponse.json(task, { status: 201 });
 }
 ```
 
-### 客户端类型
+## Trade-off 分析
 
-```typescript
-// lib/api.ts
-import { Post, CreatePostInput } from '@/types/post';
+**Zod vs 手写 if-else 验证：** 手写验证看起来简单，但很难覆盖所有边界情况，而且错误消息的一致性很难保证。Zod 的 schema 声明式写法虽然需要学习成本，但一旦上手，写出来的验证逻辑更完整、更易维护。对于一个有多个表单和 API 的项目，用 Zod 是稳赚的。
 
-// 类型安全的 API 客户端
-export async function createPost(data: CreatePostInput): Promise<Post> {
-  const response = await fetch('/api/posts', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(data),
-  });
+**前端验证 + 服务端验证 = 双倍代码？** 不是。正是因为共享 schema，你反而减少了代码量。没有 Zod 的话，你需要在服务端写一套验证规则、在前端再写一套（通常是用条件判断），两套规则很容易不一致。用 Zod 的话，schema 只定义一次，前后端共用，类型自动推导，长远来看代码量更少。
 
-  if (!response.ok) {
-    throw new Error('创建文章失败');
-  }
+**性能开销：** Zod 的解析开销在绝大多数场景下可以忽略不计。一个中等复杂度的 schema（10-20 个字段），`safeParse` 一次大约在微秒级别。即使是高并发的 API 接口，解析开销也远低于数据库查询和网络 IO。只有当你验证的数据量非常大（比如一次解析几千行的 CSV）时，才需要考虑性能优化。
 
-  return response.json();
-}
+**过度验证的风险：** 不是所有数据都需要严格的 Zod 验证。内部服务之间的通信（比如微服务 A 调微服务 B），如果两边都是你控制的，有时候简单的类型断言就够了。Zod 验证最适合的是"信任边界" -- 用户输入、外部 API 响应、第三方 Webhook 这些不可控的数据源。
 
-// 使用
-// components/CreatePost.tsx
-"use client";
+## 小结
 
-import { useState } from 'react';
-import { createPost, type CreatePostInput } from '@/lib/api';
+从上一篇的缓存策略到这篇的数据验证，我们一直在处理一个核心问题：如何让应用在面对不可预测的输入时依然稳定运行。缓存策略应对的是"数据可能过时"的问题，数据验证应对的是"数据可能就是错的"的问题。
 
-export function CreatePostForm() {
-  const [formData, setFormData] = useState<CreatePostInput>({
-    title: '',
-    content: '',
-    excerpt: '',
-    category: 'tech',
-    tags: [],
-    published: false,
-  });
-
-  const handleSubmit = async () => {
-    // formData 被完全类型检查
-    const post = await createPost(formData);
-    console.log(post);
-  };
-
-  return (
-    <form onSubmit={handleSubmit}>
-      <input
-        value={formData.title}
-        onChange={(e) => setFormData({ ...formData, title: e.target.value })}
-      />
-      {/* ... */}
-    </form>
-  );
-}
-```
-
----
-
-## 错误处理模式
-
-### 统一错误响应
-
-```typescript
-// lib/errors.ts
-export class ValidationError extends Error {
-  constructor(public details: Record<string, string[]>) {
-    super("验证失败");
-    this.name = "ValidationError";
-  }
-}
-
-export class NotFoundError extends Error {
-  constructor(resource: string) {
-    super(`${resource} 未找到`);
-    this.name = "NotFoundError";
-  }
-}
-
-export class UnauthorizedError extends Error {
-  constructor(message = "未授权") {
-    super(message);
-    this.name = "UnauthorizedError";
-  }
-}
-```
-
-### 错误处理中间件
-
-```typescript
-// lib/api-handler.ts
-import { NextResponse } from "next/server";
-import { ZodError } from "zod";
-import { ValidationError } from "./errors";
-
-export function withErrorHandler(
-  handler: (request: Request) => Promise<NextResponse>
-) {
-  return async (request: Request) => {
-    try {
-      return await handler(request);
-    } catch (error) {
-      // Zod 验证错误
-      if (error instanceof ZodError) {
-        return NextResponse.json(
-          {
-            error: "验证失败",
-            details: error.flatten(),
-          },
-          { status: 400 }
-        );
-      }
-
-      // 自定义验证错误
-      if (error instanceof ValidationError) {
-        return NextResponse.json(
-          {
-            error: error.message,
-            details: error.details,
-          },
-          { status: 400 }
-        );
-      }
-
-      // 未找到错误
-      if (error instanceof NotFoundError) {
-        return NextResponse.json({ error: error.message }, { status: 404 });
-      }
-
-      // 未授权错误
-      if (error instanceof UnauthorizedError) {
-        return NextResponse.json({ error: error.message }, { status: 401 });
-      }
-
-      // 未知错误
-      console.error("Unhandled error:", error);
-      return NextResponse.json({ error: "服务器错误" }, { status: 500 });
-    }
-  };
-}
-```
-
-### 使用错误处理
-
-```typescript
-// app/api/posts/[id]/route.ts
-import { NextResponse } from "next/server";
-import { z } from "zod";
-import { db } from "@/lib/db";
-import { withErrorHandler } from "@/lib/api-handler";
-import { NotFoundError } from "@/lib/errors";
-
-const updatePostSchema = z.object({
-  title: z.string().min(5).optional(),
-  content: z.string().min(50).optional(),
-  category: z.enum(["tech", "life", "tutorial"]).optional(),
-});
-
-export const PUT = withErrorHandler(
-  async (request: Request, { params }: { params: { id: string } }) => {
-    const body = await request.json();
-    const result = updatePostSchema.safeParse(body);
-
-    if (!result.success) {
-      throw new ZodError(result.error.issues);
-    }
-
-    // 检查文章是否存在
-    const existingPost = await db.posts.findUnique({
-      where: { id: params.id },
-    });
-
-    if (!existingPost) {
-      throw new NotFoundError("文章");
-    }
-
-    // 更新文章
-    const post = await db.posts.update({
-      where: { id: params.id },
-      data: result.data,
-    });
-
-    return NextResponse.json(post);
-  }
-);
-```
-
----
-
-## 实战：用户注册
-
-```typescript
-// lib/schemas.ts
-import { z } from "zod";
-
-export const registerSchema = z
-  .object({
-    email: z
-      .string()
-      .email("无效的邮箱地址")
-      .refine(
-        async (email) => {
-          const user = await db.user.findUnique({ where: { email } });
-          return !user;
-        },
-        { message: "邮箱已被注册" }
-      ),
-
-    username: z
-      .string()
-      .min(3, "用户名至少需要 3 个字符")
-      .max(20, "用户名不能超过 20 个字符")
-      .regex(/^[a-zA-Z0-9_]+$/, "用户名只能包含字母、数字和下划线")
-      .refine(
-        async (username) => {
-          const user = await db.user.findUnique({ where: { username } });
-          return !user;
-        },
-        { message: "用户名已被占用" }
-      ),
-
-    password: z
-      .string()
-      .min(8, "密码至少需要 8 个字符")
-      .regex(/[A-Z]/, "密码必须包含大写字母")
-      .regex(/[a-z]/, "密码必须包含小写字母")
-      .regex(/[0-9]/, "密码必须包含数字"),
-
-    confirmPassword: z.string(),
-  })
-  .refine((data) => data.password === data.confirmPassword, {
-    message: "两次密码不一致",
-    path: ["confirmPassword"],
-  });
-
-export type RegisterInput = z.infer<typeof registerSchema>;
-```
-
-```typescript
-// app/actions.ts
-"use server";
-
-import { registerSchema } from "@/lib/schemas";
-import { db } from "@/lib/db";
-import { hash } from "bcryptjs";
-
-export async function register(formData: FormData) {
-  const rawData = {
-    email: formData.get("email"),
-    username: formData.get("username"),
-    password: formData.get("password"),
-    confirmPassword: formData.get("confirmPassword"),
-  };
-
-  const result = registerSchema.safeParse(rawData);
-
-  if (!result.success) {
-    return {
-      error: "验证失败",
-      fieldErrors: result.error.flatten().fieldErrors,
-    };
-  }
-
-  // 创建用户
-  const hashedPassword = await hash(result.data.password, 10);
-
-  const user = await db.user.create({
-    data: {
-      email: result.data.email,
-      username: result.data.username,
-      password: hashedPassword,
-    },
-    select: {
-      id: true,
-      email: true,
-      username: true,
-    },
-  });
-
-  return { success: true, user };
-}
-```
-
----
-
-## 最佳实践
-
-### ✅ 推荐做法
-
-1. **始终验证输入**
-
-```typescript
-const result = schema.safeParse(input);
-if (!result.success) {
-  return { error: result.error.flatten() };
-}
-```
-
-2. **使用类型推断**
-
-```typescript
-type Input = z.infer<typeof schema>;
-```
-
-3. **集中管理 Schema**
-
-```typescript
-// lib/schemas.ts
-export const postSchemas = {
-  create: z.object({
-    /* ... */
-  }),
-  update: z.object({
-    /* ... */
-  }),
-  delete: z.object({
-    /* ... */
-  }),
-};
-```
-
-4. **提供友好的错误消息**
-
-```typescript
-min(5, "标题至少需要 5 个字符");
-```
-
-### ❌ 避免做法
-
-1. **不要跳过验证**
-
-```typescript
-// ❌ 不安全
-export async function createPost(data: any) {
-  await db.posts.create({ data });
-}
-
-// ✅ 安全
-export async function createPost(data: unknown) {
-  const result = schema.safeParse(data);
-  if (!result.success) {
-    return { error: result.error };
-  }
-  await db.posts.create({ data: result.data });
-}
-```
-
-2. **不要使用 `any` 类型**
-
-```typescript
-// ❌ 错误
-function process(data: any) {}
-
-// ✅ 正确
-function process(data: z.infer<typeof schema>) {}
-```
-
-3. **不要忽略验证错误**
-
-```typescript
-// ❌ 忽略错误
-schema.parse(input); // 可能抛出异常
-
-// ✅ 处理错误
-const result = schema.safeParse(input);
-if (!result.success) {
-  // 处理错误
-}
-```
-
----
-
-## 常见问题
-
-**Q: Zod 和 TypeScript 类型有什么区别？**
-
-A: TypeScript 类型只在编译时检查，Zod 在运行时验证。使用 Zod 可以确保数据在运行时也是有效的。
-
-**Q: 如何在客户端和服务端共享类型？**
-
-A: 创建共享的类型文件，使用 `z.infer` 推断类型：
-
-```typescript
-// types/post.ts
-export const postSchema = z.object({
-  /* ... */
-});
-export type Post = z.infer<typeof postSchema>;
-```
-
-**Q: 如何处理复杂的验证逻辑？**
-
-A: 使用 `.refine()` 添加自定义验证：
-
-```typescript
-.refine(async (val) => {
-  // 自定义验证逻辑
-  return isValid;
-}, { message: '验证失败' });
-```
-
----
-
-## 总结
-
-本文我们学习了：
-
-✅ **Zod 验证库**
-
-- 基础类型验证
-- 对象验证
-- 嵌套对象
-- 自定义验证
-
-✅ **Server Actions 验证**
-
-- 数据验证
-- 类型推断
-- 错误显示
-
-✅ **API Routes 验证**
-
-- 请求体验证
-- 查询参数验证
-- 错误处理
-
-✅ **端到端类型安全**
-
-- 共享类型
-- 类型安全的 API
-- 客户端类型
-
-✅ **错误处理模式**
-
-- 统一错误响应
-- 错误处理中间件
-- 自定义错误
-
-现在你应该能够在 Next.js 应用中实现完整的数据验证和类型安全。下一步，我们将学习 **身份验证与授权**。
-
----
-
-## 下一步
-
-在下一篇文章中，我们将详细探讨：
-
-- NextAuth.js 基础
-- OAuth 集成
-- 凭证登录
-- 会话管理
-- 中间件保护
-- 角色和权限
+下一篇文章我们会聊身份验证与授权。你会发现，登录表单的验证、用户数据的验证，正好可以用上这篇学到的所有知识。身份验证本质上是"验证用户身份"这个更特殊的验证场景，而 Zod 会在那里继续发挥它的作用。
