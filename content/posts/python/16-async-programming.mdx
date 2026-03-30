@@ -1,672 +1,273 @@
 ---
-title: "16 异步编程深入"
-date: "2026-03-29"
-summary: "深入掌握 Python 异步编程模型，理解事件循环、async/await、并发任务和异步数据库操作"
-tags: ["Python", "asyncio", "异步编程", "asyncpg"]
+title: "16 异步编程"
+date: "2026-03-30"
+summary: "Python async/await 和 Java CompletableFuture 有什么区别？理解 asyncio 事件循环、异步数据库操作和 FastAPI 的异步优势。"
+tags: ["Python", "异步", "asyncio", "FastAPI"]
 category: "python"
 cover: ""
 draft: false
-series: "Python 渐进式学习"
+series: "Python 实战"
 seriesOrder: 16
 ---
 
-# 异步编程深入
+## 一个真实的问题
 
-## 前言
+CMS 首页需要同时加载文章列表、侧边栏的标签云、用户的通知数、热门评论。如果用同步请求逐个调用，4 个接口每个 200ms，用户要等 800ms 才能看到页面。异步并发可以把等待时间压缩到 200ms 左右（取最慢的那个）。
 
-在 Web 开发中，I/O 密集型操作（数据库查询、HTTP 请求、文件读写）是性能瓶颈的主要来源。Python 的 `asyncio` 提供了一种高效的并发模型，让程序在等待 I/O 时不会阻塞，从而大幅提升吞吐量。
-
-FastAPI 本身就是基于 ASGI 异步协议构建的，理解异步编程是写出高性能 API 的关键。
-
-**本文将带你：**
-
-1. 理解同步与异步的本质区别
-2. 掌握 asyncio 事件循环和核心 API
-3. 学会使用 async/await 编写异步代码
-4. 在博客系统中集成异步数据库操作
-5. 正确处理同步与异步的混合调用
+Java 开发者对这个场景不陌生：用 `CompletableFuture.allOf()` 或者 `@Async` 注解就能实现。Python 的 `async/await` 也能做同样的事，但底层的并发模型完全不同。Java 依赖线程池（每个任务占一个线程），Python 用协程（单线程内切换）。理解这个区别，是写出高性能 FastAPI 应用的关键。
 
 ---
 
-## 核心概念
+## 同步与异步的本质区别
 
-### 同步 vs 异步
+先用一个直白的对比来说明问题：
 
 ```python
-import time
+import time, asyncio
 
-# 同步方式：依次请求 3 个 API，总耗时 = 3 秒 + 3 秒 + 3 秒 = 9 秒
-def fetch_user_sync(user_id: int) -> dict:
-    time.sleep(3)  # 模拟网络请求
-    return {"id": user_id, "name": f"User {user_id}"}
+# 同步：3 个请求依次执行，总耗时 = 3s + 3s + 3s = 9s
+def fetch_sync(url: str) -> dict:
+    time.sleep(3)
+    return {"url": url}
 
 def sync_main():
-    start = time.time()
-    results = [
-        fetch_user_sync(1),
-        fetch_user_sync(2),
-        fetch_user_sync(3),
-    ]
-    print(f"同步耗时: {time.time() - start:.2f}s")  # 约 9.00s
-    return results
-```
+    results = [fetch_sync("/users"), fetch_sync("/posts"), fetch_sync("/tags")]
+    # 总耗时 ~9s
 
-```python
-import asyncio
-
-# 异步方式：并发请求 3 个 API，总耗时 ≈ 3 秒（取最长的一个）
-async def fetch_user_async(user_id: int) -> dict:
-    await asyncio.sleep(3)  # 模拟异步网络请求，不阻塞其他任务
-    return {"id": user_id, "name": f"User {user_id}"}
+# 异步：3 个请求并发执行，总耗时 ~3s（取最慢的）
+async def fetch_async(url: str) -> dict:
+    await asyncio.sleep(3)
+    return {"url": url}
 
 async def async_main():
-    start = time.time()
-    # 并发执行三个任务
     results = await asyncio.gather(
-        fetch_user_async(1),
-        fetch_user_async(2),
-        fetch_user_async(3),
+        fetch_async("/users"), fetch_async("/posts"), fetch_async("/tags")
     )
-    print(f"异步耗时: {time.time() - start:.2f}s")  # 约 3.00s
-    return results
+    # 总耗时 ~3s
 ```
 
-**关键区别**：
+核心区别不在语法（`def` vs `async def`），而在执行模型：
 
-| 维度       | 同步                   | 异步                               |
-| ---------- | ---------------------- | ---------------------------------- |
-| 执行方式   | 逐个等待，阻塞当前线程 | 事件循环调度，等待时切换到其他任务 |
-| 并发模型   | 多线程 / 多进程        | 单线程 + 协程                      |
-| 适用场景   | CPU 密集型             | I/O 密集型                         |
-| 编程复杂度 | 简单直观               | 需要理解异步思维                   |
+| 维度       | Java 线程池                       | Python asyncio 协程                  |
+| ---------- | --------------------------------- | ------------------------------------ |
+| 并发单位   | 线程（OS 级，每线程 ~1MB 栈空间） | 协程（用户级，每协程 ~几百字节）     |
+| 切换方式   | OS 调度，抢占式                   | 事件循环调度，协作式（await 时让出） |
+| 并发规模   | 几十到几百个线程                  | 几万到几十万个协程                   |
+| 适用场景   | CPU 密集 + I/O 密集               | I/O 密集型（Web、数据库、HTTP）      |
+| 编程复杂度 | 需要处理线程安全、锁、竞态        | 不需要锁（单线程），但需理解异步思维 |
 
-### 事件循环（Event Loop）
+Java 的 `CompletableFuture` 底层是 ForkJoinPool 线程池，每个异步任务占一个线程。Python 的 `asyncio.gather` 底层是事件循环在一个线程内调度多个协程。两种方案在 I/O 密集型场景下都能提升吞吐量，但 Python 协程的内存开销小得多。
 
-事件循环是 asyncio 的核心引擎，它不断检查并执行已就绪的任务：
+---
+
+## asyncio 事件循环
+
+事件循环是 asyncio 的引擎，它的职责很简单：不断检查哪些任务可以执行，执行它们，遇到 `await` 就切换到其他任务。
 
 ```
 事件循环运行流程：
-┌─────────────────────────────────────────┐
-│           1. 检查就绪任务                  │
-│           2. 执行就绪任务                  │
-│           3. 暂停等待中的任务              │
-│           4. 处理 I/O 事件                │
-│           5. 执行回调                     │
-│           └──────► 回到步骤 1             │
-└─────────────────────────────────────────┘
+
+1. 检查就绪任务（I/O 完成、定时器到期）
+2. 执行就绪任务，直到遇到 await
+3. 被挂起的任务进入等待队列
+4. 回到步骤 1
 ```
 
-```python
-import asyncio
-
-async def main():
-    # 获取当前运行的事件循环
-    loop = asyncio.get_running_loop()
-    print(f"当前事件循环: {loop}")
-
-    # 查看当前时间（事件循环内部时钟）
-    print(f"循环时间: {loop.time()}")
-
-asyncio.run(main())
-```
+在 FastAPI 中，你不需要手动管理事件循环 -- Uvicorn 在启动时自动创建。但理解它的运行机制有助于避免常见的性能陷阱。
 
 ---
 
-## 实战演练
+## async def 路由：FastAPI 的异步优势
 
-### 示例 1：asyncio 任务管理
-
-在博客系统中，我们经常需要并发获取文章的多种信息（统计数据、评论数、标签等）。
+FastAPI 的路由函数可以是 `async def` 也可以是普通 `def`。两者的区别很重要：
 
 ```python
-import asyncio
-import random
-from typing import Any
-
-async def fetch_post_stats(post_id: int) -> dict:
-    """模拟获取文章统计数据"""
-    await asyncio.sleep(random.uniform(0.5, 1.5))
-    return {"post_id": post_id, "views": random.randint(100, 5000), "likes": random.randint(10, 200)}
-
-async def fetch_post_comments_count(post_id: int) -> dict:
-    """模拟获取评论数"""
-    await asyncio.sleep(random.uniform(0.3, 1.0))
-    return {"post_id": post_id, "comments": random.randint(5, 100)}
-
-async def fetch_post_tags(post_id: int) -> dict:
-    """模拟获取标签"""
-    await asyncio.sleep(random.uniform(0.2, 0.8))
-    tags = ["Python", "FastAPI", "异步编程", "Web开发"]
-    return {"post_id": post_id, "tags": random.sample(tags, k=random.randint(1, 3))}
-
-async def get_post_detail(post_id: int) -> dict[str, Any]:
-    """并发获取文章所有信息"""
-    # asyncio.gather: 并发执行，等待所有任务完成，按顺序返回结果
-    stats, comments, tags = await asyncio.gather(
-        fetch_post_stats(post_id),
-        fetch_post_comments_count(post_id),
-        fetch_post_tags(post_id),
-    )
-
-    return {
-        "post_id": post_id,
-        **stats,
-        **comments,
-        **tags,
-    }
-
-async def batch_get_posts(post_ids: list[int]) -> list[dict]:
-    """批量获取多篇文章详情"""
-    # 为每篇文章创建一个任务
-    tasks = [get_post_detail(pid) for pid in post_ids]
-    # 并发执行所有任务
-    results = await asyncio.gather(*tasks)
-    return list(results)
-
-async def main():
-    import time
-    start = time.time()
-
-    # 并发获取 5 篇文章的详情
-    posts = await batch_get_posts([1, 2, 3, 4, 5])
-
-    for post in posts:
-        print(f"文章 {post['post_id']}: 浏览 {post['views']}, "
-              f"点赞 {post['likes']}, 评论 {post['comments']}, 标签 {post['tags']}")
-
-    print(f"\n总耗时: {time.time() - start:.2f}s")
-
-asyncio.run(main())
-```
-
-### 示例 2：asyncio.wait 与 as_completed
-
-```python
-import asyncio
-
-async def fetch_api(endpoint: str, delay: float) -> dict:
-    """模拟 API 请求"""
-    await asyncio.sleep(delay)
-    return {"endpoint": endpoint, "status": "ok", "delay": delay}
-
-async def demo_wait():
-    """使用 asyncio.wait 精细控制任务"""
-
-    tasks = {
-        asyncio.create_task(fetch_api("/users", 1.0)): "users",
-        asyncio.create_task(fetch_api("/posts", 0.5)): "posts",
-        asyncio.create_task(fetch_api("/comments", 2.0)): "comments",
-        asyncio.create_task(fetch_api("/tags", 0.3)): "tags",
-    }
-
-    # FIRST_COMPLETED: 只要有一个完成就返回
-    # FIRST_EXCEPTION: 第一个异常时返回
-    # ALL_COMPLETED: 全部完成（默认）
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-
-    print("=== 第一个完成的任务 ===")
-    for task in done:
-        name = tasks[task]
-        result = task.result()
-        print(f"  {name}: {result}")
-
-    print(f"\n还有 {len(pending)} 个任务在执行...")
-
-    # 取消剩余任务（可选）
-    # for task in pending:
-    #     task.cancel()
-
-    # 等待剩余任务完成
-    if pending:
-        done2, _ = await asyncio.wait(pending)
-        print("\n=== 剩余完成的任务 ===")
-        for task in done2:
-            name = tasks[task]
-            result = task.result()
-            print(f"  {name}: {result}")
-
-async def demo_as_completed():
-    """使用 as_completed 按完成顺序获取结果"""
-    print("\n=== 按完成顺序获取结果 ===")
-
-    tasks = [
-        fetch_api("/slow", 2.0),
-        fetch_api("/medium", 1.0),
-        fetch_api("/fast", 0.3),
-    ]
-
-    # as_completed 返回一个迭代器，任务完成的顺序就是迭代顺序
-    for coro in asyncio.as_completed(tasks):
-        result = await coro
-        print(f"  完成: {result['endpoint']} (耗时 {result['delay']}s)")
-
-async def main():
-    await demo_wait()
-    await demo_as_completed()
-
-asyncio.run(main())
-```
-
-### 示例 3：Semaphore 控制并发
-
-在高并发场景中，我们需要限制同时执行的任务数量，避免压垮下游服务。
-
-```python
-import asyncio
+from fastapi import FastAPI
 import time
 
-# 限制最多同时执行 5 个并发请求
-semaphore = asyncio.Semaphore(5)
+app = FastAPI()
 
-async def fetch_with_limit(url: str, delay: float) -> dict:
-    """使用 Semaphore 限制并发的请求"""
-    async with semaphore:
-        print(f"开始请求: {url}")
-        await asyncio.sleep(delay)
-        print(f"完成请求: {url}")
-        return {"url": url, "status": "ok"}
+# 异步路由：在事件循环中执行，不占用线程池
+@app.get("/posts")
+async def list_posts():
+    posts = await PostService.get_list(db)  # await 异步数据库操作
+    return posts
 
-async def crawl_blog_posts(urls: list[str]) -> list[dict]:
-    """爬取博客文章（控制并发数）"""
-    tasks = [fetch_with_limit(url, 0.5) for url in urls]
-    results = await asyncio.gather(*tasks)
-    return list(results)
-
-async def main():
-    start = time.time()
-
-    # 模拟 20 个 URL，限制最多 5 个并发
-    urls = [f"https://api.example.com/posts/{i}" for i in range(1, 21)]
-    results = await crawl_blog_posts(urls)
-
-    print(f"\n共爬取 {len(results)} 个页面，耗时: {time.time() - start:.2f}s")
-    print(f"理论最短耗时: {0.5 * (20 / 5):.2f}s (4 批，每批 0.5s)")
-
-asyncio.run(main())
+# 同步路由：自动放到线程池中执行
+@app.get("/posts-sync")
+def list_posts_sync():
+    posts = PostService.get_list_sync(db)  # 同步数据库操作
+    return posts
 ```
 
-### 示例 4：异步上下文管理器与异步迭代器
+FastAPI 的处理策略是：如果路由是 `async def`，就在事件循环中直接执行；如果是普通 `def`，就放到线程池里运行（`run_in_executor`）。这意味着同步路由也能正常工作，但会多一次线程切换的开销。
+
+对应 Java 的视角：Spring MVC 的 `@GetMapping` 方法默认在 Servlet 线程池中执行（一个请求占一个线程），WebFlux 的 `@GetMapping` 返回 `Mono/Flux`，在事件循环中执行。FastAPI 的 `async def` 更接近 WebFlux 的模型。
+
+---
+
+## 异步数据库操作
+
+CMS 使用 SQLAlchemy 2.0 的异步模式，配合 `asyncpg` 驱动：
 
 ```python
-import asyncio
-from contextlib import asynccontextmanager
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 
-# ========== 异步上下文管理器 ==========
+engine = create_async_engine("postgresql+asyncpg://user:pass@localhost/blog", pool_size=10)
+AsyncSessionFactory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
 
-@asynccontextmanager
-async def async_db_connection(db_url: str):
-    """模拟异步数据库连接管理"""
-    print(f"  [连接池] 正在连接: {db_url}")
-    # 模拟连接建立
-    await asyncio.sleep(0.1)
-    conn = {"url": db_url, "connected": True}
-
-    try:
-        yield conn  # 将连接对象交给调用者使用
-    finally:
-        # 确保连接被关闭
-        print(f"  [连接池] 正在关闭连接: {db_url}")
-        await asyncio.sleep(0.05)
-        conn["connected"] = False
-
-async def use_async_context():
-    """使用异步上下文管理器"""
-    print("--- 异步上下文管理器演示 ---")
-    async with async_db_connection("postgresql://localhost/blog") as conn:
-        print(f"  连接状态: {conn['connected']}")
-        await asyncio.sleep(0.2)
-        print(f"  执行查询...")
-    print(f"  连接已关闭\n")
-
-# ========== 异步迭代器 ==========
-
-class AsyncPostIterator:
-    """异步分页迭代器：模拟分页获取文章"""
-
-    def __init__(self, total_pages: int = 3):
-        self.current_page = 0
-        self.total_pages = total_pages
-
-    def __aiter__(self):
-        return self
-
-    async def __anext__(self) -> list[dict]:
-        self.current_page += 1
-        if self.current_page > self.total_pages:
-            raise StopAsyncIteration
-
-        # 模拟分页请求
-        await asyncio.sleep(0.3)
-        print(f"  [分页] 获取第 {self.current_page}/{self.total_pages} 页")
-
-        return [
-            {"id": (self.current_page - 1) * 10 + i, "title": f"Post {(self.current_page - 1) * 10 + i}"}
-            for i in range(1, 11)
-        ]
-
-async def use_async_iterator():
-    """使用异步迭代器"""
-    print("--- 异步迭代器演示 ---")
-    all_posts = []
-
-    # 使用 async for 遍历
-    async for page_posts in AsyncPostIterator(total_pages=3):
-        all_posts.extend(page_posts)
-
-    print(f"  共获取 {len(all_posts)} 篇文章\n")
-
-async def main():
-    await use_async_context()
-    await use_async_iterator()
-
-asyncio.run(main())
-```
-
-### 示例 5：异步数据库操作
-
-```python
-"""
-博客系统 - 异步数据库操作示例
-使用 SQLAlchemy 2.0 异步会话 + asyncpg 驱动
-"""
-import asyncio
-from datetime import datetime
-
-from sqlalchemy import Column, Integer, String, DateTime, Text, select, func
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
-
-
-# ========== 数据模型 ==========
-
-class Base(DeclarativeBase):
-    pass
-
-class Post(Base):
-    __tablename__ = "posts"
-
-    id: Mapped[int] = mapped_column(primary_key=True)
-    title: Mapped[str] = mapped_column(String(200))
-    content: Mapped[str] = mapped_column(Text)
-    author_id: Mapped[int] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(String(20), default="draft")
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
-    view_count: Mapped[int] = mapped_column(Integer, default=0)
-
-
-# ========== 数据库配置 ==========
-
-DATABASE_URL = "postgresql+asyncpg://user:password@localhost:5432/blog_db"
-
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,              # 关闭 SQL 日志（生产环境）
-    pool_size=10,            # 连接池大小
-    max_overflow=20,         # 最大溢出连接数
-    pool_pre_ping=True,      # 连接前检查可用性
-)
-
-# 创建异步会话工厂
-async_session = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-
-# ========== 数据库依赖（FastAPI 中使用）==========
-
-async def get_db() -> AsyncSession:
-    """FastAPI 依赖注入中使用的数据库会话"""
-    async with async_session() as session:
+async def get_db():
+    async with AsyncSessionFactory() as session:
         try:
             yield session
             await session.commit()
         except Exception:
             await session.rollback()
             raise
-        finally:
-            await session.close()
+```
 
+关键的异步 CRUD 操作：
 
-# ========== 异步 CRUD 操作 ==========
+```python
+from sqlalchemy import select, func
 
-async def create_post(session: AsyncSession, title: str, content: str, author_id: int) -> Post:
-    """创建文章"""
-    post = Post(title=title, content=content, author_id=author_id, status="published")
-    session.add(post)
-    await session.flush()  # 获取自动生成的 ID
-    await session.refresh(post)
-    return post
-
-async def get_post_by_id(session: AsyncSession, post_id: int) -> Post | None:
-    """根据 ID 获取文章"""
+async def get_post_detail(session: AsyncSession, post_id: int) -> Post:
     result = await session.execute(select(Post).where(Post.id == post_id))
     return result.scalar_one_or_none()
 
-async def get_published_posts(
-    session: AsyncSession,
-    page: int = 1,
-    page_size: int = 10,
-) -> tuple[list[Post], int]:
-    """分页获取已发布文章（含总数）"""
-    # 并发查询：文章列表 + 总数
-    count_query = select(func.count()).select_from(Post).where(Post.status == "published")
+async def get_posts_with_stats(session: AsyncSession, page: int = 1, page_size: int = 10):
+    """并发执行 COUNT 和 SELECT 查询"""
+    count_query = select(func.count(Post.id)).where(Post.is_published == True)
     posts_query = (
         select(Post)
-        .where(Post.status == "published")
+        .where(Post.is_published == True)
         .order_by(Post.created_at.desc())
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
-
-    # 并发执行两个查询
     count_result, posts_result = await asyncio.gather(
         session.execute(count_query),
         session.execute(posts_query),
     )
-
-    total = count_result.scalar()
-    posts = list(posts_result.scalars().all())
-
-    return posts, total
-
-async def increment_view_count(session: AsyncSession, post_id: int) -> bool:
-    """原子性增加浏览量"""
-    result = await session.execute(
-        select(Post).where(Post.id == post_id).with_for_update()
-    )
-    post = result.scalar_one_or_none()
-    if post:
-        post.view_count += 1
-        return True
-    return False
-
-
-# ========== 完整示例 ==========
-
-async def main():
-    """演示异步数据库操作"""
-    async with async_session() as session:
-        # 创建文章
-        post = await create_post(
-            session,
-            title="深入理解 Python 异步编程",
-            content="本文将详细介绍 asyncio 的核心概念...",
-            author_id=1,
-        )
-        print(f"创建文章: {post.id} - {post.title}")
-
-        # 并发获取多篇文章
-        posts, total = await get_published_posts(session, page=1, page_size=10)
-        print(f"文章列表: 共 {total} 篇，当前页 {len(posts)} 篇")
-
-        # 增加浏览量
-        await increment_view_count(session, post.id)
-        updated = await get_post_by_id(session, post.id)
-        print(f"浏览量: {updated.view_count}")
-
-        await session.commit()
-
-asyncio.run(main())
+    return list(posts_result.scalars().all()), count_result.scalar()
 ```
 
-### 示例 6：同步与异步混合使用（run_in_executor）
+`asyncio.gather` 并发执行 COUNT 和 SELECT 是一个实用的优化：两个查询不互相依赖，串行执行要两次网络往返，并发执行只需要一次。
 
-有些第三方库不支持异步（如 `requests`、`Pillow`），需要用 `run_in_executor` 在线程池中运行。
+对应 Java 的等价写法：
+
+```java
+// Spring Boot + JPA（同步）
+public Page<Post> getPosts(int page, int size) {
+    return postRepository.findByPublishedTrue(PageRequest.of(page, size));
+    // COUNT 和 SELECT 在 Pageable 内部串行执行
+}
+
+// Spring WebFlux + R2DBC（异步）
+public Mono<Page<Post>> getPostsReactive(int page, int size) {
+    Mono<Long> count = postRepository.countByPublishedTrue();
+    Flux<Post> posts = postRepository.findByPublishedTrue(PageRequest.of(page, size));
+    return Mono.zip(count, posts.collectList())
+        .map(tuple -> new PageImpl<>(tuple.getT2(), PageRequest.of(page, size), tuple.getT1()));
+}
+```
+
+Python 的 `asyncio.gather` 比 Java 的 `Mono.zip` 更直观 -- 不需要理解 `Mono` 和 `Flux` 的响应式流概念，直接把协程传进去就行。
+
+---
+
+## 并发控制：Semaphore vs ThreadPoolExecutor
+
+CMS 的文章批量导入功能需要并发处理，但不能一次性发送太多数据库写入请求。Python 用 `asyncio.Semaphore` 控制并发数：
 
 ```python
 import asyncio
-import time
-import json
-from functools import partial
 
-# 假设 requests 是同步库，不能直接 await
-def sync_fetch_user(user_id: int) -> dict:
-    """同步函数：模拟 requests.get"""
-    time.sleep(1)
-    return {"id": user_id, "name": f"User {user_id}"}
+semaphore = asyncio.Semaphore(5)  # 最多 5 个并发
 
-def sync_process_image(image_path: str) -> str:
-    """同步函数：模拟图片处理"""
-    time.sleep(2)
-    return f"processed_{image_path}"
+async def import_post(session: AsyncSession, post_data: dict):
+    async with semaphore:
+        await asyncio.sleep(0.1)  # 模拟数据库写入
+        # ... 创建文章逻辑
 
-async def mixed_async_example():
-    """同步异步混合使用"""
+async def batch_import(posts: list[dict]):
+    await asyncio.gather(*[import_post(session, p) for p in posts])
+```
+
+Java 中的等价方案：
+
+```java
+// 方式 1：CompletableFuture + 线程池
+ExecutorService pool = Executors.newFixedThreadPool(5);
+List<CompletableFuture<Void>> futures = posts.stream()
+    .map(p -> CompletableFuture.runAsync(() -> importPost(p), pool))
+    .toList();
+CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+// 方式 2：Spring @Async + 线程池配置
+@Async("taskExecutor")  // 线程池配置为 corePoolSize=5
+public CompletableFuture<Void> importPost(PostData data) { ... }
+```
+
+两者效果一样，但 Python 的 Semaphore 更轻量 -- 不需要创建线程池，不需要管理线程生命周期，一个对象就控制了并发数。
+
+---
+
+## 同步库的桥接：run_in_executor
+
+CMS 可能需要调用一些不支持异步的库（比如 `Pillow` 处理图片、`requests` 调用外部 API）。`run_in_executor` 把同步函数扔到线程池里执行，不阻塞事件循环：
+
+```python
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import requests  # 同步 HTTP 库
+
+# 创建专用线程池
+http_pool = ThreadPoolExecutor(max_workers=10)
+
+async def fetch_external_api(url: str) -> dict:
     loop = asyncio.get_running_loop()
-
-    # 方式 1：直接使用 run_in_executor
-    # 第一个参数 None 表示使用默认的 ThreadPoolExecutor
-    user = await loop.run_in_executor(None, sync_fetch_user, 1)
-    print(f"用户: {user}")
-
-    # 方式 2：使用 partial 传递关键字参数
-    process_func = partial(sync_process_image, image_path="avatar.jpg")
-    result = await loop.run_in_executor(None, process_func)
-    print(f"图片处理结果: {result}")
-
-    # 方式 3：并发执行多个同步任务
-    start = time.time()
-    results = await asyncio.gather(
-        loop.run_in_executor(None, sync_fetch_user, 1),
-        loop.run_in_executor(None, sync_fetch_user, 2),
-        loop.run_in_executor(None, sync_process_image, "cover.jpg"),
-    )
-    print(f"\n并发执行 {len(results)} 个同步任务，耗时: {time.time() - start:.2f}s")
-    print(f"结果: {results}")
-
-asyncio.run(mixed_async_example())
+    # 在线程池中执行同步的 requests.get，不阻塞事件循环
+    response = await loop.run_in_executor(http_pool, requests.get, url)
+    return response.json()
 ```
+
+这和 Java 中在异步代码里调用同步方法的情况类似 -- Spring WebFlux 中如果调用了阻塞的 JDBC 操作，需要用 `Schedulers.boundedElastic()` 包装。思路完全一致：把阻塞操作从事件循环线程中剥离出去。
 
 ---
 
-## 最佳实践
+## 常见陷阱
 
-### 1. 异步函数命名规范
+**`time.sleep` vs `asyncio.sleep`**：在 `async def` 中使用 `time.sleep` 会阻塞整个事件循环，所有请求都会卡住。必须用 `await asyncio.sleep`。这是 Python 异步编程最容易犯的错误。
 
-```python
-# 异步函数使用 async_ 前缀或明确含义的名称
-async def async_fetch_user(user_id: int) -> dict:
-    ...
+**`await` 只能在 `async def` 中使用**：不能在普通函数里写 `await`，也不能在 `async def` 外面调用 `asyncio.run()`（一个线程只能有一个事件循环）。
 
-# 如果整个模块都是异步的，可以省略前缀
-async def get_user(user_id: int) -> dict:
-    ...
-```
-
-### 2. 避免阻塞事件循环
-
-```python
-import asyncio
-
-# 错误：time.sleep 会阻塞整个事件循环
-async def bad_example():
-    time.sleep(5)  # 绝对不要在异步函数中使用 time.sleep
-
-# 正确：使用 asyncio.sleep
-async def good_example():
-    await asyncio.sleep(5)
-
-# 正确：同步阻塞操作用 run_in_executor
-async def correct_example():
-    loop = asyncio.get_running_loop()
-    await loop.run_in_executor(None, time.sleep, 5)
-```
-
-### 3. 超时控制
-
-```python
-import asyncio
-
-async def fetch_with_timeout(url: str, timeout: float = 5.0):
-    """为异步操作设置超时"""
-    try:
-        result = await asyncio.wait_for(
-            fetch_api(url, 3.0),
-            timeout=timeout,
-        )
-        return result
-    except asyncio.TimeoutError:
-        print(f"请求超时: {url}")
-        return None
-```
-
-### 4. 异步日志记录
-
-```python
-import asyncio
-import logging
-
-logger = logging.getLogger(__name__)
-
-async def fetch_with_logging(url: str):
-    """带日志的异步请求"""
-    logger.info(f"开始请求: {url}")
-    try:
-        result = await fetch_api(url, 1.0)
-        logger.info(f"请求成功: {url}")
-        return result
-    except Exception as e:
-        logger.error(f"请求失败: {url}, 错误: {e}")
-        raise
-```
+**数据库连接池要设合理上限**：`pool_size=10` 意味着最多 10 个并发数据库连接。如果用 `asyncio.gather` 并发 100 个查询，其中 90 个会排队等待连接。这在 Java 的 HikariCP 中也是同样的道理。
 
 ---
 
-## 常见问题
+## 对比总结
 
-**Q: 什么时候该用异步，什么时候该用同步？**
-
-A: 如果你的操作是 I/O 密集型（网络请求、数据库查询、文件读写），优先使用异步。如果是 CPU 密集型（图像处理、数值计算），使用多进程（`multiprocessing`）。FastAPI 中，数据库操作和 HTTP 客户端调用应该用异步。
-
-**Q: `asyncio.run()` 可以嵌套调用吗？**
-
-A: 不可以。一个线程只能有一个运行中的事件循环。如果已经在异步上下文中，直接使用 `await` 调用协程即可，不要再用 `asyncio.run()`。
-
-**Q: `create_task` 和 `gather` 有什么区别？**
-
-A: `create_task` 将协程包装为 Task 并立即调度执行，返回 Task 对象。`gather` 接收多个协程/Task，并发执行并等待全部完成，按顺序返回结果。通常用 `gather` 更方便，需要精细控制时用 `create_task`。
-
-**Q: 数据库操作一定要用异步吗？**
-
-A: 不是必须的，但强烈推荐。SQLAlchemy 2.0 提供了完善的异步支持（`AsyncSession` + `asyncpg`），在 FastAPI 中使用异步数据库可以显著提升并发性能。如果使用同步 ORM，可以考虑配合 `run_in_executor`。
-
-**Q: 如何在 FastAPI 中正确使用异步？**
-
-A: 路由处理函数声明为 `async def`，内部 I/O 操作使用 `await`。FastAPI 会自动在线程池中运行普通的 `def` 路由函数，所以同步函数也能正常工作，只是性能不如异步。
+| 维度     | Java (CompletableFuture / WebFlux)               | Python (asyncio)        |
+| -------- | ------------------------------------------------ | ----------------------- |
+| 并发模型 | 线程池 / 响应式流                                | 事件循环 + 协程         |
+| 并发语法 | `CompletableFuture.supplyAsync()` / `Mono.zip()` | `asyncio.gather()`      |
+| 控制并发 | `ThreadPoolExecutor(max)` / `Semaphore`          | `asyncio.Semaphore`     |
+| 桥接同步 | `Schedulers.boundedElastic()`                    | `run_in_executor()`     |
+| Web 框架 | Spring MVC（同步）/ WebFlux（异步）              | FastAPI（异步优先）     |
+| 数据库   | JPA（同步）/ R2DBC（异步）                       | SQLAlchemy AsyncSession |
+| 学习曲线 | 需理解线程安全、响应式流                         | 需理解事件循环、协程    |
 
 ---
 
-## 总结
+## Trade-off
 
-本文深入介绍了 Python 异步编程的核心概念和实践方法：
+Python asyncio 的优势在于**轻量和直观**：协程的创建和切换成本极低，代码读起来和同步代码几乎没有区别（多了个 `await` 关键字）。在 I/O 密集型的 CMS 场景中，单进程就能支撑数千并发。
 
-| 概念                   | 说明                   |
-| ---------------------- | ---------------------- |
-| `async def` / `await`  | 定义和调用协程         |
-| `asyncio.gather`       | 并发执行多个任务       |
-| `asyncio.wait`         | 精细控制任务等待策略   |
-| `asyncio.as_completed` | 按完成顺序获取结果     |
-| `asyncio.Semaphore`    | 控制并发数量           |
-| `async with`           | 异步上下文管理器       |
-| `async for`            | 异步迭代器             |
-| `run_in_executor`      | 在线程池中运行同步函数 |
+代价是 asyncio 不能加速 CPU 密集型操作（图像处理、数据计算），这类任务仍然需要多进程。另外，Python 的异步生态不如 Java 成熟 -- 很多第三方库只提供同步接口，需要 `run_in_executor` 桥接。Java 的优势在于线程模型对 CPU 和 I/O 密集型任务都能胜任，且 `CompletableFuture` 可以和现有的同步代码无缝混用。
 
-掌握异步编程后，我们将在下一篇深入 FastAPI 的中间件与依赖注入系统，进一步提升应用的架构能力。
+---
+
+## 回顾与预告
+
+从第 12 篇到本篇，我们完成了 CMS 的数据层（SQLAlchemy）、API 层（CRUD）、安全层（JWT）、验证层（Pydantic）和性能层（asyncio）。下一篇将讨论 FastAPI 的中间件与依赖注入系统，对比 Spring 的 `@Autowired` 和 Interceptor，理解 Python 的依赖注入模型。

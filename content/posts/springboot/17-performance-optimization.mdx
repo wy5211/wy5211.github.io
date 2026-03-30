@@ -1,284 +1,367 @@
 ---
 title: "17 性能优化"
-date: "2026-03-23"
-summary: "掌握 SpringBoot 应用的性能调优技巧，提升系统吞吐量和响应速度。"
-tags: ["SpringBoot", "性能优化", "JVM", "监控"]
+date: "2026-03-30"
+summary: "Java 性能瓶颈和 Node.js 有什么不同？从 CMS 的 N+1 查询问题出发，理解 @EntityGraph、HikariCP 连接池和 JVM 调优基础。"
+tags: ["Spring Boot", "性能优化", "JVM", "SQL优化"]
 category: "springboot"
 cover: ""
 draft: false
-series: "SpringBoot 渐进式学习指南"
+series: "Spring Boot 实战"
 seriesOrder: 17
 ---
 
-## 前言
+CMS 部署上线了，但用户反馈文章列表页加载很慢。你打开浏览器的 Network 面板，看到 `/api/posts?page=0&size=10` 这个接口返回花了 3 秒。十篇文章要 3 秒，这不对。
 
-性能优化是生产环境的关键环节。本文将讲解从 JVM 到应用层面的全方位优化策略。
+你打开应用的 SQL 日志（开发环境 `show-sql: true`），发现请求一篇文章列表，Hibernate 执行了 21 条 SQL：1 条查文章列表，每篇文章又各查 1 次作者信息和 1 次标签。10 篇文章，1 + 10 + 10 = 21 条查询。这就是经典的 N+1 问题。
 
-## JVM 调优
+在 Node.js + Sequelize/TypeORM 项目里，N+1 同样存在。但你可能没感觉到，因为 Node.js 的异步 I/O 模型让这 21 条查询几乎并发执行，总耗时可能只有 200ms。而 Spring Boot 默认用的是同步 JDBC，21 条查询串行执行，每条 20ms 的话就是 420ms——再加上网络延迟，很容易就到秒级。
 
-### JVM 参数
+这暴露了一个根本差异：**Node.js 的性能瓶颈通常在 CPU，Spring Boot 的性能瓶颈通常在 I/O。**
 
-```bash
-java -jar app.jar \
-  -Xms512m \
-  -Xmx1024m \
-  -XX:+UseG1GC \
-  -XX:MaxGCPauseMillis=200 \
-  -XX:+HeapDumpOnOutOfMemoryError \
-  -XX:HeapDumpPath=/app/logs/heapdump.hprof
+## N+1 查询问题
+
+先用代码复现这个问题。CMS 的文章实体有作者关联和标签关联：
+
+```java
+@Entity
+public class Post {
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String title;
+    private String content;
+    private PostStatus status;
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "author_id")
+    private User author;
+
+    @ManyToMany(fetch = FetchType.LAZY)
+    @JoinTable(
+        name = "post_tags",
+        joinColumns = @JoinColumn(name = "post_id"),
+        inverseJoinColumns = @JoinColumn(name = "tag_id")
+    )
+    private Set<Tag> tags = new HashSet<>();
+}
 ```
 
-### Dockerfile 中配置
+`FetchType.LAZY` 是 JPA 的默认行为——关联实体不随主查询一起加载，等你访问的时候再查。问题在于，你在 Controller 或 Service 里遍历文章列表并访问作者和标签时，每访问一次就触发一次额外的 SQL 查询：
 
-```dockerfile
-FROM eclipse-temurin:17-jre-alpine
-WORKDIR /app
-COPY app.jar app.jar
-EXPOSE 8080
-
-ENV JAVA_OPTS="-Xms512m -Xmx1024m -XX:+UseG1GC"
-
-ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+```java
+// 触发 N+1 的典型写法
+public List<PostResponse> listPosts() {
+    List<Post> posts = postRepository.findAll();  // 1 条 SQL
+    return posts.stream().map(post -> {
+        String authorName = post.getAuthor().getUsername();  // N 条 SQL
+        Set<String> tagNames = post.getTags().stream()        // N 条 SQL
+            .map(Tag::getName).collect(Collectors.toSet());
+        return new PostResponse(post, authorName, tagNames);
+    }).toList();
+}
 ```
 
-## 数据库优化
+等价的 Node.js + Sequelize 写法：
 
-### 连接池配置
+```js
+// 同样会触发 N+1
+const posts = await Post.findAll(); // 1 条 SQL
+return posts.map((post) => ({
+  ...post.toJSON(),
+  authorName: post.author.username, // N 条 SQL
+  tagNames: post.tags.map((t) => t.name), // N 条 SQL
+}));
+```
+
+问题一模一样，但 Node.js 的异步特性让 N+1 的后果没那么严重。Sequelize 的懒加载是通过 Promise 实现的，如果你用了 `Promise.all` 或者框架自动并发，21 条查询可以几乎同时发出。而 Spring Boot 默认的 Hibernate 同步查询是串行的。
+
+## 解决方案一：@EntityGraph
+
+`@EntityGraph` 告诉 JPA 在查询文章时一并加载关联的作者和标签，用 JOIN 把 N+1 合成 1 条 SQL：
+
+```java
+public interface PostRepository extends JpaRepository<Post, Long> {
+
+    @EntityGraph(attributePaths = {"author", "tags"})
+    @Query("SELECT p FROM Post p WHERE p.status = :status ORDER BY p.createdAt DESC")
+    Page<Post> findByStatus(@Param("status") PostStatus status, Pageable pageable);
+}
+```
+
+加了 `@EntityGraph` 后，Hibernate 生成的 SQL 大概是这样：
+
+```sql
+SELECT p.*, u.*, t.*
+FROM post p
+LEFT OUTER JOIN user u ON p.author_id = u.id
+LEFT OUTER JOIN post_tags pt ON p.id = pt.post_id
+LEFT OUTER JOIN tag t ON pt.tag_id = t.id
+WHERE p.status = 'PUBLISHED'
+ORDER BY p.created_at DESC
+LIMIT 10 OFFSET 0
+```
+
+一条 SQL 搞定，不再有 N+1。
+
+等价的 Node.js + Sequelize 写法：
+
+```js
+// 用 include 一次性加载关联
+const posts = await Post.findAll({
+  where: { status: "PUBLISHED" },
+  include: [
+    { model: User, as: "author", attributes: ["username"] },
+    { model: Tag, as: "tags", attributes: ["name"] },
+  ],
+  order: [["createdAt", "DESC"]],
+  limit: 10,
+  offset: 0,
+});
+```
+
+两者功能等价。区别在于 `@EntityGraph` 是声明式的（在 Repository 接口上加注解），Sequelize 的 `include` 是命令式的（在查询选项里指定）。前者和查询方法绑定，不容易遗漏；后者灵活但需要每次查询都记得加。
+
+## 解决方案二：@BatchSize
+
+如果有些场景你没法用 `@EntityGraph`（比如同一个 Repository 方法在不同地方调用，有时需要关联数据有时不需要），可以在实体上加 `@BatchSize`：
+
+```java
+@Entity
+@BatchSize(size = 50)
+public class Post {
+    // ...
+
+    @BatchSize(size = 50)
+    @ManyToMany(fetch = FetchType.LAZY)
+    private Set<Tag> tags = new HashSet<>();
+}
+```
+
+`@BatchSize(size = 50)` 的含义是：当 Hibernate 需要懒加载文章的标签时，不会一条一条查，而是用 `WHERE tag_id IN (?, ?, ..., ?)` 一次性加载最多 50 篇文章的标签。N+1 变成了 1+1（主查询 1 条 + 批量加载关联 1 条）。
+
+Node.js 没有等价机制。你需要在代码层面自己实现批量加载——先收集所有文章 ID，用 `Tag.findAll({ where: { postId: [1, 2, ..., 10] } })` 批量查询，再手动关联。或者用 DataLoader（Facebook 出品的批量加载工具），它的思路和 `@BatchSize` 完全一样。
+
+## 解决方案三：JOIN FETCH in JPQL
+
+`@EntityGraph` 适用于 Spring Data JPA 的方法名查询。如果你需要更灵活的控制，直接在 JPQL 里写 `JOIN FETCH`：
+
+```java
+@Query("SELECT p FROM Post p JOIN FETCH p.author LEFT JOIN FETCH p.tags WHERE p.status = :status")
+Page<Post> findWithRelations(@Param("status") PostStatus status, Pageable pageable);
+```
+
+注意 `JOIN FETCH` 和 `Page` 返回类型一起用时有一个 Hibernate 已知问题：`JOIN FETCH` 会导致分页在内存中执行（而不是 SQL 的 LIMIT/OFFSET），数据量大时有性能风险。解决办法是先用普通查询分页拿到 ID 列表，再用 `WHERE p.id IN :ids JOIN FETCH ...` 加载关联数据。
+
+## HikariCP 连接池配置
+
+N+1 解决了，但还有另一个问题：连接池配置不当。
+
+Spring Boot 默认使用 HikariCP 作为数据库连接池。默认配置是 `maximum-pool-size: 10`。这个值在开发环境够用，但在生产环境中可能不够——特别是如果你的应用有多个并发请求都需要查数据库。
+
+但连接池不是越大越好。连接数太多会导致数据库服务器压力过大（每个连接占用数据库的一个线程和内存）。一个经验公式：
+
+```
+连接数 = (核心数 * 2) + 有效磁盘数
+```
+
+对于一个 4 核的服务器连接 MySQL，合理值大约是 10-20。
 
 ```yaml
 spring:
   datasource:
     hikari:
-      # 连接池大小
       maximum-pool-size: 20
       minimum-idle: 5
-
-      # 连接超时
-      connection-timeout: 30000
-      idle-timeout: 600000
-      max-lifetime: 1800000
-
-      # 性能优化
-      connection-test-query: SELECT 1
-      validation-timeout: 3000
+      connection-timeout: 30000 # 获取连接的最大等待时间（毫秒）
+      idle-timeout: 600000 # 空闲连接存活时间（10 分钟）
+      max-lifetime: 1800000 # 连接最大存活时间（30 分钟）
+      leak-detection-threshold: 60000 # 连接泄漏检测（60 秒）
 ```
 
-### JPA 优化
+`leak-detection-threshold` 是一个容易被忽略但非常有用的配置。如果一个连接被借出超过 60 秒还没归还，HikariCP 会打印一条警告日志，包含获取连接的堆栈信息。这能帮你快速定位"借了连接忘了关"的代码——在 JDBC 里这是 `Connection` 没有在 `finally` 块或 try-with-resources 里关闭。在 Node.js 里不存在这个问题，因为 Sequelize/TypeORM 的连接管理是自动的。
 
-```java
-// ✅ 推荐：批量插入
-@Transactional
-public void batchSave(List<User> users) {
-    userRepository.saveAll(users);
-}
+Node.js 的连接池管理通常比较简单——Sequelize 默认 `pool.max: 5`，TypeORM 也是类似的小值。这是因为 Node.js 的单线程模型意味着同一时刻只有一个查询在执行，即使你发起了多个异步查询，它们也是在事件循环里排队处理。所以 Node.js 的连接池主要是为了"查询 A 执行中、查询 B 不用等 A 完成再获取连接"，而不是为了"并发执行多个查询"。
 
-// ✅ 推荐：使用投影查询
-public interface UserNameOnly {
-    String getUsername();
-}
+## 慢 SQL 排查
 
-@Query("SELECT u.username FROM User u")
-List<UserNameOnly> findAllUserNames();
+SQL 是性能问题最常见的来源。排查方式有两种：
 
-// ✅ 推荐：使用 EntityGraph
-@EntityGraph(attributePaths = {"roles", "permissions"})
-List<User> findAll();
-```
-
-### 懒加载配置
+**方式一：开启 SQL 日志**
 
 ```yaml
 spring:
   jpa:
+    show-sql: true
     properties:
       hibernate:
-        enable_lazy_load_no_trans: true
-        default_batch_fetch_size: 100
+        format_sql: true
+logging:
+  level:
+    org.hibernate.SQL: DEBUG
+    org.hibernate.type.descriptor.sql.BasicBinder: TRACE # 显示绑定参数值
 ```
 
-## 缓存优化
+`format_sql: true` 让 SQL 可读。`BasicBinder: TRACE` 显示参数值（否则只看到 `?`）。这种方式适合开发环境。
 
-### 多级缓存
+**方式二：Spring Boot Actuator + Micrometer**
 
-```java
-@Service
-public class UserService {
-
-    // L1：本地缓存
-    @Cacheable(value = "users", key = "#id")
-    public User findById(Long id) {
-        return userRepository.findById(id).orElse(null);
-    }
-
-    // L2：分布式缓存
-    @Cacheable(value = "userSessions", key = "#token")
-    public UserSession findByToken(String token) {
-        return sessionRepository.findByToken(token);
-    }
-}
-```
-
-### 缓存预热
-
-```java
-@Component
-public class CacheWarmup implements ApplicationRunner {
-
-    @Autowired
-    private UserService userService;
-
-    @Override
-    public void run(ApplicationArguments args) {
-        // 预热热点数据
-        userService.loadHotData();
-    }
-}
-```
-
-## 接口优化
-
-### 分页优化
-
-```java
-// ✅ 推荐：使用游标分页
-@GetMapping("/users")
-public Page<User> getUsers(
-    @RequestParam(defaultValue = "0") int page,
-    @RequestParam(defaultValue = "20") int size
-) {
-    return userRepository.findAll(
-        PageRequest.of(page, size, Sort.by("id").descending())
-    );
-}
-```
-
-### 异步处理
-
-```java
-@Service
-public class ReportService {
-
-    @Async
-    public CompletableFuture<Report> generateReport(Long id) {
-        // 耗时操作异步执行
-        Report report = buildReport(id);
-        return CompletableFuture.completedFuture(report);
-    }
-}
-```
-
-### 批量操作
-
-```java
-@RestController
-public class UserController {
-
-    @PostMapping("/users/batch")
-    public Result<Void> batchCreate(@Valid @RequestBody List<UserDTO> users) {
-        userService.batchSave(users);
-        return Result.success();
-    }
-}
-```
-
-## 监控与分析
-
-### Actuator 配置
+生产环境不能一直开着 SQL 日志。用 Actuator 的 metrics 端点监控 SQL 执行时间：
 
 ```yaml
 management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics,prometheus
+        include: health,metrics,prometheus
   metrics:
-    export:
-      prometheus:
-        enabled: true
+    enable:
+      hikari: true
+      jdbc: true
 ```
 
-### 自定义指标
+然后在 Grafana 或 Prometheus 里配置仪表盘，观察慢查询。
+
+**方式三：MySQL 慢查询日志**
+
+最直接的方式——让数据库自己告诉你哪些查询慢：
+
+```sql
+-- 开启慢查询日志
+SET GLOBAL slow_query_log = ON;
+SET GLOBAL long_query_time = 1;  -- 超过 1 秒的查询记录到日志
+SET GLOBAL slow_query_log_file = '/var/log/mysql/slow.log';
+```
+
+Node.js 项目排查慢 SQL 用的是完全相同的方式。Sequelize 和 TypeORM 不会告诉你哪条 SQL 慢——你需要数据库层面的工具。
+
+## JVM 基础调优
+
+SQL 优化是应用层的。JVM 调优是运行时的。
+
+JVM 的内存模型和 Node.js 的 V8 有本质区别。V8 的堆内存上限默认约 1.5GB（64 位系统），开发者通常不需要调整。JVM 的堆内存需要根据应用的实际负载来配置。
+
+核心参数：
+
+```bash
+java -Xms512m -Xmx1024m -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -jar app.jar
+```
+
+- **`-Xms512m`**：初始堆大小。建议和 `-Xmx` 设成一样，避免运行时动态扩容的开销
+- **`-Xmx1024m`**：最大堆大小。不是越大越好——堆越大，GC 一次要扫描的对象越多，暂停时间越长
+- **`-XX:+UseG1GC`**：使用 G1 垃圾回收器。G1 的设计目标是在大堆（> 4GB）下保持可控的暂停时间。对于 CMS 这种中小型应用，G1 是合理的选择
+- **`-XX:MaxGCPauseMillis=200`**：GC 暂停时间目标。G1 会尽量把暂停控制在 200ms 以内。注意这只是"目标"，不是保证
+
+在 Docker 容器中，JVM 需要知道容器的内存限制，否则它会按宿主机的内存来分配堆大小，导致容器 OOM 被杀。Java 8u191 之后的版本默认识别容器内存限制，但显式指定更可靠：
+
+```bash
+# 容器限制 1GB 内存，JVM 堆设 512MB，留一半给非堆（线程栈、Metaspace、直接内存等）
+java -Xms512m -Xmx512m -XX:MaxMetaspaceSize=256m -XX:+UseG1GC -jar app.jar
+```
+
+`MaxMetaspaceSize=256m` 限制类元数据的内存使用。Spring Boot 项目加载了大量的类（几十个 starter），Metaspace 使用量通常在 100-200MB 之间。
+
+Node.js 没有这些概念。V8 的内存管理是自动的——你不需要设堆大小、不需要选 GC 策略、不需要管 Metaspace。这是 Node.js 开发体验更简单的原因之一，但也是 Node.js 在大规模应用中可控性不如 Java 的原因之一。
+
+## CMS 实战：文章列表查询优化
+
+综合以上策略，优化 CMS 的文章列表接口：
 
 ```java
-@Component
-public class ApiMetrics {
+@Service
+@Transactional(readOnly = true)
+public class PostService {
 
-    private final MeterRegistry meterRegistry;
+    private final PostRepository postRepository;
+    private final PostQueryService postQueryService;
 
-    public void recordApiCall(String endpoint, long duration) {
-        Timer.builder("api.call.duration")
-            .tag("endpoint", endpoint)
-            .register(meterRegistry)
-            .record(duration, TimeUnit.MILLISECONDS);
+    public PostService(PostRepository postRepository, PostQueryService postQueryService) {
+        this.postRepository = postRepository;
+        this.postQueryService = postQueryService;
+    }
+
+    public Page<PostListResponse> listPublishedPosts(int page, int size) {
+        // 用 @EntityGraph 一次查询加载作者和标签
+        Page<Post> posts = postRepository.findByStatus(
+            PostStatus.PUBLISHED,
+            PageRequest.of(page, size, Sort.by("createdAt").descending())
+        );
+
+        // 只返回列表需要的字段，不传 content
+        return posts.map(PostListResponse::from);
     }
 }
 ```
 
-### 性能分析工具
-
-```bash
-# JVM 监控
-jps -l
-jstat -gcutil <pid> 1000
-
-# 线程 dump
-jstack <pid> > thread_dump.txt
-
-# 堆 dump
-jmap -dump:live,format=b,file=heap.hprof <pid>
-```
-
-## 最佳实践
-
-### 1. 避免过度优化
-
 ```java
-// ✅ 推荐：先监控后优化
-// 通过 Actuator 找到真正的瓶颈
-// 优先优化热点代码
-
-// ❌ 避免：过早优化
+// 投影 DTO：列表页不需要 content 字段
+public record PostListResponse(
+    Long id,
+    String title,
+    String summary,
+    String authorName,
+    Set<String> tagNames,
+    LocalDateTime createdAt,
+    int viewCount
+) {
+    public static PostListResponse from(Post post) {
+        return new PostListResponse(
+            post.getId(),
+            post.getTitle(),
+            truncate(post.getContent(), 200),  // 只取前 200 字符做摘要
+            post.getAuthor().getUsername(),
+            post.getTags().stream().map(Tag::getName).collect(Collectors.toSet()),
+            post.getCreatedAt(),
+            post.getViewCount()
+        );
+    }
+}
 ```
 
-### 2. 合理使用缓存
+优化点总结：
 
-```java
-// ✅ 推荐：只缓存热点数据
-@Cacheable(value = "hotData", key = "#id")
+1. `@EntityGraph` 消除 N+1，一条 SQL 加载文章 + 作者 + 标签
+2. `PostListResponse` 只返回列表需要的字段，不传 `content`（可能几 KB），减少序列化和网络传输开销
+3. `@Transactional(readOnly = true)` 告诉 Hibernate 不需要脏检查，可以跳过实体状态的快照保存，节省内存
+4. `record` 类型替代传统的 class，自动生成 getter 和构造器，减少样板代码
 
-// ❌ 避免：缓存所有数据
-```
+## 完整对比
 
-### 3. 异步处理耗时操作
+| 维度         | Node.js 性能瓶颈         | Spring Boot 性能瓶颈                   |
+| ------------ | ------------------------ | -------------------------------------- |
+| 典型瓶颈     | CPU 密集计算阻塞事件循环 | I/O 等待（数据库、网络）               |
+| N+1 影响     | 较轻（异步并发查询）     | 严重（同步串行查询）                   |
+| N+1 解决     | DataLoader / include     | @EntityGraph / @BatchSize / JOIN FETCH |
+| 连接池       | 简单配置（默认 5-10）    | 需要调优（CPU 核数相关公式）           |
+| 内存调优     | V8 自动管理，几乎不需要  | JVM 堆大小、GC 策略需要配置            |
+| GC           | V8 的分代 GC，自动       | 可选 G1/ZGC/Shenandoah，需要选型和调参 |
+| 慢 SQL 排查  | 相同（数据库慢查询日志） | 相同（数据库慢查询日志）               |
+| 热点代码优化 | profiler 分析 CPU 占用   | JIT 编译器自动优化热点路径             |
 
-```java
-// ✅ 推荐：邮件、报表生成等使用异步
-@Async
-public void sendEmail() { }
+## Trade-off 分析
 
-// ❌ 避免：阻塞主线程
-```
+**Spring Boot 性能优化的收益：**
 
-## 总结
+- `@EntityGraph` 和 `@BatchSize` 是声明式的优化，加注解就行，不需要改业务逻辑。Sequelize 的 `include` 虽然也简单，但需要每次查询都记得加
+- HikariCP 的连接池监控和泄漏检测是内置的。Node.js 的连接池管理更原始，没有等价的泄漏检测机制
+- JVM 的 JIT 编译器在长期运行的服务中会自动优化热点代码。V8 也有 JIT（TurboFan），但 Java 的 JIT 在类型信息更丰富的情况下能做更激进的优化
+- Actuator + Prometheus + Grafana 的监控体系比 Node.js 生态的 pm2 + 仪表盘更标准化
 
-本文介绍了性能优化，主要内容：
+**代价：**
 
-- ✅ JVM 调优
-- ✅ 数据库连接池优化
-- ✅ 缓存策略优化
-- ✅ 接口性能优化
-- ✅ 监控与分析
+- 性能优化的认知负担重。你需要理解 N+1 的原理、HikariCP 的参数含义、JVM 的内存模型和 GC 策略。Node.js 开发者通常不需要了解这些
+- JVM 调优不当反而会降低性能。把堆设得太大导致 GC 暂停变长，连接池设得太大导致数据库压力过大——这些都需要根据实际负载来调整
+- 同步 JDBC 模型让 N+1 的后果更严重。Node.js 的异步 I/O 天然缓解了这个问题。如果你在 Spring Boot 中用同步 JDBC，需要更严格地避免 N+1
+- 调优需要工具。jstat、jmap、jstack、VisualVM——这些 JVM 工具的学习成本不低。Node.js 的性能分析用 Chrome DevTools 就够了
 
-接下来我们将学习微服务架构入门。
+## 回顾与预告
 
-## 下一步
+到这篇为止，CMS 的性能优化已经做了关键几步：
 
-在最后一篇文章《18 微服务架构入门》中，我们将学习：
+- 定位并解决了 N+1 查询问题——用 `@EntityGraph` 把 21 条 SQL 降为 1 条
+- 理解了 `@BatchSize` 作为 N+1 的补充方案，以及 `JOIN FETCH` 的适用场景
+- 配置了 HikariCP 连接池参数，启用了泄漏检测
+- 理解了 JVM 基础调优——堆大小、GC 选择、容器环境下的内存限制
 
-- 微服务架构设计原则
-- Spring Cloud 组件介绍
-- 服务注册与发现
-- 配置中心
-- 服务网关
+CMS 现在是一个功能完整、测试覆盖、容器化部署、性能合理的单体应用。但如果用户量继续增长，评论功能、用户中心、消息通知这些模块全部塞在一个应用里，部署和扩展都会越来越困难。
 
----
+下一篇是系列收官——从 CMS 的评论服务拆分出发，了解微服务架构的基本概念和 Spring Cloud 的核心组件，回顾整个系列 18 篇的核心对比点。

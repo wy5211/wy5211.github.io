@@ -1,661 +1,331 @@
 ---
-title: "19 WebSocket 实时通信"
-date: "2026-03-29"
-summary: "使用 FastAPI WebSocket 实现实时通信功能，包括聊天室、在线状态和消息推送"
+title: "19 WebSocket"
+date: "2026-03-30"
+summary: "Python WebSocket 和 Spring 的有什么不同？用 FastAPI WebSocket 实现 CMS 的评论实时推送，对比 Spring WebSocket + STOMP 方案。"
 tags: ["Python", "FastAPI", "WebSocket", "实时通信"]
 category: "python"
 cover: ""
 draft: false
-series: "Python 渐进式学习"
+series: "Python 实战"
 seriesOrder: 19
 ---
 
-# WebSocket 实时通信
+# WebSocket
 
-## 前言
+CMS 的文章详情页需要实时显示新评论。用户 A 发了评论，正在看同一篇文章的用户 B 和 C 应该立刻看到，不用刷新页面。
 
-HTTP 协议是"请求-响应"模式，客户端主动请求，服务端被动响应。但在很多场景下（聊天室、实时通知、协作编辑），我们需要服务端主动向客户端推送数据。WebSocket 正是为了解决这一问题而生的全双工通信协议。
+HTTP 的请求-响应模式做不到这一点。WebSocket 通过一次 HTTP 握手建立持久连接，之后双方可以随时互发消息。
 
-FastAPI 内置了对 WebSocket 的完整支持，让我们可以轻松构建实时功能。
+## FastAPI WebSocket：裸协议
 
-**本文将带你：**
-
-1. 理解 WebSocket 与 HTTP 的区别
-2. 使用 FastAPI WebSocket API
-3. 设计连接管理器（ConnectionManager）
-4. 实现房间机制和广播/定向推送
-5. 添加心跳检测和认证
-
----
-
-## 核心概念
-
-### WebSocket vs HTTP
-
-```
-HTTP 通信模式（半双工）：
-客户端 ──── 请求 ────► 服务端
-客户端 ◄─── 响应 ──── 服务端
-（每次通信需要重新建立连接，Header 冗余大）
-
-WebSocket 通信模式（全双工）：
-客户端 ◄──────────────────► 服务端
-（一次握手后持久连接，双向实时通信，开销极小）
-```
-
-**WebSocket 握手过程**：
-
-```
-1. 客户端发送 HTTP 请求，带有 Upgrade: websocket 头
-2. 服务端返回 101 Switching Protocols
-3. 之后双方通过同一个 TCP 连接双向通信
-4. 客户端或服务端都可以随时发送消息
-```
-
----
-
-## 实战演练
-
-### 示例 1：连接管理器（ConnectionManager）
+FastAPI 内置了 WebSocket 支持，用法很直接：
 
 ```python
-"""
-博客系统 - WebSocket 连接管理器
-"""
+from fastapi import FastAPI, WebSocket
+
+app = FastAPI()
+
+@app.websocket("/ws/posts/{post_id}/comments")
+async def post_comments(ws: WebSocket, post_id: int):
+    await ws.accept()
+    while True:
+        data = await ws.receive_text()
+        # 收到客户端消息，广播给同文章的其他连接
+```
+
+这里有一个关键区别：FastAPI 的 WebSocket 是**裸协议**——你直接收发文本或字节，消息格式自己定义。没有内置的订阅机制、没有消息路由、没有房间概念。
+
+Spring Boot 的方案完全不同：
+
+```java
+// Spring Boot 使用 STOMP over WebSocket
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry config) {
+        // 启用简单的内存消息代理，目的地前缀为 /topic
+        config.enableSimpleBroker("/topic");
+        // 客户端发送消息的目的地前缀
+        config.setApplicationDestinationPrefixes("/app");
+    }
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        // WebSocket 握手端点
+        registry.addEndpoint("/ws")
+                .setAllowedOriginPatterns("*");
+    }
+}
+
+// 发送消息到 /topic/posts/{postId}/comments
+@MessageMapping("/posts/{postId}/comments")
+public void handleComment(CommentMessage msg) {
+    messagingTemplate.convertAndSend(
+        "/topic/posts/" + msg.getPostId() + "/comments",
+        msg
+    );
+}
+```
+
+Spring Boot 把 WebSocket 抽象成了 STOMP 消息代理。客户端通过 `stomp.js` 订阅 `/topic/posts/123/comments`，服务端用 `@MessageMapping` 声明消息处理方法。这是发布-订阅模型。
+
+FastAPI 没有这层抽象。你需要自己管理连接、自己实现广播、自己定义消息格式。这意味着更多代码，但也意味着更灵活、更透明。
+
+| 维度      | Spring Boot WebSocket + STOMP | FastAPI WebSocket         |
+| --------- | ----------------------------- | ------------------------- |
+| 抽象层级  | 高（消息代理 + 订阅/发布）    | 低（裸 WebSocket 协议）   |
+| 订阅机制  | 内置（`/topic/xxx`）          | 需要手动实现              |
+| 消息格式  | STOMP 帧协议                  | 自定义 JSON（或任意格式） |
+| 房间/频道 | 内置（destination 前缀）      | 需要手动实现              |
+| 客户端库  | stomp.js + SockJS             | 原生 WebSocket API        |
+| 认证      | Spring Security 集成          | 查询参数传 Token          |
+
+## 连接管理器
+
+因为 FastAPI 没有内置的房间机制，CMS 需要自己管理"哪些 WebSocket 连接在关注哪篇文章"：
+
+```python
 import asyncio
 import json
 from datetime import datetime
-from typing import Dict, Set, Optional
-from fastapi import WebSocket, WebSocketDisconnect
-import logging
+from typing import Dict, Set
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
-logger = logging.getLogger(__name__)
+app = FastAPI()
 
 
 class ConnectionManager:
-    """
-    WebSocket 连接管理器
-    管理所有活跃连接，支持广播、房间、定向推送
-    """
+    """管理所有活跃的 WebSocket 连接，按文章分组"""
 
     def __init__(self):
-        # 活跃连接: {websocket: user_id}
-        self.active_connections: Dict[WebSocket, int] = {}
-        # 房间: {room_id: set(websocket)}
-        self.rooms: Dict[str, Set[WebSocket]] = {}
-        # 用户到连接的映射（一个用户可能有多个连接）
-        self.user_connections: Dict[int, Set[WebSocket]] = {}
+        # post_id -> Set[WebSocket]
+        self.rooms: Dict[int, Set[WebSocket]] = {}
 
-    async def connect(self, websocket: WebSocket, user_id: int):
-        """接受新的 WebSocket 连接"""
-        await websocket.accept()
-        self.active_connections[websocket] = user_id
+    async def connect(self, ws: WebSocket, post_id: int):
+        await ws.accept()
+        if post_id not in self.rooms:
+            self.rooms[post_id] = set()
+        self.rooms[post_id].add(ws)
 
-        # 记录用户连接
-        if user_id not in self.user_connections:
-            self.user_connections[user_id] = set()
-        self.user_connections[user_id].add(websocket)
+    def disconnect(self, ws: WebSocket, post_id: int):
+        if post_id in self.rooms:
+            self.rooms[post_id].discard(ws)
+            if not self.rooms[post_id]:
+                del self.rooms[post_id]
 
-        logger.info(f"用户 {user_id} 已连接，当前在线: {len(self.active_connections)}")
-
-    def disconnect(self, websocket: WebSocket):
-        """断开连接"""
-        user_id = self.active_connections.pop(websocket, None)
-
-        # 从所有房间中移除
-        for room_id, members in self.rooms.items():
-            members.discard(websocket)
-            if not members:
-                del self.rooms[room_id]
-
-        # 从用户连接映射中移除
-        if user_id and user_id in self.user_connections:
-            self.user_connections[user_id].discard(websocket)
-            if not self.user_connections[user_id]:
-                del self.user_connections[user_id]
-
-        logger.info(f"用户 {user_id} 已断开，当前在线: {len(self.active_connections)}")
-
-    async def send_personal_message(self, message: dict, websocket: WebSocket):
-        """向指定连接发送消息"""
-        try:
-            await websocket.send_json(message)
-        except Exception as e:
-            logger.error(f"发送消息失败: {e}")
-            self.disconnect(websocket)
-
-    async def send_to_user(self, user_id: int, message: dict):
-        """向指定用户的所有连接发送消息"""
-        if user_id in self.user_connections:
-            for ws in self.user_connections[user_id].copy():
-                await self.send_personal_message(message, ws)
-
-    async def broadcast(self, message: dict):
-        """向所有连接广播消息"""
-        for connection in list(self.active_connections.keys()):
-            await self.send_personal_message(message, connection)
-
-    async def join_room(self, websocket: WebSocket, room_id: str):
-        """加入房间"""
-        if room_id not in self.rooms:
-            self.rooms[room_id] = set()
-        self.rooms[room_id].add(websocket)
-
-        # 通知房间内其他成员
-        user_id = self.active_connections.get(websocket)
-        await self.broadcast_to_room(
-            room_id,
-            {
-                "type": "user_joined",
-                "user_id": user_id,
-                "room_id": room_id,
-                "online_count": len(self.rooms[room_id]),
-            },
-            exclude=websocket,
-        )
-
-    async def leave_room(self, websocket: WebSocket, room_id: str):
-        """离开房间"""
-        if room_id in self.rooms:
-            self.rooms[room_id].discard(websocket)
-
-            user_id = self.active_connections.get(websocket)
-            await self.broadcast_to_room(
-                room_id,
-                {
-                    "type": "user_left",
-                    "user_id": user_id,
-                    "room_id": room_id,
-                    "online_count": len(self.rooms.get(room_id, set())),
-                },
-            )
-
-    async def broadcast_to_room(
-        self,
-        room_id: str,
-        message: dict,
-        exclude: Optional[WebSocket] = None,
-    ):
-        """向房间内所有成员广播"""
-        if room_id not in self.rooms:
+    async def broadcast(self, post_id: int, message: dict):
+        """向关注同一篇文章的所有连接广播"""
+        if post_id not in self.rooms:
             return
-        for ws in self.rooms[room_id].copy():
-            if ws != exclude:
-                await self.send_personal_message(message, ws)
+        dead = []
+        for ws in self.rooms[post_id]:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.rooms[post_id].discard(ws)
 
-    def get_online_users(self, room_id: Optional[str] = None) -> list[int]:
-        """获取在线用户列表"""
-        if room_id and room_id in self.rooms:
-            return [
-                self.active_connections[ws]
-                for ws in self.rooms[room_id]
-                if ws in self.active_connections
-            ]
-        return list(self.user_connections.keys())
+    def get_online_count(self, post_id: int) -> int:
+        return len(self.rooms.get(post_id, set()))
 
 
-# 全局连接管理器
 manager = ConnectionManager()
 ```
 
-### 示例 2：实时聊天室
+在 Spring Boot 中，同样的功能由 STOMP 消息代理自动处理。你不需要手动管理连接集合——`/topic/posts/123/comments` 这个 destination 本身就是"房间"，消息代理负责路由。
+
+## CMS 评论实时推送
+
+把连接管理器和评论业务串起来：
 
 ```python
-"""
-博客系统 - WebSocket 实时聊天室
-"""
-from datetime import datetime
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
-from typing import Optional
-import json
+from fastapi import WebSocket, WebSocketDisconnect, Query, APIRouter
 import uuid
-
-app = FastAPI(title="博客系统 API - WebSocket 聊天")
-
-
-@app.websocket("/ws/chat/{room_id}")
-async def chat_websocket(
-    websocket: WebSocket,
-    room_id: str,
-    token: Optional[str] = Query(None),
-):
-    """
-    聊天室 WebSocket 端点
-
-    消息格式:
-    - 客户端发送: {"type": "message", "content": "你好"}
-    - 服务端广播: {"type": "message", "user_id": 1, "username": "admin",
-                   "content": "你好", "timestamp": "...", "message_id": "..."}
-    """
-    # ========== 认证 ==========
-    user_id = authenticate_ws_token(token)
-    if user_id is None:
-        await websocket.close(code=4001, reason="认证失败")
-        return
-
-    # ========== 连接 ==========
-    await manager.connect(websocket, user_id)
-    await manager.join_room(websocket, room_id)
-
-    # 获取用户信息
-    username = f"User_{user_id}"
-
-    # 发送加入欢迎消息
-    await manager.send_personal_message(
-        {
-            "type": "system",
-            "content": f"欢迎 {username} 加入聊天室",
-            "room_id": room_id,
-            "timestamp": datetime.utcnow().isoformat(),
-        },
-        websocket,
-    )
-
-    # ========== 消息循环 ==========
-    try:
-        while True:
-            # 接收客户端消息
-            data = await websocket.receive_text()
-
-            try:
-                message = json.loads(data)
-            except json.JSONDecodeError:
-                await manager.send_personal_message(
-                    {"type": "error", "content": "无效的 JSON 格式"},
-                    websocket,
-                )
-                continue
-
-            msg_type = message.get("type")
-
-            if msg_type == "message":
-                # 聊天消息：广播给房间内所有人
-                chat_msg = {
-                    "type": "message",
-                    "message_id": str(uuid.uuid4()),
-                    "user_id": user_id,
-                    "username": username,
-                    "content": message.get("content", "")[:500],  # 限制长度
-                    "room_id": room_id,
-                    "timestamp": datetime.utcnow().isoformat(),
-                }
-
-                await manager.broadcast_to_room(room_id, chat_msg)
-
-            elif msg_type == "typing":
-                # 正在输入提示
-                await manager.broadcast_to_room(
-                    room_id,
-                    {
-                        "type": "typing",
-                        "user_id": user_id,
-                        "username": username,
-                    },
-                    exclude=websocket,
-                )
-
-            elif msg_type == "ping":
-                # 心跳响应
-                await manager.send_personal_message(
-                    {"type": "pong"},
-                    websocket,
-                )
-
-    except WebSocketDisconnect:
-        manager.disconnect(websocket)
-    except Exception as e:
-        logger.error(f"WebSocket 异常: {e}")
-        manager.disconnect(websocket)
-
-
-def authenticate_ws_token(token: Optional[str]) -> Optional[int]:
-    """简单的 Token 认证（实际项目中验证 JWT）"""
-    if token and token.startswith("valid_"):
-        return int(token.split("_")[1])
-    return None
-```
-
-### 示例 3：在线用户列表与实时通知
-
-```python
-from fastapi import APIRouter, WebSocket, Depends
 
 router = APIRouter()
 
-# ========== 在线状态 ==========
 
-@app.websocket("/ws/online")
-async def online_status_websocket(websocket: WebSocket):
-    """在线状态 WebSocket"""
-    # 简单认证（实际项目中通过 Query 参数传 Token）
-    user_id = 1  # 模拟
-    await manager.connect(websocket, user_id)
+@router.websocket("/ws/posts/{post_id}/comments")
+async def comment_stream(ws: WebSocket, post_id: int, token: str = Query(None)):
+    """文章评论实时推送"""
 
-    # 发送当前在线用户列表
-    await manager.send_personal_message(
-        {
-            "type": "online_list",
-            "users": manager.get_online_users(),
-        },
-        websocket,
-    )
+    # 1. 认证（通过查询参数传 JWT）
+    user_id = verify_token(token)  # 假设这个函数验证 JWT 并返回 user_id
+    if user_id is None:
+        await ws.close(code=4001, reason="未认证")
+        return
 
-    # 广播上线通知
-    await manager.broadcast(
-        {
-            "type": "user_online",
-            "user_id": user_id,
-            "online_count": len(manager.active_connections),
-        },
-        exclude=websocket,
-    )
+    # 2. 建立连接
+    await manager.connect(ws, post_id)
 
+    # 3. 发送当前在线人数
+    await ws.send_json({
+        "type": "welcome",
+        "online_count": manager.get_online_count(post_id),
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+
+    # 4. 消息循环
     try:
         while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "detail": "无效的 JSON"})
+                continue
 
-            if message.get("type") == "ping":
-                await manager.send_personal_message({"type": "pong"}, websocket)
+            if msg.get("type") == "ping":
+                await ws.send_json({"type": "pong"})
+            # 其他消息类型在这里处理
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
-        # 广播离线通知
-        await manager.broadcast(
-            {
-                "type": "user_offline",
-                "user_id": user_id,
-                "online_count": len(manager.active_connections),
-            }
-        )
-
-
-# ========== HTTP API：获取在线状态 ==========
-
-@app.get("/api/online/{room_id}")
-async def get_room_online(room_id: str):
-    """获取房间在线用户列表"""
-    return {
-        "room_id": room_id,
-        "online_users": manager.get_online_users(room_id),
-        "online_count": len(manager.get_online_users(room_id)),
-    }
-
-
-# ========== 实时通知推送 ==========
-
-async def notify_user(user_id: int, title: str, content: str, notify_type: str = "info"):
-    """
-    向指定用户推送实时通知
-
-    使用方式：在业务逻辑中调用
-    await notify_user(user_id, "新评论", "你的文章收到了新评论")
-    """
-    message = {
-        "type": "notification",
-        "notification_type": notify_type,
-        "title": title,
-        "content": content,
-        "timestamp": datetime.utcnow().isoformat(),
-    }
-    await manager.send_to_user(user_id, message)
-
-
-# ========== 评论通知示例 ==========
-
-async def on_new_comment(post_author_id: int, comment_content: str, commenter_name: str):
-    """新评论时通知文章作者"""
-    await notify_user(
-        user_id=post_author_id,
-        title="新评论",
-        content=f"{commenter_name} 评论了你的文章: {comment_content[:50]}",
-        notify_type="comment",
-    )
-
-
-async def on_new_like(post_author_id: int, liker_name: str):
-    """新点赞时通知文章作者"""
-    await notify_user(
-        user_id=post_author_id,
-        title="新点赞",
-        content=f"{liker_name} 赞了你的文章",
-        notify_type="like",
-    )
-
-
-async def on_new_follower(user_id: int, follower_name: str):
-    """新粉丝时通知用户"""
-    await notify_user(
-        user_id=user_id,
-        title="新粉丝",
-        content=f"{follower_name} 关注了你",
-        notify_type="follow",
-    )
+        manager.disconnect(ws, post_id)
 ```
 
-### 示例 4：心跳检测机制
+当有新评论创建时，在 HTTP 路由里调用 `manager.broadcast`：
+
+```python
+from fastapi import BackgroundTasks
+
+@router.post("/api/posts/{post_id}/comments")
+async def create_comment(
+    post_id: int,
+    content: str,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+):
+    # 1. 保存评论到数据库
+    comment = await save_comment(post_id, current_user["id"], content)
+
+    # 2. 广播给所有正在看这篇文章的用户
+    await manager.broadcast(post_id, {
+        "type": "new_comment",
+        "comment": {
+            "id": comment.id,
+            "author": current_user["username"],
+            "content": content,
+            "created_at": comment.created_at.isoformat(),
+        },
+        "online_count": manager.get_online_count(post_id),
+    })
+
+    return {"comment_id": comment.id}
+```
+
+对应的 Spring Boot 实现更简洁，因为 STOMP 帮你处理了广播：
+
+```java
+@MessageMapping("/posts/{postId}/comments")
+public void handleComment(
+    @DestinationVariable Long postId,
+    CommentMessage msg,
+    Principal principal
+) {
+    Comment comment = commentService.save(postId, principal.getName(), msg.getContent());
+
+    // 直接发送到 destination，STOMP 代理负责广播给所有订阅者
+    messagingTemplate.convertAndSend(
+        "/topic/posts/" + postId + "/comments",
+        Map.of(
+            "type", "new_comment",
+            "comment", Map.of(
+                "id", comment.getId(),
+                "author", comment.getAuthor(),
+                "content", comment.getContent()
+            )
+        )
+    );
+}
+```
+
+## 水平扩展问题
+
+单机 WebSocket 有一个硬伤：连接状态保存在内存中，多实例部署时，用户 A 连接到实例 1，用户 B 连接到实例 2，实例 1 的广播到达不了实例 2 的连接。
+
+Spring Boot 有多种解决方案：用 RabbitMQ 或 ActiveMQ 作为 STOMP 代理替代内置的 SimpleBroker，消息代理负责跨实例路由。
+
+FastAPI 的做法类似——用 Redis Pub/Sub 做跨实例消息转发：
+
+```python
+import redis.asyncio as redis
+
+redis_client = redis.Redis("redis://localhost:6379")
+pubsub = redis_client.pubsub()
+
+
+async def broadcast_with_redis(post_id: int, message: dict):
+    """跨实例广播：发布到 Redis，所有实例订阅后转发给本地连接"""
+    await redis_client.publish(
+        f"ws:post:{post_id}",
+        json.dumps(message),
+    )
+
+
+# 启动时订阅 Redis 频道
+async def start_pubsub_listener():
+    await pubsub.psubscribe("ws:post:*")
+    async for message in pubsub.listen():
+        if message["type"] == "pmessage":
+            channel = message["channel"]  # ws:post:123
+            post_id = int(channel.split(":")[-1])
+            data = json.loads(message["data"])
+            await manager.broadcast(post_id, data)
+```
+
+## 心跳检测
+
+WebSocket 连接可能因为网络问题"假死"——TCP 层面没断开，但实际上已经无法通信。需要心跳检测来发现这种情况：
 
 ```python
 import asyncio
-from fastapi import WebSocket
 
-class HeartbeatManager:
-    """心跳检测管理器"""
-
-    def __init__(self, interval: float = 30.0, timeout: float = 60.0):
-        self.interval = interval   # 心跳间隔（秒）
-        self.timeout = timeout     # 超时时间（秒）
-        # 记录每个连接的最后活跃时间
-        self.last_active: dict[WebSocket, float] = {}
-
-    def update_activity(self, websocket: WebSocket):
-        """更新连接的活跃时间"""
-        self.last_active[websocket] = asyncio.get_event_loop().time()
-
-    def is_alive(self, websocket: WebSocket) -> bool:
-        """检查连接是否存活"""
-        if websocket not in self.last_active:
-            return False
-        elapsed = asyncio.get_event_loop().time() - self.last_active[websocket]
-        return elapsed < self.timeout
-
-    async def start_heartbeat(self, websocket: WebSocket):
-        """启动心跳检测任务"""
-        self.update_activity(websocket)
-        try:
-            while True:
-                await asyncio.sleep(self.interval)
-                # 发送 ping
-                try:
-                    await websocket.send_json({"type": "ping"})
-                except Exception:
-                    break
-
-                # 等待 pong（设置超时）
-                if not self.is_alive(websocket):
-                    logger.warning(f"心跳超时，关闭连接")
-                    await websocket.close(code=4002, reason="心跳超时")
-                    break
-
-        except asyncio.CancelledError:
-            pass
-
-heartbeat_mgr = HeartbeatManager(interval=30, timeout=90)
+async def heartbeat_loop(ws: WebSocket, interval: int = 30):
+    """定期发送 ping，检测连接是否存活"""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            await ws.send_json({"type": "ping"})
+    except Exception:
+        pass  # 连接已断开，退出心跳循环
 
 
-@app.websocket("/ws/heartbeat")
-async def heartbeat_websocket(websocket: WebSocket):
-    """带心跳检测的 WebSocket 连接"""
-    await websocket.accept()
-
-    # 启动心跳任务
-    heartbeat_task = asyncio.create_task(heartbeat_mgr.start_heartbeat(websocket))
+# 在 WebSocket 路由中使用
+async def comment_stream(ws: WebSocket, post_id: int, ...):
+    await manager.connect(ws, post_id)
+    heartbeat = asyncio.create_task(heartbeat_loop(ws))
 
     try:
         while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-
-            if message.get("type") == "pong":
-                # 收到心跳响应，更新活跃时间
-                heartbeat_mgr.update_activity(websocket)
-
-            # 处理其他消息...
-
+            raw = await ws.receive_text()
+            msg = json.loads(raw)
+            if msg.get("type") == "pong":
+                pass  # 心跳响应
     except WebSocketDisconnect:
-        heartbeat_task.cancel()
-    except Exception:
-        heartbeat_task.cancel()
+        pass
+    finally:
+        heartbeat.cancel()
+        manager.disconnect(ws, post_id)
 ```
 
-### 示例 5：WebSocket 与 FastAPI 路由共存
+Spring Boot 的 STOMP 有内置的心跳机制，通过 `configureClientInboundChannel` 配置即可，不需要手动写。
 
-```python
-"""
-完整的 FastAPI 应用：HTTP API + WebSocket 共存
-"""
-from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
+## 对比总结
 
-app = FastAPI(title="博客系统 API")
+| 维度     | Spring Boot + STOMP                  | FastAPI WebSocket                  |
+| -------- | ------------------------------------ | ---------------------------------- |
+| 开发效率 | 高，STOMP 封装了连接管理、广播、订阅 | 低，需要手动实现 ConnectionManager |
+| 灵活性   | 受限于 STOMP 协议规范                | 完全自定义消息格式和逻辑           |
+| 心跳     | 内置，配置即可                       | 手动实现 ping/pong 循环            |
+| 水平扩展 | RabbitMQ/ActiveMQ 替代 SimpleBroker  | Redis Pub/Sub 手动转发             |
+| 客户端   | 需要 stomp.js                        | 原生 WebSocket API，更轻量         |
+| 适合场景 | 复杂的消息路由（聊天室、通知中心）   | 简单的实时推送（评论、状态更新）   |
 
-# ========== HTTP 路由 ==========
+## 回顾与预告
 
-@app.get("/api/posts")
-async def list_posts():
-    return {"posts": []}
+[上一篇](/posts/python/18-file-upload)的封面图片上传是 HTTP 请求-响应模式，本篇的 WebSocket 打破了这种限制。FastAPI 的 WebSocket 更底层，代码量更多，但你完全掌控消息的收发逻辑。Spring Boot 的 STOMP 方案更适合复杂的消息路由场景。
 
-@app.post("/api/posts")
-async def create_post(title: str, content: str):
-    # 创建文章后，通知关注者
-    await manager.broadcast({
-        "type": "new_post",
-        "title": title,
-    })
-    return {"message": "创建成功"}
-
-# ========== WebSocket 路由 ==========
-
-@app.websocket("/ws/chat/{room_id}")
-async def chat(websocket: WebSocket, room_id: str):
-    # 聊天室逻辑...
-    pass
-
-@app.websocket("/ws/notifications")
-async def notifications(websocket: WebSocket):
-    # 通知推送逻辑...
-    pass
-
-# ========== 静态文件 ==========
-
-app.mount("/static", StaticFiles(directory="uploads"), name="static")
-```
-
----
-
-## 最佳实践
-
-### 1. 消息格式规范
-
-```python
-# 统一的消息格式
-{
-    "type": "message | system | notification | typing | ping | pong | error",
-    "data": {},           # 消息内容
-    "timestamp": "ISO8601",
-    "message_id": "uuid",  # 用于消息去重
-}
-
-# 系统消息
-{"type": "system", "data": {"content": "欢迎加入聊天室"}, "timestamp": "..."}
-
-# 聊天消息
-{"type": "message", "data": {"user_id": 1, "content": "你好"}, "timestamp": "..."}
-```
-
-### 2. 断线重连
-
-```javascript
-// 前端断线重连示例
-let ws;
-let reconnectAttempts = 0;
-const MAX_RECONNECT = 5;
-
-function connect() {
-  ws = new WebSocket(`ws://localhost:8000/ws/chat/${roomId}?token=${token}`);
-
-  ws.onopen = () => {
-    reconnectAttempts = 0;
-  };
-  ws.onclose = () => {
-    if (reconnectAttempts < MAX_RECONNECT) {
-      reconnectAttempts++;
-      setTimeout(connect, 1000 * reconnectAttempts); // 指数退避
-    }
-  };
-}
-```
-
-### 3. 消息持久化
-
-```python
-# WebSocket 消息应该同时写入数据库
-async def handle_chat_message(room_id: str, user_id: int, content: str):
-    """处理聊天消息：广播 + 持久化"""
-    message_id = str(uuid.uuid4())
-    timestamp = datetime.utcnow()
-
-    # 1. 持久化到数据库
-    await save_message_to_db(
-        message_id=message_id,
-        room_id=room_id,
-        user_id=user_id,
-        content=content,
-        timestamp=timestamp,
-    )
-
-    # 2. 广播给房间内所有用户
-    await manager.broadcast_to_room(room_id, {
-        "type": "message",
-        "message_id": message_id,
-        "user_id": user_id,
-        "content": content,
-        "timestamp": timestamp.isoformat(),
-    })
-```
-
----
-
-## 常见问题
-
-**Q: WebSocket 连接突然断开怎么办？**
-
-A: 网络不稳定、代理超时、服务器重启都可能导致断开。实现心跳检测（ping/pong）来发现断连，前端使用指数退避策略重连。
-
-**Q: FastAPI 的 WebSocket 支持多少并发连接？**
-
-A: 取决于 Uvicorn 的配置和服务器资源。默认单进程大约能支持几千个并发连接。生产环境建议使用多 Worker + Nginx 反向代理。
-
-**Q: WebSocket 如何做认证？**
-
-A: 通过查询参数传递 Token（`ws://host/ws?token=xxx`），在连接建立时验证。WebSocket 协议不支持自定义 Header（浏览器限制）。
-
-**Q: 需要水平扩展时怎么办？**
-
-A: 单机 WebSocket 连接无法直接跨进程/跨服务器共享。水平扩展需要使用 Redis Pub/Sub 作为消息中间件，每个服务器实例订阅同一个频道，收到消息后转发给本地连接的客户端。
-
----
-
-## 总结
-
-| 概念              | 说明                      |
-| ----------------- | ------------------------- |
-| ConnectionManager | 管理所有 WebSocket 连接   |
-| 广播              | 向所有/房间内连接发送消息 |
-| 定向推送          | 向指定用户发送消息        |
-| 房间机制          | 按主题分组管理连接        |
-| 心跳检测          | 定期 ping/pong 发现断连   |
-| 消息持久化        | 重要消息同时写入数据库    |
-| 断线重连          | 前端指数退避重连策略      |
-
-下一篇将学习 Redis 缓存策略，为博客系统增加高性能缓存层。
+下一篇讲 Redis 缓存，给 CMS 的文章列表加上缓存层，同时对比 Spring `@Cacheable` 的注解式缓存和 Python 的手动缓存模式。
