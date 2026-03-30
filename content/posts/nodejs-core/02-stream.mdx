@@ -1,7 +1,7 @@
 ---
 title: "02 Stream：流式处理实战"
 date: "2026-03-29"
-summary: "从内存限制问题出发，理解 Stream 的四种类型、背压机制、pipe 与 pipeline 的区别，用流式处理搞定大日志文件。"
+summary: "从内存限制问题出发，理解 Stream 的四种类型、背压机制、pipe 与 pipeline 的区别，用流式处理搞定大文件。"
 tags: ["Node.js", "Stream", "流式处理", "背压"]
 category: "nodejs-core"
 cover: ""
@@ -10,19 +10,19 @@ series: "Node.js 核心概念深度解析"
 seriesOrder: 2
 ---
 
-上一篇我们用 Buffer 解析了单条日志记录。但日志服务每天产生一个 500MB 的日志文件。如果你用 `fs.readFile` 一次性读入内存，服务器只有 2GB 内存，同时来两个请求就 OOM 了。
+你写了一个数据分析脚本，从 CSV 文件中提取特定列的数据。测试时用的 100KB 样本文件一切正常，上了生产遇到 2GB 的 CSV 导出文件，`fs.readFile` 一执行，服务器直接 OOM 了——2GB 内存根本不够用。
 
 你需要一种方式：不用把整个文件放进内存，而是读一块、处理一块、写一块。这就是 Stream。
 
 ## 为什么需要 Stream
 
-问题的本质是**数据量和内存之间的矛盾**。一个 500MB 的文件，用 `fs.readFile` 会创建一个 500MB 的 Buffer——整个文件的数据都在内存里。如果你同时处理 4 个文件，就是 2GB 内存，还没算上 V8 堆和 Node.js 自身的开销。
+问题的本质是**数据量和内存之间的矛盾**。一个 2GB 的文件，用 `fs.readFile` 会创建一个 2GB 的 Buffer——整个文件的数据都在内存里。如果你同时处理 4 个文件，就是 8GB 内存，服务器扛不住。
 
 Stream 的思路完全不同：它把数据分成小块（chunk），一块一块地流过处理管线：
 
 ```
 readFile 方式：
-磁盘 → [500MB Buffer 全部加载到内存] → 处理 → 写入
+磁盘 → [2GB Buffer 全部加载到内存] → 处理 → 写入
 
 Stream 方式：
 磁盘 → [64KB chunk] → 处理 → 写入
@@ -31,7 +31,7 @@ Stream 方式：
      → ...（内存中始终只有 64KB）
 ```
 
-内存占用从 500MB 降到了 64KB（默认 chunk 大小），而且不管文件多大，内存占用都不会增长。
+内存占用从 2GB 降到了 64KB（默认 chunk 大小），而且不管文件多大，内存占用都不会增长。
 
 ## 四种流类型
 
@@ -53,7 +53,7 @@ Node.js 的流分为四种，按数据流向和功能划分：
 ```js
 import { createReadStream, createWriteStream } from "node:fs";
 
-createReadStream("access.log").pipe(createWriteStream("access-backup.log"));
+createReadStream("data.csv").pipe(createWriteStream("data-backup.csv"));
 ```
 
 `pipe` 做了三件事：自动从可读流取数据、自动写入可写流、自动管理流量（背压）。看起来很完美，但它有一个致命问题。
@@ -79,7 +79,7 @@ createReadStream("access.log").pipe(createWriteStream("access-backup.log"));
 ```js
 // 这个 pipe 的问题：如果目标目录不存在，createWriteStream 会报错
 // 但 createReadStream 不会被关闭，文件句柄会泄露
-createReadStream("big.log").pipe(createWriteStream("/nonexistent/path.log"));
+createReadStream("big.csv").pipe(createWriteStream("/nonexistent/path.csv"));
 ```
 
 这就是为什么 Node.js 12 引入了 `stream.pipeline`。
@@ -93,7 +93,7 @@ import { createReadStream, createWriteStream } from "node:fs";
 import { pipeline } from "node:stream/promises";
 
 try {
-  await pipeline(createReadStream("big.log"), createWriteStream("backup.log"));
+  await pipeline(createReadStream("big.csv"), createWriteStream("backup.csv"));
   console.log("复制完成");
 } catch (err) {
   // 任何环节出错都会到这里，所有流都会被正确关闭
@@ -112,34 +112,40 @@ try {
 
 一个实用的经验法则：**永远用 `pipeline`，不要用 `pipe`**。
 
-## 实战：日志处理管线
+## 实战：CSV 列提取管线
 
-回到日志服务的场景。每天产生一个 500MB 的日志文件，你需要做三件事：
+回到数据分析的场景。你需要从一个 2GB 的 CSV 文件中提取 `email` 和 `signup_date` 两列，写入新文件。用 Stream 实现"读一块、处理一块、写一块"：
 
-1. 流式读取日志文件
-2. 过滤出 ERROR 级别的日志
-3. 将过滤结果写入单独的错误日志文件
+### 自定义 Transform 流
 
-这正好是一个 Readable → Transform → Writable 的管线。
-
-### 自定义 Transform 流：日志过滤
-
-用 Transform 流实现日志级别过滤：
+用 Transform 流实现 CSV 列提取：
 
 ```js
 import { Transform } from "node:stream";
 
-class LogFilter extends Transform {
-  constructor(level) {
+class CsvColumnExtractor extends Transform {
+  constructor(columns) {
     super({ objectMode: true });
-    this.level = level;
+    this.columns = columns;
+    this.headerProcessed = false;
   }
 
   _transform(chunk, encoding, callback) {
-    // chunk 是一行日志文本
-    if (chunk.includes(`"level":"${this.level}"`)) {
-      this.push(chunk);
+    const line = chunk.toString("utf-8").trim();
+    if (!line) return callback();
+
+    if (!this.headerProcessed) {
+      // 第一行是表头，记录目标列的索引
+      const headers = line.split(",");
+      this.columnIndices = this.columns.map((col) => headers.indexOf(col));
+      this.headerProcessed = true;
+      return callback();
     }
+
+    // 提取目标列的数据
+    const fields = line.split(",");
+    const selected = this.columnIndices.map((i) => fields[i] ?? "");
+    this.push(selected.join(",") + "\n");
     callback();
   }
 }
@@ -149,7 +155,7 @@ class LogFilter extends Transform {
 
 ### 组装管线
 
-将二进制日志解析（上一篇的 FrameReader）和日志过滤组合成完整管线：
+把按行分割和列提取组合成完整管线：
 
 ```js
 import { createReadStream, createWriteStream } from "node:fs";
@@ -157,7 +163,7 @@ import { createGzip } from "node:zlib";
 import { pipeline } from "node:stream/promises";
 import { Transform } from "node:stream";
 
-// 按行分割的 Transform（简化版）
+// 按行分割的 Transform
 class LineSplitter extends Transform {
   constructor() {
     super();
@@ -182,32 +188,17 @@ class LineSplitter extends Transform {
   }
 }
 
-// 日志级别过滤
-class LogFilter extends Transform {
-  constructor(level) {
-    super({ objectMode: true });
-    this.level = level;
-  }
-
-  _transform(chunk, encoding, callback) {
-    if (chunk.includes(`"level":"${this.level}"`)) {
-      this.push(chunk + "\n");
-    }
-    callback();
-  }
-}
-
-// 组装完整管线
+// 组装完整管线：读取 → 按行分割 → 提取列 → gzip 压缩 → 写入
 await pipeline(
-  createReadStream("logs/2026-03-15.log", { highWaterMark: 256 * 1024 }),
+  createReadStream("users-export.csv", { highWaterMark: 256 * 1024 }),
   new LineSplitter(),
-  new LogFilter("ERROR"),
-  createGzip(), // 压缩输出
-  createWriteStream("logs/error-2026-03-15.log.gz")
+  new CsvColumnExtractor(["email", "signup_date"]),
+  createGzip(),
+  createWriteStream("users-clean.csv.gz")
 );
 ```
 
-这个管线的内存占用始终很小——`highWaterMark` 设为 256KB 意味着读缓冲区最大 256KB，LineSplitter 只保留一行剩余数据，LogFilter 不缓存任何数据。不管输入文件多大，内存占用都是可控的。
+这个管线的内存占用始终很小——`highWaterMark` 设为 256KB 意味着读缓冲区最大 256KB，LineSplitter 只保留一行剩余数据，CsvColumnExtractor 不缓存任何数据。不管输入文件多大，内存占用都是可控的。
 
 ### highWaterMark 的影响
 
@@ -215,13 +206,13 @@ await pipeline(
 
 ```js
 // 默认值
-createReadStream("file.log"); // highWaterMark: 64KB
+createReadStream("file.csv"); // highWaterMark: 64KB
 
 // 高吞吐场景
-createReadStream("file.log", { highWaterMark: 1024 * 1024 }); // 1MB
+createReadStream("file.csv", { highWaterMark: 1024 * 1024 }); // 1MB
 
 // 低内存场景（比如嵌入式设备）
-createReadStream("file.log", { highWaterMark: 16 * 1024 }); // 16KB
+createReadStream("file.csv", { highWaterMark: 16 * 1024 }); // 16KB
 ```
 
 选择多大的 `highWaterMark` 取决于你的场景。对于本地文件处理，256KB-1MB 通常是一个好的平衡点。对于网络流，默认的 16KB 就够了——网络本身就有延迟，缓冲区再大也不会更快。
@@ -233,7 +224,7 @@ createReadStream("file.log", { highWaterMark: 16 * 1024 }); // 16KB
 **flowing 模式**：数据自动从流中流出，通过 `data` 事件或 `pipe` 消费。你不需要手动取数据，流会"推"给你。
 
 ```js
-const stream = createReadStream("file.log");
+const stream = createReadStream("file.csv");
 stream.on("data", (chunk) => {
   console.log(`收到 ${chunk.length} 字节`);
 });
@@ -242,7 +233,7 @@ stream.on("data", (chunk) => {
 **paused 模式**：你需要手动调用 `stream.read()` 来取数据。流会"等"你来取。
 
 ```js
-const stream = createReadStream("file.log");
+const stream = createReadStream("file.csv");
 stream.on("readable", () => {
   let chunk;
   while ((chunk = stream.read()) !== null) {
@@ -255,19 +246,19 @@ stream.on("readable", () => {
 
 ## Stream vs 一次性读取：性能对比
 
-用数据说话。处理一个 500MB 的日志文件，只统计行数：
+用数据说话。处理一个 2GB 的 CSV 文件，只统计行数：
 
 ```js
-// 方式 1：一次性读取（内存占用 ~500MB）
+// 方式 1：一次性读取（内存占用 ~2GB）
 import { readFile } from "node:fs/promises";
-const data = await readFile("big.log", "utf-8");
+const data = await readFile("big.csv", "utf-8");
 const lineCount = data.split("\n").length;
 
 // 方式 2：Stream（内存占用 ~64KB）
 import { createReadStream } from "node:fs";
 let lineCount = 0;
 await pipeline(
-  createReadStream("big.log"),
+  createReadStream("big.csv"),
   new Transform({
     transform(chunk, enc, cb) {
       lineCount += chunk.toString("utf-8").split("\n").length;

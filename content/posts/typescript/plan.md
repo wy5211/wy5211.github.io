@@ -1,27 +1,63 @@
-# TypeScript 高级技巧系列
+# TypeScript 类型系统进阶
 
 ## 背景
 
-本系列面向已经熟练掌握 TypeScript 基础的前端开发者，深入探讨 TypeScript 的高级特性和实战技巧。跳过基础语法，直接攻克类型系统的难点、痛点，帮助开发者编写更优雅、更类型安全的代码。
+你用 TypeScript 写了一年多，泛型会用了，联合类型也懂了，interface 和 type 随便切换。但一看到开源库里 `T extends infer U ? ... : never` 这种代码就头大。自己想写一个类型安全的工具函数，发现类型怎么都推导不出来。面试官问"什么是协变和逆变"，你只能尴尬地笑笑。
 
-**目标读者**：
+这个系列就是为你准备的。我们不会把 TypeScript 类型体操题刷一遍，而是从"这个类型能帮我解决什么问题"出发，带你逐步构建一个**类型安全的 HTTP API 客户端**。每解决一个真实的类型问题，你就自然掌握了一个 TypeScript 类型特性。
 
-- ✅ 熟练使用 TypeScript 日常开发
-- ✅ 理解泛型、联合类型等基础概念
-- ✅ 希望掌握高级类型技巧
-- ✅ 追求极致的类型安全
+### 技术栈选择
 
-**核心主题**：
+| 技术       | 版本   | 为什么选它                                        |
+| ---------- | ------ | ------------------------------------------------- |
+| TypeScript | 5.x    | 当前最新稳定版，infer、const 类型参数等新特性完善 |
+| Node.js    | 22 LTS | 运行示例代码                                      |
 
-- 高级类型体操（Type Manipulation）
-- 泛型深入应用
-- 条件类型与类型推断
-- 模板字面量类型
-- 装饰器与元编程
-- 类型守卫与断言
-- 工具类型实现原理
-- React + TypeScript 高级模式
-- 性能优化技巧
+> 如果你刚入门 TypeScript，建议先打好基础再来看本系列。本系列不会覆盖 interface、泛型基础、类型断言等入门内容，而是直接攻克类型系统的进阶难点。
+
+---
+
+## 主线案例：类型安全的 HTTP API 客户端
+
+整个系列围绕构建一个**类型安全的 HTTP API 客户端**展开——类似 Axios，但类型更强。你定义一个 API 路由表，客户端自动推导出每个接口的请求参数类型和响应类型。调用时参数传错或响应类型用错，编译器直接报错。
+
+**案例场景**：为你的团队封装一个统一的 API 调用层。后端有 30+ 个接口，前端之前用 any 到处传，出了 bug 难排查。现在要做成类型安全的，让编译器帮你检查。
+
+**案例数据示例**（贯穿全系列使用）：
+
+```typescript
+// API 路由定义
+const api = {
+  'GET /users': { response: User[] },
+  'GET /users/:id': { params: { id: string }; response: User },
+  'POST /users': { body: CreateUserDTO; response: User },
+  'POST /users/:id/avatar': { params: { id: string }; body: FormData; response: { url: string } },
+  'GET /users/:userId/orders/:orderId': { params: { userId: string; orderId: string }; response: Order },
+}
+
+// 使用 —— 编译期检查参数和响应类型
+const users = await client.get('/users')           // 返回 User[]
+const user = await client.get('/users/:id', { id: 'usr_a1x9k2m' })  // 返回 User
+const newUser = await client.post('/users', { name: 'zhang_wei', email: 'zw@example.com' })
+```
+
+---
+
+## 系列节奏
+
+```
+基础篇（01-03）：独立小案例，建立类型系统直觉
+  → 每篇一个独立场景，降低入门门槛
+
+核心篇（04-06）：引入 API 客户端案例，深入类型设计
+  → 品牌类型防止数据混淆、工具类型实现、映射类型变换
+
+进阶篇（07-09）：深入类型系统底层
+  → 函数签名设计、装饰器元数据、协变逆变
+
+实战篇（10）：性能优化与综合回顾
+  → 类型性能、综合实战
+```
 
 ---
 
@@ -29,839 +65,281 @@
 
 ```
 content/posts/typescript/
-├── plan.md                                    # 本计划文件
-├── 01-conditional-types-inference.mdx         # 条件类型与类型推断
-├── 02-template-literal-types.mdx              # 模板字面量类型实战
-├── 03-advanced-generics.mdx                   # 泛型高级应用
-├── 04-branding-nominal-typing.mdx             # 品牌类型与名义类型
-├── 05-type-guards-assertions.mdx              # 类型守卫与断言技巧
-├── 06-utility-types-implementation.mdx        # 工具类型实现原理
-├── 07-inference-keyof-mapped.mdx              # 类型推断与映射类型
-├── 08-decorators-metadata.mdx                 # 装饰器与元数据
-├── 09-react-typescript-patterns.mdx           # React + TypeScript 高级模式
-├── 10-function-overloading-signatures.mdx     # 函数重载与签名设计
-├── 11-covariant-contravariant.mdx             # 协变与逆变
-├── 12-type-performance-optimization.mdx       # 类型性能优化
-└── README.mdx                                  # 系列索引
+├── plan.md                              # 本计划文件
+├── 01-conditional-types-inference.mdx   # 条件类型与 infer
+├── 02-template-literal-types.mdx        # 模板字面量类型
+├── 03-advanced-generics.mdx             # 泛型高级应用
+├── 04-branding-type-guards.mdx          # 品牌类型与类型守卫
+├── 05-utility-types-implementation.mdx  # 工具类型实现原理
+├── 06-mapped-types-remapping.mdx        # 映射类型与 Key Remapping
+├── 07-function-overloading.mdx          # 函数重载与签名设计
+├── 08-decorators-metadata.mdx           # 装饰器与元数据
+├── 09-covariance-contravariance.mdx     # 协变与逆变
+└── 10-type-performance.mdx              # 类型性能优化与综合实战
 ```
 
 ---
 
-## 第一阶段：类型操作基础（2-3篇）
+## 基础篇：独立小案例（01-03）
 
-### 01. 条件类型与类型推断
+目标：用 3 篇文章帮你建立对 TypeScript 类型系统的直觉，每篇一个独立场景。
 
-**目标**：掌握条件类型和 infer 关键字的强大能力
+---
+
+### 01. 条件类型与 infer：TypeScript 的 if-else
+
+**核心问题**：你在用 Fetch API 写请求，想根据传入的泛型自动推导响应类型——传 User 就返回 User，传 Promise<User> 就返回 User。怎么做？
+
+**主线案例**：实现一组实用的类型工具——提取 Promise 内部类型、提取函数返回值类型、提取数组元素类型、递归展开嵌套 Promise。
 
 **内容要点**：
 
-- 条件类型语法（`T extends U ? X : Y`）
-- 分布式条件类型
-- infer 关键字深入
-- 多层条件类型嵌套
-- 条件类型在函数重载中的应用
-- 实战：实现高级工具类型
+- 条件类型语法：T extends U ? X : Y
+- 分布式条件类型：为什么 `string | number extends string ? ...` 会展开
+- infer 关键字：在条件类型中"捕获"类型
+- 多个 infer：同时提取多个位置的类型
+- 递归条件类型：用递归处理嵌套结构
+- 条件类型的实际应用：事件处理函数类型推导、API 响应类型提取
 
-**实战示例**：
-
-```typescript
-// 提取函数返回值类型
-type ReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
-
-// 提取 Promise 内部类型
-type Awaited<T> = T extends Promise<infer U> ? U : T;
-
-// 深度 Awaited
-type DeepAwaited<T> = T extends Promise<infer U> ? DeepAwaited<U> : T;
-
-// 实战：提取事件处理函数的参数类型
-type EventHandler<T> = T extends { on(event: infer E): any }
-  ? E extends string
-    ? E
-    : never
-  : never;
-```
-
-**高级技巧**：
-
-- 使用条件类型实现类型级别的递归
-- 条件类型的类型分发特性
-- 使用条件类型过滤联合类型
+**与前篇关联**：系列第一篇，无前篇。
 
 ---
 
-### 02. 模板字面量类型实战
+### 02. 模板字面量类型：字符串也能做类型检查
 
-**目标**：利用字符串类型实现编译期类型检查
+**核心问题**：你的项目有几十个事件名，格式都是 "module:action"（如 "user:login"、"order:created"）。你想让 emit 和 on 的事件名和参数类型一一对应，手写太累。能不能让编译器帮你推导？
+
+**主线案例**：实现一个类型安全的事件系统——定义事件映射表，on 和 emit 的事件名、回调参数全部由编译器检查。
 
 **内容要点**：
 
-- 模板字面量类型语法
-- 内置字符串工具类型（Uppercase、Lowercase、Capitalize、Uncapitalize）
-- 字符串类型模式匹配
-- 类型级别的字符串操作
-- 实战：构建类型安全的路由系统
+- 模板字面量类型语法：`${A}-${B}`
+- 内置字符串工具类型：Uppercase、Lowercase、Capitalize、Uncapitalize
+- 字符串模式匹配：用模板字面量类型匹配和提取字符串中的部分
+- 从字符串字面量中提取路径参数：/users/:id → { id: string }
+- 类型安全的事件系统：事件名与参数类型的自动关联
+- 模板字面量类型的实际应用：CSS 属性类型、路由参数提取
 
-**实战示例**：
-
-```typescript
-// 类型安全的事件系统
-type Events = {
-  "user:created": { id: string; name: string };
-  "user:updated": { id: string; changes: Partial<User> };
-  "user:deleted": { id: string };
-};
-
-type EventName<T extends Record<string, any>> = {
-  [K in keyof T]: K;
-}[keyof T];
-
-class EventEmitter<T extends Record<string, any>> {
-  on<K extends EventName<T>>(event: K, handler: (data: T[K]) => void): void;
-  emit<K extends EventName<T>>(event: K, data: T[K]): void;
-}
-
-// 类型安全的路由
-type Routes = "/users" | "/users/:id" | "/posts/:postId/comments/:commentId";
-
-type ExtractParams<T extends string> =
-  T extends `${string}:${infer Param}/${infer Rest}`
-    ? Param | ExtractParams<`/${Rest}`>
-    : T extends `${string}:${infer Param}`
-      ? Param
-      : never;
-
-type UserRouteParams = ExtractParams<Routes>;
-// 'id' | 'postId' | 'commentId'
-```
+**与前篇关联**：上一篇学了条件类型的判断能力，这一篇把条件类型用在字符串上。
 
 ---
 
-### 03. 泛型高级应用
+### 03. 泛型高级应用：让函数变得通用又安全
 
-**目标**：超越基础泛型，掌握高级泛型模式
+**核心问题**：你写了一个深度合并对象的函数，想支持任意嵌套层级的对象。但泛型写到第三层就开始头大了——递归泛型怎么写？默认泛型参数什么时候用？
+
+**主线案例**：实现一组实用的泛型工具——深度 Readonly、深度 Partial、类型安全的路径访问（lodash.get 的类型安全版）。
 
 **内容要点**：
 
-- 多个泛型参数的协作
-- 泛型约束（extends）
-- 默认泛型参数
-- 条件泛型类型
-- 泛型递归与深度操作
-- 实战：构建类型安全的 API 客户端
+- 多个泛型参数的协作：什么时候需要多个泛型
+- 泛型约束 extends：限制泛型的范围
+- 默认泛型参数：让调用方少写代码
+- 递归泛型：处理任意深度的嵌套结构
+- 泛型与条件类型结合：在泛型中做条件判断
+- 泛型与模板字面量结合：类型安全的属性路径
+- 什么时候该用泛型，什么时候该用联合类型
 
-**实战示例**：
-
-```typescript
-// 深度 Readonly
-type DeepReadonly<T> = {
-  readonly [P in keyof T]: T[P] extends object ? DeepReadonly<T[P]> : T[P];
-};
-
-// 深度 Partial
-type DeepPartial<T> = {
-  [P in keyof T]?: T[P] extends object ? DeepPartial<T[P]> : T[P];
-};
-
-// 类型安全的路径访问
-type Path<T, K extends string> = K extends `${infer Key}.${infer Rest}`
-  ? Key extends keyof T
-    ? Path<T[Key], Rest>
-    : never
-  : K extends keyof T
-    ? T[K]
-    : never;
-
-interface User {
-  profile: {
-    address: {
-      city: string;
-    };
-  };
-}
-
-type City = Path<User, "profile.address.city">; // string
-```
+**与前篇关联**：前两篇学了条件类型和模板字面量，这一篇用泛型把它们串联起来。
 
 ---
 
-## 第二阶段：类型设计模式（3-4篇）
+## 核心篇：API 客户端案例（04-06）
 
-### 04. 品牌类型与名义类型
+目标：引入类型安全的 API 客户端作为贯穿案例，深入品牌类型、工具类型和映射类型。从这一篇开始，所有文章都在构建同一个类型工具。
 
-**目标**：在结构化类型系统中实现名义类型
+---
+
+### 04. 品牌类型与类型守卫：防止数据混淆
+
+**核心问题**：你的 API 客户端里，userId 和 orderId 都是 string，但传混了编译器不会报错——直到线上出了 bug。string 太宽泛了，怎么让编译器区分"语义不同但底层类型相同"的值？
+
+**主线案例**：为 API 客户端设计类型安全的 ID 系统——UserId 和 OrderId 是不同的类型，传错参数编译器直接报错；实现运行时类型验证，确保外部数据符合类型要求。
 
 **内容要点**：
 
-- TypeScript 的结构化类型系统
-- 品牌类型（Branded Types）实现
-- 不可变类型设计
-- 类型擦除与运行时验证
-- 实战：防止类型混淆的错误
+- TypeScript 的结构化类型系统：为什么 string 和 string 是"一样的"
+- 品牌类型（Branded Types）：给 string 加上"身份标识"
+- 品牌类型的运行时验证：创建值时校验，编译时检查
+- 类型谓词（arg is Type）：自定义类型守卫
+- 断言函数（asserts）：验证失败直接抛错
+- 可辨识联合（Discriminated Unions）：用 type 字段区分联合类型
+- 品牌类型的实际应用：货币类型（USD vs EUR）、ID 类型（UserId vs OrderId）
 
-**实战示例**：
-
-```typescript
-// 品牌类型基础
-type Brand<T, B> = T & { __brand: B };
-
-type UserId = Brand<string, "UserId">;
-type Email = Brand<string, "Email">;
-
-const userId = "123" as UserId;
-const email = "test@example.com" as Email;
-
-// 编译期类型检查
-function getUserById(id: UserId) {}
-function sendEmail(email: Email) {}
-
-getUserById(email); // ❌ 类型错误
-
-// 高级品牌类型
-type SafeBrand<T, B> = T & { readonly __brand: B; readonly __type: B };
-
-type USD = SafeBrand<number, "USD">;
-type EUR = SafeBrand<number, "EUR">;
-
-function addUsd(a: USD, b: USD): USD {
-  return (a + b) as USD;
-}
-
-const usd = 100 as USD;
-const eur = 100 as EUR;
-addUsd(usd, eur); // ❌ 类型错误，防止货币混淆
-```
+**与前篇关联**：前几篇的类型工具返回的都是 string、number 等基础类型，这一篇让类型更精确、更安全。
 
 ---
 
-### 05. 类型守卫与断言技巧
+### 05. 工具类型实现原理：读懂内置工具类型的源码
 
-**目标**：编写更精确的类型收窄逻辑
+**核心问题**：你每天都在用 Partial、Pick、Omit、Record，但你知道它们是怎么实现的吗？理解了原理，你就能自己写工具类型，而不是到处找第三方库。
+
+**主线案例**：从零实现 TypeScript 的核心内置工具类型，并基于它们构建 API 客户端需要的自定义工具类型——DeepPartial、DeepOmit、Optionalize。
 
 **内容要点**：
 
-- 类型谓词（`arg is Type`）
-- typeof 和 instanceof 守卫
-- 自定义类型守卫
-- 可辨识联合（Discriminated Unions）
-- 断言函数（asserts）
-- 实战：复杂的类型收窄场景
+- 映射类型基础：[P in keyof T] 的原理
+- Partial / Required / Readonly 实现：加减修饰符
+- Record 实现：从键值对构建对象类型
+- Pick / Omit / Exclude / Extract 实现：筛选和排除
+- 深度工具类型：DeepReadonly、DeepPartial、DeepOmit
+- 自定义工具类型设计：针对 API 场景的类型变换
+- 工具类型的组合：像搭积木一样组合工具类型
 
-**实战示例**：
-
-```typescript
-// 基础类型守卫
-function isString(value: unknown): value is string {
-  return typeof value === "string";
-}
-
-// 可辨识联合
-interface Success<T> {
-  type: "success";
-  data: T;
-}
-interface Error {
-  type: "error";
-  error: Error;
-}
-type Result<T> = Success<T> | Error;
-
-function isSuccess<T>(result: Result<T>): result is Success<T> {
-  return result.type === "success";
-}
-
-// 断言函数
-function assertDefined<T>(value: T | null | undefined): asserts value is T {
-  if (value === undefined || value === null) {
-    throw new Error("value is not defined");
-  }
-}
-
-// 高级类型守卫：检查对象属性
-function hasKey<K extends string>(key: K, obj: any): obj is Record<K, unknown> {
-  return key in obj;
-}
-
-function isUser(value: unknown): value is User {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    hasKey("id", value) &&
-    hasKey("name", value) &&
-    typeof value.id === "string" &&
-    typeof value.name === "string"
-  );
-}
-```
+**与前篇关联**：上一篇用品牌类型精确化了单个值的类型，这一篇批量变换对象类型。
 
 ---
 
-### 06. 工具类型实现原理
+### 06. 映射类型与 Key Remapping：批量变换对象类型
 
-**目标**：理解内置工具类型的实现，并创建自定义工具类型
+**核心问题**：后端返回的字段名是 snake_case（created_at），前端要用 camelCase（createdAt）。手动写一个一个转换太痛苦。能不能在类型层面自动转换？
+
+**主线案例**：为 API 客户端实现自动化的类型变换——snake_case 到 camelCase 的字段名转换、提取对象中的可选字段、为对象生成 getter/setter 类型。
 
 **内容要点**：
 
-- Partial、Readonly、Required 实现
-- Record、Pick、Omit 实现
-- Extract、Exclude 实现
-- 自定义工具类型设计
-- 工具类型的组合使用
-- 实战：构建自己的工具类型库
+- Key Remapping（as 子句）：在映射类型中重命名属性
+- 模板字面量类型在映射中的应用：批量转换属性名
+- 条件过滤：用 as never 过滤不需要的属性
+- 为对象生成 getter/setter 类型
+- 从对象类型生成验证规则类型
+- 映射类型的实际应用：API 响应类型转换、表单字段类型生成
 
-**实战示例**：
-
-```typescript
-// 实现 Readonly
-type MyReadonly<T> = {
-  readonly [P in keyof T]: T[P];
-};
-
-// 实现 Partial
-type MyPartial<T> = {
-  [P in keyof T]?: T[P];
-};
-
-// 实现 Required
-type MyRequired<T> = {
-  [P in keyof T]-?: T[P];
-};
-
-// 实现 Pick
-type MyPick<T, K extends keyof T> = {
-  [P in K]: T[P];
-};
-
-// 实现 Omit（旧版本）
-type MyOmit<T, K extends keyof T> = MyPick<T, Exclude<keyof T, K>>;
-
-// 实现深度工具类型
-type DeepMutable<T> = {
-  -readonly [P in keyof T]: T[P] extends object ? DeepMutable<T[P]> : T[P];
-};
-
-// 实用工具：将对象类型转换为查询参数类型
-type QueryParams<T> = {
-  [K in keyof T as T[K] extends string ? K : never]?: string;
-};
-```
+**与前篇关联**：上一篇实现了基础的工具类型，这一篇用 Key Remapping 做更高级的类型变换。
 
 ---
 
-## 第三阶段：高级类型技巧（3-4篇）
+## 进阶篇：深入类型系统（07-09）
 
-### 07. 类型推断与映射类型
+目标：深入函数签名设计、装饰器元数据、类型系统底层的协变逆变。
 
-**目标**：掌握类型推断的高级用法和映射类型的强大能力
+---
+
+### 07. 函数重载与签名设计：设计优雅的 API
+
+**核心问题**：你的 API 客户端 get 方法有时候传 string（路径），有时候传对象（路径+查询参数）。一个函数签名搞不定，用联合类型又丢失了类型推导的精确度。怎么办？
+
+**主线案例**：为 API 客户端设计类型精确的函数签名——不同参数对应不同返回类型的重载、链式调用 API 的类型推导。
 
 **内容要点**：
 
-- 映射类型基础语法
-- Key Remapping（as 子句）
-- 模板字面量类型在映射中的应用
-- 条件类型与映射类型结合
-- 实战：构建类型安全的表单系统
+- 函数重载语法：多个签名 + 一个实现
+- 重载签名的顺序：从具体到一般
+- 联合类型 vs 重载：什么时候该用哪个
+- 泛型函数重载：泛型约束下的重载设计
+- this 类型：链式调用的类型实现
+- 函数声明的其他技巧：可选参数、默认参数、rest 参数
+- 设计模式中的重载：工厂函数、策略模式的类型表达
 
-**实战示例**：
-
-```typescript
-// 提取所有 getter
-type Getters<T> = {
-  [K in keyof T as T[K] extends Function
-    ? never
-    : `get${Capitalize<string & K>}`]: () => T[K];
-};
-
-interface User {
-  name: string;
-  age: number;
-  email: string;
-}
-
-type UserGetters = Getters<User>;
-// {
-//   getName: () => string
-//   getAge: () => number
-//   getEmail: () => string
-// }
-
-// 提取所有 setter
-type Setters<T> = {
-  [K in keyof T as T[K] extends Function
-    ? never
-    : `set${Capitalize<string & K>}`]: (value: T[K]) => void;
-};
-
-// 创建响应式代理
-type Reactive<T> = {
-  [K in keyof T as `on${Capitalize<string & K>}Change`]: (
-    callback: (value: T[K]) => void
-  ) => void;
-} & {
-  [K in keyof T]: T[K];
-};
-```
+**与前篇关联**：前几篇构建了类型工具，这一篇用它们设计出类型精确的函数 API。
 
 ---
 
-### 08. 装饰器与元数据
+### 08. 装饰器与元数据：运行时的类型信息
 
-**目标**：掌握装饰器的使用和元数据反射
+**核心问题**：TypeScript 的类型在编译后就没了（类型擦除）。但你的 API 客户端需要在运行时知道参数类型来做序列化——比如把 Date 对象转成 ISO 字符串。怎么办？
+
+**主线案例**：为 API 客户端实现运行时类型信息——用装饰器标注字段的序列化规则，用 reflect-metadata 存储和读取元数据。
 
 **内容要点**：
 
-- 类装饰器
-- 方法装饰器
-- 属性装饰器
-- 参数装饰器
-- 装饰器工厂
-- reflect-metadata API
-- 实战：构建依赖注入容器
+- 类型擦除：为什么 TypeScript 的类型在运行时不存在
+- 装饰器基础：类装饰器、方法装饰器、属性装饰器、参数装饰器
+- 装饰器工厂：带参数的装饰器
+- reflect-metadata API：在运行时存储和读取类型信息
+- 用装饰器实现字段级别的配置：序列化规则、验证规则
+- 装饰器的实际应用：依赖注入容器、验证框架、ORM 字段映射
+- TypeScript 5.0+ 的装饰器新语法
 
-**实战示例**：
-
-```typescript
-// 类装饰器：单例模式
-function Singleton<T extends { new (...args: any[]): {} }>(constructor: T) {
-  let instance: any;
-  return class extends constructor {
-    constructor(...args: any[]) {
-      if (instance) return instance;
-      super(...args);
-      instance = this;
-    }
-  };
-}
-
-@Singleton
-class Database {
-  constructor(private connection: string) {}
-}
-
-// 方法装饰器：日志
-function Log(target: any, propertyKey: string, descriptor: PropertyDescriptor) {
-  const originalMethod = descriptor.value;
-  descriptor.value = function (...args: any[]) {
-    console.log(`Calling ${propertyKey} with`, args);
-    const result = originalMethod.apply(this, args);
-    console.log(`${propertyKey} returned`, result);
-    return result;
-  };
-}
-
-// 属性装饰器：验证
-function Min(min: number) {
-  return function (target: any, propertyKey: string) {
-    let value: any;
-
-    const getter = () => value;
-    const setter = (newValue: any) => {
-      if (newValue < min) {
-        throw new Error(`${propertyKey} must be >= ${min}`);
-      }
-      value = newValue;
-    };
-
-    Object.defineProperty(target, propertyKey, {
-      get: getter,
-      set: setter,
-      enumerable: true,
-      configurable: true,
-    });
-  };
-}
-```
+**与前篇关联**：前面所有类型操作都在编译期，这一篇桥接编译期类型和运行时行为。
 
 ---
 
-### 09. React + TypeScript 高级模式
+### 09. 协变与逆变：理解类型系统的方向性
 
-**目标**：在 React 中应用高级 TypeScript 技巧
+**核心问题**：面试官问"函数参数是协变还是逆变"，你答不上来。你在实际开发中也遇到过——明明类型看着没问题，编译器却报错。TypeScript 的类型兼容规则到底是什么？
+
+**主线案例**：理解类型兼容性在 API 客户端中的影响——回调函数的类型安全、事件监听器的类型推导、数组协变的风险。
 
 **内容要点**：
 
-- 组件 Props 类型设计
-- 泛型组件实现
-- HOC 类型推导
-- 自定义 Hook 类型
-- Context 类型安全
-- 实战：构建类型安全的表单组件库
+- 赋值兼容性：子类型可以赋值给父类型（协变）
+- 函数参数的逆变：为什么 (animal: Animal) => void 能赋值给 (dog: Dog) => void
+- 函数返回值的协变：返回值类型是协变的
+- 严格函数类型检查：--strictFunctionTypes 的影响
+- 数组的协变问题：为什么 number[] 不能赋值给 (string | number)[]
+- 实际应用：事件监听器的类型安全、Promise 的类型兼容
+- 什么时候需要关心协变逆变：什么时候不用管
 
-**实战示例**：
-
-```typescript
-// 泛型组件
-type TableProps<T> = {
-  data: T[]
-  columns: Column<T>[]
-}
-
-type Column<T> = {
-  key: keyof T
-  title: string
-  render?: (value: T[keyof T], record: T) => ReactNode
-}
-
-function Table<T>({ data, columns }: TableProps<T>) {
-  return (
-    <table>
-      {data.map((item) => (
-        <tr key={String(item.id)}>
-          {columns.map((col) => (
-            <td key={String(col.key)}>
-              {col.render
-                ? col.render(item[col.key], item)
-                : String(item[col.key])}
-            </td>
-          ))}
-        </tr>
-      ))}
-    </table>
-  )
-}
-
-// 类型安全的表单
-type FormField<T, K extends keyof T> = {
-  name: K
-  label: string
-  type: 'text' | 'number' | 'email'
-  validate?: (value: T[K]) => string | undefined
-}
-
-type FormProps<T> = {
-  fields: FormField<T, keyof T>[]
-  onSubmit: (data: T) => void
-}
-
-function Form<T extends object>({ fields, onSubmit }: FormProps<T>) {
-  // 实现类型安全的表单
-}
-
-// 自定义 Hook 类型推导
-function useLocalStorage<T>(
-  key: string,
-  initialValue: T
-): [T, (value: T | ((prev: T) => T)) => void] {
-  const [storedValue, setStoredValue] = useState<T>(initialValue)
-  // ...
-  return [storedValue, setStoredValue]
-}
-
-// 推导出 localStorage 中存储的类型
-const [user, setUser] = useLocalStorage('user', { name: '', age: 0 })
-// user 类型被推导为 { name: string; age: number }
-```
+**与前篇关联**：前几篇一直在创建类型，这一篇理解类型之间的关系和兼容性。
 
 ---
 
-## 第四阶段：类型系统深入（2-3篇）
+## 实战篇：性能优化与综合回顾（10）
 
-### 10. 函数重载与签名设计
+目标：优化类型性能，综合运用全系列知识完成 API 客户端。
 
-**目标**：设计优雅的函数 API，处理复杂的类型关系
+---
+
+### 10. 类型性能优化与综合实战
+
+**核心问题**：你的类型工具写好了，但项目编译时间从 10 秒涨到了 2 分钟。复杂条件类型和递归泛型是性能杀手。怎么让类型既强大又高效？
+
+**主线案例**：优化 API 客户端的类型性能，综合运用全系列知识完成最终版——类型安全的路由定义、参数检查、响应推导、错误处理全部到位。
 
 **内容要点**：
 
-- 函数重载语法
-- 重载签名与实现签名
-- 联合类型与重载的选择
-- 泛型函数重载
-- 实战：构建类型链式 API
-
-**实战示例**：
-
-```typescript
-// 基础重载
-function process(value: string): string;
-function process(value: number): number;
-function process(value: string | number): string | number {
-  return value;
-}
-
-// 泛型重载
-function create<T>(value: T): T;
-function create<T>(value: () => T): T;
-function create<T>(value: T | (() => T)): T {
-  return typeof value === "function" ? (value as () => T)() : value;
-}
-
-// 类型链式调用
-class QueryBuilder<T> {
-  where<K extends keyof T>(field: K, operator: "=", value: T[K]): this;
-
-  where<K extends keyof T>(
-    field: K,
-    operator: ">",
-    value: T[K] extends number ? number : never
-  ): this;
-
-  where(...args: any[]): this {
-    // 实现
-    return this;
-  }
-
-  select<K extends keyof T>(...fields: K[]): Pick<T, K> {
-    // 实现
-    return {} as any;
-  }
-}
-```
-
----
-
-### 11. 协变与逆变
-
-**目标**：理解类型系统的协变、逆变和双向协变
-
-**内容要点**：
-
-- 什么是协变和逆变
-- 函数类型的参数逆变
-- 函数类型的返回值协变
-- 严格函数类型检查
-- 实战：避免类型系统的陷阱
-
-**实战示例**：
-
-```typescript
-// 协变示例
-interface Animal {
-  name: string;
-}
-interface Dog extends Animal {
-  bark: () => void;
-}
-
-let animal: Animal;
-let dog: Dog;
-
-animal = dog; // ✅ 协变：子类型可以赋值给父类型
-
-// 逆变示例（函数参数）
-type AnimalHandler = (animal: Animal) => void;
-type DogHandler = (dog: Dog) => void;
-
-let handleAnimal: AnimalHandler;
-let handleDog: DogHandler;
-
-handleDog = handleAnimal; // ✅ 逆变：父类型函数可以赋值给子类型函数
-handleAnimal = handleDog; // ❌ 类型错误
-
-// 实际应用
-type EventListener<T> = (event: T) => void;
-
-class EventEmitter<E> {
-  on<K extends keyof E>(event: K, listener: EventListener<E[K]>): void;
-}
-
-// 数组的协变问题（在严格模式下）
-interface ReadonlyArray<out T> {} // 协变
-interface Array<in out T> {} // TypeScript 中数组是双向协变
-```
-
----
-
-### 12. 类型性能优化
-
-**目标**：编写高性能的类型定义，避免编译器性能问题
-
-**内容要点**：
-
-- TypeScript 编译器性能瓶颈
-- 避免过度复杂的条件类型
-- 类型实例化优化
-- 减少类型分配
-- 实战：优化大型项目中的类型定义
-
-**实战示例**：
-
-```typescript
-// ❌ 性能差：复杂的递归条件类型
-type DeepKeys<T> = T extends object
-  ? {
-      [K in keyof T]: K | `${K}.${DeepKeys<T[K]>}`;
-    }[keyof T]
-  : never;
-
-// ✅ 性能好：使用辅助类型简化
-type DeepKeysHelper<T, K extends keyof T> =
-  | K
-  | (T[K] extends object ? `${K}.${DeepKeys<T[K]>}` : K);
-
-type DeepKeys<T> = T extends object ? DeepKeysHelper<T, keyof T> : never;
-
-// ❌ 性能差：多次实例化泛型
-type Bad<T> = {
-  a: ComplexType<T>;
-  b: ComplexType<T>;
-  c: ComplexType<T>;
-};
-
-// ✅ 性能好：使用类型别名缓存
-type Cached<T> = ComplexType<T>;
-type Good<T> = {
-  a: Cached<T>;
-  b: Cached<T>;
-  c: Cached<T>;
-};
-
-// 避免大型联合类型的展开
-// ❌ Bad
-type Values<T> = T[keyof T];
-
-// ✅ Good：保持分布式
-type DistributedValues<T> = T extends any ? T[keyof T] : never;
-```
-
----
-
-## 写作规范
-
-### 每篇文章结构
-
-````markdown
----
-title: "序号 文章标题"
-date: "YYYY-MM-DD"
-summary: "一句话总结（100字以内）"
-tags: ["TypeScript", "相关标签"]
-category: "typescript"
-draft: false
-series: "TypeScript 高级技巧系列"
-seriesOrder: N
----
-
-## 前言
-
-解释这个高级特性的应用场景和解决的问题。
-
-## 核心概念
-
-深入浅出地解释核心概念，必要时对比其他语言。
-
-## 高级技巧
-
-### 技巧 1：标题
-
-```typescript
-// 完整可运行的代码示例
-```
-````
-
-**详细说明**：
-
-- 为什么这样写
-- 有什么优势
-- 注意事项
-
-### 技巧 2：标题
-
-...
-
-## 实战应用
-
-结合实际项目场景展示如何应用这些技巧。
-
-## 避坑指南
-
-总结常见的错误用法和陷阱。
-
-## 总结
-
-回顾核心要点。
-
-## 参考资料
-
-- 官方文档链接
-- 相关文章推荐
-
----
-
-- **上一篇**：[文章标题](../文章链接)
-- **下一篇**：[文章标题](../文章链接)
-
-```
-
-### 代码示例要求
-
-1. ✅ **实用性**：每个技巧都来自实际项目需求
-2. ✅ **完整性**：代码可以直接运行
-3. ✅ **对比性**：展示 ❌ 错误示范 vs ✅ 正确做法
-4. ✅ **解释性**：详细注释说明设计意图
-5. ✅ **渐进性**：从简单到复杂
-
-### 内容要求
-
-- 跳过基础语法，直接讲高级技巧
-- 每篇文章解决 3-5 个具体问题
-- 提供可以直接使用的代码模板
-- 分析 TypeScript 设计决策背后的原理
+- TypeScript 编译器性能瓶颈：什么操作最慢
+- 避免过度复杂的条件类型：简化策略
+- 类型实例化优化：用类型别名缓存避免重复计算
+- 递归类型的深度限制：TypeScript 的递归上限
+- 大型联合类型的性能问题：什么时候该用 interface 替代 union
+- 诊断类型性能：--extendedDiagnostics
+- 综合实战：回顾 API 客户端的完整类型设计
+- 系列回顾：类型系统的知识地图、最佳实践清单、进阶方向
+
+**与前篇关联**：前 9 篇掌握了类型系统的各个方面，这一篇解决性能问题并综合回顾。
 
 ---
 
 ## 学习路径图
 
 ```
-
-┌─────────────────────────────────────────────────────────────┐
-│ TypeScript 高级技巧学习路径 │
-├─────────────────────────────────────────────────────────────┤
-│ │
-│ 第一阶段：类型操作基础 │
-│ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ │
-│ │ 01. 条件类型 │ → │ 02. 模板字面量 │ → │ 03. 高级泛型 │ │
-│ └──────────────┘ └──────────────┘ └──────────────┘ │
-│ │ │ │
-│ ▼ ▼ ▼ │
-│ 第二阶段：类型设计模式 │
-│ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ │
-│ │ 04. 品牌类型 │ │ 05. 类型守卫 │ │ 06. 工具类型 │ │
-│ └──────────────┘ └──────────────┘ └──────────────┘ │
-│ │ │ │
-│ ▼ ▼ ▼ │
-│ 第三阶段：高级类型技巧 │
-│ ┌──────────────┐ ┌──────────────┐ ┌──────────────┐ │
-│ │ 07. 映射类型 │ │ 08. 装饰器 │ │ 09. React模式 │ │
-│ └──────────────┘ └──────────────┘ └──────────────┘ │
-│ │ │ │
-│ ▼ ▼ ▼ │
-│ 第四阶段：类型系统深入 │
-│ ┌──────────────┐ ┌──────────────┐ │
-│ │ 10. 函数重载 │ → │ 11. 协变逆变 │ │
-│ └──────────────┘ └──────────────┘ │
-│ │ │
-│ ▼ ▼ │
-│ ┌──────────────────────────────────────────────┐ │
-│ │ 12. 类型性能优化 │ │
-│ └──────────────────────────────────────────────┘ │
-│ │
-└─────────────────────────────────────────────────────────────┘
-
+基础篇 ─────────────────────────────────────────────
+  01 条件类型 ──► 02 模板字面量 ──► 03 高级泛型
+                                          │
+核心篇 ─────────────────────────────────────────────
+          04 品牌类型与类型守卫
+                │
+          05 工具类型实现
+                │
+          06 映射类型
+                          │
+进阶篇 ─────────────────────────────────────────────
+       07 函数重载 ──► 08 装饰器 ──► 09 协变逆变
+                                           │
+实战篇 ─────────────────────────────────────────────
+       10 类型性能优化与综合实战
 ```
 
 ---
 
 ## 预期效果
 
-完成本系列学习后，你将能够：
+完成本系列后，你将能够：
 
-1. ✅ 理解 TypeScript 类型系统的深层原理
-2. ✅ 编写类型安全的高级类型定义
-3. ✅ 设计优雅的类型 API
-4. ✅ 解决复杂类型推断问题
-5. ✅ 优化类型性能，避免编译器瓶颈
-6. ✅ 在 React 中应用高级 TypeScript 模式
-7. ✅ 构建可复用的类型工具库
-8. ✅ 赋予团队成员类型安全的能力
+- 读懂开源库中的复杂类型定义
+- 灵活运用条件类型、模板字面量类型、递归泛型
+- 设计类型安全的 API 和工具函数
+- 用品牌类型防止类型混淆的错误
+- 自己实现需要的工具类型
+- 理解协变逆变，写出类型兼容的代码
+- 用装饰器桥接编译期类型和运行时行为
+- 优化复杂类型的编译性能
 
 ---
 
 ## 版本信息
 
-- **TypeScript**：5.6+（使用最新特性）
-- **Node.js**：20.x LTS
-- **React**：18+（相关章节）
-
-*计划创建日期：2026-03-23*
-*预计完成时间：2-3个月（每周 1 篇）*
-```
+- **TypeScript**：5.x
+- **Node.js**：22 LTS

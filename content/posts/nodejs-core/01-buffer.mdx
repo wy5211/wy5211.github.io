@@ -10,7 +10,7 @@ series: "Node.js 核心概念深度解析"
 seriesOrder: 1
 ---
 
-你正在做一个日志处理服务，上游系统发来的日志不是 JSON 文本，而是一串二进制数据。你用 `fs.readFile` 读出来一看，得到的是一堆 `<Buffer 00 00 00 1a 45 52 52 ...>` 这种东西。怎么把它变成可读的日志内容？
+你接手了一个物联网项目，设备通过 TCP 上报传感器数据。你用 `fs.readFile` 读到的是一个 Buffer——`<Buffer 00 00 00 1a 45 52 52 ...>`。设备厂商的协议文档写着：前 4 字节是消息长度，第 5 字节是消息类型，接下来 8 字节是时间戳，剩余的是负载数据。怎么把这些字节变成可读的 JSON？
 
 在前端开发中，我们几乎不需要直接操作二进制数据。最多处理一下 `FormData`，或者在 Canvas 上画个图。但在 Node.js 的世界里，文件读写、网络通信、加密解密，全都是二进制操作。不理解 Buffer，你连一个完整的 HTTP 请求体都读不明白。
 
@@ -167,28 +167,28 @@ const value = buf.readUInt32BE(0); // 0x01020304
 
 如果数据来自本机（x86 架构），可能需要用 `writeUInt32LE` / `readUInt32LE`。读写两端的字节序必须一致，否则数据就是乱的。
 
-## 实战：解析自定义二进制日志协议
+## 实战：解析自定义二进制协议
 
-回到开头的问题。上游系统发来的日志用的是自定义的二进制协议，帧格式如下：
+回到开头的问题。设备上报的数据用的是自定义的二进制协议，帧格式如下：
 
 ```
 ┌──────────┬──────────┬──────────────┬──────────────────┐
 │ 4 bytes  │ 1 byte   │ 8 bytes      │ N bytes          │
-│ 总长度   │ 日志级别 │ 时间戳(ms)   │ 日志内容(UTF-8)  │
+│ 总长度   │ 消息类型 │ 时间戳(ms)   │ 负载数据(UTF-8)  │
 │ (BE)     │          │ (BE)         │                  │
 └──────────┴──────────┴──────────────┴──────────────────┘
 ```
 
-比如一条 ERROR 日志可能是这样的字节序列：
+比如一条温度传感器数据可能是这样的字节序列：
 
 ```
-00 00 00 3A  03  00 00 01 7F 3A 8C 90 00  {"traceId":"trace_a1x9k2m","message":"Connection timeout..."}
+00 00 00 3A  01  00 00 01 7F 3A 8C 90 00  {"sensorId":"temp_001","value":23.5,"unit":"celsius"}
 ```
 
 解析代码：
 
 ```js
-function parseLogFrame(data) {
+function parseFrame(data) {
   if (data.length < 13) {
     throw new Error(
       `帧长度不足：至少需要 13 字节头部，实际 ${data.length} 字节`
@@ -207,22 +207,27 @@ function parseLogFrame(data) {
     );
   }
 
-  // 1 字节日志级别
-  const levelMap = { 0: "DEBUG", 1: "INFO", 2: "WARN", 3: "ERROR", 4: "FATAL" };
-  const level = data[offset];
+  // 1 字节消息类型
+  const typeMap = {
+    0: "HEARTBEAT",
+    1: "SENSOR_DATA",
+    2: "ALERT",
+    3: "COMMAND",
+  };
+  const type = data[offset];
   offset += 1;
 
   // 8 字节时间戳（大端序，毫秒级 Unix 时间戳）
   const timestamp = Number(data.readBigUInt64BE(offset));
   offset += 8;
 
-  // 剩余字节为日志内容（UTF-8）
-  const content = data.subarray(offset, totalLength).toString("utf-8");
+  // 剩余字节为负载数据（UTF-8）
+  const payload = data.subarray(offset, totalLength).toString("utf-8");
 
   return {
-    level: levelMap[level] ?? `UNKNOWN(${level})`,
+    type: typeMap[type] ?? `UNKNOWN(${type})`,
     timestamp: new Date(timestamp).toISOString(),
-    content: JSON.parse(content),
+    payload: JSON.parse(payload),
   };
 }
 ```
@@ -264,7 +269,7 @@ class FrameReader {
       this.buffer = this.buffer.subarray(frameLength);
 
       try {
-        this.onFrame(parseLogFrame(frame));
+        this.onFrame(parseFrame(frame));
       } catch (err) {
         console.error("帧解析失败:", err.message);
       }
@@ -273,7 +278,7 @@ class FrameReader {
 }
 ```
 
-每次调用 `Buffer.concat` 都会创建新的 Buffer——如果数据量很大，频繁 concat 会有性能问题。更高效的实现可以用链表结构管理缓冲区块，不过对于大多数场景，concat 已经够用了。TCP 粘包的完整处理我们会在 [第 7 篇：网络编程](/posts/nodejs-core/07-tcp-udp-network-programming) 中深入讨论。
+每次调用 `Buffer.concat` 都会创建新的 Buffer——如果数据量很大，频繁 concat 会有性能问题。更高效的实现可以用链表结构管理缓冲区块，不过对于大多数场景，concat 已经够用了。
 
 ## 什么时候用 Buffer，什么时候用字符串
 
