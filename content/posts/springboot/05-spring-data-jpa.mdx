@@ -1,0 +1,615 @@
+---
+title: "05 Spring Data JPA"
+date: "2026-03-30"
+summary: "TypeORM 的 Active Record 和 JPA 的 Repository 哪个好？从内存存储切换到 MySQL，用 @Entity 和 JpaRepository 实现 CMS 的数据持久化。"
+tags: ["Spring Boot", "JPA", "MySQL", "ORM"]
+category: "springboot"
+cover: ""
+draft: false
+series: "Spring Boot 实战"
+seriesOrder: 5
+---
+
+上一篇我们给 API 加上了 RESTful 规范——统一响应格式、分页参数、正确的状态码。但有一个问题一直没解决：数据存在内存的 `ConcurrentHashMap` 里，应用一重启，所有文章、标签全没了。
+
+这在 Express 项目里也一样。一开始你用数组存数据做原型，然后引入 `pg` 或 `mongoose` 接数据库。Spring Boot 的对应方案是 Spring Data JPA——它不是直接操作 SQL 的库，而是一套基于 JPA（Java Persistence API）规范的 ORM 框架。如果你用过 TypeORM 或 Prisma，Spring Data JPA 做的事情本质上一样：把数据库表映射成 Java 对象，让你用面向对象的方式操作数据。
+
+但有一个根本性的区别值得展开：**JPA 只支持 Repository 模式，不支持 Active Record。**
+
+## Active Record vs Repository：设计哲学之争
+
+TypeORM 同时支持 Active Record 和 Data Mapper（Repository）两种模式。Active Record 模式下，实体类本身携带数据库操作方法：
+
+```typescript
+// TypeORM Active Record 模式
+@Entity()
+export class Post extends BaseEntity {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  title: string;
+
+  // 实体自己知道怎么保存、查询、删除
+  async save() {
+    /* ... */
+  }
+  static async findOne(id: number) {
+    /* ... */
+  }
+  async remove() {
+    /* ... */
+  }
+}
+
+// 使用方式
+const post = new Post();
+post.title = "新文章";
+await post.save();
+```
+
+这种写法很直观——实体就是数据库行的映射，调 `save()` 就写库，调 `remove()` 就删除。对于小项目和原型开发，Active Record 确实够用。但它有一个根本性的问题：**实体和数据访问逻辑耦合在一起。** 你的 `Post` 类既要描述数据结构，又要知道怎么连数据库。在单元测试里你想 mock 数据库行为，得用 proxyquire 或依赖注入来替换 `BaseEntity` 的底层实现，非常别扭。
+
+JPA 的选择很明确——**只用 Repository 模式**。实体类（Entity）只描述数据结构和映射关系，不包含任何数据库操作方法。所有的 CRUD 通过专门的 Repository 接口完成：
+
+```java
+// JPA Entity：纯数据结构
+@Entity
+@Table(name = "posts")
+public class Post {
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String title;
+    // 没有 save()、没有 delete()、没有查询方法
+}
+
+// JPA Repository：所有数据库操作集中在这里
+public interface PostRepository extends JpaRepository<Post, Long> {
+    List<Post> findByStatus(PostStatus status);
+}
+
+// 使用方式
+Post post = new Post();
+post.setTitle("新文章");
+postRepository.save(post); // 操作通过 Repository 进行
+```
+
+这不是"JPA 没想到支持 Active Record"——JPA 规范的设计者有意为之。在企业级 Java 开发中，职责分离（Separation of Concerns）是核心原则：Entity 只管数据，Repository 只管访问，Service 管业务逻辑，Controller 管请求处理。每一层各司其职，互不越界。
+
+两种模式的核心区别：
+
+| 维度       | TypeORM Active Record      | TypeORM Repository     | Spring Data JPA     |
+| ---------- | -------------------------- | ---------------------- | ------------------- |
+| 实体职责   | 数据结构 + DB 操作         | 仅数据结构             | 仅数据结构          |
+| 保存方式   | `entity.save()`            | `repo.save(entity)`    | `repo.save(entity)` |
+| 静态查询   | `Post.findOne()`           | `repo.findOne()`       | `repo.findById()`   |
+| 测试友好度 | 差（需要 mock BaseEntity） | 好（可注入 mock repo） | 好（接口可替换）    |
+| 适用场景   | 原型、小项目               | 中大型项目             | 中大型项目          |
+
+如果你从 TypeORM 的 Active Record 模式转过来，最大的观念转变就是：**实体不再是"会动的对象"，而是纯粹的"数据载体"。** 所有的行为都通过注入的 Repository 来触发。
+
+## 引入 Spring Data JPA
+
+在 Maven 的 `pom.xml` 里加两个依赖：
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-jpa</artifactId>
+</dependency>
+<dependency>
+    <groupId>com.mysql</groupId>
+    <artifactId>mysql-connector-j</artifactId>
+    <scope>runtime</scope>
+</dependency>
+```
+
+`spring-boot-starter-data-jpa` 这个起步依赖帮你拉了 Hibernate（JPA 的实现）、Spring Data Commons（Repository 的基础接口）和事务管理模块。对应 Express 生态，这相当于同时引入了 TypeORM + 连接池配置 + 事务中间件。
+
+然后在 `application.yml` 里配数据源：
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/techblog?useUnicode=true&characterEncoding=utf8&serverTimezone=Asia/Shanghai
+    username: root
+    password: your_password
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: update # 开发阶段自动建表，生产环境用 Flyway
+    show-sql: false # 打印 SQL 语句，调试时改为 true
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.MySQLDialect
+```
+
+几个关键配置项的含义：
+
+- `ddl-auto: update` —— Hibernate 根据你的 `@Entity` 类自动生成或更新表结构。这在开发阶段很方便，但**绝对不要在生产环境用**。生产环境应该用 Flyway 或 Liquibase 做数据库迁移，确保表结构变更是可控的。
+- `show-sql: false` —— 默认关闭 SQL 日志。开发时打开可以看到 Hibernate 生成的 SQL，排查问题。生产环境关闭，避免日志膨胀。
+- `dialect: MySQLDialect` —— 告诉 Hibernate 用 MySQL 特有的 SQL 语法。如果你换成 PostgreSQL，只需要改这个配置和驱动依赖，业务代码不用动。
+
+在 Express + TypeORM 里，类似的配置写在 `ormconfig.json` 或 `typeorm.config.ts` 中。两者做的事一样——告诉 ORM 框架怎么连数据库、用什么数据库。区别在于 Spring Boot 把这些配置和自动配置机制绑定在一起，你不需要手动创建 `DataSource`，框架根据 `spring.datasource.*` 配置自动生成。
+
+## @Entity：把 Java 类映射成数据库表
+
+CMS 目前有三个核心实体：Post（文章）、Tag（标签）、User（用户）。先把 Post 从普通的 Java 类升级为 JPA 实体。
+
+### Post 实体
+
+```java
+@Entity
+@Table(name = "posts")
+public class Post {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, length = 200)
+    private String title;
+
+    @Column(unique = true, length = 200)
+    private String slug;
+
+    @Column(columnDefinition = "TEXT")
+    private String content;
+
+    @Enumerated(EnumType.STRING)
+    @Column(length = 20)
+    private PostStatus status;
+
+    private Long authorId;
+
+    private int viewCount;
+
+    @Column(name = "created_at", updatable = false)
+    private LocalDateTime createdAt;
+
+    // 以下省略 getter/setter，实际项目用 Lombok @Data
+}
+```
+
+逐个看关键注解：
+
+- `@Entity` —— 标记这个类是 JPA 实体。没有这个注解，Spring Data JPA 不会管理它。
+- `@Table(name = "posts")` —— 指定表名。不写的话默认用类名（`Post` -> 表名 `post`）。显式指定复数形式的表名是好的实践。
+- `@Id` + `@GeneratedValue(strategy = GenerationType.IDENTITY)` —— 主键策略。`IDENTITY` 对应 MySQL 的 `AUTO_INCREMENT`。还有 `SEQUENCE`（Oracle、PostgreSQL 常用）和 `UUID` 等策略。
+- `@Column(nullable = false, length = 200)` —— 列约束。`nullable = false` 生成 `NOT NULL` 约束，`length = 200` 对应 `VARCHAR(200)`。
+- `@Enumerated(EnumType.STRING)` —— 枚举类型存为字符串。默认存的是 ordinal（序号），一旦枚举值顺序变了就会数据错乱。**永远用 STRING。**
+- `@Column(name = "created_at", updatable = false)` —— `updatable = false` 确保 Hibernate 更新时不会修改这个字段。 createdAt 只在创建时写入一次。
+
+对应 TypeORM 的写法：
+
+```typescript
+@Entity()
+export class Post {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column({ length: 200 })
+  title: string;
+
+  @Column({ unique: true, length: 200 })
+  slug: string;
+
+  @Column({ type: "text" })
+  content: string;
+
+  @Column({ type: "enum", enum: PostStatus })
+  status: PostStatus;
+
+  @Column()
+  authorId: number;
+
+  @Column({ default: 0 })
+  viewCount: number;
+
+  @CreateDateColumn({ name: "created_at" })
+  createdAt: Date;
+}
+```
+
+结构几乎一样，区别主要在语法层面：TypeORM 用 TypeScript 装饰器 `@Column()`，JPA 用 Java 注解 `@Column`。TypeORM 的 `@CreateDateColumn` 是内置的自动填充，JPA 需要用 Hibernate 的 `@CreationTimestamp` 或者手动在 Service 层设置。
+
+### Tag 实体
+
+```java
+@Entity
+@Table(name = "tags")
+public class Tag {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true, length = 50)
+    private String name;
+
+    @Column(unique = true, length = 50)
+    private String slug;
+
+    @Column(length = 7)
+    private String color;
+}
+```
+
+### User 实体
+
+```java
+@Entity
+@Table(name = "users")
+public class User {
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    @Column(nullable = false, unique = true, length = 50)
+    private String username;
+
+    @Column(nullable = false, unique = true, length = 100)
+    private String email;
+
+    @Column(name = "password_hash", nullable = false)
+    private String passwordHash;
+
+    @Enumerated(EnumType.STRING)
+    @Column(length = 20)
+    private UserRole role;
+
+    private String avatar;
+
+    @Column(name = "created_at", updatable = false)
+    private LocalDateTime createdAt;
+}
+```
+
+注意 `passwordHash` 而不是 `password`。数据库里存的是哈希值，这个命名约定能避免不小心把明文密码写入响应。
+
+## 实体关系：@OneToMany 和 @ManyToMany
+
+CMS 的数据模型有两个核心关系：Post 属于某个 User（多对一），Post 可以有多个 Tag（多对多）。JPA 用 `@ManyToOne`、`@OneToMany`、`@ManyToMany` 注解来声明关系。
+
+### Post -> User（多对一）
+
+一篇文章属于一个作者，一个作者可以写多篇文章。在 Post 端用 `@ManyToOne` 声明：
+
+```java
+@Entity
+@Table(name = "posts")
+public class Post {
+
+    // ... 其他字段
+
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "author_id")
+    private User author;
+}
+```
+
+`@JoinColumn(name = "author_id")` 指定外键列名。不写的话 Hibernate 会自动生成一个 `author_id` 列，但显式指定更可控。`FetchType.LAZY` 意味着查询 Post 时不会自动加载关联的 User，只有当你调用 `post.getAuthor()` 时才触发额外的 SQL。这是防止 N+1 问题的第一道防线。
+
+在上一篇的内存版本中，Post 只存了 `authorId`（一个 Long），没有 User 对象。现在有了 `@ManyToOne`，你可以直接拿到作者的全部信息，而不是只拿到一个 ID 再手动查一次。这是 ORM 的核心价值之一——**把外键关系变成对象引用**。
+
+### Post <-> Tag（多对多）
+
+一篇文章可以有多个标签，一个标签可以属于多篇文章。这是经典的多对多关系，需要一张中间表。
+
+```java
+@Entity
+@Table(name = "posts")
+public class Post {
+
+    // ... 其他字段
+
+    @ManyToMany(fetch = FetchType.LAZY)
+    @JoinTable(
+        name = "post_tags",
+        joinColumns = @JoinColumn(name = "post_id"),
+        inverseJoinColumns = @JoinColumn(name = "tag_id")
+    )
+    private Set<Tag> tags = new HashSet<>();
+}
+```
+
+`@JoinTable` 告诉 Hibernate 创建一张名为 `post_tags` 的中间表，包含 `post_id` 和 `tag_id` 两个外键。`Set<Tag>` 而不是 `List<Tag>` 是因为集合语义上标签不应该重复——Set 天然去重。
+
+对应 TypeORM 的写法：
+
+```typescript
+@Entity()
+export class Post {
+  @ManyToMany(() => Tag, (tag) => tag.posts)
+  @JoinTable({
+    name: "post_tags",
+    joinColumn: { name: "post_id", referencedColumnName: "id" },
+    inverseJoinColumn: { name: "tag_id", referencedColumnName: "id" },
+  })
+  tags: Tag[];
+}
+```
+
+结构一致，TypeORM 用箭头函数 `() => Tag` 来解决循环引用问题（TypeScript 的限制），JPA 没有这个问题因为 Java 用类引用不需要额外处理。
+
+### 关系的"双面"：mappedBy
+
+上面的多对多关系中，只有 Post 端声明了 `@ManyToMany`。Tag 端如果要访问某标签下的所有文章，需要在 Tag 里也加上关系声明：
+
+```java
+@Entity
+@Table(name = "tags")
+public class Tag {
+
+    // ... 其他字段
+
+    @ManyToMany(mappedBy = "tags", fetch = FetchType.LAZY)
+    private Set<Post> posts = new HashSet<>();
+}
+```
+
+`mappedBy = "tags"` 告诉 Hibernate：**关系已经由 Post 端的 `tags` 字段定义了，Tag 端只是反向引用，不要重复创建中间表。** 如果不加 `mappedBy`，Hibernate 会尝试创建第二张中间表，启动时直接报错。
+
+这是 JPA 关系映射中最容易踩的坑之一。记住一个原则：**双向关系只能有一方是关系的"拥有者"（Owner），另一方必须用 `mappedBy` 声明。** 对于 `@ManyToMany`，拥有者通常是那个有 `@JoinTable` 的一方。对于 `@OneToMany`，拥有者通常是 `@ManyToOne` 的一方。
+
+## JpaRepository：零实现的 CRUD
+
+定义好 Entity 之后，创建 Repository 只需要写一个接口：
+
+```java
+@Repository
+public interface PostRepository extends JpaRepository<Post, Long> {
+    // JpaRepository 已经提供了：
+    // save(entity), findById(id), findAll(), deleteById(id), count()
+    // findAll(Pageable), findAll(Sort), existsById(id) ...
+
+    // 自定义查询：方法名即查询条件
+    List<Post> findByStatus(PostStatus status);
+    Optional<Post> findBySlug(String slug);
+    boolean existsBySlug(String slug);
+    Page<Post> findByStatus(PostStatus status, Pageable pageable);
+}
+```
+
+你没有写一行实现代码。Spring Data JPA 在运行时根据接口方法名自动生成实现类——方法名 `findByStatus` 被解析为 `SELECT * FROM posts WHERE status = ?`，`existsBySlug` 被解析为 `SELECT COUNT(*) > 0 FROM posts WHERE slug = ?`。
+
+这就是 Spring Data JPA 最大的卖点：**方法名查询（Query Method）。** 你不需要写 SQL，不需要写 QueryBuilder，只要按命名约定定义方法签名，框架帮你生成查询。常见的关键字：
+
+| 方法名关键字       | 生成的 SQL 片段         | 示例                                 |
+| ------------------ | ----------------------- | ------------------------------------ |
+| `findBy`           | `WHERE field = ?`       | `findByTitle(String title)`          |
+| `findBy...And`     | `WHERE a = ? AND b = ?` | `findByStatusAndAuthorId()`          |
+| `findBy...Or`      | `WHERE a = ? OR b = ?`  | `findByStatusOrAuthorId()`           |
+| `existsBy`         | `SELECT COUNT(*) > 0`   | `existsBySlug(String slug)`          |
+| `countBy`          | `SELECT COUNT(*)`       | `countByStatus(PostStatus status)`   |
+| `findBy...OrderBy` | `... ORDER BY field`    | `findByStatusOrderByCreatedAtDesc()` |
+| `deleteBy`         | `DELETE WHERE`          | `deleteByStatus(PostStatus status)`  |
+
+方法名查询能覆盖 80% 的简单查询。对于更复杂的场景（多表联查、聚合统计、子查询），用 `@Query` 注解写 JPQL 或原生 SQL：
+
+```java
+@Repository
+public interface PostRepository extends JpaRepository<Post, Long> {
+
+    // JPQL 查询——用实体名和属性名，不直接写表名和列名
+    @Query("SELECT p FROM Post p WHERE p.title LIKE %:keyword%")
+    List<Post> searchByTitle(@Param("keyword") String keyword);
+
+    // JOIN FETCH 解决 N+1 问题——一次查询把关联数据也拉出来
+    @Query("SELECT p FROM Post p LEFT JOIN FETCH p.tags WHERE p.id = :id")
+    Optional<Post> findWithTagsById(@Param("id") Long id);
+
+    // 原生 SQL——直接写数据库方言
+    @Query(value = "SELECT * FROM posts WHERE status = :status ORDER BY view_count DESC LIMIT :limit",
+           nativeQuery = true)
+    List<Post> findTopByViewCount(@Param("status") String status,
+                                   @Param("limit") int limit);
+}
+```
+
+对比 TypeORM 的 Repository：
+
+```typescript
+// TypeORM Repository
+const posts = await postRepository.find({
+  where: { status: PostStatus.PUBLISHED },
+  order: { createdAt: "DESC" },
+  relations: ["tags", "author"],
+  skip: 0,
+  take: 20,
+});
+
+// 或者用 QueryBuilder
+const posts = await postRepository
+  .createQueryBuilder("post")
+  .leftJoinAndSelect("post.tags", "tag")
+  .where("post.status = :status", { status: PostStatus.PUBLISHED })
+  .orderBy("post.createdAt", "DESC")
+  .getMany();
+```
+
+TypeORM 的查询方式更灵活——`find` 的 options 对象和 QueryBuilder 可以组合出任意复杂的查询。Spring Data JPA 的方法名查询更简洁——对于简单查询，一个方法签名就搞定了，不需要写任何实现。两者各有优势：JPA 的方法名查询上手快但表达力有上限，TypeORM 的 QueryBuilder 表达力强但代码量多。
+
+## 替换内存存储：改造 PostService
+
+现在把上一篇用 `List<Post>` 存储的 `PostService` 改为使用 `PostRepository`。改造的核心思路：**Service 层的业务逻辑不变，数据存储方式从内存切换到数据库。**
+
+```java
+@Service
+public class PostService {
+
+    private final PostRepository postRepository;
+
+    public PostService(PostRepository postRepository) {
+        this.postRepository = postRepository;
+    }
+
+    public Page<Post> findAll(int page, int size, PostStatus status, String sort) {
+        // PageRequest.of 的 page 从 0 开始，API 设计中 page 从 1 开始，需要转换
+        Pageable pageable = PageRequest.of(page - 1, size);
+
+        if (status != null) {
+            return postRepository.findByStatus(status, pageable);
+        }
+        return postRepository.findAll(pageable);
+    }
+
+    public Optional<Post> findById(Long id) {
+        return postRepository.findWithTagsById(id);
+    }
+
+    @Transactional
+    public Post create(String title, String content, String slug, Set<Tag> tags) {
+        String finalSlug = (slug != null && !slug.isBlank())
+            ? slug : generateSlug(title);
+
+        if (postRepository.existsBySlug(finalSlug)) {
+            throw new IllegalArgumentException("Slug '" + finalSlug + "' 已存在");
+        }
+
+        Post post = new Post();
+        post.setTitle(title);
+        post.setSlug(finalSlug);
+        post.setContent(content);
+        post.setStatus(PostStatus.DRAFT);
+        post.setViewCount(0);
+        post.setCreatedAt(LocalDateTime.now());
+        post.setTags(tags != null ? tags : new HashSet<>());
+
+        return postRepository.save(post);
+    }
+
+    @Transactional
+    public Optional<Post> update(Long id, String title, String content,
+                                  String slug, PostStatus status) {
+        return postRepository.findById(id).map(existing -> {
+            if (title != null) existing.setTitle(title);
+            if (content != null) existing.setContent(content);
+            if (slug != null) existing.setSlug(slug);
+            if (status != null) existing.setStatus(status);
+            return postRepository.save(existing);
+        });
+    }
+
+    @Transactional
+    public boolean delete(Long id) {
+        if (!postRepository.existsById(id)) {
+            return false;
+        }
+        postRepository.deleteById(id);
+        return true;
+    }
+
+    private String generateSlug(String title) {
+        return title.toLowerCase()
+            .replaceAll("[^a-z0-9\\u4e00-\\u9fa5]+", "-")
+            .replaceAll("^-|-$", "");
+    }
+}
+```
+
+对比改造前后的变化：
+
+- `List<Post>` 消失了，取而代之的是 `PostRepository`——数据从内存转移到数据库
+- `nextId` 消失了——数据库的 `AUTO_INCREMENT` 自动生成 ID，不需要手动维护
+- `@PostConstruct` 的 `init()` 方法消失了——初始数据可以通过 Flyway 迁移脚本或单独的数据初始化类来导入
+- `findAll` 返回类型从 `List<Post>` 变为 `Page<Post>`——Spring Data JPA 的分页对象包含了总页数、总记录数等元数据，比手动 `subList` 完整得多
+- 写操作（create、update、delete）加了 `@Transactional`——确保操作在事务中执行，失败时自动回滚
+
+`@Transactional` 在这里的作用值得展开。上一篇的内存版本不需要事务——操作一个 `ArrayList` 要么成功要么失败，不存在"改了一半"的状态。但数据库操作不一样：创建文章时可能需要同时写入 `posts` 表和 `post_tags` 中间表，如果写完 `posts` 表后写中间表失败，就会留下一条没有标签的孤立记录。`@Transactional` 确保这些操作要么全部成功，要么全部回滚。
+
+在 Express + TypeORM 中，等价的做法是用 `QueryRunner` 或 `transaction` 方法：
+
+```typescript
+// TypeORM 事务
+await dataSource.transaction(async (manager) => {
+  const post = manager.create(Post, {
+    title,
+    slug,
+    content,
+    status: PostStatus.DRAFT,
+  });
+  await manager.save(post);
+  for (const tag of tags) {
+    await manager.save(PostTag, { postId: post.id, tagId: tag.id });
+  }
+});
+```
+
+JPA 的 `@Transactional` 更简洁——不需要手动获取 transaction manager，不需要回调函数，加个注解就行。框架在方法进入时开启事务，正常返回时提交，抛异常时回滚。
+
+## Tag 和 User 的 Repository
+
+按照同样的模式创建 TagRepository 和 UserRepository：
+
+```java
+@Repository
+public interface TagRepository extends JpaRepository<Tag, Long> {
+    Optional<Tag> findByName(String name);
+    Optional<Tag> findBySlug(String slug);
+    boolean existsByName(String name);
+}
+
+@Repository
+public interface UserRepository extends JpaRepository<User, Long> {
+    Optional<User> findByUsername(String username);
+    Optional<User> findByEmail(String email);
+    boolean existsByUsername(String username);
+    boolean existsByEmail(String email);
+}
+```
+
+这三个 Repository 接口加起来不到 20 行代码，但已经覆盖了 CMS 目前需要的所有数据访问操作。这就是 Spring Data JPA 的效率——JpaRepository 自带的 20+ 个通用方法加上方法名查询，大部分场景下不需要写任何实现。
+
+## 对比总结
+
+| 维度       | TypeORM                     | Prisma                  | Spring Data JPA                 |
+| ---------- | --------------------------- | ----------------------- | ------------------------------- |
+| 设计模式   | Active Record + Data Mapper | Data Mapper（独有）     | Data Mapper                     |
+| 查询方式   | find options + QueryBuilder | Prisma Client API       | 方法名 + @Query + Specification |
+| 类型安全   | TypeScript 编译期           | Schema 驱动，极强       | Java 编译期                     |
+| 关系映射   | 装饰器声明                  | schema.prisma 声明      | 注解声明                        |
+| 事务       | QueryRunner / transaction   | `prisma.$transaction()` | `@Transactional` 注解           |
+| 数据库迁移 | 内置 migration              | 内置 migration          | Flyway / Liquibase              |
+| 零代码查询 | 有限                        | Prisma Client 自动生成  | 方法名查询（核心优势）          |
+| 学习曲线   | 中等                        | 低                      | 中等偏高                        |
+
+Prisma 值得单独提一下。它不是传统的 ORM——你先在 `schema.prisma` 文件里用 DSL 定义数据模型，然后 `prisma generate` 自动生成类型安全的 Client。这种"schema 驱动"的方式避免了在实体类上堆砌注解/装饰器，代码更干净。但 Prisma 目前只有 Node.js/Python/Go 支持，Java 生态没有对应方案。Spring Data JPA 的方法名查询在简洁程度上和 Prisma Client 的 API 是同一个思路——**用约定代替手写查询代码。**
+
+## Trade-off：JPA 的代价
+
+**抽象泄漏。** JPA 让你用面向对象的方式操作数据库，但关系型数据库不是面向对象的。当你遇到复杂的联表查询、批量更新、窗口函数时，JPQL 的表达力可能不够，最终还是要写原生 SQL。TypeORM 的 QueryBuilder 在这方面更灵活——你可以逐步构建查询，而 JPA 的 `@Query` 要么写完整的 JPQL，要么写原生 SQL，没有中间态。
+
+**N+1 问题是隐形炸弹。** 上面的 Post 实体里，`tags` 用了 `FetchType.LAZY`。这看似解决了问题，但如果你在循环里访问 `post.getTags()`：
+
+```java
+List<Post> posts = postRepository.findAll();
+for (Post post : posts) {
+    // 每次调用 getTags() 都会触发一条额外的 SQL
+    Set<Tag> tags = post.getTags();
+}
+```
+
+10 篇文章就会产生 1 + 10 = 11 条 SQL。解决方案是上面提到的 `@Query("... JOIN FETCH p.tags")` 或者用 `@EntityGraph` 提前声明需要加载的关联。TypeORM 的 `find({ relations: ["tags"] })` 在直观性上更好一些。
+
+**启动时间和内存开销。** JPA 在启动时需要扫描所有 `@Entity` 类、解析注解、生成 SQL、验证表结构。对于一个有 30 个实体的项目，启动时间可能比没有 JPA 时多 2-3 秒。Hibernate 的 SessionFactory（一级缓存、二级缓存、查询缓存）也会占用额外的堆内存。Express + TypeORM 也有类似的启动开销，但通常更小，因为 Node.js 的 ORM 不需要做那么多编译期处理。
+
+**`ddl-auto: update` 的局限。** 它只能加列，不能删列、不能改列类型。如果你把 `title` 从 `VARCHAR(200)` 改成 `VARCHAR(100)`，或者删除了 `viewCount` 字段，`update` 不会做任何事。长期来看，Flyway 或 Liquibase 是必须的。TypeORM 的 `synchronize: true` 有同样的问题——官方文档也明确说不要在生产环境用。
+
+## 回顾
+
+上一篇我们完善了 RESTful API 的设计规范，数据还停留在内存存储。这篇引入了 Spring Data JPA，完成了 CMS 从内存到 MySQL 的切换：
+
+- JPA 只支持 Repository 模式（Data Mapper），不支持 Active Record。实体类只描述数据结构，所有操作通过 Repository 接口进行
+- `@Entity` + `@Table` + `@Column` 注解把 Java 类映射成数据库表和列
+- `@ManyToOne`、`@ManyToMany` + `@JoinTable` 声明实体间关系，双向关系用 `mappedBy` 避免重复创建
+- `JpaRepository` 提供零实现的 CRUD，方法名查询自动生成 SQL，`@Query` 处理复杂场景
+- `@Transactional` 确保写操作在事务中执行，失败时自动回滚
+- Service 层改造后业务逻辑不变，数据存储方式从内存切换到数据库
+
+CMS 现在有了真实的数据持久化能力。但有一个问题还没解决：客户端传过来的请求参数该怎么校验？现在 `PostService.create()` 里只做了 slug 唯一性校验，如果 `title` 是空字符串、`content` 超过数据库列的长度限制，会直接抛 SQL 异常。下一篇引入 Spring Validation，用 `@Valid`、`@NotBlank`、`@Size` 等注解在请求进入业务逻辑之前就拦截非法数据——对应 Node.js 生态里的 Joi 或 Zod。
