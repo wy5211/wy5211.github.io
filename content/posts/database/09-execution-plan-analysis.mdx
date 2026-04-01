@@ -1,8 +1,8 @@
 ---
-title: "09. 执行计划分析：诊断数据库性能问题的终极武器"
+title: "09. 执行计划：慢查询诊断终极武器"
 date: "2026-03-19"
-summary: "深入理解 PostgreSQL 执行计划，掌握诊断性能问题的核心技能"
-tags: ["PostgreSQL", "执行计划", "性能诊断", "EXPLAIN"]
+summary: "学会读 EXPLAIN ANALYZE 的输出，理解 Seq Scan、Index Scan、Hash Join 等执行策略，掌握定位慢查询根因的方法"
+tags: ["PostgreSQL", "执行计划", "EXPLAIN", "性能诊断"]
 category: "数据库"
 cover: ""
 draft: false
@@ -10,469 +10,214 @@ series: "数据库渐进式学习路线"
 seriesOrder: 9
 ---
 
-## 前言
+上一篇讲了几个查询优化的套路。但很多时候你不知道查询慢在哪里——加了索引没用、改了写法反而更慢、同样的查询有时快有时慢。这时候你需要看数据库的执行计划。
 
-你的查询慢，但你不知道为什么？执行计划分析就是诊断性能问题的终极武器！
+`EXPLAIN ANALYZE` 是 PostgreSQL 最有用的诊断工具。它不只告诉你数据库"打算怎么执行"（计划），还会告诉你"实际执行了多久"（真实耗时）。这两个信息合在一起，就能帮你定位慢查询的根因。
 
-通过执行计划，你可以看到数据库是如何执行你的查询的，哪里是瓶颈，是否使用了索引，如何优化。
+## EXPLAIN vs EXPLAIN ANALYZE
 
-本文将深入讲解 PostgreSQL 执行计划的各个要素，帮助你成为性能诊断专家。
+先区分两个命令：
 
----
+`EXPLAIN` 只显示执行计划，不真正执行查询。它告诉你数据库打算用什么策略，每个步骤预估的成本是多少。但它不会告诉你实际花了多少时间——因为查询根本没跑。
 
-## 核心概念
-
-### 什么是执行计划？
-
-**执行计划**是数据库优化器生成的查询执行步骤图，展示了数据库如何获取数据。
-
-**如何查看执行计划**：
-
-```sql
--- 方式 1：EXPLAIN（不执行查询）
-EXPLAIN SELECT * FROM users WHERE email = 'user@example.com';
-
--- 方式 2：EXPLAIN ANALYZE（执行并返回实际执行时间）
-EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'user@example.com';
-
--- 方式 3：详细模式
-EXPLAIN (ANALYZE, BUFFERS, VERBOSE) SELECT * FROM users WHERE email = 'user@example.com';
-```
-
----
-
-## 扫描方式
-
-### 1. Seq Scan（顺序扫描）
-
-全表扫描，最慢的方式。
-
-```sql
-EXPLAIN ANALYZE SELECT * FROM users;
-
--- 输出
--- Seq Scan on users (cost=0.00..25.50 rows=1000 width=200) (actual time=0.123..5.678 rows=1000 loops=1)
-```
-
-**何时出现**：
-
-- ❌ 没有索引
-- ❌ 数据量小（优化器选择全表扫描）
-- ❌ 返回大部分数据
-
----
-
-### 2. Index Scan（索引扫描）
-
-使用索引扫描，快。
-
-```sql
-EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'user@example.com';
-
--- 输出
--- Index Scan using idx_users_email on users (cost=0.42..8.44 rows=1 width=200) (actual time=0.123..0.456 rows=1 loops=1)
---   Index Cond: (email = 'user@example.com'::text)
-```
-
-**何时出现**：
-
-- ✅ 有索引
-- ✅ 返回少量数据（< 10%）
-
----
-
-### 3. Index Only Scan（只读索引扫描）
-
-最快，只读索引，不读表。
-
-```sql
-EXPLAIN ANALYZE SELECT email FROM users WHERE email = 'user@example.com';
-
--- 输出
--- Index Only Scan using idx_users_email on users (cost=0.42..8.44 rows=1 width=32) (actual time=0.123..0.234 rows=1 loops=1)
---   Heap Fetches: 0
-```
-
-**何时出现**：
-
-- ✅ 查询的列都在索引中
-- ✅ 覆盖索引
-
----
-
-### 4. Bitmap Index Scan（位图索引扫描）
-
-结合索引和全表扫描，适合 OR 条件。
-
-```sql
-EXPLAIN ANALYZE SELECT * FROM users WHERE email = 'a@example.com' OR email = 'b@example.com';
-
--- 输出
--- Bitmap Heap Scan on users (cost=20.50..40.50 rows=100 width=200)
---   Recheck Cond: ((email = 'a@example.com'::text) OR (email = 'b@example.com'::text))
---   -> BitmapOr (cost=10.00..10.00 rows=200 width=0)
---     -> Bitmap Index Scan on idx_users_email (cost=5.00..5.00 rows=100 width=0)
---         Index Cond: (email = 'a@example.com'::text)
---     -> Bitmap Index Scan on idx_users_email (cost=5.00..5.00 rows=100 width=0)
---         Index Cond: (email = 'b@example.com'::text)
-```
-
----
-
-## 连接方式
-
-### 1. Nested Loop（嵌套循环）
-
-适合小表。
+`EXPLAIN ANALYZE` 真正执行查询，并返回实际执行时间和行数。这才是你需要用的。
 
 ```sql
 EXPLAIN ANALYZE
-SELECT * FROM users u
-INNER JOIN orders o ON u.id = o.user_id;
-
--- 输出
--- Nested Loop (cost=0.42..12345.67 rows=1000 width=400)
---   -> Index Scan using users_pkey on users (cost=0.42..8.44 rows=100 width=200)
---   -> Index Scan using idx_orders_user_id on orders (cost=0.42..12.34 rows=10 width=200)
---       Index Cond: (user_id = u.id)
-```
-
-**何时出现**：
-
-- ✅ 小表连接
-- ✅ 有索引
-
----
-
-### 2. Hash Join（哈希连接）
-
-适合大表。
-
-```sql
-EXPLAIN ANALYZE
-SELECT * FROM users u
-INNER JOIN orders o ON u.id = o.user_id;
-
--- 输出
--- Hash Join (cost=123.45..23456.78 rows=10000 width=400)
---   Hash Cond: (o.user_id = u.id)
---   -> Seq Scan on orders (cost=0.00..12345.67 rows=100000 width=200)
---   -> Hash (cost=22.00..22.00 rows=1000 width=200)
---       -> Seq Scan on users (cost=0.00..22.00 rows=1000 width=200)
-```
-
-**何时出现**：
-
-- ✅ 大表连接
-- ✅ 等值连接
-- ❌ 不适合排序数据
-
----
-
-### 3. Merge Join（合并连接）
-
-适合已排序的数据。
-
-```sql
-EXPLAIN ANALYZE
-SELECT * FROM users u
-INNER JOIN orders o ON u.id = o.user_id
-ORDER BY u.id;
-
--- 输出
--- Merge Join (cost=123.45..23456.78 rows=10000 width=400)
---   Merge Cond: (u.id = o.user_id)
---   -> Index Scan using users_pkey on users (cost=0.42..123.45 rows=1000 width=200)
---   -> Sort (cost=123.45..126.78 rows=100000 width=200)
---       Sort Key: o.user_id
---       -> Seq Scan on orders (cost=0.00..12345.67 rows=100000 width=200)
-```
-
-**何时出现**：
-
-- ✅ 已排序的数据
-- ✅ 大表连接
-- ✅ 排序连接
-
----
-
-## 聚合方式
-
-### 1. Hash Aggregate（哈希聚合）
-
-```sql
-EXPLAIN ANALYZE
-SELECT user_id, COUNT(*), SUM(total)
-FROM orders
-GROUP BY user_id;
-
--- 输出
--- HashAggregate (cost=12345.67..13456.78 rows=1000 width=40)
---   Group Key: user_id
---   -> Seq Scan on orders (cost=0.00..12345.67 rows=100000 width=20)
-```
-
----
-
-### 2. GroupAggregate（分组聚合）
-
-```sql
-EXPLAIN ANALYZE
-SELECT DATE(created_at), COUNT(*)
-FROM orders
-GROUP BY DATE(created_at);
-
--- 输出
--- GroupAggregate (cost=12345.67..13456.78 rows=1000 width=40)
---   Group Key: DATE(created_at)
---   -> Sort (cost=12345.67..12678.90 rows=100000 width=20)
---       Sort Key: DATE(created_at)
---       -> Seq Scan on orders (cost=0.00..12345.67 rows=100000 width=20)
-```
-
----
-
-## 执行计划解读
-
-### 完整示例
-
-```sql
-EXPLAIN (ANALYZE, BUFFERS, VERBOSE)
-SELECT
-  u.email,
-  o.order_number,
-  o.total
-FROM users u
-INNER JOIN orders o ON u.id = o.user_id
-WHERE u.is_verified = TRUE
-  AND o.created_at >= '2024-01-01'
+SELECT o.id, o.order_number, o.total, u.full_name
+FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.status = 'paid'
 ORDER BY o.created_at DESC
 LIMIT 20;
 ```
 
-**输出解读**：
+输出大概是这样：
 
 ```
-Limit  (cost=1234.56..1234.78 rows=20 width=200) (actual time=0.123..12.345 rows=20 loops=1)
-  Buffers: shared hit=1234 read=56
-  -> Sort  (cost=1234.56..1234.78 rows=20 width=200) (actual time=0.123..12.234 rows=20 loops=1)
-        Sort Key: o.created_at DESC
-        Sort Method: top-N heapsort  Memory: 25kB
-        Buffers: shared hit=1234 read=56
-        -> Hash Join  (cost=100.00..1234.56 rows=1000 width=200) (actual time=0.123..10.123 rows=1000 loops=1)
-              Hash Cond: (o.user_id = u.id)
-              Buffers: shared hit=1234 read=56
-              -> Index Scan using idx_orders_created on orders o  (cost=0.42..1000.00 rows=10000 width=100) (actual time=0.123..5.123 rows=10000 loops=1)
-                    Index Cond: (created_at >= '2024-01-01'::date)
-                    Buffers: shared hit=567 read=23
-              -> Hash  (cost=50.00..50.00 rows=1000 width=100) (actual time=0.123..0.234 rows=1000 loops=1)
-                    Buckets: 1024  Batches: 1  Memory Usage: 64kB
-                    Buffers: shared hit=12 read=3
-                    -> Index Scan using idx_users_verified on users u  (cost=0.42..50.00 rows=1000 width=100) (actual time=0.123..0.456 rows=1000 loops=1)
-                          Index Cond: (is_verified = true)
-                          Buffers: shared hit=12 read=3
+Limit  (cost=0.71..458.23 rows=20 width=72) (actual time=0.032..0.156 ms rows=20 loops=1)
+  ->  Nested Loop  (cost=0.71..15234.56 rows=678 width=72) (actual time=0.031..0.148 ms rows=20 loops=1)
+        ->  Index Scan using idx_orders_status_created on orders o  (cost=0.42..12456.78 rows=678 width=52) (actual time=0.021..0.089 ms rows=20 loops=1)
+              Index Cond: (status = 'paid'::text)
+        ->  Index Scan using users_pkey on users u  (cost=0.29..4.12 rows=1 width=28) (actual time=0.003..0.003 ms rows=1 loops=20)
+              Index Cond: (id = o.user_id)
+Planning Time: 0.124 ms
+Execution Time: 0.234 ms
 ```
 
-**关键信息**：
+第一眼看过去可能有点懵，但其实结构很清晰。每一行代表一个执行步骤，缩进表示步骤之间的嵌套关系（像一棵树）。每个步骤有两个关键信息：`cost` 是预估成本，`actual time` 是实际耗时。**看 actual time，忽略 cost**——预估成本和实际耗时经常对不上。
 
-- `cost=123.45..234.56`：成本估算（启动成本..总成本）
-- `actual time=0.123..12.345`：实际执行时间（毫秒）
-- `rows=20`：实际返回行数
-- `loops=1`：循环次数
-- `Buffers`：缓冲区使用情况
-- `shared hit=1234`：共享缓冲命中
-- `read=56`：从磁盘读取
+## 三种扫描方式
 
----
+执行计划里最常见的操作是"扫描"——数据库怎么从表里读数据。
 
-## 性能问题诊断
+**Seq Scan（顺序扫描）**：从第一行开始，逐行扫描整张表。没有 WHERE 条件的全表查询就是这个。如果在 WHERE 条件里有过滤但没有合适的索引，也会退化为 Seq Scan。
 
-### 1. 全表扫描
+```
+Seq Scan on orders  (cost=0.00..15432.00 rows=1000000 width=64)
+  Filter: (status = 'paid')
+```
+
+这个输出告诉你：数据库在 orders 表上做顺序扫描，然后在每一行上执行 `status = 'paid'` 的过滤。如果 orders 表有 100 万行，但只有 10 万行是 `paid` 状态，那 90 万行的扫描是浪费的。
+
+Seq Scan 不一定是坏事。如果你的查询需要返回表中大部分行（比如超过 30%），全表扫描可能比索引扫描更快——因为索引扫描需要先读索引再回表读数据，两次 I/O 的开销可能比一次全表扫描还大。数据库的优化器会根据统计信息自动选择。
+
+**Index Scan（索引扫描）**：通过索引定位到满足条件的行，然后回表读取完整的行数据。
+
+```
+Index Scan using idx_orders_status_created on orders  (cost=0.42..4567.89 rows=100000 width=52)
+  Index Cond: (status = 'paid')
+```
+
+`using idx_orders_status_created` 告诉你数据库用了哪个索引。`rows=100000` 是预估返回的行数。如果你的 WHERE 条件能精确匹配索引列，而且返回的行数远小于总行数，Index Scan 通常比 Seq Scan 快得多。
+
+**Index Only Scan（只读索引扫描）**：只需要的数据都在索引里，不需要回表。
+
+```
+Index Only Scan using idx_orders_status_created on orders  (cost=0.42..2345.67 rows=100000 width=20)
+  Index Cond: (status = 'paid')
+```
+
+Index Only Scan 是最理想的——数据库只需要读索引，不需要读表数据，I/O 量最少。但前提是你 SELECT 的列全部包含在索引里。比如你的索引是 `(status, created_at)`，查询 `SELECT status, created_at FROM orders WHERE status = 'paid'` 就可以走 Index Only Scan。但如果你还 SELECT 了 `total`，数据库就得回表去读 `total` 列，退化为 Index Scan。
+
+想让更多查询走 Index Only Scan，可以考虑把需要的列都加到索引里——但要注意索引会变大，写入会更慢。
+
+## 三种 JOIN 策略
+
+当查询涉及 JOIN 时，数据库有三种执行策略可选。选哪种取决于表的大小、是否有索引、数据分布。
+
+**Nested Loop（嵌套循环）**：对外表的每一行，在内表里查找匹配的行。就是两层循环。
+
+```
+Nested Loop  (actual time=0.031..0.148 ms rows=20 loops=1)
+  ->  Index Scan on orders (actual time=0.021..0.089 ms rows=20 loops=1)
+  ->  Index Scan on users (actual time=0.003..0.003 ms rows=1 loops=20)
+```
+
+注意内层扫描的 `loops=20`——外层返回了 20 行，所以内层执行了 20 次。如果内层有索引，每次执行都很快（0.003ms），总开销就是 20 × 0.003 = 0.06ms，可以接受。
+
+Nested Loop 适合外表小、内表有索引的场景。如果外表有 10 万行，内表没有索引，Nested Loop 就会很慢——要做 10 万次全表扫描。
+
+**Hash Join（哈希连接）**：先扫描较小的表，在内存里建一个哈希表，然后扫描较大的表，用哈希表来查找匹配。
+
+```
+Hash Join  (actual time=12.345..89.012 ms rows=500000 loops=1)
+  Hash Cond: (o.user_id = u.id)
+  ->  Seq Scan on orders (actual time=0.012..34.567 ms rows=1000000 loops=1)
+  ->  Hash  (actual time=0.123..0.456 ms rows=50000 loops=1)
+        ->  Seq Scan on users (actual time=0.011..0.345 ms rows=50000 loops=1)
+```
+
+Hash Join 的两个阶段很清楚：先建 Hash（扫描 users 表，50ms），再做 Join（扫描 orders 表，34ms）。总共 84ms。
+
+Hash Join 适合两个表都比较大、没有合适索引的场景。它的优势是只需要扫描两张表各一次，不需要反复查找。但代价是需要内存来存哈希表——如果小表太大，内存放不下，就要溢出到磁盘，性能会断崖式下降。PostgreSQL 的 `work_mem` 参数控制每个操作能用的最大内存。
+
+**Merge Join（归并连接）**：要求两个表都按 JOIN 的列排好序。然后像合并两个有序数组一样，各取一行比较，匹配的输出，不匹配的移动指针。
+
+```
+Merge Join  (actual time=5.678..45.123 ms rows=500000 loops=1)
+  Merge Cond: (o.user_id = u.id)
+  ->  Index Scan using idx_orders_user_id on orders (actual time=0.012..20.345 ms rows=1000000 loops=1)
+  ->  Sort  (actual time=0.123..2.456 ms rows=50000 loops=1)
+        Sort Key: u.id
+        ->  Seq Scan on users (actual time=0.011..0.567 ms rows=50000 loops=1)
+```
+
+Merge Join 在两个表都已经有序（通过索引或排序）的情况下最快——只需要各遍历一次。如果其中一个表没有按 JOIN 列排序，优化器需要先排序，排序的开销可能抵消 Merge Join 的优势。
+
+PostgreSQL 的优化器会自动在这三种策略中选择它认为最快的。大多数情况下它的选择是对的。但如果统计信息过时，它可能选错。
+
+## 优化器选错方案怎么办
+
+执行计划里最让人困惑的情况是：你明明建了索引，查询还是走了 Seq Scan。
+
+这通常是因为统计信息过时了。PostgreSQL 的查询优化器根据统计信息（每列有多少不同值、数据的分布情况、表有多少行）来选择执行策略。这些统计信息通过 `ANALYZE` 命令收集，PostgreSQL 默认会在数据变化超过一定阈值后自动执行 `ANALYZE`。但如果你刚导入了一大堆数据、刚建了一张新表、或者刚跑了大批量的 UPDATE/DELETE，统计信息可能还没更新，优化器就会做出错误的判断。
+
+比如你刚给 orders 表导入了 100 万条数据，然后查询 `WHERE status = 'paid'`。优化器根据旧统计信息认为 `status = 'paid'` 会返回 80% 的行，选择 Seq Scan。但实际上新数据里只有 10% 是 `paid` 状态，用 Index Scan 会快得多。
+
+手动更新统计信息：
 
 ```sql
--- 问题：Seq Scan（应该用索引）
-EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 'user-1';
-
--- 解决：创建索引
-CREATE INDEX idx_orders_user_id ON orders(user_id);
-```
-
----
-
-### 2. 缺失索引
-
-```sql
--- 问题：Filter 而不是 Index Scan
-EXPLAIN ANALYZE SELECT * FROM orders WHERE status = 'paid';
-
--- 输出：Seq Scan on orders (cost=..)
---       Filter: (status = 'paid'::text)
-
--- 解决：创建索引
-CREATE INDEX idx_orders_status ON orders(status);
-```
-
----
-
-### 3. 统计信息过时
-
-```sql
--- 问题：优化器选择错误的计划
-EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 'user-1';
-
--- 解决：更新统计信息
 ANALYZE orders;
-
--- 或收集详细统计信息
-ALTER TABLE orders SET (statistics_target = 1000);
-ANALYZE orders;
 ```
 
----
-
-### 4. 不当的类型转换
+`ANALYZE` 不会锁表，可以随时执行。如果你不确定哪张表的统计信息过时了，可以更新所有表：
 
 ```sql
--- 问题：隐式类型转换导致不使用索引
-EXPLAIN ANALYZE SELECT * FROM users WHERE id = 123;  -- id 是 UUID
-
--- 输出：Seq Scan on users (cost=..)
---       Filter: (id = '123'::uuid)
-
--- 解决：使用正确类型
-SELECT * FROM users WHERE id = '123'::uuid;
+ANALYZE;
 ```
 
----
-
-### 5. 锁等待
+另一个常见原因是**参数类型不匹配**。假设 `user_id` 列的类型是 `INTEGER`，但你的查询写的是：
 
 ```sql
--- 查看锁等待
-SELECT
-  pid,
-  usename,
-  pg_blocking_pids(pid) as blocked_by,
-  query as blocked_query
-FROM pg_stat_activity
-WHERE cardinality(pg_blocking_pids(pid)) > 0;
+SELECT * FROM orders WHERE user_id = '42';  -- 字符串 '42'，不是整数 42
 ```
 
----
+PostgreSQL 不会自动把 `'42'` 转成 `42` 来匹配索引——它会认为你在比较 `INTEGER` 和 `TEXT`，类型不匹配，索引不能用。解决办法是确保参数类型正确，或者显式转换：
 
-## 监控工具
+```sql
+SELECT * FROM orders WHERE user_id = '42'::INTEGER;
+```
 
-### pg_stat_statements
+这在 ORM 里也可能发生。如果 Prisma 的 schema 里 `userId` 是 `Int` 类型，但前端传过来的参数是字符串，Prisma 通常会处理好类型转换。但如果你用了 `$queryRaw` 或 `$executeRaw` 写原生 SQL，就需要自己注意类型匹配。
+
+## pg_stat_statements：找出最慢的 SQL
+
+你不可能每次都手动给每个查询加 EXPLAIN ANALYZE。当系统变慢了，你首先想知道的是："哪些 SQL 最慢？"
+
+PostgreSQL 的 `pg_stat_statements` 扩展帮你做这件事。它记录数据库执行过的每条 SQL 的统计信息：执行次数、总耗时、平均耗时、最快/最慢一次的耗时。
 
 ```sql
 -- 启用扩展
-CREATE EXTENSION pg_stat_statements;
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
 
--- 查看最慢的查询
-SELECT
-  query,
-  calls,
-  total_exec_time / 1000 as total_seconds,
-  mean_exec_time / 1000 as avg_seconds,
-  stddev_exec_time / 1000 as stddev_seconds
+-- 查看最慢的 10 条 SQL（按平均耗时排序）
+SELECT query,
+       calls,
+       total_exec_time / 1000 AS total_ms,
+       mean_exec_time / 1000 AS avg_ms,
+       max_exec_time / 1000 AS max_ms,
+       rows
 FROM pg_stat_statements
 ORDER BY mean_exec_time DESC
 LIMIT 10;
 ```
 
----
+这个查询返回的是已经执行过的 SQL 的统计信息，不是执行计划。它能帮你快速定位"哪条 SQL 该优化"，但具体怎么优化还需要对那条 SQL 加 EXPLAIN ANALYZE 看执行计划。
 
-### pg_stat_activity
+`pg_stat_statements` 还有一个有用的功能：看"总耗时最高的 SQL"。一条 SQL 平均只执行 50ms，但如果每秒执行 100 次，它占用的总数据库时间可能比一条执行 2 秒但每小时只执行一次的 SQL 还多。
 
 ```sql
--- 查看当前正在执行的查询
-SELECT
-  pid,
-  now() - query_start as duration,
-  state,
-  query
-FROM pg_stat_activity
-WHERE state != 'idle'
-ORDER BY duration DESC;
+-- 按总耗时排序（找出最浪费数据库时间的 SQL）
+SELECT query,
+       calls,
+       total_exec_time / 1000 AS total_ms,
+       mean_exec_time / 1000 AS avg_ms
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
 ```
 
----
+在 Docker 环境里启用 `pg_stat_statements`，需要在 `shared_preload_libraries` 配置里加上这个扩展，然后重启 PostgreSQL：
 
-## 最佳实践
+```yaml
+# docker-compose.yml
+postgres:
+  image: postgres:16-alpine
+  command:
+    - "postgres"
+    - "-c"
+    - "shared_preload_libraries=pg_stat_statements"
+    - "-c"
+    - "pg_stat_statements.track=all"
+```
 
-### 诊断流程
+## 小结
 
-1. 使用 EXPLAIN ANALYZE 分析查询
-2. 检查是否使用索引
-3. 查看扫描方式（Seq Scan vs Index Scan）
-4. 查看连接方式（Nested Loop vs Hash Join）
-5. 查看实际执行时间（actual time）
-6. 查看缓冲区使用（Buffers）
-7. 找出瓶颈并优化
+读执行计划的核心是关注 `actual time` 而不是 `cost`。看数据库用了什么扫描方式（Seq Scan 说明可能缺索引，Index Only Scan 是最理想的），用了什么 JOIN 策略（Nested Loop 适合小外表，Hash Join 适合大表），每个步骤实际返回了多少行（和预估差很多说明统计信息过时了）。
 
----
+当你发现查询走了 Seq Scan 但觉得应该走 Index Scan，先检查：索引存在吗？WHERE 条件里的列和索引列匹配吗？参数类型匹配吗？如果都匹配但还是走 Seq Scan，跑一下 `ANALYZE` 更新统计信息。
 
-## 常见问题
+`pg_stat_statements` 是你的全局监控工具——它告诉你哪些 SQL 最该优化。EXPLAIN ANALYZE 是你的局部诊断工具——它告诉你某条 SQL 具体慢在哪里。两个配合使用，就能系统地解决性能问题。
 
-### Q1: cost 高但实际快？
-
-**cost 是估算值，actual time 才是实际执行时间**。优化器可能估算不准确。
-
----
-
-### Q2: 为什么不使用索引？
-
-**可能原因**：
-
-- 数据量小（全表扫描更快）
-- 索引列被函数包裹
-- 隐式类型转换
-- 统计信息过时
-
----
-
-## 总结
-
-本文深入学习了执行计划分析：
-
-**扫描方式**：
-
-- Seq Scan：全表扫描
-- Index Scan：索引扫描
-- Index Only Scan：只读索引
-- Bitmap Index Scan：位图索引
-
-**连接方式**：
-
-- Nested Loop：嵌套循环
-- Hash Join：哈希连接
-- Merge Join：合并连接
-
-**性能诊断**：
-
-- 全表扫描
-- 缺失索引
-- 统计信息过时
-- 不当类型转换
-
-**监控工具**：
-
-- pg_stat_statements
-- pg_stat_activity
-
----
-
-## 下一步
-
-掌握了执行计划分析后，下一步我们将学习：
-
-**《10. Prisma ORM 入门》**：学习现代化的 ORM 工具，提升开发效率。
-
-你将学习：
-
-- 🚀 Prisma 核心概念
-- 📊 Schema 定义
-- 🔄 数据库迁移
-- 💻 类型安全的 CRUD 操作
-
-继续关注，让我们一起学习现代化数据库开发！
+下一篇开始进入 ORM 篇——我们用 Prisma 把前面学的 SQL 知识转化成类型安全的 TypeScript 代码。

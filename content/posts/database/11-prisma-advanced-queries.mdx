@@ -1,8 +1,8 @@
 ---
-title: "11. Prisma 高级查询：掌握复杂查询与性能优化"
+title: "11. Prisma 高级查询与性能优化"
 date: "2026-03-19"
-summary: "深入学习 Prisma 的高级查询技巧，掌握复杂场景的最佳实践"
-tags: ["Prisma", "高级查询", "性能优化", "TypeScript"]
+summary: "实现订单管理后台的多条件筛选、用户消费统计、商品列表游标分页等真实业务中的复杂查询"
+tags: ["Prisma", "高级查询", "分页", "聚合"]
 category: "数据库"
 cover: ""
 draft: false
@@ -10,433 +10,280 @@ series: "数据库渐进式学习路线"
 seriesOrder: 11
 ---
 
-## 前言
+上一篇学会了 Prisma 的基础 CRUD。但在真实业务中，查询远不止"按 ID 查一条"这么简单。运营后台的订单管理需要按用户、状态、时间范围、金额区间多条件筛选；用户消费统计需要按月分组、求和、排序；商品列表需要支持游标分页来应对大数据量。
 
-掌握了 Prisma 基础用法后，如何处理复杂查询？如何优化性能？避免 N+1 问题？
+这些查询用原生 SQL 都不太好写，用 Prisma 的 API 写反而更直观——前提是你知道怎么用。
 
-本文将深入讲解 Prisma 的高级查询技巧，帮助你应对各种复杂场景，写出高性能的代码。
+## 多条件筛选：订单管理后台
 
----
+运营后台的订单列表通常有一排筛选条件：用户搜索框、状态下拉框、日期范围选择器、金额区间。这些条件是可选的——用户可能只填了状态筛选，也可能全部填了。
 
-## 核心概念
-
-### 关系查询
-
-Prisma 提供了强大的关系查询能力。
-
-**include vs select**：
-
-- `include`：包含关联数据
-- `select`：精确控制返回字段
-
----
-
-## 实战演练
-
-### 1. 关系查询（避免 N+1）
+用原生 SQL 你得动态拼接 WHERE 条件，很容易出错。Prisma 的 `where` 对象天然支持这种"可选条件"的写法：
 
 ```typescript
-// ❌ N+1 问题
-const users = await prisma.user.findMany();
-for (const user of users) {
-  const orders = await prisma.order.findMany({
-    where: { userId: user.id },
-  });
-}
+// 构建动态筛选条件
+const where = {
+  AND: [
+    // 状态筛选（可选）
+    ...(status ? [{ status }] : []),
+    // 用户邮箱模糊搜索（可选）
+    ...(email
+      ? [
+          {
+            user: { email: { contains: email } },
+          },
+        ]
+      : []),
+    // 日期范围（可选）
+    ...(startDate || endDate
+      ? [
+          {
+            createdAt: {
+              ...(startDate ? { gte: new Date(startDate) } : {}),
+              ...(endDate ? { lte: new Date(endDate) } : {}),
+            },
+          },
+        ]
+      : []),
+    // 金额范围（可选）
+    ...(minAmount || maxAmount
+      ? [
+          {
+            total: {
+              ...(minAmount ? { gte: minAmount } : {}),
+              ...(maxAmount ? { lte: maxAmount } : {}),
+            },
+          },
+        ]
+      : []),
+  ],
+};
 
-// ✅ 使用 include
-const usersWithOrders = await prisma.user.findMany({
-  include: {
-    orders: {
-      select: {
-        id: true,
-        orderNumber: true,
-        total: true,
-        createdAt: true,
-      },
-      where: { status: "PAID" },
-      orderBy: { createdAt: "desc" },
-      take: 5,
-    },
-  },
-});
-```
-
----
-
-### 2. 复杂过滤
-
-```typescript
-// AND 条件
 const orders = await prisma.order.findMany({
-  where: {
-    AND: [
-      { status: { in: ["PAID", "SHIPPED"] } },
-      { createdAt: { gte: startDate } },
-      { total: { gte: 100 } },
-    ],
-  },
-});
-
-// OR 条件
-const users = await prisma.user.findMany({
-  where: {
-    OR: [{ email: { contains: query } }, { fullName: { contains: query } }],
-  },
-});
-
-// NOT 条件
-const users = await prisma.user.findMany({
-  where: {
-    NOT: {
-      isVerified: true,
-    },
+  where,
+  orderBy: { createdAt: "desc" },
+  take: pageSize,
+  skip: (page - 1) * pageSize, // OFFSET 分页
+  include: {
+    user: { select: { id: true, fullName: true, email: true } },
+    _count: { select: { orderItems: true } }, // 订单项数量
   },
 });
 ```
 
----
+`AND` 数组里放的是所有必须同时满足的条件。用展开运算符 `...` 把可选条件加进去——如果某个筛选条件没提供，展开一个空数组，不影响其他条件。
 
-### 3. 全文搜索
+`_count` 是 Prisma 的一个特殊语法，可以在不加载关联数据的情况下获取关联的数量。`_count: { select: { orderItems: true } }` 会在结果里加一个 `_count` 字段告诉你这个订单有几个订单项，而不需要真的把订单项查出来。
 
-```typescript
-// PostgreSQL 全文搜索
-const users = await prisma.user.findMany({
-  where: {
-    OR: [
-      { email: { contains: query, mode: "insensitive" } },
-      { fullName: { contains: query, mode: "insensitive" } },
-    ],
-  },
-});
+这种写法生成的 SQL 是带 `WHERE ... AND ... AND ...` 的查询。当条件为空时，`AND []` 会被 Prisma 忽略，不会生成多余的 `WHERE 1=1` 之类的占位条件。
 
-// 使用原生 SQL（更强大的全文搜索）
-const users = await prisma.$queryRaw`
-  SELECT * FROM users
-  WHERE to_tsvector('chinese', email || ' ' || full_name) @@ to_tsquery('chinese', ${query})
-`;
-```
+## 聚合查询：用户消费统计面板
 
----
-
-### 4. 聚合查询
+运营需要一份统计面板：显示每个用户的总消费金额、订单数量、平均订单金额。用原生 SQL 你要写 GROUP BY 和聚合函数。Prisma 提供了 `groupBy` 方法。
 
 ```typescript
-// 统计订单
-const stats = await prisma.order.aggregate({
-  where: { status: "PAID" },
-  _count: { id: true },
-  _sum: { total: true },
-  _avg: { total: true },
-  _min: { total: true },
-  _max: { total: true },
-});
-
-// 分组查询
-const orderStatsByUser = await prisma.order.groupBy({
+// 统计每个用户的消费情况
+const stats = await prisma.order.groupBy({
   by: ["userId"],
-  where: { status: "PAID" },
-  _count: { id: true },
+  where: { status: { in: ["paid", "shipped", "delivered"] } },
   _sum: { total: true },
+  _count: { id: true },
+  _avg: { total: true },
   orderBy: { _sum: { total: "desc" } },
+  take: 20,
 });
 ```
 
----
-
-### 5. Cursor 分页
+返回结果大概是这样：
 
 ```typescript
-// 第一页
-const firstPage = await prisma.order.findMany({
-  orderBy: { createdAt: "desc" },
-  take: 20,
-});
-
-// 下一页
-const lastItem = firstPage[firstPage.length - 1];
-const nextPage = await prisma.order.findMany({
-  cursor: { id: lastItem.id },
-  orderBy: { createdAt: "desc" },
-  take: 20,
-  skip: 1,
-});
-
-// API 实现
-app.get("/orders", async (req, res) => {
-  const { cursor, limit = 20 } = req.query;
-
-  const orders = await prisma.order.findMany({
-    take: Number(limit),
-    ...(cursor && {
-      skip: 1,
-      cursor: { id: String(cursor) },
-    }),
-    orderBy: { createdAt: "desc" },
-  });
-
-  res.json({
-    orders,
-    nextCursor: orders[orders.length - 1]?.id,
-  });
-});
+[
+  { userId: 42, _sum: { total: 29897.00 }, _count: { id: 15 }, _avg: { total: 1993.13 } },
+  { userId: 67, _sum: { total: 12450.00 }, _count: { id: 8 }, _avg: { total: 1556.25 } },
+  ...
+]
 ```
 
----
-
-### 6. 原生 SQL
+注意 `groupBy` 返回的是聚合后的原始数据，不包含关联的 model 信息。上面的结果里只有 `userId`，没有用户名和邮箱。如果你需要这些信息，需要再做一次查询：
 
 ```typescript
-// $queryRaw（查询）
-const result = await prisma.$queryRaw`
-  SELECT
-    u.email,
-    COUNT(o.id) as order_count,
-    COALESCE(SUM(o.total), 0) as total_spent
-  FROM users u
-  LEFT JOIN orders o ON u.id = o.user_id
-  WHERE u.is_verified = true
-  GROUP BY u.id, u.email
+// 获取用户信息
+const userIds = stats.map((s) => s.userId);
+const users = await prisma.user.findMany({
+  where: { id: { in: userIds } },
+  select: { id: true, fullName: true, email: true },
+});
+
+// 合并结果
+const result = stats.map((stat) => ({
+  ...stat,
+  user: users.find((u) => u.id === stat.userId),
+}));
+```
+
+这看起来有点麻烦——为什么不直接 `include: { user: true }`？因为 `groupBy` 不支持 `include`。这是 Prisma 的一个限制——聚合查询和关联查询不能同时使用。遇到这种情况，要么分两步查，要么降级到 `$queryRaw` 用原生 SQL。
+
+`groupBy` 的另一个限制是它不支持 HAVING（过滤聚合后的结果）。如果你只想看"总消费超过 5000 元的用户"，用 `groupBy` 查出所有结果再在代码里过滤。数据量大的时候这样做不高效，不如直接写原生 SQL：
+
+```typescript
+// 用原生 SQL 实现带 HAVING 的聚合查询
+const topUsers = await prisma.$queryRaw`
+  SELECT u.id, u.full_name, u.email,
+         SUM(o.total) AS total_spent,
+         COUNT(o.id) AS order_count
+  FROM orders o
+  JOIN users u ON o.user_id = u.id
+  WHERE o.status IN ('paid', 'shipped', 'delivered')
+  GROUP BY u.id, u.full_name, u.email
+  HAVING SUM(o.total) > 5000
   ORDER BY total_spent DESC
-  LIMIT 10
+  LIMIT 20
 `;
-
-// $executeRaw（执行）
-await prisma.$executeRaw`UPDATE users SET last_login_at = NOW() WHERE id = ${userId}`;
 ```
 
----
-
-### 7. 批量操作
+`$queryRaw` 返回的类型是 `any[]`，没有类型安全。如果你既想要原生 SQL 的灵活性，又想要类型安全，可以用 `$queryRawUnsafe` 配合 Prisma 的类型工具：
 
 ```typescript
-// 批量创建
-const users = await prisma.user.createMany({
-  data: [
-    { email: "user1@example.com", passwordHash: "hash1" },
-    { email: "user2@example.com", passwordHash: "hash2" },
-    { email: "user3@example.com", passwordHash: "hash3" },
-  ],
-  skipDuplicates: true,
-});
+import { Prisma } from "@prisma/client";
 
-// 批量更新
-await prisma.order.updateMany({
-  where: { status: "PENDING", createdAt: { lt: cutoffDate } },
-  data: { status: "CANCELLED" },
-});
+type TopUser = {
+  id: number;
+  full_name: string;
+  email: string;
+  total_spent: Prisma.Decimal;
+  order_count: bigint;
+};
+
+const topUsers = await prisma.$queryRaw<TopUser[]>`
+  SELECT u.id, u.full_name, u.email,
+         SUM(o.total) AS total_spent,
+         COUNT(o.id)::integer AS order_count
+  FROM orders o
+  JOIN users u ON o.user_id = u.id
+  WHERE o.status IN ('paid', 'shipped', 'delivered')
+  GROUP BY u.id, u.full_name, u.email
+  HAVING SUM(o.total) > 5000
+  ORDER BY total_spent DESC
+  LIMIT 20
+`;
 ```
 
----
+## 游标分页 vs OFFSET 分页
 
-### 8. JSON 字段查询
-
-```typescript
-// 查询 JSON 字段
-const users = await prisma.user.findMany({
-  where: {
-    preferences: {
-      path: ["notifications", "email"],
-      equals: true,
-    },
-  },
-});
-
-// 更新 JSON 字段
-await prisma.user.update({
-  where: { id: userId },
-  data: {
-    preferences: {
-      ...existingPreferences,
-      theme: "dark",
-    },
-  },
-});
-```
-
----
-
-### 9. 原子操作
+第 8 篇讲过深分页的问题。Prisma 的 `skip` 就是 OFFSET，页码大了之后性能会下降。Prisma 也支持游标分页：
 
 ```typescript
-await prisma.product.update({
-  where: { id: productId },
-  data: {
-    stock: { increment: 1 },
-    views: { decrement: 1 },
-    version: { set: 2 },
-  },
-});
-```
-
----
-
-### 10. Upsert
-
-```typescript
-const user = await prisma.user.upsert({
-  where: { email: "user@example.com" },
-  create: {
-    email: "user@example.com",
-    passwordHash: "hash",
-  },
-  update: {
-    lastLoginAt: new Date(),
-  },
-});
-```
-
----
-
-## 性能优化
-
-### 1. select 只查询需要的字段
-
-```typescript
-// ❌ 查询所有字段
-const users = await prisma.user.findMany();
-
-// ✅ 只查询需要的字段
-const users = await prisma.user.findMany({
-  select: {
-    id: true,
-    email: true,
-    fullName: true,
-  },
-});
-```
-
----
-
-### 2. 避免 N+1 查询
-
-```typescript
-// ❌ N+1 问题
-const users = await prisma.user.findMany();
-for (const user of users) {
-  const orders = await prisma.order.findMany({
-    where: { userId: user.id },
-  });
-}
-
-// ✅ 使用 include
-const users = await prisma.user.findMany({
-  include: { orders: true },
-});
-```
-
----
-
-### 3. 使用 take 限制结果
-
-```typescript
-const users = await prisma.user.findMany({
-  take: 20,
+// 游标分页：基于上一页最后一条记录的 ID
+const orders = await prisma.order.findMany({
+  where: { status: "paid" },
   orderBy: { createdAt: "desc" },
+  take: 20,
+  cursor: { id: lastOrderId }, // 上一页最后一条的 ID
+  skip: 1, // 跳过 cursor 本身
 });
 ```
 
----
+`cursor` 告诉 Prisma"从这条记录之后开始取"，`skip: 1` 跳过 cursor 指向的那条记录本身（因为上一页已经显示过了）。
 
-## 最佳实践
+游标分页的 SQL 等价于我们第 8 篇写的 `WHERE id > lastId ORDER BY id DESC LIMIT 20`。数据库可以直接从索引定位到起始位置，不需要扫描和丢弃前面的行。
 
-### 1. 事务处理
+游标分页的局限是你只能"往后翻"，不能跳到任意页。对于"我的订单"这种列表完全够用。对于管理后台需要"跳到第 50 页"的场景，OFFSET 分页还是更方便——只要数据量不是特别大（几万行以内），OFFSET 分页的性能也是可以接受的。
+
+## 原子操作：库存扣减
+
+商品库存的扣减有一个经典 bug：
 
 ```typescript
-await prisma.$transaction(async (tx) => {
-  const order = await tx.order.create({ ... })
-  await tx.orderItem.create({ ... })
-  await tx.product.update({ ... })
-})
+// 错误做法：先读后写
+const product = await prisma.product.findUnique({ where: { id: 42 } });
+// 此时 stock = 10
+await prisma.product.update({
+  where: { id: 42 },
+  data: { stock: product.stock - 1 },
+});
+// 如果两个请求同时执行到这里，都读到 stock = 10，都写入 9
+// 结果：卖了两件但库存只减了 1
 ```
 
----
+这就是第 1 篇讲过的并发写入冲突——在文件系统里会出现，在数据库里同样会出现。
 
-### 2. 错误处理
+Prisma 提供了原子操作来解决：
 
 ```typescript
-try {
-  const user = await prisma.user.create({ ... })
-} catch (error) {
-  if (error.code === 'P2002') {
-    // 唯一约束冲突
-    console.log('Email already exists')
-  }
+// 正确做法：原子操作
+await prisma.product.update({
+  where: { id: 42 },
+  data: { stock: { decrement: 1 } },
+});
+```
+
+`{ decrement: 1 }` 生成的是 `UPDATE products SET stock = stock - 1 WHERE id = 42`。这是一条原子操作，数据库层面保证了不会出现"读到旧值、写入错误值"的问题。即使 100 个请求同时执行，库存也会正确地从 10 减到 0。
+
+Prisma 支持的原子操作有 `increment`（加）、`decrement`（减）、`multiply`（乘）、`set`（设为某值）。只有 `Int` 和 `Float` 类型支持原子操作，`Decimal` 不支持——如果你用 `Decimal` 存库存，需要用 `$executeRaw` 写原生 SQL。
+
+还有一个更安全的做法是加上条件检查：
+
+```typescript
+// 只在库存大于 0 时才扣减
+const result = await prisma.product.updateMany({
+  where: { id: 42, stock: { gt: 0 } },
+  data: { stock: { decrement: 1 } },
+});
+
+if (result.count === 0) {
+  throw new Error("库存不足");
 }
 ```
 
----
+`updateMany` 返回一个 `{ count: number }` 对象，告诉你更新了多少行。如果库存已经是 0，`where` 条件 `stock > 0` 不满足，`count` 就是 0，你就可以抛出"库存不足"的错误。
 
-### 3. 日志配置
+注意这里用的是 `updateMany` 而不是 `update`——`update` 在找不到匹配记录时会抛出 `PrismaClientKnownRequestError`（P2025），而 `updateMany` 不会，它只是返回 `count: 0`。
+
+## JSON 字段查询
+
+上一篇的表设计里，products 表有一个 `attributes` JSONB 字段。Prisma 支持对这个字段进行查询：
 
 ```typescript
-const prisma = new PrismaClient({
-  log: [
-    { level: "query", emit: "event" },
-    { level: "error", emit: "stdout" },
-    { level: "warn", emit: "stdout" },
-  ],
+// 查询存储量为 256GB 的手机
+const phones = await prisma.product.findMany({
+  where: {
+    categoryId: 1, // 数码分类
+    attributes: {
+      path: ["storage"],
+      equals: "256GB",
+    },
+  },
 });
 
-prisma.$on("query", (e) => {
-  console.log("Query: " + e.query);
-  console.log("Params: " + e.params);
-  console.log("Duration: " + e.duration + "ms");
+// 查询重量小于 300g 的商品
+const lightProducts = await prisma.product.findMany({
+  where: {
+    attributes: {
+      path: ["weight"],
+      // Prisma 对 JSON 数字比较支持有限
+      // 复杂的数值比较可能需要 $queryRaw
+    },
+  },
 });
 ```
 
----
+Prisma 对 JSON 字段的查询支持还比较基础——`path` + `equals`、`string_contains`、`array_contains` 这些能用。但更复杂的操作（比如数值比较、正则匹配、嵌套过滤）还是需要 `$queryRaw`：
 
-## 常见问题
+```typescript
+// 复杂的 JSON 查询用原生 SQL
+const products = await prisma.$queryRaw`
+  SELECT * FROM products
+  WHERE (attributes->>'weight')::numeric < 300
+    AND attributes->>'waterproof' = 'true'
+`;
+```
 
-### Q1: 如何处理循环依赖？
+这是 Prisma 的一个妥协——它的 API 设计追求类型安全，而 JSON 字段的内容是动态的，不可能在编译阶段确定类型。所以对 JSON 字段的深度查询，降级到原生 SQL 是合理的。
 
-使用 `select` 而不是 `include`，精确控制返回字段。
+## 小结
 
----
+Prisma 的高级查询能力覆盖了大部分日常业务场景。动态 `where` 条件让多条件筛选变得优雅，`groupBy` 处理基本的聚合需求，`cursor` 分页解决深分页问题，原子操作避免并发写入冲突。
 
-### Q2: 如何优化大数据量查询？
+但 Prisma 不是万能的。当你的查询涉及复杂的聚合（HAVING）、JSON 字段的深度操作、或者需要精确控制生成的 SQL 时，`$queryRaw` 是你的逃生舱。用 Prisma 的类型标注来保持类型安全，同时享受原生 SQL 的灵活性。
 
-使用 cursor 分页，而不是 offset 分页。
-
----
-
-## 总结
-
-本文深入学习了 Prisma 高级查询：
-
-**高级查询**：
-
-- 关系查询（避免 N+1）
-- 复杂过滤（AND、OR、NOT）
-- 聚合查询、分组查询
-- Cursor 分页
-
-**性能优化**：
-
-- select 精确控制字段
-- 避免 N+1 查询
-- 使用 take 限制结果
-
-**最佳实践**：
-
-- 事务处理
-- 错误处理
-- 日志配置
-
----
-
-## 下一步
-
-掌握了 Prisma 高级查询后，下一步我们将学习：
-
-**《12. 事务与并发控制》**：掌握事务处理和并发控制机制。
-
-你将学习：
-
-- 🔒 事务 ACID 特性
-- 🔐 并发问题与锁机制
-- 🚀 乐观锁 vs 悲观锁
-- 💡 Prisma 事务最佳实践
-
-继续关注，让我们一起深入理解事务与并发！
+下一篇我们讲 Prisma 的事务——并发下单时怎么保证不会超卖，事务的隔离级别该怎么选。

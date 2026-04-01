@@ -1,7 +1,7 @@
 ---
-title: "15. Redis 数据结构与缓存：高性能内存数据库"
+title: "15. Redis 缓存策略：让接口快起来"
 date: "2026-03-19"
-summary: "掌握 Redis 的数据结构和缓存策略，提升应用性能"
+summary: "用 Redis 五种数据结构实现电商系统的缓存层，掌握 Cache Aside 模式和穿透、击穿、雪崩的应对方案"
 tags: ["Redis", "缓存", "内存数据库", "性能优化"]
 category: "数据库"
 cover: ""
@@ -10,273 +10,280 @@ series: "数据库渐进式学习路线"
 seriesOrder: 15
 ---
 
-## 前言
+上一篇用 MongoDB 做了日志分析。但分析是后台的事，用户直接感知到的是"接口快不快"。电商首页的商品列表、商品详情页、购物车——这些接口每次都查 PostgreSQL，QPS 一高数据库就扛不住。
 
-你的应用慢吗？缓存是提升性能最直接的方式！Redis 作为高性能内存数据库，提供了丰富的数据结构和强大的缓存能力。
+Redis 就是来解决这个问题的。它把数据放在内存里，读写速度是磁盘数据库的几十倍到上百倍。一个需要 50ms 的 PostgreSQL 查询，从 Redis 读取可能只需要 1ms。
 
-本文将系统讲解 Redis 的数据结构和缓存策略，帮助你构建高性能应用。
+但缓存不是"查不到就去数据库取，取到了存进缓存"这么简单。缓存了旧数据怎么办？缓存突然失效了怎么办？大量缓存同时过期怎么办？这些问题处理不好，缓存不仅不能提速，反而可能成为系统的隐患。
 
----
+## Redis 的五种数据结构
 
-## 核心概念
+Redis 不只是一个简单的 key-value 存储。它提供了五种数据结构，每种适合不同的场景。用电商系统来逐一说明。
 
-### 为什么选择 Redis？
+**String**：最基本的结构，存字符串、数字、JSON。
 
-**Redis 优势**：
+```javascript
+// 商品详情缓存
+await redis.set(`product:42`, JSON.stringify(productData), "EX", 600);
+// EX 600 = 10 分钟后自动过期
 
-- ✅ 极高性能（10万+ OPS）
-- ✅ 丰富的数据结构
-- ✅ 持久化支持
-- ✅ 分布式缓存
-- ✅ 多种缓存模式
-
----
-
-## Redis 数据类型
-
-### 1. String（字符串）
-
-```typescript
-// 缓存用户信息
-await redis.set("user:123", JSON.stringify({ id: 123, name: "张三" }));
-await redis.expire("user:123", 3600); // 1小时过期
-
-const user = JSON.parse(await redis.get("user:123"));
-
-// 计数器
-await redis.incr("views:post:456");
+// 缓存读取
+const cached = await redis.get(`product:42`);
+if (cached) {
+  return JSON.parse(cached);
+}
+// 缓存未命中，查数据库
 ```
 
----
+String 是用得最多的类型。商品详情、用户信息、配置数据——任何可以序列化成 JSON 的数据都能用 String 缓存。`EX` 参数设置过期时间（TTL），过期后 Redis 自动删除这个 key。
 
-### 2. Hash（哈希）
+**Hash**：一个 key 下有多个字段，类似 JavaScript 对象。
 
-```typescript
-// 用户属性
-await redis.hSet("user:123:profile", {
-  name: "张三",
-  email: "user@example.com",
-  age: "25",
+```javascript
+// 存储用户的基本信息
+await redis.hset("user:42", {
+  fullName: "张伟",
+  email: "zhang_wei@example.com",
+  level: "gold",
+  totalSpent: "29897.00",
 });
 
-const name = await redis.hGet("user:123:profile", "name");
+// 读取单个字段
+const level = await redis.hget("user:42", "level");
+
+// 读取所有字段
+const userInfo = await redis.hgetAll("user:42");
 ```
 
----
+Hash 适合存"一个实体有多个属性，但你只需要读取其中一两个"的场景。比如用户的等级和消费总额在多个接口里都要用，用 Hash 可以只读需要的字段，不用把整个用户信息反序列化。相比之下，String 类型要么全部取出，要么不取。
 
-### 3. List（列表）
+**List**：有序列表，支持从两端推入和弹出。
 
-```typescript
-// 最新文章
-await redis.lPush("articles:latest", "article-1", "article-2");
-const articles = await redis.lRange("articles:latest", 0, 9);
+```javascript
+// 最新消息列表
+await redis.lpush("recent_orders:42", JSON.stringify(orderData));
+await redis.ltrim("recent_orders:42", 0, 49); // 只保留最新 50 条
+
+// 读取最新订单
+const recentOrders = await redis.lrange("recent_orders:42", 0, 9);
 ```
 
----
+List 适合"按时间排列的列表"——最新消息、最新订单、操作日志。`lpush` 从左边推入（最新的在左边），`lrange` 从左到右读。`ltrim` 限制列表长度，防止无限增长。
 
-### 4. Set（集合）
+**Set**：无序集合，自动去重。
 
-```typescript
-// 用户标签
-await redis.sAdd("user:123:tags", "tech", "programming");
-const tags = await redis.sMembers("user:123:tags");
+```javascript
+// 用户浏览过的商品（去重）
+await redis.sadd("viewed:42", "product:100", "product:200", "product:100");
+// product:100 只会出现一次
+
+// 获取浏览过的商品数
+const count = await redis.scard("viewed:42");
+
+// 判断是否浏览过某个商品
+const hasViewed = await redis.sismember("viewed:42", "product:100");
 ```
 
----
+Set 适合"去重"和"判断存在"的场景——用户标签、浏览记录、收藏列表。`sismember` 的时间复杂度是 O(1)，比从 List 里遍历查找快得多。
 
-### 5. Sorted Set（有序集合）
+**Sorted Set（ZSet）**：有序集合，每个元素有一个分数，按分数排序。
 
-```typescript
-// 排行榜
-await redis.zAdd("leaderboard", [
-  { score: 100, value: "user-1" },
-  { score: 85, value: "user-2" },
+```javascript
+// 商品销量排行
+await redis.zadd("sales_ranking", [
+  { score: 1520, value: "product:42" },
+  { score: 890, value: "product:67" },
+  { score: 2340, value: "product:88" },
 ]);
 
-const top10 = await redis.zRangeWithScores("leaderboard", 0, 9, {
-  REV: true,
-});
+// 获取销量 Top 10
+const top10 = await redis.zrevrange("sales_ranking", 0, 9, "WITHSCORES");
+
+// 某个商品的排名
+const rank = await redis.zrevrank("sales_ranking", "product:42");
 ```
 
----
+Sorted Set 是 Redis 里最强大的数据结构。分数可以是任何数值，Redis 自动按分数排序。`zrevrange` 按分数从高到低取，`zrevrank` 获取某个元素的排名。时间复杂度都是 O(log N)，即使集合里有几百万个元素也很快。
 
-## 缓存策略
+排行榜、热搜词、延迟队列——凡是需要"按某个数值排序"的场景，Sorted Set 都能用。
 
-### 1. Cache Aside（旁路缓存）
+## Cache Aside：最常用的缓存模式
 
-```typescript
-// 读取
-async function getUser(userId: string) {
-  // 1. 先查缓存
-  let user = await redis.get(`user:${userId}`);
-  if (user) return JSON.parse(user);
+缓存有几种使用模式，但 Cache Aside 是最通用的。它的规则很简单：
 
-  // 2. 缓存未命中，查数据库
-  user = await db.findUser(userId);
-
-  // 3. 写入缓存
-  await redis.set(`user:${userId}`, JSON.stringify(user), { EX: 3600 });
-
-  return user;
-}
-
-// 更新
-async function updateUser(userId: string, data: any) {
-  // 1. 更新数据库
-  await db.updateUser(userId, data);
-
-  // 2. 删除缓存
-  await redis.del(`user:${userId}`);
-}
-```
-
----
-
-### 2. 缓存穿透防护
+1. 先查缓存
+2. 缓存命中，直接返回
+3. 缓存未命中，查数据库
+4. 把数据库结果写入缓存，设置过期时间
+5. 返回结果
 
 ```typescript
-// 布隆过滤器
-async function getProduct(productId: string) {
-  const key = `product:${productId}`;
+async function getProductDetail(productId: number) {
+  const cacheKey = `product:${productId}`;
 
-  // 检查布隆过滤器
-  const exists = await redis.exists(`filter:${key}`);
-  if (!exists) return null;
-
-  // 查询缓存
-  let product = await redis.get(key);
-  if (product) return JSON.parse(product);
-
-  // 查询数据库
-  product = await db.findProduct(productId);
-  if (product) {
-    await redis.set(key, JSON.stringify(product), { EX: 3600 });
-    await redis.set(`filter:${key}`, "1", { EX: 86400 });
+  // 1. 查缓存
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    return JSON.parse(cached);
   }
+
+  // 2. 查数据库
+  const product = await prisma.product.findUnique({
+    where: { id: productId },
+    include: { category: true },
+  });
+
+  if (!product) {
+    return null;
+  }
+
+  // 3. 写入缓存，10 分钟过期
+  await redis.set(cacheKey, JSON.stringify(product), "EX", 600);
 
   return product;
 }
 ```
 
----
-
-### 3. 缓存击穿防护
+数据更新时怎么办？最简单的做法是**删缓存**而不是更新缓存：
 
 ```typescript
-// 互斥锁
-async function getProduct(productId: string) {
-  const key = `product:${productId}`;
-  let product = await redis.get(key);
+async function updateProduct(productId: number, data: any) {
+  // 1. 更新数据库
+  await prisma.product.update({ where: { id: productId }, data });
 
-  if (product) return JSON.parse(product);
+  // 2. 删除缓存（下次读取时会重新从数据库加载）
+  await redis.del(`product:${productId}`);
+}
+```
 
-  const lockKey = `lock:${key}`;
-  const lock = await redis.set(lockKey, "1", { NX: true, EX: 10 });
+为什么删缓存而不是更新缓存？因为更新缓存有一个并发问题：如果两个请求同时更新同一个商品，可能一个更新了数据库还没来得及更新缓存，另一个请求从缓存读到了旧数据。删缓存更安全——下一次读取一定会从数据库拿最新数据。
 
-  if (lock) {
+但删缓存也有一个极端情况：删除缓存失败了，缓存里一直是旧数据。对于商品详情这种数据，10 分钟后 TTL 过期会自动刷新，问题不大。对于不能容忍 10 分钟旧数据的场景，可以用"先更新数据库，再删缓存"配合重试机制。
+
+## 三大缓存问题
+
+### 穿透：查询不存在的数据
+
+穿透是指请求查询一个数据库里不存在的数据。比如有人恶意请求 `/api/products/999999`，这个商品不存在，缓存里也没有。每次请求都会打到数据库——如果有大量这样的请求，数据库可能被压垮。
+
+解决方案是**缓存空值**：
+
+```typescript
+async function getProductDetail(productId: number) {
+  const cached = await redis.get(`product:${productId}`);
+  if (cached !== null) {
+    // 缓存了空值也会命中
+    return cached === "" ? null : JSON.parse(cached);
+  }
+
+  const product = await prisma.product.findUnique({ where: { id: productId } });
+  if (!product) {
+    // 缓存空值，但过期时间设短一点（1 分钟）
+    await redis.set(`product:${productId}`, "", "EX", 60);
+    return null;
+  }
+
+  await redis.set(`product:${productId}`, JSON.stringify(product), "EX", 600);
+  return product;
+}
+```
+
+注意这里用空字符串 `''` 来标记"缓存了但值为空"。不能用 `null`，因为 Redis 的 `get` 返回 `null` 表示 key 不存在，你没法区分"没缓存"和"缓存了空值"。用一个特殊的占位值（空字符串或者 `"NULL"`）来区分。
+
+### 击穿：热点 key 过期
+
+击穿是指一个热点 key（被大量请求访问的 key）突然过期，大量请求同时打到数据库。
+
+比如首页推荐的商品列表，缓存在 Redis 里，TTL 是 5 分钟。当这个 key 过期的瞬间，可能有上千个请求同时发现缓存未命中，全部去查数据库——数据库瞬时压力暴增。
+
+解决方案是**互斥锁**：只允许一个请求去查数据库并重建缓存，其他请求等待。
+
+```typescript
+async function getHotProducts() {
+  const cached = await redis.get("hot_products");
+  if (cached) return JSON.parse(cached);
+
+  // 尝试获取锁
+  const lockKey = "lock:hot_products";
+  const acquired = await redis.set(lockKey, "1", "NX", "EX", 10);
+  // NX = 只在 key 不存在时设置（互斥）
+  // EX = 10 秒后自动释放（防止死锁）
+
+  if (acquired) {
     try {
-      const data = await db.findProduct(productId);
-      await redis.set(key, JSON.stringify(data), { EX: 3600 });
-      return data;
+      // 获取到锁，查数据库
+      const products = await prisma.product.findMany({
+        where: { isActive: true, isFeatured: true },
+        orderBy: { createdAt: "desc" },
+        take: 20,
+      });
+      await redis.set("hot_products", JSON.stringify(products), "EX", 300);
+      return products;
     } finally {
       await redis.del(lockKey);
     }
   } else {
+    // 没获取到锁，等待一小段时间后重试
     await new Promise((resolve) => setTimeout(resolve, 100));
-    return await getProduct(productId);
+    return getHotProducts();
   }
 }
 ```
 
----
+`SET lock_key 1 NX EX 10` 是 Redis 实现分布式锁的经典写法。`NX` 保证只有一个请求能设置成功（获取锁），`EX 10` 保证即使获取锁的请求崩溃了，锁也会在 10 秒后自动释放，不会死锁。
 
-## 分布式锁
+### 雪崩：大量 key 同时过期
+
+雪崩是指大量缓存在同一时间过期，导致大量请求同时打到数据库。
+
+这通常发生在你用固定的 TTL（比如全部设为 10 分钟），而且大量缓存是在同一时间写入的——那么它们也会在同一时间过期。
+
+解决方案很简单：**给 TTL 加一个随机偏移**。
 
 ```typescript
-// 获取锁
-const lockKey = "lock:resource:123";
-const lockValue = Date.now().toString();
-const lock = await redis.set(lockKey, lockValue, { NX: true, EX: 30 });
-
-if (lock) {
-  try {
-    // 执行业务逻辑
-  } finally {
-    // Lua 脚本释放锁
-    const script = `
-      if redis.call("get", KEYS[1]) == ARGV[1] then
-        return redis.call("del", KEYS[1])
-      else
-        return 0
-      end
-    `;
-    await redis.eval(script, { keys: [lockKey], arguments: [lockValue] });
-  }
-}
+// 基础 TTL 10 分钟，加上 0-3 分钟的随机偏移
+const ttl = 600 + Math.floor(Math.random() * 180);
+await redis.set(`product:${id}`, JSON.stringify(data), "EX", ttl);
 ```
 
----
+这样即使 1000 个商品是在同一时间缓存的，它们的过期时间也会散布在 10-13 分钟之间，不会同时失效。
 
-## 最佳实践
+## 分布式锁：Redis SET NX EX
 
-### 1. 缓存设计原则
+上面缓存击穿的解决方案里用到了分布式锁。分布式锁的完整实现比看起来要复杂——你需要考虑锁的释放、锁的超时、锁的可重入。
 
-- ✅ 热点数据缓存
-- ✅ 设置过期时间
-- ✅ 避免缓存过大 key
-- ✅ 使用合适的数据结构
+一个生产级的分布式锁通常用 Lua 脚本来保证"检查 + 释放"的原子性：
 
----
+```lua
+-- 释放锁的 Lua 脚本
+-- 只有持有锁的请求才能释放锁（通过比较 value）
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+```
 
-### 2. 性能优化
+为什么释放锁要比较 value？因为如果请求 A 获取了锁，但处理时间超过了锁的超时时间（锁自动释放了），请求 B 获取了锁。此时请求 A 处理完了来释放锁，如果只是简单地 `DEL`，就会把请求 B 的锁也删掉。用 value 来标识"这个锁是谁的"，只有自己加的锁才能自己释放。
 
-- ✅ 使用 Pipeline 批量操作
-- ✅ 避免大 key
-- ✅ 合理设置过期时间
-- ✅ 监控缓存命中率
+在 Node.js 里，这些通常用 `ioredis` 库的 `eval` 方法执行 Lua 脚本。实际项目中你也可以用 Redlock 这样的库来封装分布式锁的逻辑，不需要自己写。
 
----
+## 什么时候不该用缓存
 
-## 常见问题
+缓存能提速，但不是所有数据都该缓存。
 
-### Q1: 缓存穿透、击穿、雪崩？
+**写频繁的数据不适合缓存**。库存就是一个典型例子——每次下单都要扣减库存，如果你把库存缓存到 Redis，每次下单都要同时更新数据库和缓存，缓存的一致性很难保证。不如直接从数据库读库存，用数据库的行锁保证正确性。
 
-- 穿透：布隆过滤器
-- 击穿：互斥锁
-- 雪崩：过期时间加随机值
+**强一致性数据不适合缓存**。银行余额、账户状态——这些数据必须实时准确，任何延迟都可能造成严重后果。缓存了旧数据导致用户看到的余额和实际不一致，是金融系统的红线。
 
----
+**缓存命中率低的数据不适合缓存**。如果某个接口的查询参数组合非常多（比如用户自定义的各种筛选条件组合），缓存命中率可能很低——大部分请求都缓存未命中，但你每次还是要查 Redis 一次，反而增加了延迟。
 
-## 总结
+## 小结
 
-本文系统学习了 Redis：
+Redis 的五种数据结构覆盖了大部分缓存场景：String 存对象，Hash 存属性，List 存时间序列，Set 去重，Sorted Set 排序。
 
-**数据类型**：
+Cache Aside 是最通用的缓存模式——读时建缓存，写时删缓存。三大缓存问题各有对策：穿透用缓存空值，击穿用互斥锁，雪崩用 TTL 随机偏移。
 
-- String、Hash、List、Set、Sorted Set
+但缓存不是银弹。写频繁、强一致性、命中率低的数据不适合缓存。缓存加对了能提速十倍，加错了可能引入数据不一致的问题。
 
-**缓存策略**：
-
-- Cache Aside
-- 缓存穿透/击穿/雪崩
-
-**分布式锁**：
-
-- 互斥锁
-- Lua 脚本
-
----
-
-## 下一步
-
-掌握了 Redis 缓存后，下一步我们将学习：
-
-**《16. Elasticsearch 全文搜索》**：学习 Elasticsearch 的全文搜索能力。
-
-你将学习：
-
-- 🔍 Elasticsearch 核心概念
-- 📊 查询 DSL
-- 🚀 与 PostgreSQL 集成
-
-继续关注，让我们一起学习全文搜索！
+下一篇我们讲 Elasticsearch——当 PostgreSQL 的 LIKE 搜索和 MongoDB 的文本索引都不够用的时候，ES 是终极方案。

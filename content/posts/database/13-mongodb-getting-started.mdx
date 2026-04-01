@@ -1,8 +1,8 @@
 ---
-title: "13. MongoDB 文档数据库：灵活的 NoSQL 数据存储"
+title: "13. MongoDB：当关系型数据库不够用时"
 date: "2026-03-19"
-summary: "学习 MongoDB 的核心概念和基本操作，掌握文档数据库的使用"
-tags: ["MongoDB", "NoSQL", "文档数据库", "数据库"]
+summary: "理解文档数据库的核心价值，用 MongoDB 存储电商系统的用户行为日志，掌握 CRUD 操作和索引设计"
+tags: ["MongoDB", "NoSQL", "文档数据库", "日志"]
 category: "数据库"
 cover: ""
 draft: false
@@ -10,358 +10,298 @@ series: "数据库渐进式学习路线"
 seriesOrder: 13
 ---
 
-## 前言
+前 12 篇我们一直在用 PostgreSQL。它很强大，但有一个局限：数据结构必须是固定的。你想给 `users` 表加一个字段？得 ALTER TABLE，大表加列可能要锁表几分钟。你想让不同类型的商品有不同的属性？得建子表或者用 JSONB，但查询和索引不如原生列方便。
 
-当数据结构灵活多变、需要快速迭代时，关系型数据库可能不够灵活。MongoDB 作为最流行的文档数据库，提供了 schema-less 的设计，让开发更加灵活。
+电商系统里有一类数据天然适合"灵活结构"——用户行为日志。用户浏览了什么商品、搜索了什么关键词、点了什么按钮、停留了多久。这些日志的结构经常变：今天加了"推荐来源"字段，明天加了"设备信息"字段。每次都 ALTER TABLE 太麻烦了。
 
-本文将系统讲解 MongoDB 的核心概念和基本操作，帮你掌握文档数据库的使用。
+MongoDB 就是干这个的。它是一个文档数据库，每条记录是一个 JSON 格式的文档，不同文档可以有完全不同的结构。
 
----
+## 为什么不用 PostgreSQL 的 JSONB
 
-## 核心概念
+你可能会问：PostgreSQL 不是有 JSONB 吗？为什么还要引入 MongoDB？
 
-### 为什么选择 MongoDB？
+JSONB 确实能存灵活结构的数据。但 JSONB 有几个限制：它不支持单独对内部字段建索引的实时更新（需要重建索引），复杂的 JSON 查询性能不如 MongoDB 的原生查询，而且 PostgreSQL 的 WAL 机制对大量小写入（日志场景）的开销比 MongoDB 的日志追加方式大。
 
-**MongoDB 优势**：
+MongoDB 在这方面做了专门的优化：高吞吐量的写入、自动分片（数据量大了可以分布到多台机器）、TTL 索引（自动删除过期的日志数据）、变更流（Change Streams，实时监听数据变化）。这些都是围绕"存大量结构灵活的数据"这个场景设计的。
 
-- ✅ 灵活的文档模型（JSON）
-- ✅ Schema-less（无需预定义结构）
-- ✅ 高查询性能
-- ✅ 水平扩展能力
-- ✅ 丰富的查询语言
+所以选择标准很清晰：**核心业务数据（用户、订单、商品）用 PostgreSQL，行为日志和分析数据用 MongoDB**。不要为了用 MongoDB 而用 MongoDB——如果你的数据结构稳定、需要事务和复杂查询，PostgreSQL 仍然是更好的选择。
 
-**vs PostgreSQL**：
+## 文档模型 vs 关系模型
 
-- PostgreSQL：结构化数据、事务、复杂查询
-- MongoDB：灵活 schema、快速迭代、嵌入式文档
+MongoDB 里数据存储的基本单位是"文档"（document），类似 JSON 对象。一组相关的文档存在一个"集合"（collection）里，类似关系型数据库的表。
 
----
+用一个用户行为日志的例子来看差异。在 PostgreSQL 里，你可能需要这样建表：
 
-## MongoDB 核心概念
-
-**1. Database（数据库）**
-
-- 数据的逻辑容器
-
-**2. Collection（集合）**
-
-- 类似关系型数据库的表
-- 但不需要预定义结构
-
-**3. Document（文档）**
-
-- JSON 格式的数据记录
-- 类似关系型数据库的行
-
-**4. Field（字段）**
-
-- 文档中的键值对
-- 类似关系型数据库的列
-
-**5. \_id（主键）**
-
-- 每个文档的唯一标识
-- 默认自动生成 ObjectId
-
----
-
-## 快速开始
-
-### 1. Docker Compose 配置
-
-```yaml
-version: "3.8"
-
-services:
-  mongodb:
-    image: mongo:7
-    container_name: mongodb_dev
-    environment:
-      MONGO_INITDB_ROOT_USERNAME: admin
-      MONGO_INITDB_ROOT_PASSWORD: admin123
-      MONGO_INITDB_DATABASE: dev_db
-    ports:
-      - "27017:27017"
-    volumes:
-      - mongodb_data:/data/db
-
-  mongoui:
-    image: mongo-express:latest
-    environment:
-      ME_CONFIG_MONGODB_URL: mongodb://admin:admin123@mongodb:27017/
-      ME_CONFIG_BASICAUTH_USERNAME: admin
-      ME_CONFIG_BASICAUTH_PASSWORD: admin
-    ports:
-      - "8081:8081"
-    depends_on:
-      - mongodb
-
-volumes:
-  mongodb_data:
+```sql
+CREATE TABLE user_events (
+    id BIGSERIAL PRIMARY KEY,
+    user_id INTEGER,
+    event_type VARCHAR(50) NOT NULL,
+    properties JSONB DEFAULT '{}',
+    -- 浏览商品事件的具体数据
+    -- {
+    --   "product_id": 42,
+    --   "category": "数码",
+    --   "referrer": "search",
+    --   "duration_ms": 15000
+    -- }
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
 ```
 
----
-
-### 2. 连接 MongoDB
+在 MongoDB 里，同样的数据是这样存储的：
 
 ```javascript
-// 连接 MongoDB
+{
+  _id: ObjectId("66f1a2b3c4d5e6f7a8b9c0d1"),
+  userId: 42,
+  eventType: "product_view",
+  properties: {
+    productId: 42,
+    category: "数码",
+    referrer: "search",
+    durationMs: 15000,
+    device: {          // 明天新增的字段，不需要 ALTER COLLECTION
+      type: "mobile",
+      os: "iOS 18.1",
+      screen: "390x844"
+    }
+  },
+  createdAt: new Date("2025-03-20T10:30:00Z")
+}
+```
+
+看起来差别不大？确实，JSONB 和 MongoDB 文档在存储格式上很相似。关键区别在于 MongoDB 的查询能力——你可以直接对嵌套字段建索引、查询、过滤：
+
+```javascript
+// 直接查询嵌套字段
+db.user_events.find({
+  "properties.category": "数码",
+  "properties.durationMs": { $gt: 10000 },
+});
+```
+
+在 PostgreSQL 里，同样的查询需要用 `->>` 操作符提取 JSONB 内部字段，写起来更啰嗦，性能也稍差。
+
+## CRUD 操作
+
+MongoDB 的 CRUD 操作通过驱动程序执行。Node.js 环境下用官方的 `mongodb` 包。
+
+先连接数据库：
+
+```javascript
 import { MongoClient } from "mongodb";
 
 const client = new MongoClient("mongodb://localhost:27017");
 await client.connect();
 const db = client.db("ecommerce");
+const events = db.collection("user_events");
 ```
 
----
-
-## CRUD 操作
-
-### 1. Create（插入）
+**插入**：
 
 ```javascript
-// 插入单个文档
-await db.collection("users").insertOne({
-  email: "user@example.com",
-  fullName: "张三",
+// 插入一条
+const result = await events.insertOne({
+  userId: 42,
+  eventType: "product_view",
+  properties: {
+    productId: 42,
+    category: "数码",
+    referrer: "search",
+    durationMs: 15000,
+  },
   createdAt: new Date(),
 });
 
-// 插入多个文档
-await db.collection("users").insertMany([
-  { email: "user1@example.com", fullName: "李四" },
-  { email: "user2@example.com", fullName: "王五" },
+// 插入多条（批量）
+await events.insertMany([
+  {
+    userId: 42,
+    eventType: "search",
+    properties: { keyword: "降噪耳机" },
+    createdAt: new Date(),
+  },
+  {
+    userId: 42,
+    eventType: "add_to_cart",
+    properties: { productId: 42, quantity: 1 },
+    createdAt: new Date(),
+  },
 ]);
 ```
 
----
+`insertOne` 返回的 `result.insertedId` 是 MongoDB 自动生成的 `_id`（ObjectId 类型）。你可以用这个 `_id` 来定位这条记录，也可以自定义 `_id`。
 
-### 2. Read（查询）
+**查询**：
 
 ```javascript
-// 查询单个文档
-const user = await db.collection("users").findOne({
-  email: "user@example.com",
-});
-
-// 查询多个文档
-const users = await db
-  .collection("users")
+// 按条件查询
+const views = await events
   .find({
-    fullName: "张三",
+    userId: 42,
+    eventType: "product_view",
   })
   .toArray();
 
-// 条件查询
-const users = await db
-  .collection("users")
+// 范围查询
+const recentEvents = await events
   .find({
-    age: { $gte: 18 },
+    createdAt: { $gte: new Date("2025-03-01") },
   })
+  .sort({ createdAt: -1 })
+  .limit(20)
+  .toArray();
+
+// 嵌套字段查询
+const mobileViews = await events
+  .find({
+    "properties.device.type": "mobile",
+  })
+  .toArray();
+
+// 只返回特定字段
+const summaries = await events
+  .find({ userId: 42 }, { projection: { eventType: 1, createdAt: 1 } })
   .toArray();
 ```
 
----
+MongoDB 的查询语法和 SQL 很不一样。`$gte`、`$lt`、`$in`、`$ne` 这些操作符替代了 SQL 的 `>=`、`<`、`IN`、`!=`。嵌套字段用点号（`properties.device.type`）访问，这在 SQL 里需要用 `->` 操作符。
 
-### 3. Update（更新）
+**更新**：
 
 ```javascript
-// 更新单个文档
-await db
-  .collection("users")
-  .updateOne({ email: "user@example.com" }, { $set: { fullName: "李四" } });
+// 更新一条
+await events.updateOne(
+  { _id: someId },
+  { $set: { 'properties.durationMs': 20000 } }
+)
 
-// 更新多个文档
-await db
-  .collection("users")
-  .updateMany({ age: { $lt: 18 } }, { $set: { isMinor: true } });
-
-// 增加数值
-await db
-  .collection("products")
-  .updateOne({ _id: productId }, { $inc: { stock: -1 } });
+// upsert：不存在就插入
+await events.updateOne(
+  { userId: 42, eventType: 'session_start', date: '2025-03-20' },
+  { $set: { properties: { ... } }, $inc: { count: 1 } },
+  { upsert: true }
+)
 ```
 
----
+`$set` 只更新指定的字段，不影响其他字段。`$inc` 是原子递增。`$unset` 删除一个字段。这些操作符是 MongoDB 的特色——它们让你精确地修改文档的某一部分，而不是替换整个文档。
 
-### 4. Delete（删除）
+**删除**：
 
 ```javascript
-// 删除单个文档
-await db.collection("users").deleteOne({
-  email: "user@example.com",
-});
+// 删除一条
+await events.deleteOne({ _id: someId });
 
-// 删除多个文档
-await db.collection("users").deleteMany({
-  createdAt: { $lt: new Date("2024-01-01") },
+// 删除多条
+await events.deleteMany({
+  createdAt: { $lt: new Date("2025-01-01") },
 });
 ```
 
----
+## 索引：MongoDB 也要建索引
 
-## 数据建模
-
-### 嵌入式文档（推荐）
+MongoDB 的查询在没有索引的时候也是全集合扫描。和 PostgreSQL 一样，你不建索引，查询就会随着数据量增长越来越慢。
 
 ```javascript
-// 订单（嵌入订单项）
-const order = await db.collection("orders").insertOne({
-  orderNumber: "ORD-001",
-  userId: "user-123",
-  items: [
-    {
-      productId: "prod-1",
-      name: "商品A",
-      quantity: 2,
-      price: 100,
-    },
-    {
-      productId: "prod-2",
-      name: "商品B",
-      quantity: 1,
-      price: 50,
-    },
-  ],
-  total: 250,
+// 给常用查询字段建索引
+await events.createIndex({ userId: 1 }); // 按用户查
+await events.createIndex({ eventType: 1 }); // 按事件类型查
+await events.createIndex({ createdAt: -1 }); // 按时间倒序查
+await events.createIndex({ userId: 1, createdAt: -1 }); // 组合索引
+```
+
+`1` 表示升序，`-1` 表示降序。MongoDB 的索引也是 B-Tree 结构，和 PostgreSQL 一样。
+
+有一个特别有用的索引类型是 **TTL 索引**，自动删除过期的数据：
+
+```javascript
+// 30 天后自动删除
+await events.createIndex(
+  { createdAt: 1 },
+  { expireAfterSeconds: 30 * 24 * 60 * 60 }
+);
+```
+
+这个索引让 MongoDB 每 60 秒运行一次后台任务，删除 `createdAt` 超过 30 天的文档。对于日志数据来说太有用了——日志通常只需要保留一段时间，过期的自动清理，不需要写定时脚本。
+
+还有一个常用的索引是**文本索引**，支持简单的全文搜索：
+
+```javascript
+await events.createIndex({ "properties.keyword": "text" });
+
+// 全文搜索
+db.user_events.find({ $text: { $search: "降噪耳机" } });
+```
+
+MongoDB 的全文搜索不如 Elasticsearch 强大（不支持中文分词、没有相关性排序的精细控制），但对于简单的关键词搜索够用了。
+
+## 嵌入 vs 引用：怎么组织数据
+
+MongoDB 不支持 JOIN（`$lookup` 有但性能不好，不推荐）。所以你需要在"嵌入文档"和"引用另一个集合"之间做选择。
+
+**嵌入**：把关联数据直接放在父文档里。适合"总是一起查询"且"不会无限增长"的数据。
+
+```javascript
+// 订单文档，嵌入订单项
+{
+  _id: ObjectId("..."),
+  orderNumber: "ORD-20250320-a8f3",
+  userId: 42,
   status: "paid",
-  createdAt: new Date(),
-});
+  items: [
+    { productId: 42, name: "Sony WH-1000XM5", quantity: 1, price: 2499 },
+    { productId: 67, name: "AirPods Pro 2", quantity: 1, price: 1799 },
+  ],
+  total: 4298,
+  createdAt: new Date()
+}
 ```
 
-**优点**：
+优点：一次查询就拿到所有数据，不需要 JOIN。缺点：如果 `items` 数组可能无限增长（比如一个用户有上千个订单），文档会变得很大，超出 MongoDB 的 16MB 文档大小限制。
 
-- ✅ 查询快（一次查询获取所有数据）
-- ✅ 适合 1:N 关系
-- ✅ 原子更新
-
----
-
-### 引用式文档
+**引用**：只存关联文档的 `_id`，需要的时候再查。
 
 ```javascript
-// 用户（引用订单）
-const user = await db.collection("users").insertOne({
-  email: "user@example.com",
-  fullName: "张三",
-  orderIds: ["order-1", "order-2"],
-});
+// 订单文档，只引用用户
+{
+  _id: ObjectId("..."),
+  orderNumber: "ORD-20250320-a8f3",
+  userId: 42,
+  total: 4298,
+}
 
-// 查询时需要 $lookup
-const userWithOrders = await db
-  .collection("users")
-  .aggregate([
-    { $match: { email: "user@example.com" } },
-    {
-      $lookup: {
-        from: "orders",
-        localField: "orderIds",
-        foreignField: "_id",
-        as: "orders",
-      },
-    },
-  ])
-  .toArray();
+// 用户文档
+{
+  _id: ObjectId("..."),
+  userId: 42,
+  email: "zhang_wei@example.com",
+  fullName: "张伟",
+}
 ```
 
-**适用场景**：
+需要同时显示订单和用户信息时，得查两次。
 
-- ✅ M:N 关系
-- ✅ 子文档数量不确定
-- ✅ 需要独立管理子文档
+选择标准：**一对少量用嵌入，一对多且"多"可能很多用引用**。用户的收货地址（通常 3-5 个）适合嵌入到用户文档里。用户的订单（可能几百个）适合用引用，存在独立的集合里。
 
----
+回到日志场景：一条事件日志通常不需要和其他数据关联查询，直接存成独立文档就好。如果需要按用户聚合分析，用下一篇讲的聚合管道。
 
-## 索引
+## 什么时候不该用 MongoDB
 
-```javascript
-// 单字段索引
-await db.collection("users").createIndex({ email: 1 }, { unique: true });
+MongoDB 适合存日志、内容、配置这类"结构灵活、读多写多、单条数据不大"的数据。但有些场景不适合：
 
-// 复合索引
-await db.collection("orders").createIndex({ userId: 1, createdAt: -1 });
+**需要强事务的数据**。MongoDB 从 4.0 开始支持多文档事务，但复杂度和性能都不如 PostgreSQL。涉及金钱的操作（转账、库存扣减、支付），还是用 PostgreSQL 靠谱。
 
-// 文本索引
-await db
-  .collection("products")
-  .createIndex({ name: "text", description: "text" });
+**需要复杂 JOIN 的数据**。订单列表需要 JOIN users、products、categories 好几张表，这种查询在 MongoDB 里要么用 `$lookup`（性能差），要么在应用层做多次查询手动拼接（代码复杂）。
 
-// 地理空间索引
-await db.collection("locations").createIndex({ location: "2dsphere" });
+**数据结构稳定且需要复杂查询的数据**。如果你的数据结构不会经常变，而且需要复杂的条件筛选、分组统计、排序，PostgreSQL 的 SQL 能力远比 MongoDB 的查询语言强大。
 
-// 查看索引
-await db.collection("users").indexes();
+## 小结
 
-// 删除索引
-await db.collection("users").dropIndex("email_1");
-```
+MongoDB 不是 PostgreSQL 的替代品，而是补充。它擅长的是"结构灵活、写入量大、查询相对简单"的数据——日志、内容、配置、缓存。电商系统里，用户行为日志、商品浏览记录、搜索历史这些数据放 MongoDB 是合理的。
 
----
+但核心业务数据——用户、订单、商品、支付——还是应该在 PostgreSQL 里。它们需要强事务保证、复杂查询能力、外键约束，这些是 PostgreSQL 的强项。
 
-## 最佳实践
+MongoDB 的 CRUD 操作和 PostgreSQL 一样需要建索引。TTL 索引对日志数据的自动清理特别有用。嵌入 vs 引用的选择取决于"一对多"中的"多"会不会无限增长。
 
-### 1. 数据建模原则
-
-- ✅ 优先使用嵌入式文档
-- ✅ 文档大小限制（16MB）
-- ✅ 合理使用引用
-- ✅ 避免过深嵌套
-
----
-
-### 2. 索引策略
-
-- ✅ 为查询字段创建索引
-- ✅ 复合索引注意顺序
-- ✅ 定期检查索引使用情况
-
----
-
-## 常见问题
-
-### Q1: MongoDB vs PostgreSQL？
-
-- 结构化数据 → PostgreSQL
-- 灵活 schema → MongoDB
-- 事务要求高 → PostgreSQL
-- 快速迭代 → MongoDB
-
----
-
-## 总结
-
-本文系统学习了 MongoDB：
-
-**核心概念**：
-
-- Database、Collection、Document
-- \_id 主键
-- BSON 数据格式
-
-**CRUD 操作**：
-
-- Create、Read、Update、Delete
-- 条件查询
-- 复杂更新
-
-**数据建模**：
-
-- 嵌入式文档
-- 引用式文档
-- 索引设计
-
----
-
-## 下一步
-
-掌握了 MongoDB 基础后，下一步我们将学习：
-
-**《14. MongoDB 聚合管道》**：深入学习 MongoDB 的聚合查询能力。
-
-你将学习：
-
-- 🔄 聚合管道阶段
-- 📊 复杂统计查询
-- 🚀 性能优化技巧
-
-继续关注，让我们一起深入 MongoDB！
+下一篇我们讲 MongoDB 的聚合管道——如何在日志数据上做统计分析，生成运营需要的报表。

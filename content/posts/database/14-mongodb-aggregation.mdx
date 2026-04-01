@@ -1,7 +1,7 @@
 ---
-title: "14. MongoDB 聚合管道：强大的数据处理能力"
+title: "14. MongoDB 聚合管道：数据统计分析"
 date: "2026-03-19"
-summary: "掌握 MongoDB 聚合管道的高级用法，实现复杂的数据统计和分析"
+summary: "用 MongoDB 聚合管道实现电商系统的用户行为分析——每日活跃、商品浏览排行、转化漏斗"
 tags: ["MongoDB", "聚合管道", "数据分析", "NoSQL"]
 category: "数据库"
 cover: ""
@@ -10,264 +10,179 @@ series: "数据库渐进式学习路线"
 seriesOrder: 14
 ---
 
-## 前言
+上一篇我们把用户行为日志存进了 MongoDB。但存进去只是第一步——运营真正需要的是从这些日志里提炼出有价值的信息：每天有多少活跃用户、哪些商品被浏览最多、用户从浏览到下单的转化率是多少。
 
-MongoDB 的聚合管道提供了强大的数据处理能力，类似于 SQL 的 GROUP BY、JOIN，但更加灵活。
+在 SQL 里，这些统计用 GROUP BY、COUNT、SUM 实现。MongoDB 里对应的工具是聚合管道（Aggregation Pipeline）。概念上和 SQL 的聚合查询类似，但语法和执行方式不同——它不是一条语句，而是一系列处理步骤的串联。
 
-本文将深入讲解 MongoDB 聚合管道的各种阶段和操作符，帮你掌握复杂的数据统计和分析。
+## 聚合管道的基本概念
 
----
+聚合管道的核心思想是：**数据像流水线一样经过多个处理阶段，每个阶段对数据做一种变换，最终输出你想要的结果**。
 
-## 核心概念
+用 SQL 思维来对应：
 
-### 什么是聚合管道？
+```
+SQL:  SELECT ... FROM ... WHERE ... GROUP BY ... HAVING ... ORDER BY ...
 
-**聚合管道**是一系列数据处理阶段的组合，每个阶段接收输入数据，处理后输出给下一阶段。
-
-**vs SQL**：
-
-- MongoDB：aggregate + pipeline
-- SQL：GROUP BY、JOIN、HAVING
-
----
-
-## 聚合管道阶段
-
-### 1. $match（过滤）
-
-```javascript
-const results = await db
-  .collection("orders")
-  .aggregate([{ $match: { status: "paid" } }])
-  .toArray();
+MongoDB 聚合管道:
+  $match (WHERE) → $group (GROUP BY + 聚合函数) → $sort (ORDER BY) → $limit (LIMIT)
 ```
 
----
+不是一一对应，但思路类似——先过滤，再分组统计，再排序，再限制结果数量。
 
-### 2. $group（分组）
-
-```javascript
-const results = await db
-  .collection("orders")
-  .aggregate([
-    { $match: { status: "paid" } },
-    {
-      $group: {
-        _id: "$userId",
-        totalOrders: { $sum: 1 },
-        totalSpent: { $sum: "$total" },
-        avgOrderValue: { $avg: "$total" },
-      },
-    },
-  ])
-  .toArray();
-```
-
----
-
-### 3. $project（投影）
-
-```javascript
-const results = await db
-  .collection("users")
-  .aggregate([
-    {
-      $project: {
-        _id: 0,
-        email: 1,
-        fullName: 1,
-        createdAt: 1,
-      },
-    },
-  ])
-  .toArray();
-```
-
----
-
-### 4. $lookup（左连接）
-
-```javascript
-const results = await db
-  .collection("orders")
-  .aggregate([
-    {
-      $lookup: {
-        from: "users",
-        localField: "userId",
-        foreignField: "_id",
-        as: "user",
-      },
-    },
-    { $unwind: "$user" },
-  ])
-  .toArray();
-```
-
----
-
-### 5. $unwind（展开数组）
-
-```javascript
-const results = await db
-  .collection("orders")
-  .aggregate([
-    { $unwind: "$items" },
-    {
-      $group: {
-        _id: "$items.productId",
-        totalSold: { $sum: "$items.quantity" },
-      },
-    },
-  ])
-  .toArray();
-```
-
----
-
-## 实战案例
-
-### 案例 1：用户订单统计
+用一个最简单的例子来看：统计每种事件类型发生了多少次。
 
 ```javascript
 const stats = await db
-  .collection("orders")
+  .collection("user_events")
   .aggregate([
-    { $match: { status: "paid" } },
+    // 第一阶段：过滤（可选）
+    { $match: { createdAt: { $gte: new Date("2025-03-01") } } },
+
+    // 第二阶段：按事件类型分组，计算数量
     {
       $group: {
-        _id: "$userId",
-        totalOrders: { $sum: 1 },
-        totalSpent: { $sum: "$total" },
-        avgOrderValue: { $avg: "$total" },
-        lastOrderDate: { $max: "$createdAt" },
+        _id: "$eventType",
+        count: { $sum: 1 },
       },
     },
-    { $sort: { totalSpent: -1 } },
-    { $limit: 10 },
-    {
-      $lookup: {
-        from: "users",
-        localField: "_id",
-        foreignField: "_id",
-        as: "user",
-      },
-    },
-    { $unwind: "$user" },
-    {
-      $project: {
-        _id: 0,
-        userId: "$_id",
-        email: "$user.email",
-        fullName: "$user.fullName",
-        totalOrders: 1,
-        totalSpent: 1,
-        avgOrderValue: { $round: ["$avgOrderValue", 2] },
-        lastOrderDate: 1,
-      },
-    },
+
+    // 第三阶段：按数量降序排列
+    { $sort: { count: -1 } },
   ])
   .toArray();
 ```
 
----
-
-### 案例 2：商品销售统计
+结果大概是这样：
 
 ```javascript
-const sales = await db
-  .collection("orders")
-  .aggregate([
-    { $unwind: "$items" },
-    { $match: { status: "paid" } },
-    {
-      $group: {
-        _id: "$items.productId",
-        productName: { $first: "$items.name" },
-        totalSold: { $sum: "$items.quantity" },
-        revenue: { $sum: "$items.subtotal" },
-        ordersCount: { $sum: 1 },
-      },
-    },
-    {
-      $addFields: {
-        avgPrice: { $divide: ["$revenue", "$totalSold"] },
-      },
-    },
-    { $sort: { revenue: -1 } },
-  ])
-  .toArray();
+[
+  { _id: "product_view", count: 152340 },
+  { _id: "search", count: 89200 },
+  { _id: "add_to_cart", count: 23400 },
+  { _id: "purchase", count: 8700 },
+];
 ```
 
----
+`$match` 对应 SQL 的 WHERE，`$group` 对应 GROUP BY，`$sort` 对应 ORDER BY。`_id` 在 `$group` 里是分组键——和 SQL 的 `GROUP BY eventType` 一样。
 
-### 案例 3：时间序列分析
+注意 `$match` 的位置。如果把 `$match` 放在 `$group` 前面（像上面这样），MongoDB 会先过滤再分组，处理的文档数量更少，性能更好。如果把 `$match` 放在 `$group` 后面，MongoDB 会先对全量数据分组，再过滤——这在数据量大的时候很慢。**$match 尽量往前放**，这是聚合管道最重要的优化原则。
+
+## 用户行为分析：每日活跃统计
+
+运营想看每天有多少活跃用户（DAU），以及他们的行为分布。
 
 ```javascript
-const dailyRevenue = await db
-  .collection("orders")
+const dailyStats = await db.collection('user_events').aggregate([
+  // 只看 3 月份的数据
+  { $match: { createdAt: { $gte: new Date('2025-03-01'), $lt: new Date('2025-04-01') } } },
+
+  // 按日期和用户分组（去重）
+  {
+    $group: {
+      _id: {
+        date: { $dateToString: { format: '%Y-%m-%d', date: '$createdAt' } },
+        userId: '$userId',
+      },
+      events: { $sum: 1 },
+    }
+  },
+
+  // 再按日期分组，统计每天的用户数和事件数
+  {
+    $group: {
+      _id: '$_id.date',
+      activeUsers: { $sum: 1 },
+      totalEvents: { { $sum: '$_id.events' } },
+    }
+  },
+
+  { $sort: { _id: 1 } },
+]).toArray()
+```
+
+这个管道做了两次 `$group`。第一次按 `(日期, 用户ID)` 分组，把同一个用户同一天的多条事件合并成一行。第二次按日期分组，统计每天有多少个不同的用户（即活跃用户数）。
+
+`$dateToString` 是 MongoDB 的日期格式化函数，把 `createdAt` 转成 `YYYY-MM-DD` 格式的字符串，方便按天分组。
+
+## 商品浏览排行
+
+运营想知道上个月被浏览最多的商品 Top 10。
+
+```javascript
+const topProducts = await db
+  .collection("user_events")
   .aggregate([
-    { $match: { status: "paid" } },
+    // 只看浏览商品事件
     {
-      $project: {
-        date: {
-          $dateToString: { format: "%Y-%m-%d", date: "$createdAt" },
+      $match: {
+        eventType: "product_view",
+        createdAt: {
+          $gte: new Date("2025-03-01"),
+          $lt: new Date("2025-04-01"),
         },
-        total: 1,
       },
     },
+
+    // 按商品分组
     {
       $group: {
-        _id: "$date",
-        revenue: { $sum: "$total" },
-        ordersCount: { $sum: 1 },
+        _id: "$properties.productId",
+        viewCount: { $sum: 1 },
+        uniqueUsers: { $addToSet: "$userId" },
       },
     },
-    { $sort: { _id: 1 } },
+
+    // 统计去重后的用户数
+    {
+      $project: {
+        productId: "$_id",
+        viewCount: 1,
+        uniqueViewerCount: { $size: "$uniqueUsers" },
+      },
+    },
+
+    // 按浏览次数排序，取前 10
+    { $sort: { viewCount: -1 } },
+    { $limit: 10 },
   ])
   .toArray();
 ```
 
----
+这里有一个技巧：`$addToSet` 收集一个数组里所有不重复的值。我们用它来收集每个商品被哪些不同的用户浏览过，然后用 `$size` 得到去重后的用户数。这比在 SQL 里用 `COUNT(DISTINCT user_id)` 稍微复杂一点，但功能一样。
 
-### 案例 4：多管道并行（$facet）
+`$project` 阶段用来选择和重命名字段，类似 SQL 的 `SELECT`。`$size` 是数组操作符，返回数组长度。
+
+## 转化漏斗
+
+运营最关心的问题之一：用户从"浏览商品"到"加入购物车"到"下单支付"的转化率是多少？
+
+这就是经典的"漏斗分析"。MongoDB 的 `$facet` 阶段可以在一次查询里返回多种维度的统计结果：
 
 ```javascript
-const analytics = await db
-  .collection("orders")
+const funnel = await db
+  .collection("user_events")
   .aggregate([
-    { $match: { status: "paid" } },
+    { $match: { createdAt: { $gte: new Date("2025-03-01") } } },
+
     {
       $facet: {
-        stats: [
-          {
-            $group: {
-              _id: null,
-              totalRevenue: { $sum: "$total" },
-              totalOrders: { $sum: 1 },
-              avgOrderValue: { $avg: "$total" },
-            },
-          },
+        // 维度 1：浏览商品的用户数
+        viewed: [
+          { $match: { eventType: "product_view" } },
+          { $group: { _id: "$userId" } },
+          { $count: "total" },
         ],
-        byStatus: [
-          {
-            $group: {
-              _id: "$status",
-              count: { $sum: 1 },
-              revenue: { $sum: "$total" },
-            },
-          },
+        // 维度 2：加入购物车的用户数
+        carted: [
+          { $match: { eventType: "add_to_cart" } },
+          { $group: { _id: "$userId" } },
+          { $count: "total" },
         ],
-        timeSeries: [
-          {
-            $group: {
-              _id: {
-                $dateToString: { format: "%Y-%m", date: "$createdAt" },
-              },
-              revenue: { $sum: "$total" },
-            },
-          },
-          { $sort: { _id: 1 } },
+        // 维度 3：完成支付的用户数
+        purchased: [
+          { $match: { eventType: "purchase" } },
+          { $group: { _id: "$userId" } },
+          { $count: "total" },
         ],
       },
     },
@@ -275,119 +190,102 @@ const analytics = await db
   .toArray();
 ```
 
----
-
-## 性能优化
-
-### 1. 早期过滤
+`$facet` 让你在一次查询中并行执行多个聚合管道，每个管道独立处理同一批输入数据。结果是一个文档，包含每个维度的统计：
 
 ```javascript
-// ✅ 早期过滤
-{ $match: { status: 'paid' } },
-{ $group: { ... } }
-
-// ❌ 后期过滤
-{ $group: { ... } },
-{ $match: { status: 'paid' } }
+[
+  {
+    viewed: [{ total: 50000 }],
+    carted: [{ total: 8000 }],
+    purchased: [{ total: 3000 }],
+  },
+];
 ```
 
----
+转化率就可以算出来了：加购转化率 16%（8000/50000），支付转化率 37.5%（3000/8000）。
 
-### 2. 使用索引
+注意 `$facet` 里的每个管道处理的是全量数据（`$facet` 前面 `$match` 过滤后的数据）。所以每个管道都需要自己的 `$match` 来筛选特定事件类型。`$facet` 不共享中间结果。
 
-```javascript
-// 为 $match 阶段创建索引
-await db.collection("orders").createIndex({ status: 1, createdAt: -1 });
-```
+## $lookup：MongoDB 的 JOIN
 
----
+MongoDB 从 3.2 开始支持 `$lookup`，相当于 SQL 的 LEFT JOIN。但性能不如 PostgreSQL 的 JOIN，而且只能在聚合管道里使用。
 
-### 3. 限制数据量
+假设你的用户行为日志里存的是 `userId`，你想在统计结果里显示用户名：
 
 ```javascript
-// 使用 $limit 限制处理数据量
-{
-  $limit: 1000;
-}
-```
-
----
-
-## 最佳实践
-
-### 1. 管道设计原则
-
-- ✅ $match 尽早过滤
-- ✅ $project 减少数据量
-- ✅ 合理使用索引
-- ✅ 分阶段优化
-
----
-
-### 2. 性能监控
-
-```javascript
-// 使用 explain 分析
 const results = await db
-  .collection("orders")
-  .aggregate([{ $match: { status: "paid" } }], { explain: true });
+  .collection("user_events")
+  .aggregate([
+    { $match: { eventType: "purchase" } },
+    {
+      $lookup: {
+        from: "users", // 要 JOIN 的集合
+        localField: "userId", // 当前集合的字段
+        foreignField: "userId", // 目标集合的字段
+        as: "userInfo", // 结果存到这个字段
+      },
+    },
+    {
+      $project: {
+        eventType: 1,
+        createdAt: 1,
+        "userInfo.fullName": 1,
+        "userInfo.email": 1,
+      },
+    },
+  ])
+  .toArray();
 ```
 
----
+`$lookup` 的结果是一个数组（因为一对多可能匹配多条）。如果确定是一对一关系，可以用 `$unwind` 把数组展开成单条：
 
-## 常见问题
+```javascript
+{
+  $unwind: "$userInfo";
+} // 把 userInfo 从数组变成单个对象
+```
 
-### Q1: 聚合管道 vs 查询？
+`$lookup` 能用，但别滥用。每次 `$lookup` 都是一次独立的查询，如果数据量大，性能可能很差。如果你的数据需要频繁 JOIN，可能应该重新考虑数据模型——是不是该把关联数据嵌入到同一个文档里，或者干脆用 PostgreSQL。
 
-- 简单查询 → find()
-- 复杂统计 → aggregate()
+## $unwind：展开数组
 
----
+`$unwind` 把数组字段拆成多行。这在聚合之前处理嵌套数据时很有用。
 
-### Q2: 如何优化聚合管道？
+假设你的事件日志里有标签数组：
 
-- 早期过滤
-- 使用索引
-- 限制数据量
-- 分阶段优化
+```javascript
+{ productId: 42, tags: ['降噪', '蓝牙', '头戴式'] }
+{ productId: 67, tags: ['蓝牙', '入耳式'] }
+```
 
----
+你想统计每个标签出现了多少次：
 
-## 总结
+```javascript
+const tagStats = await db
+  .collection("user_events")
+  .aggregate([
+    // 只看有标签的事件
+    { $match: { tags: { $exists: true, $ne: [] } } },
+    // 展开标签数组
+    { $unwind: "$tags" },
+    // 按标签分组计数
+    { $group: { _id: "$tags", count: { $sum: 1 } } },
+    { $sort: { count: -1 } },
+    { $limit: 20 },
+  ])
+  .toArray();
+```
 
-本文深入学习了 MongoDB 聚合管道：
+`$unwind` 之后，每个标签变成独立的一行，然后就可以正常分组统计了。如果不 `$unwind`，你没法直接对数组元素做 GROUP BY。
 
-**核心阶段**：
+注意 `$unwind` 会"膨胀"数据——一个文档有 3 个标签，`$unwind` 后变成 3 行。如果数组很大，膨胀后的数据量可能很大，影响后续阶段的性能。
 
-- $match、$group、$project
-- $lookup、$unwind、$facet
+## 小结
 
-**实战案例**：
+MongoDB 聚合管道的基本套路是：`$match` 过滤 → `$group` 分组统计 → `$sort` 排序 → `$limit` 限制结果。`$match` 尽量放前面，减少后续阶段处理的数据量。
 
-- 用户订单统计
-- 商品销售统计
-- 时间序列分析
-- 多管道并行
+`$facet` 让你在一次查询中返回多种维度的统计，特别适合做漏斗分析。`$lookup` 是 MongoDB 的 JOIN，能用但别滥用——频繁 JOIN 的数据可能更适合放在 PostgreSQL 里。`$unwind` 展开数组，让后续的分组统计能正常工作。
 
-**性能优化**：
+聚合管道的能力远不止这些——还有 `$bucket`（自动分桶）、`$sample`（随机采样）、`$merge`（把聚合结果写回集合）等。但上面这几个覆盖了 80% 的日常需求。
 
-- 早期过滤
-- 使用索引
-- 限制数据量
-
----
-
-## 下一步
-
-掌握了 MongoDB 聚合管道后，下一步我们将学习：
-
-**《15. Redis 数据结构与缓存》**：学习 Redis 的数据结构和缓存策略。
-
-你将学习：
-
-- 🚀 Redis 数据类型
-- 💾 缓存策略
-- ⚡ 性能优化
-- 🔐 分布式锁
-
-继续关注，让我们一起学习高性能缓存！
+下一篇我们讲 Redis——当数据库查询跟不上流量的时候，用缓存来扛。

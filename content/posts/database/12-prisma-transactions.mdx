@@ -1,8 +1,8 @@
 ---
-title: "12. 事务与并发控制：保证数据一致性的关键"
+title: "12. 事务与并发：防止库存超卖"
 date: "2026-03-19"
-summary: "深入理解事务的 ACID 特性，掌握并发控制和锁机制"
-tags: ["PostgreSQL", "事务", "并发控制", "锁"]
+summary: "理解事务的隔离级别、悲观锁和乐观锁，用 Prisma 实现电商系统的高并发下单流程"
+tags: ["PostgreSQL", "事务", "并发", "Prisma"]
 category: "数据库"
 cover: ""
 draft: false
@@ -10,397 +10,296 @@ series: "数据库渐进式学习路线"
 seriesOrder: 12
 ---
 
-## 前言
+上一篇我们实现了订单查询、聚合统计、游标分页。但漏了一个最关键的操作——创建订单。这个操作不是一个简单的 INSERT，它涉及多个步骤：创建订单记录、扣减商品库存、记录支付流水。这些步骤必须全部成功或者全部失败，不能出现"订单创建了但库存没扣"或者"库存扣了但订单没创建"的情况。
 
-你有没有遇到过这样的问题：银行转账时，钱转出但没收到？库存超卖？数据不一致？
+这就是事务要解决的问题。
 
-这些都是**事务处理**不当导致的。本文将深入讲解事务的 ACID 特性、并发问题和锁机制，帮你掌握保证数据一致性的核心技能。
+## 事务的 ACID：用下单场景来理解
 
----
+ACID 这个词你大概在面试里背过，但放到电商下单场景里，它的意义非常具体。
 
-## 核心概念
+**原子性（Atomicity）**：创建订单和扣减库存要么同时成功，要么同时失败。如果库存扣减失败（比如商品已下架），整个操作回滚，订单不会创建。如果订单创建失败（比如订单号生成冲突），库存不会扣减。
 
-### 什么是事务？
+**一致性（Consistency）**：事务执行前后，数据库的约束不会被违反。如果 `stock` 列有 `CHECK (stock >= 0)` 约束，事务不能把库存减成负数。如果 `total` 列有 `CHECK (total >= 0)` 约束，订单总金额不能为负。
 
-**事务**是一组数据库操作，要么全部成功，要么全部失败。
+**隔离性（Isolation）**：两个用户同时购买同一件商品，他们的事务不会互相干扰。用户 A 读到库存是 10，扣减 1，得到 9。用户 B 也读到库存是 10，扣减 1，得到 9。如果没有隔离性，最终库存可能是 9 而不是 8——这就是超卖。
 
-**ACID 特性**：
+**持久性（Durability）**：一旦事务提交成功（COMMIT），即使服务器下一秒断电，数据也不会丢。数据库通过 WAL（预写日志）来保证这一点——修改先写入日志，再更新数据文件。断电恢复时通过日志重放来恢复未落盘的修改。
 
-- **原子性**（Atomicity）：事务是不可分割的最小单位
-- **一致性**（Consistency）：事务前后数据保持一致
-- **隔离性**（Isolation）：并发事务互不干扰
-- **持久性**（Durability）：提交后数据永久保存
+## Prisma 事务的两种用法
 
----
+Prisma 提供了两种方式来执行事务。
 
-## 事务隔离级别
-
-### 1. Read Uncommitted（读未提交）
-
-```sql
--- 可能读到未提交的数据（脏读）
-SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
-```
-
-**问题**：脏读、不可重复读、幻读
-
----
-
-### 2. Read Committed（读已提交，PostgreSQL 默认）
-
-```sql
--- 只能读到已提交的数据
-SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
-```
-
-**问题**：不可重复读、幻读
-
----
-
-### 3. Repeatable Read（可重复读）
-
-```sql
--- 保证同一事务中多次读取结果一致
-SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
-```
-
-**问题**：幻读
-
----
-
-### 4. Serializable（可序列化）
-
-```sql
--- 最高隔离级别，完全隔离
-SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
-```
-
-**问题**：性能最低，可能发生序列化失败
-
----
-
-## 并发问题
-
-### 1. 脏读
-
-读到未提交的数据。
-
-```sql
--- 事务 A
-BEGIN;
-UPDATE users SET balance = balance - 100 WHERE id = 1;
--- 还未 COMMIT
-
--- 事务 B（脏读）
-SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
-SELECT balance FROM users WHERE id = 1;  -- 读到了未提交的数据
-```
-
----
-
-### 2. 不可重复读
-
-同一事务中多次读取结果不同。
-
-```sql
--- 事务 A
-BEGIN;
-SELECT balance FROM users WHERE id = 1;  -- 第一次读取：1000
-
--- 事务 B
-BEGIN;
-UPDATE users SET balance = 900 WHERE id = 1;
-COMMIT;
-
--- 事务 A（不可重复读）
-SELECT balance FROM users WHERE id = 1;  -- 第二次读取：900
-```
-
----
-
-### 3. 幻读
-
-同一事务中，同样的条件返回的行数不同。
-
-```sql
--- 事务 A
-BEGIN;
-SELECT * FROM users WHERE age > 18;  -- 返回 10 行
-
--- 事务 B
-BEGIN;
-INSERT INTO users (age) VALUES (20);
-COMMIT;
-
--- 事务 A（幻读）
-SELECT * FROM users WHERE age > 18;  -- 返回 11 行
-```
-
----
-
-## 锁机制
-
-### 1. 行锁（SELECT FOR UPDATE）
-
-```sql
--- 悲观锁
-BEGIN;
-
-SELECT stock FROM products WHERE id = 'prod-1' FOR UPDATE;
--- 其他事务会等待，直到当前事务提交
-
-UPDATE products SET stock = stock - 2 WHERE id = 'prod-1';
-
-COMMIT;
-```
-
----
-
-### 2. 表锁
-
-```sql
--- 锁定整个表
-LOCK TABLE users IN ACCESS EXCLUSIVE MODE;
-```
-
----
-
-### 3. 乐观锁（版本号）
-
-```sql
--- 添加版本号字段
-ALTER TABLE products ADD COLUMN version INTEGER DEFAULT 1;
-
--- 更新时检查版本号
-UPDATE products
-SET stock = stock - 2, version = version + 1
-WHERE id = 'prod-1' AND version = 5;
-
--- 检查是否更新成功
-SELECT ROW_COUNT();
-```
-
----
-
-## Prisma 事务
-
-### 1. $transaction API
+**交互式事务（Interactive Transactions）**：你在一个回调函数里执行多个操作，Prisma 把它们包在一个数据库事务里。
 
 ```typescript
-await prisma.$transaction(async (tx) => {
-  const order = await tx.order.create({
+const order = await prisma.$transaction(async (tx) => {
+  // 1. 创建订单
+  const newOrder = await tx.order.create({
     data: {
-      userId,
+      userId: 1,
       orderNumber: `ORD-${Date.now()}`,
-      total: 100,
+      status: "pending",
+      total: 2499.0,
     },
   });
 
+  // 2. 创建订单项
   await tx.orderItem.create({
     data: {
-      orderId: order.id,
-      productId,
-      quantity: 2,
-      unitPrice: 50,
-      subtotal: 100,
+      orderId: newOrder.id,
+      productId: 42,
+      quantity: 1,
+      unitPrice: 2499.0,
     },
   });
 
-  await tx.product.update({
-    where: { id: productId },
-    data: { stock: { decrement: 2 } },
+  // 3. 扣减库存
+  const result = await tx.product.updateMany({
+    where: { id: 42, stock: { gte: 1 } },
+    data: { stock: { decrement: 1 } },
   });
 
-  return order;
+  if (result.count === 0) {
+    throw new Error("库存不足"); // 抛出异常，事务自动回滚
+  }
+
+  return newOrder;
 });
 ```
 
----
+注意这里用的是 `tx.order.create()` 而不是 `prisma.order.create()`——`tx` 是事务对象，所有通过 `tx` 执行的操作都在同一个事务里。如果你不小心用了 `prisma` 而不是 `tx`，那个操作就不在事务之内了。
 
-### 2. 批量事务
+**批量事务（Batch Transactions）**：把多个 Prisma 操作放在一个数组里，顺序执行。如果任何一步失败，全部回滚。
 
 ```typescript
-const [user, order] = await prisma.$transaction([
-  prisma.user.create({ data: userData }),
-  prisma.order.create({ data: orderData }),
+const [order, orderItem] = await prisma.$transaction([
+  prisma.order.create({
+    data: {
+      userId: 1,
+      orderNumber: `ORD-${Date.now()}`,
+      status: "pending",
+      total: 2499.0,
+    },
+  }),
+  prisma.orderItem.create({
+    data: {
+      productId: 42,
+      quantity: 1,
+      unitPrice: 2499.0,
+      // 注意：这里需要 orderId，但此时 order 还没创建完
+      // 所以批量事务不适合有依赖关系的操作
+    },
+  }),
 ]);
 ```
 
----
+批量事务的局限是：操作之间不能有依赖关系——你不能用第一个操作的结果作为第二个操作的参数。因为批量事务里的所有操作在发送到数据库之前就被序列化了。
 
-### 3. 设置隔离级别
+所以实际业务中，**交互式事务用得更多**。上面的下单流程就是一个典型例子——创建订单的结果（orderId）是创建订单项的输入，有明确的依赖关系。
+
+## 并发下单：脏读、不可重复读、幻读
+
+理解了事务的基本用法，现在来看并发问题。
+
+假设商品库存是 10，两个用户同时下单各买 1 件。理想情况是：一个用户的事务先完成（库存减到 9），另一个用户的事务后完成（库存减到 8）。但如果两个事务同时读到了库存 10，各自减 1 后都写入 9，就超卖了。
+
+这就是并发控制要解决的核心问题。SQL 标准定义了四种隔离级别来应对不同级别的并发问题：
+
+**Read Uncommitted**：最低级别，几乎不用。一个事务能读到另一个事务还没提交的修改。如果事务 A 扣了库存但还没提交，事务 B 就能读到扣减后的库存——如果事务 A 回滚了，事务 B 读到的就是"脏数据"。
+
+**Read Committed**（PostgreSQL 默认）：一个事务只能读到其他事务已经提交的修改。脏读被解决了，但不可重复读和幻读可能发生。
+
+**Repeatable Read**：一个事务内多次读同一行数据，结果是一致的。即使其他事务修改了这行数据并提交了，当前事务读到的还是事务开始时的快照。
+
+**Serializable**：最高级别，完全隔离。不仅保证读的一致性，还保证"如果两个事务的执行顺序可能导致数据不一致，就拒绝其中一个"。
+
+用电商下单的场景来说明这三个问题：
+
+**脏读**（Read Uncommitted 才会出现）：事务 A 扣了库存（10→9）但还没提交，事务 B 读到库存是 9。然后事务 A 回滚了，库存恢复到 10。事务 B 基于"库存是 9"做的判断就是错的。
+
+**不可重复读**（Read Committed 会出现）：事务 A 第一次读库存是 10，事务 B 把库存减到 9 并提交了。事务 A 第二次读库存变成了 9——同一个事务内两次读同一行，结果不一样。
+
+**幻读**（Repeatable Read 会出现）：事务 A 查询"库存大于 0 的商品"返回 100 条。事务 B 插入了一条新商品（库存 50）并提交了。事务 A 再查一次，返回 101 条——像"幻觉"一样多了一行。
+
+PostgreSQL 的 Read Committed 默认隔离级别对大多数场景够用了。但并发下单需要更强的保护。
+
+## 悲观锁：SELECT FOR UPDATE
+
+悲观锁的思路是："这个数据可能被并发修改，我先锁住，别人等我用完再说。"
 
 ```typescript
-await prisma.$transaction(
-  async (tx) => {
-    // 事务操作
-  },
-  {
-    maxWait: 5000,
-    timeout: 10000,
-    isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
-  }
-);
-```
-
----
-
-## 并发控制实战
-
-### 1. 乐观锁实现
-
-```typescript
-try {
-  const product = await prisma.product.findUnique({ where: { id: productId } });
-
-  const updatedProduct = await prisma.product.updateMany({
-    where: {
-      id: productId,
-      version: product.version,
-    },
-    data: {
-      stock: product.stock - quantity,
-      version: product.version + 1,
-    },
+const order = await prisma.$transaction(async (tx) => {
+  // 1. 锁定商品行（SELECT ... FOR UPDATE）
+  const product = await tx.product.findUnique({
+    where: { id: 42 },
+    // Prisma 不直接支持 FOR UPDATE，需要用 queryRaw
   });
 
-  if (updatedProduct.count === 0) {
-    throw new Error("并发冲突：数据已被其他事务修改");
-  }
-} catch (error) {
-  // 处理并发冲突
-}
-```
-
----
-
-### 2. 悲观锁实现
-
-```typescript
-await prisma.$transaction(async (tx) => {
-  const product = await tx.$queryRaw<Array<{ stock: number }>>`
-    SELECT stock FROM products
-    WHERE id = ${productId}
-    FOR UPDATE
+  // 用原生 SQL 加锁
+  const [lockedProduct] = await tx.$queryRaw`
+    SELECT id, name, stock, price FROM products
+    WHERE id = 42 FOR UPDATE
   `;
 
-  if (product[0].stock < quantity) {
+  if (lockedProduct.stock < 1) {
     throw new Error("库存不足");
   }
 
-  await tx.product.update({
-    where: { id: productId },
-    data: { stock: { decrement: quantity } },
+  // 2. 创建订单
+  const newOrder = await tx.order.create({
+    data: {
+      userId: 1,
+      orderNumber: `ORD-${Date.now()}`,
+      status: "pending",
+      total: lockedProduct.price,
+    },
   });
+
+  // 3. 扣减库存
+  await tx.product.update({
+    where: { id: 42 },
+    data: { stock: { decrement: 1 } },
+  });
+
+  return newOrder;
 });
 ```
 
----
+`FOR UPDATE` 会锁定查到的行，直到事务提交或回滚才释放。如果另一个事务也试图锁定同一行，它会被阻塞——等待当前事务完成。这就是"悲观"的含义：假设冲突一定会发生，先锁再说。
 
-### 3. 重试机制
+`FOR UPDATE` 有几个变体：
+
+- `FOR UPDATE`：锁定选中的行，其他事务不能 UPDATE 或 DELETE 这些行
+- `FOR NO KEY UPDATE`：更轻量的锁，允许其他事务修改非键列
+- `FOR SHARE`：允许其他事务读和加 SHARE 锁，但不允许 UPDATE
+- `FOR UPDATE NOWAIT`：如果行已被锁定，不等待，直接报错
+
+秒杀场景适合用 `FOR UPDATE NOWAIT`——不需要让用户等，抢不到就直接返回"库存不足"。
+
+悲观锁的问题是可能降低并发性能。如果锁持有的时间很长（事务里有很多操作），等待的请求会排队，吞吐量下降。
+
+## 乐观锁：版本号机制
+
+乐观锁的思路是："冲突不常见，先不做锁，提交时再检查有没有冲突。"
+
+实现方式是给表加一个 `version` 字段：
+
+```sql
+ALTER TABLE products ADD COLUMN version INTEGER DEFAULT 1;
+```
+
+更新时带上版本号检查：
 
 ```typescript
-async function executeWithRetry<T>(
-  operation: () => Promise<T>,
-  maxRetries = 3
-): Promise<T> {
-  let lastError: Error;
+const result = await prisma.product.updateMany({
+  where: {
+    id: 42,
+    version: currentVersion, // 你读到的版本号
+  },
+  data: {
+    stock: { decrement: 1 },
+    version: { increment: 1 },
+  },
+});
 
-  for (let i = 0; i < maxRetries; i++) {
-    try {
-      return await operation();
-    } catch (error) {
-      lastError = error;
-      if (i < maxRetries - 1) {
-        await new Promise((resolve) => setTimeout(resolve, 100 * (i + 1)));
-      }
-    }
-  }
-
-  throw lastError;
+if (result.count === 0) {
+  // 版本号不匹配，说明在你读和写之间有人修改了这条记录
+  // 重试整个事务
+  throw new ConflictError("数据已被修改，请重试");
 }
 ```
 
----
+如果在你读和写之间，另一个事务修改了这条记录（版本号变了），`where version = currentVersion` 就不匹配了，`count` 是 0，你就知道有冲突，可以重试。
 
-## 最佳实践
+乐观锁适合冲突率低的场景——比如编辑文档、修改用户资料。如果冲突率高（比如秒杀），乐观锁的重试次数会很多，反而不如悲观锁高效。
 
-### 1. 事务设计原则
+## 什么时候用哪种锁
 
-- ✅ 事务尽可能短
-- ✅ 避免在事务中执行长时间操作
-- ✅ 合理选择隔离级别
-- ✅ 使用连接池
+| 场景              | 推荐方案              | 原因                             |
+| ----------------- | --------------------- | -------------------------------- |
+| 秒杀/抢购         | 悲观锁（FOR UPDATE）  | 冲突率高，乐观锁重试太多         |
+| 编辑文档/个人资料 | 乐观锁（版本号）      | 冲突率低，不需要等待             |
+| 普通下单          | 原子操作（decrement） | `stock = stock - 1` 本身是原子的 |
+| 库存检查 + 扣减   | 悲观锁或原子操作      | 需要保证"检查和扣减"是一个整体   |
 
----
+实际上，对于大多数电商场景，原子操作（上一篇讲的 `stock: { decrement: 1 }`）就够用了。数据库层面的 `UPDATE products SET stock = stock - 1 WHERE id = 42` 是原子的，不会出现超卖。
 
-### 2. 并发控制选择
+只有在"检查库存 + 扣减库存 + 创建订单"需要作为整体执行时，才需要事务。而在事务里，如果你用原子操作扣减库存（而不是先读再写），Read Committed 隔离级别就够用了——原子操作不会出现"读到旧值"的问题。
 
-- ✅ 冲突少：乐观锁
-- ✅ 冲突多：悲观锁
-- ✅ 高并发：重试机制
+悲观锁（FOR UPDATE）适合你需要在扣减之前做额外的检查或计算的复杂场景。乐观锁适合你不希望请求阻塞等待的场景。
 
----
+## 重试机制：并发冲突是正常现象
 
-## 常见问题
+无论用悲观锁还是乐观锁，并发冲突都可能发生。悲观锁会阻塞等待，乐观锁需要重试。对于乐观锁，你需要一个重试机制：
 
-### Q1: 如何选择隔离级别？
+```typescript
+async function createOrderWithRetry(
+  userId: number,
+  productId: number,
+  maxRetries = 3
+) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await prisma.$transaction(async (tx) => {
+        const product = await tx.product.findUnique({
+          where: { id: productId },
+        });
+        if (!product || product.stock < 1) {
+          throw new Error("商品不存在或库存不足");
+        }
 
-- 默认：Read Committed
-- 高一致性要求：Serializable
-- 高并发要求：Read Committed + 悲观锁
+        const newOrder = await tx.order.create({
+          data: {
+            userId,
+            orderNumber: `ORD-${Date.now()}`,
+            total: product.price,
+          },
+        });
 
----
+        await tx.orderItem.create({
+          data: {
+            orderId: newOrder.id,
+            productId,
+            quantity: 1,
+            unitPrice: product.price,
+          },
+        });
 
-### Q2: 如何处理死锁？
+        await tx.product.update({
+          where: { id: productId, version: product.version },
+          data: {
+            stock: { decrement: 1 },
+            version: { increment: 1 },
+          },
+        });
 
-```sql
--- 查看死锁
-SELECT * FROM pg_stat_activity WHERE wait_event_type = 'Lock';
-
--- 解决方案
-- 设置锁超时
-- 优化事务顺序
-- 使用重试机制
+        return newOrder;
+      });
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError &&
+        attempt < maxRetries - 1
+      ) {
+        await new Promise((resolve) => setTimeout(resolve, 50 * (attempt + 1)));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
 ```
 
----
+重试不是"出错了就无限重试"。设一个最大重试次数（3 次通常够用），每次重试之间加一个短暂的随机延迟（避免多个重试同时发起再次冲突）。超过最大重试次数就返回错误，让用户手动重试。
 
-## 总结
+并发冲突不是错误，是分布式系统的正常现象。设计系统的时候要预期到冲突会发生，并优雅地处理它——而不是假设"冲突不会发生"。
 
-本文系统学习了事务与并发控制：
+## 小结
 
-**事务特性**：
+事务保证了"多个操作要么全成功，要么全失败"。Prisma 的交互式事务（`$transaction` 回调）是最常用的形式，适合操作之间有依赖关系的场景。
 
-- ACID 特性
-- 四种隔离级别
-- 并发问题（脏读、不可重复读、幻读）
+并发问题的根源是"读和写之间有时间窗口"。悲观锁通过加锁消除这个窗口（先锁住，别人等），乐观锁通过版本号检测冲突（提交时检查，冲突了就重试），原子操作通过数据库层面的单条语句消除窗口（`stock = stock - 1` 不需要先读）。
 
-**锁机制**：
+选哪种方案取决于冲突率：高冲突用悲观锁，低冲突用乐观锁，简单的增减操作用原子操作。
 
-- 行锁、表锁
-- 乐观锁、悲观锁
-- 死锁检测
-
-**Prisma 事务**：
-
-- $transaction API
-- 隔离级别设置
-- 并发控制实战
-
----
-
-## 下一步
-
-掌握了事务与并发后，下一步我们将学习 NoSQL 数据库：
-
-**《13. MongoDB 文档数据库》**：学习 MongoDB 的核心概念和基本操作。
-
-你将学习：
-
-- 📄 MongoDB 核心概念
-- 🔍 CRUD 操作
-- 📊 嵌入式文档设计
-- 🚀 与 PostgreSQL 的区别
-
-继续关注，让我们一起扩展数据库技能！
+核心篇和 ORM 篇到此结束。你已经掌握了从表设计、关系建模、索引优化、查询调优到 Prisma ORM 的完整技能链。下一篇开始进入扩展篇——当 PostgreSQL 不够用时，引入 MongoDB、Redis、Elasticsearch。

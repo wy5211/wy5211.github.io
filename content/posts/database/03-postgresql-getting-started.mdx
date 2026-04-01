@@ -1,8 +1,8 @@
 ---
-title: "03. PostgreSQL 快速入门：搭建你的第一个生产级数据库"
+title: "03. 搭建 PostgreSQL 开发环境：从安装到连接"
 date: "2026-03-19"
-summary: "从零开始搭建 PostgreSQL 开发环境，掌握核心概念和基本操作，为后续深入学习打下基础"
-tags: ["PostgreSQL", "数据库", "Docker", "环境搭建"]
+summary: "用 Docker 一键搭建 PostgreSQL 开发环境，掌握 psql 客户端和核心配置"
+tags: ["PostgreSQL", "Docker", "数据库", "环境搭建"]
 category: "数据库"
 cover: ""
 draft: false
@@ -10,746 +10,334 @@ series: "数据库渐进式学习路线"
 seriesOrder: 3
 ---
 
-## 前言
+上一篇我们学了 SQL 的基本语法，但还没地方执行。今天来搭一个 PostgreSQL 环境，后面所有实战都在这个基础上展开。
 
-在众多关系型数据库中，PostgreSQL 以其强大的功能、优异的性能和开源免费的特点，成为了越来越多企业的首选。无论是 Instagram、Reddit 这样的互联网巨头，还是各种创业公司，都在使用 PostgreSQL。
+上个月团队决定新项目用 PostgreSQL，理由很充分：我们要存商品的自定义属性（JSONB）、要做复杂的多表关联查询（CTE）、将来可能还要接 PostGIS 做地理围栏。MySQL 也能做这些事，但 PostgreSQL 做得更自然，生态也更成熟。
 
-为什么选择 PostgreSQL？相比 MySQL 它有哪些优势？如何快速搭建一个开发环境？
+问题来了：谁来装？老张在自己 Mac 上 brew install，小王在 Windows 上下载安装包配环境变量，我用的 Ubuntu 又是另一套流程。三个人折腾了一下午，版本还不统一 -- 老张装的是 15，小王装的是 16，我是 14。然后导入初始数据的时候，有些语法在不同版本之间行为不一致，排查又花了一晚上。
 
-本文将带你从零开始，搭建 PostgreSQL 开发环境，掌握核心操作，为后续深入学习打下坚实基础。
+最后我们统一用了 Docker Compose。一条命令启动，版本一致，数据持久化，换电脑也只需要拉一下镜像。下面把这套方案分享出来。
 
----
+## 为什么选 PostgreSQL 而不是 MySQL
 
-## 核心概念
+这不是一个非此即彼的选择，但了解差异能帮你做出更合理的决策。
 
-### 为什么选择 PostgreSQL？
+PostgreSQL 有几个 MySQL 没有或做得不够好的地方。第一个是 JSONB -- 你可以在同一个表里存结构化数据和半结构化数据，而且能建索引、能做 JSON 内部字段的查询。电商系统里的商品自定义属性就是一个典型场景：手机有屏幕尺寸和处理器，衣服有尺码和面料，这些属性结构完全不同，用传统列设计要么建很多可空列，要么拆子表，但用 JSONB 一列就搞定了。
 
-**PostgreSQL** 是世界上最先进的开源关系型数据库系统，具有以下核心优势：
+第二个是 CTE（Common Table Expression）。MySQL 8.0 才支持，而 PostgreSQL 从 8.4 就有了，优化器也做得更成熟。当你需要写多层嵌套的报表查询时，CTE 能让 SQL 的可读性提升一个档次。
 
-**1. 完整的 ACID 支持**
+第三个是扩展体系。PostGIS 做地理空间、pg_trgm 做模糊搜索、pgcrypto 做加密、TimescaleDB 做时序数据 -- 这些都是作为扩展安装的，不需要换数据库。MySQL 也有插件机制，但生态差距明显。
 
-- 原子性（Atomicity）：事务要么全部成功，要么全部失败
-- 一致性（Consistency）：事务前后数据保持一致
-- 隔离性（Isolation）：并发事务互不干扰
-- 持久性（Durability）：提交后数据永久保存
+当然 MySQL 也有它的优势：上手门槛更低、默认配置更保守（不容易踩坑）、社区规模更大、国内招聘市场对 MySQL 的需求更多。如果你做的是一个内部管理系统，数据结构简单，团队对 PostgreSQL 没有经验，选 MySQL 完全没问题。但如果你预期会有复杂查询、非结构化数据、或者需要空间数据库能力，PostgreSQL 是更好的长期选择。
 
-**2. 丰富的数据类型**
+## Docker Compose 方案
 
-```sql
--- PostgreSQL 独有或独特的类型
-JSONB           -- 二进制 JSON（查询性能更好）
-ARRAY           -- 数组类型
-UUID            -- 全球唯一标识符
-CIDR            -- IP 地址范围
-HSTORE          -- 键值对存储
-```
+我之前一直习惯在本机直接装 PostgreSQL，直到遇到几个问题：升级大版本要 dump 再 restore、换电脑要重新装、多个项目的数据库实例容易端口冲突。Docker 把这些问题都解决了。
 
-**3. 强大的扩展性**
-
-- **PostGIS**：地理空间数据扩展（GIS 应用首选）
-- **pgcrypto**：加密函数库
-- **full text search**：全文搜索
-- **foreign data wrapper**：访问外部数据源
-
-**4. MVCC 并发控制**
-
-- 多版本并发控制，读写不阻塞
-- 适合高并发场景
-
-**5. 高度标准兼容**
-
-- 完全支持 SQL:2016 标准
-- 跨平台支持（Linux、Windows、macOS）
-
-**PostgreSQL vs MySQL**：
-
-| 特性     | PostgreSQL | MySQL      |
-| -------- | ---------- | ---------- |
-| 复杂查询 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐   |
-| 数据类型 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐     |
-| 并发性能 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐   |
-| 扩展性   | ⭐⭐⭐⭐⭐ | ⭐⭐⭐     |
-| 易用性   | ⭐⭐⭐⭐   | ⭐⭐⭐⭐⭐ |
-| 学习曲线 | 较陡       | 较平       |
-
-**选择建议**：
-
-- ✅ 选择 PostgreSQL：复杂业务、数据分析、地理信息、高并发
-- ✅ 选择 MySQL：简单 Web 应用、快速开发、广为人知
-
----
-
-### PostgreSQL 核心概念
-
-**1. 数据库集群（Cluster）**
-
-- 一个 PostgreSQL 服务器实例管理多个数据库
-- 物理上共享同一数据目录
-
-**2. 数据库（Database）**
-
-- 逻辑上的数据隔离
-- 不同数据库之间表名可以重复
-
-**3. Schema（模式）**
-
-- 数据库内部的命名空间
-- 默认 schema：`public`
-- 同一数据库内不同 schema 的表名可以重复
-
-**4. 表（Table）**
-
-- 数据的实际存储单元
-- 属于某个 schema
-
-**层次关系**：
-
-```
-Cluster (服务器实例)
-  └─ Database (数据库)
-      └─ Schema (模式)
-          └─ Table (表)
-```
-
----
-
-## 实战演练
-
-### 一、环境搭建
-
-我们使用 Docker Compose 搭建开发环境，这是最简单、最推荐的方式。
-
-#### 1. 创建项目目录
-
-```bash
-mkdir postgres-learning
-cd postgres-learning
-```
-
-#### 2. 创建 Docker Compose 配置
+核心配置其实不复杂，关键是理解几个参数的作用。
 
 ```yaml
-# docker-compose.yml
-version: "3.8"
-
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: postgres_dev
+    container_name: pg_ecommerce
     environment:
-      POSTGRES_USER: dev # 超级用户名
-      POSTGRES_PASSWORD: dev123 # 密码
-      POSTGRES_DB: dev_db # 默认数据库
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: dev_only_not_production
+      POSTGRES_DB: ecommerce
     ports:
-      - "5432:5432" # 主机端口:容器端口
+      - "5432:5432"
     volumes:
-      # 数据持久化
-      - postgres_data:/var/lib/postgresql/data
-      # 初始化脚本
+      - pg_data:/var/lib/postgresql/data
       - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U dev"]
-      interval: 10s
-      timeout: 5s
+      test: ["CMD-SHELL", "pg_isready -U admin"]
+      interval: 5s
+      timeout: 3s
       retries: 5
 
-  pgadmin:
-    image: dpage/pgadmin4:latest
-    container_name: pgadmin_dev
-    environment:
-      PGADMIN_DEFAULT_EMAIL: admin@example.com
-      PGADMIN_DEFAULT_PASSWORD: admin
-    ports:
-      - "5050:80"
-    depends_on:
-      - postgres
-
 volumes:
-  postgres_data:
+  pg_data:
 ```
 
-#### 3. 创建初始化脚本
+几个关键点。`volumes` 里的 `pg_data` 是一个 Docker 命名卷，数据库文件存在这里，容器删了数据还在。`./init.sql` 挂载到 `docker-entrypoint-initdb.d/` 目录，这个目录里的 `.sql` 文件会在容器首次启动时自动执行 -- 注意是"首次"，如果卷里已经有数据了就不会再跑。
 
-```sql
--- init.sql
--- 这个脚本会在容器首次启动时自动执行
+`healthcheck` 很重要。PostgreSQL 容器启动后，数据库进程需要几秒钟才能就绪。如果你的应用（或者 pgAdmin）在数据库就绪前就去连接，会报 "connection refused"。加了 healthcheck 之后，Docker Compose 的 `depends_on` 可以配合 `condition: service_healthy` 使用，确保依赖的服务已经真正可用。
 
--- 创建示例数据库
-CREATE DATABASE ecommerce;
-
--- 连接到 ecommerce 数据库
-\c ecommerce;
-
--- 创建用户表
-CREATE TABLE users (
-  id SERIAL PRIMARY KEY,
-  email VARCHAR(255) UNIQUE NOT NULL,
-  password_hash VARCHAR(255) NOT NULL,
-  full_name VARCHAR(100),
-  is_verified BOOLEAN DEFAULT FALSE,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 插入示例数据
-INSERT INTO users (email, password_hash, full_name) VALUES
-  ('user1@example.com', 'hash1', '张三'),
-  ('user2@example.com', 'hash2', '李四'),
-  ('user3@example.com', 'hash3', '王五');
-
--- 授权
-GRANT ALL PRIVILEGES ON DATABASE ecommerce TO dev;
-```
-
-#### 4. 启动服务
-
-```bash
-# 启动服务
-docker-compose up -d
-
-# 查看日志
-docker-compose logs -f postgres
-
-# 查看运行状态
-docker-compose ps
-```
-
-#### 5. 连接数据库
-
-**方式 1：使用 psql 命令行工具**
-
-```bash
-# 进入容器
-docker exec -it postgres_dev psql -U dev -d dev_db
-
-# 或者直接从主机连接（需要安装 psql 客户端）
-psql -h localhost -p 5432 -U dev -d dev_db
-```
-
-**方式 2：使用 pgAdmin（可视化工具）**
-
-1. 打开浏览器访问 http://localhost:5050
-2. 使用 `admin@example.com` / `admin` 登录
-3. 添加服务器连接：
-   - Host：`postgres`
-   - Port：`5432`
-   - Username：`dev`
-   - Password：`dev123`
-
----
-
-### 二、基本操作
-
-#### 1. psql 常用命令
-
-```bash
-# 连接数据库
-psql -h localhost -U dev -d dev_db
-
-# \? - 查看所有 psql 命令
-\?
-
-# \l - 列出所有数据库
-\l
-
-# \c database_name - 切换数据库
-\c ecommerce
-
-# \dt - 列出当前数据库的所有表
-\dt
-
-# \d table_name - 查看表结构
-\d users
-
-# \du - 列出所有用户
-\du
-
-# \conninfo - 显示当前连接信息
-\conninfo
-
-# \i file.sql - 执行 SQL 文件
-\i /path/to/script.sql
-
-# \o file.txt - 将查询结果输出到文件
-\o output.txt
-SELECT * FROM users;
-\o
-
-# \q - 退出
-\q
-```
-
-#### 2. 数据库操作
-
-```sql
--- 创建数据库
-CREATE DATABASE myapp;
-
--- 切换数据库
-\c myapp
-
--- 查看数据库大小
-SELECT
-  pg_database.datname,
-  pg_size_pretty(pg_database_size(pg_database.datname)) AS size
-FROM pg_database
-ORDER BY pg_database_size(pg_database.datname) DESC;
-
--- 删除数据库（不能删除当前连接的数据库）
-DROP DATABASE myapp;
-
--- 重命名数据库
-ALTER DATABASE myapp RENAME TO newname;
-```
-
-#### 3. 表操作
-
-```sql
--- 创建表
-CREATE TABLE products (
-  id SERIAL PRIMARY KEY,
-  name VARCHAR(255) NOT NULL,
-  price NUMERIC(10, 2) NOT NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 查看表结构
-\d products
-
--- 重命名表
-ALTER TABLE products RENAME TO items;
-
--- 删除表
-DROP TABLE products;
-
--- 删除表（如果存在）
-DROP TABLE IF EXISTS products;
-```
-
-#### 4. 数据操作
-
-```sql
--- 插入数据
-INSERT INTO users (email, password_hash, full_name)
-VALUES ('newuser@example.com', 'hash', '赵六');
-
--- 查询数据
-SELECT * FROM users;
-
--- 查询特定列
-SELECT id, email, full_name FROM users;
-
--- 条件查询
-SELECT * FROM users WHERE is_verified = TRUE;
-
--- 更新数据
-UPDATE users
-SET is_verified = TRUE
-WHERE id = 1;
-
--- 删除数据
-DELETE FROM users WHERE id = 1;
-```
-
----
-
-### 三、用户权限管理
-
-PostgreSQL 的权限系统非常灵活。
-
-#### 1. 创建用户
-
-```sql
--- 创建用户（CREATE USER 和 CREATE ROLE 相同，USER 默认可登录）
-CREATE USER app_user WITH PASSWORD 'secure_password';
-
--- 创建只读用户
-CREATE USER readonly WITH PASSWORD 'readonly_pass';
-
--- 创建超级用户
-CREATE USER admin WITH PASSWORD 'admin_pass' SUPERUSER;
-```
-
-#### 2. 授权
-
-```sql
--- 授予数据库连接权限
-GRANT CONNECT ON DATABASE ecommerce TO app_user;
-
--- 授予 schema 使用权限
-GRANT USAGE ON SCHEMA public TO app_user;
-
--- 授予表权限
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO app_user;
-
--- 授予只读权限
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly;
-
--- 授予序列权限（SERIAL 自增需要）
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO app_user;
-
--- 默认权限（未来创建的表自动授权）
-ALTER DEFAULT PRIVILEGES IN SCHEMA public
-  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO app_user;
-```
-
-#### 3. 撤销权限
-
-```sql
--- 撤销权限
-REVOKE DELETE ON ALL TABLES IN SCHEMA public FROM app_user;
-
--- 撤销超级用户权限
-ALTER USER admin WITH NOSUPERUSER;
-```
-
-#### 4. 角色管理
-
-```sql
--- 创建角色
-CREATE ROLE developer;
-
--- 将用户添加到角色
-GRANT developer TO app_user;
-
--- 为角色授权
-GRANT ALL PRIVILEGES ON DATABASE ecommerce TO developer;
-
--- 查看角色权限
-\du
-```
-
----
-
-### 四、配置文件详解
-
-PostgreSQL 的配置文件位于容器的 `/var/lib/postgresql/data` 目录。
-
-#### 1. postgresql.conf（主配置文件）
-
-```bash
-# 进入容器查看配置
-docker exec -it postgres_dev cat /var/lib/postgresql/data/postgresql.conf
-
-# 常用配置项
-
-# 连接设置
-listen_addresses = '*'                  # 监听所有 IP
-max_connections = 100                   # 最大连接数
-
-# 内存设置（根据服务器内存调整）
-shared_buffers = 256MB                  # 共享缓冲区（内存的 25%）
-effective_cache_size = 1GB              # 有效缓存大小（内存的 50-75%）
-work_mem = 16MB                         # 每个查询操作的内存
-maintenance_work_mem = 128MB            # 维护操作内存
-
-# WAL 设置
-wal_buffers = 16MB                      # WAL 缓冲区
-checkpoint_completion_target = 0.9      # 检查点完成目标
-
-# 日志设置
-logging_collector = on                  # 启用日志收集
-log_directory = 'log'                   # 日志目录
-log_filename = 'postgresql-%Y-%m-%d.log' # 日志文件名
-log_statement = 'mod'                   # 记录 SQL（none, ddl, mod, all）
-log_duration = on                       # 记录查询执行时间
-```
-
-#### 2. pg_hba.conf（认证配置文件）
-
-```bash
-# 查看认证配置
-docker exec -it postgres_dev cat /var/lib/postgresql/data/pg_hba.conf
-
-# 配置格式
-# TYPE  DATABASE  USER  ADDRESS  METHOD
-
-# 允许本地所有用户使用 trust 认证（开发环境）
-local   all   all   trust
-
-# 允许本地所有用户使用密码认证
-local   all   all   md5
-
-# 允许 IPv4 连接
-host    all   all   0.0.0.0/0   md5
-
-# 允许特定 IP 段
-host    ecommerce  app_user  192.168.1.0/24  md5
-```
-
-#### 3. 修改配置（需要重启）
-
-```bash
-# 创建自定义配置文件
-cat > custom_postgresql.conf <<EOF
-shared_buffers = 512MB
-effective_cache_size = 2GB
-work_mem = 32MB
-EOF
-
-# 挂载到容器（修改 docker-compose.yml）
-volumes:
-  - ./custom_postgresql.conf:/etc/postgresql/postgresql.conf
-
-# 重启服务
-docker-compose restart postgres
-```
-
----
-
-### 五、连接池（PgBouncer）
-
-在高并发场景下，直接创建大量数据库连接会消耗很多资源。这时需要使用连接池。
-
-#### 1. 添加 PgBouncer 服务
+如果你还想要一个可视化管理工具，可以加一个 pgAdmin 服务：
 
 ```yaml
-# docker-compose.yml
-services:
-  pgbouncer:
-    image: edoburu/pgbouncer:latest
-    container_name: pgbouncer_dev
-    environment:
-      DB_HOST: postgres
-      DB_PORT: 5432
-      DB_USER: dev
-      DB_PASSWORD: dev123
-      DATABASES: dev_db
-      POOL_MODE: transaction # 连接池模式
-      MAX_CLIENT_CONN: 200 # 最大客户端连接数
-      DEFAULT_POOL_SIZE: 25 # 每个数据库的连接池大小
-    ports:
-      - "6432:6432"
-    depends_on:
-      - postgres
+pgadmin:
+  image: dpage/pgadmin4
+  environment:
+    PGADMIN_DEFAULT_EMAIL: admin@local.dev
+    PGADMIN_DEFAULT_PASSWORD: admin
+  ports:
+    - "5050:80"
+  depends_on:
+    postgres:
+      condition: service_healthy
 ```
 
-#### 2. 连接 PgBouncer
+启动之后访问 `http://localhost:5050` 就能用了。但说实话，日常开发我更多用 psql 命令行，速度更快，而且能逼你熟悉 SQL 语法。
+
+## psql 客户端：最常用的几个命令
+
+psql 是 PostgreSQL 自带的命令行客户端。你不需要记住所有命令，下面这几个覆盖了 90% 的日常操作。
 
 ```bash
-# 应用连接 PgBouncer 而不是直接连接 PostgreSQL
-psql -h localhost -p 6432 -U dev -d dev_db
+# 连接数据库（从宿主机）
+psql -h localhost -p 5432 -U admin -d ecommerce
+
+# 或者直接进入容器
+docker exec -it pg_ecommerce psql -U admin -d ecommerce
 ```
 
----
+连上之后，以反斜杠开头的命令是 psql 的元命令，不经过 SQL 引擎直接在客户端执行：
 
-## 最佳实践
-
-### 1. 生产环境部署建议
-
-**安全性**：
-
-- ✅ 使用强密码
-- ✅ 限制监听地址
-- ✅ 使用 SSL/TLS 加密连接
-- ✅ 定期更新数据库版本
-- ✅ 最小权限原则
-
-**性能优化**：
-
-- ✅ 根据服务器内存调整 `shared_buffers`
-- ✅ 定期执行 `VACUUM ANALYZE`
-- ✅ 监控慢查询
-- ✅ 合理设置索引
-
-**高可用**：
-
-- ✅ 配置主从复制（Streaming Replication）
-- ✅ 定期备份
-- ✅ 监控数据库状态
-
----
-
-### 2. 开发环境建议
-
-**使用 Docker Compose**：
-
-- ✅ 快速搭建环境
-- ✅ 数据持久化
-- ✅ 方便团队协作
-
-**版本控制**：
-
-- ✅ 使用迁移工具（Prisma Migrate、Flyway）
-- ✅ 将 Schema 变更纳入版本控制
-- ✅ 分离开发/测试/生产环境配置
-
-**数据管理**：
-
-- ✅ 使用种子数据（seed data）进行测试
-- ✅ 定期清理测试数据
-- ✅ 使用 `.env` 文件管理敏感信息
-
----
-
-### 3. 监控与日志
-
-**启用慢查询日志**：
-
-```sql
--- 修改 postgresql.conf
-log_min_duration_statement = 1000  -- 记录超过 1 秒的查询
-
--- 重启后生效
+```
+\l          -- 列出所有数据库
+\c ecommerce  -- 切换到 ecommerce 数据库
+\dt         -- 列出当前数据库的所有表
+\d orders   -- 查看 orders 表的结构（列、类型、索引）
+\du         -- 列出所有角色（用户）
+\conninfo   -- 显示当前连接信息
+\q          -- 退出
 ```
 
-**查看当前活动连接**：
+有几个技巧值得一提。`\d+ orders` 会显示更多信息，包括表的存储参数和描述。`\x` 可以切换"扩展显示"模式，当列很多的时候（比如 `\d+` 的输出），扩展模式会把每一列的信息竖着排列，可读性好很多。
 
-```sql
-SELECT
-  pid,
-  usename,
-  application_name,
-  client_addr,
-  state,
-  query_start,
-  state_change,
-  query
-FROM pg_stat_activity
-WHERE state != 'idle';
-```
-
----
-
-## 常见问题
-
-### Q1: 忘记密码怎么办？
+如果你想执行一个 SQL 文件：
 
 ```bash
-# 1. 停止容器
-docker-compose stop postgres
-
-# 2. 以单用户模式启动
-docker run -it --rm \
-  -v postgres_data:/var/lib/postgresql/data \
-  postgres:16-alpine bash
-
-# 3. 在容器内修改密码
-psql -U dev
-ALTER USER dev WITH PASSWORD 'new_password';
-\q
-
-# 4. 正常启动容器
-docker-compose start postgres
+\i /path/to/migration.sql
 ```
 
----
+如果想把查询结果导出到文件：
 
-### Q2: 如何查看 PostgreSQL 版本？
+```
+\o /tmp/orders.csv
+COPY (SELECT * FROM orders ORDER BY created_at DESC LIMIT 100) TO STDOUT WITH CSV HEADER;
+\o
+```
+
+另外，psql 支持事务的自动提示。如果你执行了 `BEGIN` 但没有 `COMMIT` 或 `ROLLBACK` 就想退出，psql 会警告你：
+
+```
+WARNING: there is no transaction in progress
+```
+
+这个提示能帮你避免一个常见的坑：开了一个事务忘了关，导致表锁一直持有，其他查询全被阻塞。
+
+## 创建电商数据库
+
+现在环境搭好了，我们来做一些有实际意义的事 -- 创建电商系统的数据库和初始表结构。
+
+写一个 `init.sql` 文件放在项目根目录，Docker 首次启动时会自动执行：
 
 ```sql
--- 方式 1
-SELECT version();
+-- 创建应用用户（不用超级用户跑业务）
+CREATE USER app_dev WITH PASSWORD 'app_dev_pass';
 
--- 方式 2（在命令行）
-psql --version
+-- 创建电商数据库
+CREATE DATABASE ecommerce OWNER app_dev;
 
--- 方式 3
-SHOW server_version;
+-- 切换到电商数据库
+\c ecommerce;
+
+-- 商品分类表
+CREATE TABLE categories (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    slug VARCHAR(100) UNIQUE NOT NULL,
+    parent_id INTEGER REFERENCES categories(id),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 商品表（用 JSONB 存自定义属性）
+CREATE TABLE products (
+    id SERIAL PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    price NUMERIC(10, 2) NOT NULL CHECK (price >= 0),
+    stock INTEGER NOT NULL DEFAULT 0 CHECK (stock >= 0),
+    category_id INTEGER REFERENCES categories(id),
+    attributes JSONB DEFAULT '{}',  -- 自定义属性：颜色、尺码等
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 用户表
+CREATE TABLE users (
+    id SERIAL PRIMARY KEY,
+    email VARCHAR(255) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    full_name VARCHAR(100),
+    phone VARCHAR(20),
+    is_verified BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 订单表
+CREATE TABLE orders (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    status VARCHAR(20) NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'paid', 'shipped', 'delivered', 'cancelled')),
+    total_amount NUMERIC(10, 2) NOT NULL,
+    shipping_address JSONB NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 授权：app_dev 对 public schema 有完整权限
+GRANT ALL ON SCHEMA public TO app_dev;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO app_dev;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO app_dev;
+
+-- 确保未来创建的表也自动授权
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL ON TABLES TO app_dev;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL ON SEQUENCES TO app_dev;
 ```
 
----
+这里有几个值得注意的设计决策。
 
-### Q3: 数据库连接失败怎么办？
+`attributes` 列用了 JSONB 类型。假设你在卖手机，iPhone 15 Pro 的自定义属性可能是 `{"storage": "256GB", "color": "深空黑", "chip": "A17 Pro"}`，而一件羽绒服的属性可能是 `{"size": "L", "filling": "90%白鹅绒", "waterproof": true}`。传统做法是建一个 `product_attributes` 子表，每次查询都要 JOIN，JSONB 让你用一个列就解决了，而且 PostgreSQL 支持 GIN 索引，对 JSONB 内部字段建索引后查询性能也很好。
 
-**检查清单**：
+`shipping_address` 也用了 JSONB。地址结构在不同国家差异很大（有些国家没有省份、有些有邮编有些没有），用 JSONB 比拆七八个可空列灵活得多。
 
-```bash
-# 1. 检查容器是否运行
-docker-compose ps
+`TIMESTAMPTZ` 而不是 `TIMESTAMP`。后者存的是不带时区的时间戳，如果你从北京时间存了一条记录，换了 UTC 时区的服务器去读，时间就会错。`TIMESTAMPTZ` 内部统一转成 UTC 存储，取出来时根据当前会话的时区自动转换，避免了一大类时区 bug。
 
-# 2. 检查端口是否被占用
-lsof -i :5432
+## 角色和权限：为什么开发时别用超级用户
 
-# 3. 查看日志
-docker-compose logs postgres
+看上面的 init.sql，你会注意到我创建了一个 `app_dev` 用户，而不是直接用启动时设置的 `admin` 超级用户。这不是多此一举。
 
-# 4. 测试连接
-docker exec -it postgres_dev pg_isready -U dev
+PostgreSQL 的权限体系分几个层级：连接数据库的权限、在 schema 里创建对象的权限、对表的操作权限（SELECT / INSERT / UPDATE / DELETE）、对序列的权限（SERIAL 列自增需要）。超级用户绕过所有这些检查。
 
-# 5. 检查防火墙
-sudo ufw status
-```
+开发时用超级用户会有两个问题。第一是安全性 -- 你的应用代码里如果有一个 bug 导致了 SQL 注入，用超级用户连接的后果是不可控的。用受限用户至少把损害范围限制在了当前数据库。第二是"影子 bug" -- 某些操作在超级用户下能跑通，但部署到生产环境（用受限用户）就报权限错误，而你本地根本测不出来。
 
----
-
-### Q4: 如何清理测试数据？
+一个实用的角色划分方案：
 
 ```sql
--- 方式 1：删除所有数据（保留表结构）
-TRUNCATE TABLE users, orders, products RESTART IDENTITY CASCADE;
+-- 只读用户：给数据分析师或者 BI 工具用
+CREATE ROLE readonly WITH LOGIN PASSWORD 'readonly_pass';
+GRANT CONNECT ON DATABASE ecommerce TO readonly;
+GRANT USAGE ON SCHEMA public TO readonly;
+GRANT SELECT ON ALL TABLES IN SCHEMA public TO readonly;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT SELECT ON TABLES TO readonly;
 
--- 方式 2：删除并重建表
-DROP TABLE IF EXISTS users CASCADE;
-CREATE TABLE users (...);
-
--- 方式 3：删除整个 schema
-DROP SCHEMA public CASCADE;
-CREATE SCHEMA public;
-GRANT ALL ON SCHEMA public TO dev;
+-- 应用开发用户：日常开发用
+CREATE ROLE app_dev WITH LOGIN PASSWORD 'app_dev_pass';
+GRANT CONNECT ON DATABASE ecommerce TO app_dev;
+GRANT USAGE ON SCHEMA public TO app_dev;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO app_dev;
+GRANT ALL ON ALL SEQUENCES IN SCHEMA public TO app_dev;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL ON TABLES TO app_dev;
+ALTER DEFAULT PRIVILEGES IN SCHEMA public
+    GRANT ALL ON SEQUENCES TO app_dev;
 ```
 
----
+`ALTER DEFAULT PRIVILEGES` 这行很容易忘。它解决的问题是：你现在授权了所有已有的表，但以后新建的表呢？默认情况下，新建的表的所有者是创建者，其他角色没有任何权限。加了这行之后，以后新建的表会自动给对应角色授权。
 
-### Q5: 如何导出/导入数据？
+如果你有多个环境（开发、测试、生产），可以用 PostgreSQL 的"角色组"来简化管理：
 
-```bash
-# 导出数据库
-pg_dump -h localhost -U dev -d dev_db > dev_db.sql
+```sql
+-- 创建角色组
+CREATE ROLE app_users;
 
-# 导出特定表
-pg_dump -h localhost -U dev -d dev_db -t users > users.sql
+-- 把具体用户加入角色组
+GRANT app_users TO app_dev;
+GRANT app_users TO app_test;
+GRANT app_users TO app_prod;
 
-# 导入数据
-psql -h localhost -U dev -d dev_db < dev_db.sql
-
-# 使用 Docker
-docker exec -i postgres_dev pg_dump -U dev dev_db > backup.sql
-docker exec -i postgres_dev psql -U dev dev_db < backup.sql
+-- 只需要给角色组授权一次
+GRANT USAGE ON SCHEMA public TO app_users;
+GRANT ALL ON ALL TABLES IN SCHEMA public TO app_users;
 ```
 
----
+## 连接池：为什么不能每个请求都创建新连接
 
-## 总结
+PostgreSQL 的每个客户端连接都会 fork 一个操作系统进程来处理。这不是线程，是进程 -- 意味着每个连接都要分配独立的内存空间（大约 5-10MB），还要做上下文切换。PostgreSQL 默认的 `max_connections` 是 100，但建议实际并发连接数不要超过 CPU 核心数的 2-3 倍，否则 CPU 会在进程切换上浪费大量时间。
 
-本文我们从零开始搭建了 PostgreSQL 开发环境，学习了：
+在你的 Node.js / Python / Java 应用里，如果每个 HTTP 请求都创建一个新的数据库连接，用完就关，会出现几个问题：
 
-**核心概念**：
+- 连接建立本身有开销（TCP 握手、SSL 协商、认证），大约 5-50ms，高并发下会变成瓶颈。
+- 峰值流量时连接数可能瞬间打满 `max_connections`，新请求直接被拒绝。
+- 频繁创建和销毁连接给数据库带来额外压力。
 
-- PostgreSQL 的优势（vs MySQL）
-- 数据库层次结构（Cluster → Database → Schema → Table）
-- MVCC 并发控制
+解决方案是连接池。最常用的是 PgBouncer，它和 PostgreSQL 一样是开源的。
 
-**环境搭建**：
+在 Docker Compose 里加一个 PgBouncer 服务：
 
-- 使用 Docker Compose 快速搭建
-- 配置 pgAdmin 可视化工具
-- 配置 PgBouncer 连接池
+```yaml
+pgbouncer:
+  image: edoburu/pgbouncer
+  container_name: pgbouncer_ecommerce
+  environment:
+    DB_HOST: postgres
+    DB_PORT: 5432
+    DB_USER: admin
+    DB_PASSWORD: dev_only_not_production
+    DATABASES: "ecommerce = host=postgres port=5432 dbname=ecommerce"
+    POOL_MODE: transaction
+    MAX_CLIENT_CONN: 200
+    DEFAULT_POOL_SIZE: 20
+  ports:
+    - "6432:6432"
+  depends_on:
+    postgres:
+      condition: service_healthy
+```
 
-**基本操作**：
+这里的关键参数是 `POOL_MODE`。PgBouncer 支持三种模式：
 
-- psql 常用命令
-- 数据库/表/数据操作
-- 用户权限管理
+- **session**：一个客户端连接占用一个数据库连接，直到客户端断开。这基本等于没池化，只是做了一层转发。
+- **transaction**：一个客户端连接在事务开始时从池里取连接，事务结束后归还。这是最常用的模式。大部分时间里你的连接处于空闲状态（等应用代码处理逻辑、等客户端下一次请求），transaction 模式让多个客户端可以共享少量的数据库连接。
+- **statement**：每条 SQL 语句结束后就归还连接。限制最多，不是所有场景都能用（比如 `SET` 命令、事务内的多条语句）。
 
-**配置优化**：
+`DEFAULT_POOL_SIZE: 20` 意味着 PgBouncer 到 PostgreSQL 最多保持 20 个连接，但可以同时服务最多 200 个客户端连接（`MAX_CLIENT_CONN`）。你的应用代码连接 `localhost:6432` 而不是 `localhost:5432`，其他什么都不用改。
 
-- postgresql.conf 性能调优
-- pg_hba.conf 认证配置
-- 慢查询日志
+## 常用配置：shared_buffers、work_mem 什么意思
 
----
+PostgreSQL 的配置项非常多，但大部分用默认值就行。开发环境里你需要关注的其实就几个。
 
-## 下一步
+**shared_buffers** -- 共享缓冲区，PostgreSQL 的数据缓存。默认 128MB，生产环境一般设为物理内存的 25%。你的 Mac 如果有 16GB 内存，设 4GB 差不多。这不是设越大越好 -- PostgreSQL 还依赖操作系统的文件系统缓存，shared_buffers 吃太多反而会挤占 OS 缓存的空间。
 
-掌握了 PostgreSQL 的基本操作后，下一步我们将学习：
+**work_mem** -- 每个查询操作（排序、哈希表、合并连接）能用的最大内存。默认 4MB。注意这个值是"每个操作"不是"每个查询" -- 一条复杂的 SQL 可能包含多个排序和哈希操作，每个都能用这么多。如果你的查询里有一个大表的 `ORDER BY`，4MB 可能不够用，PostgreSQL 就会把数据溢出到磁盘，性能会断崖式下降。开发环境设 16-32MB 通常够用，但要记住：这个值乘以 `max_connections` 再乘以每连接平均操作数，不能超过物理内存。
 
-**《04. 表设计与数据类型》**：如何设计合理的数据库表结构，选择合适的数据类型，避免常见的设计陷阱。
+**effective_cache_size** -- 这不是一个实际的内存分配参数，它只是告诉 PostgreSQL 的查询优化器："系统大概有多少缓存可用（包括 shared_buffers + OS 文件缓存）。"优化器根据这个值决定是用索引扫描还是顺序扫描。一般设为物理内存的 50-75%。
 
-你将学习：
+**maintenance_work_mem** -- 维护操作（VACUUM、CREATE INDEX、ALTER TABLE）能用的内存。默认 64MB。如果你要在一个大表上建索引，调大到 256MB 或更多会快不少。这个参数不影响日常查询性能，只在维护操作时生效。
 
-- 📊 表设计原则与命名规范
-- 🔢 PostgreSQL 丰富的数据类型
-- 🔒 约束类型（NOT NULL、UNIQUE、CHECK）
-- 🎯 主键设计（UUID vs 自增 ID）
+在 Docker 环境里，你可以通过命令行参数或者自定义配置文件来修改这些值。最简单的方式是在 docker-compose.yml 的 `command` 里覆盖：
 
-继续关注，让我们一起系统学习数据库设计！
+```yaml
+postgres:
+  image: postgres:16-alpine
+  command:
+    - "postgres"
+    - "-c"
+    - "shared_buffers=256MB"
+    - "-c"
+    - "work_mem=16MB"
+    - "-c"
+    - "effective_cache_size=512MB"
+    - "-c"
+    - "log_min_duration_statement=500"
+```
+
+最后一行 `log_min_duration_statement=500` 会把所有执行时间超过 500ms 的 SQL 记录到日志里。开发时开着这个参数，帮你发现哪些查询需要优化，不需要单独装监控工具。
+
+## 什么时候该用其他方案
+
+Docker Compose 适合本地开发和测试环境。但到了生产环境，你需要考虑更多事情：自动备份、故障恢复、主从复制、连接池的高可用。这些不是 Docker Compose 能搞定的，通常会用云数据库（RDS、Cloud SQL、Supabase）或者 Kubernetes + Operator 来管理。
+
+如果你在做数据科学或者数据分析，直接用 Python + SQLAlchemy 连接 PostgreSQL 可能比 Docker Compose 更简单。Jupyter Notebook 里直接写 SQL 查询，数据读进 DataFrame 做分析，不需要额外的容器化。
+
+如果你只是想快速体验一下 SQL 语法，不想装任何东西，可以用 [DB Fiddle](https://www.db-fiddle.com/) 或者 [SQL Fiddle](http://sqlfiddle.com/) 这类在线工具，浏览器里就能跑 SQL。但这种方式没法持久化数据，也没法体验真实的配置和权限管理。
+
+回到我们团队的选择：Docker Compose + PostgreSQL + PgBouncer 这套组合，在开发阶段够用了。每个人的环境一致，初始化数据通过 init.sql 版本控制，新同事 clone 下来一条 `docker compose up -d` 就能跑。后面我们会在这套环境上建表、写查询、做优化，所有实战都基于这个基础。

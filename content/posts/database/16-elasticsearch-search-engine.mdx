@@ -1,8 +1,8 @@
 ---
-title: "16. Elasticsearch 全文搜索：强大的搜索引擎"
+title: "16. Elasticsearch：商品搜索的正确姿势"
 date: "2026-03-19"
-summary: "掌握 Elasticsearch 的核心概念和使用方法，实现强大的全文搜索功能"
-tags: ["Elasticsearch", "全文搜索", "搜索引擎", "数据分析"]
+summary: "用 Elasticsearch 实现电商商品搜索——中文分词、多字段匹配、搜索高亮、与 PostgreSQL 的数据同步"
+tags: ["Elasticsearch", "全文搜索", "中文分词", "倒排索引"]
 category: "数据库"
 cover: ""
 draft: false
@@ -10,334 +10,246 @@ series: "数据库渐进式学习路线"
 seriesOrder: 16
 ---
 
-## 前言
+上篇讲了 Redis 缓存。这篇来聊搜索——电商系统里一个特殊但非常重要的查询场景。
 
-PostgreSQL 的全文搜索不够强大？需要实现复杂的搜索功能？Elasticsearch 是最流行的开源搜索引擎，提供了强大的全文搜索、分布式架构和实时分析能力。
+你可能已经遇到了：用 PostgreSQL 的 `LIKE '%降噪耳机%'` 做商品搜索，用户搜"降噪耳机"能搜到，但搜"主动降噪无线耳机"就搜不到了。搜"耳机降噪"也搜不到——因为 LIKE 是精确子串匹配，不支持分词和语义匹配。中文分词更是一塌糊涂——"索尼耳机"可能被切成"索"、"尼"、"耳"、"机"四个单字，搜"索尼"匹配不到。
 
-本文将系统讲解 Elasticsearch 的核心概念和使用方法，帮你实现强大的搜索功能。
+MongoDB 的文本索引稍微好一点，支持英文的分词和词干提取（searching 和 search 被视为同一个词），但中文分词还是不行，也没有相关性排序。
 
----
+Elasticsearch 就是干这个的。它是一个专门为全文搜索设计的分布式搜索引擎，支持中文分词、相关性排序、模糊匹配、搜索高亮、多维度聚合。电商、内容平台、日志分析——凡是需要"像 Google 一样搜索"的场景，ES 是标准答案。
 
-## 核心概念
+## 倒排索引：ES 快的核心
 
-### 为什么选择 Elasticsearch？
+理解 ES 之前，先理解它为什么比 LIKE 快。
 
-**Elasticsearch 优势**：
+LIKE 查询的工作方式是：遍历每一行，检查字段值是否包含搜索词。100 万个商品，最坏情况要比较 100 万次。
 
-- ✅ 强大的全文搜索
-- ✅ 分布式架构
-- ✅ 实时性
-- ✅ 可扩展性
-- ✅ 丰富的查询 DSL
+ES 用的是倒排索引（Inverted Index）。它的工作方式是：**先对文档内容做分词，然后建立"词 → 文档"的映射表**。
 
-**vs PostgreSQL 全文搜索**：
+假设你有三个商品：
 
-- PostgreSQL：简单搜索场景
-- Elasticsearch：复杂搜索、大数据量
-
----
-
-## 核心概念
-
-**1. Index（索引）**
-
-- 类似关系型数据库的数据库
-- 存储相似类型的文档
-
-**2. Document（文档）**
-
-- JSON 格式的数据记录
-- 类似关系型数据库的行
-
-**3. Field（字段）**
-
-- 文档中的键值对
-- 类似关系型数据库的列
-
-**4. Mapping（映射）**
-
-- 定义文档结构和字段类型
-- 类似关系型数据库的 Schema
-
-**5. Analyzer（分析器）**
-
-- 分词器
-- 用于全文搜索
-
----
-
-## 快速开始
-
-### 1. Docker Compose 配置
-
-```yaml
-version: "3.8"
-
-services:
-  elasticsearch:
-    image: elasticsearch:8.11.0
-    container_name: elasticsearch_dev
-    environment:
-      - discovery.type=single-node
-      - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
-    ports:
-      - "9200:9200"
-    volumes:
-      - es_data:/usr/share/elasticsearch/data
-
-  kibana:
-    image: kibana:8.11.0
-    container_name: kibana_dev
-    environment:
-      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
-    ports:
-      - "5601:5601"
-    depends_on:
-      - elasticsearch
-
-volumes:
-  es_data:
+```
+商品 42: "Sony WH-1000XM5 主动降噪头戴式无线蓝牙耳机"
+商品 67: "Apple AirPods Pro 2 主动降噪入耳式无线耳机"
+商品 88: "Bose QC Ultra 主动降噪头戴式无线消噪耳机"
 ```
 
----
+ES 的分词器（配合中文分词插件）会把它们切成词，然后建立倒排索引：
 
-### 2. 连接 Elasticsearch
-
-```typescript
-import { Client } from "@elastic/elasticsearch";
-
-const client = new Client({
-  node: "http://localhost:9200",
-});
+```
+"降噪"   → [商品 42, 商品 67, 商品 88]
+"耳机"   → [商品 42, 商品 67, 商品 88]
+"头戴式" → [商品 42, 商品 88]
+"无线"   → [商品 42, 商品 67, 商品 88]
+"蓝牙"   → [商品 42]
+"索尼"   → [商品 42]
+"入耳式" → [商品 67]
+"苹果"   → [商品 67]
+...
 ```
 
----
+用户搜"降噪 蓝牙 耳机"时，ES 分别在倒排索引里查找这三个词，找到对应的文档列表，然后做交集——同时包含这三个词的文档排在前面。整个过程只需要几次索引查找和集合运算，不需要遍历所有文档。
 
-## 基本操作
+这就是 ES 比 LIKE 快几十倍的原因：LIKE 是"在文档里找词"，ES 是"通过词找文档"。
 
-### 1. 创建索引
+## Mapping 设计：text vs keyword
 
-```typescript
-await client.indices.create({
-  index: "products",
-  body: {
-    mappings: {
-      properties: {
-        name: { type: "text", analyzer: "ik_max_word" },
-        description: { type: "text", analyzer: "ik_max_word" },
-        price: { type: "double" },
-        category: { type: "keyword" },
-        tags: { type: "keyword" },
-        createdAt: { type: "date" },
-      },
-    },
+在 ES 里存数据之前，需要定义 Mapping——类似数据库的 Schema。Mapping 里最重要的一个概念是字段类型。
+
+**text** 类型：用于需要全文搜索的字段。ES 会对 text 字段做分词，然后建立倒排索引。
+
+**keyword** 类型：用于精确匹配和聚合的字段。ES 不会对 keyword 做分词，整个值作为一个整体索引。
+
+电商商品搜索的 Mapping：
+
+```json
+{
+  "mappings": {
+    "properties": {
+      "productId": { "type": "keyword" },
+      "name": { "type": "text", "analyzer": "ik_max_word" },
+      "description": { "type": "text", "analyzer": "ik_max_word" },
+      "category": { "type": "keyword" },
+      "brand": { "type": "keyword" },
+      "price": { "type": "float" },
+      "stock": { "type": "integer" },
+      "isActive": { "type": "boolean" },
+      "createdAt": { "type": "date" }
+    }
+  }
+}
+```
+
+`name` 用 `text` 类型 + `ik_max_word` 分词器——这是中文分词插件 IK Analyzer 的最细粒度分词模式，会把"主动降噪耳机"切成"主动"、"降噪"、"耳机"等尽可能多的词，提高搜索的召回率。
+
+`category` 和 `brand` 用 `keyword` 类型——分类和品牌不需要分词，用户搜"手机"不应该匹配到"手机壳"这个分类。keyword 支持精确匹配、排序和聚合。
+
+`price` 和 `stock` 用数值类型——ES 对数值类型支持范围查询和排序。
+
+有些字段可能需要同时支持全文搜索和精确匹配。比如 `name` 既要能分词搜索（搜"耳机"能匹配），也要能精确匹配（按商品名排序去重）。这种情况下可以用 `fields` 定义多种类型：
+
+```json
+"name": {
+  "type": "text",
+  "analyzer": "ik_max_word",
+  "fields": {
+    "keyword": { "type": "keyword" }
+  }
+}
+```
+
+搜索时用 `name`（text 类型，分词搜索），聚合排序时用 `name.keyword`（keyword 类型，精确值）。
+
+## 查询 DSL：match、term、bool
+
+ES 的查询用 JSON 格式的 DSL（Domain Specific Language）表达。虽然不如 SQL 直观，但表达能力更强。
+
+**match 查询**：对 text 字段做全文搜索，会先对搜索词分词，然后在倒排索引里查找。
+
+```json
+{
+  "query": {
+    "match": {
+      "name": "降噪蓝牙耳机"
+    }
+  }
+}
+```
+
+搜索词"降噪蓝牙耳机"会被分词成"降噪"、"蓝牙"、"耳机"三个词，ES 找到包含这些词的商品，按相关性排序。包含词越多的排越前。
+
+**term 查询**：精确匹配，不分词。适合 keyword 类型的字段。
+
+```json
+{
+  "query": {
+    "term": { "category": "数码" }
+  }
+}
+```
+
+搜"数码"只会精确匹配"数码"，不会匹配"数码产品"或"数码配件"。因为 keyword 类型不分词，整个值是一个整体。
+
+**bool 查询**：组合多个查询条件，类似 SQL 的 WHERE ... AND/OR。
+
+```json
+{
+  "query": {
+    "bool": {
+      "must": [{ "match": { "name": "降噪耳机" } }],
+      "filter": [
+        { "term": { "isActive": true } },
+        { "range": { "price": { "gte": 100, "lte": 3000 } } }
+      ]
+    }
+  }
+}
+```
+
+`must` 里的条件参与相关性评分（匹配程度越高分越高），`filter` 里的条件只做过滤不参与评分（"要还是不要"，没有"多匹配一点"的概念）。`filter` 比 `must` 快——ES 可以缓存 filter 的结果，不需要每次重新计算。
+
+还有 `should`（类似 OR）和 `must_not`（类似 NOT）：
+
+```json
+{
+  "query": {
+    "bool": {
+      "should": [
+        { "match": { "name": "降噪耳机" } },
+        { "match": { "description": "降噪耳机" } }
+      ],
+      "must_not": [{ "term": { "category": "配件" } }]
+    }
+  }
+}
+```
+
+## 搜索高亮和多维度筛选
+
+电商搜索页通常需要：搜索关键词在结果中高亮显示，同时支持按分类、价格区间、品牌等条件筛选。
+
+```json
+{
+  "query": {
+    "bool": {
+      "must": [{ "match": { "name": "降噪耳机" } }],
+      "filter": [
+        { "terms": { "category": ["数码", "电脑配件"] } },
+        { "range": { "price": { "gte": 200, "lte": 5000 } } },
+        { "term": { "brand": "Sony" } }
+      ]
+    }
   },
-});
-```
-
----
-
-### 2. 插入文档
-
-```typescript
-// 插入单个文档
-await client.index({
-  index: "products",
-  id: "prod-1",
-  body: {
-    name: "Apple iPhone 15",
-    description: "最新款 iPhone，搭载 A17 芯片",
-    price: 7999,
-    category: "手机",
-    tags: ["Apple", "iPhone", "5G"],
-    createdAt: new Date(),
+  "highlight": {
+    "fields": {
+      "name": {},
+      "description": {}
+    }
   },
-});
-
-// 批量插入
-const operations = products.flatMap((product) => [
-  { index: { _index: "products", _id: product.id } },
-  product,
-]);
-await client.bulk({ body: operations });
+  "aggs": {
+    "categories": { "terms": { "field": "category" } },
+    "price_ranges": {
+      "range": {
+        "field": "price",
+        "ranges": [{ "to": 500 }, { "from": 500, "to": 2000 }, { "from": 2000 }]
+      }
+    }
+  }
+}
 ```
 
----
+`highlight` 让 ES 在返回结果中标记匹配的文本，前端可以用 `<em>` 标签做高亮。`aggs`（聚合）在返回搜索结果的同时，返回每个分类有多少匹配商品、每个价格区间有多少匹配商品——前端用这些数据来渲染筛选面板。
 
-### 3. 查询文档
+## 与 PostgreSQL 的数据同步
 
-```typescript
-// 根据 ID 查询
-const result = await client.get({
-  index: "products",
-  id: "prod-1",
-});
-```
+商品数据存在 PostgreSQL 里，搜索在 ES 里。问题是：PostgreSQL 里的数据更新了（价格改了、商品下架了），ES 里的数据怎么同步？
 
----
+有三种方案。
 
-## 查询 DSL
-
-### 1. 全文搜索
+**方案一：应用层双写**。在"更新商品"的代码里，同时更新 PostgreSQL 和 ES。
 
 ```typescript
-const result = await client.search({
-  index: "products",
-  body: {
-    query: {
-      multi_match: {
-        query: "iPhone",
-        fields: ["name^2", "description"],
-        fuzziness: "AUTO",
-      },
-    },
-    highlight: {
-      fields: {
-        name: {},
-        description: {},
-      },
-    },
-  },
-});
-```
+async function updateProduct(id: number, data: any) {
+  // 1. 更新 PostgreSQL
+  await prisma.product.update({ where: { id }, data });
 
----
-
-### 2. 布尔查询
-
-```typescript
-const result = await client.search({
-  index: "products",
-  body: {
-    query: {
-      bool: {
-        must: [{ match: { name: "iPhone" } }],
-        should: [{ term: { tags: "Apple" } }, { term: { category: "手机" } }],
-        filter: [{ range: { price: { lte: 10000 } } }],
-      },
-    },
-  },
-});
-```
-
----
-
-### 3. 聚合查询
-
-```typescript
-const result = await client.search({
-  index: "products",
-  body: {
-    size: 0,
-    aggregations: {
-      categories: {
-        terms: { field: "category" },
-      },
-      priceRanges: {
-        range: {
-          field: "price",
-          ranges: [{ to: 1000 }, { from: 1000, to: 5000 }, { from: 5000 }],
-        },
-      },
-      stats: {
-        stats: { field: "price" },
-      },
-    },
-  },
-});
-```
-
----
-
-## 与 PostgreSQL 集成
-
-### 1. 应用层同步
-
-```typescript
-async function syncProductToES(product: Product) {
-  // 1. 写入 PostgreSQL
-  await prisma.product.create({ data: product });
-
-  // 2. 同步到 Elasticsearch
-  await client.index({
+  // 2. 更新 ES
+  await esClient.update({
     index: "products",
-    id: product.id,
-    body: product,
+    id: String(id),
+    body: { doc: data },
   });
 }
 ```
 
----
+优点是简单直接。缺点是如果有多个服务都在更新商品数据，你得在每个服务里都加上 ES 同步逻辑，容易遗漏。
 
-### 2. 使用 CDC 工具（Debezium）
+**方案二：数据库触发器 + 消息队列**。在 PostgreSQL 里建触发器，数据变更时往消息队列发一条消息，消费者监听队列更新 ES。
 
-- 实时同步 PostgreSQL 到 Elasticsearch
-- 无需应用层干预
+这个方案解耦了 PostgreSQL 和 ES——应用代码不需要关心 ES 同步。但引入了消息队列（Kafka、RabbitMQ）的运维复杂度。
 
----
+**方案三：CDC（Change Data Capture）**。用 Debezium 之类的工具监听 PostgreSQL 的 WAL（预写日志），自动捕获数据变更，同步到 ES。
 
-## 最佳实践
+CDC 是最"不侵入"的方案——应用代码完全不需要改动，PostgreSQL 也不需要建触发器。Debezium 作为独立进程运行，读取 WAL 里的变更事件，转发到 Kafka，再由 Kafka Connect 把数据写入 ES。
 
-### 1. 索引设计
+对于大多数项目，**应用层双写**就够用了——简单、可控、不需要额外的基础设施。如果你的系统有多个服务都在写数据库，或者对数据一致性要求很高，再考虑 CDC。
 
-- ✅ 合理选择字段类型
-- ✅ 使用合适的分析器
-- ✅ 设置分片和副本
+## 什么时候该上 ES
 
----
+Elasticsearch 不是必须的。它能解决搜索问题，但引入了额外的运维复杂度——ES 集群需要内存（建议至少 8GB）、需要监控索引状态、需要处理数据同步。
 
-### 2. 查询优化
+**可以不上 ES 的情况**：商品数量在几万以内、搜索需求简单（只需要名称模糊匹配）、用户量不大。PostgreSQL 的 `pg_trgm` 扩展（三元组匹配）能支持基本的模糊搜索，对中文也有一定效果。
 
-- ✅ 使用 filter 而不是 bool 查询
-- ✅ 避免深度分页
-- ✅ 使用聚合缓存
+**该上 ES 的情况**：商品数量超过 10 万、需要中文分词和语义搜索、需要相关性排序、需要搜索建议（"搜'耳'自动提示'耳机'、'耳麦'）、需要搜索结果的多维度聚合。
 
----
+一个实用的判断标准：如果你的搜索功能直接影响用户的购买决策（大多数电商都是），搜索质量就是核心体验。这时候 ES 的投入是值得的。
 
-## 常见问题
+## 小结
 
-### Q1: Elasticsearch vs PostgreSQL？
+Elasticsearch 用倒排索引实现全文搜索，核心思路是"通过词找文档"而不是"在文档里找词"。Mapping 设计的关键是区分 text（分词搜索）和 keyword（精确匹配），中文搜索需要配合 IK 分词器。
 
-- 全文搜索 → Elasticsearch
-- 结构化数据 → PostgreSQL
-- 结合使用
+查询 DSL 的 `match` 做全文搜索，`term` 做精确匹配，`bool` 组合条件。`filter` 比 `must` 快，因为它不参与相关性评分，结果可以被缓存。
 
----
+ES 和 PostgreSQL 的数据同步，简单项目用应用层双写，复杂项目用 CDC。ES 不是必须的——数据量小、搜索需求简单的时候，PostgreSQL 的 `pg_trgm` 就够用。
 
-## 总结
-
-本文系统学习了 Elasticsearch：
-
-**核心概念**：
-
-- Index、Document、Field
-- Mapping、Analyzer
-
-**基本操作**：
-
-- 创建索引
-- 插入文档
-- 查询文档
-
-**查询 DSL**：
-
-- 全文搜索
-- 布尔查询
-- 聚合查询
-
----
-
-## 下一步
-
-掌握了 Elasticsearch 后，下一步我们将学习：
-
-**《17. 数据库备份与恢复》**：掌握数据库备份和恢复方法。
-
-你将学习：
-
-- 💾 备份类型与策略
-- 🛠️ 备份工具使用
-- 🔄 恢复演练
-
-继续关注，让我们一起学习数据保护！
+扩展篇到此结束。最后一篇实战篇我们聊备份恢复和监控调优——让这套数据库架构真正能跑在生产环境。

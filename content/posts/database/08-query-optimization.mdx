@@ -1,8 +1,8 @@
 ---
-title: "08. SQL 查询优化：让查询速度提升 10 倍的实战技巧"
+title: "08. SQL 查询优化实战"
 date: "2026-03-19"
-summary: "掌握 SQL 查询优化的核心技巧，通过实际案例让查询速度大幅提升"
-tags: ["PostgreSQL", "SQL优化", "性能调优", "查询优化"]
+summary: "用电商系统的真实慢查询场景，掌握深分页、N+1 查询、批量操作等常见性能问题的解决方法"
+tags: ["PostgreSQL", "SQL 优化", "性能调优", "深分页"]
 category: "数据库"
 cover: ""
 draft: false
@@ -10,405 +10,251 @@ series: "数据库渐进式学习路线"
 seriesOrder: 8
 ---
 
-## 前言
+上一篇讲了索引原理。索引建好了，理论上查询应该快了。但现实往往是：你加了索引，查询还是慢；你改了 WHERE 条件，反而更慢了；你觉得自己写的 SQL 很合理，EXPLAIN 的结果告诉你数据库根本没用你的索引。
 
-你的 SQL 查询慢吗？一个简单的优化可能让速度提升 10 倍！
+这篇我们不讲理论了，直接拿电商系统的几个典型慢查询来开刀。每个场景都是一个真实会踩到的坑。
 
-查询优化是数据库性能提升最直接、最有效的方法。本文将通过实际案例，系统讲解 SQL 查询优化的技巧和最佳实践。
+## 深分页：OFFSET 10000 为什么慢
 
----
-
-## 核心概念
-
-### 查询优化的重要性
-
-**优化前后对比**：
-
-- 慢查询：5 秒
-- 优化后：0.1 秒
-- 提升：50 倍
-
-**优化方向**：
-
-- ✅ 减少返回数据量
-- ✅ 使用索引
-- ✅ 优化 JOIN 顺序
-- ✅ 避免全表扫描
-
----
-
-## 实战优化案例
-
-### 案例 1：避免 SELECT \*
+电商后台有一个"所有订单"的分页列表。运营翻到第 500 页，每页 20 条，SQL 大概是这样：
 
 ```sql
--- ❌ 优化前（查询所有列）
-SELECT * FROM orders WHERE user_id = 'user-1';
-
--- ✅ 优化后（只查询需要的列）
-SELECT id, order_number, total, status
-FROM orders
-WHERE user_id = 'user-1';
-
--- 性能提升：2-5 倍
+SELECT o.id, o.order_number, o.total, o.status, u.full_name
+FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.status != 'cancelled'
+ORDER BY o.created_at DESC
+OFFSET 10000 LIMIT 20;
 ```
 
-**原因**：
+你给 `created_at` 建了索引，给 `user_id` 也建了索引。但这个查询还是跑了 2 秒。
 
-- 减少网络传输
-- 减少内存占用
-- 可能使用覆盖索引
+问题出在 `OFFSET 10000`。数据库的处理方式是：先按 `created_at DESC` 排序，取前 10020 行，然后扔掉前 10000 行，返回最后 20 行。不管你只要 20 行还是 100 行，数据库都得先找到前 10000 行——这些行要从磁盘读出来、排序、过滤，然后丢弃。页码越大，要丢弃的行越多，查询越慢。
 
----
-
-### 案例 2：使用 LIMIT
+这就是深分页问题。解决方法是用"游标分页"（也叫 keyset pagination）——不用 OFFSET，而是记住上一页最后一条记录的位置，从这个位置开始取下一页：
 
 ```sql
--- ❌ 优化前（返回所有数据）
-SELECT * FROM orders ORDER BY created_at DESC;
-
--- ✅ 优化后（限制返回数量）
-SELECT * FROM orders
-ORDER BY created_at DESC
+-- 第一页：正常取
+SELECT o.id, o.order_number, o.total, o.status, u.full_name
+FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.status != 'cancelled'
+ORDER BY o.created_at DESC, o.id DESC
 LIMIT 20;
 
--- 性能提升：10-100 倍
+-- 第二页：用上一页最后一条的 created_at 和 id 作为起点
+SELECT o.id, o.order_number, o.total, o.status, u.full_name
+FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.status != 'cancelled'
+  AND (o.created_at, o.id) < ('2025-03-20 14:30:00', 9876)
+ORDER BY o.created_at DESC, o.id DESC
+LIMIT 20;
 ```
 
----
+`(o.created_at, o.id) < ('2025-03-20 14:30:00', 9876)` 的意思是：找到 `created_at` 比上一页最后一条更早的记录，如果 `created_at` 相同则找 `id` 更小的。这样数据库可以直接从索引定位到起始位置，不需要跳过前面的所有行。
 
-### 案例 3：避免在 WHERE 中使用函数
+游标分页的缺点是不能直接跳到任意页——你必须从第一页开始一页一页翻。但对于"浏览型"的分页（比如订单列表、商品列表、消息列表），用户通常就是一页一页往下翻的，游标分页完全够用。只有"跳页型"的分页（比如后台数据管理的"跳到第 50 页"）才需要 OFFSET。
+
+如果你确实需要 OFFSET 分页，有一个折中方案：用"延迟 JOIN"。先只查主表的 ID，分页后再 JOIN 其他表：
 
 ```sql
--- ❌ 优化前（函数包裹索引列）
-SELECT * FROM users WHERE LOWER(email) = 'user@example.com';
+-- 先分页取 ID（只扫描 orders 表的索引，不 JOIN）
+SELECT o.id
+FROM orders o
+WHERE o.status != 'cancelled'
+ORDER BY o.created_at DESC
+OFFSET 10000 LIMIT 20;
 
--- ✅ 优化后（直接比较）
-SELECT * FROM users WHERE email = 'user@example.com';
-
--- 或者创建表达式索引
-CREATE INDEX idx_users_lower_email ON users(LOWER(email));
+-- 再用这些 ID 去 JOIN
+SELECT o.id, o.order_number, o.total, u.full_name
+FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.id IN (/* 上面查到的 20 个 ID */);
 ```
 
----
+这样深分页的代价只是扫描 orders 表的索引，不需要 JOIN users 表。对于第 500 页可能还是慢，但比同时 JOIN 两张表的深分页要快得多。
 
-### 案例 4：使用 EXISTS 替代 IN
+## N+1 查询：先查 100 个订单，再逐个查用户
+
+这是 ORM 用户最容易犯的错误。假设你在写一个订单列表的 API，代码是这样的：
+
+```javascript
+// 第 1 次查询：获取 20 个订单
+const orders = await prisma.order.findMany({
+  take: 20,
+  orderBy: { createdAt: "desc" },
+});
+
+// 接下来 20 次查询：逐个查每个订单的用户
+for (const order of orders) {
+  const user = await prisma.user.findUnique({
+    where: { id: order.userId },
+  });
+  order.user = user;
+}
+```
+
+这段代码看起来没问题，但执行了 21 次数据库查询——1 次查订单 + 20 次查用户。如果每查询一次需要 5ms，总共就是 105ms。数据量更大的时候（100 个订单），就是 505ms。
+
+这就是 N+1 查询。N 是主查询的结果数，1 是主查询本身。解决办法很简单：一次查出来。
+
+```javascript
+// 1 次查询搞定
+const orders = await prisma.order.findMany({
+  take: 20,
+  orderBy: { createdAt: "desc" },
+  include: { user: true }, // 一次 JOIN 把用户信息也查出来
+});
+```
+
+Prisma 的 `include` 会生成一条带 JOIN 的 SQL，一次查询就拿到所有数据。在纯 SQL 里等价于：
 
 ```sql
--- ❌ 优化前（IN 子查询）
-SELECT * FROM orders
-WHERE user_id IN (SELECT id FROM users WHERE is_verified = TRUE);
+SELECT o.*, u.id AS user_id, u.full_name, u.email
+FROM orders o
+JOIN users u ON o.user_id = u.id
+ORDER BY o.created_at DESC
+LIMIT 20;
+```
 
--- ✅ 优化后（EXISTS 子查询）
-SELECT * FROM orders o
+N+1 查询的隐蔽之处在于：单次测试的时候你可能感觉不到慢（每个查询 5ms，总共 105ms 还能接受），但并发上来之后，21 个查询 × 100 个并发请求 = 2100 个数据库查询，连接池可能直接被打满。
+
+判断你的代码有没有 N+1 查询的方法很简单：看日志里有没有大量相似结构的查询。如果你看到 20 条 `SELECT * FROM users WHERE id = ?`，只是参数不同，那就是 N+1。
+
+## EXISTS vs IN：不是 EXISTS 一定快
+
+很多人听过"EXISTS 比 IN 快"这个说法，然后在所有子查询场景都用 EXISTS。这个说法的来源是：在某些数据库（特别是 Oracle）里，EXISTS 可以利用索引做半连接（semi-join），而 IN 会先把子查询的结果全部计算出来放到一个临时表里，再和外表做匹配。如果子查询返回大量数据，IN 的临时表会很大。
+
+但在 PostgreSQL 里，优化器对 EXISTS 和 IN 的处理方式基本一样——它会根据统计信息自动选择最优的执行计划。所以"EXISTS 一定比 IN 快"在 PostgreSQL 里不成立。
+
+实际选择标准是语义上的：你想表达"存在"用 EXISTS，想表达"属于某个集合"用 IN。
+
+```sql
+-- 查询"有已付款订单的用户"——语义是"存在"
+SELECT * FROM users u
 WHERE EXISTS (
-  SELECT 1 FROM users u
-  WHERE u.id = o.user_id AND u.is_verified = TRUE
+    SELECT 1 FROM orders o
+    WHERE o.user_id = u.id AND o.status = 'paid'
 );
 
--- 性能提升：2-10 倍
+-- 查询"在特定城市注册的用户"——语义是"属于"
+SELECT * FROM users
+WHERE city IN ('北京', '上海', '广州', '深圳');
 ```
 
-**原因**：
+两种写法的性能差异通常可以忽略。真正影响性能的是子查询里的数据量和你有没有建合适的索引。如果 `orders.user_id` 有索引，两种写法都会走索引，都很快。如果没有索引，两种写法都是全表扫描，都很慢。
 
-- EXISTS 只要找到一条就停止
-- IN 需要扫描所有结果
+有一个需要注意的情况：当子查询返回 NULL 值时，IN 和 EXISTS 的行为不同。`IN (NULL, 1, 2)` 的结果是"匹配 1 或 2 或未知"——因为 NULL 的比较结果是 NULL（不是 TRUE 也不是 FALSE），所以 `NOT IN (NULL, 1, 2)` 永远不会返回 TRUE。如果你不确定子查询会不会返回 NULL，用 EXISTS 更安全。
 
----
+## UNION ALL vs UNION
 
-### 案例 5：使用 UNION ALL 替代 UNION
+你需要合并两个查询的结果时，`UNION` 会去掉重复行，`UNION ALL` 不会。
 
 ```sql
--- ❌ 优化前（UNION 去重排序）
-SELECT email FROM users_a
+-- UNION：去重（需要排序来识别重复行，开销大）
+SELECT user_id FROM orders WHERE status = 'paid'
 UNION
-SELECT email FROM users_b;
+SELECT user_id FROM orders WHERE status = 'shipped';
 
--- ✅ 优化后（UNION ALL 不去重）
-SELECT email FROM users_a
+-- UNION ALL：不去重（直接拼接，快得多）
+SELECT user_id FROM orders WHERE status = 'paid'
 UNION ALL
-SELECT email FROM users_b;
-
--- 性能提升：5-20 倍
+SELECT user_id FROM orders WHERE status = 'shipped';
 ```
 
-**注意**：
+如果一个订单不可能同时是 `paid` 和 `shipped`（状态是排他的），那 `UNION` 的去重操作就是浪费——根本不会有重复行，用 `UNION ALL` 就好。
 
-- UNION ALL 不去重，如果数据本身不重复可以用
-- 如果需要去重，必须用 UNION
+很多开发者习惯性用 `UNION`，觉得"去重更安全"。但 UNION 的去重需要做一次排序（或哈希聚合），当结果集很大的时候，这个排序可能比两个查询本身还慢。除非你确实需要去重，否则一律用 `UNION ALL`。
 
----
+## 批量操作：单条 INSERT vs 批量 INSERT
 
-### 案例 6：分页优化
+电商系统有一个常见操作：用户下了一单，包含 3 件商品。你需要往 order_items 表插入 3 条记录。
 
-```sql
--- ❌ 优化前（深分页慢）
-SELECT * FROM orders
-ORDER BY created_at DESC
-LIMIT 20 OFFSET 10000;
+最直觉的写法是：
 
--- ✅ 优化后（游标分页）
-SELECT * FROM orders
-WHERE created_at < '2024-01-15 10:00:00'
-ORDER BY created_at DESC
-LIMIT 20;
-
--- 性能提升：100-1000 倍（深分页场景）
-```
-
-**游标分页实现**：
-
-```typescript
-// 前端
-const [posts, setPosts] = useState([])
-const [cursor, setCursor] = useState(null)
-
-// 后端
-app.get('/posts', async (req, res) => {
-  const { cursor, limit = 20 } = req.query
-
-  const posts = await prisma.post.findMany({
-    take: limit,
-    ...(cursor && {
-      skip: 1, // 跳过游标本身
-      cursor: { id: cursor }
+```javascript
+for (const item of orderItems) {
+  await prisma.orderItem.create({
+    data: {
+      orderId: order.id,
+      productId: item.productId,
+      quantity: item.quantity,
+      unitPrice: item.unitPrice,
     },
-    orderBy: { createdAt: 'desc' }
-  })
-
-  res.json({
-    posts,
-    nextCursor: posts[posts.length - 1]?.id
-  })
-})
+  });
+}
 ```
 
----
+这会执行 3 次 INSERT，每次 INSERT 都是一次网络往返 + 一次事务日志写入 + 一次索引更新。如果订单有 10 件商品，就是 10 次。
 
-### 案例 7：批量插入优化
+PostgreSQL 支持在一条 INSERT 里插入多行：
 
 ```sql
--- ❌ 优化前（逐条插入）
-INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)
-VALUES ('order-1', 'prod-1', 2, 100, 200);
-
-INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal)
-VALUES ('order-1', 'prod-2', 1, 50, 50);
-
--- ✅ 优化后（批量插入）
-INSERT INTO order_items (order_id, product_id, quantity, unit_price, subtotal) VALUES
-  ('order-1', 'prod-1', 2, 100, 200),
-  ('order-1', 'prod-2', 1, 50, 50);
-
--- 性能提升：10-50 倍
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES
+    (1001, 42, 1, 2499.00),
+    (1001, 67, 2, 599.00),
+    (1001, 88, 1, 399.00);
 ```
 
----
+一条语句，一次网络往返，一次事务日志写入，一次索引更新。性能差 3-10 倍。
 
-### 案例 8：使用 CTE 优化复杂查询
+如果数据量更大（比如导入 10000 条商品记录），用 `COPY` 命令比 INSERT 快更多——它直接读取文件写入表，跳过了 SQL 解析和执行计划生成的开销：
 
 ```sql
--- ❌ 优化前（重复子查询）
-SELECT
-  u.id,
-  u.email,
-  (SELECT COUNT(*) FROM orders WHERE user_id = u.id) as order_count,
-  (SELECT SUM(total) FROM orders WHERE user_id = u.id) as total_spent
-FROM users u;
+COPY products(name, price, stock, category_id)
+FROM '/path/to/products.csv'
+WITH (FORMAT csv, HEADER true);
+```
 
--- ✅ 优化后（CTE）
-WITH user_stats AS (
-  SELECT
-    user_id,
-    COUNT(*) as order_count,
-    SUM(total) as total_spent
-  FROM orders
-  GROUP BY user_id
+在 Prisma 里，用 `createMany` 来做批量插入：
+
+```javascript
+await prisma.orderItem.createMany({
+  data: orderItems.map((item) => ({
+    orderId: order.id,
+    productId: item.productId,
+    quantity: item.quantity,
+    unitPrice: item.unitPrice,
+  })),
+});
+```
+
+`createMany` 会生成一条多行 INSERT 语句，比循环 `create` 快得多。
+
+## CTE 的性能陷阱
+
+我们在第 2 篇介绍了 CTE（`WITH ... AS (...)`），说它让代码更可读。但有一个性能陷阱需要知道：**在 PostgreSQL 12 之前，CTE 是一个"优化围栏"——优化器不会把 CTE 里的逻辑推进到外层查询里做全局优化**。
+
+什么意思？看这个例子：
+
+```sql
+WITH active_users AS (
+    SELECT id FROM users WHERE is_active = TRUE
 )
-SELECT
-  u.id,
-  u.email,
-  COALESCE(us.order_count, 0) as order_count,
-  COALESCE(us.total_spent, 0) as total_spent
-FROM users u
-LEFT JOIN user_stats us ON u.id = us.user_id;
-
--- 性能提升：2-10 倍
-```
-
----
-
-## JOIN 优化
-
-### 1. 小表驱动大表
-
-```sql
--- ❌ 优化前（大表驱动小表）
-SELECT * FROM orders o  -- 大表
-INNER JOIN users u ON o.user_id = u.id;
-
--- ✅ 优化后（小表驱动大表）
-SELECT * FROM users u   -- 小表
-INNER JOIN orders o ON u.id = o.user_id;
-```
-
----
-
-### 2. INNER JOIN vs LEFT JOIN
-
-```sql
--- ❌ 不必要的 LEFT JOIN
-SELECT * FROM users u
-LEFT JOIN orders o ON u.id = o.user_id
-WHERE o.status = 'paid';  -- 实际上过滤掉了 NULL 值
-
--- ✅ 使用 INNER JOIN
-SELECT * FROM users u
-INNER JOIN orders o ON u.id = o.user_id
+SELECT o.* FROM orders o
+JOIN active_users u ON o.user_id = u.id
 WHERE o.status = 'paid';
 ```
 
----
+在 PostgreSQL 12 之前，优化器会先执行 CTE——查出所有活跃用户的 ID，放到一个临时结果里。然后外层查询 JOIN 这个临时结果。优化器不会考虑"其实我可以先从 orders 表里筛选 `status = 'paid'` 的行，再 JOIN users"这种更高效的执行路径。CTE 就像一堵墙，把 CTE 内部和外部的优化隔开了。
 
-### 3. JOIN 顺序
+如果你的 CTE 返回几百万行数据，这个"先全部计算出来"的开销可能是致命的。
 
-PostgreSQL 会自动优化 JOIN 顺序，但有时需要手动指定：
+PostgreSQL 12 修复了这个问题——现在 CTE 默认可以被优化器内联处理（就像子查询一样）。但如果你确实需要 CTE 的"物化"行为（比如 CTE 的结果在外层查询中被引用多次，你不想重复计算），可以显式加 `MATERIALIZED`：
 
 ```sql
--- 使用 CTE 强制顺序
-WITH step1 AS (
-  SELECT * FROM users WHERE is_active = TRUE
-),
-step2 AS (
-  SELECT * FROM step1
-  INNER JOIN orders ON step1.id = orders.user_id
+WITH active_users AS MATERIALIZED (
+    SELECT id FROM users WHERE is_active = TRUE
 )
-SELECT * FROM step2;
+SELECT ...
 ```
 
----
+## 小结
 
-## 分析查询性能
+查询优化的核心不是背诵技巧，而是理解你的数据是怎么被访问的。深分页慢是因为 OFFSET 要丢弃大量行，用游标分页可以绕过这个问题。N+1 查询慢是因为把一次能做完的事拆成了 N+1 次，用 JOIN 或 `include` 一次搞定。UNION 慢是因为不必要的去重排序，确定不会重复就用 UNION ALL。批量操作比单条操作快是因为减少了网络往返和事务日志写入。
 
-### EXPLAIN ANALYZE
+这些都是你在电商系统里大概率会遇到的问题。每一个单独看都不复杂，但累积起来就是接口响应时间从 200ms 涨到 2s 的原因。
 
-```sql
--- 分析查询执行计划
-EXPLAIN ANALYZE
-SELECT u.email, o.order_number, o.total
-FROM users u
-INNER JOIN orders o ON u.id = o.user_id
-WHERE u.is_verified = TRUE;
-
--- 输出示例
--- Hash Join (cost=.. rows=..) (actual time=0.123..1.456 rows=100 loops=1)
---   Hash Cond: (o.user_id = u.id)
---   -> Seq Scan on orders o (cost=.. rows=..)
---   -> Hash (cost=..)
---     -> Seq Scan on users u (cost=..)
-```
-
-**关键信息**：
-
-- `Seq Scan`：全表扫描（慢）
-- `Index Scan`：索引扫描（快）
-- `Hash Join`：哈希连接
-- `Nested Loop`：嵌套循环
-- `actual time`：实际执行时间
-
----
-
-## 最佳实践
-
-### 查询优化清单
-
-- [ ] 只查询需要的列
-- [ ] 使用 LIMIT 限制结果集
-- [ ] 避免 SELECT \*
-- [ ] 避免在 WHERE 中使用函数
-- [ ] 使用 EXISTS 替代 IN
-- [ ] 使用 UNION ALL 替代 UNION
-- [ ] 批量插入/更新
-- [ ] 使用 CTE 优化复杂查询
-- [ ] 使用 EXPLAIN ANALYZE 分析
-- [ ] 为查询创建索引
-
----
-
-## 常见问题
-
-### Q1: 为什么加了索引还是慢？
-
-**可能原因**：
-
-- ❌ 索引列被函数包裹
-- ❌ 隐式类型转换
-- ❌ 数据量太小，优化器选择全表扫描
-- ❌ 统计信息过时
-
-**解决方案**：
-
-```sql
--- 更新统计信息
-ANALYZE table_name;
-
--- 检查是否使用索引
-EXPLAIN ANALYZE SELECT ...;
-```
-
----
-
-### Q2: 如何优化慢查询？
-
-**步骤**：
-
-1. 使用 EXPLAIN ANALYZE 分析
-2. 检查是否使用索引
-3. 优化查询语句
-4. 添加合适的索引
-5. 更新统计信息
-
----
-
-## 总结
-
-本文系统学习了 SQL 查询优化：
-
-**优化技巧**：
-
-- 避免 SELECT \*
-- 使用 LIMIT
-- 避免函数包裹索引列
-- 使用 EXISTS 替代 IN
-- 使用 UNION ALL 替代 UNION
-- 优化分页查询
-- 批量操作
-
-**JOIN 优化**：
-
-- 小表驱动大表
-- 选择合适的 JOIN 类型
-- 使用 CTE 优化复杂查询
-
-**性能分析**：
-
-- EXPLAIN ANALYZE
-- 查看执行计划
-- 识别性能瓶颈
-
----
-
-## 下一步
-
-掌握了查询优化后，下一步我们将学习：
-
-**《09. 执行计划分析》**：深入理解 SQL 执行计划，诊断复杂性能问题。
-
-你将学习：
-
-- 📊 执行计划解读
-- 🔍 扫描方式（Seq Scan、Index Scan）
-- 🔗 连接方式（Hash Join、Nested Loop）
-- 🎯 性能问题诊断
-
-继续关注，让我们一起深入理解数据库性能优化！
+下一篇我们讲执行计划——EXPLAIN ANALYZE 的输出怎么看，怎么判断你的优化有没有生效，以及优化器在什么情况下会"选错方案"。
