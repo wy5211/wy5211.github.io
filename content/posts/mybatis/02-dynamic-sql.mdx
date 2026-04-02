@@ -1,0 +1,321 @@
+---
+title: "02 动态 SQL：优雅处理复杂查询条件"
+date: "2026-03-23"
+summary: "用 CMS 文章搜索作为案例，掌握 MyBatis 动态 SQL 的核心标签，解决多条件组合查询的难题。"
+tags: ["MyBatis", "动态SQL"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 渐进式学习路线"
+seriesOrder: 2
+---
+
+产品经理丢过来一个需求：文章搜索页要有 5 个筛选条件——分类、标签、关键词、发布时间范围、文章状态。用户可能只选了"分类"，也可能选了"分类 + 关键词 + 时间范围"，总之任意组合都要支持。
+
+你心想，这不就是几个 WHERE 条件嘛。然后你开始写：
+
+```java
+if (categoryId != null && keyword != null && startTime != null
+    && endTime != null && status != null) {
+    sql = "SELECT * FROM articles WHERE category_id = ? AND title LIKE ? "
+        + "AND create_time BETWEEN ? AND ? AND status = ?";
+} else if (categoryId != null && keyword != null && startTime != null) {
+    // 又一种组合...
+}
+```
+
+5 个条件，32 种组合。你不可能把每种情况都写一遍。这种场景下，硬编码 WHERE 条件根本不现实。
+
+MyBatis 的动态 SQL 就是专门解决这个问题的——在 XML 里根据参数是否为空，动态决定要不要拼接某个条件。
+
+## if 标签：最基础的条件判断
+
+先看最简单的用法。假设只有两个筛选条件：分类和关键词。
+
+```xml
+<select id="searchArticles" resultType="Article">
+    SELECT id, title, content, author_id, category_id,
+           status, view_count, create_time
+    FROM articles
+    WHERE status = 1
+    <if test="categoryId != null">
+        AND category_id = #{categoryId}
+    </if>
+    <if test="keyword != null and keyword != ''">
+        AND title LIKE CONCAT('%', #{keyword}, '%')
+    </if>
+    ORDER BY create_time DESC
+</select>
+```
+
+`<if test="...">` 里的表达式是 OGNL（Object-Graph Navigation Language），可以直接访问方法参数的属性。条件成立，标签内的 SQL 片段会被拼进去；条件不成立，直接跳过。
+
+但这里有个问题：如果 `categoryId` 为 null，最终 SQL 变成：
+
+```sql
+SELECT ... FROM articles WHERE status = 1 AND title LIKE '%MyBatis%'
+```
+
+没问题。但如果 `categoryId` 和 `keyword` 都为 null 呢？
+
+```sql
+SELECT ... FROM articles WHERE status = 1 ORDER BY create_time DESC
+```
+
+也还好，因为我们有一个固定的 `status = 1` 条件兜底。但如果连固定条件都没有，所有条件都是动态的：
+
+```xml
+<select id="searchArticles" resultType="Article">
+    SELECT ... FROM articles
+    WHERE
+    <if test="categoryId != null">
+        category_id = #{categoryId}
+    </if>
+    <if test="keyword != null and keyword != ''">
+        AND title LIKE CONCAT('%', #{keyword}, '%')
+    </if>
+</select>
+```
+
+当 `categoryId` 为 null 时，SQL 变成：
+
+```sql
+SELECT ... FROM articles WHERE AND title LIKE '%MyBatis%'
+```
+
+多了一个 `AND`，SQL 语法错误。这就是为什么 MyBatis 提供了 `where` 标签。
+
+## where 标签：自动处理 AND/OR 前缀
+
+`<where>` 标签会做两件事：如果内部有条件成立，它自动加上 `WHERE` 关键字；如果第一个条件前面多了一个 `AND` 或 `OR`，它自动去掉。
+
+```xml
+<select id="searchArticles" resultType="Article">
+    SELECT id, title, content, author_id, category_id,
+           status, view_count, create_time
+    FROM articles
+    <where>
+        <if test="categoryId != null">
+            AND category_id = #{categoryId}
+        </if>
+        <if test="keyword != null and keyword != ''">
+            AND title LIKE CONCAT('%', #{keyword}, '%')
+        </if>
+        <if test="status != null">
+            AND status = #{status}
+        </if>
+    </where>
+    ORDER BY create_time DESC
+</select>
+```
+
+不管哪个条件为 null，`<where>` 都能正确处理。全部为 null 时，它不会生成 WHERE 子句（查询所有记录）。
+
+这是实际项目中最常用的组合——`<where>` + `<if>`。大多数动态查询场景用这两个标签就够了。
+
+## set 标签：动态更新字段
+
+查询有动态 WHERE，更新也有类似的问题。编辑文章时，用户可能只改了标题，可能只改了状态，也可能改了好几个字段。你不想每次都全量 UPDATE（覆盖未修改的字段），只想更新用户实际修改的字段。
+
+```xml
+<update id="updateArticle">
+    UPDATE articles
+    <set>
+        <if test="title != null and title != ''">
+            title = #{title},
+        </if>
+        <if test="content != null">
+            content = #{content},
+        </if>
+        <if test="status != null">
+            status = #{status},
+        </if>
+        <if test="categoryId != null">
+            category_id = #{categoryId},
+        </if>
+        update_time = NOW()
+    </set>
+    WHERE id = #{id}
+</update>
+```
+
+`<set>` 标签和 `<where>` 类似：自动加上 `SET` 关键字，自动去掉最后一个多余的逗号。注意 `update_time = NOW()` 我放在最后且不加逗号——这是一个固定的更新字段，每次修改都应该更新时间。
+
+## foreach 标签：处理集合参数
+
+产品经理又加了个需求：文章列表页要支持批量操作——批量发布、批量归档、批量删除。这意味着 Mapper 方法要接收一个 ID 集合。
+
+```xml
+<!-- 批量查询：根据多个 ID 获取文章 -->
+<select id="selectByIds" resultType="Article">
+    SELECT id, title, status, create_time
+    FROM articles
+    WHERE id IN
+    <foreach collection="list" item="id" open="(" close=")" separator=",">
+        #{id}
+    </foreach>
+</select>
+
+<!-- 批量更新状态 -->
+<update id="batchUpdateStatus">
+    UPDATE articles
+    SET status = #{status}, update_time = NOW()
+    WHERE id IN
+    <foreach collection="list" item="id" open="(" close=")" separator=",">
+        #{id}
+    </foreach>
+</update>
+```
+
+`<foreach>` 的几个属性：
+
+- `collection`：集合参数名。Mapper 方法参数是 `List<Long>` 时用 `"list"`，是数组时用 `"array"`，是 `@Param("ids")` 标注的参数时用 `"ids"`
+- `item`：遍历时每个元素的变量名
+- `open` / `close`：包裹符号
+- `separator`：元素之间的分隔符
+
+批量插入也常用 foreach：
+
+```xml
+<insert id="batchInsert">
+    INSERT INTO articles (title, content, author_id, category_id, status)
+    VALUES
+    <foreach collection="list" item="article" separator=",">
+        (#{article.title}, #{article.content}, #{article.authorId},
+         #{article.categoryId}, #{article.status})
+    </foreach>
+</insert>
+```
+
+但要注意，foreach 批量 INSERT 会把所有数据拼成一条 SQL。如果一次插入 1000 条，SQL 会非常长，可能超过 MySQL 的 `max_allowed_packet` 限制。大批量插入建议分批执行，每批 200-500 条。
+
+## choose/when/otherwise：多选一
+
+有些场景不是"条件成立就加"，而是"多个条件只选一个"。比如文章排序：用户可以选择按时间排序、按阅读量排序、或者默认排序。
+
+```xml
+<select id="selectArticles" resultType="Article">
+    SELECT id, title, view_count, create_time
+    FROM articles
+    <where>
+        <if test="categoryId != null">
+            AND category_id = #{categoryId}
+        </if>
+    </where>
+    <choose>
+        <when test="sortField == 'viewCount'">
+            ORDER BY view_count DESC
+        </when>
+        <when test="sortField == 'createTime'">
+            ORDER BY create_time DESC
+        </when>
+        <otherwise>
+            ORDER BY create_time DESC, view_count DESC
+        </otherwise>
+    </choose>
+</select>
+```
+
+`<choose>` 类似 Java 的 switch——从上到下判断，命中第一个条件就执行，都不命中走 `<otherwise>`。
+
+## sql 片段：复用公共 SQL
+
+文章列表和文章搜索的 SELECT 字段是一样的，如果每个 SQL 都写一遍 `id, title, content, ...`，改一个字段就要改多处。
+
+```xml
+<!-- 定义可复用的 SQL 片段 -->
+<sql id="articleColumns">
+    id, title, content, author_id, category_id,
+    status, view_count, create_time, update_time
+</sql>
+
+<!-- 引用片段 -->
+<select id="selectById" resultType="Article">
+    SELECT <include refid="articleColumns"/>
+    FROM articles WHERE id = #{id}
+</select>
+
+<select id="selectAll" resultType="Article">
+    SELECT <include refid="articleColumns"/>
+    FROM articles ORDER BY create_time DESC
+</select>
+```
+
+`<sql>` 定义片段，`<include refid="...">` 引用片段。但不要过度使用——如果一个片段只被引用一次，提取出来反而增加跳转成本。
+
+## 完整实战：CMS 文章搜索接口
+
+把上面的知识组合起来，实现 CMS 的文章搜索接口：
+
+```xml
+<sql id="articleBaseColumns">
+    a.id, a.title, a.content, a.author_id, a.category_id,
+    a.status, a.view_count, a.create_time, a.update_time
+</sql>
+
+<select id="searchArticles" resultType="Article">
+    SELECT <include refid="articleBaseColumns"/>
+    FROM articles a
+    <where>
+        <if test="query.categoryId != null">
+            AND a.category_id = #{query.categoryId}
+        </if>
+        <if test="query.authorId != null">
+            AND a.author_id = #{query.authorId}
+        </if>
+        <if test="query.status != null">
+            AND a.status = #{query.status}
+        </if>
+        <if test="query.keyword != null and query.keyword != ''">
+            <bind name="pattern" value="'%' + query.keyword + '%'" />
+            AND (a.title LIKE #{pattern} OR a.content LIKE #{pattern})
+        </if>
+        <if test="query.startTime != null">
+            AND a.create_time &gt;= #{query.startTime}
+        </if>
+        <if test="query.endTime != null">
+            AND a.create_time &lt;= #{query.endTime}
+        </if>
+    </where>
+    <choose>
+        <when test="query.sortField == 'viewCount'">
+            ORDER BY a.view_count DESC
+        </when>
+        <when test="query.sortField == 'createTime'">
+            ORDER BY a.create_time DESC
+        </when>
+        <otherwise>
+            ORDER BY a.create_time DESC
+        </otherwise>
+    </choose>
+</select>
+```
+
+这里用了一个 `<bind>` 标签——它在 OGNL 表达式中把模糊查询的 `%keyword%` 拼好，赋值给 `pattern` 变量。这样比在 SQL 中直接拼接更安全，也更清晰。
+
+注意 XML 中 `<` 和 `>` 需要转义为 `&lt;` 和 `&gt;`，或者用 `<![CDATA[ ]]>` 包裹。
+
+Mapper 接口对应的方法：
+
+```java
+List<Article> searchArticles(@Param("query") ArticleSearchQuery query);
+```
+
+```java
+@Data
+public class ArticleSearchQuery {
+    private Long categoryId;
+    private Long authorId;
+    private Integer status;
+    private String keyword;
+    private LocalDateTime startTime;
+    private LocalDateTime endTime;
+    private String sortField;
+}
+```
+
+用一个 Query 对象封装所有搜索条件，比给 Mapper 方法塞 7 个参数清晰得多。这也是实际项目中的常见做法。
+
+---
+
+上篇我们实现了文章的 CRUD，这篇解决了多条件组合搜索的问题。但有一个更复杂的需求还没碰：文章详情页需要同时展示作者信息、标签列表和评论数据，这些分散在不同表里。下一篇我们来看 MyBatis 怎么处理这种关联查询。

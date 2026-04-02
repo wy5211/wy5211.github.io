@@ -1,0 +1,258 @@
+---
+title: "03 结果映射与关联查询"
+date: "2026-03-23"
+summary: "用文章详情页作为案例，掌握 MyBatis 的结果映射机制，处理一对一和一对多关联查询，解决 N+1 性能问题。"
+tags: ["MyBatis", "结果映射", "关联查询"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 渐进式学习路线"
+seriesOrder: 3
+---
+
+前两篇我们处理的都是单表查询——查文章表，返回文章对象。但 CMS 的文章详情页需要的不是一张表的数据，而是好几张表拼在一起：
+
+- 文章基本信息（`articles` 表）
+- 作者信息（`users` 表）
+- 标签列表（`article_tags` + `tags` 表，多对多）
+- 评论列表（`comments` 表，一对多）
+
+你希望一次查询就能拿到一个完整的 `ArticleDetail` 对象，里面包含作者对象、标签集合和评论集合。这就涉及 MyBatis 的结果映射和关联查询。
+
+## resultType vs resultMap：什么时候用哪个
+
+MyBatis 有两种方式把数据库查询结果映射到 Java 对象：
+
+`resultType` 是自动映射——数据库列名和 Java 属性名一致（或开启驼峰转换后能对应上），MyBatis 自动赋值。前两篇我们用的都是这种方式。
+
+```xml
+<!-- 自动映射：create_time → createTime，author_id → authorId -->
+<select id="selectById" resultType="Article">
+    SELECT id, title, content, author_id, category_id,
+           status, view_count, create_time, update_time
+    FROM articles WHERE id = #{id}
+</select>
+```
+
+`resultMap` 是手动映射——你明确告诉 MyBatis 哪个列映射到哪个属性。当自动映射搞不定的时候（列名和属性名对应不上、需要嵌套对象、需要关联查询），就得用 `resultMap`。
+
+```xml
+<resultMap id="ArticleResultMap" type="Article">
+    <id column="id" property="id"/>
+    <result column="title" property="title"/>
+    <result column="author_id" property="authorId"/>
+    <result column="category_id" property="categoryId"/>
+    <result column="create_time" property="createTime"/>
+</resultMap>
+```
+
+实际开发中，`resultType` 能搞定就用 `resultType`，简单直观。只有遇到以下情况才需要 `resultMap`：
+
+- 列名和属性名无法通过驼峰转换对应（比如列名是 `article_title`，属性名是 `name`）
+- 需要嵌套关联对象（文章里包含作者对象）
+- 需要嵌套集合（文章里包含评论列表）
+- 需要处理复杂类型（JSON 字段映射为 Java 对象）
+
+## 一对一：文章与作者
+
+文章详情页需要展示作者信息。文章表里存的是 `author_id`，作者详情在 `users` 表里。
+
+**方案一：嵌套查询（发两次 SQL）**
+
+```xml
+<resultMap id="ArticleWithAuthorMap" type="ArticleDetail">
+    <id column="id" property="id"/>
+    <result column="title" property="title"/>
+    <result column="content" property="content"/>
+    <result column="author_id" property="authorId"/>
+    <result column="create_time" property="createTime"/>
+
+    <!-- 嵌套查询：根据 author_id 再查一次 users 表 -->
+    <association property="author" column="author_id"
+                 select="com.example.mapper.UserMapper.selectById"
+                 fetchType="lazy"/>
+</resultMap>
+
+<select id="selectDetailById" resultMap="ArticleWithAuthorMap">
+    SELECT id, title, content, author_id, category_id,
+           status, view_count, create_time
+    FROM articles WHERE id = #{id}
+</select>
+```
+
+查文章时，MyBatis 发现 `author_id` 不为 null，会自动调用 `UserMapper.selectById` 查作者。你不需要手动调两次。
+
+`fetchType="lazy"` 表示延迟加载——查文章的时候不立即查作者，只有当代码访问 `article.getAuthor()` 时才触发查询。
+
+**方案二：嵌套结果（一次 JOIN 查询）**
+
+```xml
+<resultMap id="ArticleWithAuthorJoinMap" type="ArticleDetail">
+    <id column="id" property="id"/>
+    <result column="title" property="title"/>
+    <result column="content" property="content"/>
+    <result column="create_time" property="createTime"/>
+
+    <association property="author" javaType="User">
+        <id column="author_id" property="id"/>
+        <result column="author_name" property="name"/>
+        <result column="author_avatar" property="avatar"/>
+    </association>
+</resultMap>
+
+<select id="selectDetailWithAuthor" resultMap="ArticleWithAuthorJoinMap">
+    SELECT a.id, a.title, a.content, a.create_time,
+           u.id as author_id, u.name as author_name, u.avatar as author_avatar
+    FROM articles a
+    LEFT JOIN users u ON a.author_id = u.id
+    WHERE a.id = #{id}
+</select>
+```
+
+一次 SQL 搞定，JOIN 以后把作者字段查出来，通过 `association` 映射到嵌套的 `User` 对象。注意列名要有别名避免冲突（`u.id as author_id`）。
+
+**两种方案怎么选？**
+
+如果查文章详情页，你确定一定会用到作者信息，用嵌套结果（JOIN）更好——一次查询，没有额外开销。
+
+如果查文章列表页，你可能不需要展示作者信息（或者只在鼠标悬停时才加载），用嵌套查询 + 延迟加载更好——不访问作者属性就不发 SQL。
+
+## 一对多：文章与评论
+
+一篇文章有多条评论，这是典型的一对多关系。
+
+```xml
+<resultMap id="ArticleDetailMap" type="ArticleDetail">
+    <id column="id" property="id"/>
+    <result column="title" property="title"/>
+    <result column="content" property="content"/>
+    <result column="create_time" property="createTime"/>
+
+    <!-- 一对一：作者 -->
+    <association property="author" javaType="User">
+        <id column="author_id" property="id"/>
+        <result column="author_name" property="name"/>
+    </association>
+
+    <!-- 一对多：评论列表 -->
+    <collection property="comments" ofType="Comment">
+        <id column="comment_id" property="id"/>
+        <result column="comment_content" property="content"/>
+        <result column="comment_user_name" property="userName"/>
+        <result column="comment_create_time" property="createTime"/>
+    </collection>
+</resultMap>
+
+<select id="selectFullDetail" resultMap="ArticleDetailMap">
+    SELECT a.id, a.title, a.content, a.create_time,
+           u.id as author_id, u.name as author_name,
+           c.id as comment_id, c.content as comment_content,
+           cu.name as comment_user_name, c.create_time as comment_create_time
+    FROM articles a
+    LEFT JOIN users u ON a.author_id = u.id
+    LEFT JOIN comments c ON c.article_id = a.id
+    LEFT JOIN users cu ON c.user_id = cu.id
+    WHERE a.id = #{id}
+</select>
+```
+
+`<collection>` 和 `<association>` 的用法类似，区别在于 `ofType` 指定集合中元素的类型（而不是 `javaType`）。
+
+这里有个需要注意的地方：`<id column="comment_id">` 中的 `<id>` 标签对 collection 很重要。MyBatis 靠它来判断每条评论是否已经处理过——如果两行数据的 `comment_id` 相同，MyBatis 会认为是同一条评论（不会重复添加）。
+
+## N+1 问题：关联查询的性能陷阱
+
+现在有个更实际的问题：文章列表页要展示每篇文章的作者和评论数。如果用嵌套查询：
+
+```xml
+<!-- 查 10 篇文章：1 次 SQL -->
+<select id="selectAll" resultMap="ArticleWithAuthorMap">
+    SELECT * FROM articles ORDER BY create_time DESC LIMIT 10
+</select>
+
+<!-- 每篇文章查作者：10 次 SQL -->
+<select id="selectById" resultType="User">
+    SELECT * FROM users WHERE id = #{id}
+</select>
+```
+
+查 10 篇文章 = 1 次文章查询 + 10 次作者查询 = **11 次 SQL**。如果有 100 篇文章分 10 页，每页都 11 次 SQL，数据库压力很大。这就是经典的 **N+1 问题**——1 次主查询 + N 次关联查询。
+
+**解决方式一：嵌套结果（JOIN）**
+
+最直接的方案，一次 JOIN 查完所有数据：
+
+```xml
+<select id="selectListWithAuthor" resultMap="ArticleWithAuthorJoinMap">
+    SELECT a.id, a.title, a.view_count, a.create_time,
+           u.id as author_id, u.name as author_name
+    FROM articles a
+    LEFT JOIN users u ON a.author_id = u.id
+    ORDER BY a.create_time DESC
+    LIMIT 10
+</select>
+```
+
+但 JOIN 不是万能的。如果一篇文章有 50 条评论，JOIN 后结果集会有 50 行（文章数据重复 50 次），数据量大的时候反而更慢。
+
+**解决方式二：分步查询**
+
+先查主数据，再批量查关联数据：
+
+```java
+// 1. 查文章列表
+List<Article> articles = articleMapper.selectList();
+// 1 次 SQL
+
+// 2. 提取所有 author_id
+List<Long> authorIds = articles.stream()
+    .map(Article::getAuthorId)
+    .distinct()
+    .collect(Collectors.toList());
+
+// 3. 批量查作者
+Map<Long, User> authorMap = userMapper.selectByIds(authorIds)
+    .stream()
+    .collect(Collectors.toMap(User::getId, u -> u));
+// 1 次 SQL
+
+// 4. 组装数据
+articles.forEach(a -> a.setAuthor(authorMap.get(a.getAuthorId())));
+```
+
+总共 2 次 SQL，不管有多少篇文章。这是实际项目中处理列表关联查询最常用的方式——简单、可控、不会因为数据量增大而线性增长。
+
+**选择建议：**
+
+- 查详情页（1 条主数据 + 少量关联数据）→ JOIN 嵌套结果
+- 查列表页（多条主数据 + 每条少量关联）→ 分步查询或批量查询
+- 关联数据量不确定（一篇文章可能有 5 条也可能 500 条评论）→ 分步查询 + 分页
+
+## 延迟加载：按需查询
+
+不是每次查文章都需要作者信息和评论列表。比如文章列表页只需要标题、时间和阅读量，作者信息只在详情页才需要。
+
+```xml
+<settings>
+    <setting name="lazyLoadingEnabled" value="true"/>
+    <setting name="aggressiveLazyLoading" value="false"/>
+</settings>
+```
+
+`lazyLoadingEnabled` 开启延迟加载，`aggressiveLazyLoading` 设为 false 表示按需加载（只加载被访问的关联属性，而不是访问任何一个属性就加载所有关联）。
+
+配合嵌套查询使用：
+
+```xml
+<association property="author" column="author_id"
+             select="com.example.mapper.UserMapper.selectById"
+             fetchType="lazy"/>
+```
+
+这样查文章列表时不会触发作者查询，只有在代码里调用 `article.getAuthor()` 时才发 SQL。
+
+但延迟加载有个坑：如果关联查询在 SqlSession 关闭后才触发，会抛异常。所以在 Spring Boot 整合后要注意事务边界。下一篇整合 Spring Boot 时会详细讲这个问题。
+
+---
+
+上篇我们用动态 SQL 解决了多条件搜索，这篇解决了关联查询和 N+1 问题。但前 3 篇都是用原生 MyBatis，实际项目几乎不会这么用——大家都是 Spring Boot + MyBatis。下一篇我们把这个 CMS 系统整合进 Spring Boot，看看真实项目中的写法。

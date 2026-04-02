@@ -1,0 +1,335 @@
+---
+title: "01 快速入门：告别繁琐的 JDBC"
+date: "2026-03-23"
+summary: "从 JDBC 的痛点出发，理解 MyBatis 的设计思路，用 CMS 文章管理作为案例完成第一个 MyBatis 程序。"
+tags: ["MyBatis", "ORM", "Java", "入门"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 渐进式学习路线"
+seriesOrder: 1
+---
+
+你刚接手一个 Java 项目，打开代码一看，数据访问层全是这种东西：
+
+```java
+public Article getArticleById(Long id) {
+    Article article = null;
+    Connection conn = null;
+    PreparedStatement pstmt = null;
+    ResultSet rs = null;
+    try {
+        conn = dataSource.getConnection();
+        String sql = "SELECT id, title, content, author_id, category_id, "
+                   + "status, view_count, create_time FROM articles WHERE id = ?";
+        pstmt = conn.prepareStatement(sql);
+        pstmt.setLong(1, id);
+        rs = pstmt.executeQuery();
+        if (rs.next()) {
+            article = new Article();
+            article.setId(rs.getLong("id"));
+            article.setTitle(rs.getString("title"));
+            article.setContent(rs.getString("content"));
+            article.setAuthorId(rs.getLong("author_id"));
+            article.setCategoryId(rs.getLong("category_id"));
+            article.setStatus(rs.getInt("status"));
+            article.setViewCount(rs.getInt("view_count"));
+            article.setCreateTime(rs.getTimestamp("create_time").toLocalDateTime());
+        }
+    } catch (SQLException e) {
+        throw new RuntimeException("查询失败", e);
+    } finally {
+        if (rs != null) try { rs.close(); } catch (SQLException e) { }
+        if (pstmt != null) try { pstmt.close(); } catch (SQLException e) { }
+        if (conn != null) try { conn.close(); } catch (SQLException e) { }
+    }
+    return article;
+}
+```
+
+30 行代码，干的就一件事——根据 ID 查一篇文章。如果查询条件变成"按分类筛选、按时间排序、分页"，这段代码还得再翻一倍。更别提 SQL 注入的风险、连接泄漏的可能、字段映射的心智负担。
+
+这就是 JDBC 的现实：**你写的不是业务逻辑，而是大量的样板代码**。
+
+## MyBatis 的解决思路
+
+MyBatis 的核心思路很简单：**把 SQL 从 Java 代码中抽出来，放到 XML 文件里单独管理；把结果映射自动完成，不用手动 `rs.getString()`**。
+
+同样的查询，用 MyBatis 写只需要两部分：
+
+Mapper 接口（Java）：
+
+```java
+public interface ArticleMapper {
+    Article selectById(Long id);
+}
+```
+
+Mapper XML（SQL 定义）：
+
+```xml
+<select id="selectById" resultMap="ArticleResultMap">
+    SELECT id, title, content, author_id, category_id,
+           status, view_count, create_time
+    FROM articles WHERE id = #{id}
+</select>
+```
+
+调用时一行代码：
+
+```java
+Article article = articleMapper.selectById(1L);
+```
+
+SQL 在 XML 里，映射由框架处理，连接管理由框架负责。你只需要关注 SQL 本身和业务逻辑。
+
+## MyBatis vs Hibernate：选哪个？
+
+在国内 Java 圈，持久层框架的选择基本就是 MyBatis 和 Hibernate（JPA 实现）二选一。两者的设计哲学完全不同：
+
+**Hibernate 的思路**：你告诉我对象关系，我帮你生成 SQL。你操作 Java 对象，框架自动同步到数据库。
+
+**MyBatis 的思路**：你自己写 SQL，我帮你管理连接和映射。
+
+这意味着什么？看几个真实场景：
+
+场景一：多条件动态查询——用户可以按分类、标签、时间范围、关键词任意组合搜索文章。Hibernate 要么用 Criteria API 写一堆条件判断，要么手写 JPQL/HQL。MyBatis 直接在 XML 里写动态 SQL，直观且可控。
+
+场景二：复杂报表查询——统计每月各分类的文章数、阅读量 TOP 10 作者、近 7 天热门标签。这种 SQL 本身就很复杂，Hibernate 的自动生成反而增加了理解成本。MyBatis 你写什么 SQL 就执行什么 SQL，没有"翻译"的中间层。
+
+场景三：简单 CRUD——一个后台管理模块，只有增删改查。Hibernate 几乎不需要写 SQL，实体类定义好就完事了。MyBatis 还要写 XML。
+
+所以选择标准其实很清晰：
+
+- 查询复杂、需要精细控制 SQL → MyBatis
+- 简单 CRUD、追求开发速度 → Hibernate
+- 国内项目、团队规范要求 → MyBatis（这是行业惯例）
+
+这也是为什么国内约 80% 的公司用 MyBatis——不是 Hibernate 不好，而是国内业务场景普遍更复杂，MyBatis 更适合。
+
+## 搭建第一个 MyBatis 项目
+
+以我们的 CMS 内容管理系统为例。假设需求是管理技术博客的文章，最基本的能力就是文章的增删改查。
+
+### 1. 创建 Maven 项目并添加依赖
+
+```xml
+<!-- pom.xml -->
+<dependencies>
+    <dependency>
+        <groupId>org.mybatis</groupId>
+        <artifactId>mybatis</artifactId>
+        <version>3.5.13</version>
+    </dependency>
+    <dependency>
+        <groupId>com.mysql</groupId>
+        <artifactId>mysql-connector-j</artifactId>
+        <version>8.0.33</version>
+    </dependency>
+    <dependency>
+        <groupId>org.projectlombok</groupId>
+        <artifactId>lombok</artifactId>
+        <version>1.18.28</version>
+        <scope>provided</scope>
+    </dependency>
+</dependencies>
+```
+
+三个依赖就够了：MyBatis 本身、MySQL 驱动、Lombok（简化实体类）。
+
+### 2. 建表
+
+```sql
+CREATE TABLE articles (
+    id          BIGINT PRIMARY KEY AUTO_INCREMENT,
+    title       VARCHAR(200) NOT NULL,
+    content     TEXT,
+    author_id   BIGINT NOT NULL,
+    category_id BIGINT NOT NULL,
+    status      TINYINT NOT NULL DEFAULT 0 COMMENT '0-草稿 1-已发布 2-已归档',
+    view_count  INT NOT NULL DEFAULT 0,
+    create_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    update_time TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    INDEX idx_category (category_id),
+    INDEX idx_author (author_id),
+    INDEX idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+```
+
+注意几个设计细节：`status` 用 TINYINT 而不是 VARCHAR，`view_count` 有默认值 0，索引建在了 `category_id`、`author_id`、`status` 上（这些是常用查询条件）。这些都是实际生产中的做法，不是随便写写。
+
+### 3. 实体类
+
+```java
+@Data
+public class Article {
+    private Long id;
+    private String title;
+    private String content;
+    private Long authorId;
+    private Long categoryId;
+    private Integer status;
+    private Integer viewCount;
+    private LocalDateTime createTime;
+    private LocalDateTime updateTime;
+}
+```
+
+### 4. 核心配置文件
+
+MyBatis 需要一个配置文件来知道数据库在哪、Mapper 文件在哪。这个文件叫 `mybatis-config.xml`，放在 `src/main/resources/` 下：
+
+```xml
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE configuration
+        PUBLIC "-//mybatis.org//DTD Config 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-config.dtd">
+<configuration>
+    <settings>
+        <!-- 数据库下划线命名自动转 Java 驼峰命名 -->
+        <setting name="mapUnderscoreToCamelCase" value="true"/>
+        <!-- 打印 SQL 日志，开发阶段方便调试 -->
+        <setting name="logImpl" value="STDOUT_LOGGING"/>
+    </settings>
+
+    <environments default="development">
+        <environment id="development">
+            <transactionManager type="JDBC"/>
+            <dataSource type="POOLED">
+                <property name="driver" value="com.mysql.cj.jdbc.Driver"/>
+                <property name="url" value="jdbc:mysql://localhost:3306/blog_cms"/>
+                <property name="username" value="root"/>
+                <property name="password" value="root123"/>
+            </dataSource>
+        </environment>
+    </environments>
+
+    <mappers>
+        <mapper resource="mapper/ArticleMapper.xml"/>
+    </mappers>
+</configuration>
+```
+
+这里有个关键设置：`mapUnderscoreToCamelCase`。数据库字段是 `author_id`，Java 属性是 `authorId`，开启这个设置后 MyBatis 会自动转换，不需要手动映射每一个字段。
+
+### 5. Mapper 接口和 XML
+
+```java
+public interface ArticleMapper {
+    Article selectById(Long id);
+    List<Article> selectAll();
+    int insert(Article article);
+    int update(Article article);
+    int deleteById(Long id);
+}
+```
+
+```xml
+<!-- src/main/resources/mapper/ArticleMapper.xml -->
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper
+        PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.example.mapper.ArticleMapper">
+
+    <select id="selectById" resultType="Article">
+        SELECT id, title, content, author_id, category_id,
+               status, view_count, create_time, update_time
+        FROM articles WHERE id = #{id}
+    </select>
+
+    <select id="selectAll" resultType="Article">
+        SELECT id, title, author_id, category_id,
+               status, view_count, create_time
+        FROM articles
+        ORDER BY create_time DESC
+    </select>
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO articles (title, content, author_id, category_id, status)
+        VALUES (#{title}, #{content}, #{authorId}, #{categoryId}, #{status})
+    </insert>
+
+    <update id="update">
+        UPDATE articles
+        SET title = #{title},
+            content = #{content},
+            status = #{status},
+            update_time = NOW()
+        WHERE id = #{id}
+    </update>
+
+    <delete id="deleteById">
+        DELETE FROM articles WHERE id = #{id}
+    </delete>
+
+</mapper>
+```
+
+几个要点：
+
+- `namespace` 必须和 Mapper 接口的全限定名一致，MyBatis 靠这个把接口方法和 XML 中的 SQL 对应起来
+- `#{id}` 是参数占位符，MyBatis 会用 PreparedStatement 的参数绑定，防止 SQL 注入
+- `useGeneratedKeys="true"` 让插入后自动回填主键 ID 到 `article.id`
+
+### 6. 运行
+
+```java
+public class CmsApplication {
+    public static void main(String[] args) throws Exception {
+        String resource = "mybatis-config.xml";
+        InputStream inputStream = Resources.getResourceAsStream(resource);
+        SqlSessionFactory factory = new SqlSessionFactoryBuilder().build(inputStream);
+
+        try (SqlSession session = factory.openSession()) {
+            ArticleMapper mapper = session.getMapper(ArticleMapper.class);
+
+            // 插入一篇文章
+            Article article = new Article();
+            article.setTitle("MyBatis 入门指南");
+            article.setContent("这是文章内容...");
+            article.setAuthorId(1L);
+            article.setCategoryId(2L);
+            article.setStatus(1);
+            mapper.insert(article);
+            session.commit();
+
+            // 查询刚插入的文章
+            Article saved = mapper.selectById(article.getId());
+            System.out.println("文章标题：" + saved.getTitle());
+        }
+    }
+}
+```
+
+## 核心概念理解
+
+你可能注意到了两个关键对象：**SqlSessionFactory** 和 **SqlSession**。
+
+`SqlSessionFactory` 是全局唯一的，应用启动时创建一次。它负责读取配置文件、解析所有 Mapper XML，内部维护了 SQL 的解析结果。它线程安全，所以用静态变量持有即可。
+
+`SqlSession` 相当于一次数据库会话。它不是线程安全的，每次操作都应该创建一个新的，用完关闭。你可以把它理解为 JDBC 中 `Connection` 的升级版——不仅管理连接，还管理事务和一级缓存。
+
+实际项目中你不会手动管理这些对象。下一篇我们会把 MyBatis 整合进 Spring Boot，到时候 Spring 容器会帮你管理 SqlSessionFactory，你只需要 `@Autowired` 注入 Mapper 就行。
+
+但理解这两个对象很重要，因为后面讲缓存机制和事务管理时，都和 SqlSession 的生命周期有关。
+
+## 一个容易踩的坑
+
+初学者经常搞混 `#{}` 和 `${}`：
+
+```xml
+<!-- #{}：预编译参数绑定，安全 -->
+SELECT * FROM articles WHERE id = #{id}
+<!-- 实际执行：SELECT * FROM articles WHERE id = ?，参数通过 PreparedStatement 绑定 -->
+
+<!-- ${}：字符串直接替换，有 SQL 注入风险 -->
+SELECT * FROM articles WHERE id = ${id}
+<!-- 实际执行：SELECT * FROM articles WHERE id = 1，直接拼进 SQL -->
+```
+
+`${}` 的唯一合理使用场景是动态表名或列名——这些地方没法用预编译参数。其他任何情况都应该用 `#{}`。
+
+---
+
+上篇我们用原生 MyBatis 实现了文章的 CRUD，但实际项目中搜索文章不可能只有一个条件——用户可能按分类筛选、按关键词搜索、按时间范围过滤。下一篇我们来看 MyBatis 的动态 SQL 怎么优雅地处理这些组合查询。

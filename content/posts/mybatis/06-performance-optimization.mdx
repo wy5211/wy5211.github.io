@@ -1,0 +1,316 @@
+---
+title: "06 性能优化实战：让你的查询快起来"
+date: "2026-03-23"
+summary: "排查 CMS 的性能问题，掌握批量操作、缓存策略、SQL 优化和分页深度优化的实战技巧。"
+tags: ["MyBatis", "性能优化", "缓存"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 渐进式学习路线"
+seriesOrder: 6
+---
+
+CMS 上线运行了三个月，数据量上来了——5 万篇文章、30 万条评论、20 万个标签关联。然后问题开始出现：首页文章列表接口响应 1.5 秒，文章详情页偶尔超过 2 秒，后台批量发布文章时数据库 CPU 飙到 90%。
+
+你打开慢查询日志，发现几个典型问题。这篇我们就针对这些问题，逐个排查和优化。
+
+## 问题一：N+1 查询导致列表页慢
+
+**现象**：首页文章列表 20 条数据，响应时间 1.5 秒。查看日志，发现发了 21 次 SQL——1 次查文章列表，20 次查每篇文章的作者信息。
+
+**原因**：第三篇讲过的 N+1 问题。文章列表页用了嵌套查询（`association` + `select`），每条文章都触发一次作者查询。
+
+**解决方案**：改用分步查询，批量获取关联数据。
+
+```java
+@Service
+public class ArticleService {
+
+    private final ArticleMapper articleMapper;
+    private final UserMapper userMapper;
+
+    @Transactional(readOnly = true)
+    public List<ArticleVO> getHomePageArticles(int pageSize) {
+        // 1. 查文章列表（1 次 SQL）
+        List<Article> articles = articleMapper.selectLatest(pageSize);
+
+        // 2. 提取去重后的 authorId
+        List<Long> authorIds = articles.stream()
+            .map(Article::getAuthorId)
+            .distinct()
+            .collect(Collectors.toList());
+
+        // 3. 批量查作者（1 次 SQL）
+        List<User> authors = userMapper.selectByIds(authorIds);
+        Map<Long, User> authorMap = authors.stream()
+            .collect(Collectors.toMap(User::getId, Function.identity()));
+
+        // 4. 组装 VO
+        return articles.stream()
+            .map(a -> {
+                ArticleVO vo = new ArticleVO();
+                vo.setId(a.getId());
+                vo.setTitle(a.getTitle());
+                vo.setViewCount(a.getViewCount());
+                vo.setAuthorName(authorMap.get(a.getAuthorId()).getName());
+                return vo;
+            })
+            .collect(Collectors.toList());
+    }
+}
+```
+
+批量查作者的 SQL：
+
+```xml
+<select id="selectByIds" resultType="User">
+    SELECT id, name, avatar FROM users
+    WHERE id IN
+    <foreach collection="list" item="id" open="(" close=")" separator=",">
+        #{id}
+    </foreach>
+</select>
+```
+
+21 次 SQL 降到 2 次，响应时间从 1.5 秒降到 80 毫秒。
+
+关键点：不要在循环里调 Mapper 方法。如果发现自己在写 `for (Article a : articles) { mapper.selectXxx(a.getId()); }`，就要警惕 N+1 问题。
+
+## 问题二：批量插入太慢
+
+**现象**：运营同事要导入 5000 篇文章，后台脚本跑了一分多钟，数据库 CPU 90%。
+
+**原因**：代码里是一条一条 INSERT：
+
+```java
+// 5000 次 INSERT，每次都和网络交互一次
+for (Article article : articles) {
+    articleMapper.insert(article);
+}
+```
+
+每次 INSERT 都是一次网络往返 + 一次事务提交（如果 autoCommit 开启），5000 条就是 5000 次。
+
+**解决方案一：foreach 批量 INSERT**
+
+```xml
+<insert id="batchInsert">
+    INSERT INTO articles (title, content, author_id, category_id, status)
+    VALUES
+    <foreach collection="list" item="a" separator=",">
+        (#{a.title}, #{a.content}, #{a.authorId}, #{a.categoryId}, #{a.status})
+    </foreach>
+</insert>
+```
+
+一条 SQL 插入所有数据，只有一次网络往返。但注意：MySQL 对单条 SQL 的大小有限制（`max_allowed_packet`，默认 4MB）。5000 篇文章如果内容很长，可能超限。
+
+安全做法是分批，每批 200-500 条：
+
+```java
+public void batchInsert(List<Article> articles) {
+    int batchSize = 300;
+    for (int i = 0; i < articles.size(); i += batchSize) {
+        List<Article> batch = articles.subList(i, Math.min(i + batchSize, articles.size()));
+        articleMapper.batchInsert(batch);
+    }
+}
+```
+
+**解决方案二：BATCH Executor**
+
+MyBatis 的 `SqlSession` 支持批量模式。和 foreach 不同的是，BATCH 模式下每条 INSERT 都是独立的 PreparedStatement，但 JDBC 驱动会在客户端缓冲，一次发送：
+
+```java
+@Service
+public class ArticleService {
+
+    private final SqlSessionFactory sqlSessionFactory;
+
+    public void batchImport(List<Article> articles) {
+        // 开启批量模式
+        try (SqlSession session = sqlSessionFactory.openSession(ExecutorType.BATCH)) {
+            ArticleMapper mapper = session.getMapper(ArticleMapper.class);
+            for (int i = 0; i < articles.size(); i++) {
+                mapper.insert(articles.get(i));
+                // 每 500 条提交一次，避免内存溢出
+                if ((i + 1) % 500 == 0) {
+                    session.flushStatements();
+                    session.commit();
+                }
+            }
+            session.flushStatements();
+            session.commit();
+        }
+    }
+}
+```
+
+两种方案的选择：
+
+- 数据量小（几百条以内）→ foreach 批量 INSERT，简单直接
+- 数据量大、需要回填主键 → BATCH Executor
+- 数据量特别大（万级以上）→ 分批处理 + BATCH Executor，避免内存问题
+
+## 问题三：缓存使用不当
+
+MyBatis 有一级缓存和二级缓存。了解它们的机制，才能知道什么时候该用、什么时候不该用。
+
+**一级缓存：SqlSession 级别**
+
+同一个 SqlSession 内，相同查询条件的结果会被缓存。第二次查询直接走缓存，不发 SQL。
+
+```java
+try (SqlSession session = factory.openSession()) {
+    ArticleMapper mapper = session.getMapper(ArticleMapper.class);
+
+    Article a1 = mapper.selectById(1L);  // 查数据库
+    Article a2 = mapper.selectById(1L);  // 走缓存
+
+    // a1 == a2（同一个对象引用）
+}
+```
+
+一级缓存默认开启，你不需要配置。但有一个坑：在同一个 SqlSession 内，如果两次查询之间执行了 insert/update/delete，缓存会被清空。这是正确的行为——数据被修改了，缓存自然要失效。
+
+在 Spring Boot 中，每个事务方法有独立的 SqlSession，所以一级缓存在事务内生效。事务结束，缓存也随之清除。
+
+**二级缓存：Mapper 级别（Namespace 级别）**
+
+二级缓存跨 SqlSession，同一个 Mapper 的查询结果可以在不同 SqlSession 之间共享。默认关闭。
+
+```xml
+<!-- 在 ArticleMapper.xml 中加上 -->
+<cache eviction="LRU" flushInterval="300000" size="1024" readOnly="true"/>
+```
+
+```java
+// SqlSession 1
+Article a1 = mapper1.selectById(1L);  // 查数据库，结果存入二级缓存
+
+// SqlSession 2（不同的 SqlSession）
+Article a2 = mapper2.selectById(1L);  // 走二级缓存
+```
+
+**二级缓存的生产建议：慎用。**
+
+原因有几个：
+
+- 缓存粒度是整个 Mapper（Namespace），清空任何一个查询的缓存都会清空整个 Mapper 的缓存。一篇文章被修改，所有文章的查询缓存全部失效。
+- 多表关联查询的缓存一致性很难保证。如果文章关联了作者，作者信息改了，文章的缓存不会自动失效。
+- 分布式环境下每个 JVM 节点都有自己的二级缓存，数据不一致。
+
+实际项目中，缓存层通常交给 Redis 或 Caffeine 来做，而不是 MyBatis 的二级缓存。你可以控制缓存的 key、过期时间、失效策略，比 MyBatis 内置的缓存灵活得多。
+
+如果你确实要用二级缓存，只建议用在**很少修改的配置数据或字典数据**上（比如文章分类列表），不要用在频繁更新的业务数据上。
+
+## 问题四：深分页慢
+
+**现象**：文章列表第 1 页响应 50ms，第 100 页响应 800ms，第 500 页直接超时。
+
+**原因**：MySQL 的 `LIMIT offset, size` 在 offset 大的时候性能很差。`LIMIT 5000, 20` 意味着 MySQL 要扫描 5020 行，丢弃前 5000 行，只返回 20 行。offset 越大，浪费的扫描越多。
+
+**解决方案一：游标分页（推荐）**
+
+不传页码，传上一页最后一条记录的 ID：
+
+```xml
+<select id="selectNextPage" resultType="Article">
+    SELECT id, title, view_count, create_time
+    FROM articles
+    WHERE id < #{lastId}
+    <if test="categoryId != null">
+        AND category_id = #{categoryId}
+    </if>
+    ORDER BY id DESC
+    LIMIT #{pageSize}
+</select>
+```
+
+`WHERE id < #{lastId}` 利用主键索引，MySQL 直接定位到起始位置，不需要扫描前面的数据。不管翻到第几页，查询速度都一样快。
+
+但游标分页有个局限：不支持跳页（用户没法直接跳到第 50 页）。对于无限滚动加载（瀑布流）的场景，游标分页是最优解。
+
+**解决方案二：子查询优化**
+
+如果必须支持跳页：
+
+```xml
+<select id="selectByPage" resultType="Article">
+    SELECT a.id, a.title, a.view_count, a.create_time
+    FROM articles a
+    INNER JOIN (
+        SELECT id FROM articles
+        <where>
+            <if test="categoryId != null">
+                AND category_id = #{categoryId}
+            </if>
+        </where>
+        ORDER BY id DESC
+        LIMIT #{offset}, #{pageSize}
+    ) t ON a.id = t.id
+</select>
+```
+
+子查询先通过主键索引查出 ID（覆盖索引，不需要回表），再 JOIN 回主表取完整数据。比直接 `LIMIT offset, size` 快，但 offset 非常大时效果有限。
+
+**选择建议：**
+
+- 移动端瀑布流 / 无限滚动 → 游标分页
+- 后台管理列表（需要跳页）→ 子查询优化，同时控制最大页码（比如最多翻到 100 页）
+- 数据量特别大的列表 → 考虑搜索引擎（Elasticsearch）而不是数据库分页
+
+## 问题五：查询了不需要的字段
+
+这是一个容易被忽略但影响不小的点。
+
+```xml
+<!-- 文章列表页只需要标题、摘要、时间、阅读量 -->
+<!-- ❌ 查了所有字段，包括 content（文章内容可能有几十 KB） -->
+<select id="selectList" resultType="Article">
+    SELECT * FROM articles ORDER BY create_time DESC LIMIT 20
+</select>
+
+<!-- ✅ 只查需要的字段 -->
+<select id="selectList" resultType="ArticleVO">
+    SELECT id, title, LEFT(content, 200) as summary,
+           view_count, create_time
+    FROM articles ORDER BY create_time DESC LIMIT 20
+</select>
+```
+
+文章的 `content` 字段是 TEXT 类型，一篇文章内容可能几十 KB。列表页 20 条数据，如果查了 `content`，就是多传输了几百 KB 无用的数据。数据库读取、网络传输、MyBatis 映射，每个环节都浪费时间。
+
+原则很简单：**列表页只查列表需要的字段，详情页才查完整数据**。不要因为"方便"就 `SELECT *`。
+
+## 排查慢 SQL 的实用方法
+
+最后分享几个在 CMS 项目中排查性能问题的实用技巧。
+
+**开启 SQL 日志**：开发环境下打印每条 SQL 和执行时间：
+
+```yaml
+mybatis:
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+```
+
+**PageHelper 的分页 SQL**：PageHelper 会打印两条 SQL——一条 COUNT、一条分页查询。关注 COUNT 的执行时间，如果 COUNT 很慢，说明查询条件没有走索引。
+
+**EXPLAIN 分析**：把 MyBatis 打印的 SQL 拿到数据库客户端执行 EXPLAIN：
+
+```sql
+EXPLAIN SELECT id, title FROM articles
+WHERE category_id = 3 AND status = 1
+ORDER BY create_time DESC LIMIT 20;
+```
+
+关注 `type` 列（ALL 表示全表扫描，应该走 index 或 range）和 `rows` 列（预估扫描行数）。
+
+**Druid 监控**：生产环境可以用 Druid 数据源，它内置了 SQL 监控面板，能看到每条 SQL 的执行时间、执行次数、慢查询列表。对排查性能问题非常有帮助。
+
+---
+
+到这里，MyBatis 渐进式学习路线就完成了。从第一篇用 MyBatis 替代繁琐的 JDBC，到动态 SQL 处理复杂查询，到关联查询和 N+1 问题，到 Spring Boot 整合，到 MyBatis-Plus 提效，再到性能优化——这 6 篇覆盖了 MyBatis 在真实项目中 90% 的使用场景。
+
+掌握这些内容后，你完全具备了在企业项目中使用 MyBatis 的能力。剩下的 10%，是那些更复杂的场景——读写分离、分库分表、自定义插件——这些需要你在实际项目中根据具体需求去深入。

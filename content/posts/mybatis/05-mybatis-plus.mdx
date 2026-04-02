@@ -1,0 +1,273 @@
+---
+title: "05 MyBatis-Plus：让 CRUD 开发提效"
+date: "2026-03-23"
+summary: "用 MyBatis-Plus 重构 CMS 的通用 CRUD，掌握 BaseMapper、条件构造器、代码生成器和全局配置。"
+tags: ["MyBatis", "MyBatis-Plus"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 渐进式学习路线"
+seriesOrder: 5
+---
+
+CMS 有 6 张表——文章、分类、标签、文章标签关联、评论、用户。每个表都要写 Mapper 接口、XML、Service，功能无非就是增删改查。你算一下，光 `selectById`、`insert`、`update`、`deleteById`、`selectList` 这些通用方法，6 张表就要写 30 个，加上 XML 里的 SQL 定义和 Service 层的包装方法，代码量巨大。
+
+但你要问自己一个问题：**这些 CRUD 代码有多少是真正有业务差异的？**
+
+大部分表的基础查询逻辑完全一样——根据 ID 查、根据条件查列表、插入、更新、删除。差异只在于表名和字段名不同。MyBatis-Plus 的核心思路就是：**通用 CRUD 不用写，框架帮你生成；你只写有业务差异的部分**。
+
+## BaseMapper：继承即获得 CRUD
+
+```xml
+<dependency>
+    <groupId>com.baomidou</groupId>
+    <artifactId>mybatis-plus-boot-starter</artifactId>
+    <version>3.5.4</version>
+</dependency>
+```
+
+加上依赖后，Mapper 接口只需要继承 `BaseMapper<T>`：
+
+```java
+@Mapper
+public interface ArticleMapper extends BaseMapper<Article> {
+    // 什么都不用写，已经拥有以下方法：
+    // selectById(id)
+    // selectList(wrapper)
+    // selectPage(page, wrapper)
+    // insert(article)
+    // updateById(article)
+    // deleteById(id)
+    // deleteBatchIds(ids)
+    // selectCount(wrapper)
+    // ...等 17 个通用方法
+}
+```
+
+Service 层也不用每个方法都写一遍：
+
+```java
+@Service
+public class ArticleService {
+
+    private final ArticleMapper articleMapper;
+
+    public ArticleService(ArticleMapper articleMapper) {
+        this.articleMapper = articleMapper;
+    }
+
+    public Article getById(Long id) {
+        return articleMapper.selectById(id);
+    }
+
+    public List<Article> list() {
+        return articleMapper.selectList(null); // null 表示无条件
+    }
+
+    public void create(Article article) {
+        articleMapper.insert(article);
+    }
+
+    public void update(Article article) {
+        articleMapper.updateById(article);
+    }
+
+    public void remove(Long id) {
+        articleMapper.deleteById(id);
+    }
+}
+```
+
+如果连 Service 层的通用方法也不想写，可以继承 `ServiceImpl`：
+
+```java
+public interface ArticleService extends IService<Article> {
+    // 自定义方法写这里
+}
+
+@Service
+public class ArticleServiceImpl extends ServiceImpl<ArticleMapper, Article>
+        implements ArticleService {
+    // selectById、insert、update 等方法已经实现，直接调用
+}
+```
+
+不过我建议 Service 层不要直接暴露 `BaseMapper` 的所有方法——加一层包装，控制哪些能力对外暴露，后续加业务逻辑也更方便。
+
+## 条件构造器：替代简单动态 SQL
+
+上一篇我们用动态 SQL 做文章搜索，需要写一段 XML。如果查询条件比较简单（没有复杂的 LIKE、BETWEEN、子查询），MyBatis-Plus 的条件构造器可以完全替代 XML。
+
+**LambdaQueryWrapper：类型安全，推荐使用**
+
+```java
+public List<Article> search(ArticleSearchQuery query) {
+    LambdaQueryWrapper<Article> wrapper = new LambdaQueryWrapper<>();
+
+    wrapper.eq(query.getCategoryId() != null, Article::getCategoryId, query.getCategoryId())
+           .eq(query.getStatus() != null, Article::getStatus, query.getStatus())
+           .like(query.getKeyword() != null, Article::getTitle, query.getKeyword())
+           .ge(query.getStartTime() != null, Article::getCreateTime, query.getStartTime())
+           .le(query.getEndTime() != null, Article::getCreateTime, query.getEndTime())
+           .orderByDesc(Article::getCreateTime);
+
+    return articleMapper.selectList(wrapper);
+}
+```
+
+第一个参数是 boolean 条件——为 true 时才拼接这个条件。这和 MyBatis 动态 SQL 的 `<if test="...">` 效果一样，但写在 Java 代码里，不需要 XML。
+
+`Article::getTitle` 是方法引用，MyBatis-Plus 会自动解析成 `title` 列名。比手写字符串 `"title"` 更安全——列名改了，编译器会报错。
+
+**LambdaUpdateWrapper：动态更新**
+
+```java
+public void updateStatus(Long id, Integer status) {
+    LambdaUpdateWrapper<Article> wrapper = new LambdaUpdateWrapper<>();
+    wrapper.eq(Article::getId, id)
+           .set(Article::getStatus, status)
+           .set(Article::getUpdateTime, LocalDateTime.now());
+
+    articleMapper.update(null, wrapper);
+}
+```
+
+**什么时候用条件构造器，什么时候写 XML？**
+
+条件构造器适合简单的等值查询、范围查询、排序。但以下场景还是得写 XML：
+
+- 多表 JOIN（条件构造器只支持单表）
+- 复杂的子查询
+- 自定义 SELECT 字段
+- GROUP BY + HAVING
+- 需要数据库特定函数
+
+实际项目中，两者混合使用最常见：简单查询用条件构造器，复杂查询用 XML。MyBatis-Plus 完全兼容原生 MyBatis 的 XML 写法。
+
+## 全局配置：主键策略、逻辑删除、自动填充
+
+MyBatis-Plus 的全局配置能减少很多重复代码。
+
+**主键策略**
+
+```yaml
+mybatis-plus:
+  global-config:
+    db-config:
+      id-type: auto # 数据库自增主键
+```
+
+配置后，所有实体的 `insert` 都不需要手动指定 ID：
+
+```java
+Article article = new Article();
+article.setTitle("新文章");
+// 不用 set id
+articleMapper.insert(article);
+// article.getId() 自动回填
+```
+
+**逻辑删除**
+
+CMS 中删除文章不应该是物理删除（`DELETE FROM`），而是标记为"已删除"状态。MyBatis-Plus 的逻辑删除让这个过程透明：
+
+```yaml
+mybatis-plus:
+  global-config:
+    db-config:
+      logic-delete-field: deleted # 逻辑删除字段名
+      logic-delete-value: 1 # 删除后的值
+      logic-not-delete-value: 0 # 未删除的值
+```
+
+```java
+@Data
+public class Article {
+    // ...
+    @TableLogic
+    private Integer deleted;
+}
+```
+
+配置后，调用 `articleMapper.deleteById(id)` 实际执行的是 `UPDATE articles SET deleted = 1 WHERE id = ?`。查询时 MyBatis-Plus 自动加上 `WHERE deleted = 0`。你不需要在任何地方写这些条件。
+
+**自动填充**
+
+`create_time` 和 `update_time` 每个表都有，每次 insert/update 都手动设置很烦：
+
+```java
+@Component
+public class AutoFillHandler implements MetaObjectHandler {
+
+    @Override
+    public void insertFill(MetaObject metaObject) {
+        this.strictInsertFill(metaObject, "createTime", LocalDateTime.class, LocalDateTime.now());
+        this.strictInsertFill(metaObject, "updateTime", LocalDateTime.class, LocalDateTime.now());
+    }
+
+    @Override
+    public void updateFill(MetaObject metaObject) {
+        this.strictUpdateFill(metaObject, "updateTime", LocalDateTime.class, LocalDateTime.now());
+    }
+}
+```
+
+```java
+@Data
+public class Article {
+    // ...
+    @TableField(fill = FieldFill.INSERT)
+    private LocalDateTime createTime;
+
+    @TableField(fill = FieldFill.INSERT_UPDATE)
+    private LocalDateTime updateTime;
+}
+```
+
+insert 时自动填充 `createTime` 和 `updateTime`，update 时自动填充 `updateTime`。代码里不需要手动 `setCreateTime(LocalDateTime.now())`。
+
+## 代码生成器
+
+如果连实体类和 Mapper 都不想手写，MyBatis-Plus 提供了代码生成器，根据数据库表自动生成：
+
+```java
+public class CodeGenerator {
+    public static void main(String[] args) {
+        FastAutoGenerator.create("jdbc:mysql://localhost:3306/blog_cms", "root", "root123")
+            .globalConfig(builder -> builder
+                .author("cms")
+                .outputDir("src/main/java")
+            )
+            .packageConfig(builder -> builder
+                .parent("com.example.cms")
+                .entity("entity")
+                .mapper("mapper")
+                .service("service")
+                .controller("controller")
+            )
+            .strategyConfig(builder -> builder
+                .addInclude("articles", "categories", "tags", "comments", "users")
+                .entityBuilder()
+                .enableLombok()
+                .naming(NamingStrategy.underline_to_camel)
+            )
+            .execute();
+    }
+}
+```
+
+运行一次，6 张表的 Entity、Mapper、Service、Controller 全部生成。你只需要在生成代码的基础上修改业务逻辑。
+
+## MyBatis-Plus 的局限
+
+MyBatis-Plus 不是万能的，有几个地方要注意：
+
+**复杂查询还是要写 XML**。条件构造器只支持单表操作。上一篇做的文章搜索（JOIN users 表查作者名、JOIN comments 表统计评论数），条件构造器搞不定，还是得在 XML 里写 SQL。
+
+**BaseMapper 和自定义方法混用时注意命名冲突**。如果你继承了 `BaseMapper<Article>` 又在 XML 里定义了一个 `<select id="selectById">`，会覆盖 BaseMapper 的 `selectById` 方法。
+
+**过度依赖 Wrapper 会导致 SQL 不可控**。当条件构造器链式调用很长时，你很难一眼看出最终生成的 SQL 是什么。复杂查询建议写 XML，SQL 清晰可见。
+
+---
+
+上篇我们用 MyBatis-Plus 消灭了大量的重复 CRUD 代码。现在 CMS 的功能完整了：文章管理、分类管理、标签管理、评论管理都能正常工作。但有一个问题还没考虑——当数据量增长到几万篇文章、几十万条评论时，查询还能快吗？下一篇我们来处理性能优化。

@@ -1,0 +1,330 @@
+---
+title: "04 Spring Boot 整合 MyBatis：现代化开发方式"
+date: "2026-03-23"
+summary: "把 CMS 系统迁移到 Spring Boot，掌握 Starter 自动配置、注解与 XML 混用、事务管理和分页整合。"
+tags: ["MyBatis", "Spring Boot", "整合"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 渐进式学习路线"
+seriesOrder: 4
+---
+
+前 3 篇我们用原生 MyBatis 搭建了 CMS 的基础功能。但你回头看代码，有个问题一直没解决：每次操作数据库都要手动创建 `SqlSession`，手动 `commit()`，手动 `close()`。这在实际项目中是不可能的——谁会每个方法都写一遍 `try-finally`？
+
+真实项目几乎都是 Spring Boot + MyBatis。Spring 容器帮你管理 `SqlSessionFactory`，你只需要 `@Autowired` 注入 Mapper；Spring 的事务管理帮你处理 `commit/rollback`，你只需要一个 `@Transactional` 注解。
+
+## Starter 做了什么
+
+```xml
+<dependency>
+    <groupId>org.mybatis.spring.boot</groupId>
+    <artifactId>mybatis-spring-boot-starter</artifactId>
+    <version>3.0.3</version>
+</dependency>
+```
+
+这一个依赖带来了三样东西：
+
+1. 自动配置 `SqlSessionFactory`——你不用再手动 `new SqlSessionFactoryBuilder().build()`
+2. 自动扫描 `@Mapper` 接口——注册为 Spring Bean，可以直接 `@Autowired`
+3. 自动配置事务管理器——和 Spring 的 `@Transactional` 无缝对接
+
+所以你之前写的那些初始化代码（`MyBatisUtil` 工具类、手动创建 `SqlSession`），在 Spring Boot 里全部不需要。
+
+## 配置方式的变化
+
+原生 MyBatis 的配置写在 `mybatis-config.xml` 里，Spring Boot 整合后大部分配置可以搬到 `application.yml`：
+
+```yaml
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/blog_cms?useSSL=false&serverTimezone=Asia/Shanghai
+    username: root
+    password: root123
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    # HikariCP 连接池配置（Spring Boot 默认）
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+
+mybatis:
+  # Mapper XML 文件位置
+  mapper-locations: classpath:mapper/*.xml
+  # 实体类别名包（不用写全限定名）
+  type-aliases-package: com.example.cms.entity
+  configuration:
+    # 这两个之前在 mybatis-config.xml 里配置，现在搬到 yml
+    map-underscore-to-camel-case: true
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+
+# Mapper 接口的日志级别
+logging:
+  level:
+    com.example.cms.mapper: debug
+```
+
+`mybatis.mapper-locations` 告诉 MyBatis 去哪找 XML 文件。`type-aliases-package` 配置后，XML 里的 `resultType="Article"` 就不用写全限定名 `com.example.cms.entity.Article`。
+
+## 三层架构
+
+Spring Boot 整合后，CMS 的代码结构变成标准的三层架构：
+
+```
+com.example.cms/
+├── entity/          # 实体类
+│   ├── Article.java
+│   ├── Comment.java
+│   └── User.java
+├── mapper/          # Mapper 接口（数据访问层）
+│   ├── ArticleMapper.java
+│   └── CommentMapper.java
+├── service/         # Service（业务逻辑层）
+│   └── ArticleService.java
+├── controller/      # Controller（接口层）
+│   └── ArticleController.java
+└── CmsApplication.java
+```
+
+Mapper 接口加上 `@Mapper` 注解（或者用 `@MapperScan` 批量扫描），Spring 会自动创建代理对象：
+
+```java
+@Mapper
+public interface ArticleMapper {
+    Article selectById(Long id);
+    List<Article> searchArticles(@Param("query") ArticleSearchQuery query);
+    int insert(Article article);
+    int update(Article article);
+    int deleteById(Long id);
+}
+```
+
+Service 层注入 Mapper，处理业务逻辑：
+
+```java
+@Service
+public class ArticleService {
+
+    private final ArticleMapper articleMapper;
+
+    public ArticleService(ArticleMapper articleMapper) {
+        this.articleMapper = articleMapper;
+    }
+
+    public ArticleDetail getDetail(Long id) {
+        Article article = articleMapper.selectById(id);
+        if (article == null) {
+            throw new BusinessException("文章不存在", 404);
+        }
+        // 查询作者和评论，组装成 ArticleDetail
+        ArticleDetail detail = new ArticleDetail();
+        detail.setArticle(article);
+        detail.setAuthor(userMapper.selectById(article.getAuthorId()));
+        detail.setComments(commentMapper.selectByArticleId(id));
+        return detail;
+    }
+
+    @Transactional
+    public void publish(Long id) {
+        Article article = articleMapper.selectById(id);
+        if (article == null) {
+            throw new BusinessException("文章不存在", 404);
+        }
+        article.setStatus(1);
+        articleMapper.update(article);
+    }
+}
+```
+
+注意这里用了构造器注入而不是 `@Autowired` 字段注入——这是 Spring 推荐的方式，方便测试，也更明确地声明了依赖关系。
+
+Controller 层处理 HTTP 请求：
+
+```java
+@RestController
+@RequestMapping("/api/articles")
+public class ArticleController {
+
+    private final ArticleService articleService;
+
+    public ArticleController(ArticleService articleService) {
+        this.articleService = articleService;
+    }
+
+    @GetMapping("/{id}")
+    public ArticleDetail getDetail(@PathVariable Long id) {
+        return articleService.getDetail(id);
+    }
+
+    @GetMapping
+    public List<Article> search(ArticleSearchQuery query) {
+        return articleService.search(query);
+    }
+
+    @PostMapping
+    public Article create(@RequestBody Article article) {
+        articleService.create(article);
+        return article;
+    }
+
+    @PutMapping("/{id}/publish")
+    public void publish(@PathVariable Long id) {
+        articleService.publish(id);
+    }
+}
+```
+
+你看，Controller 里没有任何数据库操作逻辑，Service 里也没有 SQL。每一层的职责很清晰。
+
+## 注解 vs XML：混合使用
+
+MyBatis 支持用注解写 SQL，不用 XML：
+
+```java
+@Mapper
+public interface ArticleMapper {
+
+    // 简单查询用注解
+    @Select("SELECT id, title, status, create_time FROM articles WHERE id = #{id}")
+    Article selectById(Long id);
+
+    @Select("SELECT id, title, status, create_time FROM articles WHERE author_id = #{authorId}")
+    List<Article> selectByAuthorId(Long authorId);
+
+    @Insert("INSERT INTO articles (title, content, author_id, category_id, status) "
+          + "VALUES (#{title}, #{content}, #{authorId}, #{categoryId}, #{status})")
+    @Options(useGeneratedKeys = true, keyProperty = "id")
+    int insert(Article article);
+
+    // 复杂查询用 XML（定义在 ArticleMapper.xml 中）
+    List<Article> searchArticles(@Param("query") ArticleSearchQuery query);
+}
+```
+
+原则很简单：**简单 SQL 用注解（一目了然，不用跳文件），复杂 SQL 用 XML（动态 SQL、JOIN、长查询在 XML 里更清晰）**。
+
+MyBatis 的注解和 XML 可以混合使用——同一个 Mapper 接口中，部分方法用注解定义 SQL，部分方法在 XML 中定义。MyBatis 会自动合并两者。
+
+## 事务管理
+
+上一篇提到了延迟加载的一个坑：如果关联查询在 SqlSession 关闭后才触发会报错。在 Spring Boot 中，SqlSession 的生命周期和事务绑定——事务开启时创建，事务提交/回滚时关闭。
+
+这意味着延迟加载必须在事务内完成。看一个反面例子：
+
+```java
+@Service
+public class ArticleService {
+
+    @Autowired
+    private ArticleMapper articleMapper;
+
+    // 没有事务注解
+    public Article getArticle(Long id) {
+        Article article = articleMapper.selectById(id);
+        // SqlSession 在方法返回时已经关闭
+        return article;
+        // 调用方如果访问 article.getAuthor()（延迟加载），会抛异常
+    }
+}
+```
+
+加上 `@Transactional(readOnly = true)` 后，SqlSession 的生命周期扩展到整个方法，延迟加载可以正常工作：
+
+```java
+@Transactional(readOnly = true)
+public ArticleDetail getDetail(Long id) {
+    Article article = articleMapper.selectById(id);
+    ArticleDetail detail = new ArticleDetail();
+    detail.setArticle(article);
+    // 延迟加载 author 在事务内触发，没有问题
+    detail.setAuthor(article.getAuthor());
+    return detail;
+}
+```
+
+`@Transactional` 默认在 `RuntimeException` 时回滚，在 `checked Exception` 时不回滚。如果需要自定义回滚行为：
+
+```java
+@Transactional(rollbackFor = Exception.class)
+public void batchPublish(List<Long> ids) {
+    for (Long id : ids) {
+        Article article = articleMapper.selectById(id);
+        article.setStatus(1);
+        articleMapper.update(article);
+        // 如果中间某条更新失败，所有已发布的都回滚
+    }
+}
+```
+
+## PageHelper 分页整合
+
+CMS 的文章列表需要分页。PageHelper 是 MyBatis 最常用的分页插件，整合到 Spring Boot 只需要加一个依赖：
+
+```xml
+<dependency>
+    <groupId>com.github.pagehelper</groupId>
+    <artifactId>pagehelper-spring-boot-starter</artifactId>
+    <version>2.0.0</version>
+</dependency>
+```
+
+配置：
+
+```yaml
+pagehelper:
+  helper-dialect: mysql
+  reasonable: true # 页码 <= 0 时查第一页，页码 > 总页数时查最后一页
+```
+
+使用方式：
+
+```java
+@Service
+public class ArticleService {
+
+    public PageInfo<Article> searchPaged(ArticleSearchQuery query, int pageNum, int pageSize) {
+        // 核心：在查询之前调用 PageHelper.startPage
+        PageHelper.startPage(pageNum, pageSize);
+
+        // 紧接着的第一个查询会被分页
+        List<Article> articles = articleMapper.searchArticles(query);
+
+        // 包装成 PageInfo，包含分页信息
+        return new PageInfo<>(articles);
+    }
+}
+```
+
+`PageHelper.startPage()` 通过 ThreadLocal 拦截紧接着的第一个查询，自动加上 `LIMIT` 和 `COUNT`。你不需要修改任何 Mapper XML。
+
+`PageInfo` 包含的分页信息：
+
+```java
+pageInfo.getList();        // 当前页数据
+pageInfo.getTotal();       // 总记录数
+pageInfo.getPages();       // 总页数
+pageInfo.getPageNum();     // 当前页码
+pageInfo.getPageSize();    // 每页大小
+pageInfo.isHasNextPage();  // 是否有下一页
+pageInfo.isHasPreviousPage(); // 是否有上一页
+```
+
+Controller 层接收分页参数：
+
+```java
+@GetMapping
+public PageInfo<Article> search(
+    ArticleSearchQuery query,
+    @RequestParam(defaultValue = "1") int pageNum,
+    @RequestParam(defaultValue = "10") int pageSize
+) {
+    return articleService.searchPaged(query, pageNum, pageSize);
+}
+```
+
+有两个注意点：`startPage()` 必须紧跟在查询方法之前，中间不能有其他数据库操作，否则分页会作用到错误的 SQL 上。如果一次 Service 方法里有多个查询，只有第一个会被分页。
+
+---
+
+前 4 篇我们用原生 MyBatis 和 Spring Boot 搭好了 CMS 的完整架构。但有一个问题一直存在：每个表都要写 Mapper 接口 + XML + Service，80% 的代码都是重复的增删改查。下一篇我们用 MyBatis-Plus 来消灭这些重复代码。
