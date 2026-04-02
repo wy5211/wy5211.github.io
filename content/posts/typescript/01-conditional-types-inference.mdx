@@ -1,7 +1,8 @@
 ---
-title: "01 条件类型与 infer"
+title: "01 条件类型与 infer：TypeScript 的 if-else"
 date: "2026-03-23"
-tags: ["TypeScript"]
+summary: "从 API 响应类型提取出发，掌握条件类型和 infer 关键字，理解分布式条件类型和递归类型。"
+tags: ["TypeScript", "条件类型", "infer"]
 category: "typescript"
 cover: ""
 draft: false
@@ -9,493 +10,280 @@ series: "TypeScript 类型系统进阶"
 seriesOrder: 1
 ---
 
-## 前言
+# 条件类型与 infer：TypeScript 的 if-else
 
-在日常开发中，我们经常需要根据类型关系做出不同的类型选择。TypeScript 的**条件类型**（Conditional Types）让我们能够在类型级别实现类似三元表达式的逻辑，配合 `infer` 关键字，可以实现非常强大的类型推断和转换。
-
-条件类型是很多高级类型技巧的基础，理解了它，你就能看懂绝大多数工具类型的实现原理。
-
-## 核心概念
-
-### 条件类型语法
-
-条件类型的基本语法类似三元表达式：
+你在给团队封装一个统一的 API 调用层。后端的接口返回格式是统一的，外面一层信封，里面才是真正的数据：
 
 ```typescript
-T extends U ? X : Y
+// 后端返回的实际结构
+{
+  code: 0,
+  message: "ok",
+  data: {
+    userId: "usr_a1x9k2m",
+    email: "zhangsan@example.com",
+    avatar: "https://cdn.example.com/avatars/a1x9k2m.webp"
+  }
+}
 ```
 
-- `T extends U`：检查类型 `T` 是否可以赋值给类型 `U`
-- 如果是，返回类型 `X`
-- 如果不是，返回类型 `Y`
+你的 API 客户端拿到这个响应后，应该把 `data` 里的东西交给业务代码用。业务代码不关心 `code` 和 `message`——那是客户端统一处理的。问题来了：你怎么写一个类型工具，把 `ApiResponse<User>` 里的 `User` 自动提取出来？
+
+泛型做不到这件事。泛型只是"参数化类型"的容器，它本身没有分支能力。你需要的是类型层面的 if-else——条件类型。
+
+## 条件类型：类型层面的分支
+
+JavaScript 里你会写 `typeof x === 'string' ? doA() : doB()` 来做分支判断。TypeScript 的条件类型做的事情几乎一样，只不过判断发生在类型层面：
 
 ```typescript
 type IsString<T> = T extends string ? true : false;
 
-type Test1 = IsString<string>; // true
-type Test2 = IsString<number>; // false
-type Test3 = IsString<"hello">; // true
+type A = IsString<"hello">; // true
+type B = IsString<42>; // false
 ```
 
-### 分布式条件类型
+`T extends U ? X : Y` 这段代码的含义是：如果类型 `T` 可以赋值给类型 `U`，那么整个条件类型的结果是 `X`，否则是 `Y`。这和运行时的三元表达式是一一对应的。
 
-当条件类型作用于联合类型时，会自动分发：
+为什么需要这个东西？回到我们开头的问题。API 响应有两种可能：成功时 `data` 里有东西，失败时 `data` 可能是 `null`。你想根据泛型参数来决定类型行为，但泛型本身不会"做判断"——它只是个占位符。条件类型补上了这个能力缺口。
+
+用一个最简单的例子来感受一下：
+
+```typescript
+type UnwrapApiResponse<T> = T extends { data: infer D } ? D : T;
+
+type RawUser = {
+  code: number;
+  message: string;
+  data: { userId: string; email: string };
+};
+
+type User = UnwrapApiResponse<RawUser>;
+// { userId: string; email: string }
+```
+
+这里出现了一个新面孔：`infer`。
+
+## infer：在条件分支里"捕获"类型
+
+`infer` 的作用是声明一个类型变量，让 TypeScript 在模式匹配的过程中自动推断它的具体类型。上面的例子里，`T extends { data: infer D }` 的意思是："如果 `T` 是一个包含 `data` 字段的对象，把 `data` 字段的类型记为 `D`"。后面的 `? D` 就直接使用了这个推断出来的类型。
+
+关键点在于：你不需要事先知道 `D` 是什么，TypeScript 会根据传入的实际类型来推断。这就像正则表达式里的捕获组——你定义一个模式，引擎帮你把匹配到的部分提取出来。
+
+让我们看几个更实用的例子，都围绕 API 客户端这个场景。
+
+### 从 Promise 里提取内部类型
+
+API 客户端的每个方法都返回 `Promise`。你经常需要拿到 Promise 内部的类型来做后续的类型操作：
+
+```typescript
+type Awaited<T> = T extends Promise<infer Inner> ? Inner : T;
+
+type UserPromise = Promise<{
+  userId: string;
+  email: string;
+}>;
+
+type User = Awaited<UserPromise>;
+// { userId: string; email: string }
+
+type PlainString = Awaited<string>;
+// string（不是 Promise，原样返回）
+```
+
+这个类型工具的逻辑很清晰：传入的类型如果是 `Promise<某个东西>`，就把那个"东西"提取出来；如果不是 Promise，原样返回。TypeScript 标准库里已经内置了 `Awaited`，但理解它的实现原理比直接用它重要得多——因为同样的模式可以应用在任何"容器类型"上。
+
+### 从函数签名里提取返回值和参数
+
+API 客户端里你还会遇到函数类型。比如你想从一个请求处理函数里提取它的参数类型和返回值类型：
+
+```typescript
+type GetReturn<T> = T extends (...args: any[]) => infer R ? R : never;
+type GetParams<T> = T extends (first: infer P, ...args: any[]) => any
+  ? P
+  : never;
+
+type FetchUsers = (page: number, pageSize: number) => Promise<User[]>;
+
+type Response = GetReturn<FetchUsers>;
+// Promise<User[]>
+
+type FirstArg = GetParams<FetchUsers>;
+// number
+```
+
+`GetReturn` 的模式匹配规则是：如果 `T` 是一个函数（不管参数是什么，用 `any[]` 忽略掉），就把返回值类型记为 `R`。`GetParams` 类似，但它只关心第一个参数。
+
+这两个工具类型组合起来能做的事情很多。比如你有一批请求函数，想统一提取它们的返回类型做成一个联合类型——在后面的文章里会用到这个技巧。
+
+### 多个 infer 同时使用
+
+一个条件分支里可以放多个 `infer`，各自捕获不同位置的类型：
+
+```typescript
+type FunctionParts<T> = T extends (
+  first: infer F,
+  ...rest: infer R
+) => infer Return
+  ? { first: F; rest: R; return: Return }
+  : never;
+
+type Handler = (id: string, name: string, age: number) => boolean;
+
+type Parts = FunctionParts<Handler>;
+// { first: string; rest: [string, number]; return: boolean }
+```
+
+这里 `F` 捕获第一个参数，`R` 捕获剩余参数组成的元组，`Return` 捕获返回值。三个 `infer` 各司其职，互不干扰。
+
+有一点需要注意：`infer` 只能在 `extends` 后面的模式里使用，不能在其他地方出现。它不是一个通用的类型变量声明机制，而是专门为条件类型的模式匹配设计的。
+
+## 分布式条件类型：联合类型会自动展开
+
+条件类型有一个行为很容易让人踩坑。假设你写了一个把类型包装成数组的工具：
 
 ```typescript
 type ToArray<T> = T extends any ? T[] : never;
 
 type Result = ToArray<string | number>;
-// 等价于 ToArray<string> | ToArray<number>
-// 结果：string[] | number[]
 ```
 
-**重要**：分发发生在被检查类型是裸类型参数时：
+你觉得 `Result` 是什么？是 `(string | number)[]` 吗？不是。实际结果是 `string[] | number[]`。
+
+这就是**分布式条件类型**。规则是：当条件类型作用于一个"裸类型参数"（就是直接用泛型参数 `T` 本身，没有被包裹在元组或其他类型里），并且传入的实际类型是联合类型时，TypeScript 会把联合类型拆开，对每个成员分别计算，最后再把结果合并成联合类型。
+
+等价于：
 
 ```typescript
-// ✅ 会分发
-type Distributive<T> = T extends any ? T[] : never;
-
-// ❌ 不会分发（被数组包裹）
-type NonDistributive<T extends any[]> = T extends any ? T : never;
+type Result = ToArray<string> | ToArray<number>;
+// string[] | number[]
 ```
 
-### infer 关键字
-
-`infer` 关键字用于在条件类型中**推断**类型的一部分，并将其绑定到一个类型变量：
+这在很多时候是你想要的行为。但有时候你确实需要把联合类型当作一个整体来处理。阻止分布的方法是用元组包一层：
 
 ```typescript
-// 提取函数返回值类型
-type ReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
+type ToArrayNonDist<T> = [T] extends [any] ? T[] : never;
 
-function getUser() {
-  return { id: 1, name: "Alice" };
+type Result = ToArrayNonDist<string | number>;
+// (string | number)[]
+```
+
+把 `T` 放进元组 `[T]` 之后，它就不再是"裸类型参数"了，分布式行为不会触发。这个技巧在写工具类型时经常用到。
+
+为什么默认要分布式？因为大多数场景下分布式的结果更精确。`ToArray<string | number>` 返回 `string[] | number[]`，意味着"要么是 string 数组，要么是 number 数组"，这比 `(string | number)[]`（"一个可能同时包含 string 和 number 的数组"）语义更严格。默认更严格的语义是一个合理的设计选择。
+
+## 递归条件类型：处理嵌套的 Promise
+
+回到 `Awaited` 那个例子。如果传入的类型是 `Promise<Promise<User>>` 呢？我们之前写的简单版本只能剥一层：
+
+```typescript
+// 简单版本，只能剥一层
+type SimpleAwaited<T> = T extends Promise<infer Inner> ? Inner : T;
+
+type R = SimpleAwaited<Promise<Promise<User>>>;
+// Promise<User>，不是 User
+```
+
+在真实场景里，多层嵌套的 Promise 并不少见。比如一个中间件先包了一层 Promise，API 客户端又包了一层。要彻底剥干净，需要递归：
+
+```typescript
+type DeepAwaited<T> = T extends Promise<infer Inner> ? DeepAwaited<Inner> : T;
+
+type R = DeepAwaited<Promise<Promise<User>>>;
+// User
+
+type R2 = DeepAwaited<Promise<Promise<Promise<{ orderId: string }>>>>;
+// { orderId: string }
+```
+
+逻辑是这样的：如果 `T` 是 `Promise<某个东西>`，就把那个东西取出来，再递归调用 `DeepAwaited`。如果不是 Promise 了，就到达递归终点，直接返回 `T`。
+
+TypeScript 支持这种递归条件类型，但有一个深度限制——通常在 45 到 50 层左右。如果你的类型嵌套超过了这个深度，编译器会报 "Type instantiation is excessively deep and possibly infinite" 的错误。在正常业务代码里几乎不可能达到这个限制，但在写极端的类型体操时需要注意。
+
+递归条件类型是 TypeScript 类型系统里非常强大的能力。很多看似复杂的问题——深层嵌套对象的处理、路径类型的解析、模板字面量类型的反复匹配——都可以用递归优雅地解决。后面几篇文章会反复用到这个模式。
+
+## 实战：构建 API 响应解包类型
+
+现在把前面学到的东西组合起来，为我们的 API 客户端写一个完整的响应解包类型。
+
+后端的接口返回格式并不总是完美的。有的接口用 `{ code, message, data }` 包装，有的接口直接返回数据，还有的接口在 data 里嵌套了一层分页结构。我们需要一个能处理这些差异的类型工具。
+
+先定义基础结构：
+
+```typescript
+interface User {
+  userId: string;
+  email: string;
+  avatar: string;
 }
 
-type User = ReturnType<typeof getUser>;
-// { id: number; name: string }
-```
-
-## 高级技巧
-
-### 技巧 1：提取 Promise 内部类型
-
-处理异步函数时，我们经常需要提取 Promise 返回的类型：
-
-```typescript
-// 基础版本：只处理一层 Promise
-type Awaited<T> = T extends Promise<infer U> ? U : T;
-
-type Test1 = Awaited<Promise<string>>; // string
-type Test2 = Awaited<Promise<Promise<number>>>; // Promise<number>
-
-// 高级版本：递归处理多层 Promise
-type DeepAwaited<T> = T extends Promise<infer U> ? DeepAwaited<U> : T;
-
-type Test3 = DeepAwaited<Promise<Promise<Promise<boolean>>>>;
-// boolean
-```
-
-**实战应用**：
-
-```typescript
-// API 响应类型提取
-type ApiResponse<T> = Promise<{
+interface PaginatedResponse<T> {
   code: number;
-  data: T;
   message: string;
-}>;
-
-async function fetchUser(): ApiResponse<User> {
-  return {
-    code: 200,
-    data: { id: 1, name: "Alice" },
-    message: "success",
+  data: {
+    items: T[];
+    total: number;
+    page: number;
+    pageSize: number;
   };
 }
 
-type UserData = DeepAwaited<ReturnType<typeof fetchUser>>;
-// {
-//   code: number
-//   data: User
-//   message: string
-// }
-```
-
----
-
-### 技巧 2：提取函数参数类型
-
-```typescript
-// 提取第一个参数类型
-type FirstParam<T> = T extends (first: infer F, ...args: any[]) => any
-  ? F
-  : never;
-
-// 提取所有参数类型（元组）
-type Params<T> = T extends (...args: infer P) => any ? P : never;
-
-function greet(name: string, age: number, city: string) {
-  console.log(`${name} is ${age} years old from ${city}`);
+interface PlainResponse<T> {
+  code: number;
+  message: string;
+  data: T;
 }
-
-type GreetFirst = FirstParam<typeof greet>; // string
-type GreetParams = Params<typeof greet>; // [string, number, string]
 ```
 
-**实战应用**：类型安全的事件监听器
+然后写解包类型：
 
 ```typescript
-type EventHandler<T extends any[]> = (...args: T) => void;
+// 第一层：解包外层信封
+type UnwrapEnvelope<T> = T extends { data: infer D } ? D : T;
 
-class EventEmitter<Events extends Record<string, any[]>> {
-  private listeners: Map<keyof Events, Set<EventHandler<any>>> = new Map();
+// 第二层：如果是分页结构，提取 items 数组的元素类型
+type ExtractPageItem<T> = T extends { items: (infer I)[] } ? I : T;
 
-  on<K extends keyof Events>(event: K, handler: EventHandler<Events[K]>): void {
-    if (!this.listeners.has(event)) {
-      this.listeners.set(event, new Set());
-    }
-    this.listeners.get(event)!.add(handler);
-  }
-
-  emit<K extends keyof Events>(event: K, ...args: Events[K]): void {
-    this.listeners.get(event)?.forEach((handler) => handler(...args));
-  }
-}
-
-// 使用
-interface AppEvents {
-  "user:login": [userId: string, timestamp: number];
-  "user:logout": [userId: string];
-}
-
-const emitter = new EventEmitter<AppEvents>();
-
-emitter.on("user:login", (userId, timestamp) => {
-  // userId: string
-  // timestamp: number
-  console.log(`User ${userId} logged in at ${timestamp}`);
-});
-
-// ✅ 类型安全
-emitter.emit("user:login", "user-123", Date.now());
-
-// ❌ 类型错误：参数不匹配
-emitter.emit("user:login", "user-123"); // 缺少 timestamp
+// 组合起来
+type ApiResult<T> = ExtractPageItem<UnwrapEnvelope<T>>;
 ```
 
----
-
-### 技巧 3：过滤联合类型
-
-使用条件类型可以过滤联合类型的某些成员：
+用实际类型验证一下：
 
 ```typescript
-// 提取函数类型
-type OnlyFunctions<T> = T extends (...args: any[]) => any ? T : never;
+type UserResult = ApiResult<PlainResponse<User>>;
+// User —— 普通接口，解包信封后直接拿到 User
 
-type Mixed = string | number | ((x: number) => string) | boolean;
-
-type FunctionsOnly = OnlyFunctions<Mixed>;
-// ((x: number) => string)
-
-// 过滤掉函数类型
-type RemoveFunctions<T> = T extends (...args: any[]) => any ? never : T;
-
-type NoFunctions = RemoveFunctions<Mixed>;
-// string | number | boolean
+type UserListResult = ApiResult<PaginatedResponse<User>>;
+// User —— 分页接口，解包信封后拿到 { items, total, page, pageSize }，
+//         再提取 items 的元素类型，得到 User
 ```
 
-**实战应用**：提取对象的方法名
+这两个类型工具各做一件事，然后通过组合完成整个解包流程。这种"小工具组合"的思路比写一个巨大的条件类型更清晰——每个工具的职责单一，出问题了也好排查。
+
+再来看一个更复杂的场景：有的接口返回的数据本身就是异步的，你需要同时处理 Promise 嵌套和信封结构。把 `DeepAwaited` 加进来：
 
 ```typescript
-type FunctionPropertyNames<T> = {
-  [K in keyof T]: T[K] extends Function ? K : never;
-}[keyof T];
+type SafeApiResult<T> = ApiResult<DeepAwaited<T>>;
 
-type NonFunctionPropertyNames<T> = {
-  [K in keyof T]: T[K] extends Function ? never : K;
-}[keyof T];
+type AsyncUser = SafeApiResult<Promise<PlainResponse<User>>>;
+// User —— 先剥掉 Promise，再解包信封
 
-interface User {
-  id: number;
-  name: string;
-  greet(): string;
-  update(data: Partial<User>): void;
-}
-
-type Methods = FunctionPropertyNames<User>;
-// "greet" | "update"
-
-type Properties = NonFunctionPropertyNames<User>;
-// "id" | "name"
+type AsyncUserList = SafeApiResult<Promise<PaginatedResponse<User>>>;
+// User —— 先剥掉 Promise，再解包信封，再提取分页元素
 ```
 
----
+四个类型工具（`DeepAwaited`、`UnwrapEnvelope`、`ExtractPageItem`、`ApiResult`），每个不超过两行，组合起来能处理 API 响应的各种变形。这就是条件类型的实用价值——你写的不是一行复杂的"万能公式"，而是几个简洁、可组合的小工具。
 
-### 技巧 4：类型链式判断
+## 条件类型的代价
 
-通过嵌套条件类型，实现复杂的类型判断：
+条件类型确实强大，但它不是万能的，使用时需要权衡几个问题。
 
-```typescript
-// 判断是否为数组
-type IsArray<T> = T extends any[] ? true : false;
+第一是**类型计算开销**。条件类型（尤其是递归的）会在编译时执行类型计算。TypeScript 编译器对类型实例化的深度有硬性限制，超过就会直接报错。在一个大型项目里，如果到处都是复杂的条件类型，编译速度会受到明显影响。你可以在 `tsconfig.json` 里设置 `"noErrorTruncation": true` 来看到完整的错误信息，方便定位是哪个类型导致了过深的实例化。
 
-// 判断是否为元组
-type IsTuple<T> = T extends readonly any[]
-  ? number extends T["length"]
-    ? false
-    : true
-  : false;
+第二是**可读性**。`T extends (infer U)[] ? DeepAwaited<U> : never` 这种代码对作者来说很清晰，但团队里的其他人可能要盯着看一分钟才能理解。复杂的条件类型最好加上注释说明意图，或者拆成命名清晰的多个小类型。
 
-type Test1 = IsArray<string[]>; // true
-type Test2 = IsArray<[string, number]>; // true
-type Test3 = IsTuple<[string, number]>; // true
-type Test4 = IsTuple<string[]>; // false
-```
+第三是**调试困难**。当条件类型的结果不符合预期时，你没有办法像调试运行时代码那样 `console.log`。只能靠 IDE 的悬浮提示或者 `type X = ...` 这种辅助类型来逐步排查。TypeScript 4.7+ 提供了 `--generateTrace` 选项，可以输出编译器的类型检查轨迹，但输出内容非常冗长，只适合作为最后的手段。
 
-**实战应用**：智能的 API 响应处理器
+我的建议是：条件类型用在真正需要类型层面分支的场景——从容器类型中提取内部类型、根据输入类型决定输出类型、处理联合类型的分发。如果用简单的泛型约束就能解决的问题，不要为了"看起来高级"而引入条件类型。工具类型应该服务于类型安全的目标，而不是成为炫技的载体。
 
-```typescript
-type ApiResult<T> = T extends any[]
-  ? { type: "array"; data: T }
-  : T extends object
-    ? { type: "object"; data: T }
-    : { type: "primitive"; data: T };
-
-function processApiResult<T>(result: T): ApiResult<T> {
-  if (Array.isArray(result)) {
-    return { type: "array", data: result } as ApiResult<T>;
-  }
-  if (typeof result === "object" && result !== null) {
-    return { type: "object", data: result } as ApiResult<T>;
-  }
-  return { type: "primitive", data: result } as ApiResult<T>;
-}
-
-const result1 = processApiResult([{ id: 1 }, { id: 2 }]);
-// result1.type: "array"
-
-const result2 = processApiResult({ id: 1, name: "Alice" });
-// result2.type: "object"
-
-const result3 = processApiResult("hello");
-// result3.type: "primitive"
-```
-
----
-
-### 技巧 5：条件类型类型推断
-
-使用 `infer` 在多个位置进行推断：
-
-```typescript
-// 提取 Promise 的 resolve 和 reject 类型
-type PromiseTypes<T> =
-  T extends Promise<infer U>
-    ? { resolve: U; reject: unknown }
-    : T extends Promise<infer U, infer E>
-      ? { resolve: U; reject: E }
-      : never;
-
-// 提取对象方法
-type ObjectMethods<T> = {
-  [K in keyof T as T[K] extends Function ? K : never]: T[K];
-};
-
-interface Service {
-  id: string;
-  getData(): Promise<Data>;
-  updateData(data: Data): Promise<void>;
-  delete(id: string): Promise<boolean>;
-}
-
-type ServiceMethods = ObjectMethods<Service>;
-// {
-//   getData: () => Promise<Data>
-//   updateData: (data: Data) => Promise<void>
-//   delete: (id: string) => Promise<boolean>
-// }
-```
-
-## 实战应用
-
-### 构建类型安全的 HTTP 客户端
-
-```typescript
-type HttpMethod = "GET" | "POST" | "PUT" | "DELETE" | "PATCH";
-
-type ApiEndpoint<T extends HttpMethod, U, V> = T extends "GET"
-  ? (params?: U) => Promise<V>
-  : T extends "POST" | "PUT" | "PATCH"
-    ? (data: U) => Promise<V>
-    : T extends "DELETE"
-      ? (id: string) => Promise<V>
-      : never;
-
-interface User {
-  id: string;
-  name: string;
-  email: string;
-}
-
-interface CreateUserData {
-  name: string;
-  email: string;
-}
-
-interface UpdateUserData {
-  name?: string;
-  email?: string;
-}
-
-// API 定义
-interface UserApi {
-  getUsers: ApiEndpoint<"GET", undefined, User[]>;
-  getUserById: ApiEndpoint<"GET", { id: string }, User>;
-  createUser: ApiEndpoint<"POST", CreateUserData, User>;
-  updateUser: ApiEndpoint<"PUT", { id: string } & UpdateUserData, User>;
-  deleteUser: ApiEndpoint<"DELETE", undefined, void>;
-}
-
-// 客户端实现
-class ApiClient<Api extends Record<string, (...args: any[]) => Promise<any>>> {
-  async call<K extends keyof Api>(
-    method: K,
-    ...args: Parameters<Api[K]>
-  ): Promise<ReturnType<Api[K]>> {
-    // 实现实际的 HTTP 调用
-    return {} as any;
-  }
-}
-
-const api = new ApiClient<UserApi>();
-
-// ✅ 类型安全
-api.call("getUsers");
-api.call("getUserById", { id: "123" });
-api.call("createUser", { name: "Alice", email: "alice@example.com" });
-
-// ❌ 类型错误
-api.call("createUser", { name: "Alice" }); // 缺少 email
-```
-
-## 避坑指南
-
-### ❌ 错误 1：忽略分布式条件类型的影响
-
-```typescript
-type Naked<T> = T extends any ? T[] : never;
-type Wrapped<T extends any[]> = T extends any ? T : never;
-
-type Test1 = Naked<string | number>;
-// string[] | number[] (分发)
-
-type Test2 = Wrapped<(string | number)[]>;
-// (string | number)[] (不分发)
-```
-
-**✅ 正确做法**：理解何时分发何时不分发，根据需要选择。
-
----
-
-### ❌ 错误 2：在错误的位置使用 infer
-
-```typescript
-// ❌ 错误：infer 不能在条件分支外使用
-type Bad<T> = infer R extends T ? R : never;
-
-// ❌ 错误：infer 必须在 extends 子句中
-type AlsoBad<T> = T extends infer R ? R : R;
-//                         ^^^^^^ 第二个 R 不合法
-
-// ✅ 正确
-type Good<T> = T extends infer R ? R : never;
-```
-
----
-
-### ❌ 错误 3：联合类型在条件类型中的意外分发
-
-```typescript
-// 想要检查是否为联合类型
-type IsUnion<T> = T extends any ? ([any] extends [T] ? false : true) : never;
-
-type Test = IsUnion<string | number>; // true（正确）
-type Test2 = IsUnion<string>; // false（正确）
-
-// 但这有个问题
-type Test3 = IsUnion<any>; // false（可能是错误的）
-```
-
-**✅ 正确做法**：使用更健壮的联合类型检测
-
-```typescript
-type IsUnion<T, B = T> = [T] extends [UnionToIntersection<B>] ? false : true;
-
-type UnionToIntersection<U> = (U extends any ? (k: U) => void : never) extends (
-  k: infer I
-) => void
-  ? I
-  : never;
-```
-
----
-
-### ❌ 错误 4：过度嵌套导致性能问题
-
-```typescript
-// ❌ 性能差：深层嵌套
-type Bad<T> =
-  T extends Promise<infer U>
-    ? U extends Promise<infer V>
-      ? V extends Promise<infer W>
-        ? W
-        : V
-      : U
-    : T;
-
-// ✅ 性能好：使用递归
-type Good<T> = T extends Promise<infer U> ? Good<U> : T;
-```
-
-## 总结
-
-### 核心要点
-
-1. **条件类型**：`T extends U ? X : Y` 实现类型级别的条件判断
-2. **分布式条件类型**：自动分发到联合类型的每个成员
-3. **infer 关键字**：在条件类型中推断类型的一部分
-4. **递归条件类型**：处理多层嵌套类型（如 `Promise<Promise<T>>`）
-
-### 实用工具类型
-
-```typescript
-// 提取函数返回值
-type ReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
-
-// 提取 Promise 内部类型
-type Awaited<T> = T extends Promise<infer U> ? U : T;
-
-// 提取函数参数
-type Parameters<T> = T extends (...args: infer P) => any ? P : never;
-
-// 提取实例类型
-type InstanceType<T> = T extends new (...args: any[]) => infer R ? R : any;
-
-// 提取 this 参数类型
-type ThisParameterType<T> = T extends (this: infer U, ...args: any[]) => any
-  ? U
-  : unknown;
-
-// 去除 this 参数类型
-type OmitThisParameter<T> = T extends (this: any, ...args: infer A) => infer R
-  ? (...args: A) => R
-  : T;
-```
-
-## 参考资料
-
-- [TypeScript Handbook: Conditional Types](https://www.typescriptlang.org/docs/handbook/2/conditional-types.html)
-- [TypeScript Handbook: Type Inference in Conditional Types](https://www.typescriptlang.org/docs/handbook/2/conditional-types.html#inferring-within-conditional-types)
-
----
+下一篇我们会进入另一个领域：模板字面量类型。如果说条件类型给了你在类型层面做判断的能力，那模板字面量类型就给了你在类型层面操作字符串的能力——我们会用它来解决 API 路由参数提取的问题。

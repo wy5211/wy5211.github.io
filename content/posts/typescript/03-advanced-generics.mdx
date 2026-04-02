@@ -1,7 +1,8 @@
 ---
-title: "03 泛型高级应用"
+title: "03 泛型高级应用：构建灵活的类型工具"
 date: "2026-03-23"
-tags: ["TypeScript"]
+summary: "掌握递归泛型、多泛型参数协作、泛型约束，构建深度类型变换工具和类型安全的路径访问。"
+tags: ["TypeScript", "泛型", "递归类型"]
 category: "typescript"
 cover: ""
 draft: false
@@ -9,662 +10,383 @@ series: "TypeScript 类型系统进阶"
 seriesOrder: 3
 ---
 
-## 前言
+## 从一个真实的痛点开始
 
-泛型是 TypeScript 类型系统中最强大的特性之一。很多开发者只停留在使用 `Array<T>` 这样的基础泛型上，但实际上泛型可以实现远超于此的高级功能。
-
-本文将深入探讨多参数泛型、泛型约束、默认泛型参数、递归泛型等高级模式，帮助你构建更加灵活、类型安全的通用 API。
-
-## 核心概念
-
-### 多个泛型参数
-
-泛型可以有多个参数，它们之间可以相互约束：
+你接手了一个 API 客户端的封装工作，后端的响应结构是这样的：
 
 ```typescript
-function merge<T, U>(obj1: T, obj2: U): T & U {
-  return { ...obj1, ...obj2 };
-}
-
-const result = merge(
-  { id: 1, name: "Alice" },
-  { email: "alice@example.com", age: 30 }
-);
-// result: { id: number; name: string; email: string; age: number }
-```
-
-### 泛型约束
-
-使用 `extends` 关键字约束泛型的类型范围：
-
-```typescript
-// 基础约束
-function length<T extends { length: number }>(value: T): number {
-  return value.length;
-}
-
-length("hello"); // ✅ 5
-length([1, 2, 3]); // ✅ 3
-length({ length: 10 }); // ✅ 10
-length(123); // ❌ number 没有 length 属性
-
-// 条件约束
-type ElementType<T extends readonly any[]> = T extends readonly (infer E)[]
-  ? E
-  : never;
-
-type Element1 = ElementType<[string, number]>; // string | number
-type Element2 = ElementType<string[]>; // string
-```
-
-### 默认泛型参数
-
-为泛型参数提供默认值：
-
-```typescript
-function createMap<K extends string | number = string, V = any>(
-  initial?: Partial<Record<K, V>>
-): Map<K, V> {
-  return new Map(Object.entries(initial || {}) as [K, V][]);
-}
-
-const map1 = createMap(); // Map<string, any>
-const map2 = createMap<number, string>(); // Map<number, string>
-```
-
-## 高级技巧
-
-### 技巧 1：深度操作泛型
-
-实现对嵌套对象的深度操作：
-
-```typescript
-// 深度 Readonly
-type DeepReadonly<T> = {
-  readonly [P in keyof T]: T[P] extends object ? DeepReadonly<T[P]> : T[P];
+type ApiResponse<T> = {
+  code: number;
+  message: string;
+  data: T;
 };
 
-interface User {
-  id: number;
-  profile: {
+// 实际用起来
+type UserDetailResponse = ApiResponse<{
+  user: {
+    id: string;
     name: string;
-    address: {
-      city: string;
-      country: string;
-    };
-  };
-}
-
-type ReadonlyUser = DeepReadonly<User>;
-// 所有属性都是 readonly，包括嵌套对象
-
-// 深度 Partial
-type DeepPartial<T> = {
-  [P in keyof T]?: T[P] extends object ? DeepPartial<T[P]> : T[P];
-};
-
-// 深度 Required
-type DeepRequired<T> = {
-  [P in keyof T]-?: T[P] extends object ? DeepRequired<T[P]> : T[P];
-};
-
-// 深度 Nullable
-type DeepNullable<T> = {
-  [P in keyof T]?: T[P] extends object ? DeepNullable<T[P]> : T[P] | null;
-};
-
-// 使用示例
-function updateUser(user: User, updates: DeepPartial<User>): User {
-  return {
-    ...user,
-    ...updates,
     profile: {
-      ...user.profile,
-      ...updates.profile,
-      address: {
-        ...user.profile.address,
-        ...updates.profile?.address,
-      },
-    },
+      avatar: string;
+      bio: string;
+    };
+    orders: Array<{
+      id: string;
+      amount: number;
+      createdAt: string;
+    }>;
   };
-}
+}>;
 ```
 
----
-
-### 技巧 2：类型安全的路径访问
-
-实现一个能够安全访问嵌套对象路径的类型：
+需求来了：单元测试里需要一个 mock 数据，大部分字段可以不填，但类型还要保持正确。你第一反应是用 `Partial`：
 
 ```typescript
-// 提取路径对应的类型
-type Path<T, K extends string> = K extends `${infer Key}.${infer Rest}`
-  ? Key extends keyof T
-    ? Path<T[Key], Rest>
-    : never
-  : K extends keyof T
-    ? T[K]
-    : never;
+type MockResponse = Partial<UserDetailResponse>;
+// 结果：code, message, data 都变成了可选的
+// 但 data.user.profile.avatar 依然是必填的
+```
 
-// 实现路径访问函数
-function get<T, K extends string>(obj: T, path: K): Path<T, K> {
-  const keys = path.split(".");
-  let result: any = obj;
-  for (const key of keys) {
-    result = result?.[key];
+`Partial` 只作用于第一层。你想要的是**所有叶子节点都变成可选的**，嵌套多深都行。这就是 `DeepPartial` 要解决的问题。
+
+在解决这个问题之前，我们先回顾几个泛型的进阶技巧，它们是构建复杂类型工具的基础。
+
+## 多个泛型参数：一个不够用的时候
+
+初学泛型时，大多数场景一个 `<T>` 就够了。但有些工具函数天然涉及两种不同的类型，强行只用一个泛型反而会把类型搞得更复杂。
+
+看一个 `pluck` 函数——从对象数组中提取某个字段：
+
+```typescript
+function pluck<T, K extends keyof T>(items: T[], key: K): T[K][] {
+  return items.map((item) => item[key]);
+}
+
+const users = [
+  { id: "usr_001", name: "张三", role: "admin" },
+  { id: "usr_002", name: "李四", role: "editor" },
+  { id: "usr_003", name: "王五", role: "viewer" },
+];
+
+const ids = pluck(users, "id"); // string[]
+const roles = pluck(users, "role"); // string[]
+
+// 传了不存在的 key，编译器直接报错
+// pluck(users, 'age');  // Error
+```
+
+这里 `T` 是对象的类型，`K` 是字段的 key。它们各司其职：`K extends keyof T` 确保 key 一定存在于对象上，`T[K]` 取出对应字段的类型作为返回值。如果只有一个泛型参数，你没办法在保证类型安全的前提下表达"从 T 中取 K 这个字段的类型"这个关系。
+
+再看看我们系列主线里的 API 客户端场景：
+
+```typescript
+async function request<TResponse, TBody = void>(
+  url: string,
+  body?: TBody
+): Promise<TResponse> {
+  /* ... */
+}
+
+// TBody 默认是 void，不传 body 时不需要指定
+const users = await request<User[]>("/users");
+// 需要传 body 时，两个泛型都派上用场
+const newUser = await request<User, CreateUserDTO>("/users", { name: "张三" });
+```
+
+`TResponse` 和 `TBody` 是两个完全独立的维度，分开声明比合并成一个对象泛型更清晰。
+
+## 泛型约束：extends 不是继承
+
+`extends` 在泛型里的含义和在 class 里不同。泛型里的 `extends` 是约束，意思是"T 必须满足某种条件"。
+
+```typescript
+function mergeDeep<T extends object>(target: T, source: Partial<T>): T {
+  const result = { ...target };
+  for (const key in source) {
+    const targetVal = result[key];
+    const sourceVal = source[key];
+    if (
+      typeof targetVal === "object" &&
+      targetVal !== null &&
+      typeof sourceVal === "object" &&
+      sourceVal !== null
+    ) {
+      result[key] = mergeDeep(targetVal, sourceVal);
+    } else if (sourceVal !== undefined) {
+      result[key] = sourceVal as T[Extract<keyof T, string>];
+    }
   }
   return result;
 }
 
-// 使用示例
-interface User {
-  id: number;
-  name: string;
-  profile: {
-    email: string;
-    address: {
-      city: string;
-      country: string;
-    };
-  };
+const defaults = {
+  pagination: { page: 1, pageSize: 20 },
+  filters: { status: "active", region: "cn" },
+};
+
+// source 的类型被约束为 Partial<typeof defaults>，写错字段名会报错
+const config = mergeDeep(defaults, {
+  pagination: { pageSize: 50 },
+});
+```
+
+没有 `T extends object` 这个约束，`mergeDeep(42, {})` 这种无意义的调用也能通过类型检查。约束把错误扼杀在编译期。
+
+约束也可以更灵活，不只是 `object`。比如只接受带有 `id` 字段的对象：
+
+```typescript
+function findById<T extends { id: string }>(
+  items: T[],
+  id: string
+): T | undefined {
+  return items.find((item) => item.id === id);
+}
+```
+
+## 默认泛型参数：减少调用处的噪音
+
+有些泛型参数在绝大多数场景下都是同一个值，每次都手动传一遍很烦。默认泛型参数解决这个问题：
+
+```typescript
+// 不用默认值 —— 调用时必须写
+function createCache<T>(): Map<string, T> {
+  /* ... */
+}
+const cache1 = createCache<User>(); // 每次都要写泛型
+
+// 用默认值 —— 简单场景不用写
+function createCache<T = unknown>(): Map<string, T> {
+  /* ... */
+}
+const cache2 = createCache(); // Map<string, unknown>
+const cache3 = createCache<User>(); // Map<string, User>
+```
+
+默认值放在最右边。多泛型参数时，有默认值的参数必须排在没有默认值的后面：
+
+```typescript
+function request<TResponse, TBody = void, TQuery = void>() // ...
+{
+  /* ... */
 }
 
-const user: User = {
-  id: 1,
-  name: "Alice",
-  profile: {
-    email: "alice@example.com",
-    address: {
-      city: "New York",
-      country: "USA",
+// 三种调用方式都合法
+request<User[]>();
+request<User[], CreateUserDTO>("/users", body);
+request<User[], void, PaginationQuery>("/users", undefined, query);
+```
+
+## 递归泛型：DeepPartial 的实现
+
+回到文章开头的问题。`DeepPartial` 需要递归地遍历类型结构，把每一层的属性都变成可选。核心思路和递归函数一样：有一个基准情况（base case），有一个递归情况（recursive case）。
+
+```typescript
+type DeepPartial<T> = T extends object
+  ? {
+      [K in keyof T]?: T[K] extends object ? DeepPartial<T[K]> : T[K];
+    }
+  : T;
+```
+
+拆解一下这个类型：
+
+- `T extends object`：如果 T 是对象，进入映射类型
+- `[K in keyof T]?`：每一层的属性都变成可选
+- `T[K] extends object`：如果属性的值还是对象，继续递归
+- 否则直接返回 `T[K]` 本身（基准情况）
+
+用在我们的 API 响应上：
+
+```typescript
+type MockResponse = DeepPartial<UserDetailResponse>;
+// 现在整个嵌套结构的所有叶子节点都是可选的
+const mock: MockResponse = {
+  code: 200,
+  data: {
+    user: {
+      name: "测试用户",
+      // profile、orders 全都可以不填
     },
   },
 };
-
-const city = get(user, "profile.address.city");
-// city 类型: string
-
-const invalid = get(user, "profile.address.unknown");
-// invalid 类型: never
-
-// 实现路径设置函数
-function set<T, K extends string>(obj: T, path: K, value: Path<T, K>): void {
-  const keys = path.split(".");
-  const lastKey = keys.pop()!;
-  let target: any = obj;
-  for (const key of keys) {
-    if (!target[key]) {
-      target[key] = {};
-    }
-    target = target[key];
-  }
-  target[lastKey] = value;
-}
-
-set(user, "profile.address.city", "Boston");
 ```
 
----
-
-### 技巧 3：类型链式 API
-
-构建类型安全的链式调用 API：
+同理可以写 `DeepReadonly`：
 
 ```typescript
-class QueryBuilder<T> {
-  private conditions: string[] = [];
+type DeepReadonly<T> = T extends object
+  ? {
+      readonly [K in keyof T]: T[K] extends object ? DeepReadonly<T[K]> : T[K];
+    }
+  : T;
 
-  where<K extends keyof T>(
-    field: K,
-    operator: "=" | "!=" | ">" | "<" | ">=" | "<=",
-    value: T[K]
-  ): this {
-    this.conditions.push(
-      `${String(field)} ${operator} ${JSON.stringify(value)}`
-    );
-    return this;
-  }
+type FrozenConfig = DeepReadonly<{
+  database: { host: string; port: number };
+  cache: { ttl: number; maxSize: number };
+}>;
+// FrozenConfig.database.host 是 readonly 的，所有嵌套层都是
+```
 
-  whereIn<K extends keyof T>(field: K, values: T[K][]): this {
-    this.conditions.push(
-      `${String(field)} IN (${values.map((v) => JSON.stringify(v)).join(", ")})`
-    );
-    return this;
-  }
+这里有一个需要注意的地方：TypeScript 对递归类型的深度有限制，大约 50 层。对于正常业务数据来说完全够用，但如果你有一个超过 50 层嵌套的类型（极其罕见），TypeScript 会报递归过深的错误。
 
-  orderBy<K extends keyof T>(
-    field: K,
-    direction: "ASC" | "DESC" = "ASC"
-  ): this {
-    this.conditions.push(`ORDER BY ${String(field)} ${direction}`);
-    return this;
-  }
+实际项目中，用 `ts-toolbelt` 或 `type-fest` 这类库提供的实现更稳妥，它们处理了数组、Date、函数等边界情况。上面的实现是一个教学版本，帮你理解原理。
 
-  limit(count: number): this {
-    this.conditions.push(`LIMIT ${count}`);
-    return this;
-  }
+## 类型安全的路径访问
 
-  build(): string {
-    return `SELECT * FROM table WHERE ${this.conditions.join(" AND ")}`;
-  }
-}
+在 API 客户端里，经常需要用字符串路径访问嵌套数据。比如 `get(response, 'data.user.profile.avatar')`。lodash 的 `get` 函数能做到运行时安全，但类型上返回的是 `any`。
 
-// 使用示例
-interface User {
-  id: number;
+用泛型配合模板字面量类型（我们在 02 篇学过的）和条件类型（01 篇的内容），可以做到编译期类型安全：
+
+```typescript
+type PathValue<
+  T,
+  Path extends string,
+> = Path extends `${infer Key}.${infer Rest}`
+  ? Key extends keyof T
+    ? PathValue<T[Key], Rest>
+    : never
+  : Path extends keyof T
+    ? T[Path]
+    : never;
+
+type User = {
+  id: string;
   name: string;
-  age: number;
-  email: string;
-}
-
-const query = new QueryBuilder<User>()
-  .where("age", ">=", 18)
-  .whereIn("name", ["Alice", "Bob"])
-  .orderBy("name", "ASC")
-  .limit(10)
-  .build();
-
-// 类型安全：
-// query.where('age', '>=', 18)    ✅
-// query.where('age', '>=', '18')  ❌ age 是 number
-// query.where('unknown', '=', 1)  ❌ unknown 不存在
-```
-
----
-
-### 技巧 4：泛型工厂模式
-
-使用泛型实现工厂模式：
-
-```typescript
-// 基础类型
-interface Constructor<T> {
-  new (...args: any[]): T;
-}
-
-// 泛型工厂
-interface Factory<T> {
-  create(type: string): T;
-}
-
-// 具体工厂实现
-class UserFactory implements Factory<User> {
-  private types = new Map<string, Constructor<User>>();
-
-  registerType(type: string, constructor: Constructor<User>): void {
-    this.types.set(type, constructor);
-  }
-
-  create(type: string): User {
-    const Constructor = this.types.get(type);
-    if (!Constructor) {
-      throw new Error(`Unknown type: ${type}`);
-    }
-    return new Constructor();
-  }
-}
-
-// 使用示例
-class AdminUser implements User {
-  id = 1;
-  name = "Admin";
-  permissions = ["read", "write", "delete"];
-}
-
-class RegularUser implements User {
-  id = 2;
-  name = "User";
-  permissions = ["read"];
-}
-
-const factory = new UserFactory();
-factory.registerType("admin", AdminUser);
-factory.registerType("user", RegularUser);
-
-const admin = factory.create("admin");
-const user = factory.create("user");
-```
-
----
-
-### 技巧 5：类型安全的依赖注入容器
-
-```typescript
-// 依赖注入容器
-interface DIContainer {
-  register<T>(token: string, constructor: new (...args: any[]) => T): void;
-  resolve<T>(token: string): T;
-}
-
-class Container implements DIContainer {
-  private services = new Map<string, any>();
-
-  register<T>(token: string, constructor: new (...args: any[]) => T): void {
-    this.services.set(token, constructor);
-  }
-
-  resolve<T>(token: string): T {
-    const constructor = this.services.get(token);
-    if (!constructor) {
-      throw new Error(`Service not found: ${token}`);
-    }
-    return new constructor();
-  }
-}
-
-// 使用示例
-interface Logger {
-  log(message: string): void;
-}
-
-interface Database {
-  query(sql: string): any[];
-}
-
-class ConsoleLogger implements Logger {
-  log(message: string) {
-    console.log(`[LOG] ${message}`);
-  }
-}
-
-class PostgreSQL implements Database {
-  query(sql: string) {
-    // 实际查询逻辑
-    return [];
-  }
-}
-
-class UserService {
-  constructor(
-    private logger: Logger,
-    private db: Database
-  ) {}
-
-  getUser(id: number) {
-    this.logger.log(`Fetching user ${id}`);
-    return this.db.query(`SELECT * FROM users WHERE id = ${id}`);
-  }
-}
-
-const container = new Container();
-container.register("Logger", ConsoleLogger);
-container.register("Database", PostgreSQL);
-container.register("UserService", UserService);
-
-// 手动注入依赖
-const logger = container.resolve<Logger>("Logger");
-const db = container.resolve<Database>("Database");
-const userService = new UserService(logger, db);
-```
-
----
-
-### 技巧 6：类型验证器
-
-```typescript
-// 验证器类型
-type Validator<T> = {
-  validate(value: unknown): value is T;
+  profile: {
+    avatar: string;
+    bio: string;
+  };
+  orders: Array<{ id: string; amount: number }>;
 };
 
-// 创建验证器工厂
-function createValidator<T>(check: (value: unknown) => boolean): Validator<T> {
-  return {
-    validate: (value: unknown): value is T => check(value),
-  };
-}
+// 编译期推导出正确类型
+type A = PathValue<User, "id">; // string
+type B = PathValue<User, "profile.avatar">; // string
+type C = PathValue<User, "name">; // string
 
-// 常用验证器
-const stringValidator = createValidator<string>(
-  (value): value is string => typeof value === "string"
-);
-
-const numberValidator = createValidator<number>(
-  (value): value is number => typeof value === "number" && !isNaN(value)
-);
-
-const objectValidator = createValidator<Record<string, unknown>>(
-  (value): value is Record<string, unknown> =>
-    typeof value === "object" && value !== null && !Array.isArray(value)
-);
-
-// 复合验证器
-function arrayValidator<T>(itemValidator: Validator<T>): Validator<T[]> {
-  return {
-    validate: (value): value is T[] =>
-      Array.isArray(value) &&
-      value.every((item) => itemValidator.validate(item)),
-  };
-}
-
-function unionValidator<T extends unknown[]>(
-  ...validators: { [K in keyof T]: Validator<T[K]> }
-): Validator<T[number]> {
-  return {
-    validate: (value): value is T[number] =>
-      validators.some((v) => v.validate(value)),
-  };
-}
-
-// 使用示例
-interface User {
-  id: number;
-  name: string;
-  email: string;
-}
-
-const userValidator: Validator<User> = createValidator<User>((value) => {
-  return (
-    typeof value === "object" &&
-    value !== null &&
-    "id" in value &&
-    "name" in value &&
-    "email" in value &&
-    numberValidator.validate((value as any).id) &&
-    stringValidator.validate((value as any).name) &&
-    stringValidator.validate((value as any).email)
-  );
-});
-
-function processData<T>(data: unknown, validator: Validator<T>): T {
-  if (validator.validate(data)) {
-    return data;
-  }
-  throw new Error("Invalid data");
-}
-
-// ✅ 类型安全
-const validUser = processData(
-  { id: 1, name: "Alice", email: "alice@example.com" },
-  userValidator
-);
-
-// ❌ 类型错误（运行时抛出异常）
-const invalidUser = processData(
-  { id: "1", name: "Alice", email: "alice@example.com" },
-  userValidator
-);
+// 路径不存在，返回 never
+type D = PathValue<User, "profile.foo">; // never
+type E = PathValue<User, "address.city">; // never
 ```
 
-## 实战应用
+`PathValue` 的工作原理：
 
-### 类型安全的 API 客户端
+1. `Path extends '${infer Key}.${infer Rest}'` —— 用模板字面量匹配，把路径拆成第一段 `Key` 和剩余部分 `Rest`
+2. 如果 `Key` 是 `T` 的属性，就递归处理 `T[Key]` 和 `Rest`
+3. 如果路径里没有 `.` 了（基准情况），直接从 `T` 中取对应属性
+
+这就是前三篇文章知识的综合运用：泛型负责类型参数传递，条件类型负责分支判断，模板字面量负责字符串解析。
+
+## API 响应类型变换
+
+实际项目中，后端返回的 JSON 和前端使用的数据类型之间经常有差异。比如后端的时间字段都是 ISO 字符串，前端想统一转成 `Date` 对象：
 
 ```typescript
-// HTTP 方法类型
-type HTTPMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+type StringToDate<T> = T extends string
+  ? Date
+  : T extends object
+    ? { [K in keyof T]: StringToDate<T[K]> }
+    : T;
 
-// API 端点配置
-type EndpointConfig<TMethod extends HTTPMethod, TParams, TResponse> = {
-  method: TMethod;
-  path: string;
+// 后端返回的类型
+type ApiUser = {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  profile: {
+    birthday: string;
+  };
 };
 
-// API 客户端
-class APIClient {
-  private baseUrl: string;
+// 前端使用的类型 —— 所有 string 变成了 Date
+type DomainUser = StringToDate<ApiUser>;
+// {
+//   id: Date;    // 注意：id 也会变成 Date
+//   name: Date;
+//   createdAt: Date;
+//   updatedAt: Date;
+//   profile: { birthday: Date };
+// }
+```
 
-  constructor(baseUrl: string) {
-    this.baseUrl = baseUrl;
-  }
+这个实现太粗暴了——它把所有 string 都变成了 Date。更精确的做法是只转换特定字段名：
 
-  async request<TMethod extends HTTPMethod, TParams, TResponse>(
-    config: EndpointConfig<TMethod, TParams, TResponse>,
-    params?: TParams
-  ): Promise<TResponse> {
-    const url = new URL(config.path, this.baseUrl);
+```typescript
+type DateFields = "createdAt" | "updatedAt" | "birthday" | "deletedAt";
 
-    let options: RequestInit = {
-      method: config.method,
-    };
-
-    if (config.method === "GET") {
-      // GET 请求使用查询参数
-      if (params) {
-        Object.entries(params as any).forEach(([key, value]) => {
-          url.searchParams.set(key, String(value));
-        });
-      }
-    } else {
-      // 其他方法使用请求体
-      options.body = JSON.stringify(params);
-      options.headers = {
-        "Content-Type": "application/json",
-      };
+type TransformDates<T> = T extends object
+  ? {
+      [K in keyof T]: K extends DateFields
+        ? Date
+        : T[K] extends object
+          ? TransformDates<T[K]>
+          : T[K];
     }
+  : T;
 
-    const response = await fetch(url.toString(), options);
-    return response.json();
-  }
-}
-
-// 定义 API 端点
-interface User {
-  id: number;
-  name: string;
-  email: string;
-}
-
-interface CreateUserParams {
-  name: string;
-  email: string;
-}
-
-interface UpdateUserParams {
-  id: number;
-  changes: Partial<Omit<User, "id">>;
-}
-
-// API 定义
-const api = new APIClient("https://api.example.com");
-
-// ✅ 类型安全
-api.request({ method: "GET", path: "/users" });
-api.request({ method: "GET", path: "/users/:id" }, { id: 1 });
-api.request(
-  { method: "POST", path: "/users" },
-  { name: "Alice", email: "alice@example.com" }
-);
-api.request(
-  { method: "PUT", path: "/users/:id" },
-  { id: 1, changes: { name: "Bob" } }
-);
-
-// ❌ 类型错误
-api.request({ method: "GET", path: "/users/:id" }, { id: "1" }); // id 应该是 number
-api.request({ method: "POST", path: "/users" }, { name: "Alice" }); // 缺少 email
+type DomainUser = TransformDates<ApiUser>;
+// {
+//   id: string;
+//   name: string;
+//   createdAt: Date;      // 只有日期字段被转换
+//   updatedAt: Date;
+//   profile: { birthday: Date };
+// }
 ```
 
-## 避坑指南
-
-### ❌ 错误 1：过度使用泛型导致类型复杂
+另一个常见需求是去除响应中的 `null` 字段，得到一个更确定的类型：
 
 ```typescript
-// ❌ 过于复杂
-function veryComplex<T extends { a: U }, U extends { b: V }, V extends string>(
-  arg: T
-): V {
-  return arg.a.b;
-}
+type NonNullableDeep<T> = T extends null | undefined
+  ? never
+  : T extends object
+    ? { [K in keyof T]: NonNullableDeep<T[K]> }
+    : T;
 
-// ✅ 简化
-function simple<T extends { a: { b: string } }>(arg: T): string {
-  return arg.a.b;
-}
+type RawResponse = {
+  user: {
+    name: string | null;
+    email: string | null;
+    phone: string;
+  };
+};
+
+type CleanResponse = NonNullableDeep<RawResponse>;
+// {
+//   user: {
+//     name: string;
+//     email: string;
+//     phone: string;
+//   }
+// }
 ```
 
----
+这些类型变换工具组合起来，就能在 API 客户端层自动完成"后端类型"到"前端类型"的转换，调用方拿到的永远是干净、精确的类型。
 
-### ❌ 错误 2：泛型约束过于宽松
+## 泛型复杂度的取舍
+
+泛型是强大的，但不是免费的。每多一层泛型嵌套，类型检查的时间就会增加，代码的可读性也会下降。
+
+一个内部只用了一次的工具函数，加三个泛型参数可能是过度设计：
 
 ```typescript
-// ❌ 约束太宽松
-function badGetLength<T extends any>(value: T): number {
-  return (value as any).length; // 需要类型断言
+// 过度设计 —— 一个只在一处使用的私有函数
+function formatItem<
+  T extends { id: string; createdAt: string },
+  K extends keyof T,
+>(item: T, fields: K[]): Pick<T, K> & { formattedAt: string } {
+  // ...
 }
 
-// ✅ 正确约束
-function goodGetLength<T extends { length: number }>(value: T): number {
-  return value.length; // 类型安全
+// 实际上直接写可能更清晰
+function formatUserItem(item: ApiUser, fields: (keyof ApiUser)[]) {
+  // ...
 }
 ```
 
----
+泛型的价值在于**复用**和**类型安全的自动化**。如果一个类型工具要在多个地方使用，或者它能让调用方省去大量的类型标注，那投入精力设计泛型是值得的。我们的 `DeepPartial`、`PathValue`、`TransformDates` 都属于这一类——写一次，到处用，每次用都能自动推导出正确的类型。
 
-### ❌ 错误 3：忽略泛型参数的可推断性
+反过来，如果一个函数只在一处调用，参数类型和返回类型都确定，硬编码类型比泛型更直观。读代码的人不需要在脑子里"展开"泛型就能理解函数签名，维护成本更低。
 
-```typescript
-// ❌ 用户必须手动指定泛型
-function identity<T>(value: T): T {
-  return value;
-}
-const result = identity<string>("hello");
-
-// ✅ 让 TypeScript 推断
-const result = identity("hello");
-```
-
----
-
-### ❌ 错误 4：递归泛型导致的性能问题
-
-```typescript
-// ❌ 可能导致性能问题
-type BadDeepType<T> = T extends object
-  ? { [K in keyof T]: BadDeepType<T[K]> }
-  : T
-
-// ✅ 添加深度限制
-type GoodDeepType<T, Depth extends number = 5> =
-  Depth extends 0
-    ? T
-    : T extends object
-      ? { [K in keyof T]: GoodDeepType<T[K], Depth extends 10 ? 9 : Depth - 1> }
-      : T
-```
-
-## 总结
-
-### 核心要点
-
-1. **多参数泛型**：实现复杂的类型关系
-2. **泛型约束**：限制泛型的类型范围
-3. **默认泛型参数**：提供合理的默认值
-4. **递归泛型**：处理嵌套类型结构
-5. **类型推断**：让 TypeScript 自动推断泛型类型
-
-### 实用模式
-
-- **深度操作**：DeepReadonly、DeepPartial、DeepRequired
-- **类型路径访问**：安全的嵌套对象访问
-- **链式 API**：类型安全的构建器模式
-- **工厂模式**：泛型工厂和依赖注入
-- **类型验证**：运行时和编译期双重验证
-
-## 参考资料
-
-- [TypeScript Handbook: Generics](https://www.typescriptlang.org/docs/handbook/2/generics.html)
-- [TypeScript Handbook: Generic Constraints](https://www.typescriptlang.org/docs/handbook/2/generics.html#generic-constraints)
-
----
+判断标准很简单：如果去掉泛型，调用方需要手动标注的类型变多了，或者类型安全性下降了，那就该用泛型。否则，保持简单。

@@ -1,0 +1,203 @@
+---
+title: "06 类型系统深入：协变逆变与性能"
+date: "2026-03-23"
+summary: "理解类型兼容性的方向性规则，掌握 TypeScript 编译性能优化的实用策略。"
+tags: ["TypeScript", "协变", "逆变", "性能优化"]
+category: "typescript"
+cover: ""
+draft: false
+series: "TypeScript 类型系统进阶"
+seriesOrder: 6
+---
+
+你一定遇到过这种情况：把一个 `(dog: Dog) => void` 的函数传给一个期望 `(animal: Animal) => void` 的参数，编译器居然报错了。
+
+可 `Dog` 明明是 `Animal` 的子类型啊。把 `Dog` 赋值给 `Animal` 类型完全没问题，为什么套进函数参数里就翻了？
+
+这个反直觉的现象困扰过不少有经验的开发者。理解它需要搞清楚两个概念：协变和逆变。这是 TypeScript 类型系统中最容易踩坑，也最能帮你写出类型安全代码的知识点。我们还会聊到另一个实际问题：类型写得太复杂，编译时间从几秒变成两分钟，怎么办。
+
+## 协变：顺着子类型方向走
+
+先从最直观的情况说起。
+
+`Dog` 是 `Animal` 的子类型，所以 `Dog` 可以赋值给 `Animal` 类型的变量。这在 TypeScript 里理所当然：
+
+```typescript
+class Animal {
+  name: string;
+}
+class Dog extends Animal {
+  bark() {}
+}
+
+const dog: Animal = new Dog(); // 没问题
+```
+
+不仅单个值可以这样，数组也行。`Dog[]` 是 `Animal[]` 的子类型：
+
+```typescript
+const dogs: Animal[] = [new Dog()]; // 也没问题
+```
+
+返回值也一样。如果一个函数返回 `Dog`，你可以把它当作返回 `Animal` 的函数来用：
+
+```typescript
+const getDog = (): Dog => new Dog();
+const getAnimal: () => Animal = getDog; // 正确
+```
+
+这种"子类型保持方向不变"的关系，叫协变（covariance）。从生产者的角度看：一个返回 `Dog` 的函数，比返回 `Animal` 的函数更具体，所以用更具体的替代更泛化的，类型系统是安全的。
+
+到目前为止一切都很自然。问题出在函数参数上。
+
+## 逆变：方向反转
+
+现在看这个场景：
+
+```typescript
+// strictFunctionTypes 开启时
+const handleDog = (dog: Dog) => console.log(dog.bark());
+const handleAnimal: (animal: Animal) => void = handleDog;
+// 报错：不能将类型 "(dog: Dog) => void" 分配给类型 "(animal: Animal) => void"
+```
+
+编译器拒绝了。为什么？
+
+换个角度想：`handleAnimal` 这个函数签名承诺的是"我能处理任何 Animal"。如果你把 `handleDog` 赋给它，那调用方完全可能传入一个 `Cat` 对象——因为调用方只知道自己拿到的是一个 `(animal: Animal) => void` 的函数。但 `handleDog` 里面调了 `dog.bark()`，`Cat` 没有 `bark` 方法，运行时就炸了。
+
+所以编译器拒绝是对的。这违反了里氏替换原则（Liskov Substitution Principle）：子类型必须能替换父类型而不改变程序行为。`handleDog` 不能替换 `handleAnimal`，因为它处理不了所有 `Animal`。
+
+反过来呢？如果一个函数能处理任何 `Animal`，把它当作只能处理 `Dog` 的函数，完全安全：
+
+```typescript
+const handleAnimal = (animal: Animal) => console.log(animal.name);
+const handleDog: (dog: Dog) => void = handleAnimal; // 正确
+```
+
+调用 `handleDog` 时传入的肯定是 `Dog`，而 `handleAnimal` 能处理所有 `Animal`，处理 `Dog` 当然没问题。
+
+这就是逆变（contravariance）：函数参数的方向和子类型方向相反。`Dog` 是 `Animal` 的子类型，但 `(animal: Animal) => void` 是 `(dog: Dog) => void` 的子类型。
+
+一句话记忆：参数是消费者，消费者要能处理更广的范围才安全，所以方向反转。返回值是生产者，生产者提供更具体的类型才安全，所以方向不变。
+
+## API 客户端中的实际影响
+
+回到我们一直在构建的 API 客户端。假设你在设计一个请求拦截器，支持注册响应回调：
+
+```typescript
+interface ApiClient {
+  onResponse<T>(handler: (response: ApiResponse<T>) => void): void;
+}
+```
+
+当 `T` 是 `User` 时，handler 的参数类型是 `ApiResponse<User>`。如果你有一个通用的 handler 能处理任何 `ApiResponse`：
+
+```typescript
+const logResponse = (res: ApiResponse<unknown>) => {
+  console.log(res.status);
+};
+client.onResponse<User>(logResponse); // 正确：逆变，更宽泛的参数兼容
+```
+
+这没问题，因为 `ApiResponse<unknown>` 的处理范围更广，用在只期望 `ApiResponse<User>` 的地方，天然安全。
+
+但如果你的 handler 依赖 `User` 特有的字段：
+
+```typescript
+const handleUserResponse = (res: ApiResponse<User>) => {
+  console.log(res.data.email); // 用到了 User 特有字段
+};
+// 如果 client 内部把这个 handler 用在了 ApiResponse<Order> 的场景，
+// 访问 res.data.email 就会出错
+```
+
+逆变规则保护你免受这种运行时错误。类型系统在编译期就拦住了不安全的赋值。
+
+## strictFunctionTypes 和双向协变
+
+上面逆变报错的例子，前提是开启了 `--strictFunctionTypes`。这个选项在 `--strict` 模式下默认启用。
+
+没开启时，TypeScript 对函数参数采用双向协变（bivariance）：既允许协变也允许逆变。也就是说 `(dog: Dog) => void` 和 `(animal: Animal) => void` 可以互相赋值。这样做是为了兼容旧代码，但牺牲了类型安全。
+
+如果你维护的代码库还有 `strictFunctionTypes: false` 的配置，建议尽快开启。绝大多数情况下只需要改几处函数参数的类型声明就能修复报错，换来的是整个项目的类型安全提升。
+
+对于方法签名和函数签名的区别：`strictFunctionTypes` 只检查函数类型的参数，不检查方法声明。这是另一个历史遗留的设计，写代码时最好统一用函数类型而不是方法简写来声明回调参数，这样类型检查更严格。
+
+## in 和 out：显式标注方差
+
+TypeScript 4.7 引入了 `in` 和 `out` 修饰符，让你显式声明类型的方差：
+
+```typescript
+type Producer<out T> = {
+  get(): T;
+  // T 只出现在输出位置，协变
+};
+
+type Consumer<in T> = {
+  put(value: T): void;
+  // T 只出现在输入位置，逆变
+};
+
+type InOut<in T, out U> = {
+  transform(value: T): U;
+  // T 逆变，U 协变
+};
+```
+
+加了这些修饰符后，TypeScript 会强制检查你的用法是否一致。如果你在 `out T` 的类型中把 `T` 用在了参数位置，编译器会直接报错。这种显式标注让类型的意图更清晰，也防止你无意中写出有方差 bug 的代码。
+
+在实际项目中，普通业务代码很少需要手动标注 `in`/`out`。但在写泛型工具类型、库代码时，这能帮你避免很多难以追踪的类型错误。
+
+## 类型性能：编译太慢怎么办
+
+聊完类型安全，说一个工程上很现实的问题：编译性能。
+
+我们这个系列从条件类型到递归泛型，一步步构建了越来越复杂的类型。在小型项目里这些类型的编译开销可以忽略。但当一个项目有上千个文件、几十万行代码时，复杂的类型定义会成为编译瓶颈。
+
+最常见的性能杀手有几个。
+
+递归条件类型是最重的。像深度 `Partial` 或深度 `Readonly` 这种递归遍历对象结构的类型，如果套在一个多层嵌套、几十个字段的类型上，编译器需要展开大量中间状态。在某个内部项目里，一个递归的 `DeepPartial<Config>` 就让单文件编译时间从 200ms 涨到了 3s。
+
+分布式条件类型对联合类型的处理也很吃资源。`type Result = MyCondition<string | number | boolean | ...>` 这种写法会让编译器对联合的每个成员都做一次完整推导。联合成员越多，开销越大。
+
+大型联合类型本身就有性能问题。如果你用联合类型描述了一个 API 可能返回的所有错误类型——几十个成员的联合——每次用到这个联合的地方，编译器都要检查所有成员的兼容性。
+
+几个实用的优化策略。
+
+优先用 `interface` 而不是大型联合类型来描述对象。`interface` 在编译时有专门优化，声明合并和缓存的效率远高于每次重新计算联合。
+
+把中间结果提取成类型别名。编译器对同一个类型别名有缓存机制：
+
+```typescript
+// 每次用到 ApiRoutes 都重新计算整个路由表类型
+type ApiRoutes = typeof apiRoutes;
+
+// 提取中间类型，复用计算结果
+type ExtractParams<T> = T extends `${string}:${infer Param}/${infer Rest}`
+  ? Param extends `${string}?`
+    ? {}
+    : { [K in Param | keyof ExtractParams<Rest>]: string }
+  : {};
+
+type RouteParams = ExtractParams<keyof typeof apiRoutes>;
+```
+
+遇到编译变慢时，用 `--extendedDiagnostics` 找到瓶颈：
+
+```bash
+tsc --extendedDiagnostics
+```
+
+输出里会列出每个文件的类型检查耗时。找到最慢的那个文件，检查里面是不是有特别复杂的条件类型或递归泛型，针对性地简化。
+
+最后一个建议：避免过度设计。如果运行时的类型守卫已经能保证安全，就没必要在编译期用三层嵌套的条件类型来推导。类型系统的目的是帮助开发者，不是展示技巧。
+
+## 回顾与展望
+
+这 6 篇从条件类型出发，经过模板字面量类型、泛型、类型安全模式、函数签名设计，到类型系统底层。一路走下来，我们围绕一个类型安全的 API 客户端，把 TypeScript 类型系统的核心能力过了一遍。
+
+你现在有了读懂开源库类型定义的能力。看到 `zod` 里的 `z.infer<typeof schema>`、`tRPC` 里的 `ProcedureBuilder<Input, Output>`，不会再觉得是天书。你也具备了设计类型安全 API 的能力——从品牌类型防止 ID 混淆，到函数重载精确表达调用方式，到方差规则保证回调类型安全。
+
+如果想继续深入类型系统，可以看看这几个方向。`zod` 的类型推导机制是运行时验证与编译期类型结合的典范。`tRPC` 把端到端类型安全做到了极致，值得研究它的泛型链路设计。`Effect`（原 fp-ts 生态）对高阶类型和类型级编程的运用非常深入，适合想挑战类型体操极限的开发者。
+
+类型系统是工具，不是目的。能把类型写得既安全又简洁，才是真正掌握了 TypeScript。
