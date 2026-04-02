@@ -1,0 +1,211 @@
+---
+title: "01 Linux 服务器基础配置"
+date: "2026-04-02"
+summary: "拿到一台全新的 Linux 服务器后，在上业务之前需要做哪些基础配置？从 SSH 加固到防火墙，系统性地搭建安全可靠的基础设施。"
+tags: ["Linux", "运维", "服务器", "SSH", "安全"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战：从裸机到生产环境"
+seriesOrder: 1
+---
+
+你买了一台云服务器，SSH 连上去之后看到黑乎乎的终端，接下来该干什么？
+
+很多人习惯性地直接开始装软件：`apt install nginx`、`apt install docker`。但这样的服务器就像一间门没锁、窗户没关的房子——在网络扫描器面前几乎透明的。
+
+今天我们先把"房子"的安全性处理好。这是所有后续工作的基础——不管你后面要跑 Docker、Kubernetes 还是 Nginx，都需要一个安全的服务器底座。
+
+## SSH：你的远程入口
+
+SSH 是管理服务器的唯一入口（绝大多数情况下），也是攻击者的首要目标。一个弱 SSH 配置等于把钥匙放在门垫下。
+
+### 密钥认证替代密码登录
+
+密码登录有两个问题：弱密码容易被暴力破解，而且你每次登录都要输入密码（脚本化部署时不方便）。密钥认证更安全也更方便。
+
+在本地机器生成密钥对：
+
+```bash
+ssh-keygen -t ed25519 -C "cloudpulse-server"
+# 会生成 ~/.ssh/id_ed25519（私钥）和 ~/.ssh/id_ed25519.pub（公钥）
+```
+
+把公钥上传到服务器：
+
+```bash
+ssh-copy-id -i ~/.ssh/id_ed25519.pub root@your-server-ip
+```
+
+然后禁用密码登录：
+
+```bash
+sudo vim /etc/ssh/sshd_config
+```
+
+需要修改的关键配置：
+
+```
+PermitRootLogin no          # 禁止 root 直接登录
+PasswordAuthentication no  # 禁止密码登录
+PubkeyAuthentication yes   # 只允许密钥登录
+Port 2222                 # 换一个非默认端口（可选）
+```
+
+修改完后重启 SSH 服务：
+
+```bash
+sudo systemctl restart sshd
+```
+
+之后登录方式变成：
+
+```bash
+ssh -i ~/.ssh/id_ed25519 -p 2222 deploy@your-server-ip
+```
+
+**为什么要换端口？** 默认的 22 端口是自动化扫描器的首要目标。换一个端口（比如 2222、10022）不能防止定向扫描，但能过滤掉大量低质量的自动化攻击。代价是你每次登录都要指定端口。
+
+### 创建专用用户
+
+不要用 root 做日常操作。root 权限太大，一个误操作（比如 `rm -rf /`）就能毁掉整个系统。
+
+```bash
+# 创建专用用户
+sudo useradd -m -s /bin/bash deploy
+# 设置密码（如果还需要密码登录的话）
+sudo passwd deploy
+```
+
+给 deploy 用户 sudo 权限：
+
+```bash
+sudo usermod -aG sudo deploy
+```
+
+以后日常操作用 deploy 用户登录，只在必要时切换到 root。
+
+## 防火墙：只开必要的门
+
+Ubuntu 自带的 UFW（Uncomplicated Firewall）配置起来很简单。
+
+先查看当前状态：
+
+```bash
+sudo ufw status
+```
+
+默认所有端口都是关闭的。我们只开放需要的：
+
+```bash
+# SSH（如果改了端口就填你改的端口）
+sudo ufw allow 2222/tcp
+
+# HTTP
+sudo ufw allow 80/tcp
+
+# HTTPS
+sudo ufw allow 443/tcp
+
+# 如果需要 Docker 或其他服务的端口
+sudo ufw allow 3000/tcp
+
+# 启用防火墙
+sudo ufw enable
+```
+
+启用之后可以用 `sudo ufw status verbose` 查看所有规则。
+
+一个容易犯的错：**启用防火墙之前确保 SSH 端口已开放**，否则你会把自己锁在外面。如果你改了 SSH 端口但忘了开放，还有 VNC 或云服务商的控制台可以救你——所以不要同时改端口和关防火墙。
+
+## 系统初始化
+
+### 更新系统
+
+```bash
+sudo apt update && sudo apt upgrade -y
+```
+
+第一件事先更新系统。这能修复已知的安全漏洞，确保所有包都是最新版本。
+
+### 设置时区
+
+```bash
+sudo timedatectl set-timezone Asia/Shanghai
+```
+
+时区会影响日志时间戳和定时任务（cron）。生产服务器必须设置正确的时区。
+
+### 安装基础工具
+
+```bash
+sudo apt install -y curl git htop vim tmux unzip
+```
+
+这几个工具在后续的 Docker、CI/CD、监控配置中都会用到：
+
+- `curl`：测试 API 端口、下载文件
+- `git`：拉取代码
+- `htop`：实时查看系统资源占用
+- `tmux`：SSH 断开后保持会话不中断
+
+### 配置自动安全更新
+
+```bash
+sudo apt install -y unattended-upgrades
+sudo dpkg-reconfigure -plow unattended-upgrades
+```
+
+自动安全更新会在有安全补丁时自动安装，不需要你手动检查。对于关键的生产环境，你可能想选择手动更新（避免自动更新引入兼容性问题），但对于大多数中小项目，自动更新是更好的选择。
+
+### 配置 Swap
+
+如果你的服务器内存较小（2GB 或以下），建议配置 swap，防止 OOM（Out of Memory）杀进程：
+
+```bash
+sudo fallocate -l 2G /swapfile
+sudo chmod 600 /swapfile
+sudo mkswap /swapfile
+sudo swapon /swapfile
+
+# 持久化（重启后仍然生效）
+echo '/swapfile none swap sw 0 0' | sudo tee -a /etc/fstab
+```
+
+2GB swap 对于跑一个 Next.js + PostgreSQL + Redis 的应用来说是合理的下限。
+
+## 常用运维命令速查
+
+这些命令在后续文章中会频繁用到，这里做个快速索引：
+
+```bash
+# 系统信息
+uname -a              # 内核版本
+cat /etc/os-release    # 发行版信息
+uptime                # 运行时间和负载
+free -h               # 内存使用
+df -h                 # 磁盘使用
+
+# 进程管理
+ps aux                # 查看所有进程
+ps aux | grep node    # 查找特定进程
+kill -9 <PID>         # 强制终止进程
+systemctl status nginx # 查看服务状态
+journalctl -u nginx -f  # 查看服务日志
+
+# 网络调试
+curl -I http://localhost:3000  # 测试本地端口
+ss -tlnp               # 查看所有监听端口
+dig example.com        # DNS 查询
+```
+
+## 到了什么阶段才算"准备好"
+
+完成以上配置后，你的服务器应该满足这些条件：
+
+- SSH 只允许密钥登录，密码登录已禁用
+- 防火墙已启用，只开放了必要端口
+- 系统已更新到最新，自动安全更新已配置
+- 基础工具已就位
+
+接下来，我们在这台服务器上安装 Docker，把 CloudPulse 的应用跑起来。

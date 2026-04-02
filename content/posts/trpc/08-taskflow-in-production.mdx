@@ -1,0 +1,353 @@
+---
+title: "08 TaskFlow 的生产级部署"
+date: "2026-04-02"
+summary: "为 TaskFlow 添加测试、错误监控和部署配置，完成从开发到生产的全过程。"
+tags: ["tRPC", "测试", "部署", "监控", "Vercel"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 8
+---
+
+TaskFlow 功能完整了，类型安全也到位了。但从"能跑"到"能上线"，还有几件事要做：确保代码有测试覆盖、出了问题能快速定位、部署流程可靠。
+
+今天关注工程化实践——这些内容不涉及 tRPC 的新 API，但会直接影响你用 tRPC 构建的应用在生产环境中的可靠性。
+
+## 测试 tRPC Procedure
+
+测试 tRPC 的正确方式不是发 HTTP 请求，而是用 **createCallerFactory** 直接创建一个 caller。这有几个好处：不需要启动服务器、测试运行更快、测试代码更简洁。
+
+### 基础 setup
+
+```typescript
+// test/setup.ts
+import { createCallerFactory } from "@trpc/server";
+import { appRouter } from "../server/trpc/router";
+import { createContext } from "../server/trpc/context";
+
+// 创建一个测试用的 caller
+export const createTestCaller = async (user?: {
+  id: string;
+  name: string;
+  role: string;
+}) => {
+  const ctx = await createContext();
+  // 在测试中可以覆盖 Context
+  return createCallerFactory()(appRouter, {
+    ...ctx,
+    user: user || ctx.user,
+  });
+};
+```
+
+### 测试 procedure
+
+```typescript
+// test/routers/projects.test.ts
+import { describe, it, expect } from "vitest";
+import { createTestCaller } from "../setup";
+
+describe("projects.list", () => {
+  it("只返回当前用户所属的项目", async () => {
+    const caller = await createTestCaller({
+      id: "usr_abc",
+      name: "张三",
+      role: "MEMBER",
+    });
+
+    const projects = await caller.projects.list();
+
+    // 假设测试数据里 usr_abc 是两个项目的成员
+    expect(projects).toHaveLength(2);
+    expect(projects[0]).toHaveProperty("id");
+    expect(projects[0]).toHaveProperty("name");
+    // 不应该返回敏感字段
+    expect(projects[0]).not.toHaveProperty("ownerId");
+  });
+});
+
+describe("projects.create", () => {
+  it("创建项目并自动加入成员", async () => {
+    const caller = await createTestCaller({
+      id: "usr_abc",
+      name: "张三",
+      role: "MEMBER",
+    });
+
+    const project = await caller.projects.create({
+      name: "测试项目",
+      description: "这是一个测试项目",
+    });
+
+    expect(project.id).toBeDefined();
+    expect(project.name).toBe("测试项目");
+
+    // 验证创建者被自动加入了项目
+    const projects = await caller.projects.list();
+    expect(projects.some((p) => p.id === project.id)).toBe(true);
+  });
+
+  it("未登录用户不能创建项目", async () => {
+    const caller = await createTestCaller(); // 不传 user
+
+    await expect(caller.projects.create({ name: "测试项目" })).rejects.toThrow(
+      "UNAUTHORIZED"
+    );
+  });
+});
+```
+
+注意测试的特点：我们测试的是"行为"而不是"实现"。不关心内部用了什么数据库、什么 ORM，只关心"给定输入，输出是否符合预期"。
+
+### 测试中间件
+
+中间件也可以单独测试。思路是创建一个"什么都不做"的 procedure，然后给它加上中间件：
+
+```typescript
+describe("auth middleware", () => {
+  it("未登录用户被拦截", async () => {
+    const caller = await createTestCaller(); // user 为 null
+
+    await expect(caller.users.me.query()).rejects.toMatchObject({
+      code: "UNAUTHORIZED",
+    });
+  });
+
+  it("登录用户正常通过", async () => {
+    const caller = await createTestCaller({
+      id: "usr_abc",
+      name: "张三",
+      role: "MEMBER",
+    });
+
+    const user = await caller.users.me.query();
+    expect(user.name).toBe("张三");
+  });
+});
+```
+
+### 测试数据库操作
+
+数据库测试最头疼的是测试数据的隔离。每次测试跑完应该清理数据，不污染其他测试。常见的做法是用事务回滚：
+
+```typescript
+import { prisma } from "../lib/prisma";
+
+describe("tasks CRUD", () => {
+  beforeEach(async () => {
+    // 每个测试前清理数据
+    await prisma.task.deleteMany();
+    await prisma.project.deleteMany();
+    await prisma.user.deleteMany();
+  });
+
+  it("创建任务并关联到项目", async () => {
+    // 先创建测试数据
+    const user = await prisma.user.create({
+      data: { name: "张三", email: "zhang@test.com", passwordHash: "xxx" },
+    });
+
+    const project = await prisma.project.create({
+      data: { name: "测试项目", ownerId: user.id },
+    });
+
+    const caller = await createTestCaller({
+      id: user.id,
+      name: "张三",
+      role: "MEMBER",
+    });
+    const task = await caller.tasks.create({
+      projectId: project.id,
+      title: "测试任务",
+      priority: "high",
+    });
+
+    expect(task.title).toBe("测试任务");
+
+    // 验证数据确实写入了数据库
+    const dbTask = await prisma.task.findUnique({ where: { id: task.id } });
+    expect(dbTask).not.toBeNull();
+    expect(dbTask?.projectId).toBe(project.id);
+  });
+});
+```
+
+`beforeEach` 里清空数据是最简单的方式，虽然不是最快的（每次都要 DELETE），但对于中小型项目的测试套件来说够用了。如果测试很多、数据量大，可以考虑用 Docker 容器创建临时的测试数据库。
+
+## 错误监控
+
+生产环境的错误处理和开发环境不一样。开发时你可以在控制台看到错误堆栈，但生产环境的错误发生在用户的浏览器或服务器上，你需要一个机制来收集和分析这些错误。
+
+### 结构化日志
+
+给 tRPC 加一个日志中间件，让每个请求都有完整的日志记录：
+
+```typescript
+const logger = t.middleware(async ({ path, type, next, ctx }) => {
+  const start = Date.now();
+
+  try {
+    const result = await next();
+
+    console.log(
+      JSON.stringify({
+        level: "info",
+        path,
+        type,
+        userId: ctx.user?.id,
+        duration: Date.now() - start,
+        status: "success",
+      })
+    );
+
+    return result;
+  } catch (error) {
+    console.log(
+      JSON.stringify({
+        level: "error",
+        path,
+        type,
+        userId: ctx.user?.id,
+        duration: Date.now() - start,
+        status: "error",
+        errorCode: error instanceof TRPCError ? error.code : "INTERNAL",
+        message: error instanceof Error ? error.message : "Unknown",
+      })
+    );
+
+    throw error;
+  }
+});
+```
+
+结构化日志（JSON 格式）的好处是：可以直接导入到日志分析工具（ELK、DataDog、Loki），方便搜索和统计。
+
+### 集成 Sentry
+
+Sentry 是常用的错误监控工具。在 tRPC 的错误格式化器里集成 Sentry：
+
+```typescript
+import * as Sentry from "@sentry/nextjs";
+
+const t = initTRPC.context<Context>().create({
+  errorFormatter({ shape, error }) {
+    // 把错误上报给 Sentry
+    if (error.code === "INTERNAL_SERVER_ERROR") {
+      Sentry.captureException(error);
+    }
+
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError:
+          error.code === "BAD_REQUEST" && error.cause instanceof ZodError
+            ? error.cause.flatten()
+            : null,
+      },
+    };
+  },
+});
+```
+
+注意：**只上报 INTERNAL_SERVER_ERROR**。UNAUTHORIZED、NOT_FOUND 这些是正常的业务错误，不应该发送到 Sentry——否则会淹没真正的 bug。区分"业务异常"和"系统异常"是错误监控的基本原则。
+
+### 慢查询检测
+
+在日志中间件里加上慢查询告警：
+
+```typescript
+const result = await next();
+const duration = Date.now() - start;
+
+if (duration > 2000) {
+  console.warn(
+    JSON.stringify({
+      level: "warn",
+      type: "SLOW_QUERY",
+      path,
+      duration,
+      userId: ctx.user?.id,
+    })
+  );
+}
+```
+
+2 秒是一个合理的阈值。如果你的 API 大部分响应在 100ms 以内，那超过 2 秒的请求大概率是有问题的（N+1 查询、缺少索引、外部服务超时等）。
+
+## 部署
+
+### Vercel 部署 Next.js + tRPC
+
+TaskFlow 用 Next.js 构建，Vercel 是最自然的部署平台。
+
+部署时需要注意的几个点：
+
+**环境变量**：确保 `DATABASE_URL`、`JWT_SECRET` 等在 Vercel 的环境变量中配置。不要把这些值硬编码在代码里或提交到 Git。
+
+**数据库迁移**：Vercel 的 build 阶段不会自动运行 Prisma 迁移。你需要在部署前手动运行 `npx prisma migrate deploy`，或者把它加到 build script 里：
+
+```json
+{
+  "scripts": {
+    "build": "prisma generate && prisma migrate deploy && next build"
+  }
+}
+```
+
+**Prisma generate**：每次构建时运行 `prisma generate`，确保 Prisma Client 的类型是最新的。
+
+### API Route 的 Edge 兼容性
+
+如果你的 Next.js 部署在 Edge Runtime（而不是 Node.js Runtime），需要注意 tRPC 的 Route Handler 依赖 Node.js 的 Request/Response API。确保 `route.ts` 文件没有标记为 edge runtime：
+
+```typescript
+// app/api/trpc/[trpc]/route.ts
+// 不要加 export const runtime = "edge"
+// tRPC 的 fetch 适配器需要 Node.js runtime
+```
+
+### 缓存策略
+
+对于不频繁变化的数据，可以配置 Next.js 的缓存：
+
+```typescript
+// 服务端组件页面级别缓存
+export const revalidate = 60; // 60 秒
+
+// 或者在 procedure 里用 React Query 的缓存
+const { data } = trpc.users.me.useQuery(undefined, {
+  staleTime: 1000 * 60 * 30, // 30 分钟内不重新获取
+});
+```
+
+服务端组件的 `revalidate` 和客户端 React Query 的 `staleTime` 是两套独立的缓存机制。前者控制 Next.js 的页面缓存（SSR/ISR），后者控制客户端的 API 缓存。两者可以同时使用，互不冲突。
+
+## 系列回顾
+
+8 篇文章，从"为什么需要 tRPC"到"部署到生产环境"，我们用 TaskFlow 这个真实案例走完了 tRPC 的完整学习路径。
+
+回顾一下关键节点：
+
+**第 1-2 篇**解决了"是什么"和"怎么组织"的问题。tRPC 的核心价值是端到端类型安全，Router 和 Procedure 是 API 的组织方式，Zod 提供运行时验证。
+
+**第 3-4 篇**解决了"前端接入"和"安全"的问题。类型推断通过 `typeof appRouter` + React Hooks 实现，中间件系统让认证和权限控制不侵入业务代码。
+
+**第 5-6 篇**解决了"数据持久化"和"Web 界面"的问题。Prisma 和 tRPC 组成了完整的类型安全链路，Next.js 的服务端组件让首屏渲染更快。
+
+**第 7-8 篇**解决了"进阶需求"和"生产环境"的问题。Subscriptions 实现了实时协作，测试、监控、部署让应用真正可靠。
+
+### tRPC 的适用边界
+
+学完这个系列，你应该对 tRPC 的能力有了清晰的认识。最后再强调一次适用边界：
+
+tRPC 解决的是**TypeScript 全栈项目的前后端类型同步**问题。如果你的后端不是 TypeScript、如果你的 API 需要给第三方使用、如果你的前端需要 GraphQL 那种灵活查询能力，tRPC 不是最佳选择。
+
+但如果你的场景正好匹配——TypeScript 全栈、内部 API、快速迭代——tRPC 能显著减少类型维护的负担，让前端的开发体验接近调用本地函数。这种体验，用过的开发者通常不想再回去。
+
+### 进一步学习
+
+- [tRPC 官方文档](https://trpc.io/docs)——最权威的参考
+- [tRPC GitHub Examples](https://github.com/trpc/trpc/tree/main/examples)——官方示例，包含各种框架集成
+- [Prisma 文档](https://www.prisma.io/docs)——如果需要更深入的数据库操作
+- [create-t3-app](https://create.t3.gg/)——tRPC + Next.js + Prisma + Tailwind 的脚手架工具，可以快速启动一个新项目

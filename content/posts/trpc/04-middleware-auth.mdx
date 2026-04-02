@@ -1,0 +1,380 @@
+---
+title: "04 中间件与认证：谁有权限做什么"
+date: "2026-04-02"
+summary: "掌握 tRPC 的中间件系统和 Context 机制，为 TaskFlow 实现 JWT 认证和基于角色的权限控制。"
+tags: ["tRPC", "中间件", "认证", "JWT", "权限控制"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 4
+---
+
+TaskFlow 的 API 已经能正常工作了，类型安全也到位了。但有一个大问题：任何人都能调用任何 API。创建项目、删除任务、修改别人的任务——统统没有限制。
+
+今天解决认证和权限问题。但不是在每个 procedure 里写一遍 `if (!user) throw error`，而是用 tRPC 的中间件系统，把这些横切逻辑统一处理。
+
+## Context：每个请求的"行李箱"
+
+在讲中间件之前，需要先理解 Context。
+
+Context 是每个请求携带的共享数据。你可以把它理解成一个行李箱——每个请求来的时候，你往里面放一些东西（用户信息、数据库连接、请求 ID），后续的 procedure 和中间件都能打开箱子取东西。
+
+```typescript
+// 定义 Context 的类型
+interface Context {
+  user: { id: string; name: string; role: string } | null;
+  requestId: string;
+}
+
+// 创建 Context
+const createContext = async ({ req }): Promise<Context> => {
+  // 从请求中提取用户信息（比如解析 JWT）
+  const user = await extractUserFromRequest(req);
+
+  return {
+    user,
+    requestId: crypto.randomUUID(),
+  };
+};
+
+// 把 Context 类型传给 tRPC
+const t = initTRPC.context<Context>().create();
+```
+
+为什么用 Context 而不是全局变量？因为 Context 是**请求隔离**的——每个请求有自己的 Context，互不干扰。而且 Context 有类型，你在 procedure 里写 `ctx.user` 时，TypeScript 知道它的类型，不会是 `any`。
+
+## 中间件：在 Procedure 前后插入逻辑
+
+中间件的核心作用是：**在不修改 procedure 代码的前提下，给它添加前置检查和后置处理**。
+
+一个最简单的日志中间件：
+
+```typescript
+const logger = t.middleware(async ({ path, type, next }) => {
+  const start = Date.now();
+  console.log(`[${type}] ${path} 开始`);
+
+  const result = await next(); // 调用下一个中间件或 procedure
+
+  console.log(`[${type}] ${path} 完成，耗时 ${Date.now() - start}ms`);
+  return result;
+});
+```
+
+`next()` 是关键——它把控制权传给下一个中间件或最终的 procedure。你可以选择在 `next()` 之前做前置处理（比如验证身份），在 `next()` 之后做后置处理（比如记录耗时）。
+
+中间件最强大的地方在于它可以**修改 Context**：
+
+```typescript
+const auth = t.middleware(async ({ ctx, next }) => {
+  if (!ctx.user) {
+    throw new TRPCError({ code: "UNAUTHORIZED", message: "请先登录" });
+  }
+
+  // 修改 Context：把 user 从 nullable 变成 non-null
+  return next({
+    ctx: {
+      ...ctx,
+      user: ctx.user, // TypeScript 现在知道 ctx.user 不是 null
+    },
+  });
+});
+```
+
+注意这个技巧：Context 中 `user` 的原始类型是 `User | null`，但在 `auth` 中间件之后，我们告诉 TypeScript "user 一定存在"。后续的 procedure 拿到的 `ctx.user` 就是非空的 `User` 类型了。这意味着在 procedure 里你不需要再做 null 检查。
+
+## 创建可复用的 Procedure
+
+中间件定义好了之后，你需要把它"附着"到 procedure 上。tRPC 的做法是创建不同权限级别的 procedure：
+
+```typescript
+// 公开 API，不需要认证
+export const publicProcedure = t.procedure;
+
+// 需要登录才能调用
+export const protectedProcedure = publicProcedure.use(auth);
+
+// 需要管理员权限
+export const adminProcedure = protectedProcedure.use(
+  createRoleGuard(["admin"])
+);
+```
+
+然后在定义 Router 时，根据需要选择不同级别的 procedure：
+
+```typescript
+export const projectsRouter = t.router({
+  // 所有人都能看项目列表
+  list: publicProcedure.query(async () => {
+    /* ... */
+  }),
+
+  // 只有登录用户能创建项目
+  create: protectedProcedure
+    .input(z.object({ name: z.string().min(1) }))
+    .mutation(async ({ input, ctx }) => {
+      // ctx.user 的类型是 User（非 null），不需要 null 检查
+      return await db.project.create({
+        data: { ...input, ownerId: ctx.user.id },
+      });
+    }),
+
+  // 只有管理员能删除项目
+  delete: adminProcedure
+    .input(z.object({ id: z.string() }))
+    .mutation(async ({ input }) => {
+      /* ... */
+    }),
+});
+```
+
+这种模式的好处是：**权限逻辑和业务逻辑完全分离**。procedure 只关心"做什么"，不关心"谁有资格做"。权限检查统一在中间件里处理，改权限规则只需要改中间件，不需要动 procedure。
+
+## TaskFlow 的 JWT 认证
+
+理论讲够了，来看 TaskFlow 的具体实现。
+
+### 登录流程
+
+TaskFlow 用最简 JWT 实现认证。流程是：
+
+1. 用户发送邮箱和密码
+2. 后端验证通过后，生成 JWT Token 返回
+3. 前端存储 Token（localStorage）
+4. 后续请求在 Header 中携带 Token
+5. 后端中间件解析 Token，把用户信息放入 Context
+
+登录 procedure：
+
+```typescript
+import jwt from "jsonwebtoken";
+
+const JWT_SECRET = process.env.JWT_SECRET!;
+
+export const authRouter = t.router({
+  login: publicProcedure
+    .input(z.object({ email: z.string().email(), password: z.string().min(6) }))
+    .mutation(async ({ input }) => {
+      const user = await db.user.findUnique({ where: { email: input.email } });
+
+      if (!user || !(await verifyPassword(input.password, user.passwordHash))) {
+        throw new TRPCError({
+          code: "UNAUTHORIZED",
+          message: "邮箱或密码错误",
+        });
+      }
+
+      const token = jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, {
+        expiresIn: "7d",
+      });
+
+      return {
+        token,
+        user: { id: user.id, name: user.name, email: user.email },
+      };
+    }),
+
+  register: publicProcedure
+    .input(
+      z.object({
+        name: z.string().min(2),
+        email: z.string().email(),
+        password: z.string().min(6),
+      })
+    )
+    .mutation(async ({ input }) => {
+      const existing = await db.user.findUnique({
+        where: { email: input.email },
+      });
+      if (existing) {
+        throw new TRPCError({ code: "CONFLICT", message: "该邮箱已注册" });
+      }
+
+      const passwordHash = await hashPassword(input.password);
+      const user = await db.user.create({
+        data: { name: input.name, email: input.email, passwordHash },
+      });
+
+      const token = jwt.sign({ userId: user.id, role: user.role }, JWT_SECRET, {
+        expiresIn: "7d",
+      });
+
+      return {
+        token,
+        user: { id: user.id, name: user.name, email: user.email },
+      };
+    }),
+});
+```
+
+### Context 中解析 Token
+
+```typescript
+export const createContext = async ({ req }): Promise<Context> => {
+  let user: User | null = null;
+
+  const authHeader = req.headers.get("authorization");
+  if (authHeader?.startsWith("Bearer ")) {
+    try {
+      const token = authHeader.slice(7);
+      const payload = jwt.verify(token, JWT_SECRET) as {
+        userId: string;
+        role: string;
+      };
+      user = await db.user.findUnique({
+        where: { id: payload.userId },
+        select: { id: true, name: true, email: true, role: true, avatar: true },
+      });
+    } catch {
+      // Token 无效或过期，user 保持 null
+    }
+  }
+
+  return { user, requestId: crypto.randomUUID() };
+};
+```
+
+注意这里的设计：**即使 Token 无效，也不抛错，而是让 user 为 null**。这样公开 API 仍然能正常工作，只有使用了 `protectedProcedure` 的 API 才会被拦截。
+
+### 前端存储和发送 Token
+
+```typescript
+// 登录成功后存储 Token
+const { token, user } = await client.auth.login.mutate({
+  email: "zhang@example.com",
+  password: "password123",
+});
+localStorage.setItem("token", token);
+
+// 在 tRPC 客户端配置中自动附加 Token
+const trpcClient = trpc.createClient({
+  links: [
+    httpBatchLink({
+      url: "/api/trpc",
+      headers() {
+        const token = localStorage.getItem("token");
+        return token ? { authorization: `Bearer ${token}` } : {};
+      },
+    }),
+  ],
+});
+```
+
+## 基于角色的权限控制
+
+TaskFlow 有三种角色：`ADMIN`（管理员）、`MEMBER`（普通成员）、`VIEWER`（只读成员）。不同的角色能做不同的事情。
+
+角色检查可以用一个工厂中间件实现：
+
+```typescript
+const createRoleGuard = (allowedRoles: string[]) => {
+  return t.middleware(async ({ ctx, next }) => {
+    if (!ctx.user) {
+      throw new TRPCError({ code: "UNAUTHORIZED" });
+    }
+    if (!allowedRoles.includes(ctx.user.role)) {
+      throw new TRPCError({ code: "FORBIDDEN", message: "权限不足" });
+    }
+    return next();
+  });
+};
+
+export const adminProcedure = protectedProcedure.use(
+  createRoleGuard(["ADMIN"])
+);
+export const memberProcedure = protectedProcedure.use(
+  createRoleGuard(["ADMIN", "MEMBER"])
+);
+```
+
+但在 TaskFlow 中，很多权限检查不是基于全局角色，而是基于"用户是否是某个项目的成员"。这种细粒度的权限检查不适合用中间件（因为需要先查数据库获取项目信息），更适合在 procedure 内部处理：
+
+```typescript
+delete: protectedProcedure
+  .input(z.object({ id: z.string() }))
+  .mutation(async ({ input, ctx }) => {
+    const project = await db.project.findUnique({ where: { id: input.id } });
+
+    if (!project) {
+      throw new TRPCError({ code: "NOT_FOUND", message: "项目不存在" });
+    }
+    if (project.ownerId !== ctx.user.id && ctx.user.role !== "ADMIN") {
+      throw new TRPCError({ code: "FORBIDDEN", message: "只有项目创建者或管理员能删除项目" });
+    }
+
+    await db.project.delete({ where: { id: input.id } });
+    return { success: true };
+  }),
+```
+
+什么时候用中间件、什么时候在 procedure 里检查？一个简单的判断标准：**如果权限规则对所有 procedure 都一样（比如"必须登录"），用中间件；如果权限规则依赖于业务数据（比如"只有项目成员"），在 procedure 里检查。**
+
+## 错误处理
+
+tRPC 提供了 `TRPCError`，它映射到标准的 HTTP 状态码：
+
+```typescript
+throw new TRPCError({ code: "UNAUTHORIZED" }); // 401
+throw new TRPCError({ code: "FORBIDDEN" }); // 403
+throw new TRPCError({ code: "NOT_FOUND" }); // 404
+throw new TRPCError({ code: "CONFLICT" }); // 409
+throw new TRPCError({ code: "TOO_MANY_REQUESTS" }); // 429
+```
+
+前端处理错误时，可以直接根据 `error.code` 做分支：
+
+```typescript
+const createProject = trpc.projects.create.useMutation({
+  onError: (error) => {
+    if (error.code === "UNAUTHORIZED") {
+      router.push("/login");
+    } else if (error.code === "BAD_REQUEST") {
+      // Zod 验证失败，error.message 包含具体哪个字段有问题
+      toast.error(error.message);
+    }
+  },
+});
+```
+
+对于 Zod 验证错误，tRPC 会自动把验证失败的详情放到 `error.data.zodError` 里。如果你在初始化 tRPC 时配置了 `errorFormatter`，可以让错误信息更友好：
+
+```typescript
+const t = initTRPC.context<Context>().create({
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError:
+          error.code === "BAD_REQUEST" && error.cause instanceof ZodError
+            ? error.cause.flatten()
+            : null,
+      },
+    };
+  },
+});
+```
+
+## 中间件的组织
+
+当中间件多起来之后（日志、认证、限流、错误处理），需要一个清晰的文件组织。TaskFlow 的做法是：
+
+```typescript
+// lib/trpc.ts
+const t = initTRPC.context<Context>().create({
+  errorFormatter: customErrorFormatter,
+});
+
+// 公开 procedure：带日志和错误处理
+export const publicProcedure = t.procedure.use(logger).use(errorHandler);
+
+// 受保护 procedure：在公开的基础上加认证
+export const protectedProcedure = publicProcedure.use(auth);
+
+// 管理员 procedure：在受保护的基础上加角色检查
+export const adminProcedure = protectedProcedure.use(roleGuard("ADMIN"));
+```
+
+中间件的顺序有讲究。**日志应该放在最外层**（这样所有请求都能被记录），**认证应该放在业务逻辑之前**（避免执行了无权限的操作），**错误处理应该包裹在最外层**（确保所有异常都能被捕获）。
+
+认证和权限控制到位后，TaskFlow 的 API 不再是裸奔状态了。但数据还只存在内存里——服务器一重启就没了。下一篇，我们用 Prisma 把数据持久化到数据库。

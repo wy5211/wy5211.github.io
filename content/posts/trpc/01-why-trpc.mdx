@@ -1,0 +1,169 @@
+---
+title: "01 为什么需要 tRPC"
+date: "2026-04-02"
+summary: "从前后端类型同步的真实痛点出发，理解 tRPC 的设计思路和适用边界，用最小可运行代码感受端到端类型安全。"
+tags: ["tRPC", "TypeScript", "类型安全", "全栈开发"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 1
+---
+
+## 一个你可能经历过的下午
+
+后端同事在 Slack 上发了一条消息："User 接口加了 avatar 和 bio 两个字段，前端记得同步一下。"
+
+你改了三个文件里的类型定义，跑了 lint，提交了代码。一切正常。
+
+直到一周后，线上报了一个 bug：某个页面的用户头像显示为空。追查下来发现，那个页面用的是另一个组件库里独立维护的 User 类型，漏了 avatar 字段。
+
+这不是虚构的场景。在 TypeScript 全栈项目中，**前后端类型定义的同步**是一个持续的工程负担。每改一个接口，你都要确认所有消费方都更新了。人总会漏，而 TypeScript 编译器帮不了你——因为前端的 `fetch` 返回的是 `any`，编译器根本不知道后端返回了什么。
+
+这就是 tRPC 要解决的问题。
+
+## 传统方案的困境
+
+在 tRPC 出现之前，我们有几种应对方式，但各有代价：
+
+**手动同步**：前端手写和后端一样的类型定义。简单直接，但本质上是把类型维护的责任甩给了人，规模一大会失控。
+
+**OpenAPI / Swagger**：写一份 API Schema，然后用工具生成前后端的类型。思路正确，但 Schema 本身又是一份需要维护的文档，和代码很容易脱节。
+
+**GraphQL**：Schema 即文档，类型生成工具也成熟。但 GraphQL 引入了不小的学习成本，对于"我就是想让前端调后端的函数"这个需求来说，有点重了。
+
+**共享 npm 包**：把类型定义抽到一个共享包里，前后端都引用它。可行，但构建流程会变复杂，而且你还是在手动定义类型——只是定义了一次而不是两次。
+
+这些方案都在不同程度上解决了问题，但也都引入了新的复杂度。tRPC 的思路不太一样。
+
+## tRPC 的思路：不定义 Schema，代码本身就是 Schema
+
+tRPC 的核心洞察是：如果你的前后端都是 TypeScript，那后端的函数签名本身就已经包含了完整的类型信息——参数是什么类型、返回值是什么类型。为什么还要额外写一份 Schema？
+
+tRPC 做的事情就是：**让前端的 TypeScript 编译器直接"看到"后端的函数类型**。
+
+整个过程不需要代码生成、不需要 Schema 文件、不需要额外的构建步骤：
+
+```typescript
+// 后端：定义一个 procedure
+const getUser = t.procedure
+  .input(z.object({ id: z.string() }))
+  .query(async ({ input }) => {
+    const user = await db.user.findUnique({
+      where: { id: input.id },
+      select: { id: true, name: true, email: true, avatar: true },
+    });
+    return user;
+  });
+
+// 前端：直接调用，类型自动推断
+const user = await client.getUser.query({ id: "usr_8x9k2m" });
+// user 的类型是 { id: string; name: string; email: string; avatar: string | null } | null
+
+user.avatar; // 有自动补全
+user.age; // 编译错误：Property 'age' does not exist
+```
+
+注意这里发生了什么：前端没有定义任何类型，但 TypeScript 知道 `user` 的完整结构。如果后端改了返回的字段，前端的 TypeScript 会在编译时报错，而不是等到线上才发现。
+
+这种能力的实现原理是 TypeScript 的 `typeof` 操作符——它能提取一个值的类型。tRPC 用 `typeof appRouter` 把后端 Router 的完整类型导出给前端，前端拿到这个类型后，客户端库就能提供完整的自动补全和类型检查。
+
+## 5 分钟快速体验
+
+光说原理不够，跑起来看看。
+
+创建一个项目，安装依赖：
+
+```bash
+mkdir trpc-demo && cd trpc-demo
+npm init -y
+npm install @trpc/server zod
+npm install -D typescript @types/node tsx
+```
+
+创建 `server.ts`：
+
+```typescript
+import { initTRPC } from "@trpc/server";
+import { createHTTPServer } from "@trpc/server/adapters/standalone";
+import { z } from "zod";
+
+const t = initTRPC.create();
+
+const appRouter = t.router({
+  greet: t.procedure
+    .input(z.object({ name: z.string().min(1) }))
+    .query(({ input }) => {
+      return { message: `你好, ${input.name}` };
+    }),
+});
+
+export type AppRouter = typeof appRouter;
+
+createHTTPServer({
+  router: appRouter,
+  createContext: () => ({}),
+}).listen(3000);
+```
+
+创建 `client.ts`：
+
+```typescript
+import { createTRPCProxyClient, httpBatchLink } from "@trpc/client";
+import type { AppRouter } from "./server";
+
+const client = createTRPCProxyClient<AppRouter>({
+  links: [httpBatchLink({ url: "http://localhost:3000" })],
+});
+
+async function main() {
+  const result = await client.greet.query({ name: "世界" });
+  console.log(result.message); // "你好, 世界"
+
+  // 下面这行会编译报错：Property 'age' does not exist
+  // await client.greet.query({ name: "世界", age: 25 });
+}
+
+main();
+```
+
+运行：
+
+```bash
+# 终端 1
+tsx server.ts
+
+# 终端 2
+tsx client.ts
+```
+
+关键点在于 `client.ts` 里：你没有定义任何接口或类型，但 `result.message` 有自动补全，`client.greet.query({ name: "世界", age: 25 })` 会编译报错。这就是 tRPC 的"魔法"。
+
+## tRPC 不是什么
+
+理解 tRPC 的适用边界，和使用它本身一样重要。
+
+tRPC **不是**一个 Web 框架。它不处理路由、不处理中间件（在 HTTP 层面）、不处理静态文件。它做的事情很专一：**在 TypeScript 前后端之间建立类型安全的调用通道**。你需要一个框架（Next.js、Express、Hono 等）来处理 HTTP 层的事情。
+
+tRPC **不是** REST 的替代品。它和 REST 解决的是不同层面的问题——REST 是一种 API 设计风格，关注资源、动词、状态码；tRPC 是一种类型安全的 RPC 方案，关注的是"前端怎么调后端的函数"。你完全可以在同一个项目里同时用 REST（对外提供的公开 API）和 tRPC（内部的前后端通信）。
+
+tRPC **不是** GraphQL。GraphQL 解决的是"客户端按需获取数据"的问题，tRPC 解决的是"前后端类型同步"的问题。如果你的前端需要灵活地组合查询字段，GraphQL 更合适；如果你的 API 结构相对固定，tRPC 更轻量。
+
+## 什么时候该用 tRPC
+
+**适合的场景**：
+
+- 前后端都用 TypeScript，且在同一个仓库或 monorepo 里
+- API 结构相对稳定，不需要客户端按需组合查询字段
+- 团队规模中小（50 人以内），API 的消费者主要是自己的前端
+- 快速迭代阶段，频繁改接口
+
+**不适合的场景**：
+
+- 后端不是 TypeScript（这是硬性前提）
+- 需要提供给第三方调用的公开 API（第三方不一定用 TypeScript）
+- 前端和后端是独立的仓库，且不方便共享类型
+- 需要 GraphQL 那种灵活的查询能力（比如管理后台的自定义报表）
+
+一个简单的判断标准：**如果你的前端调用后端 API 时，经常需要"看文档才知道参数长什么样"，那 tRPC 能帮到你。** 反之，如果后端已经有完善的 OpenAPI 文档和代码生成工具链在运行，迁移到 tRPC 的收益可能不大。
+
+tRPC 的价值不在技术本身有多复杂，而在于它消除了一个很多人习以为常的负担。就像静态类型之于动态语言——你不是不能在 JavaScript 里写大型项目，但有了 TypeScript 之后，你会发现自己再也不想回去了。

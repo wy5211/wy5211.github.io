@@ -1,229 +1,167 @@
 ---
-title: "05 Prisma 集成：类型安全的数据库操作"
-date: "2026-03-23"
-summary: "学会 tRPC 与 Prisma 的深度集成，掌握类型安全的数据库操作，构建完整的 CRUD API，实现端到端的类型安全。"
-tags: ["tRPC", "Prisma", "数据库", "CRUD", "TypeScript"]
+title: "05 数据库集成：Prisma + tRPC"
+date: "2026-04-02"
+summary: "用 Prisma 为 TaskFlow 设计数据模型，实现从数据库到前端的完整类型安全链路，掌握关联查询和分页技巧。"
+tags: ["tRPC", "Prisma", "数据库", "CRUD", "类型安全"]
 category: "trpc"
 draft: false
 series: "tRPC 端到端类型安全实战"
 seriesOrder: 5
 ---
 
-## 前言
+TaskFlow 的认证和 API 都就绪了，但数据还住在内存里——上一章的 `db.project.findMany()` 实际上是从一个 JavaScript 数组里读数据。服务器一重启，所有项目都没了。
 
-如果说 tRPC 是前后端类型安全的桥梁，那么 Prisma 就是后端与数据库类型安全的桥梁。
+今天把数据迁移到 PostgreSQL。之所以选 Prisma，是因为它和 tRPC 在理念上高度一致：**都是"代码即定义"，不需要额外的 Schema 文件或代码生成步骤**。
 
-**tRPC + Prisma = 完美的类型安全组合**
+## 为什么是 Prisma
+
+tRPC 解决的是前后端之间的类型同步问题，Prisma 解决的是后端和数据库之间的类型同步问题。两者组合起来，就形成了一条完整的类型安全链路：
 
 ```
-前端 --[tRPC]--> 后端 --[Prisma]--> 数据库
-  ↓                  ↓                ↓
-类型安全          类型安全         类型安全
+数据库 Schema → Prisma 自动生成类型 → tRPC Procedure → 前端自动推断
+     ↓                  ↓                    ↓               ↓
+  PostgreSQL         TypeScript           TypeScript      TypeScript
 ```
 
-今天，我们将学习：
+Prisma 的工作方式是：你在 `schema.prisma` 里用直观的语法定义数据模型，然后运行 `prisma generate`，Prisma 会自动生成对应的 TypeScript 类型。你在代码里写的 `db.project.findMany()` 返回的是 `Project[]` 类型，不需要手写任何 interface。
 
-- Prisma 基础配置和 Schema 设计
-- tRPC 与 Prisma 的完美集成
-- 构建完整的 CRUD API
-- 关联数据和高级查询
-- 性能优化技巧
+对比其他方案：TypeORM 需要用装饰器定义 Entity 和 Column（手写类型），Drizzle 需要用 TypeScript 定义 schema 对象（手写类型）。Prisma 的 schema 语法更接近自然语言，而且类型完全自动生成。
 
-## 为什么选择 Prisma？
+## TaskFlow 的数据模型
 
-### 传统 ORM vs Prisma
+设计数据模型之前，先想清楚 TaskFlow 的核心业务关系：
 
-```typescript
-// ========== TypeORM ==========
+- 一个用户可以属于多个项目
+- 一个项目有多个成员
+- 一个项目包含多个任务
+- 一个任务可以有多条评论
+- 一个任务可以有多个标签
 
-// 需要定义 Entity 和 TypeScript 类型（重复！）
-@Entity()
-export class User {
-  @PrimaryColumn()
-  id: string;
-
-  @Column()
-  name: string;
-
-  @Column()
-  email: string;
-}
-
-// 查询时需要手动指定类型
-const users = await userRepository.find();
-// users 的类型是 User[]
-
-// ========== Prisma ==========
-
-// 只需定义 Schema（一次！）
-model User {
-  id    String @id
-  name  String
-  email String
-}
-
-// 自动生成类型
-const users = await prisma.user.findMany();
-// users 的类型自动推断为 User[]
-```
-
-### Prisma 的优势
-
-| 特性        | Prisma           | 其他 ORM      |
-| ----------- | ---------------- | ------------- |
-| 类型安全    | ✅ 自动生成      | ⚠️ 需手动维护 |
-| Schema 定义 | ✅ 直观易懂      | ⚠️ 装饰器繁琐 |
-| 迁移系统    | ✅ 自动生成      | ⚠️ 手动编写   |
-| 关联查询    | ✅ 类型安全      | ⚠️ 复杂       |
-| 性能        | ✅ 查询优化      | ⚠️ N+1 问题   |
-| 开发体验    | ✅ 优秀 IDE 支持 | ⚠️ 一般       |
-
-## 项目配置
-
-### 第一步：安装依赖
-
-```bash
-# 安装 Prisma
-npm install prisma @prisma/client
-
-# 初始化 Prisma
-npx prisma init
-```
-
-### 第二步：配置数据库连接
+对应的 Prisma Schema：
 
 ```prisma
-// prisma/schema.prisma
-
-generator client {
-  provider = "prisma-client-js"
-}
-
-datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
-}
-```
-
-```env
-# .env
-DATABASE_URL="postgresql://user:password@localhost:5432/mydb?schema=public"
-```
-
-### 第三步：设计 Schema
-
-```prisma
-// prisma/schema.prisma
-
-// ========== 用户模型 ==========
 model User {
-  id        String    @id @default(cuid())
-  email     String    @unique
-  name      String
-  password  String
-  avatar    String?
-  bio       String?
-  role      Role      @default(USER)
-  createdAt DateTime  @default(now())
-  updatedAt DateTime  @updatedAt
+  id           String    @id @default(cuid())
+  name         String
+  email        String    @unique
+  passwordHash String
+  avatar       String?
+  role         String    @default("MEMBER")
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
 
-  // 关系
-  posts     Post[]
-  comments  Comment[]
-  likes     Like[]
+  memberships ProjectMember[]
+  tasks       Task[]
+  comments    Comment[]
 
   @@index([email])
 }
 
-// ========== 角色枚举 ==========
-enum Role {
-  USER
-  MODERATOR
-  ADMIN
-}
-
-// ========== 文章模型 ==========
-model Post {
+model Project {
   id          String    @id @default(cuid())
-  title       String
-  content     String    @db.Text
-  published   Boolean   @default(false)
-  authorId    String
+  name        String
+  description String?
+  color       String    @default("#3b82f6")
+  ownerId     String
   createdAt   DateTime  @default(now())
   updatedAt   DateTime  @updatedAt
 
-  // 关系
-  author      User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
-  comments    Comment[]
-  likes       Like[]
+  owner      User             @relation("ProjectOwner", fields: [ownerId], references: [id])
+  members    ProjectMember[]
+  tasks      Task[]
 
-  @@index([authorId])
-  @@index([published, createdAt])
+  @@index([ownerId])
 }
 
-// ========== 评论模型 ==========
+model ProjectMember {
+  userId    String
+  projectId String
+  role      String @default("MEMBER")
+  joinedAt  DateTime @default(now())
+
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  project Project @relation(fields: [projectId], references: [id], onDelete: Cascade)
+
+  @@id([userId, projectId])
+}
+
+model Task {
+  id          String    @id @default(cuid())
+  title       String
+  description String?
+  status      String    @default("TODO")
+  priority    String    @default("medium")
+  dueDate     DateTime?
+  projectId   String
+  assigneeId  String?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  project    Project     @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  assignee   User?       @relation(fields: [assigneeId], references: [id])
+  comments   Comment[]
+  tags       TaskTag[]
+
+  @@index([projectId])
+  @@index([assigneeId])
+  @@index([status])
+}
+
 model Comment {
   id        String   @id @default(cuid())
   content   String
-  postId    String
+  taskId    String
   authorId  String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  // 关系
-  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
-  author    User     @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  task   Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author User @relation(fields: [authorId], references: [id])
 
-  @@index([postId])
+  @@index([taskId])
   @@index([authorId])
 }
 
-// ========== 点赞模型 ==========
-model Like {
-  id        String   @id @default(cuid())
-  userId    String
-  postId    String
-  createdAt DateTime @default(now())
+model Tag {
+  id   String @id @default(cuid())
+  name String @unique
 
-  // 关系
-  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  post      Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  tasks TaskTag[]
+}
 
-  @@unique([userId, postId])
-  @@index([postId])
+model TaskTag {
+  taskId String
+  tagId  String
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  tag  Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([taskId, tagId])
 }
 ```
 
-### 第四步：生成 Prisma Client
+几个设计决策：
 
-```bash
-# 生成 Prisma Client（自动生成类型）
-npx prisma generate
+**ProjectMember 是独立模型**而不是 Project 和 User 的多对多字段，因为我们需要存储角色信息（MEMBER/ADMIN）。如果只需要简单的关联，可以用 Prisma 的隐式多对多。
 
-# 创建数据库迁移
-npx prisma migrate dev --name init
+**Tag 和 Task 通过 TaskTag 关联**，因为标签是全局的（多个任务可以共享同一个标签），而且我们可能需要按标签筛选任务。
 
-# 打开 Prisma Studio（GUI）
-npx prisma studio
-```
+**索引**：对经常查询的字段（外键、status、email）加索引。这些索引在生产环境很重要，不加的话数据量一大查询会变慢。
 
-## 创建 Prisma Client 单例
+## Prisma Client 单例
+
+在开发环境，Next.js 的热重载会多次执行模块代码。如果每次都创建新的 PrismaClient，会打开过多的数据库连接。标准做法是用一个全局变量缓存实例：
 
 ```typescript
 // lib/prisma.ts
-
 import { PrismaClient } from "@prisma/client";
 
-// 防止开发环境热重载创建多个实例
-const globalForPrisma = global as unknown as { prisma: PrismaClient };
+const globalForPrisma = globalThis as unknown as { prisma: PrismaClient };
 
 export const prisma =
   globalForPrisma.prisma ||
   new PrismaClient({
-    log:
-      process.env.NODE_ENV === "development"
-        ? ["query", "error", "warn"]
-        : ["error"],
+    log: process.env.NODE_ENV === "development" ? ["query"] : [],
   });
 
 if (process.env.NODE_ENV !== "production") {
@@ -231,285 +169,271 @@ if (process.env.NODE_ENV !== "production") {
 }
 ```
 
-## CRUD 操作
+## 在 tRPC 中使用 Prisma
 
-### CREATE - 创建数据
+Prisma 和 tRPC 的集成非常直接——你只需要把之前用内存数据的地方换成 Prisma 查询。
+
+TaskFlow 的项目列表，带成员计数和任务计数：
 
 ```typescript
-// ========== 创建单个用户 ==========
-
-const createUser = t.procedure
-  .input(
-    z.object({
-      email: z.string().email(),
-      name: z.string().min(2),
-      password: z.string().min(8),
-    })
-  )
-  .mutation(async ({ input }) => {
-    // ✅ 返回类型自动推断为 User
-    const user = await prisma.user.create({
-      data: {
-        email: input.email,
-        name: input.name,
-        password: await hash(input.password),
-      },
-    });
-
-    // ✅ 不返回密码
-    const { password, ...userWithoutPassword } = user;
-    return userWithoutPassword;
+list: protectedProcedure.query(async () => {
+  return await prisma.project.findMany({
+    where: {
+      members: { some: { userId: ctx.user.id } },
+    },
+    select: {
+      id: true,
+      name: true,
+      description: true,
+      color: true,
+      owner: { select: { id: true, name: true, avatar: true } },
+      _count: { select: { tasks: true, members: true } },
+      updatedAt: true,
+    },
+    orderBy: { updatedAt: "desc" },
   });
+}),
+```
 
-// ========== 创建带关联的数据 ==========
+这里用了 `members: { some: { userId: ctx.user.id } }` 做过滤——只返回当前用户所属的项目。`select` 控制返回字段，`_count` 提供关联计数。
 
-const createPost = t.procedure
-  .input(
-    z.object({
-      title: z.string().min(1),
-      content: z.string().min(1),
-      published: z.boolean().default(false),
-    })
-  )
+创建项目并自动加入创建者为成员：
+
+```typescript
+create: protectedProcedure
+  .input(z.object({
+    name: z.string().min(1).max(50),
+    description: z.string().max(500).optional(),
+    color: z.string().regex(/^#[0-9a-f]{6}$/).default("#3b82f6"),
+  }))
   .mutation(async ({ input, ctx }) => {
-    // ctx.user 的类型是 User（非 null，假设使用认证中间件）
-    const post = await prisma.post.create({
-      data: {
-        ...input,
-        authorId: ctx.user.id,
-      },
-      include: {
-        author: true, // 包含关联数据
-      },
-    });
-
-    return post;
-    // ✅ 返回类型：Post & { author: User }
-  });
-```
-
-### READ - 读取数据
-
-```typescript
-// ========== 查询所有（带分页）==========
-
-const getPosts = t.procedure
-  .input(
-    z.object({
-      page: z.number().default(1),
-      limit: z.number().min(1).max(100).default(20),
-      published: z.boolean().optional(),
-    })
-  )
-  .query(async ({ input }) => {
-    const { page, limit, published } = input;
-    const skip = (page - 1) * limit;
-
-    const [posts, total] = await Promise.all([
-      prisma.post.findMany({
-        where: published !== undefined ? { published } : undefined,
-        skip,
-        take: limit,
-        orderBy: { createdAt: "desc" },
-        include: {
-          author: {
-            select: {
-              id: true,
-              name: true,
-              avatar: true,
-            },
-          },
-          _count: {
-            select: {
-              comments: true,
-              likes: true,
-            },
-          },
-        },
-      }),
-      prisma.post.count({
-        where: published !== undefined ? { published } : undefined,
-      }),
-    ]);
-
-    return {
-      posts,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit),
-      },
-    };
-  });
-```
-
-## 完整示例：博客 API
-
-```typescript
-// routers/posts.ts
-
-import { initTRPC, TRPCError } from "@trpc/server";
-import { z } from "zod";
-import { prisma } from "../lib/prisma";
-
-const t = initTRPC.create();
-
-export const postsRouter = t.router({
-  // 获取文章列表（分页）
-  list: t.procedure
-    .input(
-      z.object({
-        page: z.number().default(1),
-        limit: z.number().min(1).max(100).default(20),
-        published: z.boolean().optional(),
-      })
-    )
-    .query(async ({ input }) => {
-      const { page, limit, published } = input;
-      const skip = (page - 1) * limit;
-
-      const [posts, total] = await Promise.all([
-        prisma.post.findMany({
-          where: published !== undefined ? { published } : undefined,
-          skip,
-          take: limit,
-          orderBy: { createdAt: "desc" },
-          include: {
-            author: {
-              select: {
-                id: true,
-                name: true,
-                avatar: true,
-              },
-            },
-            _count: {
-              select: {
-                comments: true,
-                likes: true,
-              },
-            },
-          },
-        }),
-        prisma.post.count({
-          where: published !== undefined ? { published } : undefined,
-        }),
-      ]);
-
-      return {
-        posts,
-        pagination: {
-          page,
-          limit,
-          total,
-          totalPages: Math.ceil(total / limit),
-        },
-      };
-    }),
-
-  // 创建文章
-  create: t.procedure
-    .input(
-      z.object({
-        title: z.string().min(1).max(200),
-        content: z.string().min(1),
-        published: z.boolean().default(false),
-      })
-    )
-    .mutation(async ({ input, ctx }) => {
-      const post = await prisma.post.create({
+    // 用事务确保"创建项目"和"加入成员"是原子操作
+    return await prisma.$transaction(async (tx) => {
+      const project = await tx.project.create({
         data: {
           ...input,
-          authorId: ctx.user.id,
-        },
-        include: {
-          author: {
-            select: {
-              id: true,
-              name: true,
-              avatar: true,
+          ownerId: ctx.user.id,
+          members: {
+            create: {
+              userId: ctx.user.id,
+              role: "ADMIN",
             },
           },
+        },
+        include: {
+          owner: { select: { id: true, name: true, avatar: true } },
+          _count: { select: { tasks: true, members: true } },
         },
       });
 
-      return post;
-    }),
-});
-
-export type PostsRouter = typeof postsRouter;
+      return project;
+    });
+  }),
 ```
 
-## 最佳实践
+注意这里用了 `$transaction`。创建项目和加入成员是两个数据库操作，如果第一个成功但第二个失败，数据就不一致了。事务保证了它们要么都成功，要么都回滚。
 
-### 1. 类型安全
+## 关联查询的取舍
+
+Prisma 的 `include` 和 `select` 都能加载关联数据，但行为不同：
+
+**include**：加载关联对象的完整字段。简单但可能返回不必要的数据。
 
 ```typescript
-// ✅ 推荐：使用 Prisma 生成的类型
-import { User } from "@prisma/client";
-
-const getUser = t.procedure.query(async (): Promise<User[]> => {
-  return await prisma.user.findMany();
+// 返回 project 的所有字段，加上 owner 的所有字段
+const project = await prisma.project.findUnique({
+  where: { id },
+  include: { owner: true },
 });
 ```
 
-### 2. 性能优化
+**select**：精确控制返回哪些字段。更推荐的方式，因为它同时解决了"数据安全"（不返回密码等敏感字段）和"传输效率"（不返回不需要的字段）两个问题。
 
 ```typescript
-// ✅ 推荐：使用 select 限制返回字段
-const users = await prisma.user.findMany({
+// 只返回指定的字段
+const project = await prisma.project.findUnique({
+  where: { id },
   select: {
     id: true,
     name: true,
-    avatar: true,
+    owner: { select: { id: true, name: true, avatar: true } },
+    _count: { select: { tasks: true } },
   },
 });
 ```
 
-## 总结
+在 TaskFlow 里，我推荐始终用 `select`。原因很简单：**你不需要的数据，就不应该从数据库取出来**。这不仅减少了网络传输量，也避免了不小心把敏感字段（比如 User 的 passwordHash）暴露给前端。
 
-### 核心要点
+一个常见的纠结是：`select` 写起来比 `include` 繁琐。确实，但这是值得的。而且你不需要在每个 procedure 里重复写——可以提取成复用的 select 配置：
 
-1. **Prisma + tRPC = 完美组合**
-   - 端到端类型安全
-   - 自动类型生成
-   - 无需重复定义
+```typescript
+const projectSelect = {
+  id: true,
+  name: true,
+  description: true,
+  color: true,
+  owner: { select: { id: true, name: true, avatar: true } },
+  _count: { select: { tasks: true, members: true } },
+  updatedAt: true,
+} satisfies Prisma.ProjectSelect;
 
-2. **CRUD 操作**
-   - Create：创建数据
-   - Read：查询数据（分页、过滤、搜索）
-   - Update：更新数据
-   - Delete：删除数据
+// 在多个 procedure 中复用
+list: protectedProcedure.query(async () => {
+  return await prisma.project.findMany({ select: projectSelect });
+}),
+byId: protectedProcedure.input(z.object({ id: z.string() })).query(async ({ input }) => {
+  return await prisma.project.findUnique({ where: { id: input.id }, select: projectSelect });
+}),
+```
 
-3. **性能优化**
-   - 使用 select 减少传输
-   - 避免 N+1 问题
-   - 使用游标分页
+## 游标分页
 
-### 🎉 基础篇完成！
+TaskFlow 的任务列表需要分页。之前我们用的是偏移分页（page 1, 2, 3...），但在有频繁插入删除的场景下，偏移分页会导致数据重复或遗漏。游标分页更稳定。
 
-恭喜！你已经完成了 tRPC 基础篇的学习（5篇文章）：
+```typescript
+list: protectedProcedure
+  .input(z.object({
+    projectId: z.string(),
+    status: z.enum(["TODO", "IN_PROGRESS", "DONE"]).optional(),
+    priority: z.enum(["low", "medium", "high", "urgent"]).optional(),
+    limit: z.number().min(1).max(50).default(20),
+    cursor: z.string().optional(),
+  }))
+  .query(async ({ input }) => {
+    const items = await prisma.task.findMany({
+      where: {
+        projectId: input.projectId,
+        ...(input.status && { status: input.status }),
+        ...(input.priority && { priority: input.priority }),
+      },
+      take: input.limit + 1,
+      cursor: input.cursor ? { id: input.cursor } : undefined,
+      orderBy: [
+        { status: "asc" },
+        { priority: "desc" },
+        { createdAt: "desc" },
+      ],
+      select: {
+        id: true,
+        title: true,
+        status: true,
+        priority: true,
+        dueDate: true,
+        assignee: { select: { id: true, name: true, avatar: true } },
+        tags: { include: { tag: { select: { id: true, name: true } } } },
+        createdAt: true,
+      },
+    });
 
-- ✅ 初识 tRPC
-- ✅ Routers 和 Procedures
-- ✅ 类型推断与自动补全
-- ✅ 中间件系统与错误处理
-- ✅ Prisma 集成
+    let nextCursor: string | undefined;
+    if (items.length > input.limit) {
+      items.pop();
+      nextCursor = items[items.length - 1].id;
+    }
 
-### 下一步
+    return { items, nextCursor };
+  }),
+```
 
-接下来我们将进入**框架集成篇**，学习如何在不同的框架中使用 tRPC：
+游标分页的原理：多取一条数据来判断"还有没有下一页"。`take: limit + 1`，如果返回了 21 条（limit 是 20），说明还有更多数据，最后一条的 id 就是下一页的游标。
 
-- **Next.js + tRPC** 全栈开发
-- **Nuxt + tRPC** Vue 生态集成
-- **NestJS + tRPC** 企业级后端
-- **Hono + tRPC** 轻量级边缘计算
+排序规则 `[{ status: "asc" }, { priority: "desc" }, { createdAt: "desc" }]` 反映了任务管理的业务逻辑：先按状态分组（待办 → 进行中 → 已完成），再按优先级排序，最后按创建时间倒序。
 
-敬请期待！🚀
+## TaskFlow 的完整 tasks Router
 
-## 参考资源
+把上面的知识串起来：
 
-- [Prisma 文档](https://www.prisma.io/docs)
-- [tRPC + Prisma 示例](https://trpc.io/docs/prisma)
+```typescript
+export const tasksRouter = t.router({
+  list: protectedProcedure
+    .input(listTasksSchema)
+    .query(async ({ input, ctx }) => {
+      // 验证用户是否有权限查看该项目的任务
+      const member = await prisma.projectMember.findUnique({
+        where: {
+          userId_projectId: { userId: ctx.user.id, projectId: input.projectId },
+        },
+      });
+      if (!member) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "你不是该项目的成员",
+        });
+      }
+      // ...游标分页查询（如上）
+    }),
 
----
+  create: protectedProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        title: z.string().min(1).max(200),
+        description: z.string().max(2000).optional(),
+        priority: z.enum(["low", "medium", "high", "urgent"]).default("medium"),
+        assigneeId: z.string().optional(),
+        dueDate: z.string().datetime().optional(),
+        tagIds: z.array(z.string()).default([]),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      return await prisma.$transaction(async (tx) => {
+        const task = await tx.task.create({
+          data: {
+            projectId: input.projectId,
+            title: input.title,
+            description: input.description,
+            priority: input.priority,
+            assigneeId: input.assigneeId,
+            dueDate: input.dueDate ? new Date(input.dueDate) : null,
+            tags: {
+              create: input.tagIds.map((tagId) => ({ tagId })),
+            },
+          },
+          select: { id: true },
+        });
+
+        // 创建任务时给项目成员发通知（简化）
+        await tx.notification.create({
+          data: {
+            projectId: input.projectId,
+            type: "TASK_CREATED",
+            message: `${ctx.user.name} 创建了任务：${input.title}`,
+            taskId: task.id,
+          },
+        });
+
+        return task;
+      });
+    }),
+
+  update: protectedProcedure
+    .input(
+      z.object({
+        id: z.string(),
+        title: z.string().min(1).max(200).optional(),
+        status: z.enum(["TODO", "IN_PROGRESS", "DONE"]).optional(),
+        priority: z.enum(["low", "medium", "high", "urgent"]).optional(),
+        assigneeId: z.string().nullable().optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const { id, ...data } = input;
+      const task = await prisma.task.update({
+        where: { id },
+        data,
+        select: {
+          id: true,
+          title: true,
+          status: true,
+          project: { select: { id: true } },
+          assignee: { select: { id: true, name: true, email: true } },
+        },
+      });
+      return task;
+    }),
+});
+```
+
+Prisma + tRPC 的组合在类型层面是零摩擦的：Prisma 生成的类型（`Project`、`Task`、`User`）通过 tRPC 的 procedure 自动传递给前端，前端不需要定义任何 interface。你在后端改了数据库 schema、重新生成 Prisma 类型后，前端如果有用到变化了的字段，TypeScript 会直接报错。
+
+到现在，TaskFlow 的后端已经完整了：有认证、有权限控制、有数据持久化、有类型安全。下一步是给它一个 Web 界面。

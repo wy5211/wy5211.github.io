@@ -1,0 +1,222 @@
+---
+title: "02 Docker 核心概念：容器化你的第一个应用"
+date: "2026-04-02"
+summary: "理解 Docker 的核心原理，安装 Docker，编写第一个 Dockerfile，把应用装进容器。"
+tags: ["Docker", "容器化", "Dockerfile", "镜像"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战：从裸机到生产环境"
+seriesOrder: 2
+---
+
+上篇把服务器的安全配置做好了——SSH 加固、防火墙启用、系统更新完毕。现在要解决的问题是：怎么把应用跑起来。
+
+传统方式是直接在服务器上装 Node.js、装 PostgreSQL、装 Redis，各种依赖混在一起。一旦项目升级或需要切换版本，清理起来是一场噩梦。Docker 解决的核心问题就是：**把应用和它的运行环境打包在一起，在任何地方都能以相同的方式运行。**
+
+## 安装 Docker
+
+Ubuntu 上安装 Docker 很简单，官方提供了一键脚本：
+
+```bash
+# 安装 Docker
+curl -fsSL https://get.docker.com -o get-docker.sh
+sudo sh get-docker.sh
+
+# 把当前用户加入 docker 组（免 sudo）
+sudo usermod -aG docker $USER
+
+# 退出重新登录，使权限生效
+exit
+```
+
+重新 SSH 登录后验证安装：
+
+```bash
+docker --version
+# Docker version 27.x
+
+docker run hello-world
+# Hello from Docker!
+```
+
+看到 `Hello from Docker!` 说明 Docker 安装成功，能正常拉取和运行镜像。
+
+### Docker 的三个核心概念
+
+在写 Dockerfile 之前，需要理解 Docker 的三个基础概念。用类比的方式最容易理解：
+
+**镜像（Image）= 菜谱**。一个只读的模板，包含了运行应用所需的一切——代码、运行时、系统库。镜像是分层的，每一层都是只读的。
+
+**容器（Container）= 做出来的菜**。从镜像创建的运行实例。你可以从同一个镜像创建多个容器，每个容器独立运行、互不影响。
+
+**仓库（Registry）= 菜谱库**。存储和分发镜像的地方。Docker Hub 是最大的公开仓库，你也可以搭建私有仓库。
+
+三者之间的关系：从仓库拉取镜像，用镜像创建容器。
+
+## 编写第一个 Dockerfile
+
+Dockerfile 是一个文本文件，定义了如何构建镜像。CloudPulse 的 Next.js 应用，最简 Dockerfile 长这样：
+
+```dockerfile
+# Dockerfile
+FROM node:20
+
+WORKDIR /app
+
+# 先拷贝依赖文件（利用 Docker 层缓存）
+COPY package*.json ./
+RUN npm ci
+
+# 再拷贝源码
+COPY . .
+
+# 构建应用
+RUN npm run build
+
+# 暴露端口
+EXPOSE 3000
+
+# 启动命令
+CMD ["npm", "start"]
+```
+
+每个指令的解释：
+
+- `FROM node:20`：基础镜像是 Node.js 20 的官方镜像，包含了 Node.js 运行时和包管理器
+- `WORKDIR /app`：设置工作目录，后续的 COPY、RUN、CMD 都在这个目录下执行
+- `COPY package*.json ./`：只拷贝 package.json 和 package-lock.json（不拷贝源码），然后 `npm ci` 安装依赖
+- `COPY . .`：把全部源码拷贝进来
+- `RUN npm run build`：构建 Next.js 生产版本
+- `EXPOSE 3000`：声明容器监听 3000 端口（只是声明，不是自动映射）
+- `CMD ["npm", "start"]`：容器启动时执行的命令
+
+构建和运行：
+
+```bash
+# 在项目根目录构建镜像
+docker build -t cloudpulse:latest .
+
+# 运行容器，把容器的 3000 端口映射到宿主机的 3000 端口
+docker run -d -p 3000:3000 --name cloudpulse cloudpulse:latest
+```
+
+`-d` 表示后台运行，`-p 3000:3000` 做端口映射，`--name` 给容器起个名字方便管理。访问 `http://your-server-ip:3000` 就能看到应用了。
+
+## 层缓存：为什么 COPY 顺序很重要
+
+Docker 的镜像是分层存储的，每一层都是前一层的基础上做增量修改。而且 Docker 有一个层缓存机制：**如果某一层没变，就直接用缓存，不重新执行**。
+
+这就是为什么 Dockerfile 里的指令顺序很重要：
+
+```dockerfile
+# 好：先拷贝依赖文件，再拷贝源码
+COPY package*.json ./
+RUN npm ci              # 这层会被缓存，只要 package.json 没变就不会重跑
+COPY . .
+RUN npm run build      # 源码变了才会重跑这一层
+
+# 差：先拷贝所有源码，再装依赖
+COPY . .
+RUN npm ci              # 源码每次都变，这层缓存永远用不上
+```
+
+一个简单的顺序调整，就能让后续构建快很多。Dockerfile 的编写顺序对构建速度影响很大，这是最容易被忽略但也最值得优化的点。
+
+## 镜像管理常用命令
+
+```bash
+# 查看本地所有镜像
+docker images
+
+# 查看镜像的分层信息
+docker history cloudpulse:latest
+
+# 删除无用镜像
+docker rmi cloudpulse:latest
+
+# 给镜像打标签
+docker tag cloudpulse:latest cloudpulse:v1.0.0
+
+# 推送到私有仓库（如果有的话）
+docker push registry.example.com/cloudpulse:latest
+```
+
+`docker history` 命令很有用——它会显示每一层的指令和大小，帮你找到镜像体积大的原因。你可能会发现某个 RUN 指令安装了 500MB 的临时文件，但后面的 COPY 覆盖了它——这些无用数据还占着空间。
+
+## 容器操作常用命令
+
+```bash
+# 查看运行中的容器
+docker ps
+
+# 查看所有容器（包括已停止的）
+docker ps -a
+
+# 查看容器日志
+docker logs cloudpulse
+docker logs -f cloudpulse  # 实时跟踪日志
+
+# 进入容器内部调试
+docker exec -it cloudpulse sh
+
+# 停止容器
+docker stop cloudpulse
+
+# 启动已停止的容器
+docker start cloudpulse
+
+# 删除容器
+docker rm cloudpulse
+
+# 强制删除运行中的容器
+docker rm -f cloudpulse
+```
+
+`docker exec -it cloudpulse sh` 进入容器内部后，你可以运行任何 Linux 命令来调试问题——检查文件是否存在、环境变量是否正确、网络是否通畅等。
+
+## 数据持久化：为什么容器删除后数据会丢
+
+Docker 容器的文件系统是临时的。容器删除后，里面的所有数据（包括数据库文件、上传的图片、日志）都会丢失。
+
+这就是 Volume 存在的意义。Volume 把容器内的数据映射到宿主机的一个目录，容器删了数据还在。
+
+```bash
+# 创建命名 Volume
+docker volume create cloudpulse-data
+
+# 挂载到容器里
+docker run -d \
+  -v cloudpulse-data:/var/lib/postgresql/data \
+  postgres:16
+
+# 查看 Volume 列表
+docker volume ls
+
+# 查看 Volume 的详细信息（包括在宿主机上的实际路径）
+docker volume inspect cloudpulse-data
+```
+
+这里 `cloudpulse-data:/var/lib/postgresql/data` 的意思是：把宿主机上的 `cloudpulse-data` 这个 Volume 挂载到容器内的 `/var/lib/postgresql/data`。PostgreSQL 的数据文件会写入这个 Volume，即使容器删除重建，数据也不会丢。
+
+对于 CloudPulse 的 Next.js 应用来说，目前不需要 Volume——因为静态资源都在 Docker 镜像里，数据库数据由单独的 PostgreSQL 容器管理。但后面用 Docker Compose 编排多服务时，Volume 会变得重要。
+
+## .dockerignore
+
+和 .gitignore 类似，.dockerignore 告诉 Docker 构建时忽略哪些文件：
+
+```
+node_modules
+.next
+.git
+.env
+.env.local
+npm-debug.log
+Dockerfile
+docker-compose.yml
+README.md
+```
+
+如果不加 .dockerignore，`COPY . .` 会把 node_modules（几百 MB）、.git（整个版本历史）都拷贝进镜像，白白浪费构建时间和镜像空间。
+
+到这里，CloudPulse 的 Next.js 应用已经能以容器的方式运行了。但如果你执行 `docker images`，会发现这个镜像有 **1.2GB**——这对生产环境来说太大了。下一篇，我们来把它优化到生产级。

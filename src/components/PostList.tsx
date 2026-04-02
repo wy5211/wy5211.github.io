@@ -34,10 +34,9 @@ export default function PostList({ posts }: PostListProps) {
   const categories = useMemo(() => {
     // 获取所有分类（按预定义顺序）
     const categoryOrder = [
-      "后端",
       "nestjs",
-      "运维",
-      "数据库",
+      "devOps",
+      "database",
       "python",
       "rust",
       "java",

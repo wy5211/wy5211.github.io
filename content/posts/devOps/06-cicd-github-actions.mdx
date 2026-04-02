@@ -1,0 +1,380 @@
+---
+title: "06 CI/CD：GitHub Actions 自动化部署"
+date: "2026-04-02"
+summary: "把 CloudPulse 的部署流程自动化：push 到 main 分支自动测试、构建、部署，10 分钟内代码变更就能上线。"
+tags: ["CI/CD", "GitHub Actions", "自动化部署", "DevOps"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战：从裸机到生产环境"
+seriesOrder: 6
+---
+
+上篇配置好了 Nginx 和 HTTPS，CloudPulse 已经可以通过 `https://cloudpulse.com` 访问了。
+
+但每次发布新版本，你都要：
+
+1. SSH 登录服务器
+2. `git pull` 拉取最新代码
+3. `docker compose build` 重新构建镜像
+4. `docker compose up -d` 重启服务
+
+这套流程走下来要 5-10 分钟，而且容易出错——忘了拉代码、构建失败没注意到、重启后服务起不来。
+
+今天我们把这个流程自动化：**当代码 push 到 main 分支时，GitHub Actions 自动测试、构建、部署**。你只需写代码和提交，剩下的交给机器。
+
+## CI/CD 是什么
+
+CI（Continuous Integration，持续集成）和 CD（Continuous Deployment，持续部署）是 DevOps 的核心实践。
+
+**CI 的目标是**：每次代码提交都自动运行测试和构建，尽早发现问题。而不是等快上线了才发现测试挂了。
+
+**CD 的目标是**：测试通过后自动部署到生产环境。代码合并后自动上线，不需要人工介入。
+
+它们的价值：
+
+- **快速反馈**：代码提交后几分钟就知道测试是否通过
+- **减少人为错误**：不用手动敲一堆命令
+- **更频繁的发布**：没有部署痛苦，自然敢更频繁地发布
+- **回滚容易**：每次部署都有记录，出问题可以快速回退
+
+## GitHub Actions 基础
+
+GitHub Actions 是 GitHub 内置的 CI/CD 工具。配置文件放在仓库的 `.github/workflows/` 目录下，用 YAML 定义工作流。
+
+基本概念：
+
+- **workflow**：一个完整的工作流，由多个 job 组成
+- **job**：一组任务的集合，运行在同一个 runner 上
+- **step**：job 里的单个任务，可以执行命令或使用 action
+- **action**：可复用的脚本，比如 `checkout`、`setup-node`
+
+创建第一个 workflow：
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: 安装依赖
+        run: npm ci
+
+      - name: 运行测试
+        run: npm test
+
+      - name: 构建项目
+        run: npm run build
+```
+
+每次 push 或 PR 到 main 分支时，这个 workflow 会自动运行：安装依赖、运行测试、构建项目。你可以在 GitHub 仓库的 "Actions" 标签页看到运行结果。
+
+## 配置 Docker 镜像构建
+
+测试通过后，我们希望构建 Docker 镜像并推送到 Docker Hub。这样部署时可以直接拉取镜像，不需要在服务器上构建。
+
+更新 workflow：
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: 提取元数据（标签、tag）
+        uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: your-dockerhub-username/cloudpulse
+          tags: |
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+这个 workflow 做了什么：
+
+1. 用 `docker/setup-buildx-action` 启用 Buildx（支持多架构构建和高级缓存）
+2. 用 `docker/login-action` 登录 Docker Hub（账号密码存在 GitHub Secrets 里）
+3. 用 `docker/metadata-action` 自动生成镜像标签（比如 `main-abc1234`、`latest`）
+4. 用 `docker/build-push-action` 构建并推送镜像，同时启用 GitHub Actions 缓存加速构建
+
+你需要先在 GitHub 仓库设置 Secrets：
+
+1. 进入仓库的 Settings → Secrets and variables → Actions
+2. 点击 "New repository secret"
+3. 添加 `DOCKER_USERNAME`（你的 Docker Hub 用户名）
+4. 添加 `DOCKER_PASSWORD`（你的 Docker Hub 密码或访问令牌）
+
+## 配置自动部署
+
+镜像构建完成后，下一步是部署到服务器。我们需要 SSH 到服务器，拉取新镜像并重启服务。
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push # 依赖 build-and-push job
+
+    steps:
+      - name: 部署到服务器
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /home/deploy/cloudpulse
+
+            # 拉取最新镜像
+            docker compose pull
+
+            # 重启服务
+            docker compose up -d
+
+            # 清理旧镜像
+            docker image prune -af --filter "until=24h"
+```
+
+这个 workflow 用 `appleboy/ssh-action` SSH 到服务器，执行部署脚本。你需要添加以下 Secrets：
+
+- `SERVER_HOST`：服务器 IP 地址
+- `SERVER_USER`：SSH 用户名（比如 `deploy`）
+- `SSH_PRIVATE_KEY`：SSH 私钥（在本地用 `cat ~/.ssh/id_ed25519` 查看）
+
+## 服务器准备
+
+在自动部署能工作之前，服务器上需要做一些准备：
+
+1. **创建项目目录并拉取代码**：
+
+```bash
+mkdir -p /home/deploy/cloudpulse
+cd /home/deploy/cloudpulse
+git clone https://github.com/your-username/cloudpulse.git .
+```
+
+2. **配置 docker-compose.yml**：
+
+```yaml
+# docker-compose.yml
+services:
+  app:
+    image: your-dockerhub-username/cloudpulse:latest
+    # 不再需要 build 配置
+    # build:
+    #   context: .
+    #   dockerfile: Dockerfile
+```
+
+改用 Docker Hub 的镜像，不再本地构建。
+
+3. **配置 SSH 免密登录**：
+
+确保 GitHub Actions 用的 SSH 密钥能免密登录服务器。你需要在服务器的 `~/.ssh/authorized_keys` 里添加公钥：
+
+```bash
+# 在服务器上
+echo "你的公钥内容" >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+## 完整的 CI/CD Workflow
+
+把 CI 和 CD 合并成一个完整的 workflow：
+
+```yaml
+# .github/workflows/ci-cd.yml
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ========== 构建阶段 ==========
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: 提取元数据
+        uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: your-dockerhub-username/cloudpulse
+          tags: |
+            type=sha,prefix={{branch}}-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # ========== 部署阶段 ==========
+      - name: 部署到服务器
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /home/deploy/cloudpulse
+
+            # 拉取最新镜像
+            docker compose pull
+
+            # 重启服务
+            docker compose up -d
+
+            # 清理旧镜像
+            docker image prune -af --filter "until=24h"
+
+            # 健康检查
+            curl -f http://localhost:3000/api/health || exit 1
+```
+
+最后一行加了健康检查：如果新版本启动失败，workflow 会报错，你可以立即收到通知。
+
+## 多环境部署
+
+如果你有 staging 和 production 两个环境，可以创建两个 workflow：
+
+```yaml
+# .github/workflows/deploy-staging.yml
+name: Deploy Staging
+
+on:
+  push:
+    branches: [develop]
+
+jobs:
+  deploy:
+    # ... 使用 staging 的 Secrets
+```
+
+```yaml
+# .github/workflows/deploy-production.yml
+name: Deploy Production
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    # ... 使用 production 的 Secrets
+```
+
+这样 develop 分支的代码自动部署到 staging 环境，main 分支的代码部署到生产环境。
+
+## 回滚策略
+
+如果新版本有问题，需要快速回滚。最简单的方式是用 Git 回退：
+
+```bash
+# 在服务器上
+cd /home/deploy/cloudpulse
+git revert HEAD
+docker compose up -d
+```
+
+或者用 Docker Hub 的历史标签：
+
+```bash
+# 查看可用标签
+docker pull your-dockerhub-username/cloudpulse:main-abc1234
+
+# 修改 docker-compose.yml
+# image: your-dockerhub-username/cloudpulse:main-abc1234
+
+docker compose up -d
+```
+
+更高级的做法是用蓝绿部署或金丝雀发布，但那需要更复杂的架构（比如 Kubernetes）。
+
+## 常见问题
+
+### SSH 连接失败
+
+如果 Actions 报错 "SSH connection failed"，检查：
+
+1. 服务器的防火墙是否开放 SSH 端口
+2. `~/.ssh/authorized_keys` 的权限是否正确（必须是 600）
+3. SSH 密钥是否和服务器上的公钥匹配
+
+### docker compose pull 失败
+
+如果提示 "permission denied"，检查：
+
+1. Docker Hub 镜像是否设为公开（public）
+2. 如果是私有镜像，需要在服务器上 `docker login` 登录 Docker Hub
+
+到这里，CloudPulse 已经实现了完全自动化的部署流程：你只需 push 代码，10 分钟内新版本就上线了。但这套架构只能管理单台服务器，当用户量增长到需要多台服务器时怎么办？下一篇，我们用 Kubernetes 来解决多机编排的问题。

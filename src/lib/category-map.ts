@@ -2,10 +2,9 @@
 // key 是文章 frontmatter 中的 category 值
 // value 是实际的目录名
 export const categoryToDirMap: Record<string, string> = {
-  后端: "后端",
   nestjs: "nestjs",
-  运维: "运维",
-  数据库: "database",
+  devOps: "devOps",
+  database: "database",
   "claude-code": "claude-code",
   java: "java",
   hono: "hono",
@@ -31,10 +30,9 @@ export const categoryToDirMap: Record<string, string> = {
 
 // 目录名到中文分类名的反向映射
 export const dirToCategoryMap: Record<string, string> = {
-  后端: "后端",
   nestjs: "nestjs",
-  运维: "运维",
-  database: "数据库",
+  devOps: "devOps",
+  database: "database",
   "claude-code": "claude-code",
   java: "java",
   hono: "hono",

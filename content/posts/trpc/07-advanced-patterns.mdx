@@ -1,0 +1,346 @@
+---
+title: "07 进阶特性：订阅、性能优化与 Monorepo"
+date: "2026-04-02"
+summary: "为 TaskFlow 添加实时通知，掌握 tRPC 的性能优化策略和 Monorepo 工程化模式。"
+tags: ["tRPC", "WebSocket", "性能优化", "Monorepo", "Turborepo"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 7
+---
+
+TaskFlow 已经可以正常使用了，但有个体验问题：Alice 创建了一个新任务，Bob 要刷新页面才能看到。在协作场景中，这不可接受——你希望新任务出现时，所有人的页面自动更新。
+
+今天解决三个问题：实时更新（Subscriptions）、性能优化、以及项目变大后怎么组织代码。
+
+## 实时订阅：Subscriptions
+
+tRPC 的 Subscription 基于 WebSocket，工作方式是：客户端订阅某个"频道"，当服务端往频道推送消息时，所有订阅者都能收到。
+
+### 服务端实现
+
+TaskFlow 需要的实时功能是：当项目中有新任务、任务状态变更、新评论时，通知所有项目成员。
+
+tRPC 的 subscription 使用 `observable` 模式：
+
+```typescript
+import { observable } from "@trpc/server/observable";
+import { EventEmitter } from "events";
+
+// 用 EventEmitter 作为简易的消息总线
+const ee = new EventEmitter();
+
+// 在创建/更新任务时触发事件
+const createTask = protectedProcedure
+  .input(createTaskSchema)
+  .mutation(async ({ input, ctx }) => {
+    const task = await prisma.task.create({ data: { ... } });
+
+    // 通知所有订阅者
+    ee.emit("task:created", { projectId: input.projectId, task });
+
+    return task;
+  });
+
+// 定义 subscription
+onTaskUpdate: protectedProcedure
+  .input(z.object({ projectId: z.string() }))
+  .subscription(({ input }) => {
+    return observable<{ type: string; task: any }>((emit) => {
+      const handler = (data: { projectId: string; task: any; type: string }) => {
+        if (data.projectId === input.projectId) {
+          emit.next({ type: data.type, task: data.task });
+        }
+      };
+
+      ee.on("task:created", handler);
+      ee.on("task:updated", handler);
+
+      // 清理函数：取消订阅时移除监听
+      return () => {
+        ee.off("task:created", handler);
+        ee.off("task:updated", handler);
+      };
+    });
+  }),
+```
+
+注意几个关键点：
+
+**observable 的清理函数**：当客户端断开连接或取消订阅时，需要移除事件监听。如果不清理，会导致内存泄漏。这个清理函数就是 observable 的 return 值。
+
+**过滤逻辑**：在 handler 里检查 `projectId`，只推送属于当前项目的事件。不要在服务端给所有客户端推送所有事件。
+
+**EventEmitter 的局限**：`EventEmitter` 是单进程的。如果你的应用有多个实例（比如部署了多个 Pod），需要用 Redis Pub/Sub 来跨进程通信。这个复杂度不在 tRPC 内部，但 tRPC 的 subscription 模式和任何消息总线都能配合。
+
+### 客户端使用
+
+```typescript
+"use client";
+
+import { trpc } from "@/lib/trpc/client";
+
+export function TaskRealtimeUpdates({ projectId }: { projectId: string }) {
+  trpc.tasks.onTaskUpdate.useSubscription(
+    { projectId },
+    {
+      onData(data) {
+        // 收到实时更新
+        // 让相关的 React Query 缓存失效，触发重新获取
+        trpc.tasks.list.invalidate({ projectId });
+      },
+      onError(err) {
+        console.error("实时订阅出错：", err);
+      },
+    }
+  );
+
+  return null; // 这个组件不渲染任何 UI
+}
+```
+
+然后在需要实时更新的页面里挂载这个组件：
+
+```typescript
+export default function ProjectPage({ params }) {
+  const project = await caller.projects.byId({ id: params.id });
+
+  return (
+    <div>
+      <h1>{project.name}</h1>
+      {/* 挂载实时更新监听 */}
+      <TaskRealtimeUpdates projectId={params.id} />
+      <TaskBoard projectId={params.id} />
+    </div>
+  );
+}
+```
+
+当有新任务创建时，`onData` 回调会触发 `invalidate`，React Query 自动重新获取任务列表。用户不需要刷新页面就能看到新任务。
+
+### WebSocket 的配置
+
+使用 subscription 需要在客户端创建 WebSocket Link：
+
+```typescript
+import { createWSClient, wsLink } from "@trpc/client";
+
+const wsClient = createWSClient({
+  url: `ws://localhost:3000`,
+});
+
+const trpcClient = trpc.createClient({
+  links: [
+    // 普通请求走 HTTP
+    httpBatchLink({ url: "/api/trpc", transformer: superjson }),
+    // 订阅走 WebSocket
+    wsLink({ client: wsClient, transformer: superjson }),
+  ],
+});
+```
+
+tRPC 的客户端会自动判断：query 和 mutation 走 HTTP，subscription 走 WebSocket。你不需要手动选择传输方式。
+
+## 性能优化
+
+性能优化不是在最后阶段才考虑的事情，而是应该在日常开发中持续关注。以下是 TaskFlow 中用到的几个优化策略。
+
+### 数据预取
+
+React Query 支持预取（prefetch）——在用户还没看到数据之前就提前加载：
+
+```typescript
+// 在页面组件中预取用户可能需要的数据
+export default async function DashboardPage() {
+  const caller = await createCaller();
+  const projects = await caller.projects.list();
+
+  // 预取用户信息，后续客户端组件可能需要
+  // 注意：prefetch 只在客户端生效
+  return (
+    <DashboardContent projects={projects} />
+  );
+}
+```
+
+预取的价值在于消除感知延迟。用户点击一个链接时，如果数据已经缓存了，页面会瞬间显示。
+
+### 缓存失效的精确控制
+
+`invalidate` 的粒度很重要。不要在每次 mutation 后都 invalidate 所有查询——这会导致不必要的网络请求。
+
+```typescript
+// 好：只失效相关的查询
+const createTask = trpc.tasks.create.useMutation({
+  onSuccess: () => {
+    // 只刷新当前项目的任务列表
+    utils.tasks.list.invalidate({ projectId });
+    // 刷新项目计数
+    utils.projects.byId.invalidate({ id: projectId });
+  },
+});
+
+// 差：失效所有查询
+const createTask = trpc.tasks.create.useMutation({
+  onSuccess: () => {
+    utils.invalidate(); // 刷新所有缓存，浪费带宽
+  },
+});
+```
+
+`staleTime` 也值得配置。对于不常变化的数据（比如用户信息），可以设置较长的 staleTime，减少不必要的重新获取：
+
+```typescript
+const queryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      staleTime: 1000 * 60 * 5, // 5 分钟内认为数据是新鲜的
+    },
+  },
+});
+```
+
+### HTTP Batching
+
+默认的 `httpBatchLink` 会把短时间内的多个请求合并成一个。这个行为对你来说是透明的，但值得了解它的工作原理。
+
+假设你的组件同时调用了三个 API：
+
+```typescript
+const { data: projects } = trpc.projects.list.useQuery();
+const { data: user } = trpc.users.me.useQuery();
+const { data: notifications } = trpc.notifications.list.useQuery();
+```
+
+这三个请求会被打包成一次 HTTP 请求发送：
+
+```
+POST /api/trpc?batch=1
+Content-Type: application/json
+
+{
+  "0": { "projects": { "list": null } },
+  "1": { "users": { "me": null } },
+  "2": { "notifications": { "list": null } }
+}
+```
+
+服务端一次性处理所有请求，返回一个批量响应。这把三次 HTTP 往返减少到了一次，对页面加载速度有明显提升。
+
+如果你的某些请求需要独立的错误处理（不想因为一个请求失败导致整个批次失败），可以用 `httpLink`（非 batch）单独发送。
+
+### 服务端组件的 revalidate
+
+Next.js 的服务端组件支持 `revalidate`，控制页面多久重新生成一次：
+
+```typescript
+// 每 60 秒重新验证一次
+export const revalidate = 60;
+
+export default async function ProjectListPage() {
+  const caller = await createCaller();
+  const projects = await caller.projects.list();
+  return <ProjectList projects={projects} />;
+}
+```
+
+对于项目列表这种不频繁变化的页面，60 秒的 revalidate 是合理的。对于需要实时数据的页面（任务看板），还是用客户端组件 + React Query 更合适。
+
+## Monorepo 模式
+
+当 TaskFlow 长大之后——比如你需要一个管理后台、一个移动端 App——单仓库可能不够用了。这时候可以考虑 Monorepo。
+
+### 为什么需要 Monorepo
+
+单仓库的限制在于：所有代码混在一起，`tsc` 编译慢、部署不灵活、共享代码不方便。
+
+Monorepo 的好处是：
+
+- **代码共享**：tRPC Router、类型定义、工具函数放在共享包里，前后端应用都引用
+- **独立部署**：前端和管理后台可以独立部署
+- **类型安全**：所有包共享同一个 TypeScript 项目引用，类型修改会立即反映到所有消费者
+
+### 推荐结构
+
+```
+taskflow/
+├── apps/
+│   ├── web/           # Next.js 前端
+│   └── admin/         # 管理后台（也用 Next.js）
+├── packages/
+│   ├── api/           # tRPC Router + 数据库层
+│   │   ├── src/
+│   │   │   ├── routers/
+│   │   │   ├── prisma/
+│   │   │   └── index.ts    # 导出 AppRouter 类型
+│   │   └── package.json
+│   ├── ui/            # 共享 UI 组件
+│   └── tsconfig/      # 共享 TypeScript 配置
+├── turbo.json
+├── pnpm-workspace.yaml
+└── package.json
+```
+
+关键在于 `packages/api` 这个包：它导出了 `AppRouter` 类型和所有 tRPC 相关配置。前端应用只需要 import 这个包就能获得完整的类型。
+
+```typescript
+// packages/api/src/index.ts
+export { appRouter, type AppRouter } from "./routers";
+export { createContext } from "./context";
+export { protectedProcedure, publicProcedure } from "./procedures";
+```
+
+```typescript
+// apps/web/lib/trpc/client.ts
+import type { AppRouter } from "@taskflow/api";
+import { createTRPCReact } from "@trpc/react-query";
+
+export const trpc = createTRPCReact<AppRouter>();
+```
+
+### Turborepo 配置
+
+```json
+// turbo.json
+{
+  "$schema": "https://turbo.build/schema.json",
+  "tasks": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "dist/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "db:generate": {
+      "cache": false
+    }
+  }
+}
+```
+
+Turborepo 的核心价值是**任务编排和缓存**。当你运行 `turbo build` 时，Turborepo 会分析包之间的依赖关系，只重新构建变化了的包。如果 `packages/api` 没有变化，Turborepo 会直接用缓存结果，跳过构建。
+
+### 什么时候需要 Monorepo
+
+不是所有项目都需要 Monorepo。如果你的团队只有 2-3 个人，项目只有一个前端应用，单仓库完全够用。Monorepo 的额外复杂度（workspace 配置、构建编排、包版本管理）在小项目中是负担而不是收益。
+
+考虑 Monorepo 的信号：
+
+- 你需要多个前端应用（Web + Admin + Mobile）
+- 你有独立的 API 服务和前端，需要共享类型
+- 团队规模超过 5 人，需要并行开发不同模块
+- 你想独立部署不同部分（前端和后端分开 CI/CD）
+
+如果还没有这些需求，先不要过早引入 Monorepo。tRPC 在单仓库里也能很好地工作。
+
+## 选择总结
+
+Subscriptions 解决的是"多人协作时的实时更新"问题。但 WebSocket 有额外的复杂度（连接管理、断线重连、跨进程通信），如果你的应用不需要实时功能，不要为了用而用——普通的前端轮询或 React Query 的 `refetchInterval` 就够了。
+
+性能优化的核心思路是**减少不必要的工作**：预取减少感知延迟，精确 invalidate 减少多余请求，batching 减少 HTTP 往返，revalidate 平衡新鲜度和性能。
+
+Monorepo 解决的是代码组织问题。它的价值在于共享类型和独立部署，但引入了工程复杂度。根据团队规模和项目阶段决定是否采用。
+
+最后一篇，我们把 TaskFlow 从"能跑"变成"能上线"——测试、监控和部署。

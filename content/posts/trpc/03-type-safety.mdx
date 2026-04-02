@@ -1,0 +1,295 @@
+---
+title: "03 类型推断：从前端到后端的类型桥梁"
+date: "2026-04-02"
+summary: "深入理解 tRPC 的类型推断机制，掌握 React Hooks 集成和工具类型提取，在 TaskFlow 前端中体验端到端类型安全。"
+tags: ["tRPC", "TypeScript", "类型推断", "React", "React Query"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 3
+---
+
+上篇我们在后端定义了 TaskFlow 的 API——projects Router 有了 list、create、update 等接口。但这些接口目前只能在后端调用，前端还连不上。
+
+今天来解决前端接入的问题。具体来说，就是回答：**前端的 TypeScript 编译器是怎么知道后端 API 长什么样的？**
+
+## typeof：一切类型的起点
+
+上篇提到过，tRPC 的类型推断核心是 `typeof`。这里展开讲一下它到底做了什么。
+
+当你写完一个 Router：
+
+```typescript
+const appRouter = t.router({
+  projects: t.router({
+    list: t.procedure.query(async () => {
+      /* ... */
+    }),
+    create: t.procedure.input(/* ... */).mutation(async () => {
+      /* ... */
+    }),
+  }),
+});
+```
+
+这个 `appRouter` 对象包含了完整的 API 结构信息——哪些路径存在、每个路径的输入类型是什么、返回类型是什么。`typeof appRouter` 就是把这个结构信息提取成一个 TypeScript 类型。
+
+```typescript
+export type AppRouter = typeof appRouter;
+```
+
+这行代码做的事情是：**把 appRouter 的值类型导出给其他文件使用**。前端文件 import 这个类型，就能获得完整的类型信息。
+
+这里的关键在于：tRPC 的 Router 类型不是手写的 interface，而是从实际的函数实现中推断出来的。这意味着只要后端代码能编译通过，导出的类型就一定是准确的。不存在"类型定义和实际实现不一致"的可能。
+
+## 前端客户端的创建
+
+有了 AppRouter 类型，创建前端客户端只需要几行代码：
+
+```typescript
+import { createTRPCReact } from "@trpc/react-query";
+import type { AppRouter } from "../server/router";
+
+export const trpc = createTRPCReact<AppRouter>();
+```
+
+然后在 React 应用的根部包裹 Provider：
+
+```typescript
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { httpBatchLink } from "@trpc/client";
+import superjson from "superjson";
+
+export function TRPCProvider({ children }: { children: React.ReactNode }) {
+  const [queryClient] = useState(() => new QueryClient());
+  const [trpcClient] = useState(() =>
+    trpc.createClient({
+      links: [
+        httpBatchLink({
+          transformer: superjson,
+          url: "/api/trpc",
+        }),
+      ],
+    })
+  );
+
+  return (
+    <trpc.Provider client={trpcClient} queryClient={queryClient}>
+      <QueryClientProvider client={queryClient}>
+        {children}
+      </QueryClientProvider>
+    </trpc.Provider>
+  );
+}
+```
+
+两个值得注意的点：
+
+**superjson transformer**：默认情况下，tRPC 用 JSON 序列化数据。JSON 不支持 Date、BigInt 等类型，你的 `Date` 对象传到前端会变成字符串。superjson 解决了这个问题——它能正确序列化和反序列化这些特殊类型。在 TaskFlow 里，`createdAt`、`dueDate` 都是 Date 类型，所以必须用 superjson。
+
+**httpBatchLink**：这个 Link 会把短时间内的多个请求合并成一个 HTTP 请求（batching）。如果你的组件同时调用了 `projects.list` 和 `users.me`，它们会被打包成一次请求发送。这减少了 HTTP 请求数，对性能有明显帮助。
+
+## React Hooks 集成
+
+@trpc/react-query 提供的 Hooks 是类型安全的，你不需要传任何泛型参数。
+
+### useQuery：读取数据
+
+TaskFlow 的项目列表页：
+
+```typescript
+"use client";
+
+import { trpc } from "@/lib/trpc";
+
+export function ProjectList() {
+  const { data, isLoading, error } = trpc.projects.list.useQuery();
+
+  if (isLoading) return <div>加载中...</div>;
+  if (error) return <div>加载失败：{error.message}</div>;
+
+  return (
+    <ul>
+      {data?.map((project) => (
+        <li key={project.id}>
+          <span style={{ color: project.color }}>{project.name}</span>
+          <span>{project._count.tasks} 个任务</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+注意 `data` 的类型是自动推断的——它就是你后端 `projects.list` procedure 的返回类型。你在 `project.name` 上能看到自动补全，写 `project.foo` 会编译报错。不需要 import 任何 interface。
+
+### useMutation：修改数据
+
+TaskFlow 的创建项目表单：
+
+```typescript
+"use client";
+
+import { trpc } from "@/lib/trpc";
+import { useState } from "react";
+
+export function CreateProjectForm() {
+  const [name, setName] = useState("");
+  const utils = trpc.useContext();
+
+  const createProject = trpc.projects.create.useMutation({
+    onSuccess: () => {
+      setName("");
+      // 让项目列表重新获取数据
+      utils.projects.list.invalidate();
+    },
+  });
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!name.trim()) return;
+    createProject.mutate({ name });
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input
+        value={name}
+        onChange={(e) => setName(e.target.value)}
+        placeholder="项目名称"
+      />
+      <button disabled={createProject.isPending}>
+        {createProject.isPending ? "创建中..." : "创建项目"}
+      </button>
+    </form>
+  );
+}
+```
+
+`createProject.mutate({ name })` 的参数类型也是自动推断的。如果你写了 `{ name: 123 }`，TypeScript 会报错——因为后端的 Zod schema 要求 name 是 string。
+
+`onSuccess` 里调用的 `utils.projects.list.invalidate()` 是 React Query 的缓存失效机制。创建项目成功后，之前缓存的项目列表已经过期了，需要重新获取。这种"修改数据后让相关查询失效"的模式在前端开发中非常常见，tRPC 和 React Query 的集成让这个过程变得很自然。
+
+### useInfiniteQuery：无限滚动
+
+TaskFlow 的任务列表可能很长，需要分页加载：
+
+```typescript
+export function TaskList({ projectId }: { projectId: string }) {
+  const { data, fetchNextPage, hasNextPage, isFetchingNextPage } =
+    trpc.tasks.list.useInfiniteQuery(
+      { projectId, limit: 20 },
+      {
+        getNextPageParam: (lastPage) => lastPage.nextCursor,
+      }
+    );
+
+  return (
+    <div>
+      {data?.pages.map((page) =>
+        page.items.map((task) => <TaskCard key={task.id} task={task} />)
+      )}
+      {hasNextPage && (
+        <button
+          onClick={() => fetchNextPage()}
+          disabled={isFetchingNextPage}
+        >
+          {isFetchingNextPage ? "加载中..." : "加载更多"}
+        </button>
+      )}
+    </div>
+  );
+}
+```
+
+对应的后端 procedure 需要返回游标信息：
+
+```typescript
+list: t.procedure
+  .input(z.object({
+    projectId: z.string(),
+    limit: z.number().min(1).max(50).default(20),
+    cursor: z.string().optional(),
+  }))
+  .query(async ({ input }) => {
+    const items = await db.task.findMany({
+      where: { projectId: input.projectId },
+      take: input.limit + 1,
+      cursor: input.cursor ? { id: input.cursor } : undefined,
+      orderBy: { createdAt: "desc" },
+    });
+
+    let nextCursor: string | undefined;
+    if (items.length > input.limit) {
+      const nextItem = items.pop();
+      nextCursor = nextItem!.id;
+    }
+
+    return { items, nextCursor };
+  }),
+```
+
+游标分页的思路是：多取一条数据来判断"还有没有下一页"。如果取到了 `limit + 1` 条，说明还有更多数据，最后一条的 id 就是下一页的游标。这种方式比偏移分页（page \* limit）更适合无限滚动，因为它不受数据插入/删除的影响。
+
+## 提取类型：在 Procedure 之外使用
+
+有时候你需要在 procedure 之外使用某个 API 的输入或输出类型。比如你想在前端定义一个表单状态，它的类型应该和后端的输入类型一致。
+
+tRPC 提供了 `inferRouterInputs` 和 `inferRouterOutputs` 工具类型：
+
+```typescript
+import type { inferRouterInputs, inferRouterOutputs } from "@trpc/server";
+import type { AppRouter } from "../server/router";
+
+type RouterInputs = inferRouterInputs<AppRouter>;
+type RouterOutputs = inferRouterOutputs<AppRouter>;
+
+// 提取特定 API 的类型
+type CreateProjectInput = RouterInputs["projects"]["create"];
+// 等同于：{ name: string; description?: string; color: string }
+
+type ProjectListOutput = RouterOutputs["projects"]["list"];
+// 等同于后端 projects.list 的返回类型
+```
+
+在 TaskFlow 前端，你可能这样用：
+
+```typescript
+type CreateProjectInput = RouterInputs["projects"]["create"];
+
+const [formData, setFormData] = useState<CreateProjectInput>({
+  name: "",
+  color: "#3b82f6",
+});
+
+// formData 的类型和后端的输入 schema 完全一致
+// 如果后端改了 schema，这里也会编译报错
+```
+
+这种方式的好处是：类型定义只有一个来源（后端的 Zod schema），前端只是引用它。后端改了输入规则，前端会立即得到反馈。
+
+## 类型推断的边界
+
+tRPC 的类型推断很强，但有几个边界需要注意。
+
+**Date 序列化**：前面提到过，JSON 不支持 Date 类型。不用 superjson 的话，你后端的 `Date` 到了前端会变成 `string`，但 TypeScript 类型还是 `Date`——运行时行为和编译时类型不一致，容易出 bug。
+
+**循环引用**：如果 Post 引用 Author，Author 又引用 Post 的列表，TypeScript 的类型推断会陷入无限递归。解决方法是在 procedure 上手动标注返回类型：
+
+```typescript
+getPost: t.procedure
+  .input(z.object({ id: z.string() }))
+  .query(async ({ input }) => {
+    // 用泛型参数手动标注返回类型，打破循环
+    return await db.post.findUnique({
+      where: { id: input.id },
+      include: { author: true },
+    }) as Promise<{ id: string; title: string; author: { id: string; name: string } } | null>;
+  }),
+```
+
+**返回值不一致**：如果你的 procedure 在不同分支返回不同的结构，tRPC 会推断出一个联合类型。这本身没问题，但前端处理时需要用类型守卫来区分。更好的做法是让 procedure 的返回结构保持一致。
+
+**动态路由**：tRPC 的客户端是静态类型化的，不支持动态构建路径。你不能写 `client[someVar].query()`。如果你需要动态调用 API，考虑用 switch/if 来穷举所有可能的路由。
+
+到这里，TaskFlow 的前后端已经能互相"看到"对方的类型了。但还差一个关键能力：**认证**。目前任何人都能创建项目、修改任务。下一篇，我们给 TaskFlow 加上登录和权限控制。

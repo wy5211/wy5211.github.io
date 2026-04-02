@@ -1,0 +1,345 @@
+---
+title: "02 核心概念：Router、Procedure 与输入验证"
+date: "2026-04-02"
+summary: "掌握 tRPC 的 API 组织方式，理解 Router 和 Procedure 的设计思路，用 TaskFlow 项目实战 Zod 输入验证。"
+tags: ["tRPC", "Router", "Procedure", "Zod", "API设计"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 2
+---
+
+上篇用 20 行代码跑通了 tRPC，体验了类型推断的效果。但真实项目的 API 不可能全塞在一个文件里——一个中型项目可能有几十个接口，涉及用户、项目、任务、评论等多个领域。
+
+今天来解决 API 的组织问题。同时，我们会启动这个系列的主线案例——**TaskFlow**，一个团队任务协作平台。
+
+## Router：API 的目录结构
+
+tRPC 用 Router 来组织 API。你可以把它理解成文件系统的目录：Router 是文件夹，Procedure 是文件，嵌套的 Router 就是子文件夹。
+
+一个最简单的 Router：
+
+```typescript
+const t = initTRPC.create();
+
+const appRouter = t.router({
+  greet: t.procedure
+    .input(z.object({ name: z.string() }))
+    .query(({ input }) => ({ message: `你好, ${input.name}` })),
+});
+```
+
+真实项目里，你不会把所有 procedure 写在一个 router 里。和文件系统一样，tRPC 支持嵌套：
+
+```typescript
+const appRouter = t.router({
+  // 这些 procedure 直接挂在根路径
+  health: t.procedure.query(() => ({ status: "ok" })),
+
+  // projects 是一个子 Router
+  projects: t.router({
+    list: t.procedure.query(() => {
+      /* ... */
+    }),
+    create: t.procedure.input(/* ... */).mutation(() => {
+      /* ... */
+    }),
+  }),
+
+  // users 也是一个子 Router
+  users: t.router({
+    list: t.procedure.query(() => {
+      /* ... */
+    }),
+    byId: t.procedure.input(/* ... */).query(() => {
+      /* ... */
+    }),
+  }),
+});
+```
+
+客户端调用时，路径和嵌套结构一一对应：
+
+```typescript
+await client.health.query(); // 根路径
+await client.projects.list.query(); // projects.list
+await client.projects.create.mutate({
+  /* ... */
+}); // projects.create
+await client.users.byId.query({ id: "..." }); // users.byId
+```
+
+当 Router 文件多到一定程度时，你会希望把它们拆到不同的文件里，再用 `t.mergeRouters` 合并。这和把代码拆到不同模块是同一个道理：
+
+```typescript
+// routers/projects.ts
+export const projectsRouter = t.router({
+  /* ... */
+});
+
+// routers/users.ts
+export const usersRouter = t.router({
+  /* ... */
+});
+
+// routers/index.ts
+export const appRouter = t.mergeRouters(projectsRouter, usersRouter);
+```
+
+`mergeRouters` 和 `t.router({ projects: projectsRouter })` 的区别在于：前者把子 Router 的 procedure 提升到顶层，后者保留命名空间。选哪种取决于你想要什么样的 API 路径结构。
+
+## TaskFlow 的 Router 设计
+
+TaskFlow 是一个团队任务管理工具，核心实体是：用户（User）、项目（Project）、任务（Task）、评论（Comment）。
+
+对应的 Router 结构：
+
+```typescript
+export const appRouter = t.router({
+  projects: projectsRouter,
+  tasks: tasksRouter,
+  users: usersRouter,
+});
+```
+
+每个子 Router 负责自己领域的 CRUD。这个结构很直觉，不需要特别解释——就像你会在文件系统里建 `projects/`、`tasks/`、`users/` 目录一样。
+
+## Procedure：API 的函数
+
+Procedure 是 tRPC API 的最小可执行单元。每个 procedure 就是一个可以被前端调用的函数，但它比普通函数多了几层约束。
+
+### 三种 Procedure 类型
+
+tRPC 区分三种 procedure，这不是为了框架设计上的整洁，而是因为**不同类型的操作在前端的处理方式完全不同**：
+
+**query** — 读取数据。前端会用 React Query 的 `useQuery` 调用，自动处理缓存、重试、loading 状态。query 应该是幂等的（多次调用结果相同），没有副作用。
+
+```typescript
+// 读取项目列表，不修改任何数据
+list: t.procedure.query(async () => {
+  return await db.project.findMany({ orderBy: { createdAt: "desc" } });
+}),
+```
+
+**mutation** — 修改数据。前端会用 `useMutation` 调用，不会自动缓存，成功后通常需要手动让相关查询失效（invalidate）。mutation 可以有副作用。
+
+```typescript
+// 创建项目，会修改数据库
+create: t.procedure
+  .input(z.object({ name: z.string().min(1) }))
+  .mutation(async ({ input }) => {
+    return await db.project.create({ data: input });
+  }),
+```
+
+**subscription** — 实时数据推送。基于 WebSocket，用于需要实时更新的场景（比如新任务通知）。后续会专门讲。
+
+区分 query 和 mutation 的好处在于：当你写一个 procedure 时，需要先想清楚"这个操作是读还是写"。这个思考过程本身就能帮你设计出更清晰的 API。
+
+### 为什么 procedure 不只是一个函数
+
+你可能会想：这不就是一个函数吗？为什么叫 procedure？
+
+区别在于 procedure 是一个**带约束的函数管道**。一个 procedure 从定义到执行会经过多个阶段：
+
+```
+input（验证输入） → middleware（认证、日志等） → handler（实际逻辑）
+```
+
+你在定义 procedure 时，就是在配置这个管道。比如"这个 procedure 需要验证输入"、"这个 procedure 需要用户已登录"。这种声明式的配置方式，比在每个函数里手动写验证逻辑要清晰得多。
+
+## 输入验证：Zod 让类型安全更完整
+
+上篇我们看到了 tRPC 的类型推断：后端返回什么类型，前端就拿到什么类型。但这里有一个缺口——**输入参数**的类型安全。
+
+TypeScript 的类型只在编译时存在。当代码运行时，`input.id` 可能是一个数字、一个对象、或者 undefined。如果后端直接用 `input.id` 去查数据库，可能得到意料之外的结果。
+
+这就是为什么 tRPC 推荐用 Zod 做**运行时验证**。Zod 的 schema 既能定义验证规则，又能自动推断 TypeScript 类型——一个 schema 同时解决了"数据对不对"和"类型是什么"两个问题。
+
+TaskFlow 的"创建项目"接口，用 Zod 定义输入：
+
+```typescript
+import { z } from "zod";
+
+const createProjectSchema = z.object({
+  name: z.string().min(1, "项目名称不能为空").max(50, "项目名称不超过50字"),
+  description: z.string().max(500, "描述不超过500字").optional(),
+  color: z
+    .string()
+    .regex(/^#[0-9a-f]{6}$/, "颜色格式不正确")
+    .default("#3b82f6"),
+});
+
+const createProject = t.procedure
+  .input(createProjectSchema)
+  .mutation(async ({ input }) => {
+    // input 的类型由 Zod 自动推断：
+    // { name: string; description?: string; color: string }
+    // 不需要手动标注，也不会是 any
+    return await db.project.create({ data: input });
+  });
+```
+
+注意这里发生的事情：
+
+1. `createProjectSchema` 定义了验证规则（名称不能为空、颜色格式正确等）
+2. `.input(createProjectSchema)` 让 tRPC 在运行时验证输入
+3. `input` 的类型由 Zod 自动推断，不需要手动写 `interface CreateProjectInput { ... }`
+4. 如果前端传了不符合 schema 的数据，tRPC 会返回一个清晰的验证错误
+
+前端调用时，类型也是自动推断的：
+
+```typescript
+// name 是必需的，description 是可选的，color 有默认值
+await client.projects.create.mutate({
+  name: "TaskFlow 重构",
+  description: "把 API 迁移到 tRPC",
+});
+
+// 下面会编译报错：Required
+// await client.projects.create.mutate({ description: "..." });
+```
+
+这就是 tRPC + Zod 的完整闭环：**后端定义 schema → 自动验证 → 自动推断类型 → 前端获得完整类型提示**。
+
+### 复杂验证的例子
+
+Zod 不只是做简单的字段检查。TaskFlow 的"创建任务"接口需要更复杂的验证：
+
+```typescript
+const createTaskSchema = z.object({
+  title: z.string().min(1).max(200),
+  description: z.string().max(2000).optional(),
+  projectId: z.string(),
+  priority: z.enum(["low", "medium", "high", "urgent"]).default("medium"),
+  assigneeId: z.string().optional(),
+  dueDate: z.string().datetime().optional(),
+  tags: z.array(z.string().max(30)).max(10).default([]),
+});
+```
+
+这里用到了 `z.enum`（限定几个可选值）、`z.array`（数组验证，限定最大长度）、`z.string().datetime()`（日期格式验证）。Zod 的组合能力很强，基本上你能想到的验证规则都能表达。
+
+当验证失败时，tRPC 会返回结构化的错误信息，包含哪个字段出了什么问题。前端可以直接展示给用户，不需要自己解析错误格式。
+
+## 输出类型：让 tRPC 帮你推断
+
+和输入一样，tRPC 会自动推断 procedure 的返回类型。大多数情况下你不需要手动标注：
+
+```typescript
+const getProject = t.procedure
+  .input(z.object({ id: z.string() }))
+  .query(async ({ input }) => {
+    const project = await db.project.findUnique({
+      where: { id: input.id },
+      include: { tasks: true },
+    });
+    return project;
+    // tRPC 自动推断返回类型为：
+    // (Project & { tasks: Task[] }) | null
+  });
+```
+
+但有一种情况需要注意：如果你的返回值结构很复杂，或者你想要精确控制返回类型（比如不返回某些字段），可以用 `select` 而不是手动标注类型：
+
+```typescript
+const getProject = t.procedure
+  .input(z.object({ id: z.string() }))
+  .query(async ({ input }) => {
+    return await db.project.findUnique({
+      where: { id: input.id },
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        // 不返回 createdAt、updatedAt 等内部字段
+        _count: {
+          select: { tasks: true, members: true },
+        },
+      },
+    });
+  });
+```
+
+`select` 的好处是双重保障：既控制了数据库查询的字段（减少数据传输），又让 tRPC 的类型推断精确匹配实际返回的数据结构。
+
+## TaskFlow 的第一个 Router
+
+把上面的概念串起来，TaskFlow 的 projects Router 长这样：
+
+```typescript
+import { initTRPC } from "@trpc/server";
+import { z } from "zod";
+
+const t = initTRPC.create();
+
+export const projectsRouter = t.router({
+  // 获取项目列表
+  list: t.procedure.query(async () => {
+    return await db.project.findMany({
+      orderBy: { createdAt: "desc" },
+      select: {
+        id: true,
+        name: true,
+        description: true,
+        color: true,
+        _count: { select: { tasks: true, members: true } },
+      },
+    });
+  }),
+
+  // 获取项目详情
+  byId: t.procedure
+    .input(z.object({ id: z.string() }))
+    .query(async ({ input }) => {
+      const project = await db.project.findUnique({
+        where: { id: input.id },
+        include: {
+          members: { select: { id: true, name: true, avatar: true } },
+        },
+      });
+      if (!project) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "项目不存在" });
+      }
+      return project;
+    }),
+
+  // 创建项目
+  create: t.procedure
+    .input(
+      z.object({
+        name: z.string().min(1).max(50),
+        description: z.string().max(500).optional(),
+        color: z
+          .string()
+          .regex(/^#[0-9a-f]{6}$/)
+          .default("#3b82f6"),
+      })
+    )
+    .mutation(async ({ input }) => {
+      return await db.project.create({ data: input });
+    }),
+
+  // 更新项目
+  update: t.procedure
+    .input(
+      z.object({
+        id: z.string(),
+        name: z.string().min(1).max(50).optional(),
+        description: z.string().max(500).optional(),
+        color: z
+          .string()
+          .regex(/^#[0-9a-f]{6}$/)
+          .optional(),
+      })
+    )
+    .mutation(async ({ input }) => {
+      const { id, ...data } = input;
+      return await db.project.update({ where: { id }, data });
+    }),
+});
+```
+
+这个 Router 涵盖了 CRUD 的基本操作。注意每个 procedure 都有输入验证（即使是 `list` 这种"无参数"的查询，未来加筛选条件时也很容易扩展）。`select` 控制了返回字段，`_count` 提供了关联计数——这些都是为了前端不需要额外请求就能拿到展示所需的数据。
+
+到现在，TaskFlow 的骨架搭起来了。但有一个关键问题还没解决：**谁有权限调用这些 API？** 目前任何人都能创建项目、删除项目。下一篇我们来处理认证和权限控制。

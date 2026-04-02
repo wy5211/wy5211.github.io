@@ -1,0 +1,396 @@
+---
+title: "08 监控与告警：Prometheus + Grafana"
+date: "2026-04-02"
+summary: "CloudPulse 跑在生产环境了，但出了问题你不知道。用 Prometheus 采集指标、Grafana 可视化、AlertManager 告警，让系统主动告诉你问题。"
+tags: ["Prometheus", "Grafana", "监控", "告警", "可观测性"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战：从裸机到生产环境"
+seriesOrder: 8
+---
+
+上篇把 CloudPulse 部署到了 Kubernetes，它能自动扩缩、自愈。但有个问题：**你怎么知道它运行得怎么样**？
+
+用户投诉"网站很慢"，你 SSH 到服务器一顿操作，发现是数据库 CPU 跑满了。但如果能早点知道——比如 CPU 超过 80% 时收到告警，你就能在用户投诉前处理问题。
+
+监控系统的价值就在这里：**把"被动响应"变成"主动预防"**。
+
+## 为什么需要监控系统
+
+日志和监控是两回事：
+
+**日志**：记录发生了什么（比如"用户登录失败"、"数据库连接超时"）。用于事后排查问题。
+
+**监控**：采集系统的运行指标（CPU、内存、请求延迟、错误率），用于：
+
+- **趋势预判**：磁盘空间还剩 20%，提前扩容
+- **快速定位**：响应时间突然飙升，看到是数据库慢查询导致的
+- **自动告警**：某个指标异常，自动发通知给你
+
+没有监控的系统就像开车不装仪表盘——能跑，但不知道油还剩多少、发动机温度多高。
+
+## Prometheus 核心概念
+
+Prometheus 是云原生时代的监控系统，和传统监控（如 Zabbix、Nagios）的区别：
+
+| 特性     | 传统监控           | Prometheus          |
+| -------- | ------------------ | ------------------- |
+| 数据模型 | 主机为中心         | 指标为中心          |
+| 采集方式 | 推送（Agent 推送） | 拉取（Server 拉取） |
+| 数据存储 | 关系数据库         | 时序数据库          |
+| 告警     | 内置               | 分离的 AlertManager |
+| 服务发现 | 手动配置           | 自动（K8s 集成）    |
+
+Prometheus 的核心组件：
+
+**Prometheus Server**：负责拉取和存储指标数据。
+
+**Exporter**：把各种服务的指标转换成 Prometheus 格式。比如 Node Exporter 暴露服务器指标，PostgreSQL Exporter 暴露数据库指标。
+
+**Pushgateway**：用于短生命周期任务的指标推送（比如 Cron 任务）。
+
+**AlertManager**：处理告警规则，发送通知（邮件、Slack）。
+
+**Grafana**：可视化面板，连接 Prometheus 作为数据源。
+
+指标数据的格式是：`metric_name{label="value"} value`。比如：
+
+```
+http_requests_total{method="POST",path="/api/users",status="200"} 1234
+```
+
+表示：POST 请求到 `/api/users` 返回 200 的总次数是 1234。
+
+## 安装 Prometheus 和 Grafana
+
+用 Docker Compose 快速启动：
+
+```yaml
+# docker-compose.monitoring.yml
+version: "3.8"
+
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3001:3000" # 注意： grafana 默认是 3000，避免和主应用冲突
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+
+  alertmanager:
+    image: prom/alertmanager:latest
+    container_name: alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml
+
+volumes:
+  prometheus-data:
+  grafana-data:
+```
+
+Prometheus 配置文件：
+
+```yaml
+# monitoring/prometheus.yml
+global:
+  scrape_interval: 15s # 每 15 秒拉取一次指标
+
+scrape_configs:
+  # Prometheus 自己的指标
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # Node Exporter（服务器指标）
+  - job_name: "node"
+    static_configs:
+      - targets: ["node-exporter:9100"]
+
+  # CloudPulse 应用指标
+  - job_name: "cloudpulse"
+    static_configs:
+      - targets: ["app:3000"]
+    metrics_path: "/metrics"
+```
+
+启动：
+
+```bash
+docker compose -f docker-compose.monitoring.yml up -d
+```
+
+访问 `http://localhost:9090` 进入 Prometheus UI，`http://localhost:3001` 进入 Grafana（默认账号密码都是 `admin`）。
+
+## 采集服务器指标
+
+Node Exporter 暴露服务器的 CPU、内存、磁盘、网络指标。在服务器上运行：
+
+```bash
+docker run -d \
+  --name node-exporter \
+  -p 9100:9100 \
+  -v /:/host:ro,rslave \
+  prom/node-exporter:latest \
+  --path.rootfs=/host
+```
+
+然后在 Prometheus 配置里添加这个 target。
+
+访问 `http://localhost:9100/metrics` 可以看到所有暴露的指标。
+
+## 应用暴露自定义指标
+
+CloudPulse 也需要暴露业务指标，比如"当前在线用户数"、"API 请求延迟"。可以用 `prom-client` 库（Node.js）：
+
+```javascript
+// lib/metrics.ts
+import client from "prom-client";
+
+// 创建一个 Register
+const register = new client.Registry();
+
+// 添加默认的 Node.js 指标（CPU、内存等）
+client.collectDefaultMetrics({ register });
+
+// 自定义指标：HTTP 请求计数
+const httpRequestsTotal = new client.Counter({
+  name: "http_requests_total",
+  help: "Total number of HTTP requests",
+  labelNames: ["method", "path", "status"],
+  registers: [register],
+});
+
+// 自定义指标：HTTP 请求延迟
+const httpRequestDuration = new client.Histogram({
+  name: "http_request_duration_seconds",
+  help: "Duration of HTTP requests in seconds",
+  labelNames: ["method", "path", "status"],
+  buckets: [0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1], // 延迟分桶
+  registers: [register],
+});
+
+export { register, httpRequestsTotal, httpRequestDuration };
+```
+
+在 API 路由里使用：
+
+```typescript
+// pages/api/[...path].ts
+import { httpRequestsTotal, httpRequestDuration } from "@/lib/metrics";
+
+export default async function handler(req, res) {
+  const start = Date.now();
+
+  try {
+    // ... 处理请求
+
+    // 记录请求计数
+    httpRequestsTotal.labels(req.method, req.url, "200").inc();
+
+    // 记录请求延迟
+    const duration = (Date.now() - start) / 1000;
+    httpRequestDuration.labels(req.method, req.url, "200").observe(duration);
+
+    res.status(200).json({ ok: true });
+  } catch (error) {
+    httpRequestsTotal.labels(req.method, req.url, "500").inc();
+    res.status(500).json({ error: "Internal Server Error" });
+  }
+}
+```
+
+添加 `/metrics` 路由让 Prometheus 拉取：
+
+```typescript
+// pages/api/metrics.ts
+import { register } from "@/lib/metrics";
+
+export default async function handler(req, res) {
+  res.set("Content-Type", register.contentType);
+  res.end(await register.metrics());
+}
+```
+
+## 配置 Grafana Dashboard
+
+Prometheus UI 能查询指标，但不直观。Grafana 可以创建漂亮的 Dashboard。
+
+1. **添加 Prometheus 数据源**：
+   - 登录 Grafana
+   - Configuration → Data sources → Add data source
+   - 选择 Prometheus
+   - URL 填 `http://prometheus:9090`
+
+2. **创建 Dashboard**：
+   - Dashboards → New → New Dashboard
+   - Add visualization
+   - 查询语言用 PromQL（类似 SQL）
+
+常用 PromQL：
+
+```promql
+# CPU 使用率
+100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)
+
+# 内存使用率
+100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes))
+
+# 磁盘使用率
+100 * (1 - (node_filesystem_avail_bytes{fstype!="tmpfs"} / node_filesystem_size_bytes{fstype!="tmpfs"}))
+
+# API 请求速率（每秒请求数）
+rate(http_requests_total[5m])
+
+# API 错误率
+sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m]))
+```
+
+3. **导入现成模板**：
+   - Grafana 官网有大量现成的 Dashboard 模板
+   - 比如搜索 "Node Exporter" 找到 ID 为 1860 的模板
+   - Dashboards → Import → 输入模板 ID
+
+## 配置告警
+
+Prometheus 的告警规则用 YAML 定义：
+
+```yaml
+# monitoring/alerts.yml
+groups:
+  - name: cloudpulse_alerts
+    interval: 30s
+    rules:
+      # CPU 使用率超过 80%
+      - alert: HighCPUUsage
+        expr: 100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU 使用率过高"
+          description: "实例 {{ $labels.instance }} 的 CPU 使用率超过 80%"
+
+      # 内存使用率超过 90%
+      - alert: HighMemoryUsage
+        expr: 100 * (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) > 90
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "内存使用率过高"
+          description: "实例 {{ $labels.instance }} 的内存使用率超过 90%"
+
+      # API 错误率超过 5%
+      - alert: HighErrorRate
+        expr: sum(rate(http_requests_total{status=~"5.."}[5m])) / sum(rate(http_requests_total[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "API 错误率过高"
+          description: "API 错误率超过 5%，当前为 {{ $value | humanizePercentage }}"
+```
+
+在 Prometheus 配置里加载告警规则：
+
+```yaml
+# monitoring/prometheus.yml
+global:
+  scrape_interval: 15s
+
+rule_files:
+  - "/etc/prometheus/alerts.yml"
+
+# ... 其他配置
+```
+
+配置 AlertManager 发送通知：
+
+```yaml
+# monitoring/alertmanager.yml
+global:
+  resolve_timeout: 5m
+
+route:
+  group_by: ["alertname", "cluster", "service"]
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: "web.hook"
+
+receivers:
+  - name: "web.hook"
+    webhook_configs:
+      - url: "https://your-webhook-url.com/alert"
+    # 或者邮件
+    # email_configs:
+    #   - to: 'your-email@example.com'
+    #     from: 'alertmanager@example.com'
+    #     smarthost: 'smtp.example.com:587'
+```
+
+## 日志 vs 指标 vs 链路追踪
+
+监控是"可观测性"三大支柱之一（另外两个是日志和链路追踪）。它们的区别：
+
+**日志**：
+
+- 用途：事后排查问题
+- 数据：离散事件（"用户 A 登录失败"）
+- 工具：ELK（Elasticsearch + Logstash + Kibana）、Loki
+
+**指标**：
+
+- 用途：趋势预判和告警
+- 数据：时间序列（CPU 80% → 85% → 90%）
+- 工具：Prometheus + Grafana
+
+**链路追踪**：
+
+- 用途：分布式系统的性能分析
+- 数据：请求在各个服务间的调用路径
+- 工具：Jaeger、Zipkin
+
+三者互补，缺一不可。日志告诉你"发生了什么"，指标告诉你"系统状态如何"，链路追踪告诉你"请求是怎么走的"。
+
+## 监控最佳实践
+
+1. **从核心指标开始**：先监控 CPU、内存、磁盘、请求延迟、错误率。不要一上来就监控所有东西。
+
+2. **设置合理的阈值**：告警阈值太低会"狼来了"，太高会错过问题。从宽松开始，逐步收紧。
+
+3. **定期回顾告警规则**：每季度检查一次，删除没用的规则，调整阈值。
+
+4. **告警要可执行**：告警信息要包含足够的上下文（哪个实例、什么指标、当前值），让你能快速定位问题。
+
+5. **不要只监控技术指标**：也要监控业务指标（比如"注册转化率"、"支付成功率"），它们更能反映真实问题。
+
+到这里，DevOps 实战系列就结束了。我们从一台空白的 Linux 服务器开始，一步步搭建了：
+
+- 安全的服务器基础配置
+- 容器化的应用
+- Docker Compose 多服务编排
+- Nginx 反向代理和 HTTPS
+- CI/CD 自动化部署
+- Kubernetes 自动扩缩和自愈
+- Prometheus + Grafana 监控告警
+
+这套架构能支撑一个日活百万的 SaaS 产品。但记住：**没有最好的架构，只有最适合的架构**。根据你的项目规模和团队能力，选择合适的工具和流程。

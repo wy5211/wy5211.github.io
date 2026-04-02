@@ -1,0 +1,373 @@
+---
+title: "07 Kubernetes 容器编排入门"
+date: "2026-04-02"
+summary: "当单机扛不住时，用 Kubernetes 管理多机部署、自动扩缩、零停机更新。把 CloudPulse 从 Docker Compose 迁移到 K8s。"
+tags: ["Kubernetes", "K8s", "容器编排", "自动扩缩", "部署"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战：从裸机到生产环境"
+seriesOrder: 7
+---
+
+上篇实现了 CI/CD 自动化部署，每次 push 代码，10 分钟内就上线了。CloudPulse 跑在一台服务器上，通过 Docker Compose 管理三个容器。
+
+这个架构对于初期没问题，但当用户量增长时，会遇到几个瓶颈：
+
+1. **单点故障**——服务器宕机，整个服务挂掉
+2. **资源有限**——一台服务器的 CPU、内存、磁盘是固定的
+3. **手动扩容**——需要手动添加新服务器、配置负载均衡、重新部署
+4. **无法自动恢复**——容器崩溃了要手动重启
+
+Kubernetes（简称 K8s）就是为了解决这些问题而生的容器编排平台。
+
+## 为什么需要 Kubernetes
+
+Docker Compose 和 Kubernetes 的根本区别是：**Compose 只能管理单机，K8s 管理的是集群**。
+
+| 特性         | Docker Compose | Kubernetes |
+| ------------ | -------------- | ---------- |
+| 单机还是集群 | 单机           | 集群       |
+| 自动扩缩     | 手动           | 自动       |
+| 自愈能力     | 无             | 有         |
+| 滚动更新     | 手动           | 自动       |
+| 服务发现     | 简单           | 完善       |
+| 存储管理     | 手动挂载       | 自动       |
+| 运维复杂度   | 低             | 高         |
+
+K8s 的价值：
+
+- **自动扩缩**：根据 CPU/内存使用情况自动增减实例数量
+- **自愈能力**：容器崩溃自动重启，节点宕机自动迁移
+- **零停机部署**：滚动更新，一个一个替换容器，不中断服务
+- **服务发现**：容器间通过服务名互相访问，不需要知道 IP
+- **配置管理**：ConfigMap 和 Secret 集中管理配置和敏感信息
+
+代价是**更高的运维复杂度**。如果你的项目规模不大（日活 < 10万），单机 + Docker Compose 可能更合适。K8s 适合的场景：
+
+- 需要高可用（不能有单点故障）
+- 需要自动扩缩（流量波动大）
+- 有多个微服务需要编排
+- 有专门的运维团队
+
+## 核心概念速览
+
+K8s 有很多概念，先理解最核心的几个：
+
+**Node**：一台物理机或虚拟机，是集群的工作节点。
+
+**Pod**：K8s 最小的部署单位，一个 Pod 包含一个或多个容器（通常一个）。Pod 是临时的，IP 地址会变。
+
+**Deployment**：管理 Pod 的副本数量和更新策略。你告诉 Deployment "我需要 3 个副本"，它会确保始终有 3 个 Pod 在运行。
+
+**Service**：给 Pod 提供稳定的网络访问入口。Pod 的 IP 会变，但 Service 的 IP/域名不变。Service 通过标签选择器找到对应的 Pod。
+
+**ConfigMap**：存储配置数据（比如环境变量、配置文件）。
+
+**Secret**：存储敏感数据（比如密码、证书）。
+
+用类比来理解：
+
+- Node 是工厂
+- Pod 是生产线上的工人
+- Deployment 是车间主任，决定需要多少工人
+- Service 是工厂的前台电话，外部通过这个电话联系工人
+- ConfigMap 是工人的操作手册
+- Secret 是工人的保险柜钥匙
+
+## 本地搭建 Kubernetes
+
+在生产环境使用 K8s 前，先在本地搭建一个测试环境。Minikube 是最简单的选择：
+
+```bash
+# macOS
+brew install minikube
+
+# 启动集群
+minikube start
+
+# 查看节点
+kubectl get nodes
+
+# 查看 pod
+kubectl get pods -A
+```
+
+如果 Minikube 启动失败，可能需要安装虚拟化驱动（VirtualBox 或 HyperKit）。
+
+## 编写 Kubernetes 配置
+
+K8s 的配置也用 YAML 编写，但比 docker-compose.yml 复杂。我们来为 CloudPulse 编写配置。
+
+先创建 PostgreSQL 的 Deployment：
+
+```yaml
+# k8s/postgres-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudpulse-db
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cloudpulse-db
+  template:
+    metadata:
+      labels:
+        app: cloudpulse-db
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: cloudpulse
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: cloudpulse-secrets
+                  key: db-password
+            - name: POSTGRES_DB
+              value: cloudpulse
+          volumeMounts:
+            - name: db-storage
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: db-storage
+          persistentVolumeClaim:
+            claimName: db-pvc
+```
+
+然后创建 Service：
+
+```yaml
+# k8s/postgres-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudpulse-db
+spec:
+  selector:
+    app: cloudpulse-db
+  ports:
+    - port: 5432
+      targetPort: 5432
+```
+
+再创建 Secret：
+
+```yaml
+# k8s/secrets.yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: cloudpulse-secrets
+type: Opaque
+data:
+  db-password: c2VjcmV0 # base64 编码的 "secret"
+  redis-url: cmVkaXM6Ly9yZWRpczo2Mzc5
+```
+
+`data` 里的值必须是 base64 编码。你可以用 `echo -n "secret" | base64` 生成。
+
+最后创建 PersistentVolumeClaim（持久化存储）：
+
+```yaml
+# k8s/pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+```
+
+应用这些配置：
+
+```bash
+kubectl apply -f k8s/secrets.yaml
+kubectl apply -f k8s/pvc.yaml
+kubectl apply -f k8s/postgres-deployment.yaml
+kubectl apply -f k8s/postgres-service.yaml
+```
+
+查看状态：
+
+```bash
+kubectl get pods
+# NAME                             READY   STATUS    RESTARTS   AGE
+# cloudpulse-db-xxxxxxxxxx-xxxxx   1/1     Running   0          2m
+
+kubectl get services
+# NAME             TYPE        CLUSTER-IP      EXTERNAL-IP   PORT(S)    AGE
+# cloudpulse-db    ClusterIP   10.96.154.234   <none>        5432/TCP   2m
+```
+
+## 部署应用
+
+同样的方式部署 Next.js 应用：
+
+```yaml
+# k8s/app-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cloudpulse-app
+spec:
+  replicas: 3 # 运行 3 个副本
+  selector:
+    matchLabels:
+      app: cloudpulse-app
+  template:
+    metadata:
+      labels:
+        app: cloudpulse-app
+    spec:
+      containers:
+        - name: app
+          image: your-registry/cloudpulse:latest
+          ports:
+            - containerPort: 3000
+          env:
+            - name: DATABASE_URL
+              value: postgresql://cloudpulse:$(DB_PASSWORD)@cloudpulse-db:5432/cloudpulse
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: cloudpulse-secrets
+                  key: redis-url
+            - name: NODE_ENV
+              value: production
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "250m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /api/health
+              port: 3000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+```
+
+关键配置：
+
+**replicas: 3**：运行 3 个副本，K8s 会确保始终有 3 个 Pod 在运行。
+
+**resources**：限制容器资源使用。`requests` 是调度时的最低要求，`limits` 是上限。这能防止单个容器占用过多资源。
+
+**livenessProbe**：存活探针，定期检查容器是否还活着。如果失败，K8s 会重启容器。
+
+**readinessProbe**：就绪探针，检查容器是否准备好接收流量。如果失败，Service 会把这个 Pod 从负载均衡中移除。
+
+创建 Service：
+
+```yaml
+# k8s/app-service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: cloudpulse-app
+spec:
+  selector:
+    app: cloudpulse-app
+  ports:
+    - port: 80
+      targetPort: 3000
+  type: LoadBalancer # 在本地 Minikube 用 NodePort 更合适
+```
+
+在云服务商（GKE、EKS）上，`type: LoadBalancer` 会自动创建一个负载均衡器并分配公网 IP。在本地 Minikube，你需要用 `type: NodePort` 并通过 `minikube service cloudpulse-app` 访问。
+
+## 滚动更新
+
+当你更新镜像时，K8s 会自动做滚动更新：
+
+```bash
+# 更新镜像
+kubectl set image deployment/cloudpulse-app app=your-registry/cloudpulse:v2.0.0
+
+# 查看更新状态
+kubectl rollout status deployment/cloudpulse-app
+```
+
+K8s 会一个一个地替换 Pod，确保服务不中断。如果新版本有问题，你可以立即回滚：
+
+```bash
+# 回滚到上一个版本
+kubectl rollout undo deployment/cloudpulse-app
+
+# 查看历史版本
+kubectl rollout history deployment/cloudpulse-app
+```
+
+## 扩缩容
+
+手动扩容：
+
+```bash
+# 扩容到 5 个副本
+kubectl scale deployment/cloudpulse-app --replicas=5
+```
+
+自动扩缩需要安装 Horizontal Pod Autoscaler (HPA)：
+
+```bash
+# 安装 Metrics Server（HPA 依赖）
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# 创建 HPA
+kubectl autoscale deployment cloudpulse-app \
+  --min=3 --max=10 \
+  --cpu-percent=70
+```
+
+这个命令创建一个 HPA：当 CPU 使用率超过 70% 时，自动增加副本数（最多 10 个）；当 CPU 使用率下降时，减少副本数（最少 3 个）。
+
+## 什么时候用 Kubernetes
+
+K8s 不是银弹。它在解决特定问题的同时，也引入了新的复杂度。
+
+**适合 K8s 的场景：**
+
+- 需要高可用（不能接受单点故障）
+- 需要自动扩缩（流量波动大，比如电商秒杀）
+- 有多个微服务需要编排
+- 团队有专门的运维人员
+
+**不适合 K8s 的场景：**
+
+- 项目规模小（日活 < 10万）
+- 团队没有运维经验
+- 需要快速迭代（K8s 学习曲线陡峭）
+
+对于中小项目，推荐先用 Docker Compose + 单机部署，等规模增长后再迁移到 K8s。
+
+## 从 Compose 迁移到 K8s
+
+把 CloudPulse 从 Compose 迁移到 K8s，大致步骤：
+
+1. **创建 K8s 集群**：用云服务商的托管 K8s（GKE、EKS、AKS）或自建
+2. **编写 K8s 配置**：把 docker-compose.yml 转换成多个 YAML 文件
+3. **创建 PVC**：为数据库配置持久化存储
+4. **部署应用**：`kubectl apply -f k8s/`
+5. **配置 Ingress**：用 Nginx Ingress Controller 替代之前的 Nginx
+6. **更新 CI/CD**：把部署命令从 `docker compose up -d` 改成 `kubectl apply`
+
+到这里，CloudPulse 已经可以在 K8s 上自动扩缩和自愈了。但你知道它运行得怎么样吗？CPU 使用率多少、请求延迟多少、有没有报错？没有监控的系统就像盲开，下一篇我们搭建 Prometheus + Grafana 监控告警系统。

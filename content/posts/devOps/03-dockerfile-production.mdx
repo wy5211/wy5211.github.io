@@ -1,0 +1,224 @@
+---
+title: "03 Dockerfile 生产级镜像优化"
+date: "2026-04-02"
+summary: "通过多阶段构建、基础镜像选择和层缓存优化，把 CloudPulse 的镜像从 1.2GB 缩减到 150MB。"
+tags: ["Docker", "Dockerfile", "多阶段构建", "镜像优化"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战：从裸机到生产环境"
+seriesOrder: 3
+---
+
+上篇 CloudPulse 能跑了，但镜像大小 1.2GB。这在开发环境无所谓，但生产环境有几个问题：传输慢（部署一次要好几分钟）、启动慢（解压 1.2GB 的层）、攻击面大（装的软件越多，能被利用的漏洞越多）。
+
+今天来优化这个 Dockerfile，目标是把镜像体积降到 150MB 以内。
+
+## 第一步：换基础镜像
+
+镜像体积大的第一个原因往往是基础镜像太大。来看看对比：
+
+```bash
+docker images | grep node
+# REPOSITORY   TAG        SIZE
+# node         20         1.1GB
+# node         20-alpine  180MB
+# node         20-slim    220MB
+```
+
+`node:20` 是基于 Debian 的完整发行版，自带包管理器和大量系统工具——对构建镜像有用，但运行时完全不需要。`node:20-alpine` 基于 Alpine Linux，只有 5MB 左右的操作系统，整个基础镜像只有 180MB。
+
+换成 Alpine 镜像只需要改一行：
+
+```dockerfile
+FROM node:20-alpine
+```
+
+这一改动能省掉约 900MB。代价是 Alpine 用的 musl libc 而不是 glibc，极少数 npm 包（需要编译的原生模块）可能不兼容。如果遇到 `npm install` 报错说缺少某个系统库，可以考虑换回 `node:20-slim`（220MB，基于 Debian 精简版）。
+
+Alpine 还有一个注意点：它的 shell 是 `ash` 而不是 `bash`，Dockerfile 里如果用 `RUN` 执行 shell 命令需要注意。
+
+## 第二步：多阶段构建
+
+多阶段构建是 Docker 镜像优化的核心手段。思路很简单：**构建阶段装所有工具（编译器、开发依赖），运行阶段只拷贝运行时需要的文件**。
+
+```dockerfile
+# ========== 阶段 1：构建 ==========
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build
+
+# ========== 阶段 2：运行 ==========
+FROM node:20-alpine
+
+WORKDIR /app
+
+# 只从构建阶段拷贝必要文件
+COPY --from=builder /app/.next/standalone ./.next/standalone
+COPY --from=builder /app/public ./public
+
+# 设置环境变量
+ENV NODE_ENV=production
+ENV HOSTNAME="0.0.0.0"
+
+EXPOSE 3000
+
+CMD ["node", "server.js"]
+```
+
+关键在于 `COPY --from=builder`：它只从 builder 阶段拷贝指定的文件或目录到当前阶段，不会把 builder 里装的 node_modules、源码、构建工具带过来。
+
+对于 Next.js 应用，运行时只需要：
+
+- `.next/standalone/`：Next.js 的生产构建产物
+- `public/`：静态资源
+- `node_modules/`：生产依赖（不是全部依赖，是 production 里的）
+
+生产依赖可以通过分离 package.json 来处理：
+
+```json
+{
+  "dependencies": {
+    "next": "14.2.0"
+  },
+  "devDependencies": {
+    "typescript": "^5",
+    "eslint": "^8"
+  }
+}
+```
+
+然后在构建阶段单独安装生产依赖：
+
+```dockerfile
+# 阶段 1：构建
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY . .
+RUN npm run build
+
+# 阶段 2：运行
+FROM node:20-alpine
+WORKDIR /app
+COPY --from=builder /app/.next/standalone ./.next/standalone
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/node_modules ./node_modules
+```
+
+`npm ci --omit=dev` 只安装 dependencies 里的包，`npm cache clean --force` 清理 npm 缓存。这样拷贝过来的 node_modules 只有几十 MB。
+
+## 第三步：优化 COPY 顺序
+
+上篇提到过层缓存。在多阶段构建里，这个优化同样适用：
+
+```dockerfile
+# 好：先拷贝 package.json，安装依赖后再拷贝源码
+COPY package*.json ./
+RUN npm ci --omit=dev
+COPY . .
+RUN npm run build
+
+# 差：每次源码变动都导致依赖重新安装
+COPY . .
+RUN npm ci --omit=dev
+COPY package*.json ./
+```
+
+## 第四步：安全加固
+
+几个生产环境的安全最佳实践：
+
+**非 root 用户运行**：
+
+```dockerfile
+# 在 Alpine 镜像里创建非 root 用户
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nextjs
+
+WORKDIR /app
+COPY --chown=nextjs:nodejs . ./
+USER nextjs
+```
+
+`addgroup --system` 和 `adduser --system` 创建的是系统级用户（没有 home 目录），适合容器场景。`USER nextjs` 之后的所有命令都以 nextjs 用户身份执行。
+
+**不拷贝 .env 文件**：环境变量应该通过 `-e` 参数或 docker-compose 的 `environment` 传入，不要写进镜像。.env 文件应该加入 .dockerignore。
+
+**不安装不必要的工具**：不需要 curl、vim、htop 这些调试工具，它们只会增大镜像体积和攻击面。
+
+## 体积优化的效果
+
+通过以上步骤，CloudPulse 的镜像体积变化大致是：
+
+```
+node:20 单阶段          → 约 1.2GB
+node:20-alpine 单阶段    → 约 180MB
+node:20-alpine 多阶段    → 约 150MB
+```
+
+从 1.2GB 到 150MB，缩小了 87%。启动时间也会从几十秒降到几秒。
+
+## .dockerignore 不能忘
+
+```
+node_modules
+.next
+.git
+.env
+.env.*
+npm-debug.log
+Dockerfile
+docker-compose*.yml
+README.md
+*.md
+```
+
+如果之前忘记加了 .dockerignore，已经构建的胖镜像可以通过多阶段构建来"减肥"。不需要手动清理——多阶段构建天然只拷贝需要的文件。
+
+## 完整的生产级 Dockerfile
+
+综合以上优化，CloudPulse 的最终 Dockerfile：
+
+```dockerfile
+# 构建阶段
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY . .
+RUN npm run build
+
+# 运行阶段
+FROM node:20-alpine
+
+RUN addgroup --system --gid 1001 nodejs && \
+    adduser --system --uid 1001 nextjs
+
+WORKDIR /app
+
+ENV NODE_ENV=production
+ENV HOSTNAME="0.0.0.0"
+
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./.next/standalone
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/node_modules ./node_modules
+
+USER nextjs
+
+EXPOSE 3000
+
+CMD ["node", "server.js"]
+```
+
+这个 Dockerfile 适合大多数 Node.js 应用的生产部署。核心原则只有一条：**运行时镜像里只放运行时需要的东西**。
+
+到这里，CloudPulse 的单个应用已经容器化并优化到生产级了。但真实项目不止一个服务——还有数据库、缓存。手动管理多个容器既繁琐又容易出错。下一篇，我们用 Docker Compose 把它们编排在一起。
