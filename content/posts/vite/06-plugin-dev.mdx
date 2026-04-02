@@ -1,0 +1,353 @@
+---
+title: "06 插件开发实战"
+date: "2026-04-02"
+summary: "配置文件越来越复杂，能不能自动化？开发一个 Vite 插件自动生成组件文档、提取 Props、生成 Story。"
+tags: ["Vite", "插件开发", "自动化", "AST", "工具开发"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战：构建 SparkUI 组件库"
+seriesOrder: 6
+---
+
+上篇处理了 CSS 和资源，SparkUI 有完整的主题系统和图片优化。但每次添加新组件，都要手动写文档、Story、Props 类型——太重复了。
+
+今天我们开发一个 Vite 插件，自动从组件代码提取 Props，生成文档和 Story。
+
+## 插件架构
+
+Vite 插件是一个函数，返回包含钩子的对象：
+
+```typescript
+// my-plugin.ts
+import type { Plugin } from "vite";
+
+export function myPlugin(): Plugin {
+  return {
+    name: "my-plugin",
+    // 钩子函数
+    config(config) {
+      // 修改配置
+    },
+    transform(code, id) {
+      // 转换代码
+    },
+    buildStart() {
+      // 构建开始
+    },
+  };
+}
+```
+
+常用钩子：
+
+| 钩子             | 时机         | 用途               |
+| ---------------- | ------------ | ------------------ |
+| `config`         | 配置解析后   | 修改 Vite 配置     |
+| `configResolved` | 配置解析完成 | 读取最终配置       |
+| `transform`      | 转换每个模块 | 修改代码、注入内容 |
+| `load`           | 加载模块前   | 创建虚拟模块       |
+| `buildStart`     | 构建开始     | 初始化、清理缓存   |
+| `buildEnd`       | 构建结束     | 生成报告、上传资源 |
+
+## 第一个插件：自动生成 Props 文档
+
+目标是：从组件代码提取 TypeScript 类型，自动生成 Props 文档。
+
+```typescript
+// vite-plugin-component-docs.ts
+import type { Plugin } from "vite";
+import { parse } from "@babel/parser";
+import traverse from "@babel/traverse";
+import type { InterfaceDeclaration } from "@babel/types";
+
+interface PropInfo {
+  name: string;
+  type: string;
+  required: boolean;
+  description?: string;
+}
+
+export function componentDocsPlugin(): Plugin {
+  return {
+    name: "component-docs",
+    transform(code, id) {
+      // 只处理 .tsx 文件
+      if (!id.endsWith(".tsx")) return;
+
+      // 解析 AST
+      const ast = parse(code, {
+        sourceType: "module",
+        plugins: ["typescript", "jsx"],
+      });
+
+      const props: PropInfo[] = [];
+
+      // 提取接口定义
+      traverse(ast, {
+        TSInterfaceDeclaration(path) {
+          const node = path.node as InterfaceDeclaration;
+
+          // 只处理 Props 接口
+          if (node.id.name.endsWith("Props")) {
+            node.body.body.forEach((property) => {
+              if (property.type === "TSPropertySignature") {
+                props.push({
+                  name: property.key.name.toString(),
+                  type:
+                    property.typeAnnotation?.typeAnnotation.toString() || "any",
+                  required: !property.optional,
+                });
+              }
+            });
+          }
+        },
+      });
+
+      // 生成文档
+      const docs = generateDocs(props);
+
+      // 创建虚拟模块
+      const virtualModuleId = "\0component-docs:" + id;
+      this.emitFile({
+        type: "asset",
+        fileName: "component-docs.json",
+        source: JSON.stringify(docs, null, 2),
+      });
+
+      return code;
+    },
+  };
+}
+
+function generateDocs(props: PropInfo[]) {
+  return props.map((prop) => ({
+    name: prop.name,
+    type: prop.type,
+    required: prop.required,
+    description: prop.description || "",
+  }));
+}
+```
+
+使用：
+
+```typescript
+// vite.config.ts
+import { componentDocsPlugin } from "./vite-plugin-component-docs";
+
+export default defineConfig({
+  plugins: [react(), componentDocsPlugin()],
+});
+```
+
+构建后，会生成 `dist/component-docs.json`。
+
+## 虚拟模块
+
+虚拟模块是 Vite 插件的强大功能——你可以创建不存在的文件：
+
+```typescript
+// vite-plugin-virtual-module.ts
+import type { Plugin } from "vite";
+
+const virtualModuleId = "virtual:my-module";
+const resolvedVirtualModuleId = "\0" + virtualModuleId;
+
+export function virtualModulePlugin(): Plugin {
+  return {
+    name: "virtual-module",
+    resolveId(id) {
+      if (id === virtualModuleId) {
+        return resolvedVirtualModuleId;
+      }
+    },
+    load(id) {
+      if (id === resolvedVirtualModuleId) {
+        return `export const msg = "Hello from virtual module!"`;
+      }
+    },
+  };
+}
+```
+
+使用：
+
+```typescript
+// App.tsx
+import { msg } from "virtual:my-module";
+console.log(msg); // "Hello from virtual module!"
+```
+
+TypeScript 类型声明：
+
+```typescript
+// src/vite-env.d.ts
+declare module "virtual:my-module" {
+  export const msg: string;
+}
+```
+
+## 自动生成 Story
+
+用插件自动为每个组件生成 Story：
+
+```typescript
+// vite-plugin-auto-story.ts
+import type { Plugin } from "vite";
+import { parse } from "@babel/parser";
+import fs from "fs";
+import path from "path";
+
+export function autoStoryPlugin(): Plugin {
+  return {
+    name: "auto-story",
+    writeBundle() {
+      const componentsDir = "src/components";
+      const storiesDir = "src/stories";
+
+      // 确保目录存在
+      if (!fs.existsSync(storiesDir)) {
+        fs.mkdirSync(storiesDir, { recursive: true });
+      }
+
+      // 遍历组件目录
+      const components = fs.readdirSync(componentsDir);
+
+      components.forEach((component) => {
+        const componentPath = path.join(componentsDir, component);
+        const stat = fs.statSync(componentPath);
+
+        if (stat.isDirectory()) {
+          const indexFile = path.join(componentPath, "index.tsx");
+
+          if (fs.existsSync(indexFile)) {
+            const code = fs.readFileSync(indexFile, "utf-8");
+            const componentName = component;
+
+            // 生成 Story
+            const storyCode = generateStory(componentName);
+            const storyPath = path.join(storiesDir, `${component}.stories.tsx`);
+
+            fs.writeFileSync(storyPath, storyCode);
+          }
+        }
+      });
+    },
+  };
+}
+
+function generateStory(componentName: string) {
+  return `import type { Meta, StoryObj } from '@storybook/react';
+import { ${componentName} } from '../components/${componentName}';
+
+const meta: Meta<typeof ${componentName}> = {
+  title: 'Components/${componentName}',
+  component: ${componentName},
+  tags: ['autodocs'],
+};
+
+export default meta;
+type Story = StoryObj<typeof ${componentName}>;
+
+export const Primary: Story = {
+  args: {},
+};
+`;
+}
+```
+
+现在每次构建，都会自动生成 Story。
+
+## 插件调试
+
+开发插件时，可以用 `console.log` 调试：
+
+```typescript
+export function myPlugin(): Plugin {
+  return {
+    name: "my-plugin",
+    transform(code, id) {
+      console.log("Transforming:", id);
+      console.log("Code:", code);
+      // ...
+    },
+  };
+}
+```
+
+或者用 `debug` 模块：
+
+```typescript
+import createDebug from "debug";
+
+const debug = createDebug("vite:my-plugin");
+
+export function myPlugin(): Plugin {
+  return {
+    name: "my-plugin",
+    transform(code, id) {
+      debug("Transforming %s", id);
+      // ...
+    },
+  };
+}
+```
+
+运行时：
+
+```bash
+DEBUG=vite:* npm run dev
+```
+
+## 插件发布
+
+发布到 npm：
+
+```bash
+# package.json
+{
+  "name": "vite-plugin-component-docs",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": ["dist"],
+  "keywords": ["vite", "plugin", "components", "docs"],
+  "peerDependencies": {
+    "vite": ">=5.0.0"
+  }
+}
+```
+
+```bash
+# 构建
+npm run build
+
+# 发布
+npm publish
+```
+
+使用：
+
+```bash
+npm install -D vite-plugin-component-docs
+```
+
+```typescript
+// vite.config.ts
+import { componentDocsPlugin } from "vite-plugin-component-docs";
+
+export default defineConfig({
+  plugins: [componentDocsPlugin()],
+});
+```
+
+## 插件最佳实践
+
+1. **命名规范**：`vite-plugin-xxx`
+2. **类型安全**：导出 TypeScript 类型
+3. **错误处理**：try-catch 关键代码
+4. **文档完善**：README、使用示例
+5. **测试覆盖**：单元测试、集成测试
+
+到这里，SparkUI 有了自动生成文档的插件，开发效率大大提升。但组件写好了，怎么保证质量？下一篇，我们集成 Vitest 和 Playwright 做测试。

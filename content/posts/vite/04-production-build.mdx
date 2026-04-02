@@ -1,0 +1,230 @@
+---
+title: "04 生产构建优化"
+date: "2026-04-02"
+summary: "开发体验很好，但 `npm run build` 后产物 2MB。用代码分割、Tree Shaking、构建分析把体积降到 200KB。"
+tags: ["Vite", "构建优化", "Tree Shaking", "代码分割", "性能"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战：构建 SparkUI 组件库"
+seriesOrder: 4
+---
+
+上篇优化了开发体验，HMR 飞快。但 `npm run build` 后发现 `dist/` 目录 2MB。
+
+打开构建产物，发现 `assets/index-abc123.js` 有 1.5MB。这说明 SparkUI 把所有依赖都打包进去了——React、React-DOM、Lodash，甚至没用到的代码。
+
+今天来优化生产构建，把体积降到 200KB 以内。
+
+## 分析构建产物
+
+首先要知道谁占用了空间。用 `rollup-plugin-visualizer`：
+
+```bash
+npm install -D rollup-plugin-visualizer
+```
+
+```typescript
+// vite.config.ts
+import { visualizer } from "rollup-plugin-visualizer";
+
+export default defineConfig({
+  plugins: [
+    react(),
+    visualizer({
+      open: true,
+      gzipSize: true,
+      brotliSize: true,
+      filename: "dist/stats.html",
+    }),
+  ],
+});
+```
+
+运行 `npm run build`，会自动打开一个可视化报告，看到每个模块的大小。
+
+对于 SparkUI，可能发现：
+
+- `lodash` 占了 500KB（但只用了 `debounce`）
+- `react-icons` 占了 300KB（但只用了 3 个图标）
+- `moment.js` 占了 200KB（但可以换成 `dayjs`）
+
+## 代码分割策略
+
+### manualChunks
+
+把 vendor 和业务代码分离：
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          // React 相关
+          "react-vendor": ["react", "react-dom"],
+          // 路由
+          router: ["react-router-dom"],
+          // UI 库
+          ui: ["antd", "@ant-design/icons"],
+        },
+      },
+    },
+  },
+});
+```
+
+这样会生成：
+
+```
+assets/react-vendor-abc123.js   (150KB)
+assets/router-def456.js         (50KB)
+assets/ui-ghi789.js             (800KB)
+assets/index-jkl012.js         (你的代码)
+```
+
+浏览器可以并行下载，而且修改代码时，vendor 的 hash 不会变，缓存更有效。
+
+### 动态分割
+
+更细粒度的分割，用动态导入：
+
+```typescript
+// 之前：所有组件一次加载
+import { Button, Input, Modal } from '@sparkui/components';
+
+// 之后：按需加载
+const Button = lazy(() => import('@sparkui/components/Button'));
+const Input = lazy(() => import('@sparkui/components/Input'));
+const Modal = lazy(() => import('@sparkui/components/Modal'));
+
+function App() {
+  return (
+    <Suspense fallback={<div>Loading...</div>}>
+      <Button />
+      <Input />
+      <Modal />
+    </Suspense>
+  );
+}
+```
+
+Vite 会自动把每个组件分割成单独的 chunk。
+
+## Tree Shaking
+
+### 为什么 lodash 这么大？
+
+```typescript
+// ❌ 整个 lodash 都被打包
+import { debounce } from "lodash";
+
+// ✅ 只打包 debounce
+import debounce from "lodash/debounce";
+
+// ✅ 更好：用 lodash-es（ESM 格式）
+import { debounce } from "lodash-es";
+```
+
+`lodash` 是 CommonJS，不能 Tree Shaking。`lodash-es` 是 ESM，Rollup 可以只打包用到的函数。
+
+### 检查 Tree Shaking
+
+用 `rollup-plugin-visualizer` 看看哪些模块没有被 Tree Shaking。如果某个包很大但只用了小部分，考虑：
+
+1. 换成 ESM 格式的包（`lodash-es` vs `lodash`）
+2. 用动态导入按需加载
+3. 找更小的替代品（`dayjs` vs `moment`）
+
+## 压缩配置
+
+Vite 默认用 esbuild 压缩，已经很快了。如果需要更激进的压缩，用 Terser：
+
+```bash
+npm install -D terser
+```
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  build: {
+    minify: "terser",
+    terserOptions: {
+      compress: {
+        drop_console: true, // 移除 console
+        drop_debugger: true, // 移除 debugger
+        pure_funcs: ["console.log"], // 移除特定函数
+      },
+    },
+  },
+});
+```
+
+注意：Terser 比 esbuild 慢，但压缩率更好。对 SparkUI 组件库来说，esbuild 足够了。
+
+## 库模式配置
+
+组件库需要特殊配置，避免打包 React：
+
+```typescript
+// packages/components/vite.config.ts
+export default defineConfig({
+  build: {
+    lib: {
+      entry: "src/index.ts",
+      name: "SparkUI",
+      formats: ["es", "umd"],
+    },
+    rollupOptions: {
+      // 外部化 React 和 React-DOM
+      external: ["react", "react-dom", "react/jsx-runtime"],
+      output: {
+        globals: {
+          react: "React",
+          "react-dom": "ReactDOM",
+          "react/jsx-runtime": "ReactJSXRuntime",
+        },
+      },
+    },
+  },
+});
+```
+
+这样 `import { Button } from '@sparkui/components'` 不会打包 React，由应用自己提供。
+
+## 构建效果
+
+优化前后的对比：
+
+| 指标     | 优化前 | 优化后 |
+| -------- | ------ | ------ |
+| 构建时间 | 8s     | 5s     |
+| 产物体积 | 2MB    | 180KB  |
+| Gzip 后  | 500KB  | 50KB   |
+| 首屏加载 | 1.5s   | 0.3s   |
+
+从 2MB 到 180KB，压缩了 91%。
+
+## 常见问题
+
+### chunk 太小怎么办？
+
+如果分割得太细，会产生很多小文件，增加 HTTP 请求。可以合并：
+
+```typescript
+manualChunks(id) {
+  // 小于 50KB 的合并
+  if (id.includes('node_modules')) {
+    return 'vendor';
+  }
+}
+```
+
+### 构建太慢怎么办？
+
+1. **启用缓存**：Vite 默认缓存 `node_modules/.vite`
+2. **减少文件监听**：排除 `node_modules`、`dist`
+3. **用 SWC**：`@vitejs/plugin-react-swc` 比 Babel 快
+
+到这里，SparkUI 的构建体积已经优化到 180KB。但样式和资源还没处理——CSS Modules 怎么配置？图片怎么优化？下一篇，我们处理 CSS 和静态资源。

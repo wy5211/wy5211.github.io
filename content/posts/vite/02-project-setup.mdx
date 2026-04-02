@@ -1,0 +1,375 @@
+---
+title: "02 项目初始化：搭建 SparkUI"
+date: "2026-04-02"
+summary: "npm create vite 太简单。从零搭建一个符合最佳实践的 Vite 组件库项目：TypeScript、路径别名、环境变量、Monorepo 支持。"
+tags: ["Vite", "项目配置", "TypeScript", "组件库", "Monorepo"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战：构建 SparkUI 组件库"
+seriesOrder: 2
+---
+
+上篇理解了 Vite 的原理，现在来实践。我们要从零搭建 SparkUI——一个类似 Ant Design 的 React 组件库。
+
+官方的 `npm create vite` 太简单了，真实项目需要更多配置：TypeScript、路径别名、环境变量、Monorepo 支持。今天一步步来。
+
+## 初始化项目
+
+用官方模板起步，但做定制：
+
+```bash
+# 创建基础项目
+npm create vite@latest sparkui -- --template react-ts
+
+# 进入目录
+cd sparkui
+
+# 安装依赖
+npm install
+
+# 启动看看
+npm run dev
+```
+
+基础项目跑起来了，但还需要一些调整。首先改目录结构：
+
+```
+sparkui/
+├── packages/              # Monorepo：多个包
+│   ├── components/        # 组件库
+│   ├── theme/             # 主题包
+│   └── icons/             # 图标包
+├── apps/                  # 示例应用
+│   └── docs/              # 文档站点
+├── pnpm-workspace.yaml    # pnpm workspace 配置
+└── package.json
+```
+
+## 配置 pnpm workspace
+
+为什么用 pnpm workspace？因为组件库天然需要 Monorepo：
+
+```yaml
+# pnpm-workspace.yaml
+packages:
+  - "packages/*"
+  - "apps/*"
+```
+
+```bash
+# 安装 pnpm（如果还没装）
+npm install -g pnpm
+
+# 重新安装依赖
+pnpm install
+```
+
+现在你可以在 `packages/components` 里访问 `packages/theme` 的代码，就像它们在同一个项目里。
+
+## TypeScript 配置
+
+Vite 生成的 `tsconfig.json` 基本够用，但需要调整几项：
+
+```json
+// tsconfig.json
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+
+    /* Bundler mode */
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+
+    /* Linting */
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+
+    /* Path mapping - 重要！ */
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"],
+      "@sparkui/theme": ["./packages/theme/src"],
+      "@sparkui/icons": ["./packages/icons/src"]
+    }
+  },
+  "include": ["src"],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}
+```
+
+`paths` 配置让你可以用 `@sparkui/theme` 代替相对路径。
+
+## Vite 配置
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import path from "path";
+
+// https://vitejs.dev/config/
+export default defineConfig({
+  plugins: [react()],
+
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "./src"),
+      "@sparkui/theme": path.resolve(__dirname, "../theme/src"),
+      "@sparkui/icons": path.resolve(__dirname, "../icons/src"),
+    },
+  },
+
+  // 开发服务器配置
+  server: {
+    port: 3000,
+    open: true,
+    // API 代理
+    proxy: {
+      "/api": {
+        target: "http://localhost:8080",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api/, ""),
+      },
+    },
+  },
+
+  // 依赖预构建
+  optimizeDeps: {
+    include: ["react", "react-dom", "react-router-dom"],
+  },
+
+  // 构建配置
+  build: {
+    outDir: "dist",
+    sourcemap: true,
+    // 代码分割
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "react-vendor": ["react", "react-dom"],
+        },
+      },
+    },
+  },
+});
+```
+
+注意 `resolve.alias` 和 `tsconfig.json` 的 `paths` 要对应，否则 TypeScript 能识别但 Vite 找不到。
+
+## 环境变量配置
+
+Vite 的环境变量必须以 `VITE_` 开头：
+
+```bash
+# .env.development
+VITE_API_URL=http://localhost:8080/api
+VITE_APP_TITLE=SparkUI 开发环境
+
+# .env.production
+VITE_API_URL=https://api.sparkui.com
+VITE_APP_TITLE=SparkUI
+
+# .env.staging
+VITE_API_URL=https://staging-api.sparkui.com
+VITE_APP_TITLE=SparkUI (Staging)
+```
+
+类型安全的环境变量：
+
+```typescript
+// src/vite-env.d.ts
+interface ImportMetaEnv {
+  readonly VITE_API_URL: string;
+  readonly VITE_APP_TITLE: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+
+使用时：
+
+```typescript
+// src/config/index.ts
+export const config = {
+  apiUrl: import.meta.env.VITE_API_URL,
+  appTitle: import.meta.env.VITE_APP_TITLE,
+  isDev: import.meta.env.DEV,
+  isProd: import.meta.env.PROD,
+};
+
+// src/api/base.ts
+import axios from "axios";
+import { config } from "@/config";
+
+const api = axios.create({
+  baseURL: config.apiUrl,
+  timeout: 10000,
+});
+
+export default api;
+```
+
+## 第一个组件
+
+现在来写 SparkUI 的第一个组件：
+
+```typescript
+// packages/components/src/Button/Button.tsx
+import { classNames } from '@sparkui/utils';
+import styles from './Button.module.css';
+
+interface ButtonProps {
+  children: React.ReactNode;
+  type?: 'primary' | 'default' | 'danger';
+  size?: 'small' | 'medium' | 'large';
+  disabled?: boolean;
+  onClick?: () => void;
+}
+
+export const Button: React.FC<ButtonProps> = ({
+  children,
+  type = 'default',
+  size = 'medium',
+  disabled = false,
+  onClick,
+}) => {
+  return (
+    <button
+      className={classNames(
+        styles.button,
+        styles[type],
+        styles[size],
+        disabled && styles.disabled
+      )}
+      disabled={disabled}
+      onClick={onClick}
+    >
+      {children}
+    </button>
+  );
+};
+```
+
+对应的 CSS：
+
+```css
+/* packages/components/src/Button/Button.module.css */
+.button {
+  border: 1px solid #d9d9d9;
+  border-radius: 6px;
+  padding: 4px 15px;
+  cursor: pointer;
+  transition: all 0.3s;
+}
+
+.primary {
+  background-color: #1890ff;
+  color: white;
+  border-color: #1890ff;
+}
+
+.danger {
+  background-color: #ff4d4f;
+  color: white;
+  border-color: #ff4d4f;
+}
+
+.small {
+  padding: 0 7px;
+  font-size: 14px;
+}
+
+.large {
+  padding: 4px 15px;
+  font-size: 16px;
+}
+
+.disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+```
+
+## 使用组件
+
+在示例应用中使用：
+
+```typescript
+// apps/docs/src/App.tsx
+import { Button } from '@sparkui/components';
+
+function App() {
+  return (
+    <div>
+      <Button type="primary">Primary Button</Button>
+      <Button type="danger">Danger Button</Button>
+      <Button size="large">Large Button</Button>
+    </div>
+  );
+}
+```
+
+## 库模式配置
+
+组件库需要特殊的构建配置：
+
+```typescript
+// packages/components/vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import path from "path";
+
+export default defineConfig({
+  plugins: [react()],
+
+  // 库模式
+  build: {
+    lib: {
+      entry: path.resolve(__dirname, "src/index.ts"),
+      name: "SparkUI",
+      formats: ["es", "umd"],
+      fileName: (format) => `sparkui.${format}.js`,
+    },
+    rollupOptions: {
+      external: ["react", "react-dom"],
+      output: {
+        globals: {
+          react: "React",
+          "react-dom": "ReactDOM",
+        },
+      },
+    },
+  },
+
+  resolve: {
+    alias: {
+      "@sparkui/theme": path.resolve(__dirname, "../theme/src"),
+      "@sparkui/icons": path.resolve(__dirname, "../icons/src"),
+    },
+  },
+});
+```
+
+导出文件：
+
+```typescript
+// packages/components/src/index.ts
+export { Button } from "./Button";
+export { Input } from "./Input";
+export { Modal } from "./Modal";
+```
+
+到这里，SparkUI 的基础架构就搭好了。但开发体验还不够好——每次改代码要手动刷新浏览器，CSS 修改看不到即时效果。下一篇，我们用 HMR 和开发工具来优化体验。

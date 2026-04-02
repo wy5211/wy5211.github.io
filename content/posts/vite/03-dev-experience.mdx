@@ -1,0 +1,253 @@
+---
+title: "03 开发体验优化"
+date: "2026-04-02"
+summary: "项目跑起来了，但每次改代码要刷新浏览器。用 HMR 边界处理、API 代理、Source Map 让开发更爽。"
+tags: ["Vite", "HMR", "开发体验", "API 代理", "调试"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战：构建 SparkUI 组件库"
+seriesOrder: 3
+---
+
+上篇搭好了 SparkUI 的基础架构，Button 组件也能运行了。但有个问题：每次修改 CSS 或组件代码，浏览器要么全页刷新，要么看不到变化。
+
+HMR（热模块替换）已经启用，但为什么有时候还是刷新整个页面？今天来优化开发体验。
+
+## HMR 边界处理
+
+Vite 的 HMR 默认对 `.css`、`.tsx` 文件有效，但某些修改会触发全页刷新。这是因为 Vite 找不到 HMR 边界——接受更新的模块。
+
+### CSS 的 HMR
+
+CSS 文件的修改默认支持 HMR：
+
+```css
+/* Button.module.css */
+.button {
+  background-color: red; /* 改成 blue */
+}
+```
+
+修改后，浏览器只更新这个 CSS 模块，不刷新页面。这得益于 Vite 注入的 HMR 代码。
+
+### 组件的 HMR
+
+React 组件需要特殊处理。Vite 的 `@vitejs/plugin-react` 会自动注入 Fast Refresh 代码，但你的组件要符合规范：
+
+```typescript
+// ✅ 好：支持 HMR
+export const Button = () => { /* ... */ };
+
+// ❌ 差：不支持 HMR（默认导出）
+const Button = () => { /* ... */ };
+export default Button;
+
+// ❌ 差：不支持 HMR（有副作用）
+let count = 0;
+export const Button = () => {
+  count++;
+  return <button>Count: {count}</button>;
+};
+```
+
+### 自定义 HMR 边界
+
+如果你的组件有副作用，可以手动处理 HMR：
+
+```typescript
+// Button.tsx
+import { useState } from 'react';
+
+// 挂载时初始化
+let isMounted = false;
+let state = { count: 0 };
+
+export const Button = () => {
+  const [count, setCount] = useState(state.count);
+
+  // 初始化
+  if (!isMounted) {
+    isMounted = true;
+  }
+
+  // HMR 时保存状态
+  if (import.meta.hot) {
+    import.meta.hot.accept((newModule) => {
+      // 保存当前状态
+      state.count = count;
+    });
+  }
+
+  return (
+    <button onClick={() => setCount(count + 1)}>
+      Count: {count}
+    </button>
+  );
+};
+```
+
+但大多数情况下，不需要手动处理——Fast Refresh 会自动保留组件状态。
+
+## API 代理配置
+
+开发时，前端在 `localhost:3000`，后端在 `localhost:8080`。直接请求会有 CORS 问题。Vite 的代理功能可以解决：
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    proxy: {
+      // 简单代理
+      "/api": {
+        target: "http://localhost:8080",
+        changeOrigin: true,
+      },
+
+      // 重写路径
+      "/api/v1": {
+        target: "http://localhost:8080",
+        changeOrigin: true,
+        rewrite: (path) => path.replace(/^\/api\/v1/, "/api/v1"),
+      },
+
+      // WebSocket 代理
+      "/socket.io": {
+        target: "ws://localhost:8080",
+        ws: true,
+      },
+    },
+  },
+});
+```
+
+使用：
+
+```typescript
+// src/api/users.ts
+import axios from "axios";
+
+// 请求 http://localhost:3000/api/users
+// 会被代理到 http://localhost:8080/api/users
+export const getUsers = () => {
+  return axios.get("/api/users");
+};
+```
+
+### 代理不生效？
+
+检查这些点：
+
+1. **请求路径要匹配**：`/api/users` 才会匹配 `/api` 代理
+2. **后端服务要启动**：代理不会处理连接失败
+3. **changeOrigin**：某些后端需要检查 Host 头
+
+## Source Map 配置
+
+生产环境的错误很难调试——压缩后的代码看不出问题。Source Map 可以把错误映射回源码：
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  build: {
+    // 开发环境总是启用
+    sourcemap: true,
+
+    // 生产环境根据环境变量
+    // sourcemap: process.env.NODE_ENV === 'development',
+  },
+});
+```
+
+### 生产环境的 Source Map
+
+生产环境启用 Source Map 有安全风险——任何人都能看到源码。推荐用隐藏式 Source Map：
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  build: {
+    sourcemap: "hidden", // 只在错误堆栈中使用，不暴露给 DevTools
+  },
+});
+```
+
+## 开发工具集成
+
+### VS Code 集成
+
+安装 Vite 官方插件：
+
+```bash
+code --install-extension vitejs.vite
+```
+
+配置 `jsconfig.json` 或 `tsconfig.json`：
+
+```json
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  }
+}
+```
+
+现在 `import { Button } from '@/components/Button'` 可以跳转了。
+
+### Chrome DevTools
+
+Vite 自动注入 Source Map，DevTools 可以直接调试源码：
+
+1. 打开 Chrome DevTools → Sources
+2. 找到 `webpack://` 或 `vite://` 目录
+3. 设置断点，直接调试 TypeScript 代码
+
+### React DevTools
+
+安装浏览器扩展后，可以查看组件树和 props：
+
+```bash
+# npm 安装
+npm install -D @welldone-software/why-did-you-render
+```
+
+```typescript
+// src/main.tsx
+if (process.env.NODE_ENV === "development") {
+  const whyDidYouRender = require("@welldone-software/why-did-you-render");
+  whyDidYouRender(React, {
+    trackAllPureComponents: true,
+  });
+}
+```
+
+## 常见问题
+
+### HMR 不工作？
+
+如果 HMR 完全不工作，检查：
+
+1. **浏览器控制台有错误吗？**：HMR 连接失败通常有报错
+2. **防火墙/代理**：公司网络可能阻止 WebSocket
+3. **端口被占用**：HMR 默认用 24678 端口
+
+### CSS 修改不生效？
+
+如果 CSS 修改后没反应：
+
+```bash
+# 清除缓存
+rm -rf node_modules/.vite
+
+# 重启开发服务器
+npm run dev
+```
+
+### TypeScript 报错找不到模块？
+
+确保 `tsconfig.json` 和 `vite.config.ts` 的路径别名一致。
+
+到这里，开发体验已经很好了——HMR 即时更新、API 代理正常、Source Map 可以调试。但 `npm run build` 后，产物体积 2MB，显然有问题。下一篇，我们优化生产构建。
