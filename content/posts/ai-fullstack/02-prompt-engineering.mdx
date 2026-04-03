@@ -1,0 +1,245 @@
+---
+title: "02 Prompt Engineering 实战：同样的 API，为什么有人能让 AI 写出生产级代码"
+date: "2026-04-03"
+summary: "同样的 Claude API，有人让它翻译文档翻译得一塌糊涂，有人能拿到完美的结构化输出。区别在 Prompt 设计。这篇文章教你 System Prompt、Few-shot、Chain-of-Thought 和结构化输出的实战方法。"
+tags: ["AI", "Prompt Engineering", "Claude", "结构化输出", "Vercel AI SDK"]
+category: "ai-fullstack"
+cover: ""
+draft: false
+series: "AI 全栈实战"
+seriesOrder: 2
+---
+
+上一篇你搭好了流式聊天界面，能和 Claude 对话了。但如果你直接问它"审查一下这段代码"，它大概率会给你一段泛泛而谈的评价："这段代码整体不错，建议添加错误处理和类型检查。"——每段代码它都这么说。
+
+问题不在 API，在 Prompt。你给它一个模糊的指令，它就给你一个模糊的回答。给它精确的约束，它才能给出有用的输出。
+
+这篇文章带你把上一篇的通用聊天助手改造成一个**代码审查助手**——给它专业的 System Prompt、Few-shot 示例和结构化输出格式，让它能给出真正有价值的审查意见。
+
+## System Prompt：定义 AI 的"人设"
+
+你每次调用 API 时都可以传一个 `system` 参数。它和 `messages` 不同——system 不是对话的一部分，而是对模型行为的全局指令。模型不会"看到" system prompt 在对话中出现，但它会严格按照 system prompt 的约束来生成回复。
+
+一个好的 System Prompt 需要定义三件事：
+
+1. **角色**：你是谁
+2. **能力边界**：你能做什么、不能做什么
+3. **输出规范**：你怎么回答
+
+来看一个反面教材和正面教材的对比：
+
+反面——太笼统：
+
+```
+你是一个代码审查助手。
+```
+
+正面——精确且有约束：
+
+```
+你是一个资深的全栈代码审查助手，拥有 10 年以上的 TypeScript/Node.js 后端开发经验。
+
+## 你的职责
+- 审查用户提交的代码，指出潜在问题
+- 按「严重程度」分级：🔴 致命（安全漏洞、数据丢失）、🟡 警告（性能问题、可维护性）、🟢 建议（代码风格、最佳实践）
+- 给出具体的修改建议和代码示例
+
+## 你的限制
+- 不要过度赞美代码（"写得很好！"、"整体不错！"）
+- 不要给出笼统的建议（"建议添加错误处理"），必须指出具体位置
+- 如果代码没有明显问题，直接说"没有发现需要关注的问题"
+- 只关注代码质量，不评价业务逻辑是否合理
+```
+
+这个 System Prompt 的关键设计：
+
+- **"不要过度赞美"**——没有这个约束，AI 会倾向于先夸再建议，浪费 token
+- **"必须指出具体位置"**——避免"建议添加错误处理"这种正确的废话
+- **"不评价业务逻辑"**——AI 不知道你的业务背景，评业务逻辑只会给出错误建议
+- **分级制度**——让审查结果有结构，方便后续程序化处理
+
+在代码中使用：
+
+```typescript
+const SYSTEM_PROMPT = `你是一个资深的全栈代码审查助手...`;
+
+const result = streamText({
+  model: anthropic("claude-sonnet-4-20250514"),
+  system: SYSTEM_PROMPT,
+  messages,
+});
+```
+
+## Few-shot：给它看例子比告诉它规则更有效
+
+你告诉 AI "审查结果要按严重程度分级"，它可能理解了也可能没完全理解。但如果你给它看一个完整的审查示例，它立刻就知道你要什么格式。
+
+这就是 Few-shot Learning 的核心：**示例 > 描述**。
+
+在 System Prompt 里加几个示例：
+
+````
+## 审查示例
+
+用户提交：
+```typescript
+async function deleteUser(id: string) {
+  const query = `DELETE FROM users WHERE id = '${id}'`
+  await db.execute(query)
+}
+````
+
+你的审查：
+🔴 **SQL 注入漏洞** — `deleteUser` 函数直接拼接用户输入到 SQL 语句中。
+攻击者可以传入 `id = "1'; DROP TABLE users; --"` 来执行任意 SQL。
+建议使用参数化查询：
+
+```typescript
+async function deleteUser(id: string) {
+  await db.execute("DELETE FROM users WHERE id = $1", [id]);
+}
+```
+
+```
+
+注意示例的设计：
+
+- **用户的输入**是真实场景中会出现的有问题的代码，不是 Hello World
+- **审查结果**格式和你的分级制度一致（🔴 + 问题描述 + 具体位置 + 修复建议）
+- **修复建议**给的是可以直接用的代码，不是描述
+
+有 2-3 个好的示例就足够了。太多示例会占用大量 token，反而增加成本。关键不是数量，而是**覆盖不同类型的问题**——一个安全漏洞的示例、一个性能问题的示例、一个代码风格的示例，比三个同一类型的示例更有价值。
+
+## Chain-of-Thought：让模型"想清楚再回答"
+
+有时候模型给了一个错误的审查意见，不是因为它的知识不够，而是因为它"想太快了"——看到代码就立刻给结论，没有仔细分析。
+
+Chain-of-Thought（CoT）的思路是：让模型先展示推理过程，再给结论。你不需要特殊的 API 参数，只需要在 Prompt 里要求它展示思考过程：
+
+```
+
+## 审查流程
+
+在给出审查结论之前，先按以下步骤分析：
+
+1. 这段代码的功能是什么
+2. 逐行扫描，标记可疑点
+3. 对每个可疑点评估严重程度
+4. 给出最终的审查结论和修改建议
+
+```
+
+加了这段之后，模型的输出会变成这样：
+
+```
+
+**分析过程：**
+
+1. 这段代码的功能是从数据库查询用户信息并返回
+2. 可疑点：第 5 行使用了 `any` 类型，第 12 行的 N+1 查询问题
+3. 严重程度评估：类型安全问题属于🟡警告，N+1 查询在数据量大时会影响性能
+
+**审查结论：**
+🟡 **类型安全** — 第 5 行的 `db.query()` 返回值使用了 `any` 类型...
+🟡 **N+1 查询** — 第 12 行在循环中执行数据库查询...
+
+````
+
+看起来 token 用得更多了，但准确率显著提升。在代码审查这种需要精确性的场景中，CoT 的额外 token 成本是值得的。
+
+有一个需要注意的地方：CoT 不适合所有场景。如果你要 AI 做简单的事情（比如"把这段 JSON 格式化"），CoT 是浪费。**需要推理的任务用 CoT，不需要推理的任务直接要结果。**
+
+## 结构化输出：拿到可解析的 JSON
+
+到目前为止，AI 的输出都是自然语言文本。但如果你想把审查结果存到数据库、在界面上按分类展示、或者做进一步处理，你需要结构化的输出——JSON。
+
+Vercel AI SDK 支持用 zod schema 定义输出结构：
+
+```typescript
+import { z } from "zod"
+
+const reviewSchema = z.object({
+  summary: z.string().describe("一句话总结审查结论"),
+  issues: z.array(
+    z.object({
+      severity: z.enum(["critical", "warning", "suggestion"]),
+      title: z.string().describe("问题描述，简洁明确"),
+      location: z.string().describe("代码位置，如 '第 5 行'"),
+      description: z.string().describe("详细说明为什么这是个问题"),
+      fix: z.string().describe("具体的修复建议或代码"),
+    })
+  ),
+  hasIssues: z.boolean(),
+})
+
+const result = streamText({
+  model: anthropic("claude-sonnet-4-20250514"),
+  system: SYSTEM_PROMPT,
+  messages,
+})
+````
+
+但 `streamText` 不直接支持结构化输出——它在流式场景下返回的是原始文本。如果你需要结构化输出，用 `generateText` + `schema` 参数：
+
+```typescript
+import { generateText } from "ai";
+
+const { text } = await generateText({
+  model: anthropic("claude-sonnet-4-20250514"),
+  system: SYSTEM_PROMPT,
+  messages,
+  schema: reviewSchema,
+});
+
+// text 是一个符合 reviewSchema 的 JSON 字符串
+const review = JSON.parse(text);
+// review.issues[0].severity === "critical"
+// review.issues[0].title === "SQL 注入漏洞"
+```
+
+这里有个取舍：**流式输出和结构化输出，在当前的技术条件下很难同时实现**。流式输出是逐 token 返回的，你没法在最后一个 token 到来之前验证 JSON 结构。所以你需要根据场景选择：
+
+- **需要实时展示**（聊天界面）→ `streamText`，接受自然语言输出
+- **需要程序化处理**（存数据库、API 返回）→ `generateText` + `schema`，拿到完整 JSON
+
+一个折中方案是：先流式展示自然语言（用户体验好），后台异步调用结构化 API 拿到 JSON（供程序使用）。但这样就是两次 API 调用了，成本翻倍。实际项目中，大多数聊天场景直接用流式 + 自然语言就够了，只有需要"AI 输出直接进数据库"的场景才用结构化。
+
+## Prompt 模板管理
+
+不要把 Prompt 写死在代码里。随着项目迭代，你会频繁调整 Prompt——改个措辞、加个约束、调个示例。如果每次都改代码、重新部署，效率太低。
+
+把 Prompt 抽成单独的文件或配置：
+
+```typescript
+// lib/prompts.ts
+export const prompts = {
+  codeReview: {
+    system: `你是一个资深的全栈代码审查助手...`,
+    fewShots: [
+      {
+        input: "async function deleteUser(id: string) { ... }",
+        output: "🔴 **SQL 注入漏洞** — ...",
+      },
+    ],
+  },
+  translation: {
+    system: `你是一个专业翻译...`,
+  },
+};
+```
+
+更进一步，可以把 Prompt 存在数据库或配置文件中，运行时动态加载。这样产品经理想调整 AI 的行为时，改个配置就行，不用改代码重新部署。
+
+对于这个系列的代码审查助手，我们可以把 System Prompt 做成可配置的——用户可以选择不同的审查风格（严格/宽松）、关注领域（安全/性能/可维护性）。
+
+## trade-off：Prompt 工程的边界
+
+Prompt Engineering 能解决很多问题，但不是万能的。
+
+**Prompt 能做的**：控制输出格式、定义行为边界、提供上下文信息、引导推理过程。本质上是在约束和引导模型已有的能力。
+
+**Prompt 做不到的**：让模型知道它训练数据中没有的信息（你的内部 API 文档、私有数据库的 schema）、保证 100% 遵循复杂规则（模型是概率性的，不是确定性的）、处理需要精确计算的任务（数学运算、日期计算）。
+
+对于"模型不知道的信息"这个问题，下一篇我们会讲 Function Calling——让 AI 调用外部工具获取信息。对于"需要精确计算"的问题，同样可以通过 Function Calling 让 AI 调用计算工具。
+
+一个实用的原则：**能用 Prompt 解决的不要用工具，Prompt 搞不定的才上工具。** 工具调用有额外的延迟和复杂度，能省则省。

@@ -1,0 +1,295 @@
+---
+title: "01 LLM API 与流式对话：从 ChatGPT 到你自己的 AI 应用"
+date: "2026-04-03"
+summary: "你在浏览器里用 ChatGPT，文字一个一个蹦出来。这种体验背后是 API 调用、流式传输和上下文管理。这篇文章教你用 Next.js + Vercel AI SDK 从零搭建一个流式 AI 聊天应用。"
+tags: ["AI", "LLM", "Vercel AI SDK", "Anthropic", "Streaming"]
+category: "ai-fullstack"
+cover: ""
+draft: false
+series: "AI 全栈实战"
+seriesOrder: 1
+---
+
+你打开 ChatGPT，问它一个问题，回答的文字像打字机一样一个一个蹦出来。你可能觉得这个效果挺酷，但没想过它是怎么实现的——不就是 API 调用吗？
+
+但如果你是一个前端开发者，想要在自己的项目里实现同样的效果，你会发现事情没那么简单。API 怎么调？流式数据怎么传输？多轮对话的上下文怎么管理？用户发了一条新消息，之前的对话历史要不要带着？
+
+这篇文章带你从零搭建一个流式 AI 聊天应用。不绕弯子，直接上 Vercel AI SDK + Anthropic Claude API。
+
+## 先搞清楚几个概念
+
+在写代码之前，有几个概念你需要理解。不是那种"看完就忘"的概念，而是会影响你后续所有 API 调用决策的东西。
+
+### Token：LLM 的计费单位和记忆容量
+
+你在 ChatGPT 里发一条消息"帮我写一个 React 组件"，这条消息会被拆成若干个 token。Token 不等于字符，也不等于单词——它更像是语言模型能理解的最小单位。一个英文单词大约 1-2 个 token，一个中文字符大约 1-2 个 token。
+
+为什么 token 重要？两个原因：
+
+1. **计费**：Anthropic API 按 token 收费，输入 token 和输出 token 价格不同
+2. **上下文窗口**：每个模型有最大 token 限制（Claude 3.5 Sonnet 是 200K），超过就会报错或截断
+
+实际开发中，你需要关注的是：你发送的 messages 数组总共多少 token，模型的回复大概会生成多少 token。Vercel AI SDK 会在请求中自动计算并告诉你。
+
+### Temperature：控制输出的"随机性"
+
+Temperature 是 0 到 1 之间的一个参数。0 表示模型总是选择概率最高的输出（最确定），1 表示模型会随机探索更多可能（最有创意）。
+
+- 写代码、做翻译、格式化数据 → temperature 低一点（0-0.3），你需要确定性的输出
+- 写文案、头脑风暴、创意写作 → temperature 高一点（0.7-1），你需要多样性
+
+这个参数不是越大越好，也不是越小越好。关键是：**你想让 AI 做什么**。
+
+### Messages 数组：对话就是一组消息的数组
+
+LLM API 不像普通的 REST API 那样"一问一答"。它接收的是一个 messages 数组，里面包含所有的对话历史。你发一条新消息时，需要把之前的对话一起带上——模型本身没有记忆，所谓的"上下文"就是你每次都把历史消息重新发一遍。
+
+```typescript
+// 这就是一次完整的 API 调用
+const messages = [
+  { role: "user", content: "什么是闭包？" },
+  { role: "assistant", content: "闭包是..." },
+  { role: "user", content: "能给我一个例子吗？" }, // 新消息
+];
+```
+
+这意味着什么？对话越长，每次请求发送的 token 越多，费用越高，延迟也越大。所以你需要管理对话长度——后面会说到怎么做。
+
+## 搭建项目
+
+环境要求：Node.js 22+、Next.js 15+。
+
+```bash
+# 创建项目
+npx create-next-app@latest ai-chat --typescript --tailwind --app --eslint
+cd ai-chat
+
+# 安装依赖
+pnpm add ai @ai-sdk/anthropic
+```
+
+需要配置环境变量。去 [Anthropic Console](https://console.anthropic.com/) 申请 API Key：
+
+```bash
+# .env.local
+ANTHROPIC_API_KEY=sk-ant-xxx
+```
+
+> 如果你还没有 Anthropic API Key，注册账号后会赠送一些免费额度，足够你完成这个系列的所有练习。
+
+## 服务端：创建聊天 API
+
+Vercel AI SDK 的核心设计思想是：**AI 交互的逻辑应该在服务端**。这不是出于安全的考虑（虽然也很重要），而是因为服务端可以直接流式转发 LLM 的响应，不需要在客户端中转。
+
+创建 API Route：
+
+```typescript
+// app/api/chat/route.ts
+import { anthropic } from "@ai-sdk/anthropic";
+import { streamText } from "ai";
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  const result = streamText({
+    model: anthropic("claude-sonnet-4-20250514"),
+    system: "你是一个技术助手，擅长用简洁清晰的方式解释编程概念。",
+    messages,
+  });
+
+  return result.toDataStreamResponse();
+}
+```
+
+这段代码做了三件事：
+
+1. 从请求体中取出 `messages`（客户端发来的对话历史）
+2. 调用 `streamText`，指定模型和系统提示
+3. 返回一个 `DataStreamResponse`——这是 Vercel AI SDK 封装的流式响应格式
+
+注意 `streamText` 这个函数名。它和普通的 `generateText` 不同——`generateText` 会等模型生成完所有内容再一次性返回，而 `streamText` 是边生成边返回。这就是流式输出的实现原理：服务端收到模型的一个 chunk 就立刻发给客户端，不用等全部生成完。
+
+### 为什么用 streamText 而不是 generateText
+
+对于聊天场景，流式输出几乎是必须的。一个普通的回答可能需要 5-15 秒才能生成完，如果用户要等 15 秒才看到第一个字，体验是无法接受的。流式输出让用户在 1-2 秒内就能看到第一个 token，心理等待感大幅降低。
+
+但有些场景不适合流式：比如你要把 AI 的输出存到数据库、或者做批处理，这时候用 `generateText` 更简单，因为你能直接拿到完整的字符串。
+
+## 客户端：聊天界面
+
+Vercel AI SDK 提供了 `useChat` Hook，封装了流式对话的所有状态管理：
+
+```typescript
+// app/page.tsx
+"use client"
+
+import { useChat } from "ai/react"
+
+export default function Chat() {
+  const { messages, input, handleInputChange, handleSubmit, isLoading } =
+    useChat()
+
+  return (
+    <div className="mx-auto max-w-2xl p-4">
+      <div className="space-y-4 mb-4">
+        {messages.map((m) => (
+          <div key={m.id} className="whitespace-pre-wrap">
+            <span className="font-bold">
+              {m.role === "user" ? "你: " : "AI: "}
+            </span>
+            {m.content}
+          </div>
+        ))}
+      </div>
+
+      <form onSubmit={handleSubmit}>
+        <input
+          value={input}
+          onChange={handleInputChange}
+          placeholder="输入你的问题..."
+          className="w-full border p-2 rounded"
+          disabled={isLoading}
+        />
+      </form>
+    </div>
+  )
+}
+```
+
+`useChat` 帮你管理了这些状态：
+
+- `messages`：完整的对话历史数组
+- `input`：当前输入框的值
+- `isLoading`：AI 是否正在生成回复
+- `handleSubmit`：提交消息并触发流式响应
+- `handleInputChange`：更新输入框状态
+
+它在底层做了什么？当你调用 `handleSubmit` 时，它会自动把当前的 `messages` + 新输入作为请求体发送到 `/api/chat`，然后通过 SSE（Server-Sent Events）接收流式响应，实时更新 `messages` 状态。
+
+## 流式传输的原理
+
+你可能好奇，`streamText` 返回的 `DataStreamResponse` 到底是怎么工作的？
+
+底层用的是 **SSE（Server-Sent Events）**，不是 WebSocket。两者的区别：
+
+| 特性   | SSE                     | WebSocket    |
+| ------ | ----------------------- | ------------ |
+| 方向   | 服务端 → 客户端（单向） | 双向         |
+| 协议   | 基于 HTTP               | 独立协议     |
+| 重连   | 浏览器自动重连          | 需要手动处理 |
+| 复杂度 | 简单                    | 较复杂       |
+
+AI 聊天的数据流是单向的（用户发请求，服务端流式返回），SSE 完全够用，不需要 WebSocket 的双向能力。而且 SSE 基于 HTTP，不需要额外的连接管理，在 Next.js 这类 Serverless 环境下部署更简单。
+
+Vercel AI SDK 的 Data Stream 协议在 SSE 的基础上做了封装，每个 chunk 不只是纯文本，还包含了类型标识（text start、text delta、tool call 等），这样客户端就能区分不同类型的数据。
+
+## 上下文管理
+
+随着对话越来越长，messages 数组会越来越大。200K token 看起来很多，但如果你传了 50 轮对话历史，很容易就超了。
+
+有两种常见的处理方式：
+
+### 方式一：只保留最近 N 轮
+
+最简单粗暴的做法——只保留最近 10 轮对话（20 条消息），更早的丢弃：
+
+```typescript
+const recentMessages = messages.slice(-20);
+```
+
+优点是实现简单，缺点是模型会"忘记"很早的对话内容。
+
+### 方式二：摘要压缩
+
+把早期的对话用 AI 压缩成一段摘要，只保留摘要和最近几轮完整对话：
+
+```typescript
+// 伪代码，展示思路
+const oldMessages = messages.slice(0, -10);
+const recentMessages = messages.slice(-10);
+
+const summary = await generateText({
+  model: anthropic("claude-sonnet-4-20250514"),
+  prompt: `请用一段话总结以下对话的核心内容：${JSON.stringify(oldMessages)}`,
+});
+
+const compressedMessages = [
+  { role: "system", content: `之前的对话摘要：${summary.text}` },
+  ...recentMessages,
+];
+```
+
+这种方式更精细，但每次请求前多了一次 AI 调用，增加了延迟和成本。实际项目中，建议先用方式一，遇到上下文不够用再考虑升级。
+
+## 错误处理
+
+网络可能断、API 可能超限、模型可能拒绝回答。你需要处理这些情况。
+
+Vercel AI SDK 的 `useChat` 提供了 `error` 状态：
+
+```typescript
+const { messages, error } = useChat()
+
+if (error) {
+  return (
+    <div className="text-red-500">
+      出错了：{error.message}
+    </div>
+  )
+}
+```
+
+在服务端，你也可以捕获具体的错误类型：
+
+```typescript
+import { APICallError } from "ai";
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  try {
+    const result = streamText({
+      model: anthropic("claude-sonnet-4-20250514"),
+      messages,
+    });
+    return result.toDataStreamResponse();
+  } catch (e) {
+    if (e instanceof APICallError) {
+      // API 调用失败（网络错误、认证失败、限流等）
+      return new Response(e.message, { status: e.statusCode });
+    }
+    return new Response("Internal Server Error", { status: 500 });
+  }
+}
+```
+
+最常见的错误是 **429 Rate Limit**——Anthropic API 有请求频率限制。生产环境中需要做重试（指数退避）或者给用户友好的提示。
+
+## 完整项目结构
+
+到这里，你的项目应该是这个结构：
+
+```
+ai-chat/
+├── app/
+│   ├── api/chat/route.ts    # 聊天 API
+│   ├── page.tsx             # 聊天界面
+│   └── layout.tsx
+├── .env.local               # API Key
+├── package.json
+└── tsconfig.json
+```
+
+运行 `pnpm dev`，打开浏览器，你应该能看到一个能正常对话的 AI 聊天应用。文字会像 ChatGPT 一样一个一个蹦出来。
+
+## trade-off：选型的考量
+
+**Vercel AI SDK vs 直接调用 Anthropic API**
+
+直接用 `@anthropic-ai/sdk` 调用 API 也完全可以，Vercel AI SDK 本质上是各家的封装层。选它的理由：统一了不同提供商的接口（今天用 Claude，明天换 GPT-4，只改一行 model 配置）；`useChat` 等 Hook 省了大量状态管理代码；Data Stream 协议处理了流式传输的各种边界情况。
+
+但如果你只需要简单的"发请求拿响应"，不需要流式输出和状态管理，直接用 `@anthropic-ai/sdk` 更轻量。
+
+**SSE vs WebSocket**
+
+前面说了，AI 聊天场景用 SSE 就够了。但如果你要做"AI 正在生成，用户可以中途打断并修改方向"这种交互（类似 ChatGPT 的 Stop Generating 按钮），SSE 也支持——客户端断开连接，服务端检测到后停止生成。不需要 WebSocket 的双向通道。

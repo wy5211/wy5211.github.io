@@ -1,0 +1,333 @@
+---
+title: "06 AI Agent 实战：从 Chatbot 到自主决策的跨越"
+date: "2026-04-03"
+summary: "前 5 篇你学会了对话、Prompt、工具调用、MCP、RAG。但这些能力是分散的。一个真正的 AI Agent 能自主决定：什么时候搜索、什么时候查知识库、什么时候直接回答。这就是 Agent 的核心——感知、推理、行动的循环。"
+tags: ["AI", "Agent", "ReAct", "多 Agent", "AI 安全", "Vercel AI SDK"]
+category: "ai-fullstack"
+cover: ""
+draft: false
+series: "AI 全栈实战"
+seriesOrder: 6
+---
+
+前 5 篇你分别学会了对话、Prompt 设计、工具调用、MCP 协议和 RAG 检索。但它们各自独立——第 3 篇的工具调用不知道第 5 篇的知识库，第 5 篇的 RAG 不知道第 4 篇的 MCP Server。
+
+真实的 AI 应用不是这样的。用户问一个问题，AI 需要自己判断：这是一个通用知识问题（直接回答）、还是需要查文档（调用工具）、还是关于博客内容的问题（检索知识库）、还是需要多步操作（先搜索再分析再总结）。
+
+这就是 Agent 和 Chatbot 的核心区别：**Agent 能自主决策该用什么能力、按什么顺序执行。**
+
+## 从 Chatbot 到 Agent
+
+回顾一下你在这个系列中构建的应用演进：
+
+```
+第 1 篇：Chatbot — 用户问什么就答什么，没有外部能力
+第 2 篇：更好的 Chatbot — Prompt 优化后，回答质量提升了，但还是只能"说"
+第 3 篇：有点像 Agent — 能调用工具了，但工具是固定的、流程是线性的
+第 5 篇：另一个方向的增强 — 能检索知识库了，但和工具调用是分开的
+```
+
+真正的 Agent 应该是这样工作的：
+
+```
+用户：帮我看一下这段 Prisma 代码有没有安全问题，
+     然后查一下我博客里关于 Prisma 的文章推荐给用户
+
+Agent 内部决策：
+  1. 代码审查 → 需要 checkSecurityVulnerability 工具
+  2. 博客文章推荐 → 需要 search_articles 工具（来自 MCP Server）
+  3. 先执行 1，再执行 2，最后综合结果回复
+```
+
+关键点：**用户没有告诉 Agent 该做什么、用什么工具、按什么顺序。Agent 自己分析问题、制定计划、执行。**
+
+## ReAct 模式：推理 + 行动的循环
+
+Agent 最常用的模式叫 ReAct（Reasoning + Acting）。原理很简单：Agent 在每一步都先"想"（推理），再"做"（行动），然后根据结果决定下一步。
+
+```
+思考：用户要我审查 Prisma 代码的安全问题，我需要先检查代码中的安全漏洞
+行动：调用 checkSecurityVulnerability({ code: "..." })
+观察：发现一个潜在的 N+1 查询问题，但没有安全漏洞
+
+思考：用户还要求推荐博客中关于 Prisma 的文章
+行动：调用 search_articles({ query: "Prisma", limit: 3 })
+观察：找到了 3 篇相关文章
+
+思考：现在我有了安全审查结果和文章推荐，可以综合回答了
+行动：生成最终回复
+```
+
+在 Vercel AI SDK 中实现这个模式，核心是 `maxSteps` 参数：
+
+```typescript
+import { anthropic } from "@ai-sdk/anthropic";
+import { streamText } from "ai";
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  const result = streamText({
+    model: anthropic("claude-sonnet-4-20250514"),
+    system: AGENT_SYSTEM_PROMPT,
+    messages,
+    tools: {
+      ...codeReviewTools, // 代码审查工具
+      ...mcpTools, // 来自 MCP Server 的工具
+      searchKnowledgeBase, // RAG 检索工具
+    },
+    maxSteps: 10, // 允许最多 10 轮工具调用
+  });
+
+  return result.toDataStreamResponse();
+}
+```
+
+`maxSteps: 10` 意味着 SDK 会自动循环这个流程：模型生成回复 → 如果包含工具调用 → 执行工具 → 把结果发回模型 → 模型继续生成 → 最多 10 轮。不需要你手动管理这个循环。
+
+### System Prompt 的设计
+
+Agent 的 System Prompt 和普通 Chatbot 有本质区别。你需要告诉它：**你可以用什么工具、什么情况下用、遇到不确定的情况怎么办。**
+
+```
+你是一个全能 AI 技术助手。你可以使用以下能力来帮助用户：
+
+## 可用工具
+- searchNpmDocs：搜索 NPM 包文档，当需要确认库的 API 用法时使用
+- searchGitHub：搜索 GitHub 代码，当需要了解实现细节时使用
+- checkSecurityVulnerability：检查安全漏洞，当审查代码安全时使用
+- searchBlogArticles：搜索博客文章，当用户询问博客内容时使用
+- queryKnowledgeBase：检索知识库，当需要基于私有数据回答时使用
+
+## 决策原则
+1. 先分析用户的问题，判断需要哪些工具
+2. 能直接回答的问题不要调用工具（比如"什么是闭包"）
+3. 需要外部信息的问题才调用工具
+4. 多步任务按依赖顺序执行（比如先搜索再分析）
+5. 如果一个工具调用失败，尝试替代方案，不要直接放弃
+
+## 输出规范
+- 列出你使用了哪些工具、为什么使用
+- 基于工具结果给出有依据的回答
+- 如果工具返回的信息不够，明确告诉用户
+```
+
+注意最后一条"不要直接放弃"——Agent 应该有一定的韧性。一个工具调用失败了，它应该尝试其他工具或者基于已有信息给出部分回答，而不是直接报错。
+
+## 整合所有能力
+
+把前 5 篇的能力整合到一个 Agent 里。你的 API Route 大概是这样的：
+
+```typescript
+import { anthropic } from "@ai-sdk/anthropic";
+import { streamText, tool } from "ai";
+import { z } from "zod";
+
+// 第 3 篇的 Function Calling 工具
+const searchNpmDocs = tool({
+  /* ... */
+});
+const searchGitHub = tool({
+  /* ... */
+});
+const checkSecurityVulnerability = tool({
+  /* ... */
+});
+
+// 第 5 篇的 RAG 检索工具
+const queryKnowledgeBase = tool({
+  description:
+    "检索博客知识库。当用户的问题涉及博客内容、技术教程等私有数据时使用。",
+  parameters: z.object({
+    query: z.string().describe("搜索问题"),
+  }),
+  execute: async ({ query }) => {
+    const embedding = await generateEmbedding(query);
+    return await searchSimilar(embedding, 5);
+  },
+});
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  // 如果配置了 MCP Server，加载 MCP 工具
+  let mcpTools = {};
+  try {
+    const mcpClient = await experimental_createMCPClient({
+      transport: {
+        type: "stdio",
+        command: "node",
+        args: ["./mcp-server/index.js"],
+      },
+    });
+    mcpTools = await mcpClient.tools();
+  } catch {
+    // MCP Server 不可用时降级，不影响核心功能
+  }
+
+  const result = streamText({
+    model: anthropic("claude-sonnet-4-20250514"),
+    system: AGENT_SYSTEM_PROMPT,
+    messages,
+    tools: {
+      searchNpmDocs,
+      searchGitHub,
+      checkSecurityVulnerability,
+      queryKnowledgeBase,
+      ...mcpTools,
+    },
+    maxSteps: 10,
+  });
+
+  return result.toDataStreamResponse();
+}
+```
+
+这个 Agent 现在：
+
+- 能直接回答通用问题（不需要工具）
+- 能审查代码并检查安全漏洞（Function Calling）
+- 能查询博客内容（RAG）
+- 能通过 MCP 接入更多工具（MCP）
+- 能自主决定用哪些能力、按什么顺序（ReAct 循环）
+
+## 多 Agent 协作
+
+当任务足够复杂时，一个 Agent 可能不够用。比如用户的需求是"帮我写一个用户认证模块，包括注册、登录、JWT 签发和刷新"——这涉及数据库设计、安全策略、代码实现等多个领域，一个 Agent 很难同时处理好所有方面。
+
+多 Agent 的思路是：**不同的 Agent 负责不同的领域，由一个"协调者"来分配任务。**
+
+```
+用户需求 → Orchestrator Agent（分析任务、分配给专业 Agent）
+               ├── Code Architect Agent（设计架构方案）
+               ├── Security Review Agent（审查安全漏洞）
+               └── Code Writer Agent（生成代码实现）
+           → Orchestrator Agent（整合结果、输出给用户）
+```
+
+Vercel AI SDK 目前没有内置的多 Agent 编排能力，但你可以通过多次 API 调用来实现：
+
+```typescript
+async function orchestrate(userMessage: string) {
+  // 第一步：Orchestrator 分析任务
+  const plan = await generateText({
+    model: anthropic("claude-sonnet-4-20250514"),
+    system:
+      "你是一个任务协调者。分析用户的需求，拆分成子任务，分配给合适的 Agent。",
+    prompt: userMessage,
+  });
+
+  // 第二步：根据 plan 分发子任务（简化示例）
+  const subTasks = JSON.parse(plan.text).tasks;
+  const results = await Promise.all(
+    subTasks.map((task: { agent: string; task: string }) => {
+      switch (task.agent) {
+        case "architect":
+          return architectAgent(task.task);
+        case "security":
+          return securityAgent(task.task);
+        case "writer":
+          return writerAgent(task.task);
+      }
+    })
+  );
+
+  // 第三步：整合结果
+  const finalResult = await generateText({
+    model: anthropic("claude-sonnet-4-20250514"),
+    system: "基于以下各 Agent 的输出，整合成完整的回答。",
+    prompt: JSON.stringify(results),
+  });
+
+  return finalResult.text;
+}
+```
+
+多 Agent 的代价是更高的延迟和成本——每个 Agent 都是一次完整的 API 调用。在大多数实际场景中，**一个带多个工具的 Agent 已经够用了**。多 Agent 适合的是那些"需要不同领域专家分别处理"的复杂任务。
+
+## Agent 的安全边界
+
+Agent 能自主调用工具，这意味着它有"行动能力"。但能力越大，风险越大。你需要设置安全边界。
+
+### 限制工具的破坏性
+
+```typescript
+const deleteFile = tool({
+  description: "删除文件。仅在用户明确要求删除指定文件时使用。",
+  parameters: z.object({
+    path: z.string(),
+  }),
+  execute: async ({ path }) => {
+    // 只允许删除特定目录下的文件
+    if (!path.startsWith("/tmp/agent-workspace/")) {
+      return "拒绝：只能在 /tmp/agent-workspace/ 目录下操作";
+    }
+    // 不允许删除系统文件
+    if (path.includes("/etc/") || path.includes("/usr/")) {
+      return "拒绝：不允许操作系统目录";
+    }
+    await fs.unlink(path);
+    return `已删除 ${path}`;
+  },
+});
+```
+
+### 设置 maxSteps 上限
+
+`maxSteps: 10` 不只是性能考量，也是安全考量。如果 Agent 陷入了"调用工具 → 失败 → 重试 → 再失败 → 再重试"的死循环，maxSteps 能强制终止。
+
+### 人类确认
+
+对于高风险操作（删除数据、发送邮件、部署代码），应该要求人类确认：
+
+```typescript
+const deployToProduction = tool({
+  description: "部署代码到生产环境。",
+  parameters: z.object({
+    branch: z.string(),
+  }),
+  execute: async ({ branch }) => {
+    // 不直接部署，返回确认请求
+    return JSON.stringify({
+      type: "confirmation_required",
+      message: `即将部署 ${branch} 到生产环境，请确认`,
+      action: "deploy",
+      params: { branch },
+    });
+  },
+});
+```
+
+在客户端收到这种"确认请求"时，弹出确认对话框，用户确认后再执行。
+
+## Agent 的评估
+
+"我的 Agent 表现好不好"不是一个靠感觉回答的问题。你需要量化评估。
+
+几个关键指标：
+
+**任务完成率**：用户提了 10 个问题，Agent 正确完成了多少个。这是最核心的指标。
+
+**工具选择准确率**：Agent 选择了正确的工具吗？调用了不该调用的工具吗？可以通过日志记录每次工具调用的上下文，人工抽检。
+
+**平均轮次**：完成一个任务平均需要几轮工具调用。轮次越多，延迟越高，成本越高。如果一个任务平均需要 8 轮，可能需要优化 System Prompt 或者合并工具。
+
+**幻觉率**：Agent 是否基于检索结果回答，还是自己编造了信息。这个比较难自动检测，通常需要人工审核。
+
+评估的实用方法：准备一个测试集（20-30 个有代表性的问题），每个问题标注预期使用的工具和预期回答。定期跑一遍，对比结果。不需要自动化测试框架，手动跑也能发现问题。
+
+## trade-off：Agent 的边界
+
+Agent 很强大，但不是万能的。几个需要清醒认识的点：
+
+**Agent 不等于 AGI**。现在的 Agent 本质上是"LLM + 工具调用 + 循环"。它能处理有一定复杂度的任务，但它不会"思考"。它的推理能力受限于底层模型，它的决策逻辑是概率性的，不是确定性的。
+
+**复杂任务不如人工拆解**。如果一个任务需要 10 步以上的操作，与其让 Agent 自主决策 10 步，不如人工拆成 3 个子任务，分别让 Agent 完成。人的判断力在任务规划上仍然远超 AI。
+
+**成本控制很重要**。一个带 5 个工具、maxSteps=10 的 Agent，处理一个复杂问题可能消耗 50K+ token。在生产环境中，需要监控每个请求的 token 消耗，设置预算上限。
+
+**什么时候用 Agent，什么时候用普通 Chatbot**：如果用户的需求是"问一个问题，得到一个回答"，Chatbot 就够了，不需要 Agent 的自主决策能力。Agent 适合的是"帮我完成一个任务"这种需要多步操作的场景。过度设计 Agent 不但增加成本，还可能引入不必要的复杂性。
+
+---
+
+这个系列到这里就结束了。6 篇文章，从最基础的 LLM API 调用到完整的 AI Agent，你学会了 AI 应用开发的核心技能链：API 调用 → Prompt 设计 → 工具调用 → MCP 生态 → RAG 检索 → Agent 编排。这些不是孤立的技术点，而是可以组合使用的积木——根据你的业务需求，选择合适的组合方式来构建 AI 应用。

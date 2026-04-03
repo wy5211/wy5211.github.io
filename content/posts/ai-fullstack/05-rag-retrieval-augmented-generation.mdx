@@ -1,0 +1,284 @@
+---
+title: "05 RAG 检索增强生成：让 AI 基于你的数据回答问题"
+date: "2026-04-03"
+summary: "你问 AI '我的博客里有没有关于 NestJS 的文章'，它不知道。因为训练数据里没有你的博客。RAG 的思路是：把内容向量化存储，提问时先检索相关内容，再让 AI 基于检索结果回答。"
+tags: ["AI", "RAG", "向量数据库", "pgvector", "Embedding", "检索增强"]
+category: "ai-fullstack"
+cover: ""
+draft: false
+series: "AI 全栈实战"
+seriesOrder: 5
+---
+
+你问代码审查助手"Drizzle ORM 和 TypeORM 有什么区别"，它能答。因为这是公共知识，训练数据里有。但你问"我的博客里关于 Drizzle 的第 3 篇文章讲了什么"，它就傻了——你的博客内容不在它的训练数据里。
+
+前面的文章解决的是"让 AI 更聪明"的问题——更好的 Prompt、更强的工具调用。但它们都没解决一个根本问题：**AI 不知道你拥有的私有数据**。
+
+RAG（Retrieval-Augmented Generation，检索增强生成）就是用来解决这个问题的。思路很直接：把你的数据存成向量，用户提问时先检索相关内容，把检索结果塞进 Prompt 里，让 AI 基于真实内容回答。
+
+## Embedding：把文本变成数字
+
+RAG 的第一步是把文本变成数字——这叫 Embedding（嵌入）。原理是这样的：一段文本经过 Embedding 模型的处理，变成一个高维向量（比如 1536 维的浮点数数组）。**语义相近的文本，向量之间的距离也相近**。
+
+举个例子：
+
+- "JavaScript 闭包是什么" → `[0.12, -0.34, 0.56, ...]`
+- "JS 的 closure 怎么理解" → `[0.11, -0.33, 0.55, ...]` ← 距离很近
+- "Python 装饰器怎么用" → `[0.78, 0.21, -0.45, ...]` ← 距离很远
+
+"闭包"和"closure"语义相同，所以向量距离近。"闭包"和"装饰器"语义不同，距离远。
+
+这就是 RAG 检索的基础：把用户的问题变成向量，在数据库里找距离最近的文档片段，就找到了最相关的内容。
+
+Anthropic 提供了 Embedding API，但 Vercel AI SDK 目前对 Embedding 的支持还在完善中。我们直接用 Anthropic 的 Embedding API：
+
+```typescript
+const response = await fetch("https://api.anthropic.com/v1/messages", {
+  method: "POST",
+  headers: {
+    "x-api-key": process.env.ANTHROPIC_API_KEY!,
+    "content-type": "application/json",
+    "anthropic-version": "2023-06-01",
+  },
+  body: JSON.stringify({
+    model: "claude-sonnet-4-20250514",
+    max_tokens: 1024,
+    messages: [
+      {
+        role: "user",
+        content:
+          "Generate an embedding for this text: 'JavaScript closures explained'",
+      },
+    ],
+  }),
+});
+```
+
+实际上，生产环境通常使用专门的 Embedding 模型（如 OpenAI 的 `text-embedding-3-small` 或 Voyage AI 的 embedding 模型），它们比用大语言模型生成 embedding 更快、更便宜。这里为了保持技术栈一致性，你可以选择任何兼容的 embedding 服务。
+
+## 向量数据库：pgvector
+
+拿到向量之后，需要存到数据库里，并且支持"找最近的向量"这种查询。这就是向量数据库。
+
+有很多专门的向量数据库（Pinecone、Weaviate、Milvus），但对于已经有 PostgreSQL 的项目来说，**pgvector 扩展就够了**——它给 PostgreSQL 加上了向量存储和相似度查询的能力。
+
+你的博客已经在用 PostgreSQL + Drizzle ORM，只需要启用 pgvector 扩展：
+
+```sql
+CREATE EXTENSION IF NOT EXISTS vector;
+```
+
+在 Drizzle 中定义向量表：
+
+```typescript
+import { pgTable, text, timestamp, vector } from "drizzle-orm/pg-core";
+import { pgVector } from "drizzle-orm/pg-core";
+
+export const articleChunks = pgTable("article_chunks", {
+  id: text("id")
+    .primaryKey()
+    .$defaultFn(() => crypto.randomUUID()),
+  articleId: text("article_id").notNull(),
+  articleSlug: text("article_slug").notNull(),
+  chunkIndex: text("chunk_index").notNull(), // 第几个分块
+  content: text("content").notNull(), // 文本内容
+  embedding: vector("embedding", { dimensions: 1536 }), // 向量
+  createdAt: timestamp("created_at").defaultNow(),
+});
+```
+
+关键点：`vector("embedding", { dimensions: 1536 })` 创建一个 1536 维的向量列。维度数必须和你使用的 Embedding 模型输出的维度一致。
+
+### 相似度查询
+
+存入向量后，查询相似内容用的是余弦距离（cosine distance）：
+
+```typescript
+import { sql } from "drizzle-orm";
+import { cosineDistance } from "drizzle-orm/pg-core";
+
+async function searchSimilar(queryEmbedding: number[], limit = 5) {
+  const results = await db
+    .select({
+      content: articleChunks.content,
+      articleSlug: articleChunks.articleSlug,
+      distance: cosineDistance(
+        articleChunks.embedding,
+        sql`${queryEmbedding}::vector`
+      ),
+    })
+    .from(articleChunks)
+    .orderBy(
+      cosineDistance(articleChunks.embedding, sql`${queryEmbedding}::vector`)
+    )
+    .limit(limit);
+
+  return results;
+}
+```
+
+`cosineDistance` 计算两个向量之间的余弦距离，值越小表示越相似。查询返回距离最小的 N 条记录。
+
+## 文档分块
+
+你不能把一整篇文章（可能几千字）直接存成一个向量。原因有两个：
+
+1. **Embedding 模型有 token 上限**，通常几千 token
+2. **检索粒度太粗**，返回一整篇文章给 AI，大部分内容可能和问题无关
+
+所以需要把文章切分成小的 chunk，每个 chunk 单独做 embedding 和存储。
+
+分块策略是 RAG 中最容易踩坑的地方。几种常见策略：
+
+**固定长度分块**：每 500 个字符切一块，最简单但可能切断语义
+
+```typescript
+function chunkByLength(text: string, chunkSize = 500): string[] {
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += chunkSize) {
+    chunks.push(text.slice(i, i + chunkSize));
+  }
+  return chunks;
+}
+```
+
+**按段落分块**：按 Markdown 标题（`##`、`###`）切分，保持语义完整
+
+```typescript
+function chunkByHeadings(text: string): string[] {
+  return text.split(/(?=^#{2,3}\s)/m).filter(Boolean);
+}
+```
+
+**滑动窗口分块**：每 500 字符切一块，但相邻块有 100 字符的重叠
+
+```typescript
+function chunkWithOverlap(text: string, chunkSize = 500, overlap = 100) {
+  const chunks: string[] = [];
+  for (let i = 0; i < text.length; i += chunkSize - overlap) {
+    chunks.push(text.slice(i, i + chunkSize));
+  }
+  return chunks;
+}
+```
+
+对于博客文章这种结构化的 Markdown 内容，**按标题分块**通常是最佳选择。每篇文章的每个 `##` 章节（或更细的 `###`）就是一个天然的分块，语义完整，不会切断上下文。
+
+但要注意：有些章节很短（几句话），有些很长（几百字）。太短的 chunk 检索时提供的信息不够，太长的 chunk 又会引入噪声。实际项目中可以设一个阈值——低于 100 字的 chunk 和相邻 chunk 合并，高于 1000 字的 chunk 进一步切分。
+
+## 完整的 RAG 流程
+
+把所有部分串起来，完整的流程是：
+
+### 离线阶段：文档入库
+
+```
+博客文章 (MDX) → 按标题分块 → 每个 chunk 生成 embedding → 存入 PostgreSQL
+```
+
+```typescript
+async function indexArticle(slug: string, content: string) {
+  // 1. 按标题分块
+  const chunks = chunkByHeadings(content);
+
+  // 2. 为每个 chunk 生成 embedding 并存入数据库
+  for (let i = 0; i < chunks.length; i++) {
+    const embedding = await generateEmbedding(chunks[i]);
+    await db.insert(articleChunks).values({
+      articleId: slug,
+      articleSlug: slug,
+      chunkIndex: String(i),
+      content: chunks[i],
+      embedding,
+    });
+  }
+}
+```
+
+### 在线阶段：用户提问
+
+```
+用户提问 → 生成问题的 embedding → 向量检索相关 chunks → 组装 Prompt → LLM 生成回答
+```
+
+```typescript
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+  const lastMessage = messages[messages.length - 1].content;
+
+  // 1. 生成问题的 embedding
+  const queryEmbedding = await generateEmbedding(lastMessage);
+
+  // 2. 检索相关内容
+  const relevantChunks = await searchSimilar(queryEmbedding, 5);
+
+  // 3. 组装带上下文的 Prompt
+  const context = relevantChunks
+    .map((c) => `[来自文章 ${c.articleSlug}]:\n${c.content}`)
+    .join("\n\n");
+
+  const result = streamText({
+    model: anthropic("claude-sonnet-4-20250514"),
+    system: `你是一个博客内容助手。基于以下博客内容回答用户的问题。
+如果博客内容中没有相关信息，直接说"博客中没有找到相关内容"，不要编造。
+
+## 博客内容
+
+${context}`,
+    messages,
+  });
+
+  return result.toDataStreamResponse();
+}
+```
+
+注意 system prompt 里的约束："如果博客内容中没有相关信息，直接说没有，不要编造。" 这很重要——没有这个约束，AI 会基于自己的训练数据"补充"信息，而那些信息可能和你的博客内容矛盾。
+
+## RAG 的常见问题和应对
+
+### 检索不准
+
+用户问"Drizzle 怎么做事务"，但检索返回的是"Drizzle 的 CRUD 操作"——相关但不精确。
+
+改进方法：**Query 改写**。在检索之前，先用 LLM 把用户的自然语言问题改写成更适合检索的查询：
+
+```
+用户原文："Drizzle 事务怎么用"
+改写后："drizzle transaction db.transaction batch"
+```
+
+这样检索时匹配的是文档中的技术术语，而不是自然语言表达。
+
+### 信息冲突
+
+检索返回的两篇文章对同一个问题给出了不同的说法。比如一篇说"用 TypeORM"，另一篇说"用 Prisma"。
+
+这种情况 LLM 通常能处理——你在 system prompt 里告诉它"如果检索到冲突的信息，列出不同观点并说明各自的适用场景"。关键是不要让 AI 只选一个忽略另一个。
+
+### 长文档的处理
+
+一篇文章有 5000 字，按标题分成了 10 个 chunk，用户的问题可能需要跨 chunk 的上下文才能完整回答。
+
+这种情况叫"跨 chunk 上下文丢失"。改进方法：
+
+- 增加分块的重叠度（overlap 设大一点）
+- 检索时多取几个 chunk（limit 从 5 提到 8）
+- 对检索结果做二次排序：先用向量相似度粗筛，再用 LLM 判断相关性精排
+
+第二种方法（re-ranking）效果最好但成本最高——多了一次 LLM 调用。实际项目中，通常先试增大 limit 和 overlap，不够用再上 re-ranking。
+
+## trade-off：RAG vs 微调
+
+你可能听过另一种让 AI 了解私有数据的方式：微调（Fine-tuning）。RAG 和微调有什么区别？
+
+| 维度     | RAG                        | 微调                           |
+| -------- | -------------------------- | ------------------------------ |
+| 原理     | 检索相关内容塞进 Prompt    | 修改模型的权重参数             |
+| 数据更新 | 更新数据库即可，实时生效   | 需要重新训练，周期长           |
+| 成本     | 每次查询有检索 + 生成成本  | 训练成本高，推理成本不变       |
+| 幻觉控制 | 好（基于检索到的真实内容） | 较差（模型可能"记住"错误信息） |
+| 适用场景 | 知识库问答、文档搜索       | 改变模型的语气、风格、格式     |
+
+对于"让 AI 基于博客内容回答问题"这个需求，RAG 是明显的正确选择。你的博客内容经常更新（写新文章），RAG 只需要重新索引新文章就行。如果是微调，每写一篇新文章都要重新训练，成本和延迟都不可接受。
+
+微调适合的场景是：你想改变 AI 的行为风格（比如让它用特定的语气、格式写代码），而不是让它了解新信息。

@@ -1,0 +1,246 @@
+---
+title: "03 Function Calling：让 AI 拥有手，能调用外部工具"
+date: "2026-04-03"
+summary: "LLM 只是一个文本生成器，不知道今天的天气、查不了数据库、搜不了文档。Function Calling 让模型自己决定什么时候调用哪个工具。这篇文章教你用 Vercel AI SDK 实现工具调用，给代码审查助手加上搜索能力。"
+tags: ["AI", "Function Calling", "Vercel AI SDK", "工具调用", "Anthropic"]
+category: "ai-fullstack"
+cover: ""
+draft: false
+series: "AI 全栈实战"
+seriesOrder: 3
+---
+
+上一篇你把代码审查助手的 Prompt 调得很好了，它能给出专业的审查意见。但有个问题：你给它一段用了 `@prisma/client` 的代码，它告诉你"建议使用参数化查询防止 SQL 注入"——但 Prisma ORM 本身就是参数化的，它根本不存在 SQL 注入风险。
+
+这说明一个根本性的问题：**AI 的知识是训练数据里的，它不知道你代码里用的是什么库、什么版本、什么配置。** 它看到 `db.query()` 就以为是原始 SQL 查询，实际上可能是 Prisma 的安全查询方法。
+
+怎么解决这个问题？你需要让 AI 能主动获取上下文信息——查文档、搜代码库、确认依赖版本。这就是 Function Calling。
+
+## Function Calling 的工作原理
+
+先纠正一个常见误解：**模型不会直接执行你的函数**。
+
+Function Calling 的实际流程是这样的：
+
+```
+用户提问
+  → 模型分析：这个问题需要调用工具
+  → 模型输出：{ tool: "search_docs", args: { query: "Prisma SQL injection" } }
+  → 你的代码执行这个工具调用，拿到结果
+  → 把结果发回给模型
+  → 模型基于结果生成最终回答
+```
+
+模型只负责"决定调用什么工具、传什么参数"，真正的执行是你来做的。这很重要——意味着你完全控制了工具的权限和安全性。
+
+这和你在 [第 2 篇：Prompt Engineering](/posts/ai-fullstack/02-prompt-engineering) 中学的 Few-shot 有本质区别。Few-shot 是在 Prompt 里提供示例让模型模仿，Function Calling 是让模型通过工具获取实时信息。一个是"教它怎么做"，一个是"给它能力去做"。
+
+## 定义第一个工具
+
+Vercel AI SDK 用 `tool` 函数定义工具。我们给代码审查助手加一个"搜索 NPM 包文档"的能力：
+
+```typescript
+import { tool } from "ai";
+import { z } from "zod";
+
+const searchNpmDocs = tool({
+  description:
+    "搜索 NPM 包的官方文档。当需要确认某个库的 API 用法、安全特性、最佳实践时使用。",
+  parameters: z.object({
+    packageName: z.string().describe("NPM 包名，如 'prisma'、'express'"),
+    query: z
+      .string()
+      .describe("要搜索的具体问题，如 'SQL injection prevention'"),
+  }),
+  execute: async ({ packageName, query }) => {
+    // 调用实际文档搜索 API
+    const response = await fetch(
+      `https://api.npmjs.org/search?q=${encodeURIComponent(packageName)}`
+    );
+    const data = await response.json();
+    return data;
+  },
+});
+```
+
+三个关键部分：
+
+- **description**：告诉模型这个工具是干什么的、什么时候该用。这个描述的质量直接决定模型能不能正确选择工具——写得模糊，模型就会在不该用的时候用，该用的时候不用。
+- **parameters**：用 zod schema 定义参数。模型看到 schema 就知道该传什么格式的参数。
+- **execute**：实际的函数逻辑。只有当模型决定调用这个工具时才会执行。
+
+然后在 API Route 中注册工具：
+
+```typescript
+import { anthropic } from "@ai-sdk/anthropic";
+import { streamText } from "ai";
+
+export async function POST(req: Request) {
+  const { messages } = await req.json();
+
+  const result = streamText({
+    model: anthropic("claude-sonnet-4-20250514"),
+    system: SYSTEM_PROMPT,
+    messages,
+    tools: {
+      searchNpmDocs,
+    },
+  });
+
+  return result.toDataStreamResponse();
+}
+```
+
+就这样。当你告诉模型"审查这段使用 Prisma 的代码"时，模型会先调用 `searchNpmDocs` 查询 Prisma 的安全特性，然后基于文档内容给出准确的审查意见——不会再建议你"用参数化查询"了。
+
+## 工具描述的写法
+
+tool description 是 Function Calling 中最容易被忽视但最重要的部分。看一个反面教材：
+
+```
+搜索文档
+```
+
+模型看到这个描述，完全不知道什么时候该用、不该用、该传什么参数。
+
+正面教材：
+
+```
+搜索 NPM 包的官方文档。当需要确认某个库的 API 用法、安全特性、最佳实践时使用。
+不要在以下情况使用：
+- 用户问的是通用编程概念（闭包、Promise 等），不需要搜索
+- 代码中使用的是原生 API（如 fetch、Array.map），不需要搜索
+- 信息已经在对话上下文中提供
+```
+
+好的 description 包含三个要素：
+
+1. **做什么**：清晰描述工具的功能
+2. **什么时候用**：明确触发条件
+3. **什么时候不用**：排除不合适的场景
+
+"什么时候不用"特别重要。如果你的代码审查助手有 5 个工具，模型有时候会"过度使用"——明明可以直接回答的问题，它也要调用一个工具。在 description 里明确说"不要在 xxx 情况下使用"，能有效减少这种情况。
+
+## 添加更多工具
+
+一个工具不够用。代码审查助手至少需要这几个能力：
+
+```typescript
+const tools = {
+  searchNpmDocs: tool({
+    description: "搜索 NPM 包的官方文档...",
+    parameters: z.object({
+      packageName: z.string(),
+      query: z.string(),
+    }),
+    execute: async ({ packageName, query }) => {
+      /* ... */
+    },
+  }),
+
+  searchGitHub: tool({
+    description:
+      "搜索 GitHub 仓库的代码和 Issue。当需要了解某个开源项目的实现细节、已知问题、社区讨论时使用。",
+    parameters: z.object({
+      repository: z.string().describe("仓库名，如 'prisma/prisma'"),
+      query: z.string().describe("搜索内容"),
+    }),
+    execute: async ({ repository, query }) => {
+      /* ... */
+    },
+  }),
+
+  checkSecurityVulnerability: tool({
+    description:
+      "检查 NPM 包的已知安全漏洞。当审查的代码中使用了某个包，需要确认该版本是否存在已知漏洞时使用。",
+    parameters: z.object({
+      packageName: z.string(),
+      version: z.string().optional().describe("版本号，如不提供则检查最新版本"),
+    }),
+    execute: async ({ packageName, version }) => {
+      /* ... */
+    },
+  }),
+};
+```
+
+注意每个工具的 description 都明确界定了使用场景，没有重叠。如果两个工具的 description 有模糊的边界（比如一个说"搜索文档"，另一个说"查找信息"），模型会混淆，随机选一个。
+
+## 工具调用的完整流程
+
+用户发了一段代码给审查助手，模型决定调用两个工具。完整的请求流程是这样的：
+
+```
+第 1 次 API 调用：
+  用户消息 + 工具定义
+  → 模型返回：需要调用 searchNpmDocs({ packageName: "prisma", query: "..." })
+             和 checkSecurityVulnerability({ packageName: "@prisma/client" })
+
+第 2 次 API 调用：
+  用户消息 + 工具定义 + 工具调用结果
+  → 模型基于结果生成最终审查意见
+```
+
+你不需要手动管理这个流程。Vercel AI SDK 的 `streamText` 会自动处理：
+
+1. 第一次调用模型，模型返回工具调用请求
+2. SDK 自动执行 `execute` 函数
+3. 把执行结果自动发回模型
+4. 模型生成最终回复，SDK 流式返回给客户端
+
+在客户端，`useChat` 会自动显示工具调用的状态。如果需要自定义展示，可以通过 `toolInvocations` 字段获取。
+
+## 并行工具调用
+
+上面那个例子中，模型同时决定调用两个工具（searchNpmDocs 和 checkSecurityVulnerability）。这两个调用是独立的，不需要等待前一个完成再执行后一个。
+
+Anthropic 的模型支持并行工具调用——一次返回多个工具调用请求，SDK 会并行执行它们，然后把所有结果一起发回模型。这比串行调用快得多。
+
+你不需要做任何额外配置，Vercel AI SDK 默认就支持并行工具调用。只要模型的输出里包含多个 tool_use，SDK 会并行执行。
+
+但有一个注意点：**如果你用了 `maxSteps` 参数**（限制工具调用的轮数），并行调用会消耗更多的 step count。一般设 `maxSteps: 5` 就够了，绝大多数场景不会超过 3 轮工具调用。
+
+## 错误处理
+
+工具调用可能失败——网络超时、API 限流、参数无效。你需要处理这些情况：
+
+```typescript
+const searchNpmDocs = tool({
+  description: "搜索 NPM 包的官方文档...",
+  parameters: z.object({
+    packageName: z.string(),
+    query: z.string(),
+  }),
+  execute: async ({ packageName, query }) => {
+    try {
+      const response = await fetch(
+        `https://api.example.com/docs?pkg=${packageName}&q=${query}`,
+        { signal: AbortSignal.timeout(5000) }
+      );
+      if (!response.ok) {
+        return `文档搜索失败：${response.status} ${response.statusText}`;
+      }
+      return await response.json();
+    } catch (e) {
+      // 超时或网络错误，返回友好的错误信息
+      return `文档搜索暂时不可用，请稍后重试`;
+    }
+  },
+});
+```
+
+关键原则：**工具的 execute 函数不应该抛异常，而应该返回错误信息**。因为错误信息会发回给模型，模型可以根据错误信息决定是重试、换一个工具、还是直接回答用户。
+
+如果你让 execute 抛异常，Vercel AI SDK 会捕获并返回一个默认的错误信息给模型，模型不知道具体出了什么问题，无法做出合理的后续决策。
+
+## trade-off：工具调用的成本考量
+
+每次工具调用都是一次 API 往返：模型生成调用请求 → 你执行工具 → 结果发回模型 → 模型生成最终回复。这意味着：
+
+- **延迟增加**：一次工具调用额外增加 2-5 秒（取决于工具执行时间和模型推理时间）
+- **Token 消耗增加**：工具调用的结果会作为新的 message 加入上下文，增加 token 消耗
+- **成本增加**：更多 token = 更多费用
+
+所以不是所有信息都要通过工具获取。如果某个信息可以写在 Prompt 里（比如你的项目技术栈、代码规范），直接写在 Prompt 里比通过工具获取更高效。
+
+一个实用的判断标准：**信息是否频繁变化**。如果不会变（项目技术栈），写在 Prompt 里；如果会变（依赖版本、安全漏洞数据库），用工具获取。
