@@ -61,6 +61,7 @@ export default function PostList({ posts }: PostListProps) {
       "nodejs-core",
       "prisma",
       "python",
+      "rag",
       "redis",
       "redis2",
       "rust",

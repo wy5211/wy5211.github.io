@@ -1,0 +1,355 @@
+---
+title: "06 RAG 评估与优化：量化你的检索质量"
+date: "2026-04-14"
+summary: "用数据说话——RAGAS 框架评估 RAG 系统的检索和生成质量，构建测试集，发现薄弱环节，数据驱动持续优化。"
+tags: ["RAG", "RAGAS", "评估", "RAG 优化", "检索质量"]
+category: "rag"
+cover: ""
+draft: false
+series: "RAG 深入"
+seriesOrder: 6
+---
+
+产品经理问："RAG 系统效果怎么样？"
+
+你说："感觉还行。"
+
+这不行。你需要数据：检索准确率多少？回答质量如何？哪些查询容易失败？加了混合检索后提升了多少？
+
+这一篇解决 RAG 的评估问题。没有评估，优化就是瞎蒙——你不知道改了之后是变好了还是变坏了。
+
+## RAG 评估为什么难
+
+传统的搜索评估有一套成熟的方法（精确率、召回率、nDCG），但 RAG 不只是搜索——它还有生成环节。你需要同时评估两个问题：
+
+1. **检索质量**：找到的文档对不对？该找到的找到了吗？
+2. **生成质量**：LLM 基于检索到的文档回答得好不好？有没有编造？
+
+而且 RAG 的输出是自然语言，不像搜索结果那样可以简单判断"对/错"。需要一个更系统的评估框架。
+
+## 构建测试集
+
+评估的第一步是准备一组"标准问答对"——给定一个问题，我们知道正确的答案应该参考哪些文档。
+
+### 方式 1：人工标注（推荐但耗时）
+
+从真实用户问题中挑选 50-100 个有代表性的问题，人工标注：
+
+```typescript
+interface TestCase {
+  query: string; // 用户问题
+  relevantDocIds: string[]; // 应该检索到的文档 ID
+  expectedAnswer: string; // 期望的答案要点（不需要完整答案）
+  difficulty: "easy" | "medium" | "hard";
+}
+
+const testSet: TestCase[] = [
+  {
+    query: "为什么选择 PostgreSQL 不用 MongoDB？",
+    relevantDocIds: ["ADR-2025-012"],
+    expectedAnswer:
+      "关系型查询需求占 80% 以上，PostgreSQL 在事务和数据一致性上优势明显",
+    difficulty: "easy",
+  },
+  {
+    query: "支付服务宕机那次，根因和解决方案是什么？",
+    relevantDocIds: ["INC-2025-047"],
+    expectedAnswer:
+      "根因是 Redis 连接池耗尽。方案：连接池从200调到1000、实施熔断、引入 Redis Cluster",
+    difficulty: "medium",
+  },
+  {
+    query: "新人入职后开发环境怎么搭？",
+    relevantDocIds: ["ONB-001", "DEV-SETUP-GUIDE"],
+    expectedAnswer:
+      "安装 Node.js 20 + Docker + PostgreSQL，clone 仓库后运行 docker-compose up",
+    difficulty: "easy",
+  },
+];
+```
+
+### 方式 2：LLM 辅助生成（快速但需审核）
+
+用 LLM 基于文档自动生成问答对，然后人工审核：
+
+```typescript
+async function generateTestCases(docs: Document[]): Promise<TestCase[]> {
+  const cases: TestCase[] = [];
+
+  for (const doc of docs.slice(0, 20)) {
+    // 取 20 篇文档
+    const prompt = `基于以下文档内容，生成 3 个用户可能会问的问题。
+对每个问题，给出期望答案的要点。
+
+文档内容：
+${doc.pageContent}
+
+格式：
+Q1: 问题
+A1: 答案要点
+Q2: 问题
+A2: 答案要点
+Q3: 问题
+A3: 答案要点`;
+
+    const response = await llm.chat(prompt);
+    // 解析 response，生成 TestCase
+    // 记得人工审核！LLM 生成的问题可能不符合真实用户表达
+  }
+
+  return cases;
+}
+```
+
+LLM 生成的问题通常偏正式、偏书面。真实用户的问题更口语化。建议 LLM 生成初稿，再人工改写成自然的表达。
+
+## 检索质量评估
+
+### 三个核心指标
+
+**命中率（Hit Rate）**：查询相关的文档是否出现在 top-K 结果中。
+
+```
+测试 100 个查询，其中 80 个的相关文档出现在 top-5 结果中
+命中率 = 80/100 = 80%
+```
+
+**MRR（Mean Reciprocal Rank）**：相关文档排第几？
+
+```
+查询 1：相关文档排第 1 → 1/1 = 1.0
+查询 2：相关文档排第 3 → 1/3 = 0.33
+查询 3：相关文档排第 2 → 1/2 = 0.5
+MRR = (1.0 + 0.33 + 0.5) / 3 = 0.61
+```
+
+MRR 比命中率更有区分度——不只是"有没有找到"，还看"排第几"。
+
+**nDCG（Normalized Discounted Cumulative Gain）**：考虑多个相关文档的排序质量。
+
+```
+查询返回 5 个结果，其中 3 个是相关的：
+位置 1：相关 → 得分高
+位置 2：不相关
+位置 3：相关 → 得分中等
+位置 4：相关 → 得分较低
+位置 5：不相关
+
+nDCG 考虑了位置因素——排在前面的相关文档贡献更大
+理想情况：3 个相关文档排在前 3 位 → nDCG = 1.0
+实际情况：分散在位置 1,3,4 → nDCG = 0.75
+```
+
+### 实现检索评估
+
+```typescript
+interface RetrievalResult {
+  query: string;
+  retrievedIds: string[];
+  relevantIds: string[];
+}
+
+function evaluateRetrieval(results: RetrievalResult[], topK: number) {
+  let hits = 0;
+  let mrrSum = 0;
+
+  for (const r of results) {
+    // 命中率
+    const hit = r.retrievedIds.some((id) => r.relevantIds.includes(id));
+    if (hit) hits++;
+
+    // MRR
+    const rank = r.retrievedIds.findIndex((id) => r.relevantIds.includes(id));
+    if (rank !== -1) {
+      mrrSum += 1 / (rank + 1); // rank 从 0 开始，所以 +1
+    }
+  }
+
+  return {
+    hitRate: hits / results.length,
+    mrr: mrrSum / results.length,
+  };
+}
+
+// 使用
+const testResults = testSet.map((tc) => ({
+  query: tc.query,
+  retrievedIds: search(tc.query, topK).then((r) => r.map((d) => d.id)),
+  relevantIds: tc.relevantDocIds,
+}));
+
+const metrics = evaluateRetrieval(await Promise.all(testResults), 5);
+console.log(`命中率: ${(metrics.hitRate * 100).toFixed(1)}%`);
+console.log(`MRR: ${metrics.mrr.toFixed(3)}`);
+```
+
+## 生成质量评估：RAGAS 框架
+
+RAGAS（Retrieval Augmented Generation Assessment）是 RAG 评估的标准框架。它定义了四个核心指标：
+
+### Context Precision（上下文精确度）
+
+检索到的文档中，有多少是真正相关的？
+
+```
+检索到 5 个文档，其中 3 个相关、2 个不相关
+Context Precision = 3/5 = 0.6
+
+问题：检索结果里混入了不相关的内容，LLM 可能被干扰
+```
+
+### Context Recall（上下文召回率）
+
+回答问题需要的信息，是否都被检索到了？
+
+```
+问题："宕机的根因和解决方案"
+需要的信息：根因分析（INC-047 的第二段）+ 解决方案（第三段）
+实际检索到：根因分析（有）+ 解决方案（没有）
+Context Recall = 1/2 = 0.5
+
+问题：信息不完整，LLM 只能回答一半
+```
+
+### Faithfulness（忠实度）
+
+LLM 的回答是否忠实于检索到的文档？有没有编造？
+
+```
+检索到的文档："连接池从 200 调到 1000"
+LLM 回答："连接池从 200 调到 5000"
+Faithfulness = 低（数字被篡改了）
+
+检索到的文档："PostgreSQL 适合关系型查询"
+LLM 回答："团队选择 PostgreSQL 是因为关系型查询需求占比高"
+Faithfulness = 高（准确转述了文档内容）
+```
+
+### Answer Relevance（回答相关性）
+
+LLM 的回答是否切中用户的问题？
+
+```
+用户问："怎么配置 CI/CD"
+LLM 回答："CI/CD 是持续集成和持续部署的缩写，它可以帮助团队..."
+Answer Relevance = 低（在解释概念，没有回答"怎么配"）
+
+LLM 回答："配置 GitHub Actions 需要 1. 创建 .github/workflows/deploy.yml
+2. 配置构建步骤 3. 设置部署目标..."
+Answer Relevance = 高（直接回答了怎么做）
+```
+
+### 用 LLM 评估 RAGAS 指标
+
+RAGAS 的指标不能像检索指标那样精确计算——它需要 LLM 来判断语义层面的质量：
+
+```typescript
+async function evaluateFaithfulness(
+  question: string,
+  answer: string,
+  context: string
+): Promise<number> {
+  const prompt = `判断 AI 的回答是否忠实于提供的参考文档。
+  只基于文档中的信息判断，忽略合理的推理和总结。
+
+参考文档：
+${context}
+
+用户问题：${question}
+
+AI 回答：${answer}
+
+请分析回答中的每个陈述，判断是否可以在参考文档中找到依据。
+给出一个 0-1 的忠实度分数，0 表示完全编造，1 表示完全忠实。
+
+分数：`;
+
+  const response = await llm.chat(prompt);
+  const score = parseFloat(response.match(/[\d.]+/)?.[0] || "0");
+  return Math.min(1, Math.max(0, score));
+}
+```
+
+这种方式叫 **LLM-as-Judge**——用 LLM 来评估 LLM 的输出。虽然不是完美的，但比人工评估效率高得多，而且一致性不错。
+
+## 从评估到优化的闭环
+
+评估的价值不在于得到一个分数，而在于发现问题和验证改进。
+
+### 发现薄弱环节
+
+```typescript
+// 按难度分析失败案例
+const failures = testResults.filter((r) => !r.hit);
+
+const easyFailures = failures.filter(
+  (f) => testSet.find((t) => t.query === f.query)?.difficulty === "easy"
+);
+
+const hardFailures = failures.filter(
+  (f) => testSet.find((t) => t.query === f.query)?.difficulty === "hard"
+);
+
+console.log(
+  `简单问题失败 ${easyFailures.length} 个，困难问题失败 ${hardFailures.length} 个`
+);
+```
+
+### 常见问题模式
+
+| 模式           | 症状                 | 可能原因                                 | 优化方向                          |
+| -------------- | -------------------- | ---------------------------------------- | --------------------------------- |
+| 检索不到       | 命中率低             | Chunking 粒度不对或 Embedding 模型不适合 | 调整 chunkSize 或换模型           |
+| 检索到但不相关 | Context Precision 低 | 向量空间中语义混淆                       | 加 BM25 混合检索                  |
+| 信息不完整     | Context Recall 低    | 关键信息被切到了别的片段                 | 用父子文档策略                    |
+| 回答编造       | Faithfulness 低      | LLM 无视检索内容                         | 优化 prompt，强调"只基于文档回答" |
+| 答非所问       | Answer Relevance 低  | 检索结果太多噪声                         | 减少返回数量或加重排序            |
+
+### 验证改进
+
+每次改了一个策略后，重新跑评估：
+
+```
+                    命中率  MRR   Context Precision  Faithfulness
+基线（纯向量）        60%   0.48      0.55            0.82
++ 混合检索           75%   0.61      0.68            0.83
++ Query 改写         80%   0.65      0.72            0.85
++ 重排序             85%   0.73      0.80            0.87
++ 父子文档           88%   0.76      0.83            0.90
+```
+
+每一步都有数据支撑，知道哪个策略带来了多少提升。如果某个策略的提升不显著（比如从 85% 到 86%），可能不值得加它的延迟和成本。
+
+## 实践建议
+
+1. **先建测试集再优化**——没有测试集，你不知道优化是有效还是无效
+2. **从 50 个测试用例开始**——不需要太多，覆盖主要场景就行
+3. **关注真实失败案例**——比看平均分更有价值
+4. **每次只改一个变量**——改了 Embedding 模型 + Chunking 策略 + 检索方法，你不知道哪个起了作用
+5. **定期更新测试集**——用户的问题模式会变化，测试集要跟着更新
+
+## 系列回顾
+
+六篇文章，从 RAG 的原理到生产级优化：
+
+```
+01 RAG 架构原理
+    → 理解全貌，知道 Naive RAG 和 Advanced RAG 的区别
+
+02 Embedding 模型深入
+    → 文本变向量的原理，OpenAI vs 开源模型选择
+
+03 向量数据库实战
+    → 存储和检索向量的选型、索引、生产优化
+
+04 Chunking 策略
+    → 文档切分直接决定检索上限，不能无脑按字符切
+
+05 高级检索策略
+    → 混合检索、Query 改写、重排序，从 60% 提升到 85%
+
+06 RAG 评估与优化
+    → RAGAS 框架量化效果，数据驱动持续改进
+```
+
+构建一个好的 RAG 系统，不是一次搞定的，而是一个**评估 → 发现问题 → 优化 → 重新评估**的持续循环。掌握了这六篇文章的内容，你就有了一套系统的方法论来构建和优化任何 RAG 应用。

@@ -44,6 +44,7 @@ export const categoryToDirMap: Record<string, string> = {
   vite2: "vite2",
   // 新系列
   langchain: "langchain",
+  rag: "rag",
 };
 
 // 目录名到分类名的反向映射
@@ -90,4 +91,5 @@ export const dirToCategoryMap: Record<string, string> = {
   vite2: "vite2",
   // 新系列
   langchain: "langchain",
+  rag: "rag",
 };
