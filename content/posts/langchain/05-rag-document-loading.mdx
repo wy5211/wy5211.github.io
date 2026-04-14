@@ -1,0 +1,403 @@
+---
+title: "05 RAG 基础：文档加载与智能切分"
+date: "2026-04-14"
+summary: "RAG 的第一步——把 PDF、Markdown、网页等各种格式的文档加载进来，用正确的策略切分成语义完整的片段，为后续向量化检索打好基础。"
+tags: ["LangChain", "RAG", "Document Loader", "Text Splitter", "NLP"]
+category: "langchain"
+cover: ""
+draft: false
+series: "LangChain.js 实战"
+seriesOrder: 5
+---
+
+前四篇的客服助手只能靠模型自己的知识回答问题。但用户问"升级到企业版之后数据还在吗"，模型的回答可能是通用的猜测，而不是你产品文档里的准确说法。
+
+**RAG（Retrieval-Augmented Generation，检索增强生成）** 解决的就是这个问题——先从你的文档中找到相关内容，再把内容喂给 LLM，让它基于事实回答。
+
+RAG 分两步：**检索**（这一篇 + 下一篇）和 **生成**（在检索结果上回答问题）。这一篇聚焦第一步的前半段：怎么把各种格式的文档加载进来，切成 LLM 能消化的片段。
+
+## 为什么不能直接把文档塞给 LLM
+
+你的产品帮助中心有 200 页文档。直接全塞进 prompt？
+
+```
+问题：gpt-4o-mini 的上下文窗口 = 128K tokens
+200 页文档 ≈ 300,000 tokens
+结果：超出限制，API 报错
+```
+
+即使不超限，把 200 页文档全塞进去也有问题：
+
+- **噪声太多**：99% 的内容和用户问题无关，LLM 容易被无关信息干扰
+- **成本浪费**：按 token 计费，无关内容也是钱
+- **准确度下降**：给的信息越多，LLM 越容易"幻觉"
+
+正确的做法是：只把和用户问题**相关的那几段**文档塞给 LLM。要做到这一点，需要先把文档切成小片段，然后在需要时找出最相关的片段。
+
+## Document Loader：加载不同格式的文档
+
+LangChain 提供了统一的文档加载接口。不管你的文档是 Markdown、PDF 还是网页，加载后都变成相同格式的 `Document` 对象。
+
+### Document 的结构
+
+```typescript
+interface Document {
+  pageContent: string; // 文档的文本内容
+  metadata: {
+    // 元数据，用于追踪来源
+    source: string; // 文件路径或 URL
+    [key: string]: any; // 其他自定义字段
+  };
+}
+```
+
+元数据非常关键——当 LLM 返回一个答案时，你需要知道它参考了哪篇文档，方便用户验证。
+
+### 加载 Markdown 文档
+
+产品文档通常是 Markdown 格式：
+
+```typescript
+import { TextLoader } from "langchain/document_loaders/fs/text";
+
+// TextLoader 可以加载纯文本和 Markdown
+const loader = new TextLoader("./docs/api-reference.md");
+const docs = await loader.load();
+
+console.log(docs[0]);
+// {
+//   pageContent: "# API Reference\n\n## Authentication\n...",
+//   metadata: { source: "./docs/api-reference.md" }
+// }
+```
+
+一个文件生成一个 Document，`pageContent` 是完整文件内容。
+
+### 加载 PDF 文档
+
+```typescript
+import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+
+const loader = new PDFLoader("./docs/user-manual.pdf", {
+  splitPages: true, // 按页分割，每页一个 Document
+});
+const docs = await loader.load();
+
+console.log(`共加载 ${docs.length} 页`);
+// docs[0] 是第 1 页，docs[1] 是第 2 页...
+// metadata 中包含页码：{ source: "./docs/user-manual.pdf", pdf: { nPages: 45 }, loc: { pageNumber: 1 } }
+```
+
+PDF 加载是最容易出问题的——扫描件 PDF、带复杂排版的 PDF 可能提取出乱码。建议用纯文字 PDF，或者先用 OCR 工具处理扫描件。
+
+### 加载网页
+
+```typescript
+import { CheerioWebBaseLoader } from "@langchain/community/document_loaders/web/cheerio";
+
+const loader = new CheerioWebBaseLoader("https://docs.taskflow.pro/faq");
+const doc = await loader.load();
+
+console.log(doc[0].pageContent.slice(0, 200));
+// 提取了网页中的文本内容（自动去除了 HTML 标签）
+```
+
+网页加载的问题在于：导航栏、页脚、广告等噪声文本会被一起提取。通常需要在加载后做清洗。
+
+### 自定义 Loader
+
+如果你的文档源不在上述范围内（比如从数据库或 API 获取），可以自己写一个 Loader：
+
+```typescript
+import { Document } from "@langchain/core/documents";
+
+// 不需要继承任何类，只要返回 Document[] 就行
+async function loadFromDatabase(): Promise<Document[]> {
+  const articles = await db.helpArticles.findMany({
+    where: { published: true },
+  });
+
+  return articles.map((article) => ({
+    pageContent: `${article.title}\n\n${article.content}`,
+    metadata: {
+      source: `db://help_articles/${article.id}`,
+      category: article.category,
+      updatedAt: article.updatedAt,
+    },
+  }));
+}
+
+const docs = await loadFromDatabase();
+```
+
+这种方式在生产环境很常见——文档不是存在文件里，而是在 CMS 或数据库中。
+
+## Text Splitter：把文档切成片段
+
+加载完文档后，一个 Markdown 文件可能有 10,000 字。不能把整个文件当做一个片段去匹配——粒度太粗，检索不精准。
+
+Text Splitter 负责把长文档切成合适大小的片段。
+
+### RecursiveCharacterTextSplitter（推荐）
+
+这是最通用的切分器，按字符数切分，优先在段落、句子等自然断点处切割：
+
+```typescript
+import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
+
+const splitter = new RecursiveCharacterTextSplitter({
+  chunkSize: 500, // 每个片段最多 500 个字符
+  chunkOverlap: 50, // 相邻片段重叠 50 个字符
+});
+
+const chunks = await splitter.splitDocuments(docs);
+
+console.log(`原文档 ${docs.length} 个，切分后 ${chunks.length} 个片段`);
+```
+
+它的工作原理是按优先级尝试不同的分隔符：
+
+```
+尝试 1：按 "\n\n"（段落）切分
+  如果某段 > chunkSize →
+尝试 2：按 "\n"（换行）切分
+  如果某行 > chunkSize →
+尝试 3：按 "。" 或 "."（句子）切分
+  如果某句 > chunkSize →
+尝试 4：按 ""（字符）强制切分
+```
+
+这样保证了：**只要段落不超过 chunkSize，就不会在段落中间切断**。
+
+### chunkSize 和 chunkOverlap 怎么调
+
+这两个参数直接影响检索质量：
+
+**chunkSize 太大（2000+）：**
+
+- 每个片段包含太多信息，检索时难以精准匹配
+- 浪费 token，给 LLM 的噪声多
+
+**chunkSize 太小（100-）：**
+
+- 片段缺少上下文，语义不完整
+- "升级套餐后数据还在吗" 这个问题可能被切成"升级套餐"和"数据还在"两个片段
+
+**chunkOverlap 的作用：**
+
+- 避免关键信息正好落在切分点被截断
+- 50-100 字符的重叠能保证大部分句子在至少一个片段中完整出现
+
+经验值：
+
+| 文档类型       | 推荐 chunkSize | 推荐 overlap |
+| -------------- | -------------- | ------------ |
+| API 文档、FAQ  | 300-500        | 50           |
+| 用户手册、教程 | 500-1000       | 100          |
+| 法律文件、合同 | 1000-1500      | 200          |
+
+建议从 500/50 开始，看几个切分结果，再调整。
+
+### 看看切分结果
+
+```typescript
+const splitter = new RecursiveCharacterTextSplitter({
+  chunkSize: 300,
+  chunkOverlap: 30,
+});
+
+// 模拟一篇产品文档
+const doc = new Document({
+  pageContent: `# 升级套餐
+
+## 概述
+
+升级套餐不会影响已有项目数据。所有项目、任务、成员权限保持不变，仅新增企业版专属功能。
+
+## 升级步骤
+
+1. 进入「设置 → 订阅管理」
+2. 选择目标套餐（专业版或企业版）
+3. 确认价格和付款方式
+4. 立即生效，无需重新登录
+
+## 数据迁移
+
+升级后数据迁移自动完成，无需手动操作。历史数据保留完整，包括：
+- 项目结构和任务内容
+- 团队成员和权限配置
+- 评论、附件和活动日志
+
+## 注意事项
+
+- 降级不会删除数据，但会隐藏超出套餐限制的功能
+- 企业版自定义角色在降级后会变为默认角色
+- 升级过程中服务不会中断`,
+  metadata: { source: "docs/billing/upgrade.md" },
+});
+
+const chunks = await splitter.splitDocuments([doc]);
+
+chunks.forEach((chunk, i) => {
+  console.log(`--- 片段 ${i + 1} ---`);
+  console.log(chunk.pageContent);
+  console.log(`元数据:`, chunk.metadata);
+  console.log();
+});
+```
+
+输出类似：
+
+```
+--- 片段 1 ---
+# 升级套餐
+
+## 概述
+
+升级套餐不会影响已有项目数据。所有项目、任务、成员权限保持不变，仅新增企业版专属功能。
+
+## 升级步骤
+
+1. 进入「设置 → 订阅管理」
+元数据: { source: "docs/billing/upgrade.md" }
+
+--- 片段 2 ---
+1. 进入「设置 → 订阅管理」
+2. 选择目标套餐（专业版或企业版）
+3. 确认价格和付款方式
+4. 立即生效，无需重新登录
+
+## 数据迁移
+元数据: { source: "docs/billing/upgrade.md" }
+
+--- 片段 3 ---
+## 数据迁移
+
+升级后数据迁移自动完成，无需手动操作。历史数据保留完整，包括：
+- 项目结构和任务内容
+- 团队成员和权限配置
+- 评论、附件和活动日志
+元数据: { source: "docs/billing/upgrade.md" }
+```
+
+注意片段 2 和 3 之间有重叠（"数据迁移"标题出现在两个片段中）。这就是 `chunkOverlap` 的效果——即使切分点正好落在标题处，重叠也保证了上下文完整。
+
+### Markdown 按标题切分
+
+如果你的文档是结构化的 Markdown，按标题切分比按字符数切分更精准——每个片段就是一个完整的章节：
+
+```typescript
+import { MarkdownTextSplitter } from "langchain/text_splitter";
+
+const splitter = new MarkdownTextSplitter({
+  chunkSize: 1000,
+  chunkOverlap: 50,
+});
+
+// 会优先在 ## 标题处切分，保证每个片段是一个完整的小节
+const chunks = await splitter.splitDocuments([doc]);
+```
+
+## 元数据：切分后不要丢
+
+切分后，每个片段都保留了原始文档的元数据。这一点很重要——当检索返回一个片段时，你需要知道它来自哪个文件。
+
+```typescript
+// 切分后的每个 chunk 都有 metadata
+chunks.forEach((chunk) => {
+  console.log(chunk.metadata);
+  // { source: "docs/billing/upgrade.md" }
+});
+```
+
+你可以自定义元数据来增强检索：
+
+```typescript
+// 加载时添加自定义元数据
+const docs = await loader.load();
+docs.forEach((doc) => {
+  doc.metadata.loadedAt = new Date().toISOString();
+  doc.metadata.category = "billing"; // 手动标注分类
+});
+```
+
+这些元数据在后续检索时可以用来过滤——比如用户问账单问题，只搜索 `category: "billing"` 的片段。
+
+## 完整示例：加载产品文档库
+
+把加载和切分组合起来，构建一个文档预处理流程：
+
+```typescript
+import { TextLoader } from "langchain/document_loaders/fs/text";
+import { PDFLoader } from "@langchain/community/document_loaders/fs/pdf";
+import { RecursiveCharacterTextSplitter } from "langchain/text_splitter";
+import { Document } from "@langchain/core/documents";
+
+async function loadProductDocs(docDir: string) {
+  const allDocs: Document[] = [];
+
+  // 加载 Markdown 文档
+  const mdFiles = [
+    "getting-started.md",
+    "billing/upgrade.md",
+    "billing/pricing.md",
+  ];
+  for (const file of mdFiles) {
+    const loader = new TextLoader(`${docDir}/${file}`);
+    const docs = await loader.load();
+    // 给每个文档加上分类元数据
+    docs.forEach((doc) => {
+      doc.metadata.category = file.includes("billing") ? "billing" : "general";
+    });
+    allDocs.push(...docs);
+  }
+
+  // 加载 PDF 文档
+  const pdfLoader = new PDFLoader(`${docDir}/user-manual.pdf`, {
+    splitPages: true,
+  });
+  const pdfDocs = await pdfLoader.load();
+  pdfDocs.forEach((doc) => {
+    doc.metadata.category = "manual";
+  });
+  allDocs.push(...pdfDocs);
+
+  // 切分
+  const splitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 500,
+    chunkOverlap: 50,
+  });
+
+  const chunks = await splitter.splitDocuments(allDocs);
+
+  console.log(
+    `加载了 ${allDocs.length} 个文档，切分为 ${chunks.length} 个片段`
+  );
+  return chunks;
+}
+
+// 使用
+const chunks = await loadProductDocs("./docs");
+// chunks 就是准备好向量化的小片段
+```
+
+## 切分质量决定了检索质量
+
+RAG 的效果好不好，50% 取决于文档切分。切得不好，后续再怎么优化检索策略都救不回来。
+
+几个实用建议：
+
+1. **看几个切分结果**：不要装好就跑，手动检查几个片段是否语义完整
+2. **按文档结构切分优于按固定长度切分**：如果有标题层级，优先用 MarkdownTextSplitter
+3. **metadata 不要省**：记录好来源、分类、更新时间，后面检索和展示都用到
+4. **重复的文档要去重**：同一篇文档的 PDF 版和网页版不要重复加载
+
+## 这一篇你学到了什么
+
+- RAG 的核心思路：只把相关文档片段喂给 LLM，而不是全部
+- **Document Loader** 统一加载不同格式的文档
+- **RecursiveCharacterTextSplitter** 按自然断点切分，是默认推荐选择
+- **chunkSize / chunkOverlap** 直接影响检索质量
+- 元数据保留是切分中容易被忽略但非常重要的一环
+
+下一篇把切好的片段向量化并存入向量数据库，实现语义检索——用户问"升级后数据还在吗"，能精准找到文档中的那句话。

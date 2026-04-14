@@ -1,0 +1,513 @@
+---
+title: "08 生产实战：完整的智能客服助手"
+date: "2026-04-14"
+summary: "将 RAG、Agent、Memory 组装为完整的智能客服系统——流式输出、错误降级、成本控制、与 Next.js API Route 集成，从 demo 到可上线的系统。"
+tags: ["LangChain", "生产部署", "流式输出", "Next.js", "AI 客服"]
+category: "langchain"
+cover: ""
+draft: false
+series: "LangChain.js 实战"
+seriesOrder: 8
+---
+
+七篇文章，我们从零搭了一个客服助手的原型：
+
+- 02 篇：模型、提示词模板、输出解析
+- 03 篇：LCEL 管道组合
+- 04 篇：对话记忆
+- 05 篇：文档加载与切分
+- 06 篇：RAG 检索
+- 07 篇：工具调用与 Agent
+
+每个组件单独运行没问题。但组装成一个**完整系统**时，问题来了：
+
+- 用户要等 10 秒才看到回复——太慢了
+- LLM 偶尔返回 JSON 解析失败——直接崩了
+- 每次调用都发几千 token——成本蹭蹭涨
+- 怎么和前端集成？Next.js API Route 里怎么用？
+
+这一篇解决这些问题，把 demo 变成能上线的系统。
+
+## 整体架构
+
+先看完整系统的架构：
+
+```
+用户消息
+  │
+  ├─ 简单问题（FAQ）─────────────────► RAG 链 ──► 流式回答
+  │                                    ▲
+  │                              文档知识库
+  │
+  └─ 复杂操作（查订单/退款/...）──► Agent ──► 流式回答
+                                    ▲
+                              工具（订单/套餐/文档）
+                                    ▲
+                              对话记忆（数据库持久化）
+```
+
+两条路径：
+
+1. **简单咨询** → 直接走 RAG 链，从文档中检索回答（快、便宜）
+2. **复杂操作** → 走 Agent，自主调用工具（灵活、可多步）
+
+## 流式输出：用户不用等 10 秒
+
+对话场景中，用户看到文字逐步出现，比等 10 秒看到一大段舒服得多。
+
+### LCEL 的 stream 方法
+
+```typescript
+const chain = prompt.pipe(model).pipe(new StringOutputParser());
+
+const stream = await chain.stream({
+  question: "企业版和个人版有什么区别？",
+  context: "企业版支持 500 人协作...",
+});
+
+for await (const chunk of stream) {
+  // chunk 是一小段文本（通常几个字到一个句子）
+  process.stdout.write(chunk);
+}
+```
+
+### 在 Next.js API Route 中使用流式输出
+
+```typescript
+// app/api/chat/route.ts
+import { NextRequest } from "next/server";
+
+export async function POST(req: NextRequest) {
+  const { message, sessionId } = await req.json();
+
+  // 构建链（实际项目中这些应该复用，不要每次创建）
+  const chain = buildRAGChain();
+
+  const stream = await chain.stream({
+    question: message,
+    context: await retrieveContext(message),
+  });
+
+  // 用 ReadableStream 把 LLM 的输出逐块返回给前端
+  const encoder = new TextEncoder();
+  const readableStream = new ReadableStream({
+    async start(controller) {
+      for await (const chunk of stream) {
+        controller.enqueue(
+          encoder.encode(`data: ${JSON.stringify({ text: chunk })}\n\n`)
+        );
+      }
+      controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+      controller.close();
+    },
+  });
+
+  return new Response(readableStream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      Connection: "keep-alive",
+    },
+  });
+}
+```
+
+前端用 EventSource 接收：
+
+```typescript
+// 前端代码
+const eventSource = new EventSource(
+  `/api/chat?message=${encodeURIComponent(msg)}`
+);
+
+eventSource.onmessage = (event) => {
+  if (event.data === "[DONE]") {
+    eventSource.close();
+    return;
+  }
+  const { text } = JSON.parse(event.data);
+  setMessages((prev) => appendToLastMessage(prev, text));
+};
+```
+
+### Agent 的流式输出
+
+Agent 的流式输出更复杂——你需要区分"Agent 在思考"和"Agent 在输出最终回答"：
+
+```typescript
+const agentStream = await agent.stream({
+  messages: [{ role: "user", content: message }],
+});
+
+for await (const event of agentStream) {
+  // Agent 的思考/回答
+  if (event.agent?.messages?.[0]) {
+    const msg = event.agent.messages[0];
+    if (msg.content) {
+      // 发送给前端
+      yield { type: "text", content: msg.content };
+    }
+    // 如果有工具调用
+    if (msg.tool_calls?.length) {
+      yield {
+        type: "tool_call",
+        tool: msg.tool_calls[0].name,
+      };
+    }
+  }
+
+  // 工具返回结果
+  if (event.tools) {
+    // 可以在前端展示"正在查询订单..."
+    yield { type: "tool_result", data: event.tools };
+  }
+}
+```
+
+## 错误处理与降级
+
+LLM 调用随时可能失败。生产环境必须有兜底方案。
+
+### 分层错误处理
+
+```typescript
+async function safeChat(message: string, sessionId: string) {
+  try {
+    // 第一选择：走完整链（RAG + Agent）
+    return await fullChain.invoke({ message, sessionId });
+  } catch (ragError) {
+    console.error("RAG 链失败:", ragError);
+
+    try {
+      // 第二选择：降级到纯 LLM 对话（不用知识库）
+      return await fallbackChatModel.invoke(message);
+    } catch (llmError) {
+      console.error("LLM 也挂了:", llmError);
+
+      // 第三选择：返回预设回复
+      return {
+        text: "抱歉，系统暂时繁忙。请稍后再试，或联系人工客服（客服热线：400-xxx-xxxx）。",
+        fallback: true,
+      };
+    }
+  }
+}
+```
+
+### 模型降级
+
+```typescript
+// 主力模型（强但贵）
+const primaryModel = new ChatOpenAI({ modelName: "gpt-4o" });
+
+// 备用模型（弱但便宜且稳定）
+const fallbackModel = new ChatOpenAI({ modelName: "gpt-4o-mini" });
+
+// 带重试的调用
+async function callWithFallback(chain: any, input: any) {
+  try {
+    return await chain.invoke(input);
+  } catch (e) {
+    // 如果是 token 超限，换便宜模型
+    if (e.message?.includes("context_length_exceeded")) {
+      console.warn("Token 超限，切换到 gpt-4o-mini");
+      return await chain.pipe(fallbackModel).invoke(input);
+    }
+    throw e;
+  }
+}
+```
+
+### RAG 无结果时的处理
+
+```typescript
+async function ragWithFallback(question: string) {
+  const docs = await retriever.invoke(question);
+
+  if (docs.length === 0) {
+    // 检索不到相关文档时的处理策略
+    return {
+      text:
+        "我在产品文档中没有找到直接相关的信息。" +
+        "您可以尝试换个说法提问，或者联系人工客服获取帮助。",
+      source: "fallback",
+    };
+  }
+
+  // 正常 RAG 流程
+  return await ragChain.invoke({ question, context: formatDocs(docs) });
+}
+```
+
+> 最危险的错误不是 LLM 回答不了，而是它编造答案。所以 prompt 中那句"不要编造"比什么都重要。当检索结果为空时，宁可说"我不知道"，也不要让 LLM 瞎编。
+
+## 成本控制
+
+LLM 按 token 计费。不加控制的客服助手可能每月烧掉几千块。
+
+### 分级处理：简单问题用便宜模型
+
+不是每个问题都需要 gpt-4o。简单 FAQ 用 gpt-4o-mini 就够了：
+
+```typescript
+function selectModel(message: string) {
+  // 简单问题判断（不需要 100% 准确，粗筛即可）
+  const simplePatterns = [/多少钱/, /怎么.*注册/, /支持.*平台/, /有什么区别/];
+
+  const isSimple = simplePatterns.some((p) => p.test(message));
+
+  return isSimple
+    ? new ChatOpenAI({ modelName: "gpt-4o-mini", temperature: 0 })
+    : new ChatOpenAI({ modelName: "gpt-4o", temperature: 0 });
+}
+
+// 使用
+const model = selectModel(userMessage);
+const chain = prompt.pipe(model).pipe(parser);
+```
+
+### 缓存高频问题
+
+```typescript
+import { Redis } from "ioredis";
+const redis = new Redis(process.env.REDIS_URL);
+
+async function cachedAnswer(question: string): Promise<string | null> {
+  // 对问题做归一化处理后再做缓存 key
+  const normalizedKey = `qa:${question.toLowerCase().trim()}`;
+  const cached = await redis.get(normalizedKey);
+  if (cached) {
+    return cached;
+  }
+  return null;
+}
+
+async function cacheAnswer(question: string, answer: string) {
+  const normalizedKey = `qa:${question.toLowerCase().trim()}`;
+  // 缓存 1 小时
+  await redis.set(normalizedKey, answer, "EX", 3600);
+}
+
+// 使用
+async function chatWithCache(message: string) {
+  const cached = await cachedAnswer(message);
+  if (cached) {
+    console.log("命中缓存，节省一次 API 调用");
+    return cached;
+  }
+
+  const answer = await chain.invoke({ question: message });
+  await cacheAnswer(message, answer);
+  return answer;
+}
+```
+
+### Token 用量监控
+
+```typescript
+// 在每次调用后记录 token 用量
+interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  model: string;
+  timestamp: Date;
+}
+
+async function trackUsage(usage: TokenUsage) {
+  await db.tokenUsage.create({ data: usage });
+
+  // 设置告警阈值
+  const dailyTotal = await getDailyTotal();
+  if (dailyTotal > DAILY_BUDGET_LIMIT) {
+    await sendAlert(`今日 token 消耗已达 ¥${dailyTotal}，超过预算阈值`);
+  }
+}
+```
+
+## 完整系统集成
+
+把所有组件组装在一起：
+
+```typescript
+// lib/assistant.ts
+import { ChatOpenAI } from "@langchain/openai";
+import {
+  ChatPromptTemplate,
+  MessagesPlaceholder,
+} from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+import {
+  RunnablePassthrough,
+  RunnableSequence,
+  RunnableBranch,
+} from "@langchain/core/runnables";
+import { createReactAgent } from "@langchain/langgraph/prebuilt";
+
+// ---- 配置 ----
+const fastModel = new ChatOpenAI({ modelName: "gpt-4o-mini", temperature: 0 });
+const strongModel = new ChatOpenAI({ modelName: "gpt-4o", temperature: 0 });
+
+// ---- 工具 ----
+const tools = [orderLookupTool, planLookupTool, docSearchTool];
+
+// ---- Agent ----
+const agent = createReactAgent({
+  llm: strongModel,
+  tools,
+  messageModifier: new SystemMessage(
+    `你是 TaskFlow Pro 的客服助手。
+    规则：
+    1. 基于工具返回的信息回答，不要编造
+    2. 涉及退款等敏感操作，引导用户联系人工客服
+    3. 回答简洁明了`
+  ),
+});
+
+// ---- RAG 链 ----
+const ragPrompt = ChatPromptTemplate.fromMessages([
+  [
+    "system",
+    `你是 TaskFlow Pro 的客服助手。基于参考资料回答，不知道就说不知道。
+    参考资料：\n{context}`,
+  ],
+  new MessagesPlaceholder("history"),
+  ["human", "{question}"],
+]);
+
+function createRAGChain(retriever: any) {
+  return RunnableSequence.from([
+    {
+      context: (input: any) =>
+        retriever.invoke(input.question).then(formatDocs),
+      history: (input: any) => input.history ?? [],
+      question: (input: any) => input.question,
+    },
+    ragPrompt,
+    fastModel,
+    new StringOutputParser(),
+  ]);
+}
+
+// ---- 意图路由 ----
+const intentPrompt = ChatPromptTemplate.fromTemplate(
+  `判断用户消息需要简单回答还是复杂操作。
+  - "simple"：一般咨询、产品问题、使用方法
+  - "complex"：查订单、查套餐、退款、需要调用工具的操作
+  只输出 simple 或 complex。
+  用户消息：{message}`
+);
+
+const routerChain = intentPrompt.pipe(fastModel).pipe(new StringOutputParser());
+
+// ---- 主入口 ----
+export async function chat(
+  message: string,
+  sessionId: string,
+  history: Message[]
+) {
+  // 1. 检查缓存
+  const cached = await cachedAnswer(message);
+  if (cached) return { text: cached, cached: true };
+
+  // 2. 路由判断
+  const intent = (await routerChain.invoke({ message })).trim();
+
+  let response: string;
+
+  if (intent === "complex") {
+    // 复杂操作 → Agent
+    const result = await agent.invoke({
+      messages: [...history, { role: "user", content: message }],
+    });
+    response = result.messages[result.messages.length - 1].content;
+  } else {
+    // 简单咨询 → RAG 链
+    const ragChain = createRAGChain(retriever);
+    response = await ragChain.invoke({
+      question: message,
+      history,
+    });
+  }
+
+  // 3. 保存对话历史
+  await saveMessage(sessionId, "user", message);
+  await saveMessage(sessionId, "assistant", response);
+
+  // 4. 缓存简单问题的回答
+  if (intent === "simple") {
+    await cacheAnswer(message, response);
+  }
+
+  return { text: response, cached: false };
+}
+```
+
+## 部署清单
+
+上线前检查这些事项：
+
+| 检查项        | 说明                                           |
+| ------------- | ---------------------------------------------- |
+| API Key 安全  | 不要硬编码，用环境变量，生产环境用密钥管理服务 |
+| Rate Limiting | 限制每个用户每分钟的请求次数，防止滥用         |
+| 超时设置      | LLM 调用设置 30 秒超时，不要无限等待           |
+| 日志记录      | 记录每次对话的 intent 路由、工具调用、耗时     |
+| 监控告警      | token 用量、错误率、响应时间的监控             |
+| 文档更新      | RAG 文档有变更时，需要重新加载和向量化         |
+| 对话历史清理  | 定期清理过期的对话历史，避免数据库膨胀         |
+
+## 系列回顾
+
+八篇文章，我们从一个简单的 API 调用，走到了一个完整的智能客服系统。
+
+```
+01 为什么需要 LangChain
+    → 理解框架价值，搭好环境
+
+02 模型、提示词与输出解析
+    → 掌握三个核心积木
+
+03 LCEL 链式调用
+    → 学会用管道组合 AI 工作流
+
+04 记忆机制
+    → 让 AI 记住对话上下文
+
+05 RAG 基础：文档加载与切分
+    → 把知识变成可检索的片段
+
+06 RAG 进阶：向量化与检索
+    → 用语义搜索精准找到相关文档
+
+07 工具调用与 Agent
+    → 让 AI 自主决策、调用工具
+
+08 生产实战：完整系统
+    → 流式输出、错误降级、成本控制、部署
+```
+
+### LangChain 的适用场景和局限
+
+**适合用 LangChain 的场景：**
+
+- 需要组合多个 AI 步骤的应用
+- RAG（文档问答、知识库检索）
+- Agent（自主调用工具的 AI 助手）
+- 需要在不同 LLM 之间切换的项目
+
+**LangChain 的局限：**
+
+- 抽象层有学习成本，简单场景用不上
+- 版本迭代快，API 变化频繁（建议锁定版本）
+- Agent 的行为不可完全预测，需要充分的测试和约束
+- 对于极端性能要求的场景，直接调 API 更快
+
+### 继续学习的方向
+
+如果你想继续深入 AI 应用开发，建议关注：
+
+- **LangGraph**：LangChain 团队推出的状态图框架，比 Agent 更可控，适合复杂的多步骤流程
+- **向量数据库深入**：Pinecone、Weaviate、Milvus 等更适合大规模生产环境
+- **评估与测试**：如何量化评估 RAG 的检索质量和生成质量
+- **Fine-tuning**：当 RAG 不够用时，微调模型来提升特定领域的表现

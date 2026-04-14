@@ -1,0 +1,350 @@
+---
+title: "07 工具调用与 Agent：让 AI 主动干活"
+date: "2026-04-14"
+summary: "让 LLM 从只会说话变成能动手——定义工具、创建 Agent、实现自主决策，构建一个能查订单、搜文档、查套餐的智能助手。"
+tags: ["LangChain", "Agent", "Tool", "Function Calling", "TypeScript"]
+category: "langchain"
+cover: ""
+draft: false
+series: "LangChain.js 实战"
+seriesOrder: 7
+---
+
+前六篇的客服助手只能做一件事：回答问题。但用户说"帮我查一下订单 ORD-20250608-3847"，它只能说"我无法访问数据库"。
+
+**Agent 改变了这个局面。** 它让 LLM 从"只会说话"变成"能动手"——AI 自己决定什么时候查数据库、什么时候搜文档、什么时候调 API。
+
+这一篇我们给客服助手配备三个工具：查订单状态、搜索帮助文档、查询用户套餐，让 Agent 根据用户问题自主决定用哪个。
+
+## Agent 的本质：LLM 当路由器
+
+普通链式调用的流程是固定的——你写好了步骤，数据按管道走。Agent 不同：**流程是动态的，LLM 自己决定下一步做什么。**
+
+```
+普通链（固定流程）：
+用户输入 → 步骤A → 步骤B → 步骤C → 输出
+
+Agent（动态流程）：
+用户输入 → LLM 思考 "我需要查订单"
+        → 调用 "查订单" 工具 → 拿到结果
+        → LLM 思考 "结果够了，可以回答了"
+        → 输出
+
+或者：
+用户输入 → LLM 思考 "这个问题需要搜文档"
+        → 调用 "搜文档" 工具 → 拿到结果
+        → LLM 思考 "结果不够，还需要查套餐信息"
+        → 调用 "查套餐" 工具 → 拿到结果
+        → LLM 思考 "够了，可以回答了"
+        → 输出
+```
+
+Agent 的核心循环叫 **ReAct**（Reasoning + Acting）：
+
+1. **Reasoning**：LLM 分析当前情况，决定下一步做什么
+2. **Acting**：执行选定的工具
+3. **Observing**：观察工具返回的结果
+4. 重复，直到 LLM 认为信息足够，给出最终回答
+
+## 定义工具
+
+工具就是一个函数 + 一段描述。LLM 通过描述理解工具的用途，通过参数定义知道需要传什么。
+
+### 用 DynamicStructuredTool 创建工具
+
+```typescript
+import { DynamicStructuredTool } from "@langchain/core/tools";
+import { z } from "zod";
+
+// 工具 1：查订单状态
+const orderLookupTool = new DynamicStructuredTool({
+  name: "order_lookup",
+  description:
+    "查询订单状态。当用户提到订单号、想知道订单进度、或者询问发货/退款状态时使用。",
+  schema: z.object({
+    orderId: z.string().describe("订单号，格式如 ORD-20250608-3847"),
+  }),
+  func: async ({ orderId }) => {
+    // 实际项目中这里查数据库，这里用模拟数据
+    const orders: Record<string, any> = {
+      "ORD-20250608-3847": {
+        id: "ORD-20250608-3847",
+        product: "企业版年度套餐",
+        amount: "¥12,800",
+        status: "待确认",
+        createdAt: "2026-06-08",
+        estimatedActivation: "2026-06-10",
+      },
+      "ORD-20250512-2193": {
+        id: "ORD-20250512-2193",
+        product: "专业版月度套餐",
+        amount: "¥128",
+        status: "已激活",
+        createdAt: "2026-05-12",
+        activatedAt: "2026-05-12",
+      },
+    };
+
+    const order = orders[orderId];
+    if (!order) {
+      return `未找到订单 ${orderId}。请确认订单号是否正确。`;
+    }
+    return JSON.stringify(order);
+  },
+});
+
+// 工具 2：查询用户套餐
+const planLookupTool = new DynamicStructuredTool({
+  name: "plan_lookup",
+  description:
+    "查询用户的套餐信息。当用户想知道当前套餐详情、剩余用量、或者套餐对比时使用。",
+  schema: z.object({
+    userId: z.string().describe("用户ID，格式如 usr_km92x1"),
+  }),
+  func: async ({ userId }) => {
+    // 模拟数据
+    const plans: Record<string, any> = {
+      usr_km92x1: {
+        userId: "usr_km92x1",
+        plan: "专业版",
+        members: 12,
+        maxMembers: 20,
+        storage: "45GB / 100GB",
+        renewalDate: "2026-09-15",
+      },
+    };
+
+    const plan = plans[userId];
+    if (!plan) {
+      return `未找到用户 ${userId} 的套餐信息。`;
+    }
+    return JSON.stringify(plan);
+  },
+});
+
+// 工具 3：搜索帮助文档（复用上一篇的 RAG 检索）
+const docSearchTool = new DynamicStructuredTool({
+  name: "doc_search",
+  description:
+    "搜索产品帮助文档。当用户询问产品功能、使用方法、常见问题等需要参考文档的问题时使用。",
+  schema: z.object({
+    query: z.string().describe("搜索关键词或用户问题"),
+  }),
+  func: async ({ query }) => {
+    // 这里应该调用上一篇构建的 retriever
+    // 简化示意：
+    const results = await retriever.invoke(query);
+    if (results.length === 0) {
+      return "未找到相关文档。";
+    }
+    return results
+      .map((doc) => `[${doc.metadata.source}]\n${doc.pageContent}`)
+      .join("\n\n");
+  },
+});
+```
+
+工具定义中有三个关键部分：
+
+- **name**：工具的唯一标识，LLM 用它来选择工具
+- **description**：告诉 LLM 这个工具做什么、什么时候该用。写清楚很重要——LLM 根据描述决定是否调用
+- **schema**：用 Zod 定义输入参数，LLM 会按这个格式传参
+
+### description 写得好不好直接影响效果
+
+```typescript
+// 差 —— LLM 不知道什么时候该用
+description: "查询订单";
+
+// 好 —— 明确说明了使用场景
+description: "查询订单状态。当用户提到订单号、想知道订单进度、或者询问发货/退款状态时使用。";
+```
+
+把工具的适用场景写清楚，能大幅减少 LLM "乱调工具"的问题。
+
+## 创建 Agent
+
+LangChain.js 提供了 `createReactAgent` 来创建 ReAct 模式的 Agent：
+
+```typescript
+import { createReactAgent } from "@langchain/langgraph/prebuilt";
+import { ChatOpenAI } from "@langchain/openai";
+
+const model = new ChatOpenAI({
+  modelName: "gpt-4o-mini",
+  temperature: 0,
+});
+
+const tools = [orderLookupTool, planLookupTool, docSearchTool];
+
+const agent = createReactAgent({
+  llm: model,
+  tools,
+});
+```
+
+> 注意：LangChain.js 0.3.x 推荐使用 `@langchain/langgraph` 中的 `createReactAgent`。旧的 `AgentExecutor` 方式已经被标记为 legacy。
+
+### 运行 Agent
+
+```typescript
+const result = await agent.invoke({
+  messages: [
+    {
+      role: "user",
+      content: "帮我查一下订单 ORD-20250608-3847 现在什么状态了",
+    },
+  ],
+});
+
+// result.messages 包含完整的对话历史
+// 包括 Agent 的思考过程、工具调用、工具返回、最终回答
+const lastMessage = result.messages[result.messages.length - 1];
+console.log(lastMessage.content);
+// "您的订单 ORD-20250608-3847 当前状态为「待确认」。
+//  订单详情：企业版年度套餐，金额 ¥12,800，创建于 2026-06-08。
+//  预计激活时间为 2026-06-10。"
+```
+
+Agent 的内部执行过程：
+
+```
+1. 用户：帮我查一下订单 ORD-20250608-3847
+2. Agent 思考：用户要查订单，我应该用 order_lookup 工具
+3. 工具调用：order_lookup({ orderId: "ORD-20250608-3847" })
+4. 工具返回：{ status: "待确认", product: "企业版年度套餐", ... }
+5. Agent 思考：拿到订单信息了，可以回答用户了
+6. 最终回答：您的订单当前状态为「待确认」...
+```
+
+### 多工具协作
+
+Agent 也能同时使用多个工具。比如用户问："我刚升级了企业版，订单 ORD-20250608-3847 确认了没？企业版比专业版多了什么功能？"
+
+```
+Agent 思考：
+1. 需要查订单 → order_lookup
+2. 需要了解企业版功能 → doc_search
+
+两个工具调用后，Agent 整合信息给出完整回答。
+```
+
+Agent 会自己决定需要调哪些工具、按什么顺序调。你只需要定义好工具和描述。
+
+## 控制 Agent 的行为
+
+Agent 不是万能的，它有时候会做出意料之外的事。
+
+### 限制最大步数
+
+防止 Agent 陷入死循环（比如反复调同一个工具）：
+
+```typescript
+const agent = createReactAgent({
+  llm: model,
+  tools,
+  // Agent 最多执行 5 步就强制返回
+  // 通常 3-5 步足够解决大部分问题
+});
+```
+
+### 用 system prompt 约束行为
+
+```typescript
+const agent = createReactAgent({
+  llm: model,
+  tools,
+  messageModifier: new SystemMessage(
+    `你是 TaskFlow Pro 的客服助手。
+规则：
+1. 只使用提供的工具，不要编造信息
+2. 如果工具返回"未找到"，如实告知用户，不要猜测
+3. 涉及退款、删除数据等敏感操作时，建议用户联系人工客服
+4. 回答简洁明了，不要重复工具返回的原始 JSON`
+  ),
+});
+```
+
+### 只读工具 vs 写操作工具
+
+上面的工具都是查询类的（只读）。如果你想加写操作工具（如处理退款、修改套餐），建议加确认步骤：
+
+```typescript
+const refundTool = new DynamicStructuredTool({
+  name: "request_refund",
+  description: "提交退款申请。仅在用户明确要求退款且符合退款政策时使用。",
+  schema: z.object({
+    orderId: z.string(),
+    reason: z.string(),
+  }),
+  func: async ({ orderId, reason }) => {
+    // 不要直接执行退款，而是创建一个待审核的退款工单
+    const ticket = await db.refundTickets.create({
+      data: {
+        orderId,
+        reason,
+        status: "pending_review",
+        createdAt: new Date(),
+      },
+    });
+    return `退款申请已提交，工单号：${ticket.id}。客服团队将在 24 小时内审核。`;
+  },
+});
+```
+
+> 永远不要让 Agent 直接执行不可逆的操作。让它创建工单、发通知，由人工审核后执行。
+
+## Agent 和普通链的对比
+
+| 特性     | 普通链（Chain）         | Agent                           |
+| -------- | ----------------------- | ------------------------------- |
+| 执行流程 | 固定，你写死的          | 动态，LLM 自己决定              |
+| 可预测性 | 高——每步都确定          | 低——取决于 LLM 的判断           |
+| 适用场景 | 流程明确、步骤固定      | 需要灵活决策、工具选择          |
+| 成本     | 低——固定的 LLM 调用次数 | 不确定——可能多轮工具调用        |
+| 调试难度 | 简单                    | 较难——需要跟踪 Agent 的思考过程 |
+
+一个实用的策略是：**能用链就用链，需要灵活决策时才用 Agent。**
+
+比如客服助手的架构可以是：
+
+```
+用户消息
+  → 链：意图识别（固定步骤）
+  → 如果是简单咨询：走 RAG 链（固定步骤）
+  → 如果涉及多工具操作：走 Agent（动态步骤）
+```
+
+## 调试 Agent
+
+Agent 的行为不透明，调试是个挑战。一个实用的技巧是打印 Agent 的中间步骤：
+
+```typescript
+// LangGraph 的 Agent 支持流式输出，可以实时看到每一步
+const stream = await agent.stream({
+  messages: [{ role: "user", content: "帮我查订单 ORD-20250608-3847" }],
+});
+
+for await (const event of stream) {
+  // 打印每一步的事件
+  if (event.agent) {
+    console.log("Agent 思考:", event.agent.messages[0].content);
+  }
+  if (event.tools) {
+    console.log("工具调用:", JSON.stringify(event.tools));
+  }
+}
+```
+
+这样你能看到 Agent 在想什么、调了什么工具、工具返回了什么。如果 Agent 做出了错误决策，通常是因为工具描述不够清楚，或者 system prompt 的约束不够。
+
+## 这一篇你学到了什么
+
+- **Agent 的本质**：LLM 充当路由器，自己决定调什么工具、调几次
+- **ReAct 循环**：推理 → 行动 → 观察 → 重复，直到信息足够
+- **DynamicStructuredTool**：用 Zod schema 定义工具输入，LLM 按格式传参
+- **description 写作**：直接影响 LLM 选择工具的准确度
+- **安全原则**：写操作不要让 Agent 直接执行，走工单审核
+- **Agent vs 链**：能用链就用链，需要灵活决策时才用 Agent
+
+下一篇是系列收官——把 RAG、Agent、Memory 组装成一个完整的智能客服系统，加上流式输出、错误处理和成本控制。

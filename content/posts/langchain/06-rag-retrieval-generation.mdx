@@ -1,0 +1,342 @@
+---
+title: "06 RAG 进阶：向量化存储与精准检索"
+date: "2026-04-14"
+summary: "掌握 RAG 的核心技术——文本向量化、向量数据库存储、语义检索策略，从切好的文档片段到精准回答用户问题的完整链路。"
+tags: ["LangChain", "RAG", "Embedding", "Vector Store", "检索", "TypeScript"]
+category: "langchain"
+cover: ""
+draft: false
+series: "LangChain.js 实战"
+seriesOrder: 6
+---
+
+上一篇我们把文档切成了片段。但这些片段还是普通的字符串——用户问"升级后数据还在吗"，你不可能拿每个片段去做字符串匹配。
+
+这一篇解决的是：**怎么从几千个片段中，找到语义上最相关的几个。** 核心工具是 **Embedding**（向量化）+ **Vector Store**（向量存储）+ **Retriever**（检索器）。
+
+## Embedding：把文字变成数学
+
+关键词搜索（"升级"出现在哪个片段里？）有个致命缺陷：用户不会精确地用你文档中的词提问。
+
+```
+用户问："换了个贵的套餐，以前的东西还在不？"
+文档里写的是："升级套餐不会影响已有项目数据。"
+
+关键词搜索：匹配不到"升级" → 返回空结果
+语义搜索：理解"换个贵的套餐"≈"升级套餐" → 精准命中
+```
+
+Embedding 就是实现语义搜索的技术。它把文本转换成一个高维数字向量（通常是 1536 维），语义相近的文本在向量空间中距离更近。
+
+```
+"升级套餐"    → [0.023, -0.041, 0.087, ..., 0.012]  ← 相近
+"换个贵的套餐" → [0.025, -0.039, 0.085, ..., 0.010]  ← 相近
+"网络延迟高"  → [-0.041, 0.078, -0.023, ..., 0.067]  ← 远离
+```
+
+不需要理解背后的数学细节，只需要知道：**Embedding 把"语义相似度"变成了"向量距离"，而向量距离是可以精确计算的。**
+
+### 使用 OpenAI Embeddings
+
+```typescript
+import { OpenAIEmbeddings } from "@langchain/openai";
+
+const embeddings = new OpenAIEmbeddings({
+  model: "text-embedding-3-small", // 推荐，性价比高
+  // text-embedding-3-large 精度更高但更贵
+  // text-embedding-ada-002 旧版，不推荐新项目用
+});
+
+// 单条文本向量化
+const vector = await embeddings.embedQuery("升级套餐后数据还在吗？");
+
+console.log(`向量维度: ${vector.length}`);
+// 1536
+
+console.log(`前 5 个值: ${vector.slice(0, 5)}`);
+// [0.023, -0.041, 0.087, -0.015, 0.032]
+
+// 批量向量化（文档片段）
+const docVectors = await embeddings.embedDocuments([
+  "升级套餐不会影响已有项目数据",
+  "移动端在弱网环境下提交订单失败",
+  "团队协作功能支持最多 500 人",
+]);
+```
+
+`embedQuery` 和 `embedDocuments` 的区别：前者用于用户查询（单条），后者用于文档片段（批量，更高效）。
+
+## Vector Store：存储和查询向量
+
+有了向量，需要一个地方存起来并支持高效的相似度搜索。
+
+### MemoryVectorStore：开发调试用
+
+```typescript
+import { MemoryVectorStore } from "langchain/vectorstores/memory";
+import { OpenAIEmbeddings } from "@langchain/openai";
+
+// 从文档片段直接创建向量库
+const vectorStore = await MemoryVectorStore.fromDocuments(
+  chunks, // 上一篇切好的文档片段
+  new OpenAIEmbeddings()
+);
+
+// 语义检索：找到和查询最相似的 4 个片段
+const results = await vectorStore.similaritySearch(
+  "升级套餐后数据还在吗？",
+  4 // 返回 top 4
+);
+
+results.forEach((doc, i) => {
+  console.log(`--- 结果 ${i + 1} ---`);
+  console.log(doc.pageContent);
+  console.log(`来源: ${doc.metadata.source}`);
+  console.log();
+});
+```
+
+`MemoryVectorStore` 存在内存中，重启就没了。开发调试够用，生产环境需要持久化方案。
+
+### 带相似度分数的检索
+
+```typescript
+// similaritySearchWithScore 返回结果和相似度分数
+const resultsWithScore = await vectorStore.similaritySearchWithScore(
+  "升级套餐后数据还在吗？",
+  4
+);
+
+resultsWithScore.forEach(([doc, score], i) => {
+  console.log(
+    `结果 ${i + 1}（相似度: ${score.toFixed(4)}）: ${doc.pageContent.slice(0, 60)}...`
+  );
+});
+
+// 分数越低越相似（余弦距离）
+// 好的匹配通常 < 0.3，差的匹配 > 0.5
+```
+
+> 注意：OpenAI Embeddings 的余弦距离范围是 0-2。0 表示完全相同，2 表示完全相反。实际使用中，< 0.3 通常是好的匹配。
+
+## Retriever：检索的统一接口
+
+Vector Store 是存储层，Retriever 是它的检索接口。LangChain 的 RAG 链不直接操作 Vector Store，而是通过 Retriever。
+
+```typescript
+// 从 Vector Store 创建 Retriever
+const retriever = vectorStore.asRetriever({
+  k: 4, // 返回 top 4 结果
+  searchType: "similarity", // 相似度搜索（默认）
+});
+
+// 使用
+const docs = await retriever.invoke("升级套餐后数据还在吗？");
+// 返回 Document[]
+```
+
+### MMR 检索：兼顾相关性和多样性
+
+普通 `similarity` 搜索可能返回 4 个内容几乎一样的片段。MMR（Maximal Marginal Relevance）解决这个问题——在保持相关性的同时，尽量让结果多样化：
+
+```typescript
+const retriever = vectorStore.asRetriever({
+  k: 4,
+  searchType: "mmr",
+  searchKwargs: {
+    fetchK: 10, // 先取 10 个候选
+    lambda: 0.5, // 0 = 最大多样性，1 = 最大相关性
+  },
+});
+```
+
+`lambda` 参数控制平衡：
+
+- `lambda: 1.0` — 等同于普通 similarity，只看相关性
+- `lambda: 0.5` — 既相关又多样（推荐默认值）
+- `lambda: 0.0` — 最大多样性，可能不太相关
+
+### 相似度阈值过滤
+
+有时候检索结果的相关性太低，不如不返回：
+
+```typescript
+// 用 similaritySearchWithScore 手动过滤
+const rawResults = await vectorStore.similaritySearchWithScore(query, 10);
+const filtered = rawResults.filter(([_, score]) => score < 0.35);
+// 只保留相似度分数 < 0.35 的结果
+
+if (filtered.length === 0) {
+  // 没有找到相关文档，给用户兜底回答
+  return "抱歉，我在文档中没有找到相关信息。建议联系人工客服。";
+}
+```
+
+## 组装完整的 RAG 链
+
+把 Retriever、Prompt Template、Model 串起来：
+
+```typescript
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StringOutputParser } from "@langchain/core/output_parsers";
+import {
+  RunnablePassthrough,
+  RunnableSequence,
+} from "@langchain/core/runnables";
+
+const model = new ChatOpenAI({ modelName: "gpt-4o-mini", temperature: 0 });
+
+// RAG 专用的 prompt 模板
+const ragPrompt = ChatPromptTemplate.fromMessages([
+  [
+    "system",
+    `你是 TaskFlow Pro 的客服助手。基于以下参考资料回答用户问题。
+如果参考资料中没有相关信息，请如实告知，不要编造答案。
+回答时引用来源（如"根据《升级套餐》文档..."）。
+
+参考资料：
+{context}`,
+  ],
+  ["human", "{question}"],
+]);
+
+// 把检索到的文档格式化为文本
+function formatDocs(docs: Document[]): string {
+  return docs
+    .map((doc) => `[来源: ${doc.metadata.source}]\n${doc.pageContent}`)
+    .join("\n\n---\n\n");
+}
+
+// 组装 RAG 链
+const ragChain = RunnableSequence.from([
+  {
+    context: retriever.pipe(formatDocs), // 检索 → 格式化
+    question: new RunnablePassthrough(), // 原样传递用户问题
+  },
+  ragPrompt,
+  model,
+  new StringOutputParser(),
+]);
+
+// 使用
+const answer = await ragChain.invoke(
+  "升级到企业版之后，之前的项目数据还在吗？"
+);
+console.log(answer);
+// "根据升级套餐文档，升级套餐不会影响已有项目数据。所有项目、任务、成员权限保持不变，
+//  仅新增企业版专属功能。您可以放心升级。"
+```
+
+这条链的工作流程：
+
+```
+"升级后数据还在吗？"
+  ↓
+并行执行：
+  - retriever → 检索到相关片段 → formatDocs → 格式化文本
+  - RunnablePassthrough → 原样传递问题
+  ↓
+ragPrompt → 把检索结果和问题组合成完整 prompt
+  ↓
+model → LLM 基于参考资料生成回答
+  ↓
+StringOutputParser → 提取文本内容
+```
+
+关键点在 prompt 里那句 **"如果参考资料中没有相关信息，请如实告知，不要编造答案"**。这行字能显著减少 LLM 的幻觉。
+
+## 检索不准怎么办
+
+RAG 最常见的问题：检索到的片段和问题无关，导致 LLM 基于错误信息回答。
+
+### 常见原因和修复方法
+
+**1. 切分粒度不对**
+
+```
+问题：升级套餐后权限会变吗？
+检索到的片段：升级套餐不会影响已有项目数据...（没提到权限）
+
+修复：减小 chunkSize，让"权限"相关的内容独立成片段
+```
+
+**2. 用户表达和文档表达不一致**
+
+```
+用户说："花钱升了个级"
+文档写："升级套餐"
+
+修复：Query 改写——先用 LLM 把用户的口语化问题改写成正式查询
+```
+
+Query 改写的实现：
+
+```typescript
+const queryRewritePrompt = ChatPromptTemplate.fromTemplate(
+  `把以下用户问题改写为更适合搜索的正式查询语句。
+用户问题：{question}
+改写后的查询：`
+);
+
+const rewriteChain = queryRewritePrompt
+  .pipe(model)
+  .pipe(new StringOutputParser());
+
+// 使用
+const rewrittenQuery = await rewriteChain.invoke({
+  question: "花了一万多升了个级，以前做的东西还在不？",
+});
+// 输出："升级套餐后已有项目数据是否保留"
+// 用改写后的查询去检索，效果更好
+```
+
+**3. 文档太长，关键信息被淹没**
+
+```
+片段包含 500 字，但用户只需要其中一句。
+
+修复：减小 chunkSize，或者在检索后用 LLM 做二次提取
+```
+
+## 持久化：Chroma 向量数据库
+
+生产环境不能用内存向量库。Chroma 是一个轻量级的向量数据库，适合中小规模（10万级片段以内）：
+
+```typescript
+import { Chroma } from "@langchain/community/vectorstores/chroma";
+import { OpenAIEmbeddings } from "@langchain/openai";
+
+// 创建/连接 Chroma 向量库
+const vectorStore = await Chroma.fromDocuments(chunks, new OpenAIEmbeddings(), {
+  collectionName: "taskflow_docs", // 集合名（类似数据库的表名）
+  url: "http://localhost:8000", // Chroma 服务地址
+});
+
+// 后续使用时，直接连接已有的集合（不需要重新灌数据）
+const existingStore = await Chroma.fromExistingCollection(
+  new OpenAIEmbeddings(),
+  {
+    collectionName: "taskflow_docs",
+    url: "http://localhost:8000",
+  }
+);
+```
+
+Chroma 的好处是数据持久化在磁盘上，重启不丢失。用 Docker 启动：
+
+```bash
+docker run -d -p 8000:8000 chromadb/chroma
+```
+
+## 这一篇你学到了什么
+
+- **Embedding** 把文本变成向量，语义相似的文本向量距离近
+- **Vector Store** 存储向量并支持相似度搜索
+- **Retriever** 是检索的统一接口，LangChain 通过它和向量库交互
+- **MMR 检索** 兼顾相关性和多样性
+- **RAG 链** 的完整组装：retriever → prompt → model → parser
+- **检索不准** 的常见原因和修复方法（切分粒度、query 改写）
+- **Chroma** 是生产环境推荐的轻量级向量数据库
+
+下一篇进入 Agent——让 AI 不只是回答问题，还能自主决定调什么工具、查什么数据。

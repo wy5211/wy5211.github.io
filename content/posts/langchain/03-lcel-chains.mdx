@@ -1,0 +1,448 @@
+---
+title: "03 LCEL 与链式调用：像管道一样组装 AI 逻辑"
+date: "2026-04-14"
+summary: "掌握 LangChain Expression Language（LCEL），用管道语法串联 AI 工作流——条件路由、并行分支、流式输出，像 Unix 管道一样优雅。"
+tags: ["LangChain", "LCEL", "Chain", "Runnable", "TypeScript"]
+category: "langchain"
+cover: ""
+draft: false
+series: "LangChain.js 实战"
+seriesOrder: 3
+---
+
+前两篇我们掌握了三个基础积木：Model、Prompt Template、Output Parser。但单独的积木只是零件，真正的价值在于**组合**。
+
+这一篇的主角是 LCEL（LangChain Expression Language）。它让你用管道语法把积木串起来——`prompt.pipe(model).pipe(parser)` 已经见过，现在我们深入管道能做的更多事情：条件路由、并行分支、批处理、流式输出。
+
+我们的目标是：为客服助手构建一个**意图识别 + 路由**链——用户消息进来，先判断意图（咨询/投诉/查询），再路由到不同的处理逻辑。
+
+## 为什么需要链式调用
+
+一个真实的 AI 应用很少只有一步。以客服助手为例，处理一条用户消息可能需要：
+
+```
+用户消息
+  → 意图识别（是咨询、投诉还是查询？）
+  → 路由到不同处理链
+    → 咨询类：查知识库 → 生成回答
+    → 投诉类：提取关键信息 → 生成安抚话术 → 通知人工客服
+    → 查询类：提取查询参数 → 调数据库 → 格式化结果
+  → 统一输出格式
+```
+
+如果手动写这个流程，代码会是一堆嵌套的 if-else 和 try-catch。LCEL 用管道思维解决这个问题——每个步骤是一个独立的" Runnable "，通过 `pipe` 串联。
+
+## Runnable：管道的基本单元
+
+LCEL 的一切都建立在 `Runnable` 接口上。Model、Prompt Template、Output Parser 都是 Runnable。Runnable 有三个核心方法：
+
+```typescript
+// 1. invoke —— 处理单个输入，返回单个输出
+const result = await runnable.invoke(input);
+
+// 2. batch —— 批量处理多个输入
+const results = await runnable.batch([input1, input2, input3]);
+
+// 3. stream —— 流式输出（逐 token 返回）
+const stream = await runnable.stream(input);
+for await (const chunk of stream) {
+  process.stdout.write(chunk);
+}
+```
+
+这三个方法**每个 Runnable 都有**。你用 `pipe` 组合出来的链也是一个 Runnable，同样支持这三个方法。这意味着：
+
+```typescript
+// 单个组件支持批处理
+const results = await model.batch([msg1, msg2, msg3]);
+
+// 组合后的链也自动支持批处理
+const chain = prompt.pipe(model).pipe(parser);
+const results = await chain.batch([input1, input2, input3]);
+// 无需额外代码，LCEL 自动处理并发和错误
+```
+
+## 管道组合：pipe
+
+最简单的组合就是线性管道——上一步的输出是下一步的输入：
+
+```typescript
+const chain = prompt.pipe(model).pipe(parser);
+
+// 等价于：
+// input → prompt.invoke(input) → model.invoke(promptOutput) → parser.invoke(modelOutput)
+```
+
+数据像水流过管道，每个环节做自己的事。这种方式的好处是：**每个环节可以独立测试和替换**。
+
+### RunnableSequence：显式的管道
+
+`pipe` 返回的是 `RunnableSequence`。你也可以显式创建：
+
+```typescript
+import { RunnableSequence } from "@langchain/core/runnables";
+
+const chain = RunnableSequence.from([prompt, model, parser]);
+// 和 prompt.pipe(model).pipe(parser) 效果相同
+```
+
+显式写法在需要动态组合管道时更方便（比如根据配置决定管道中的步骤）。
+
+## 并行分支：RunnableParallel
+
+有些步骤之间没有依赖关系，可以并行执行。比如分析用户反馈时，情感分析和关键词提取可以同时进行：
+
+```typescript
+import { RunnableParallel } from "@langchain/core/runnables";
+
+const sentimentChain = ChatPromptTemplate.fromTemplate(
+  "分析以下文本的情感（正面/负面/中性），只输出一个词：\n{text}"
+).pipe(model);
+
+const keywordsChain = ChatPromptTemplate.fromTemplate(
+  "从以下文本中提取 3-5 个关键词，用逗号分隔：\n{text}"
+).pipe(model);
+
+// 两个分支并行执行，共享同一个输入
+const parallel = RunnableParallel.from({
+  sentiment: sentimentChain,
+  keywords: keywordsChain,
+});
+
+const result = await parallel.invoke({
+  text: "你们的 API 响应速度从上个月开始变慢了，P99 从 200ms 涨到了 1.2s，严重影响我们的用户体验",
+});
+
+// result = {
+//   sentiment: AIMessage { content: "负面" },
+//   keywords: AIMessage { content: "API, 响应速度, P99, 用户体验" }
+// }
+```
+
+两个链共享 `{text}` 输入，各自独立运行，结果合并到一个对象里。
+
+### 用对象语法创建并行
+
+`RunnableParallel.from()` 接受一个对象，key 是结果字段名，value 是 Runnable：
+
+```typescript
+// 等价的写法
+const parallel = new RunnableParallel({
+  sentiment: sentimentChain,
+  keywords: keywordsChain,
+});
+```
+
+## 条件路由：RunnableBranch
+
+客服助手需要根据用户意图走不同的处理链。`RunnableBranch` 实现条件路由：
+
+```typescript
+import { RunnableBranch } from "@langchain/core/runnables";
+
+// 定义意图识别链
+const intentPrompt = ChatPromptTemplate.fromTemplate(
+  `判断用户消息的意图类别，只输出一个类别名：
+- "consult"（产品咨询）
+- "complain"（投诉）
+- "query"（查询订单/套餐等信息）
+
+用户消息：{message}`
+);
+const intentChain = intentPrompt.pipe(model);
+
+// 定义三类处理链
+const consultChain = ChatPromptTemplate.fromTemplate(
+  `你是一个专业的客服。用户在咨询产品问题，请友好地回答：
+用户问题：{message}`
+).pipe(model);
+
+const complainChain = ChatPromptTemplate.fromTemplate(
+  `你是一个有同理心的客服。用户在投诉，请先安抚情绪，然后提供解决方案。
+如果问题严重，建议转人工客服。
+用户投诉：{message}`
+).pipe(model);
+
+const queryChain = ChatPromptTemplate.fromTemplate(
+  `你是一个高效的客服。用户在查询信息，请提取查询参数并回答：
+用户查询：{message}`
+).pipe(model);
+
+// 组装路由
+// 每个分支是一个 [condition, runnable] 对
+// condition 接收当前数据，返回 boolean
+// 第一个匹配的分支会被执行
+const branch = RunnableBranch.from([
+  [
+    (data: { intent: string; message: string }) =>
+      data.intent.includes("consult"),
+    consultChain,
+  ],
+  [
+    (data: { intent: string; message: string }) =>
+      data.intent.includes("complain"),
+    complainChain,
+  ],
+  [
+    (data: { intent: string; message: string }) =>
+      data.intent.includes("query"),
+    queryChain,
+  ],
+  // 最后一个是默认分支（没有 condition）
+  consultChain,
+]);
+```
+
+但这里有个问题：`intentChain` 的输出和 `branch` 需要的输入（`{intent, message}`）怎么衔接？需要一个中间步骤把识别结果和原始消息打包。
+
+### 完整的意图识别 + 路由链
+
+```typescript
+import { RunnablePassthrough } from "@langchain/core/runnables";
+
+// RunnablePassthrough 的作用：原样传递输入
+// 在并行分支中用于"保留原始数据"
+
+const fullChain = RunnableSequence.from([
+  // 第一步：并行执行——识别意图 + 保留原始消息
+  RunnableParallel.from({
+    intent: intentChain.pipe(
+      // 提取 AIMessage 中的文本内容
+      (msg: any) => msg.content.toString().trim().toLowerCase()
+    ),
+    message: new RunnablePassthrough(),
+  }),
+  // 第二步：根据意图路由到不同处理链
+  branch,
+]);
+
+// 调用
+const result1 = await fullChain.invoke(
+  "你们这个产品怎么连导出功能都没有？我付了钱的！"
+);
+// 走 complainChain
+
+const result2 = await fullChain.invoke(
+  "企业版和个人版在权限管理上有什么区别？"
+);
+// 走 consultChain
+
+const result3 = await fullChain.invoke("帮我查一下订单 ORD-20250608-3847");
+// 走 queryChain
+```
+
+`RunnablePassthrough` 在这里很关键——它把原始输入（用户消息）原封不动地传到下一步。这样路由分支就能同时拿到识别出的意图和原始消息。
+
+## RunnablePassthrough 的用法
+
+`RunnablePassthrough` 是 LCEL 中的"直通管"，主要用于两种场景：
+
+**1. 在并行分支中保留原始输入**
+
+```typescript
+RunnableParallel.from({
+  // 新计算的值
+  analysis: analysisChain,
+  // 原样传递原始输入
+  original: new RunnablePassthrough(),
+});
+```
+
+**2. 给输入添加额外字段**
+
+```typescript
+// 给数据加上时间戳
+new RunnablePassthrough().assign({
+  timestamp: () => new Date().toISOString(),
+});
+// 输入 { message: "hello" }
+// 输出 { message: "hello", timestamp: "2026-04-14T10:30:00.000Z" }
+```
+
+`.assign()` 方法在保留原始字段的同时添加新字段，比手动展开 `{...input, extra}` 更清晰。
+
+## 批处理：batch
+
+当你有大量数据需要处理时，`batch` 比循环调用 `invoke` 高效得多：
+
+```typescript
+const feedbacks = [
+  "移动端在弱网环境下提交订单失败",
+  "新版搜索功能太棒了，终于支持模糊匹配了",
+  "团队协作的权限管理太复杂了，能不能简化一下",
+  "导出的 Excel 文件格式乱了，日期列显示的是时间戳",
+];
+
+// batch 自动处理并发和错误
+// 第二个参数是配置项，concurrency 控制最大并发数
+const results = await chain.batch(
+  feedbacks.map((fb) => ({ feedback: fb, formatInstructions })),
+  { maxConcurrency: 3 }
+);
+
+// results 是一个数组，顺序和输入对应
+```
+
+LCEL 的 `batch` 内部做了并发控制——不会一次性发 100 个请求把 API 打爆，而是按 `maxConcurrency` 控制并发数。失败的请求会抛出错误，不会影响其他请求。
+
+## 流式输出：stream
+
+对话场景中，用户不想等 10 秒看到完整回复。`stream` 让 LLM 的输出逐 token 返回：
+
+```typescript
+const chain = prompt.pipe(model); // 注意：不要加 parser，流式输出无法解析
+
+const stream = await chain.stream({
+  message: "企业版和个人版有什么区别？",
+});
+
+// 逐块输出
+for await (const chunk of stream) {
+  process.stdout.write(chunk.content.toString());
+}
+// 输出：企业版和个人版的主要区别在于...
+```
+
+> 注意：流式输出和 Output Parser 不兼容。因为 parser 需要完整的输出才能解析 JSON。如果既要流式又要结构化，通常的做法是：流式输出给用户看，等完整输出后再解析。
+
+## 用 map 做数据转换
+
+有时候管道中间需要做简单的数据转换（不是 LLM 调用，只是 JS 函数）。用 `Runnable.map`：
+
+```typescript
+import { RunnableLambda } from "@langchain/core/runnables";
+
+// 把 AIMessage 转换成纯文本
+const extractText = RunnableLambda.from((msg: any) => msg.content.toString());
+
+// 在管道中使用
+const chain = intentPrompt
+  .pipe(model)
+  .pipe(extractText) // AIMessage → string
+  .pipe((text: string) => text.trim().toLowerCase()); // 简单转换
+```
+
+`RunnableLambda.from()` 把普通 JS 函数包装成 Runnable，让它能参与管道组合。
+
+## 完整示例：客服意图路由
+
+把上面的知识组合起来，构建一个完整的意图路由链：
+
+```typescript
+import {
+  RunnableSequence,
+  RunnableParallel,
+  RunnableBranch,
+  RunnablePassthrough,
+  RunnableLambda,
+} from "@langchain/core/runnables";
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+
+const model = new ChatOpenAI({ modelName: "gpt-4o-mini", temperature: 0 });
+
+// 意图识别
+const intentPrompt = ChatPromptTemplate.fromTemplate(
+  `判断意图类别，只输出一个词（consult/complain/query）：
+用户消息：{message}`
+);
+const intentChain = intentPrompt
+  .pipe(model)
+  .pipe(
+    RunnableLambda.from((msg: any) =>
+      msg.content.toString().trim().toLowerCase()
+    )
+  );
+
+// 三类处理链
+const consultPrompt = ChatPromptTemplate.fromTemplate(
+  `你是 TaskFlow Pro 的客服。用户在咨询产品问题，请基于你的知识友好回答。如果不确定，建议用户查看帮助文档。
+用户问题：{message}`
+);
+const complainPrompt = ChatPromptTemplate.fromTemplate(
+  `你是有同理心的客服。用户在投诉，先安抚情绪，然后说明会转交相关人员处理。
+用户投诉：{message}`
+);
+const queryPrompt = ChatPromptTemplate.fromTemplate(
+  `用户在查询信息。请提取可能的查询关键词并告知用户你能帮他查什么（目前支持：订单状态、套餐信息、账单记录）。
+用户查询：{message}`
+);
+
+// 路由
+const router = RunnableBranch.from([
+  [(data: any) => data.intent === "consult", consultPrompt.pipe(model)],
+  [(data: any) => data.intent === "complain", complainPrompt.pipe(model)],
+  [(data: any) => data.intent === "query", queryPrompt.pipe(model)],
+  consultPrompt.pipe(model), // 默认
+]);
+
+// 完整链
+const chain = RunnableSequence.from([
+  // 并行：识别意图 + 保留原始消息
+  RunnableParallel.from({
+    intent: intentChain,
+    message: new RunnablePassthrough<{ message: string }>().pipe(
+      RunnableLambda.from((input: any) =>
+        typeof input === "string" ? input : input.message
+      )
+    ),
+  }),
+  // 路由
+  router,
+]);
+
+// 测试
+const results = await chain.batch([
+  { message: "企业版的权限管理支持自定义角色吗？" },
+  { message: "我已经提交工单三天了还没人回复，什么效率！" },
+  { message: "帮我查一下上个季度的账单" },
+]);
+
+results.forEach((r: any) =>
+  console.log(r.content.toString().slice(0, 80), "\n---")
+);
+```
+
+## 管道思维的核心
+
+LCEL 的设计哲学来自 Unix 管道：
+
+| Unix 概念          | LCEL 对应              | 说明             |
+| ------------------ | ---------------------- | ---------------- | -------------------------- |
+| `                  | ` 管道符               | `.pipe()`        | 上一步的输出是下一步的输入 |
+| `cat file`         | Prompt Template        | 生成数据         |
+| `grep pattern`     | Model                  | 处理数据         |
+| `awk '{print $1}'` | Output Parser / Lambda | 转换格式         |
+| `tee`              | `RunnablePassthrough`  | 分流保留原始数据 |
+| `&` 后台并行       | `RunnableParallel`     | 多个任务同时跑   |
+| `if-else`          | `RunnableBranch`       | 条件路由         |
+
+这种思维的好处是：**复杂流程变得可视化**。你读完管道定义，就知道数据怎么流转，不需要跳转到各个函数去理解。
+
+## 什么时候用 LCEL，什么时候用普通函数
+
+LCEL 不是银弹。简单的 if-else 不需要 RunnableBranch：
+
+```typescript
+// 简单逻辑 —— 直接写函数，不要过度抽象
+if (urgency === "高") {
+  notifyOnCall();
+}
+
+// 多步骤 AI 流程 —— 用 LCEL，每个步骤独立、可测试、可替换
+const chain = prompt.pipe(model).pipe(parser);
+```
+
+一个判断标准：如果流程中有 **2 个以上的 LLM 调用**，或者需要**批处理/流式输出**，LCEL 值得用。如果只是"调一次 API，处理一下结果"，普通函数更直接。
+
+## 这一篇你学到了什么
+
+- **Runnable** 是 LCEL 的基本单元，每个组件（Model、Prompt、Parser）都是 Runnable
+- **pipe** 串联步骤，上一步输出 = 下一步输入
+- **RunnableParallel** 并行执行多个分支
+- **RunnableBranch** 条件路由，根据中间结果走不同路径
+- **RunnablePassthrough** 在管道中保留原始数据
+- **batch** 批量处理，自动控制并发
+- **stream** 流式输出，逐 token 返回
+
+下一篇，我们在管道中加入**记忆**——让 LLM 记住用户之前说过的话，实现真正的多轮对话。
