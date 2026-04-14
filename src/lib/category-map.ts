@@ -45,6 +45,7 @@ export const categoryToDirMap: Record<string, string> = {
   // 新系列
   langchain: "langchain",
   rag: "rag",
+  tailwind: "tailwind",
 };
 
 // 目录名到分类名的反向映射
@@ -92,4 +93,5 @@ export const dirToCategoryMap: Record<string, string> = {
   // 新系列
   langchain: "langchain",
   rag: "rag",
+  tailwind: "tailwind",
 };
