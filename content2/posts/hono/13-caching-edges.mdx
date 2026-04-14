@@ -1,0 +1,467 @@
+---
+title: "13. 边缘缓存策略"
+date: "2026-03-20"
+summary: "掌握边缘缓存技术，学习 HTTP 缓存头、CDN 缓存策略、KV 存储缓存，以及实现智能缓存失效机制。"
+tags: ["Hono", "Caching", "CDN", "Cloudflare KV", "Performance"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 13
+---
+
+## 前言
+
+在上一篇文章中，我们实现了各种安全措施来保护博客 API。现在我们的应用已经很安全了，但性能可能还有提升空间。
+
+你可能会发现，有些请求的数据其实很少变化，比如文章列表、热门文章、用户信息等。每次请求都去数据库查询，既慢又消耗资源。更糟糕的是，在边缘环境中，数据库可能在远方，每次查询的网络延迟都很大。
+
+缓存就是解决这个问题的方案。把频繁访问但很少变化的数据存储在离用户更近的地方，下次请求时直接返回缓存的数据，不需要查询数据库。这能大幅提升响应速度，减轻数据库负载，提升用户体验。
+
+在边缘计算环境中，缓存尤为重要。因为边缘节点遍布全球，如果能在边缘节点缓存数据，用户访问时就能从最近的边缘节点获取数据，而不是每次都回源查询。
+
+在本篇文章中，我们将学习如何为博客 API 实现多层缓存策略：HTTP 缓存头让浏览器和 CDN 缓存静态资源，KV 存储备存热点数据，以及如何智能地失效缓存。
+
+## 为什么需要缓存
+
+你可能在想，我的博客 API 流量不大，数据库性能也够用，为什么还要费心做缓存？
+
+让我举个例子说明缓存的价值。假设你的博客有一篇热门文章，每秒被访问 100 次。如果不缓存，每次访问都要查询数据库，数据库每秒要处理 100 次查询。如果缓存了文章内容，缓存命中后直接返回，数据库压力会降到接近零。
+
+缓存的好处不只是性能，还包括：
+
+- 降低成本：减少数据库查询和计算资源使用
+- 提升可用性：即使数据库暂时不可用，缓存数据仍可访问
+- 提升扩展性：相同硬件能处理更多请求
+
+不过缓存也有代价：增加了复杂度，需要处理缓存失效、数据一致性等问题。对于读写比例高的场景（读多写少），缓存的价值最大。博客正是这样的场景。
+
+## HTTP 缓存头
+
+HTTP 缓存是最基础的缓存方式，通过设置响应头告诉浏览器和 CDN 如何缓存资源。
+
+```typescript
+import { Hono } from "hono";
+
+const app = new Hono();
+
+// 静态资源长期缓存
+app.get("/static/*", (c) => {
+  c.header("Cache-Control", "public, max-age=31536000, immutable");
+  // public: 可被 CDN 和浏览器缓存
+  // max-age=31536000: 缓存 1 年
+  // immutable: 资源永不改变（适合带 hash 的文件名）
+
+  return c.file(...);
+});
+
+// API 响应短期缓存
+app.get("/api/posts", async (c) => {
+  const posts = await getPosts();
+
+  c.header("Cache-Control", "public, max-age=60, s-maxage=300");
+  // max-age: 浏览器缓存 60 秒
+  // s-maxage: CDN 缓存 300 秒（5 分钟）
+
+  return c.json(posts);
+});
+
+// 动态内容不缓存
+app.get("/api/user/profile", authMiddleware, (c) => {
+  const user = c.get("user");
+
+  c.header("Cache-Control", "no-store, no-cache, must-revalidate");
+  // no-store: 不缓存
+  // no-cache: 每次都验证
+  // must-revalidate: 必须验证过期缓存
+
+  return c.json(user);
+});
+```
+
+这段代码根据不同类型的内容设置了不同的缓存策略。静态资源（CSS、JS、图片）可以长期缓存，因为它们很少变化。API 响应可以短期缓存，因为它们可能会更新。用户个人信息这类动态内容则不应该缓存。
+
+## ETag 和 Last-Modified
+
+除了 Cache-Control，我们还可以用 ETag 和 Last-Modified 来实现更精细的缓存控制。
+
+```typescript
+app.get("/api/posts/:id", async (c) => {
+  const post = await getPost(c.req.param("id"));
+
+  // 生成 ETag（内容的哈希值）
+  const etag = generateETag(post);
+  const ifNoneMatch = c.req.header("if-none-match");
+
+  if (ifNoneMatch === etag) {
+    // 内容未变化，返回 304
+    return c.body(null, 304);
+  }
+
+  // 生成 Last-Modified（最后修改时间）
+  const lastModified = post.updatedAt.toUTCString();
+  const ifModifiedSince = c.req.header("if-modified-since");
+
+  if (ifModifiedSince === lastModified) {
+    return c.body(null, 304);
+  }
+
+  c.header("ETag", etag);
+  c.header("Last-Modified", lastModified);
+  c.header("Cache-Control", "public, max-age=3600");
+
+  return c.json(post);
+});
+
+function generateETag(data: any): string {
+  // 简单实现：用内容的 MD5 作为 ETag
+  const content = JSON.stringify(data);
+  return require("crypto").createHash("md5").update(content).digest("hex");
+}
+```
+
+ETag 是内容哈希值，Last-Modified 是最后修改时间。客户端下次请求时会带上这些值，服务器判断内容是否变化。如果没变化，返回 304 状态码，不传输内容体，节省带宽。
+
+## KV 存储缓存
+
+HTTP 缓存头主要适合静态资源和简单 API。对于复杂的查询结果，我们可以用 KV 存储来缓存。
+
+Cloudflare KV 是一个分布式的键值存储，非常适合做缓存。它在全球有多个节点，数据会自动复制到离用户近的节点。
+
+```typescript
+app.get("/api/posts/:id", async (c) => {
+  const { id } = c.req.param();
+  const cache = c.env.CACHE; // KV 绑定
+
+  // 尝试从缓存获取
+  const cached = await cache.get(`post:${id}`, "json");
+
+  if (cached) {
+    c.header("X-Cache", "HIT");
+    return c.json(cached);
+  }
+
+  // 缓存未命中，查询数据库
+  const post = await db.query.posts.findFirst({
+    where: eq(posts.id, id),
+  });
+
+  if (!post) {
+    return c.json({ error: "Post not found" }, 404);
+  }
+
+  // 写入缓存（1 小时）
+  await cache.put(`post:${id}`, JSON.stringify(post), {
+    expirationTtl: 3600,
+  });
+
+  c.header("X-Cache", "MISS");
+  return c.json(post);
+});
+```
+
+这段代码先尝试从 KV 获取文章，如果缓存命中直接返回。如果缓存未命中，查询数据库后写入缓存。X-Cache 头用于调试，可以看到缓存是否命中。
+
+## 批量缓存
+
+有时候我们需要一次获取多个资源，比如获取多个用户的信息。如果每个用户都查一次缓存，效率很低。KV 支持批量操作，我们可以优化。
+
+```typescript
+app.get("/api/users", async (c) => {
+  const ids = c.req.query("ids").split(",");
+  const cache = c.env.CACHE;
+
+  // 批量获取缓存
+  const cachedUsers = await Promise.all(
+    ids.map((id) => cache.get(`user:${id}`, "json"))
+  );
+
+  // 找出未缓存的用户 ID
+  const missingIds = ids.filter((_, i) => !cachedUsers[i]);
+
+  // 查询未缓存用户
+  let fetchedUsers = [];
+  if (missingIds.length > 0) {
+    fetchedUsers = await db.query.users.findMany({
+      where: sql`${users.id} IN ${sql.raw(`('${missingIds.join("','")}')`)}`,
+    });
+
+    // 批量写入缓存
+    await Promise.all(
+      fetchedUsers.map((user) =>
+        cache.put(`user:${user.id}`, JSON.stringify(user), {
+          expirationTtl: 3600,
+        })
+      )
+    );
+  }
+
+  // 合并结果
+  const users = ids.map((id, i) => {
+    if (cachedUsers[i]) return cachedUsers[i];
+    return fetchedUsers.find((u) => u.id === id);
+  });
+
+  return c.json({ users });
+});
+```
+
+这段代码先批量从缓存获取用户，只查询缓存未命中的用户，然后把结果合并。这样减少了数据库查询次数。
+
+## 缓存失效
+
+缓存最大的挑战是什么时候失效。如果我们更新了文章，但缓存还是旧数据，用户就会看到过时的内容。
+
+最简单的方法是更新数据时删除相关缓存：
+
+```typescript
+app.put("/api/posts/:id", authMiddleware, async (c) => {
+  const { id } = c.req.param();
+  const data = await c.req.json();
+
+  // 更新数据库
+  const [post] = await db
+    .update(posts)
+    .set({ ...data, updatedAt: new Date() })
+    .where(eq(posts.id, id))
+    .returning();
+
+  // 删除缓存
+  const cache = c.env.CACHE;
+  await cache.delete(`post:${id}`);
+
+  // 删除相关缓存（比如文章列表）
+  await cache.delete("posts:list");
+
+  return c.json(post);
+});
+```
+
+更复杂的场景是标签失效。我们可以给缓存加上标签，失效时删除所有带某个标签的缓存：
+
+```typescript
+// 写入缓存时添加标签
+async function setWithTags(
+  cache: KVNamespace,
+  key: string,
+  value: any,
+  tags: string[],
+  ttl: number
+) {
+  // 存储数据和标签
+  await cache.put(key, JSON.stringify(value), {
+    expirationTtl: ttl,
+    metadata: { tags },
+  });
+}
+
+// 按标签失效缓存
+async function invalidateByTag(cache: KVNamespace, tag: string) {
+  // 列出所有键
+  const keys = await cache.list();
+
+  // 检查每个键的标签
+  for (const key of keys.keys) {
+    const { value, metadata } = await cache.getWithMetadata(key.name, "json");
+
+    if (metadata?.tags?.includes(tag)) {
+      await cache.delete(key.name);
+    }
+  }
+}
+
+// 使用
+await setWithTags(cache, "post:123", postData, ["post", "post:123"], 3600);
+await invalidateByTag(cache, "post"); // 删除所有文章相关缓存
+```
+
+## 分层缓存
+
+单个缓存层可能不够，我们可以实现多层缓存：L1 内存缓存（最快）、L2 KV 缓存（快速）、L3 数据库（慢）。
+
+```typescript
+class CacheManager {
+  private memoryCache = new Map<string, { data: any; expires: number }>();
+
+  async get(key: string, env: any): Promise<any> {
+    // L1: 检查内存缓存
+    const memData = this.memoryCache.get(key);
+    if (memData && memData.expires > Date.now()) {
+      return memData.data;
+    }
+
+    // L2: 检查 KV 缓存
+    const kvData = await env.CACHE.get(key, "json");
+    if (kvData) {
+      // 写入内存缓存
+      this.memoryCache.set(key, {
+        data: kvData,
+        expires: Date.now() + 60000, // 1 分钟
+      });
+      return kvData;
+    }
+
+    // L3: 缓存未命中
+    return null;
+  }
+
+  async set(key: string, value: any, env: any, ttl: number): Promise<void> {
+    // 写入内存缓存
+    this.memoryCache.set(key, {
+      data: value,
+      expires: Date.now() + 60000,
+    });
+
+    // 写入 KV 缓存
+    await env.CACHE.put(key, JSON.stringify(value), {
+      expirationTtl: ttl,
+    });
+  }
+
+  async delete(key: string, env: any): Promise<void> {
+    // 删除所有层级缓存
+    this.memoryCache.delete(key);
+    await env.CACHE.delete(key);
+  }
+}
+
+const cacheManager = new CacheManager();
+
+// 使用
+app.get("/api/posts/:id", async (c) => {
+  const { id } = c.req.param();
+
+  // 尝试从缓存获取
+  const cached = await cacheManager.get(`post:${id}`, c.env);
+
+  if (cached) {
+    return c.json(cached);
+  }
+
+  // 从数据库获取
+  const post = await db.query.posts.findFirst({
+    where: eq(posts.id, id),
+  });
+
+  // 写入缓存
+  await cacheManager.set(`post:${id}`, post, c.env, 600);
+
+  return c.json(post);
+});
+```
+
+## 缓存预热
+
+缓存预热是在系统启动或定时任务中，提前把热点数据加载到缓存。这样用户第一次请求时就能从缓存获取，避免冷启动。
+
+```typescript
+// 预热热门文章
+async function warmupCache(env: any) {
+  const popularPosts = await db.query.posts.findMany({
+    where: eq(posts.featured, true),
+    limit: 100,
+  });
+
+  // 批量写入缓存
+  await Promise.all(
+    popularPosts.map((post) =>
+      env.CACHE.put(`post:${post.id}`, JSON.stringify(post), {
+        expirationTtl: 3600,
+      })
+    )
+  );
+}
+
+// Cloudflare Workers Cron 触发器
+export default {
+  async scheduled(event: any, env: any, ctx: any) {
+    // 每小时预热缓存
+    await warmupCache(env);
+  },
+};
+```
+
+## 缓存监控
+
+为了了解缓存的效果，我们需要监控缓存命中率。命中率越高说明缓存越有效。
+
+```typescript
+class CacheMetrics {
+  private hits = 0;
+  private misses = 0;
+
+  hit() {
+    this.hits++;
+  }
+
+  miss() {
+    this.misses++;
+  }
+
+  getHitRate(): number {
+    const total = this.hits + this.misses;
+    return total > 0 ? this.hits / total : 0;
+  }
+
+  getStats() {
+    return {
+      hits: this.hits,
+      misses: this.misses,
+      hitRate: this.getHitRate(),
+    };
+  }
+}
+
+const cacheMetrics = new CacheMetrics();
+
+// 使用
+app.get("/api/posts/:id", async (c) => {
+  const cached = await cache.get(`post:${id}`);
+
+  if (cached) {
+    cacheMetrics.hit();
+    c.header("X-Cache-Status", "HIT");
+    return c.json(cached);
+  }
+
+  cacheMetrics.miss();
+  c.header("X-Cache-Status", "MISS");
+
+  const post = await db.query.posts.findFirst({
+    where: eq(posts.id, id),
+  });
+
+  await cache.set(`post:${id}`, post);
+
+  return c.json(post);
+});
+
+// 监控端点
+app.get("/api/cache/stats", (c) => {
+  return c.json(cacheMetrics.getStats());
+});
+```
+
+## Trade-off 分析
+
+缓存虽然能提升性能，但也有一些权衡：
+
+**缓存 vs 一致性**
+
+缓存越多，数据一致性问题越严重。如果数据更新了但缓存还是旧的，用户会看到错误数据。需要根据业务需求平衡缓存时间和数据一致性。
+
+**缓存空间 vs 缓存命中率**
+
+缓存空间越大，能缓存的数据越多，命中率越高。但缓存空间也是成本，需要权衡。
+
+**缓存复杂度 vs 维护成本**
+
+多层缓存、缓存预热、智能失效等功能提升了缓存效果，但也增加了系统复杂度和维护成本。对于小型应用，简单的缓存策略可能就够用。
+
+## 小结
+
+在这篇文章中，我们学习了如何为博客 API 实现多层缓存策略。我们学习了 HTTP 缓存头让浏览器和 CDN 缓存静态资源，用 KV 存储备存热点数据，实现了分层缓存和缓存预热，以及如何智能地失效缓存。
+
+缓存是提升应用性能最有效的方法之一。对于读多写少的应用（如博客），合理的缓存策略能让性能提升数倍。不过缓存也增加了复杂度，需要仔细设计缓存失效策略，保证数据一致性。
+
+下一篇我们将学习如何为应用编写测试，确保代码质量和功能正确性。

@@ -1,0 +1,365 @@
+---
+title: "02 模块与依赖注入：告别意大利面条代码"
+date: "2026-03-30"
+summary: "从 Express 项目的真实痛点出发，理解 NestJS 模块化架构和 IoC 容器的工作原理。"
+tags: ["NestJS", "模块化", "依赖注入", "架构设计"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式学习"
+seriesOrder: 2
+---
+
+# 模块与依赖注入：告别意大利面条代码
+
+上一篇我们搭好了健康检查服务的基础骨架，代码总共不到 30 行，看起来清爽干净。但真实项目不会只有这一种功能——数据库连接、配置管理、各种业务模块都会加进来。如果全堆在根模块里，不出三个月你就会得到一个 2000 行的 `app.module.ts`。
+
+这篇文章要解决的就是这个问题：**怎么把代码拆到合理的位置，同时让各部分之间能正确协作**。
+
+## 先看看不加控制会变成什么样
+
+假设你的 Express 项目写了半年，现在要加一个用户注册功能。你需要访问数据库，需要读配置，需要发邮件。最自然的写法是在路由文件里直接 require 各种东西：
+
+```javascript
+// Express 项目的典型灾难现场
+const express = require("express");
+const { Pool } = require("pg");
+const { config } = require("dotenv");
+const nodemailer = require("nodemailer");
+
+config();
+
+const db = new Pool({ connectionString: process.env.DATABASE_URL });
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST,
+  // ...
+});
+
+const app = express();
+
+app.post("/register", async (req, res) => {
+  const { email, password } = req.body;
+  // 数据库操作、密码哈希、邮件发送全堆在这里
+  const user = await db.query("INSERT INTO users ...");
+  await transporter.sendMail({ to: email, subject: "欢迎注册" });
+  res.json(user);
+});
+
+// 50 个路由文件，互相 require，形成一张依赖网
+const authRoutes = require("./routes/auth")(db, transporter);
+const userRoutes = require("./routes/user")(db);
+const orderRoutes = require("./routes/order")(db, transporter);
+```
+
+这种写法有几个致命问题。第一，每个路由文件都要手动传入 `db`、`transporter` 等依赖，文件之间形成了错综复杂的 require 链——这就是所谓的"意大利面条"。第二，如果你想把 `nodemailer` 换成另一个邮件库，得改每个传入了 `transporter` 的文件。第三，单元测试基本没法写，因为你没法轻易 mock 掉数据库连接。
+
+NestJS 用两个机制来解决这些问题：**模块（Module）** 定义代码的组织边界，**依赖注入（DI）** 管理组件之间的协作关系。
+
+## 把健康检查服务拆成模块
+
+上一篇的健康检查接口把内存信息直接写在 Service 里。但在真实项目中，数据库连接状态、应用配置、内存监控通常是独立的能力，它们可能被不同的模块使用。我们把它们拆开。
+
+先创建一个配置模块，统一管理环境变量：
+
+```typescript
+// src/config/config.module.ts
+import { Module } from "@nestjs/common";
+import { ConfigService } from "./config.service";
+
+@Module({
+  providers: [ConfigService],
+  exports: [ConfigService], // 导出，其他模块才能使用
+})
+export class ConfigModule {}
+```
+
+```typescript
+// src/config/config.service.ts
+import { Injectable } from "@nestjs/common";
+
+@Injectable()
+export class ConfigService {
+  private readonly config = {
+    app: {
+      name: process.env.APP_NAME ?? "health-check-api",
+      port: parseInt(process.env.PORT ?? "3000", 10),
+      env: process.env.NODE_ENV ?? "development",
+    },
+    database: {
+      host: process.env.DB_HOST ?? "localhost",
+      port: parseInt(process.env.DB_PORT ?? "5432", 10),
+      name: process.env.DB_NAME ?? "healthcheck",
+    },
+  };
+
+  get<K extends keyof typeof this.config>(key: K): (typeof this.config)[K] {
+    return this.config[key];
+  }
+}
+```
+
+注意这里有两个关键动作：`ConfigService` 上加了 `@Injectable()` 装饰器，告诉 NestJS "这个东西可以被注入到其他类里"；`ConfigModule` 的 `exports` 数组里声明了 `ConfigService`，告诉 NestJS "这个服务允许其他模块使用"。如果只放在 `providers` 里而不 `exports`，它就只能在当前模块内部用——这是 NestJS 的封装机制。
+
+接下来创建一个数据库模块，负责数据库连接状态的检查：
+
+```typescript
+// src/database/database.module.ts
+import { Module } from "@nestjs/common";
+import { DatabaseService } from "./database.service";
+
+@Module({
+  providers: [DatabaseService],
+  exports: [DatabaseService],
+})
+export class DatabaseModule {}
+```
+
+```typescript
+// src/database/database.service.ts
+import { Injectable } from "@nestjs/common";
+import { ConfigService } from "../config/config.service";
+
+@Injectable()
+export class DatabaseService {
+  private connected = false;
+
+  constructor(private configService: ConfigService) {
+    // 模拟数据库连接
+    this.connect();
+  }
+
+  private async connect() {
+    const { host, port, name } = this.configService.get("database");
+    // 真实项目中这里会是实际的数据库连接逻辑
+    console.log(`Connecting to ${host}:${port}/${name}`);
+    this.connected = true;
+  }
+
+  getStatus() {
+    return {
+      connected: this.connected,
+      host: this.configService.get("database").host,
+      database: this.configService.get("database").name,
+      latency: `${Math.floor(Math.random() * 5 + 1)}ms`, // 模拟延迟
+    };
+  }
+}
+```
+
+`DatabaseService` 的构造函数声明了对 `ConfigService` 的依赖。注意我们**没有手动创建 ConfigService 的实例**——只是说"我需要一个 ConfigService"，由 NestJS 的 IoC 容器负责把它注入进来。
+
+## IoC 容器到底做了什么
+
+IoC（Inversion of Control，控制反转）这个名字听着吓人，原理其实很朴素。
+
+正常情况下，如果类 A 需要用类 B，你得自己 `new B()` 出来。这叫"控制正转"——你控制着依赖的创建。IoC 把这个过程反转了：你只声明"我需要什么"，容器帮你把实例创建好并塞进来。
+
+具体到 NestJS，应用启动时会经历这样的过程：
+
+1. 扫描根模块（AppModule）的 `imports`，递归加载所有被引用的模块
+2. 对每个模块的 `providers`，创建实例并缓存在容器中（默认是单例）
+3. 分析每个 provider 的构造函数参数，如果参数类型也是 provider，就把对应的实例注入进去
+4. 如果某个 provider 的依赖还没创建，先创建依赖（递归解决）
+5. 所有 provider 就绪后，初始化控制器并注册路由
+
+这就是为什么 `DatabaseService` 的构造函数里能直接拿到 `ConfigService` 的实例——容器在创建 `DatabaseService` 之前，已经把 `ConfigService` 创建好了。但前提是 `DatabaseModule` 必须在 `imports` 里引入了 `ConfigModule`，否则容器不知道 `DatabaseService` 依赖的东西从哪来。
+
+## @Module 的四个属性
+
+每个模块装饰器都有四个可选属性，理解它们的语义很重要：
+
+```typescript
+@Module({
+  imports: [ConfigModule], // 引入其他模块，获得它们 exports 的东西
+  controllers: [HealthController], // 这个模块拥有哪些 HTTP 控制器
+  providers: [HealthService], // 这个模块内部有哪些服务
+  exports: [HealthService], // 把哪些服务共享给其他模块
+})
+export class HealthModule {}
+```
+
+- **imports**：你用别人的东西，就 import 别人的模块。相当于"我需要访问 ConfigModule 导出的服务"。
+- **controllers**：控制器天然是模块私有的，不会被导出。控制器只在所属模块里生效。
+- **providers**：服务默认也是私有的。不 exports 的话，别的模块拿不到。
+- **exports**：这是模块的公共 API。你 exports 了什么，其他模块就能用什么。
+
+现在把健康检查模块组装起来：
+
+```typescript
+// src/health/health.module.ts
+import { Module } from "@nestjs/common";
+import { HealthController } from "./health.controller";
+import { HealthService } from "./health.service";
+import { ConfigModule } from "../config/config.module";
+import { DatabaseModule } from "../database/database.module";
+
+@Module({
+  imports: [ConfigModule, DatabaseModule],
+  controllers: [HealthController],
+  providers: [HealthService],
+})
+export class HealthModule {}
+```
+
+```typescript
+// src/health/health.service.ts
+import { Injectable } from "@nestjs/common";
+import * as os from "os";
+import { DatabaseService } from "../database/database.service";
+import { ConfigService } from "../config/config.service";
+
+@Injectable()
+export class HealthService {
+  constructor(
+    private databaseService: DatabaseService,
+    private configService: ConfigService
+  ) {}
+
+  getFullReport() {
+    const memUsage = process.memoryUsage();
+    const appConfig = this.configService.get("app");
+
+    return {
+      status: "ok",
+      service: appConfig.name,
+      environment: appConfig.env,
+      timestamp: new Date().toISOString(),
+      uptime: `${Math.floor(process.uptime() / 3600)}h ${Math.floor((process.uptime() % 3600) / 60)}m`,
+      memory: {
+        rss: `${(memUsage.rss / 1024 / 1024).toFixed(2)} MB`,
+        heapUsed: `${(memUsage.heapUsed / 1024 / 1024).toFixed(2)} MB`,
+        heapLimit: `${(memUsage.heapTotal / 1024 / 1024).toFixed(2)} MB`,
+        systemFree: `${(os.freemem() / 1024 / 1024 / 1024).toFixed(2)} GB`,
+      },
+      database: this.databaseService.getStatus(),
+    };
+  }
+}
+```
+
+最后更新根模块，让它只做"汇总"的事：
+
+```typescript
+// src/app.module.ts
+import { Module } from "@nestjs/common";
+import { ConfigModule } from "./config/config.module";
+import { DatabaseModule } from "./database/database.module";
+import { HealthModule } from "./health/health.module";
+
+@Module({
+  imports: [ConfigModule, DatabaseModule, HealthModule],
+})
+export class AppModule {}
+```
+
+根模块现在不包含任何控制器和服务，它只负责把子模块组合起来。这是 NestJS 推荐的根模块写法——越干净越好。
+
+## useFactory、useValue、useClass 分别什么时候用
+
+上面所有 Service 都是通过 `providers: [SomeService]` 这种简写形式声明的，NestJS 会自动把 `SomeService` 作为类来实例化。但有时候你需要更精细的控制。
+
+**useValue**：当你需要注入一个已经创建好的值，比如常量配置、mock 对象。
+
+```typescript
+@Module({
+  providers: [
+    {
+      provide: "APP_VERSION",
+      useValue: "2.4.1",
+    },
+  ],
+})
+export class AppModule {}
+
+// 使用时需要 @Inject 装饰器指定 token
+@Injectable()
+export class SomeService {
+  constructor(@Inject("APP_VERSION") private version: string) {}
+}
+```
+
+用字符串作为 token 是因为 useValue 注入的不是类实例，而是一个原始值，NestJS 没法通过类型推断来找到它。
+
+**useFactory**：当你需要根据运行时条件来创建实例，比如读取环境变量决定连接哪个数据库。
+
+```typescript
+@Module({
+  providers: [
+    {
+      provide: "DB_CONNECTION",
+      useFactory: (configService: ConfigService) => {
+        const { host, port, name } = configService.get("database");
+        // 真实项目中这里会创建实际的数据库连接池
+        return { host, port, name, poolSize: 10 };
+      },
+      inject: [ConfigService], // 声明工厂函数的依赖
+    },
+  ],
+})
+export class DatabaseModule {}
+```
+
+`inject` 数组告诉 NestJS："在调用这个工厂函数之前，先把 ConfigService 的实例准备好，作为参数传进去"。这让你的工厂函数可以依赖其他服务。
+
+**useClass**：当你想根据环境切换实现类。比如开发环境用本地日志，生产环境用结构化日志。
+
+```typescript
+@Module({
+  providers: [
+    {
+      provide: LoggerService,
+      useClass:
+        process.env.NODE_ENV === "production"
+          ? StructuredLoggerService
+          : ConsoleLoggerService,
+    },
+  ],
+})
+export class LoggerModule {}
+```
+
+这样，注入 `LoggerService` 的地方不需要改任何代码，容器会根据环境自动注入对应的实现。这是依赖注入最经典的应用场景之一。
+
+## 循环依赖：为什么会出问题
+
+当模块 A 依赖模块 B，模块 B 又依赖模块 A 时，NestJS 的初始化过程会陷入死循环——它先去创建 A，发现需要 B，转去创建 B，发现需要 A，又转回来。最终抛出 `Circular dependency detected` 错误。
+
+在真实项目中，这种循环依赖往往出现在认证和用户模块之间：AuthService 需要 UserService 来验证用户，UserService 需要 AuthService 来检查权限。
+
+NestJS 提供了 `forwardRef` 作为紧急方案：
+
+```typescript
+// users.module.ts
+@Module({
+  imports: [forwardRef(() => AuthModule)],
+  exports: [UserService],
+})
+export class UsersModule {}
+```
+
+`forwardRef` 把模块引用包装成一个函数，NestJS 在初始化时不会立即解析它，而是等到所有模块都注册完毕后再补全引用关系。这解决了启动时的死循环问题，但本质上是绕过了问题而不是解决了问题。
+
+更根本的做法是重新审视模块边界。如果 UsersModule 和 AuthModule 互相依赖，往往说明有些职责放错了位置。比如"检查用户是否存在"这个逻辑，可以抽到一个独立的 UserLookupService 放在共享模块里，AuthService 和 UserService 都依赖它，但它们之间不再直接互相依赖。
+
+## 全局模块该不该用
+
+给模块加上 `@Global()` 装饰器后，它导出的服务可以在任何地方直接注入，不需要在 imports 里声明。
+
+```typescript
+@Global()
+@Module({
+  providers: [ConfigService],
+  exports: [ConfigService],
+})
+export class ConfigModule {}
+```
+
+这很方便，但也很危险。全局模块让依赖关系变得隐式——你在某个 Service 里注入了 ConfigService，但从模块声明上看不出它从哪来。当项目变大、全局模块变多时，追踪依赖关系会变得困难。
+
+我的建议是：**只在真正"横切关注点"的服务上用全局模块**，比如日志、配置、异常过滤器。业务模块（用户、订单、文章）永远不要做成全局的——它们的依赖关系应该显式声明。
+
+## 什么时候该创建新模块
+
+一个实用的判断标准：如果你发现自己在某个模块里放了超过 3 个 Service，或者某个 Service 的代码超过 200 行，大概率应该拆模块了。模块的粒度按业务领域来划分——"用户"是一个模块，"支付"是一个模块，"通知"是一个模块。不要按技术层来分（一个 controllers 目录、一个 services 目录），那失去了模块化的意义。
+
+模块化做好之后，代码的组织结构清晰了，但我们还没有真正的业务接口。下一篇来设计第一个 API，看看 NestJS 的控制器和路由系统怎么工作。

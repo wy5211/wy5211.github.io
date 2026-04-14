@@ -1,0 +1,450 @@
+---
+title: "13. 分布式锁实现：Redis 分布式锁与 Redlock 算法"
+date: "2026-03-23"
+summary: "深入理解分布式锁的实现原理，掌握 Redis 分布式锁和 Redlock 算法。"
+tags: ["Redis", "分布式锁", "并发控制"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 13
+---
+
+上篇文章我们解决了缓存的三大问题，系统稳定多了。但直播平台有个新需求：每小时要结算一次礼物排行榜，给主播发送收益。
+
+这个结算任务很重，需要遍历所有直播间的礼物数据，计算收益，更新到数据库。如果多个服务器同时跑这个定时任务，可能会重复计算。
+
+怎么保证只有一个服务器执行这个任务？这就是分布式锁要解决的问题。
+
+## 为什么需要分布式锁
+
+你可能觉得这很简单，用 Node.js 的 mutex 或者数据库的锁不就行了？
+
+但问题是：你的直播平台部署了 3 台服务器，每台都跑着定时任务。它们是不同的进程，不能共享内存锁。数据库锁可以，但性能差，而且会增加数据库压力。
+
+Redis 的 SET NX EX 命令天然适合实现分布式锁：NX 保证只有一个客户端能设置成功，EX 保证锁会自动过期，避免死锁。
+
+## 基础分布式锁
+
+先看最简单的实现：
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+class DistributedLock {
+  constructor(private redis: Redis) {}
+
+  // 获取锁
+  async acquire(lockName: string, ttl: number = 30): Promise<string | null> {
+    const lockKey = `lock:${lockName}`;
+    const lockValue = `${Date.now()}-${Math.random()}`; // 唯一标识
+
+    // SET key value NX EX ttl
+    // NX: 仅当 key 不存在时设置
+    // EX: 设置过期时间（秒）
+    const result = await this.redis.set(lockKey, lockValue, "NX", "EX", ttl);
+
+    if (result === "OK") {
+      console.log(`获取锁成功：${lockName}`);
+      return lockValue;
+    }
+
+    console.log(`获取锁失败：${lockName}`);
+    return null;
+  }
+
+  // 释放锁
+  async release(lockName: string, lockValue: string): Promise<boolean> {
+    const lockKey = `lock:${lockName}`;
+
+    // 必须用 Lua 脚本保证原子性
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      else
+        return 0
+      end
+    `;
+
+    const result = await this.redis.eval(script, 1, lockKey, lockValue);
+    if (result === 1) {
+      console.log(`释放锁成功：${lockName}`);
+      return true;
+    }
+
+    console.log(`释放锁失败：${lockName}，锁可能已过期`);
+    return false;
+  }
+
+  // 续期（延长锁的过期时间）
+  async extend(
+    lockName: string,
+    lockValue: string,
+    ttl: number
+  ): Promise<boolean> {
+    const lockKey = `lock:${lockName}`;
+
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("expire", KEYS[1], ARGV[2])
+      else
+        return 0
+      end
+    `;
+
+    const result = await this.redis.eval(script, 1, lockKey, lockValue, ttl);
+    return result === 1;
+  }
+}
+
+// 使用示例
+const lock = new DistributedLock(redis);
+
+async function settleGifts() {
+  const lockValue = await lock.acquire("gift:settlement", 30);
+
+  if (!lockValue) {
+    console.log("其他节点正在执行结算任务");
+    return;
+  }
+
+  try {
+    console.log("开始执行礼物结算...");
+    // 执行结算逻辑
+    await doSettlement();
+  } finally {
+    await lock.release("gift:settlement", lockValue);
+  }
+}
+```
+
+### 为什么要用唯一标识
+
+你可能注意到了，获取锁时我们生成了一个唯一标识，而不是简单地用 "1"。这是为了防止误删别人的锁。
+
+假设进程 A 获取了锁，但执行时间太长，锁过期了。这时进程 B 获取了锁。如果进程 A 完成后直接删除锁，就会把进程 B 的锁删掉。
+
+用唯一标识就能避免这个问题：删除时检查标识是否匹配，不匹配就不删。
+
+### 为什么要用 Lua 脚本
+
+释放锁的代码必须用 Lua 脚本，保证"检查标识 + 删除锁"是原子操作。如果不用 Lua：
+
+```typescript
+// ❌ 错误的实现
+async function releaseWrong(lockName: string, lockValue: string) {
+  const lockKey = `lock:${lockName}`;
+
+  const current = await this.redis.get(lockKey);
+  if (current === lockValue) {
+    // 假设这时锁过期了，被其他客户端获取
+    await this.redis.del(lockKey); // 误删别人的锁
+  }
+}
+```
+
+Lua 脚本能保证这两个操作要么都执行，要么都不执行。
+
+## 锁续期
+
+基础实现有个问题：如果业务执行时间超过锁的过期时间，锁会自动释放，其他客户端就能获取锁，导致并发问题。
+
+解决方案是续期：在锁过期前自动延长过期时间。
+
+```typescript
+class AutoRenewLock {
+  private renewTimer?: NodeJS.Timeout;
+
+  constructor(
+    private lock: DistributedLock,
+    private lockName: string,
+    private lockValue: string,
+    private ttl: number = 30
+  ) {
+    this.startRenew();
+  }
+
+  private startRenew() {
+    // 每 ttl/3 秒续期一次
+    const interval = (this.ttl * 1000) / 3;
+
+    this.renewTimer = setInterval(async () => {
+      const success = await this.lock.extend(
+        this.lockName,
+        this.lockValue,
+        this.ttl
+      );
+
+      if (!success) {
+        console.log(`锁续期失败：${this.lockName}`);
+        this.stopRenew();
+        // 续期失败，可以抛出异常或做其他处理
+      }
+    }, interval);
+  }
+
+  stopRenew() {
+    if (this.renewTimer) {
+      clearInterval(this.renewTimer);
+      this.renewTimer = undefined;
+    }
+  }
+
+  async release() {
+    this.stopRenew();
+    return await this.lock.release(this.lockName, this.lockValue);
+  }
+}
+
+// 使用
+const lock = new DistributedLock(redis);
+
+async function settleGifts() {
+  const lockValue = await lock.acquire("gift:settlement", 30);
+
+  if (!lockValue) {
+    return;
+  }
+
+  // 创建自动续期的锁
+  const autoRenewLock = new AutoRenewLock(
+    lock,
+    "gift:settlement",
+    lockValue,
+    30
+  );
+
+  try {
+    // 执行长时间任务
+    await doSettlement();
+  } finally {
+    await autoRenewLock.release();
+  }
+}
+```
+
+这样即使任务执行时间超过 30 秒，锁也会自动续期，不会被其他客户端抢占。
+
+## Redlock 算法
+
+基础实现有个问题：如果 Redis 主节点挂了，从节点还没同步锁数据，新主节点没有这个锁，其他客户端就能获取锁，导致并发问题。
+
+Redlock 算法是 Redis 官方提出的分布式锁算法，通过在多个独立的 Redis 节点上获取锁来提高可靠性。
+
+```typescript
+class Redlock {
+  private nodes: Redis[];
+
+  constructor(redisUrls: string[]) {
+    this.nodes = redisUrls.map((url) => new Redis(url));
+  }
+
+  async acquire(lockName: string, ttl: number = 30): Promise<string | null> {
+    const lockValue = `${Date.now()}-${Math.random()}`;
+    const startTime = Date.now();
+    let successCount = 0;
+
+    // 向所有节点请求锁
+    for (const redis of this.nodes) {
+      try {
+        const result = await redis.set(
+          `lock:${lockName}`,
+          lockValue,
+          "PX", // 毫秒
+          ttl * 1000,
+          "NX"
+        );
+
+        if (result === "OK") {
+          successCount++;
+        }
+      } catch (error) {
+        // 节点失败，继续尝试下一个
+        console.error(`节点请求失败：${error.message}`);
+        continue;
+      }
+    }
+
+    const elapsedTime = (Date.now() - startTime) / 1000;
+    const majority = Math.floor(this.nodes.length / 2) + 1;
+
+    // 检查是否在大多数节点获取成功，且耗时小于锁的有效期
+    if (successCount >= majority && elapsedTime < ttl) {
+      console.log(
+        `Redlock 获取成功：${lockName}，成功节点：${successCount}/${this.nodes.length}`
+      );
+      return lockValue;
+    }
+
+    // 失败，释放已获取的锁
+    await this.release(lockName, lockValue);
+    return null;
+  }
+
+  async release(lockName: string, lockValue: string): Promise<void> {
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      else
+        return 0
+      end
+    `;
+
+    for (const redis of this.nodes) {
+      try {
+        await redis.eval(script, 1, `lock:${lockName}`, lockValue);
+      } catch (error) {
+        console.error(`节点释放失败：${error.message}`);
+        continue;
+      }
+    }
+  }
+}
+
+// 使用示例
+const redlock = new Redlock([
+  "redis://localhost:6379",
+  "redis://localhost:6380",
+  "redis://localhost:6381",
+  "redis://localhost:6382",
+  "redis://localhost:6383",
+]);
+
+async function settleGifts() {
+  const lockValue = await redlock.acquire("gift:settlement", 30);
+
+  if (!lockValue) {
+    console.log("获取锁失败");
+    return;
+  }
+
+  try {
+    await doSettlement();
+  } finally {
+    await redlock.release("gift:settlement", lockValue);
+  }
+}
+```
+
+Redlock 的核心思想是：在大多数节点上获取成功才算成功，这样即使少数节点挂了，锁依然有效。
+
+但 Redlock 也有争议，主要是关于时钟偏移的问题。如果节点之间的时钟不同步，可能导致锁提前失效。
+
+## 实际应用：直播平台礼物结算
+
+让我们把这些知识应用到直播平台的礼物结算场景：
+
+```typescript
+class GiftSettlementService {
+  private lock: DistributedLock;
+
+  constructor(
+    private redis: Redis,
+    private db: any
+  ) {
+    this.lock = new DistributedLock(redis);
+  }
+
+  async settleHourlyGifts() {
+    const lockName = "gift:settlement:hourly";
+    const ttl = 300; // 5 分钟
+
+    const lockValue = await this.lock.acquire(lockName, ttl);
+    if (!lockValue) {
+      console.log("其他节点正在执行小时结算");
+      return;
+    }
+
+    const autoRenewLock = new AutoRenewLock(
+      this.lock,
+      lockName,
+      lockValue,
+      ttl
+    );
+
+    try {
+      console.log("开始执行小时礼物结算...");
+
+      // 1. 获取所有正在直播的房间
+      const rooms = await this.db.query(`
+        SELECT room_id FROM livestream_rooms
+        WHERE status = 'live'
+      `);
+
+      for (const room of rooms) {
+        await this.settleRoomGifts(room.room_id);
+      }
+
+      console.log(`小时结算完成，共处理 ${rooms.length} 个房间`);
+    } finally {
+      await autoRenewLock.release();
+    }
+  }
+
+  private async settleRoomGifts(roomId: string) {
+    // 从 Sorted Set 获取礼物排行榜
+    const giftKey = `livestream:room:${roomId}:gifts`;
+    const gifts = await this.redis.zrevrange(giftKey, 0, -1, "WITHSCORES");
+
+    // 计算总收益
+    let totalRevenue = 0;
+    for (const gift of gifts) {
+      totalRevenue += parseInt(gift.score);
+    }
+
+    // 更新到数据库
+    await this.db.execute(
+      `
+      INSERT INTO room_revenue (room_id, revenue, created_at)
+      VALUES (?, ?, NOW())
+      ON DUPLICATE KEY UPDATE revenue = revenue + ?
+    `,
+      [roomId, totalRevenue, totalRevenue]
+    );
+
+    // 清空礼物榜
+    await this.redis.del(giftKey);
+
+    console.log(`房间 ${roomId} 结算完成，收益：${totalRevenue}`);
+  }
+}
+
+// 定时任务
+const settlementService = new GiftSettlementService(redis, db);
+
+// 每小时执行一次
+setInterval(
+  () => {
+    settlementService.settleHourlyGifts();
+  },
+  60 * 60 * 1000
+);
+```
+
+## Trade-off 分析
+
+分布式锁方案各有优劣：
+
+**基础实现（SET NX EX）**：
+
+- 优势：简单高效，适合大多数场景
+- 劣势：依赖单节点，Redis 故障时可能失效
+- 适用：单节点 Redis，或者能容忍短暂的并发问题
+
+**Redlock**：
+
+- 优势：高可用，少数节点故障不影响
+- 劣势：实现复杂，对时钟同步敏感，有争议
+- 适用：对可靠性要求极高的场景
+
+**续期机制**：
+
+- 优势：避免锁过期导致的并发问题
+- 劣势：增加复杂度，续期失败需要处理
+- 适用：执行时间不确定的任务
+
+对于直播平台的礼物结算，基础实现 + 续期机制就足够了。结算任务不是核心业务，短时间重复执行影响不大。而且实现简单，易于维护。
+
+如果是对一致性要求极高的场景（比如金融交易），可以考虑 Redlock 或者专门的分布式锁服务（比如 ZooKeeper、etcd）。

@@ -1,0 +1,265 @@
+---
+title: "04. 品牌类型与类型守卫：防止数据混淆"
+date: "2026-04-12"
+summary: "UserId 和 OrderId 都是 string，TypeScript 分不清它们——直到你用了品牌类型。这篇文章从数据混淆的真实 bug 出发，讲品牌类型、类型守卫、断言函数和 TS 5.5 自动过滤缩窄，让你的 API 客户端在类型层面杜绝参数传错。"
+tags: ["TypeScript"]
+category: "typescript"
+cover: ""
+draft: false
+series: "TypeScript 类型系统进阶"
+seriesOrder: 4
+---
+
+前三篇我们学了条件类型、模板字面量类型和高级泛型。用这些工具，我们已经能给 API 客户端写出相当精确的函数签名了——`fetchUser(userId)` 返回 `User`，`fetchOrder(orderId)` 返回 `Order`，类型推导一路畅通。
+
+但有一个问题一直藏在暗处：`userId` 和 `orderId` 的类型都是 `string`。
+
+在 TypeScript 的世界里，`"usr_a1x9k2m"` 和 `"ord_x7b3n5p"` 没有任何区别——它们都是 `string`。如果你不小心把 `orderId` 传给了 `fetchUser`，编译器不会报错，但你的接口会在运行时返回一个莫名其妙的错误。
+
+这就是这篇文章要解决的问题。
+
+## 一个真实的 Bug：参数传错了
+
+假设你的 API 客户端里有这样的代码：
+
+```typescript
+async function fetchUser(id: string): Promise<User> {
+  return http.get(`/users/${id}`);
+}
+
+async function fetchOrder(id: string): Promise<Order> {
+  return http.get(`/orders/${id}`);
+}
+```
+
+看起来没问题。但在某个业务流程里，你需要先查用户再查订单：
+
+```typescript
+const user = await fetchUser(orderId);
+const order = await fetchOrder(userId);
+```
+
+参数传反了。`userId` 的值是 `"usr_a1x9k2m"`，`orderId` 的值是 `"ord_x7b3n5p"`。编译器完全没意见，因为它们都是 `string`。但运行时，`GET /users/ord_x7b3n5p` 会返回 404，你还要花半小时排查到底哪里出了问题。
+
+这类 bug 的根源在于 TypeScript 的**结构化类型系统**（Structural Typing）。它只关心值的"形状"，不关心值的"身份"。`string` 就是 `string`，不管它代表用户 ID、订单 ID 还是会话令牌。
+
+我们需要的，是一种能让编译器区分"虽然都是 string，但含义不同"的机制。
+
+## 品牌类型：给类型贴标签
+
+品牌类型（Branded Types）的思路很直接：在类型上加一个独一无二的标记，让 TypeScript 能识别出来。
+
+核心定义只有两行：
+
+```typescript
+type Brand<T, B extends string> = T & { readonly __brand: B };
+type UserId = Brand<string, "UserId">;
+type OrderId = Brand<string, "OrderId">;
+```
+
+`Brand<string, "UserId">` 的意思是：这是一个 `string`，同时带有一个 `__brand` 属性，值是 `"UserId"`。由于这个 `__brand` 属性是 `readonly`，你无法在运行时赋值，所以这个类型只能通过我们专门提供的工厂函数来创建。
+
+两个 `Brand<string, ...>` 类型之间是不兼容的。`UserId` 有 `__brand: "UserId"`，`OrderId` 有 `__brand: "OrderId"`，它们的交叉类型不同，TypeScript 会报错。
+
+现在重写上面的函数：
+
+```typescript
+async function fetchUser(id: UserId): Promise<User> {
+  return http.get(`/users/${id}`);
+}
+
+async function fetchOrder(id: OrderId): Promise<Order> {
+  return http.get(`/orders/${id}`);
+}
+```
+
+如果你再写 `fetchUser(orderId)`，编译器立刻报错：`OrderId` 不能赋值给 `UserId`。问题在编译阶段就被拦住了。
+
+不过，`Brand` 的定义用到了交叉类型 `&`，这里有个细节值得说明。`string & { readonly __brand: "UserId" }` 在 TypeScript 的类型系统中是一个合法的交叉类型，编译器知道它同时具有 `string` 的所有方法和 `__brand` 属性。但运行时并不存在这个交叉——`"usr_a1x9k2m"` 就是一个普通的字符串，没有 `__brand` 属性。这正是品牌类型的设计意图：编译时区分，运行时零开销。
+
+## 工厂函数：运行时验证 + 类型创建
+
+光有类型定义还不够。你需要一种安全的方式来创建品牌类型的值。直接断言 `const id = "usr_a1x9k2m" as UserId` 虽然能编译，但跳过了验证——万一有人传了个空字符串呢？
+
+更好的做法是写工厂函数，同时完成验证和类型创建：
+
+```typescript
+function createUserId(value: string): UserId {
+  // 验证格式：以 "usr_" 开头，后跟 7 个字母数字字符
+  if (!/^usr_[a-z0-9]{7}$/.test(value)) {
+    throw new TypeError(
+      `无效的 UserId 格式: "${value}"，期望格式为 "usr_" + 7 位字母数字`
+    );
+  }
+  return value as UserId;
+}
+
+function createOrderId(value: string): OrderId {
+  // 验证格式：以 "ord_" 开头，后跟 7 个字母数字字符
+  if (!/^ord_[a-z0-9]{7}$/.test(value)) {
+    throw new TypeError(
+      `无效的 OrderId 格式: "${value}"，期望格式为 "ord_" + 7 位字母数字`
+    );
+  }
+  return value as UserId;
+}
+```
+
+这段代码做了两件事：先用正则验证格式，不合法直接抛错；合法的话用 `as` 断言告诉编译器"我确认这是一个 UserId"。`as` 断言在这里是安全的，因为前面已经验证过了。
+
+调用时很自然：
+
+```typescript
+const userId = createUserId("usr_a1x9k2m");
+const orderId = createOrderId("ord_x7b3n5p");
+
+// 下面这行编译报错：OrderId 不能赋值给参数类型 UserId
+fetchUser(orderId);
+```
+
+这样你在入口处做了验证，之后的代码里编译器会帮你盯住类型，不会再搞混。
+
+## 类型谓词：自定义类型守卫
+
+有时候你拿到的数据来自外部（API 响应、数据库、用户输入），类型信息已经丢了，你需要判断"这个东西到底是不是某个品牌类型"。
+
+TypeScript 提供了**类型谓词**（Type Predicate）来做这件事：
+
+```typescript
+function isUserId(value: string): value is UserId {
+  return /^usr_[a-z0-9]{7}$/.test(value);
+}
+```
+
+`value is UserId` 就是类型谓词。它告诉编译器：当这个函数返回 `true` 时，`value` 的类型就是 `UserId`。
+
+在 `if` 判断里用起来非常自然：
+
+```typescript
+function processId(raw: string) {
+  if (isUserId(raw)) {
+    // 这里 raw 的类型已经被缩窄为 UserId
+    fetchUser(raw);
+  }
+}
+```
+
+编译器看到 `isUserId(raw)` 返回 `true`，就把 `raw` 的类型从 `string` 缩窄成了 `UserId`。这个缩窄只发生在 `if` 的分支里，外面的 `raw` 仍然是 `string`。
+
+类型谓词的本质是一份契约：你向编译器承诺"返回 true 就意味着这个值是 T 类型"。如果验证逻辑写错了，运行时还是会出问题，所以谓词函数里的验证逻辑一定要严谨。
+
+## 断言函数：不返回 true，直接抛错
+
+类型谓词适合"可能是，也可能不是"的场景。但有时候你的逻辑是"如果不是，那就出大问题了，直接中断执行"。这时候用**断言函数**（Assertion Function）更合适：
+
+```typescript
+function assertUserId(value: string): asserts value is UserId {
+  if (!/^usr_[a-z0-9]{7}$/.test(value)) {
+    throw new TypeError(`断言失败: "${value}" 不是合法的 UserId`);
+  }
+}
+```
+
+`asserts value is UserId` 的意思是：如果这个函数正常返回（没抛错），那 `value` 一定是 `UserId`。它不返回任何值——要么通过，要么抛异常。
+
+使用方式也很直观：
+
+```typescript
+function handleRequest(rawId: string) {
+  assertUserId(rawId);
+  // 执行到这里，rawId 已经是 UserId 类型了
+  fetchUser(rawId);
+}
+```
+
+和类型谓词的区别在于：类型谓词返回布尔值，调用者需要写 `if`；断言函数不返回值，调用者直接用，验证失败就抛异常中断流程。在"数据必须合法，否则整个请求没有意义"的场景里，断言函数更简洁。
+
+## 用可辨识联合处理错误类型
+
+在 API 客户端里，错误处理是一个绕不开的话题。不同的错误需要不同的处理方式：网络错误要重试，认证错误要跳登录，参数错误要提示用户。
+
+**可辨识联合**（Discriminated Union）是处理这类场景的利器。它的核心思想是：给联合类型中的每个成员加一个共同的字面量属性（判别属性），TypeScript 可以通过这个属性来缩窄类型。
+
+先定义错误类型：
+
+```typescript
+type ApiError =
+  | { kind: "network"; status: number; message: string }
+  | { kind: "auth"; realm: string }
+  | { kind: "validation"; fields: Record<string, string> }
+  | { kind: "not_found"; resource: string; resourceId: string };
+```
+
+`kind` 就是判别属性。每个成员的 `kind` 值不同，TypeScript 靠它来区分你面对的是哪种错误。
+
+处理起来像写 switch 一样自然：
+
+```typescript
+function handleApiError(error: ApiError): string {
+  switch (error.kind) {
+    case "network":
+      // 这里 error 的类型被缩窄为 { kind: "network"; status: number; message: string }
+      return `网络错误 (${error.status}): ${error.message}`;
+    case "auth":
+      // 这里 error 的类型被缩窄为 { kind: "auth"; realm: string }
+      return `认证失败，领域: ${error.realm}`;
+    case "validation":
+      // 这里 error 的类型被缩窄为 { kind: "validation"; fields: Record<string, string> }
+      const details = Object.entries(error.fields)
+        .map(([k, v]) => `${k}: ${v}`)
+        .join(", ");
+      return `参数校验失败: ${details}`;
+    case "not_found":
+      return `资源 ${error.resource}(${error.resourceId}) 不存在`;
+  }
+}
+```
+
+关键是 `switch` 的每个 `case` 分支里，`error` 的类型都被精确缩窄了。你在 `"network"` 分支里访问 `error.status` 没问题，但如果你在 `"auth"` 分支里写 `error.status`，编译器会直接报错——因为 `auth` 类型的错误没有 `status` 属性。
+
+可辨识联合的另一个好处是**穷举检查**。如果你将来新增了一种错误类型 `{ kind: "rate_limit"; retryAfter: number }`，忘记在 `switch` 里加对应的 `case`，TypeScript 会警告你函数的返回类型不完整（因为 switch 没有覆盖所有 kind 值）。
+
+## TS 5.5 的自动 filter 缩窄
+
+在处理 API 返回的列表数据时，过滤掉无效项是常见操作。以前这需要类型谓词配合，写起来有点啰嗦。
+
+假设你从接口拿到一批可能是 `undefined` 的订单：
+
+```typescript
+const rawOrders: (Order | undefined)[] = await fetchAllOrders();
+
+// TS 5.5 之前，需要写类型谓词才能保持类型缩窄
+const orders = rawOrders.filter((order): order is Order => order !== undefined);
+```
+
+TypeScript 5.5 引入了对 `.filter()` 的自动类型缩窄。现在你可以直接写：
+
+```typescript
+const orders = rawOrders.filter((order) => order !== undefined);
+// orders 的类型自动缩窄为 Order[]
+```
+
+编译器能识别出 `order !== undefined` 这个条件，并自动把过滤后的数组类型从 `(Order | undefined)[]` 缩窄为 `Order[]`。不需要手动写类型谓词了。
+
+这个能力不只适用于 `undefined`，也能处理自定义的品牌类型守卫。如果你有一批混合了用户 ID 和订单 ID 的字符串，想过滤出用户 ID：
+
+```typescript
+const mixedIds: string[] = ["usr_a1x9k2m", "ord_x7b3n5p", "usr_b3y7l9q"];
+
+const userIds = mixedIds.filter(isUserId);
+// TS 5.5 中，userIds 的类型自动缩窄为 UserId[]
+```
+
+`isUserId` 是我们之前定义的类型谓词。在 TS 5.5 之前，`.filter(isUserId)` 返回的类型还是 `string[]`，你必须显式写 `.filter((id): id is UserId => isUserId(id))` 才行。现在省了这一步。
+
+## 什么时候值得用品牌类型
+
+品牌类型确实能防止数据混淆，但它也带来了额外的代码量——每种品牌类型都需要一个工厂函数和一个类型谓词（或断言函数）。在小型项目里，这些额外的抽象可能得不偿失。
+
+一个简单的判断标准是：**参数位置相同、类型相同、但含义不同的值超过 3 个时，值得引入品牌类型**。比如你的函数签名是 `transfer(from, to, amount)`，`from` 和 `to` 都是账户地址，传反了就是真金白银的损失。这种场景下品牌类型的收益远大于成本。
+
+在我们的 API 客户端案例中，`UserId`、`OrderId`、`SessionToken`、`ApiKey` 全是 `string` 类型，它们经常出现在同一个函数的参数列表里，混淆的风险很高。给它们各自加上品牌，成本是几个工厂函数，收益是整个调用链路上的编译时安全保障，这笔账很划算。
+
+反过来，如果一个 `string` 类型的值只在函数内部使用，不和其他 `string` 参数并列出现，那给它加品牌就是过度设计了。类型系统的目的是帮你捕捉错误，不是为了追求"每个类型都有标签"。
+
+综合来看，品牌类型最适合用在**跨模块传递的标识符**上——它们从外部输入，经过多层函数调用，每一步都可能被传错位置。在这些关键节点加上品牌，就像给数据贴上了不可撕掉的标签，编译器会替你盯住它们。

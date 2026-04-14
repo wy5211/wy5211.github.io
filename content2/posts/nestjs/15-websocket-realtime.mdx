@@ -1,0 +1,582 @@
+---
+title: "15 WebSocket 实时推送：让评论不用刷新就能看到"
+date: "2026-03-30"
+summary: "用户看文章时另一个人发评论，第一人要刷新才能看到。用 WebSocket 做实时推送，同时实现在线阅读人数统计。"
+tags: ["NestJS", "WebSocket", "Socket.IO", "实时通信", "Gateway"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式学习"
+seriesOrder: 15
+---
+
+## 刷新才能看到新评论，这体验太差了
+
+zhang_wei 在看自己的文章「从 Express 迁移到 NestJS 的踩坑记录」，评论区显示 12 条评论。与此同时，用户 li_na 在另一台电脑上发了一条评论："这篇文章帮了大忙，照着做把项目从 Express 迁过来了"。zhang_wei 并不知道有人回复了他，除非他手动刷新页面。
+
+这就是 HTTP 协议的根本限制：客户端问一次，服务端答一次。服务端不能主动告诉客户端"有新数据了"。要打破这个限制，有三种方案。
+
+## HTTP 轮询 vs SSE vs WebSocket
+
+最简单粗暴的方案是**轮询**：前端每隔 3 秒发一次 `GET /api/posts/:id/comments`，比较返回的评论数量和当前显示的是否一致，有新数据就更新 DOM。实现简单，但问题也很明显——大部分轮询请求都是无意义的。一个热门文章页面开着 10 分钟，可能只有 2 条新评论，但轮询发了 200 次请求。200 次中 198 次返回的是"没有新数据"，白白浪费带宽和服务器资源。如果在线用户多，轮询对服务器的压力不亚于 DDoS。
+
+**SSE（Server-Sent Events）** 比轮询聪明一些。客户端发一次 HTTP 请求，服务端不立即返回，而是保持连接打开。有新数据时通过这个连接推送数据，连接断开时浏览器自动重连。但 SSE 是单向的——只能服务端往客户端推，客户端要发消息还得走 HTTP。对于"纯通知"场景够用（比如通知栏），但我们的评论推送需要双向通信（用户发评论需要实时反馈）。
+
+**WebSocket** 建立的是一个全双工 TCP 连接，客户端和服务端可以随时互发消息。一个协议搞定推送和交互，不需要维护两套通道。建立连接后，每条消息只需要 2-10 字节的帧头，而 HTTP 请求光是 Header 就几百字节。
+
+三种方案的核心区别：
+
+| 方案      | 方向          | 协议复杂度 | 浏览器支持 | 适用场景               |
+| --------- | ------------- | ---------- | ---------- | ---------------------- |
+| 轮询      | 客户端→服务端 | 最低       | 全部       | 兼容性要求极高         |
+| SSE       | 服务端→客户端 | 低         | IE 除外    | 单向推送（通知、日志） |
+| WebSocket | 双向          | 中         | 全部       | 实时聊天、协作编辑     |
+
+NestJS 内置了对 WebSocket 的支持，通过 `@WebSocketGateway` 装饰器，几行代码就能建一个实时通信通道。评论数据的存储走 HTTP 接口（上一篇加了缓存后查询更快了），WebSocket 只负责推送——各管各的，互不干扰。
+
+## Gateway：WebSocket 的入口
+
+安装依赖：
+
+```bash
+pnpm add @nestjs/websockets @nestjs/platform-socket.io socket.io
+```
+
+创建一个 Gateway。NestJS 会自动把它挂载到 WebSocket 服务上，默认端口和 HTTP 服务相同：
+
+```typescript
+// comments.gateway.ts
+import {
+  WebSocketGateway,
+  WebSocketServer,
+  SubscribeMessage,
+  OnGatewayInit,
+  OnGatewayConnection,
+  OnGatewayDisconnect,
+  MessageBody,
+  ConnectedSocket,
+} from "@nestjs/websockets";
+import { Server, Socket } from "socket.io";
+import { Logger } from "@nestjs/common";
+
+@WebSocketGateway({
+  cors: { origin: process.env.FRONTEND_URL },
+  namespace: "/comments",
+})
+export class CommentsGateway
+  implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
+{
+  @WebSocketServer()
+  server: Server;
+
+  private readonly logger = new Logger(CommentsGateway.name);
+
+  afterInit() {
+    this.logger.log("WebSocket Gateway 初始化完成");
+  }
+
+  handleConnection(client: Socket) {
+    this.logger.debug(`客户端连接: ${client.id}`);
+  }
+
+  handleDisconnect(client: Socket) {
+    this.logger.debug(`客户端断开: ${client.id}`);
+    this.cleanupClient(client);
+  }
+
+  private cleanupClient(client: Socket) {
+    // 遍历该客户端加入的所有文章房间，清理在线人数
+    const rooms = Array.from(client.rooms);
+    rooms.forEach((room) => {
+      if (room.startsWith("post:")) {
+        this.readerMap.get(room)?.delete(client.data.user?.id);
+        const count = this.readerMap.get(room)?.size ?? 0;
+        this.server.to(room).emit("reader-count", { count });
+      }
+    });
+  }
+}
+```
+
+几个细节值得说清楚。
+
+`cors` 配置和 HTTP 接口一样重要，不设的话浏览器会拦截跨域的 WebSocket 连接。开发环境可以用 `origin: '*'`，生产环境应该限制为你的前端域名。
+
+`namespace` 把不同功能的 WebSocket 消息隔离到不同的命名空间里。我们的博客可能有评论推送和在线通知两个功能，放在同一个 namespace 里消息会互相干扰。用 namespace 隔离后，评论客户端连 `/comments`，通知客户端连 `/notifications`，互不干扰。
+
+`@WebSocketServer()` 注入 Socket.IO 的 Server 实例，用来向客户端推送消息。
+
+`OnGatewayInit`、`OnGatewayConnection`、`OnGatewayDisconnect` 分别监听 Gateway 初始化、客户端连接和断开三个生命周期。`handleDisconnect` 在客户端关闭浏览器标签页、网络断开、服务端主动断开等情况下都会触发。
+
+## Room 机制：每篇文章一个房间
+
+如果直接广播给所有连接的客户端，会出现一个尴尬的问题：zhang_wei 在看文章 A，收到了一条文章 B 的评论推送，毫无意义。更糟的是，如果有 1000 个用户在线，每条评论都广播给所有人，大部分人收到的都是不相关的消息，带宽和 CPU 都浪费了。
+
+Socket.IO 的 Room 机制解决了这个问题。客户端加入某个"房间"后，只有同一个房间里的客户端才能收到消息。我们把每篇文章映射为一个房间，客户端打开文章详情页时加入对应房间。
+
+```typescript
+// 在 Gateway 中维护在线人数
+// postId -> Set<userId>，按用户去重
+private readerMap = new Map<string, Set<string>>();
+// clientId -> [{ userId, postId }]，用于断开连接时反向查找
+private clientPostMap = new Map<string, { userId: string; postId: string }[]>();
+
+@SubscribeMessage('join-post')
+handleJoinPost(
+  @ConnectedSocket() client: Socket,
+  @MessageBody() postId: string,
+) {
+  const userId = client.data.user?.id;
+  if (!userId) return;
+
+  const room = `post:${postId}`;
+  client.join(room);
+
+  // 记录在线用户（按 userId 去重，同一个人开多个标签页只算一次）
+  if (!this.readerMap.has(postId)) {
+    this.readerMap.set(postId, new Set());
+  }
+  this.readerMap.get(postId)!.add(userId);
+
+  // 记录 client 到 post 的映射，断开连接时用
+  if (!this.clientPostMap.has(client.id)) {
+    this.clientPostMap.set(client.id, []);
+  }
+  this.clientPostMap.get(client.id)!.push({ userId, postId });
+
+  // 广播在线人数给房间里所有人
+  const count = this.readerMap.get(postId)!.size;
+  this.server.to(room).emit('reader-count', { count });
+}
+```
+
+`client.join(room)` 是 Socket.IO 内置的方法，把当前连接加入指定房间。`this.server.to(room).emit()` 只会给在房间里的客户端发消息，其他人不受影响。
+
+`@SubscribeMessage` 是 NestJS 的装饰器，监听客户端发送的特定事件。`@ConnectedSocket` 获取当前连接的 Socket 对象，`@MessageBody` 获取消息体。
+
+用户离开文章时需要从房间移除：
+
+```typescript
+@SubscribeMessage('leave-post')
+handleLeavePost(
+  @ConnectedSocket() client: Socket,
+  @MessageBody() postId: string,
+) {
+  const userId = client.data.user?.id;
+  const room = `post:${postId}`;
+
+  client.leave(room);
+
+  const readers = this.readerMap.get(postId);
+  if (readers) {
+    readers.delete(userId);
+    if (readers.size === 0) {
+      this.readerMap.delete(postId); // 没人了，清理掉
+    } else {
+      this.server.to(room).emit('reader-count', {
+        count: readers.size,
+      });
+    }
+  }
+
+  // 清理映射
+  const mappings = this.clientPostMap.get(client.id);
+  if (mappings) {
+    const idx = mappings.findIndex((m) => m.postId === postId);
+    if (idx !== -1) mappings.splice(idx, 1);
+  }
+}
+```
+
+断开连接时也要清理。`handleDisconnect` 里调用 `cleanupClient`，通过 `clientPostMap` 找到该客户端加入了哪些文章房间，逐个移除在线记录并广播更新后的人数。
+
+## 评论推送：WebSocket 只管推，不管存
+
+一个容易犯的错误是把评论数据的存储也放到 WebSocket 里。这样做的后果很严重：
+
+- 评论数据没有经过 HTTP 接口，无法被搜索引擎爬取，SEO 直接归零
+- 断线重连后，重连期间发送的评论全部丢失，客户端不知道
+- 无法复用已有的验证管道、DTO 校验、异常过滤器等 HTTP 层基础设施
+- 测试困难，没法用 supertest 发 HTTP 请求来测试评论功能
+- WebSocket 消息没有标准的 HTTP 状态码，错误处理不规范
+
+正确的设计是：**评论的存储走 HTTP POST 接口，HTTP 接口处理完后通知 Gateway 广播**。WebSocket 只负责推送，不负责业务逻辑。
+
+```typescript
+// comments.service.ts
+@Injectable()
+export class CommentsService {
+  constructor(
+    private prisma: PrismaService,
+    private commentsGateway: CommentsGateway
+  ) {}
+
+  async create(userId: string, postId: string, content: string) {
+    // 1. 数据验证和存储走正常的 HTTP 流程
+    const comment = await this.prisma.comment.create({
+      data: {
+        content,
+        authorId: userId,
+        postId,
+      },
+      include: {
+        author: { select: { id: true, name: true, avatar: true } },
+      },
+    });
+
+    // 2. 存完数据库后，通知 Gateway 广播
+    // 注意这里不是 await，推送失败不影响评论创建的结果
+    this.commentsGateway.broadcastComment(postId, comment);
+
+    return comment;
+  }
+}
+```
+
+Gateway 里的广播方法：
+
+```typescript
+broadcastComment(postId: string, comment: any) {
+  this.server.to(`post:${postId}`).emit('new-comment', {
+    id: comment.id,
+    content: comment.content,
+    author: comment.author,
+    createdAt: comment.createdAt,
+  });
+}
+```
+
+zhang_wei 正在看这篇文章（已经加入了 `post:express-migration-tips` 房间），他立即收到了 li_na 的评论。而另一个在看其他文章的用户，因为不在同一个房间，什么都不会收到。
+
+注意广播时只发送客户端需要的数据，不要把数据库里的所有字段都推出去。比如评论表的 `postId`、`authorId` 这些内部字段就不需要推给前端——客户端本来就知道自己在看哪篇文章。
+
+## 身份认证：握手时传 Token
+
+HTTP 接口有 JWT Guard 保护，但 WebSocket 连接默认没有认证。如果不做认证，任何人都能连接到 Gateway，监听所有房间里的消息。比如有人写个脚本连接后加入所有文章房间，就能收到全站所有新评论，这是一个信息泄露。
+
+Socket.IO 的做法是在握手阶段验证身份。客户端连接时通过 `auth` 参数传递 Token：
+
+```typescript
+// 前端
+import { io } from "socket.io-client";
+
+const socket = io(`${WS_URL}/comments`, {
+  auth: { token: localStorage.getItem("access_token") },
+  reconnection: true,
+  reconnectionDelay: 1000,
+  reconnectionAttempts: 5,
+});
+```
+
+`reconnection: true` 开启自动重连。网络抖动时 Socket.IO 会自动尝试重新连接，不需要前端手动处理。`reconnectionDelay` 是重连间隔（第一次 1 秒），`reconnectionAttempts` 是最大重连次数。
+
+服务端在 `handleConnection` 里验证 Token：
+
+```typescript
+constructor(private jwtService: JwtService) {}
+
+handleConnection(client: Socket) {
+  const token = client.handshake.auth.token as string;
+
+  if (!token) {
+    this.logger.warn(`连接被拒绝: 无 Token, client=${client.id}`);
+    client.disconnect();
+    return;
+  }
+
+  try {
+    const payload = this.jwtService.verify(token);
+    client.data.user = payload; // 把用户信息挂到 client 上，后续直接读
+    this.logger.debug(`用户 ${payload.sub} 已连接`);
+  } catch (error) {
+    this.logger.warn(`连接被拒绝: Token 无效, client=${client.id}`);
+    client.disconnect();
+  }
+}
+```
+
+验证通过后，用户信息存在 `client.data.user` 里。后续处理消息时可以直接读取 `client.data.user.id`，不需要每次都验证。如果 Token 过期或无效，直接断开连接——WebSocket 没有中间件链的概念，无法像 HTTP 那样返回 401，最干净的做法就是断开。
+
+前端监听断开事件，如果是认证问题就提示用户重新登录：
+
+```typescript
+socket.on("connect_error", (error) => {
+  if (error.message.includes("auth") || error.message.includes("token")) {
+    // Token 过期，引导用户重新登录
+    redirectToLogin();
+  }
+});
+```
+
+## 在线人数：连接与断开的生命周期
+
+前面已经看到了在线人数的实现。核心是维护一个 `Map<string, Set<string>>`——`postId` 映射到 `Set<userId>`。每次有人加入或离开，更新 Set 并广播人数。
+
+有一个边界情况：用户打开多个标签页看同一篇文章，算几个"在线读者"？如果按连接数算，同一个人开了 5 个标签页就变成 5 个人。如果按用户 ID 去重，一个人只算一个。
+
+我们的做法是按用户去重。`readerMap` 存的是 userId 的 Set，不是 clientId 的 Set。zhang_wei 开了 3 个标签页看同一篇文章，在线人数只显示 1。他关掉 2 个标签页，触发 `handleDisconnect`，但 userId 还在 Set 里（因为第 3 个标签页的连接还在），人数还是 1。只有当最后一个标签页也关了，Set 里才没有这个 userId，人数减为 0。
+
+`clientPostMap` 的作用是在 `handleDisconnect` 时做反向查找。`handleDisconnect` 只给你一个 `client.id`，你不知道这个 client 对应哪个用户、加入了哪些房间。通过 `clientPostMap.get(client.id)` 就能查到。
+
+## Socket.IO vs 原生 WebSocket
+
+NestJS 同时支持 Socket.IO 和原生 WebSocket（通过 `@nestjs/platform-ws`）。两者在 API 层面很相似，但底层实现差异不小。
+
+Socket.IO 是一个封装库，在原生 WebSocket 之上加了一层抽象。它提供了这些开箱即用的功能：
+
+- **Room 机制**：原生 WebSocket 需要自己维护一个 `Map<roomId, Set<clientId>>`，Socket.IO 内置了
+- **自动重连和回退到长轮询**：网络不稳定时保持连接。有些公司的防火墙会屏蔽 WebSocket，Socket.IO 自动回退到长轮询，保证消息不丢
+- **命名空间隔离**：原生 WebSocket 需要自己实现多路复用
+- **广播和定向推送**：`io.emit()` 广播给所有人，`to(room).emit()` 广播给房间，`to(clientId).emit()` 定向推送
+- **二进制数据支持**：自动序列化和反序列化
+- **心跳检测**：自动检测连接是否还活着，发现断开时触发 disconnect 事件
+
+代价是多了一个前端依赖（`socket.io-client` 约 50KB gzipped）。如果项目对包体积极其敏感，原生 WebSocket 更轻量——浏览器原生支持，不需要额外的前端库。
+
+原生 WebSocket 的优势是极致轻量。但它缺少 Room、自动重连、回退到长轮询这些功能，需要自己实现。Room 自己实现不难（100 行代码），但自动重连和回退机制自己写起来比较繁琐，而且容易有 bug。
+
+对于我们的博客系统，Room 机制省了太多事，而且 Socket.IO 的自动重连在生产环境更可靠（网络抖动时客户端自动重连，不需要自己写重连逻辑）。选 Socket.IO。
+
+如果未来 WebSocket 连接数达到十万级，或者你需要极致的吞吐量，原生 WebSocket 的性能优势会更明显。但对于博客评论推送这个量级，Socket.IO 绑绑有余。
+
+## WebSocket 的局限性
+
+WebSocket 不是万能的。有几个需要清楚认识的地方。
+
+**有状态 vs 无状态**。HTTP 接口是无状态的，可以轻松水平扩展——加一台服务器，前面放一个 Nginx 做负载均衡就完事了。WebSocket 是有状态的，每个连接都占用服务器内存。zhang_wei 连接后，他的 Socket 对象必须一直在同一台服务器上。如果你有两台服务器，Nginx 把 zhang_wei 的请求轮询到服务器 A，但 li_na 的评论广播到了服务器 B，zhang_wei 就收不到。
+
+解决办法是用 Redis Adapter，在多个 NestJS 实例之间转发 WebSocket 消息：
+
+```typescript
+import { RedisIoAdapter } from "@nestjs/platform-socket.io/adapters/redis-io.adapter";
+import Redis from "ioredis";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+  const pubClient = new Redis(process.env.REDIS_URL);
+  const subClient = pubClient.duplicate();
+  const redisIoAdapter = new RedisIoAdapter(app, {
+    pubClient,
+    subClient,
+  });
+  app.useWebSocketAdapter(redisIoAdapter);
+  await app.listen(3000);
+}
+```
+
+好消息是我们已经有了 Redis（BullMQ 和缓存都在用），所以不算额外的成本。但 Redis Adapter 有一个性能代价——每条消息都要经过 Redis 中转，延迟会增加几毫秒。
+
+**连接数限制**。每个 WebSocket 连接都占用服务器内存（大约 10-30KB）。10 万个在线连接就是 1-3GB 内存。操作系统对单个进程的文件描述符数量有限制（Linux 默认 1024），需要调高 `ulimit -n`。Nginx 反向代理 WebSocket 连接也有默认超时（60 秒空闲就断开），需要配置 `proxy_read_timeout`。
+
+**不适合大数据量传输**。WebSocket 的设计目标是小消息高频通信。如果你要传一个大文件（比如 zhang_wei 上传了一张 5MB 的配图），还是用 HTTP。WebSocket 传大文件没有进度回调、没有断点续传、没有分片，体验远不如 HTTP 文件上传。
+
+**调试困难**。HTTP 请求可以在 DevTools 的 Network 面板里直接看请求头、响应体、状态码。WebSocket 消息流需要专门的工具（比如 Socket.IO 官方的调试工具），排查问题成本更高。你不能像 HTTP 那样用 Postman 发一个请求来测试 WebSocket，需要一个支持 WebSocket 的客户端。
+
+**安全风险**。WebSocket 连接一旦建立，就不需要每次请求都带 Token 了（我们只在握手时验证了一次）。如果连接被劫持，攻击者可以冒充用户持续监听消息。虽然所有主流浏览器都支持 WebSocket 的 wss://（TLS 加密），但仍然比 HTTPS 多了一个攻击面。
+
+## 什么时候不该用 WebSocket
+
+如果你在纠结要不要用 WebSocket，问自己一个问题：**用户是否需要在一秒内看到更新？**
+
+如果答案是"不需要"，就用 HTTP。很多产品把"实时"当成了默认选项，但用户的实际需求可能没你想的那么急。比如一个后台管理系统里的审批流程，审批人每几分钟才刷新一次页面，"实时推送"对他来说没有意义。
+
+还有几个不适合 WebSocket 的信号：
+
+- 你的前端是 SEO 敏感的（比如博客文章页）。WebSocket 推送的内容不会被搜索引擎爬取
+- 你需要向后兼容老旧浏览器（IE 不支持 WebSocket，SSE 也支持不好）
+- 消息频率极低（比如一天才几条通知），轮询的开销完全可以接受
+- 团队没有 WebSocket 的运维经验，不想增加系统复杂度
+
+## Gateway 模块注册
+
+Gateway 创建后，需要把它注册到模块里。注意 Gateway 是一个 Provider，不需要放在 controllers 里：
+
+```typescript
+// comments.module.ts
+@Module({
+  imports: [PrismaModule],
+  controllers: [CommentsController],
+  providers: [CommentsService, CommentsGateway],
+  exports: [CommentsService],
+})
+export class CommentsModule {}
+```
+
+Gateway 的依赖注入和普通 Provider 一样——它需要 JwtService 做认证，需要 CommentsService 的引用来广播（不过我们选择了在 Service 里注入 Gateway，反过来也行，取决于你更喜欢哪种方向）。两种方式都可以工作，关键是保持一致性——不要一部分 Gateway 调用 Service，另一部分 Service 调用 Gateway，形成循环依赖。
+
+如果确实需要双向调用，可以用 `forwardRef()` 解决循环依赖，或者把共享逻辑抽到一个第三方 Service 里。
+
+## 前端对接
+
+后端搞定了，简单说一下前端怎么对接。以 React 为例：
+
+```typescript
+// hooks/useComments.ts
+import { useEffect, useState, useCallback } from "react";
+import { io, Socket } from "socket.io-client";
+
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "http://localhost:3000";
+
+export function useComments(postId: string) {
+  const [comments, setComments] = useState<Comment[]>([]);
+  const [readerCount, setReaderCount] = useState(0);
+
+  useEffect(() => {
+    const socket: Socket = io(`${WS_URL}/comments`, {
+      auth: { token: localStorage.getItem("access_token") },
+    });
+
+    // 加入文章房间
+    socket.emit("join-post", postId);
+
+    // 监听新评论
+    const handleNewComment = (comment: Comment) => {
+      setComments((prev) => [...prev, comment]);
+    };
+
+    // 监听在线人数
+    const handleReaderCount = ({ count }: { count: number }) => {
+      setReaderCount(count);
+    };
+
+    socket.on("new-comment", handleNewComment);
+    socket.on("reader-count", handleReaderCount);
+
+    return () => {
+      socket.emit("leave-post", postId);
+      socket.off("new-comment", handleNewComment);
+      socket.off("reader-count", handleReaderCount);
+      socket.disconnect();
+    };
+  }, [postId]);
+
+  return { comments, readerCount };
+}
+```
+
+几个要点：断开连接时发送 `leave-post` 消息确保服务端能正确清理在线人数。`socket.off()` 移除事件监听，防止内存泄漏。组件卸载时调用 `socket.disconnect()` 释放连接。Token 从 localStorage 取，和 HTTP 接口共用同一个 Token。
+
+发评论仍然走 HTTP：
+
+```typescript
+async function submitComment(postId: string, content: string) {
+  await fetch(`/api/posts/${postId}/comments`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${localStorage.getItem("access_token")}`,
+    },
+    body: JSON.stringify({ content }),
+  });
+  // 不需要手动刷新评论列表
+  // WebSocket 会自动推送新评论
+}
+```
+
+## 项目结构
+
+整理一下 WebSocket 相关的文件分布：
+
+```
+src/
+├── comments/
+│   ├── comments.module.ts          # 评论模块
+│   ├── comments.controller.ts      # HTTP 接口（CRUD）
+│   ├── comments.service.ts         # 业务逻辑 + 触发 WebSocket 广播
+│   └── comments.gateway.ts         # WebSocket Gateway
+├── main.ts                         # Redis Adapter 配置（多实例时）
+└── app.module.ts
+```
+
+Gateway 和 Controller 放在同一个模块里，因为它们处理的是同一个业务领域（评论）。Gateway 需要 Service 的引用来触发广播，Service 也需要 Gateway 来推送消息。
+
+## 测试 WebSocket
+
+WebSocket 的测试比 HTTP 接口复杂一些，因为你需要建立一个 WebSocket 客户端连接，发送消息，然后验证服务端的广播。NestJS 的测试模块支持 WebSocket 测试：
+
+```typescript
+// comments.gateway.spec.ts
+import { Test, TestingModule } from '@nestjs/testing';
+import { CommentsGateway } from './comments.gateway';
+import { JwtService } from '@nestjs/jwt';
+
+describe('CommentsGateway', () => {
+  let gateway: CommentsGateway;
+
+  const mockJwtService = {
+    verify: jest.fn().mockReturnValue({ sub: 'usr_a1x9k2m', name: 'zhang_wei' }),
+  };
+
+  const mockServer = {
+    to: jest.fn().mockReturnThis(),
+    emit: jest.fn(),
+  };
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        CommentsGateway,
+        { provide: JwtService, useValue: mockJwtService },
+      ],
+    }).compile();
+
+    gateway = module.get<CommentsGateway);
+    gateway.server = mockServer as any;
+  });
+
+  describe('handleJoinPost', () => {
+    it('应该加入房间并广播在线人数', () => {
+      const mockClient = {
+        id: 'test-client-id',
+        join: jest.fn(),
+        data: { user: { id: 'usr_a1x9k2m' } },
+      } as any;
+
+      gateway.handleJoinPost(mockClient, 'post-123');
+
+      expect(mockClient.join).toHaveBeenCalledWith('post:post-123');
+      expect(mockServer.to).toHaveBeenCalledWith('post:post-123');
+      expect(mockServer.emit).toHaveBeenCalledWith('reader-count', { count: 1 });
+    });
+  });
+
+  describe('handleConnection', () => {
+    it('无 Token 时应该断开连接', () => {
+      const mockClient = {
+        id: 'test-client-id',
+        handshake: { auth: {} },
+        disconnect: jest.fn(),
+      } as any;
+
+      gateway.handleConnection(mockClient);
+      expect(mockClient.disconnect).toHaveBeenCalled();
+    });
+
+    it('有效 Token 时应该保持连接', () => {
+      const mockClient = {
+        id: 'test-client-id',
+        handshake: { auth: { token: 'valid-token' } },
+        data: {},
+      } as any;
+
+      gateway.handleConnection(mockClient);
+      expect(mockClient.data.user).toEqual({ sub: 'usr_a1x9k2m', name: 'zhang_wei' });
+    });
+  });
+});
+```
+
+注意这里的测试思路：我们不建立真实的 WebSocket 连接（那属于 E2E 测试的范畴），而是直接调用 Gateway 的方法，用 mock 的 client 和 server 对象来验证行为。
+
+## 小结
+
+回顾这篇解决的问题。通过 WebSocket，zhang_wei 不需要刷新页面就能实时看到新评论。文章详情页的右上角显示当前有多少人正在阅读这篇文章（按用户去重，不是按连接数）。评论数据仍然通过 HTTP POST 接口存储，经过完整的验证管道，WebSocket 只负责推送——职责分离，各管各的。
+
+核心的 trade-off 是：WebSocket 让用户体验变好了，但系统复杂度也上去了。你需要处理连接管理、身份认证、断线重连、多实例消息同步（Redis Adapter）、操作系统文件描述符限制、Nginx 超时配置等问题。对于博客评论这种场景，投入产出比是划算的。但如果你的应用不需要实时性（比如一个内部管理后台），HTTP 轮询甚至手动刷新就够了，别为了用 WebSocket 而用 WebSocket。
+
+功能开发到这里，我们的博客 API 已经具备了文章管理、用户认证、文件上传、异步任务、缓存、实时推送这些核心能力。下一步是给它写测试。下一篇会给核心模块写单元测试和 E2E 测试，确保这些功能在各种边界条件下都能正确工作。
+
+---
+
+**完整项目示例**：[nestjs-blog-example](https://github.com/wy5211/nestjs-blog-example)
+**本篇代码分支**：[feat/websocket](https://github.com/wy5211/nestjs-blog-example/tree/feat/websocket)

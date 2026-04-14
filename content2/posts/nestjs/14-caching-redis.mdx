@@ -1,0 +1,583 @@
+---
+title: "14 缓存不是万能的：Redis 缓存实战与踩坑"
+date: "2026-03-30"
+summary: "博客首页每次查数据库 4 次，响应 300ms。加上 Redis 缓存后降到 5ms。但缓存穿透、击穿、雪崩三大经典问题你遇到过吗？"
+tags: ["NestJS", "Redis", "缓存", "性能优化", "cache-manager"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式学习"
+seriesOrder: 14
+---
+
+## 首页为什么这么慢
+
+zhang_wei 的博客上线一周了，首页加载越来越慢。打开 DevTools 看了一下，`GET /api/posts?page=1` 返回了 320ms。这个请求在后端做了四件事：查文章列表（80ms）、查热门文章 Top 10（90ms）、查分类统计（60ms）、查标签云（90ms）。加起来 320ms，但更头疼的是这四个查询是串行的，下一个等上一个查完才开始。
+
+问题在于，这些数据在几分钟内根本不会变。zhang_wei 的文章列表可能半小时才更新一次，热门排行榜更是按小时计算的。但每个用户的每次刷新，后端都老老实实地跑 4 遍 SQL。假设 100 个用户同时打开首页，数据库就要承受 400 次查询。如果首页响应时间是 320ms，而你的目标是 100ms 以内，靠优化 SQL 索引已经不够了。
+
+缓存解决的就是这个问题：**把查询结果放在 Redis 里，下次直接读内存，跳过数据库**。上一篇我们用 BullMQ 已经引入了 Redis，现在复用同一个实例做缓存，不需要额外的基础设施。如果你按上一篇的 docker-compose 启动了 Redis，现在直接用就行。
+
+## 缓存的本质：用空间换时间
+
+Redis 是内存数据库，读写延迟在亚毫秒级（通常 0.1-1ms）。PostgreSQL 即使在本地，一次查询也要几十毫秒。差距来自存储介质：内存的随机读写速度是 SSD 的 100 倍，是 HDD 的 10 万倍。
+
+但缓存不是免费午餐。你用内存空间换取了响应速度，代价是多了一层数据源：
+
+- **代码复杂度上升**：每个查询都要考虑"先查缓存还是直接查库"
+- **数据不一致**：用户刚更新的内容，别人看到的还是旧的
+- **Redis 可用性**：Redis 挂了怎么办，是降级到直接查库，还是返回错误
+- **缓存命中率**：命中率低的时候反而更慢，每次都要查 Redis（1ms）再查数据库（50ms），比直接查库还多了一步
+- **内存成本**：Redis 是全内存存储，数据量大的时候内存成本比磁盘高得多
+
+这些代价不是理论上的。后面我会一个一个讲我们怎么踩坑的。
+
+## 安装与配置
+
+NestJS 提供了 `@nestjs/cache-manager` 模块，底层对接 `cache-manager` 库。我们用 Redis 作为存储后端：
+
+```bash
+pnpm add @nestjs/cache-manager cache-manager cache-manager-redis-yet
+```
+
+创建缓存配置模块：
+
+```typescript
+// cache.module.ts
+import { Module } from "@nestjs/common";
+import { CacheModule } from "@nestjs/cache-manager";
+import { redisStore } from "cache-manager-redis-yet";
+
+@Module({
+  imports: [
+    CacheModule.register({
+      store: redisStore,
+      socket: {
+        host: process.env.REDIS_HOST || "localhost",
+        port: parseInt(process.env.REDIS_PORT) || 6379,
+      },
+      ttl: 300, // 默认 5 分钟过期
+    }),
+  ],
+  exports: [CacheModule],
+})
+export class CacheConfigModule {}
+```
+
+`ttl: 300` 是默认过期时间，单位秒。缓存不是永久有效的，必须设置过期时间，否则 Redis 内存会被撑爆。5 分钟是一个比较保守的默认值，具体的 TTL 应该根据业务场景来定——变化频率低的数据设长一些，变化频繁的设短一些。
+
+在 `app.module.ts` 里引入缓存模块，把它放在 imports 的前面，确保全局可用：
+
+```typescript
+@Module({
+  imports: [
+    CacheConfigModule,
+    // ... 其他模块
+  ],
+})
+export class AppModule {}
+```
+
+## 装饰器方式：最快但最受限
+
+NestJS 提供了 `CacheInterceptor`，在 Controller 上加一行就能自动缓存 GET 请求的响应：
+
+```typescript
+@Controller("posts")
+@UseInterceptors(CacheInterceptor)
+export class PostsController {
+  constructor(private readonly postsService: PostsService) {}
+
+  @Get()
+  getPosts() {
+    return this.postsService.findAll(); // 第一次查库，后续走缓存
+  }
+
+  @Get(":slug")
+  @CacheTTL(600) // 文章详情缓存 10 分钟
+  findOne(@Param("slug") slug: string) {
+    return this.postsService.findOne(slug);
+  }
+}
+```
+
+`@CacheTTL` 覆盖默认过期时间。`@CacheKey` 可以自定义缓存键的命名规则。看起来很方便，但这种方式有几个硬伤：
+
+- **只缓存 GET 请求**，POST/PUT/DELETE 不受影响
+- **缓存键是自动生成的**，格式类似 `GET:/posts?page=1`，但你没法控制命名规则
+- **最致命的是缓存不会自动失效**：zhang_wei 更新了文章内容，但缓存还是旧的。你需要在 Service 层手动清除，但装饰器方式拿不到 CacheManager 实例来做这件事
+- **粒度太粗**：缓存的是整个 HTTP 响应的序列化结果。如果你只想缓存数据库查询结果但需要动态组装响应，装饰器做不了
+
+所以装饰器方式只适合"几乎不会变的数据"，比如分类列表、标签云这种万年不变的接口。我们的博客系统需要更精细的控制，得手动管理缓存。
+
+## 手动缓存：Cache-Aside 模式
+
+Cache-Aside（旁路缓存）是业界使用最广泛的缓存模式。规则很简单：
+
+- **读的时候**：先查缓存，命中就返回，没命中就查数据库，把结果写入缓存
+- **写的时候**：先更新数据库，再删缓存
+
+注意是"删缓存"而不是"更新缓存"。如果两个请求同时更新同一条数据，一个更新数据库、一个更新缓存，时序不对的话缓存里就是旧数据：
+
+```
+请求 A：更新数据库（title = "新标题"）
+请求 B：查缓存未命中 → 查数据库 → 写入缓存（title = "旧标题"）← 覆盖了 A 的更新
+请求 A：更新缓存（title = "新标题"）
+```
+
+删缓存没有这个问题——下次读取时自然会从数据库加载最新值。
+
+我们封装一个通用的缓存工具类，避免在每个 Service 里重复写 Cache-Aside 逻辑：
+
+```typescript
+// cache.service.ts
+import { Injectable, Inject } from "@nestjs/common";
+import { CACHE_MANAGER } from "@nestjs/cache-manager";
+import { Cache } from "cache-manager";
+
+@Injectable()
+export class CacheService {
+  constructor(@Inject(CACHE_MANAGER) private readonly cacheManager: Cache) {}
+
+  /**
+   * Cache-Aside 读取模式的封装
+   * 先查缓存，未命中则执行 fetch 并写入缓存
+   */
+  async getOrSet<T>(
+    key: string,
+    ttl: number,
+    fetch: () => Promise<T>
+  ): Promise<T> {
+    const cached = await this.cacheManager.get<T>(key);
+    if (cached !== undefined && cached !== null) {
+      return cached;
+    }
+    const data = await fetch();
+    await this.cacheManager.set(key, data, ttl);
+    return data;
+  }
+
+  async del(key: string): Promise<void> {
+    await this.cacheManager.del(key);
+  }
+}
+```
+
+`getOrSet` 把整个 Cache-Aside 的读取流程封装成了一个方法。业务代码里用起来很干净：
+
+```typescript
+// posts.service.ts
+async findPopular(limit = 10) {
+  return this.cacheService.getOrSet(
+    `posts:popular:${limit}`,
+    1800, // 热门文章变化少，缓存 30 分钟
+    () => this.prisma.post.findMany({
+      orderBy: { views: 'desc' },
+      take: limit,
+      include: { author: true },
+    }),
+  );
+}
+```
+
+写入时删除缓存：
+
+```typescript
+async updatePost(postId: string, data: UpdatePostDto) {
+  const post = await this.prisma.post.update({
+    where: { id: postId },
+    data,
+  });
+
+  // 删除详情缓存和列表缓存
+  await this.cacheService.del(`post:${postId}`);
+  await this.cacheService.del('posts:popular:10');
+  return post;
+}
+```
+
+zhang_wei 更新文章后，下一次有人访问这篇文章，缓存未命中，自动从数据库加载新内容并写入缓存。整个过程对用户无感知。
+
+## 缓存键的命名规范
+
+缓存键的命名看似小事，但在排查问题时非常重要。推荐用冒号分隔的层级格式：
+
+```
+post:express-migration-tips          文章详情
+posts:list:1:10                      文章列表（第1页，每页10条）
+posts:popular:10                     热门文章 Top 10
+stats:categories                     分类统计
+stats:tags                           标签云
+user:usr_a1x9k2m                     用户信息
+```
+
+这种格式有几个好处。首先，Redis CLI 里用 `KEYS posts:*` 就能找到所有文章相关的缓存键，排查问题一目了然。其次，层级关系清晰——`posts:` 前缀下都是文章相关的，`stats:` 下都是统计相关的。第三，不会和其他系统的缓存键冲突（如果多个服务共享同一个 Redis 实例的话，用 `blog:posts:...` 这样的前缀做隔离）。
+
+## 三种缓存策略对比
+
+Cache-Aside 是最常用的，但不是唯一的。根据业务场景不同，还有两种常见策略：
+
+**Write-Through（写穿透）**：写入数据时，同时更新数据库和缓存。保证缓存和数据库始终一致，但写入性能差一些（每次写都要同时写两个地方）。适合数据一致性要求高的场景，比如金融账户余额。
+
+**Write-Behind（写回）**：写入数据时，先更新缓存，然后异步更新数据库。写入性能极高（用户感知到的延迟只有写缓存的时间），但数据一致性弱（缓存和数据库之间有延迟）。可以配合 BullMQ 使用——先写缓存，再通过队列异步更新数据库。
+
+对于博客系统，Cache-Aside 足够了。文章更新频率低，几秒的数据不一致完全可以接受。
+
+## 缓存穿透：查询不存在的东西
+
+有一天，线上监控报警了。大量请求打到了数据库，Redis 缓存形同虚设。排查发现，有人在爬网站，用随机 ID 不断请求 `GET /api/posts/not-exist-123`、`GET /api/posts/abc-456`。这些 slug 在数据库里不存在，缓存里也没有，每次请求都穿透到数据库。
+
+```
+请求 /api/posts/not-exist-123 → 查缓存（无）→ 查数据库（无）→ 返回 404
+请求 /api/posts/not-exist-123 → 查缓存（无）→ 查数据库（无）→ 返回 404
+请求 /api/posts/not-exist-123 → 查缓存（无）→ 查数据库（无）→ 返回 404
+... 无限循环，数据库被打垮
+```
+
+问题的根源是：对于不存在的数据，我们没有缓存"不存在"这个事实。
+
+解决方案是缓存空值。即使数据库返回 null，也把它存到 Redis 里，只是过期时间设短一些：
+
+```typescript
+async findOne(slug: string) {
+  const cacheKey = `post:${slug}`;
+  const cached = await this.cacheManager.get(cacheKey);
+
+  // 缓存命中，即使是 null 也直接返回
+  if (cached !== undefined) {
+    return cached;
+  }
+
+  const post = await this.prisma.post.findUnique({
+    where: { slug },
+    include: { author: true, tags: true },
+  });
+
+  // 即使 post 为 null 也缓存，防止穿透
+  await this.cacheManager.set(
+    cacheKey,
+    post,
+    post ? 600 : 60, // 存在的数据缓存 10 分钟，空值只缓存 1 分钟
+  );
+
+  return post;
+}
+```
+
+60 秒后空值缓存过期，如果这时真的有人发布了这个 slug 的文章，数据就能被正常缓存了。代价是 Redis 里会多存一些空值，但过期时间短，内存占用可以忽略。
+
+更极端的防护手段是布隆过滤器（Bloom Filter），在查询缓存之前先判断这个 key "有没有可能存在"。布隆过滤器是一种空间效率极高的概率型数据结构，它可能误判（告诉你存在但实际不存在），但不会漏判（告诉你不存在就一定不存在）。不过对于博客系统来说，缓存空值已经足够了，布隆过滤器更适合海量数据的场景。
+
+## 缓存击穿：热点 Key 过期瞬间
+
+zhang_wei 的那篇「从 Express 迁移到 NestJS 的踩坑记录」火了，一天之内浏览量超过 5000。文章详情缓存在 Redis 里，TTL 设为 10 分钟。
+
+问题发生在缓存过期的那一瞬间。假设有 200 个用户同时访问这篇文章，缓存刚好在第 10 分钟过期，200 个请求同时发现缓存不存在，200 个请求同时去查数据库。数据库连接池瞬间被打满（默认连接数通常是 20），其他接口也开始变慢甚至超时。
+
+这就是缓存击穿——一个热点 Key 过期，大量并发同时穿透。
+
+解决思路是让只有一个请求去查数据库，其他请求等它查完。用互斥锁实现：
+
+```typescript
+async findOneWithLock(slug: string) {
+  const cacheKey = `post:${slug}`;
+  const lockKey = `lock:${slug}`;
+
+  const cached = await this.cacheManager.get(cacheKey);
+  if (cached !== undefined) return cached;
+
+  // 尝试获取锁，10 秒后自动释放防止死锁
+  const acquired = await this.cacheManager.set(lockKey, '1', 10);
+  if (!acquired) {
+    // 没拿到锁，等 100ms 再重试
+    await new Promise((r) => setTimeout(r, 100));
+    return this.findOneWithLock(slug);
+  }
+
+  try {
+    const post = await this.prisma.post.findUnique({
+      where: { slug },
+      include: { author: true, tags: true },
+    });
+    await this.cacheManager.set(cacheKey, post, 600);
+    return post;
+  } finally {
+    await this.cacheManager.del(lockKey);
+  }
+}
+```
+
+严格来说，`cacheManager.set` 不保证原子性（它不是 Redis 的 SETNX），在极端并发下可能有两个请求同时拿到锁。生产环境应该直接用 `ioredis` 的 `set` 方法配合 `NX` 参数来保证原子性：
+
+```typescript
+const acquired = await this.redis.set(lockKey, "1", "EX", 10, "NX");
+```
+
+`NX` 表示"只在 key 不存在时设置"，`EX 10` 表示 10 秒后自动过期。Redis 的 SET 命令是原子操作，保证只有一个请求能拿到锁。
+
+另一个思路是"逻辑过期"——缓存不设 TTL，数据里带一个逻辑过期时间字段。过期后不删缓存，而是返回旧数据的同时异步更新。这样用户永远不会感受到延迟，代价是短时间内可能看到旧数据。对于博客系统，这个方案其实更合适，因为文章内容变化很少，多看几秒旧内容问题不大。
+
+## 缓存雪崩：大量 Key 同时过期
+
+比击穿更严重的问题是雪崩。假设你给所有文章详情缓存都设了 600 秒的 TTL，而系统在某个时刻重启清空了 Redis。重启后第一个用户访问首页，所有文章的缓存同时被重建。或者更常见的情况是：你批量导入了 100 篇文章，它们的缓存都是同一时间写入的，10 分钟后集体过期。
+
+所有请求同时涌向数据库，不是某一个热点 Key 的问题，而是大面积失效。
+
+解决方案简单粗暴：给 TTL 加一个随机偏移。
+
+```typescript
+function jitteredTTL(base: number): number {
+  // 基础 TTL + 0~20% 的随机偏移
+  return base + Math.floor(Math.random() * base * 0.2);
+}
+
+// 基础 600 秒 + 0~120 秒随机偏移
+// 100 篇文章的缓存不会在同一秒过期，而是分散在 10~12 分钟内
+await this.cacheManager.set(cacheKey, data, jitteredTTL(600));
+```
+
+这 20% 的随机偏移足够把过期时间打散，避免集中失效。更激进的做法是在基础 TTL 上加减 50% 的随机偏移，对于"几秒的旧数据无所谓"的场景很合适。
+
+| 问题     | 原因                      | 解决方案           |
+| -------- | ------------------------- | ------------------ |
+| 缓存穿透 | 查询不存在的数据          | 缓存空值（短 TTL） |
+| 缓存击穿 | 热点 Key 过期瞬间大量并发 | 互斥锁 / 逻辑过期  |
+| 缓存雪崩 | 大量 Key 同时过期         | TTL 加随机偏移     |
+
+## 什么时候不该用缓存
+
+前面讲了缓存怎么用，但知道什么时候不用同样重要。
+
+**浏览量计数**是一个典型的不适合缓存的场景。zhang_wei 的热门文章每秒可能有几十次浏览，如果每次浏览都更新数据库的 views 字段，写入压力很大。但如果你把 views 缓存到 Redis，然后定期同步到数据库，又会有数据不一致——用户看到的浏览量和实际数据库里的不一样。
+
+对于浏览量，更好的做法是用 Redis 的 INCR 命令做原子递增，定时批量写入数据库。这不是缓存，是计数器。缓存和计数器是两个不同的东西，不要混为一谈。
+
+**用户个性化数据**也不适合缓存。每个用户看到的推荐列表不一样，缓存键要包含用户 ID，命中率低，缓存反而浪费内存。
+
+**搜索结果**也不适合。搜索查询的参数组合太多（关键词 + 分类 + 排序 + 分页），几乎不可能有缓存命中。搜索性能应该通过数据库索引和搜索引擎（如 Elasticsearch）来优化，而不是缓存。
+
+适合缓存的场景有一个共同特征：**读多写少，公共数据**。文章详情、分类列表、标签云——所有用户看到的内容一样，变化频率低，完美适合缓存。
+
+## 缓存和 BullMQ 的配合
+
+缓存和队列在我们的博客系统里是两个独立的关注点，但它们有一个配合场景：**缓存重建**。
+
+当热门文章列表的缓存过期后，重建这个缓存需要查询数据库、排序、分页，可能耗时 200ms。如果缓存过期时有 100 个并发请求，用互斥锁让一个请求去查库，其他 99 个等 100ms 再重试，体验不好。
+
+更好的做法是：缓存即将过期时，提前通过队列异步重建。具体来说，在写入缓存时把 TTL 设为比实际需要的长一些，同时往队列里加一个延迟任务，在"实际 TTL - 余量"的时间后触发重建。
+
+```typescript
+async findPopular(limit = 10) {
+  const cacheKey = `posts:popular:${limit}`;
+  const cached = await this.cacheManager.get(cacheKey);
+  if (cached !== undefined && cached !== null) {
+    return cached;
+  }
+
+  const posts = await this.prisma.post.findMany({
+    orderBy: { views: 'desc' },
+    take: limit,
+    include: { author: true },
+  });
+
+  // 缓存 35 分钟，但 25 分钟后触发异步重建
+  await this.cacheManager.set(cacheKey, posts, 2100);
+  await this.cacheQueue.add('rebuild-cache', {
+    key: cacheKey,
+    fetchFn: 'findPopular',
+    args: [limit],
+  }, {
+    delay: 25 * 60 * 1000, // 25 分钟后执行
+  });
+
+  return posts;
+}
+```
+
+这样在 25-35 分钟这个窗口内，缓存重建是异步完成的，用户永远不会看到缓存过期的空窗期。这个技巧叫做"预热缓存"，适合对延迟非常敏感的热点数据。
+
+## 完整实战：首页缓存优化
+
+把前面的知识整合起来，优化 zhang_wei 博客首页的加载。首页需要四组数据，每组数据的缓存策略不同：
+
+```typescript
+// posts.service.ts
+@Injectable()
+export class PostsService {
+  constructor(
+    private prisma: PrismaService,
+    private cacheService: CacheService
+  ) {}
+
+  /** 文章列表：变化频率中等，缓存 5 分钟 */
+  async findList(page = 1, pageSize = 10) {
+    const cacheKey = `posts:list:${page}:${pageSize}`;
+    return this.cacheService.getOrSet(cacheKey, 300, async () => {
+      const [posts, total] = await Promise.all([
+        this.prisma.post.findMany({
+          skip: (page - 1) * pageSize,
+          take: pageSize,
+          orderBy: { createdAt: "desc" },
+          include: { author: true, tags: true },
+        }),
+        this.prisma.post.count(),
+      ]);
+      return { posts, total, page, pageSize };
+    });
+  }
+
+  /** 热门文章：变化频率低，缓存 30 分钟 */
+  async findPopular(limit = 10) {
+    const cacheKey = `posts:popular:${limit}`;
+    return this.cacheService.getOrSet(cacheKey, 1800, () =>
+      this.prisma.post.findMany({
+        orderBy: { views: "desc" },
+        take: limit,
+        include: { author: true },
+      })
+    );
+  }
+
+  /** 分类统计：几乎不变，缓存 1 小时 */
+  async getCategoryStats() {
+    return this.cacheService.getOrSet("stats:categories", 3600, () =>
+      this.prisma.post.groupBy({
+        by: ["category"],
+        _count: { id: true },
+      })
+    );
+  }
+
+  /** 标签云：几乎不变，缓存 1 小时 */
+  async getTagCloud() {
+    return this.cacheService.getOrSet("stats:tags", 3600, () =>
+      this.prisma.postTag.groupBy({
+        by: ["name"],
+        _count: { postId: true },
+        orderBy: { _count: { postId: "desc" } },
+        take: 30,
+      })
+    );
+  }
+}
+```
+
+注意 `findList` 里的 `Promise.all`——文章列表和总数可以并行查，不需要串行。这又省了一次往返。
+
+创建新文章时清除相关缓存：
+
+```typescript
+async createPost(userId: string, data: CreatePostDto) {
+  const post = await this.prisma.post.create({
+    data: { ...data, authorId: userId },
+  });
+
+  // 新文章可能影响列表、热门排行、分类统计、标签云
+  await Promise.all([
+    this.cacheService.del('posts:list:1:10'),
+    this.cacheService.del('posts:popular:10'),
+    this.cacheService.del('stats:categories'),
+    this.cacheService.del('stats:tags'),
+  ]);
+
+  return post;
+}
+```
+
+这里有一个容易犯的错：清除缓存时只清了第一页。如果有人正在看第二页呢？第二页的数据可能已经变了（新文章插入后，第二页的内容会变）。所以要么清所有分页的缓存（`posts:list:*`），要么接受短暂的不一致。对于博客系统，后者更实际——用户刷新一次就对了。
+
+优化后的效果：
+
+| 指标              | 优化前    | 优化后         | 提升      |
+| ----------------- | --------- | -------------- | --------- |
+| 首页响应时间      | 300-500ms | 5-10ms         | 30-100 倍 |
+| 数据库查询/次访问 | 4 次      | 0 次（命中时） | 100%      |
+| 数据库并发承载    | ~500 QPS  | ~5000 QPS      | 10 倍     |
+
+## 清除缓存的策略
+
+前面的代码在更新文章时，手动列出了需要清除的缓存键。这在缓存键数量少的时候没问题，但一旦缓存键多了（文章详情、列表、分页、排序、筛选条件的各种组合），手动维护就很容易遗漏。
+
+一个更系统的做法是按前缀清除。cache-manager 本身不支持通配符删除，但可以直接用 ioredis：
+
+```typescript
+// cache.service.ts
+async clearByPrefix(prefix: string): Promise<void> {
+  const store = this.cacheManager.store as any;
+  if (store.keys) {
+    const keys = await store.keys(`${prefix}*`);
+    if (keys.length > 0) {
+      await Promise.all(
+        keys.map((key: string) => this.cacheManager.del(key)),
+      );
+    }
+  }
+}
+```
+
+使用：
+
+```typescript
+async updatePost(postId: string, data: UpdatePostDto) {
+  const post = await this.prisma.post.update({ ... });
+
+  // 清除所有和这篇文章相关的缓存
+  await this.cacheService.del(`post:${postId}`);
+  // 清除所有文章列表缓存（不管第几页）
+  await this.cacheService.clearByPrefix('posts:list:');
+  await this.cacheService.del('posts:popular:10');
+
+  return post;
+}
+```
+
+`KEYS` 命令在生产环境的 Redis 集群里性能很差（时间复杂度 O(N)），但对于缓存键数量在几百个以内的场景，可以接受。如果缓存键数量达到万级，应该在写入缓存时同时把 key 记录到一个 Set 里，清除时遍历 Set 而不是用 KEYS 扫描。
+
+## Redis 挂了怎么办
+
+这是缓存方案必须回答的问题。Redis 挂了有两种处理思路。
+
+第一种是**降级到直接查库**。`cacheManager.get()` 抛异常时，catch 住，直接查数据库。用户可能感受到变慢（从 5ms 回到 300ms），但功能不受影响。这是最常见的做法。
+
+第二种是**快速失败**。Redis 挂了就返回 503 Service Unavailable，让用户知道系统出了问题。适合对性能要求极高的场景——如果首页加载超过 500ms，不如直接告诉用户稍后再试。
+
+我们的博客系统选第一种。在 `CacheService.getOrSet` 里加一层 try-catch：
+
+```typescript
+async getOrSet<T>(key: string, ttl: number, fetch: () => Promise<T>): Promise<T> {
+  try {
+    const cached = await this.cacheManager.get<T>(key);
+    if (cached !== undefined && cached !== null) {
+      return cached;
+    }
+  } catch {
+    // Redis 不可用，降级到直接查库
+    this.logger.warn(`缓存读取失败，降级到数据库: ${key}`);
+  }
+
+  const data = await fetch();
+  try {
+    await this.cacheManager.set(key, data, ttl);
+  } catch {
+    // 写缓存失败不影响返回结果
+  }
+  return data;
+}
+```
+
+这样 Redis 挂了的时候，系统自动降级到无缓存模式，不会报错。
+
+## 小结
+
+回到最初的数字。加了缓存之后，首页的四个查询全部命中 Redis，响应时间从 320ms 降到了 5ms。数据库查询次数从每次访问 4 次降到 0 次。
+
+但这个过程不是一劳永逸的。缓存穿透让我们学会了缓存空值，缓存击穿让我们加了互斥锁，缓存雪崩让我们给 TTL 加了随机偏移。每个坑都是真实线上环境踩过的。
+
+缓存的 trade-off 是：你用一层间接性换来了速度，代价是代码复杂度和潜在的数据不一致。对于博客系统，"最终一致"完全可以接受——zhang_wei 更新文章后，其他用户最多看到几分钟的旧数据，这没什么大不了的。但如果你的系统要求强一致（比如库存扣减、账户余额），缓存方案需要更谨慎地设计。
+
+缓存搞定后，还有一个体验问题：用户在看文章的时候，另一个人发了评论，第一人要刷新页面才能看到。能不能实时推送？下一篇用 WebSocket 来解决。
+
+---
+
+**完整项目示例**：[nestjs-blog-example](https://github.com/wy5211/nestjs-blog-example)
+**本篇代码分支**：[feat/caching](https://github.com/wy5211/nestjs-blog-example/tree/feat/caching)

@@ -1,0 +1,368 @@
+---
+title: "01. 从一台空服务器开始：Linux 基础配置"
+date: "2026-04-12"
+summary: "买了一台云服务器，拿到 IP 和密码。默认配置有哪些安全风险？怎么把它变成能跑应用的生产环境？"
+tags: ["Linux", "DevOps", "服务器", "安全"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战指南"
+seriesOrder: 1
+---
+
+你买了一台云服务器——2 核 4G，Ubuntu 22.04，月费 60 块。云厂商发给你一个公网 IP 和 root 密码。你 SSH 登上去一看：系统是全新的，什么都没装。
+
+你迫不及待地想把应用部署上去。但先等一下——在部署任何东西之前，这台服务器有几个默认配置是**必须改的**，不改就是在给攻击者开门。
+
+## 默认配置有多危险
+
+一台刚创建的云服务器，通常有以下问题：
+
+**SSH 允许密码登录**。默认情况下，任何人只要知道 root 密码就能登录。密码可能不复杂，或者会被暴力破解。你买的服务器 IP 是公开的，全世界的扫描器都在扫描 22 端口。
+
+**root 可以直接登录**。root 用户拥有最高权限，一旦被攻破，整个系统就完了。
+
+**防火墙没开**。所有端口都是开放的，不只是 22 端口。3306（MySQL）、6379（Redis）、27017（MongoDB）这些数据库端口也暴露在公网上。
+
+**系统可能没有更新**。云厂商的镜像可能几个月前的，有一些已知的安全漏洞还没修补。
+
+一台刚上线的、没有加固的服务器，在公网上被扫描和暴力破解是常态——不是会不会被攻击的问题，而是什么时候被攻击的问题。
+
+## SSH 安全加固
+
+SSH 是你管理服务器的入口，先把门锁好。
+
+### 禁用密码登录，只用密钥
+
+```bash
+# 在你的本地机器上生成 SSH 密钥（如果还没有的话）
+ssh-keygen -t ed25519 -C "your-email@example.com"
+# 提示输入保存路径，默认 ~/.ssh/id_ed25519
+# 提示输入密码，可以留空（按两次回车）
+```
+
+```bash
+# 把公钥传到服务器
+ssh-copy-id -i ~/.ssh/id_ed25519.pub root@你的服务器IP
+```
+
+传完之后，测试一下能不能用密钥登录：
+
+```bash
+ssh -i ~/.ssh/id_ed25519 root@你的服务器IP
+# 不需要输入密码就能登录，说明密钥配置成功
+```
+
+确认密钥登录没问题后，禁用密码登录：
+
+```bash
+# 编辑 SSH 配置
+sudo nano /etc/ssh/sshd_config
+```
+
+找到并修改以下配置：
+
+```
+# 禁用密码登录
+PasswordAuthentication no
+
+# 禁止 root 远程登录（稍后创建普通用户后再改）
+PermitRootLogin prohibit-password
+
+# 禁用空密码
+PermitEmptyPasswords no
+
+# 限制认证尝试次数，防止暴力破解
+MaxAuthTries 3
+
+# 登录超时时间
+LoginGraceTime 30
+```
+
+修改完后重启 SSH 服务：
+
+```bash
+sudo systemctl restart sshd
+```
+
+**注意：改之前一定要确保密钥登录能用，否则你会把自己锁在外面。**
+
+### 可选：改 SSH 端口
+
+把 22 端口改成其他端口（比如 2222），可以减少大量无意义的扫描：
+
+```
+Port 2222
+```
+
+改完后记得在防火墙中开放新端口，再重启 sshd。之后连接要用 `-p 2222`：
+
+```bash
+ssh -p 2222 -i ~/.ssh/id_ed25519 root@你的服务器IP
+```
+
+这个改动不是必须的——如果用了密钥认证 + 禁用密码登录，22 端口也是安全的。改端口主要是减少日志里的噪音。
+
+## 创建应用用户
+
+root 权限太大，日常操作不应该用 root。创建一个专门运行应用的用户：
+
+```bash
+# 创建用户
+sudo adduser deploy
+# 提示设置密码（这个密码只是备用，实际用密钥登录）
+
+# 把用户加入 docker 组（稍后安装 Docker 后需要）
+sudo usermod -aG docker deploy
+
+# 允许 deploy 用户用 sudo（需要时可以提权）
+sudo usermod -aG sudo deploy
+```
+
+给 deploy 用户配置密钥登录：
+
+```bash
+# 在本地机器上执行
+ssh-copy-id -i ~/.ssh/id_ed25519.pub deploy@你的服务器IP
+```
+
+测试 deploy 用户能否登录并 sudo：
+
+```bash
+ssh deploy@你的服务器IP
+sudo whoami  # 应该输出 root
+```
+
+确认 deploy 用户能用之后，可以禁用 root 远程登录：
+
+```
+PermitRootLogin no
+```
+
+```bash
+sudo systemctl restart sshd
+```
+
+## 配置防火墙
+
+Ubuntu 22.04 自带 ufw 防火墙，默认没有启用。启用它，只开放必要的端口：
+
+```bash
+# 先确保 SSH 端口是开放的（防止把自己锁在外面）
+sudo ufw allow 22/tcp     # SSH（如果改了端口，用新端口号）
+sudo ufw allow 80/tcp     # HTTP（Nginx）
+sudo ufw allow 443/tcp    # HTTPS（Nginx）
+
+# 启用防火墙
+sudo ufw enable
+
+# 查看状态
+sudo ufw status verbose
+```
+
+输出应该类似：
+
+```
+Status: active
+To                         Action      From
+--                         ------      ----
+22/tcp                     ALLOW IN    Anywhere
+80/tcp                     ALLOW IN    Anywhere
+443/tcp                    ALLOW IN    Anywhere
+22/tcp (v6)                ALLOW IN    Anywhere
+80/tcp (v6)                ALLOW IN    Anywhere
+443/tcp (v6)               ALLOW IN    Anywhere
+```
+
+三条规则就够了。3306（MySQL）、6379（Redis）这些端口**不要开放到公网**。如果应用需要访问数据库，应该通过内网或 SSH 隧道。
+
+如果你用了云厂商的安全组（Security Group），也需要同步配置——ufw 是服务器层面的防火墙，安全组是云平台层面的，两者不冲突。
+
+## 系统更新
+
+```bash
+# 更新软件包列表
+sudo apt update
+
+# 升级所有已安装的软件包
+sudo apt upgrade -y
+
+# 如果有内核更新，重启服务器
+sudo reboot
+```
+
+养成定期更新的习惯。也可以配置自动安全更新：
+
+```bash
+sudo apt install unattended-upgrades
+sudo dpkg-reconfigure -plow unattended-upgrades
+# 选择 "Yes"
+```
+
+这样安全补丁会自动安装，不需要你手动操作。
+
+## 安装 Docker
+
+FlowAPI 已经容器化了，服务器上需要 Docker 来运行它：
+
+```bash
+# 安装 Docker（官方推荐方式）
+curl -fsSL https://get.docker.com | sudo sh
+
+# 把当前用户加入 docker 组（这样不用 sudo 就能运行 docker）
+sudo usermod -aG docker $USER
+
+# 重新登录使组变更生效，或者执行：
+newgrp docker
+
+# 验证安装
+docker --version
+docker run --rm hello-world
+```
+
+用官方的一键安装脚本最简单。如果你对安装过程有安全顾虑，可以按照 Docker 官方文档手动安装。
+
+## 部署第一个容器
+
+服务器准备好了，把 FlowAPI 部署上去：
+
+```bash
+# 拉取镜像
+docker pull your-registry.com/flowapi:latest
+
+# 运行容器
+docker run -d \
+  --name flowapi \
+  --restart unless-stopped \
+  -p 3000:3000 \
+  -e NODE_ENV=production \
+  -e DATABASE_URL=postgresql://user:pass@localhost:5432/flowapi \
+  your-registry.com/flowapi:latest
+```
+
+几个关键参数：
+
+- `--restart unless-stopped`：服务器重启后自动启动容器
+- `-p 3000:3000`：端口映射，宿主机的 3000 端口映射到容器的 3000 端口
+- `-e`：环境变量。**不要把密码直接写在命令行里**，更好的做法是用 `.env` 文件或 Docker secrets
+
+用 `.env` 文件管理环境变量：
+
+```bash
+# 创建 .env 文件
+cat > /home/deploy/flowapi/.env << 'EOF'
+NODE_ENV=production
+DATABASE_URL=postgresql://flowapi:yourpassword@localhost:5432/flowapi
+PORT=3000
+EOF
+
+# 设置权限（只有 deploy 用户能读）
+chmod 600 /home/deploy/flowapi/.env
+
+# 运行容器时加载 .env 文件
+docker run -d \
+  --name flowapi \
+  --restart unless-stopped \
+  -p 3000:3000 \
+  --env-file /home/deploy/flowapi/.env \
+  your-registry.com/flowapi:latest
+```
+
+验证容器运行状态：
+
+```bash
+# 查看容器状态
+docker ps
+
+# 查看日志
+docker logs -f flowapi
+
+# 测试 API
+curl http://localhost:3000/health
+```
+
+到这里，FlowAPI 在服务器上跑起来了。但还有几个问题没解决：
+
+- 应用监听 3000 端口，用户不会访问 `example.com:3000`
+- 没有 HTTPS，数据在传输过程中是明文的
+- 每次更新镜像都要手动 SSH 上去操作
+
+这些是后面两篇文章要解决的问题。
+
+## 用 systemd 管理容器（可选）
+
+如果你不想用 Docker，也可以直接用 systemd 管理应用进程：
+
+```ini
+# /etc/systemd/system/flowapi.service
+[Unit]
+Description=FlowAPI Service
+After=network.target
+
+[Service]
+Type=simple
+User=deploy
+WorkingDirectory=/home/deploy/flowapi
+ExecStart=/usr/bin/node /home/deploy/flowapi/dist/index.js
+Restart=always
+RestartSec=5
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
+```
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable flowapi   # 开机自启
+sudo systemctl start flowapi    # 启动
+sudo systemctl status flowapi   # 查看状态
+journalctl -u flowapi -f        # 查看日志
+```
+
+systemd 的好处：开机自启、崩溃自动重启、日志管理统一。对于不使用 Docker 的部署方式，systemd 是标准选择。
+
+## 日常维护命令速查
+
+这些命令是日常运维的基础：
+
+```bash
+# 系统信息
+uname -a              # 内核版本
+uptime                # 运行时间、负载
+free -h                # 内存使用
+df -h                  # 磁盘使用
+top                    # 实时进程（按 CPU 排序）
+
+# 网络排查
+ss -tlnp               # 查看监听端口
+curl -I http://localhost:3000  # 测试 HTTP
+dig example.com        # DNS 查询
+traceroute example.com # 路由追踪
+
+# 日志查看
+journalctl -u flowapi --since "1 hour ago"  # 最近 1 小时的日志
+journalctl -f          # 实时日志（类似 tail -f）
+```
+
+## 安全加固清单
+
+到这里，你的服务器完成了基础加固。对照清单：
+
+- SSH 密钥认证（密码登录已禁用）
+- root 远程登录已禁用
+- 专用应用用户（deploy）
+- 防火墙已启用（只开 22、80、443）
+- 系统已更新到最新
+- 环境变量用 `.env` 文件管理（权限 600）
+
+还没做的（后面会逐步覆盖）：
+
+- HTTPS 证书（下一篇 Nginx）
+- 自动化部署（第 3 篇 CI/CD）
+- 基础设施版本管理（第 8 篇 Terraform）
+- 监控告警（第 7 篇 Prometheus）
+
+安全加固是一个持续的过程，不是一次性的配置。这台服务器现在比刚创建时安全了很多——密码暴力破解进不来、数据库端口没暴露、root 不能远程登录。但安全是一个纵深防御的体系，后面还有更多层面要覆盖。
+
+FlowAPI 现在能跑了，但用户还访问不了——下一篇解决 Nginx 反向代理和 HTTPS 的问题。

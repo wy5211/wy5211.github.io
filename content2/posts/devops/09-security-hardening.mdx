@@ -1,0 +1,347 @@
+---
+title: "09. 全链路安全加固"
+date: "2026-04-12"
+summary: "SSH 加固了但 CI/CD 里硬编码了密钥，K8s 配了 RBAC 但镜像没有扫描。安全不是某一个环节的事，而是贯穿整个部署链路的系统性工程。"
+tags: ["安全", "DevSecOps", "Kubernetes", "DevOps"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战指南"
+seriesOrder: 9
+---
+
+前 8 篇，你在每一篇都做了一些安全配置：第 1 篇 SSH 加固、第 2 篇 HTTPS、第 5 篇 K8s 安全。但安全不是一个" checklist 打完就安全了"的事——它是一个系统性的、贯穿整个部署链路的工程。
+
+你做了 SSH 加固，但 CI/CD 的 YAML 里是不是硬编码了数据库密码？K8s 配了 RBAC，但 Docker 镜像扫描过已知漏洞吗？Nginx 加了 HTTPS，但证书是通配符证书吗（泄露了影响所有子域名）？
+
+这篇把 FlowAPI 整条部署链路的安全审查一遍，从代码仓库到服务器到 K8s 集群。
+
+## 安全审计的框架
+
+把部署链路分成几层，逐层检查：
+
+```
+代码仓库 → CI/CD 流水线 → Docker 镜像 → K8s 集群 → 网络层 → 运维操作
+```
+
+每一层都有独立的安全风险，也需要独立的防护措施。
+
+## 代码仓库层
+
+### 不要提交密钥
+
+这是最基本的规则，但也是最常见的失误。
+
+```bash
+# 检查仓库中是否有泄露的密钥
+git log -p | grep -i "password\|secret\|api_key\|token" | head -20
+```
+
+如果不小心提交了密钥到 Git 仓库：
+
+1. **立即轮换密钥**——不要只删除文件，因为历史提交里还有
+2. 用 `git filter-branch` 或 `BFG Repo-Cleaner` 从历史中清除
+3. 如果是公开仓库，认为密钥已经泄露
+
+预防措施：
+
+```bash
+# 在项目根目录创建 .gitignore
+echo ".env" >> .gitignore
+echo ".env.local" >> .gitignore
+echo ".env.production" >> .gitignore
+echo "*.pem" >> .gitignore
+echo "*.key" >> .gitignore
+```
+
+更主动的做法是用 `git-secrets` 或 `truffleHog` 在 pre-commit 钩子中检查：
+
+```bash
+# 安装 git-secrets
+brew install git-secrets
+
+# 在仓库中启用
+git secrets --install
+git secrets --register-aws  # 检查 AWS 密钥格式
+```
+
+### 依赖安全
+
+你的应用依赖了上百个 npm 包。任何一个包出了安全问题，你的应用也受影响。
+
+```bash
+# npm 审计已知漏洞
+npm audit
+
+# 自动修复
+npm audit fix
+
+# CI 中集成
+# GitHub Actions 中加一步：
+# - run: npm audit --audit-level=high
+```
+
+GitHub 的 Dependabot 可以自动检测依赖漏洞并提交 PR：
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+```
+
+## CI/CD 供应链安全
+
+CI/CD 流水线是一个容易被忽视的攻击面。如果有人能往你的 main 分支提交恶意代码，CI/CD 会自动执行它。
+
+### Pin Action 版本
+
+```yaml
+# 危险：用 tag 引用，tag 可以被覆盖
+- uses: actions/checkout@v4
+
+# 安全：用 commit SHA，不可变
+- uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+```
+
+tag 可以被仓库维护者修改（指向不同的 commit）。用 commit SHA 是唯一确保你用的是经过审查的代码的方式。
+
+### 最小权限
+
+```yaml
+permissions:
+  contents: read # 只读代码，不需要写权限
+  packages: write # 只有构建推送需要写权限
+```
+
+不要给 workflow `write-all` 权限。只授予必要的最小权限。
+
+### 密钥不要打印
+
+```yaml
+# 危险：如果脚本出错，错误信息可能包含密钥
+- run: echo "Connecting to $DATABASE_URL"
+
+# 安全：使用 GitHub 的 mask 功能
+- run: |
+    echo "::add-mask::$DATABASE_URL"
+    # 或者干脆不要打印
+```
+
+## Docker 镜像安全
+
+### 镜像扫描
+
+用 Trivy 扫描镜像中的已知漏洞：
+
+```bash
+# 安装 Trivy
+brew install trivy
+
+# 扫描镜像
+trivy image your-registry.com/flowapi:latest
+
+# 输出示例：
+# your-registry.com/flowapi:latest (linux/amd64)
+# ========================================
+# Total: 5 (HIGH: 2, CRITICAL: 1)
+#
+# CRITICAL: CVE-2024-xxxxx (openssl)
+# HIGH: CVE-2024-yyyyy (nodejs)
+```
+
+在 CI 中集成：
+
+```yaml
+# GitHub Actions 中扫描镜像
+- name: Run Trivy vulnerability scanner
+  uses: aquasecurity/trivy-action@master
+  with:
+    image-ref: "your-registry.com/flowapi:${{ github.sha }}"
+    severity: "CRITICAL,HIGH"
+    exit-code: "1" # 发现高危漏洞时 CI 失败
+```
+
+### 最小化基础镜像
+
+```dockerfile
+# 不好：用完整 Node.js 镜像（约 1GB）
+FROM node:20
+
+# 好：用 Alpine 镜像（约 180MB）
+FROM node:20-alpine
+
+# 更好：用 distroless 镜像（约 100MB，没有 shell）
+FROM gcr.io/distroless/nodejs20-debian12
+```
+
+distroless 镜像不包含 shell、包管理器等工具。即使攻击者拿到了容器的 shell，也没法安装恶意软件。
+
+### 非根用户运行
+
+上一篇已经讲了 SecurityContext。这里从 Docker 层面再加固：
+
+```dockerfile
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --only=production
+COPY . .
+
+# 创建非 root 用户
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -S appuser -u 1001 -G appgroup
+
+USER appuser
+
+EXPOSE 3000
+CMD ["node", "dist/index.js"]
+```
+
+在 Dockerfile 里就用 `USER appuser`，即使 K8s 的 SecurityContext 配错了，容器也不会以 root 运行。
+
+## K8s 安全
+
+### Pod Security Standards
+
+K8s 1.26+ 用 Pod Security Admission 替代了 PodSecurityPolicy。通过 namespace 标签强制执行安全标准：
+
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    pod-security.kubernetes.io/enforce: restricted # 强制执行
+    pod-security.kubernetes.io/audit: restricted # 审计日志
+    pod-security.kubernetes.io/warn: restricted # 警告
+```
+
+`restricted` 是最严格的策略，要求：
+
+- 不允许 root 运行
+- 不允许特权容器
+- 必须设置 `allowPrivilegeEscalation: false`
+- 必须丢弃所有 capabilities
+- 必须使用 seccomp profile
+
+### Secret 加密
+
+etcd 中存储的 Secret 默认是明文的。启用加密：
+
+```yaml
+# encryption-config.yaml
+apiVersion: apiserver.config.k8s.io/v1
+kind: EncryptionConfiguration
+resources:
+  - resources:
+      - secrets
+    providers:
+      - aescbc:
+          keys:
+            - name: key1
+              secret: <base64-encoded-encryption-key>
+      - identity: {}
+```
+
+这个配置让 API Server 在写入 etcd 时用 AES-CBC 加密 Secret。更推荐的是用云厂商的 KMS provider。
+
+## 网络安全
+
+### TLS Everywhere
+
+集群内部通信也应该是加密的。用 K8s 的 Service Mesh（Istio、Linkerd）可以自动给 Pod 之间的通信加 TLS（mTLS），不需要修改应用代码。
+
+如果不想引入 Service Mesh 的复杂度，至少确保：
+
+- 入口流量（用户 → Ingress）用 HTTPS（第 2 篇已配置）
+- 数据库连接用 TLS
+- 外部 API 调用用 HTTPS
+
+### 网络分段
+
+```yaml
+# 默认拒绝所有入站流量
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: production
+spec:
+  podSelector: {} # 所有 Pod
+  policyTypes:
+    - Ingress
+```
+
+先默认拒绝，再按需放行。这是防火墙的基本原则，也适用于 K8s 网络。
+
+## 运维操作安全
+
+### 审计日志
+
+K8s 的审计日志记录了谁在什么时候对集群做了什么操作：
+
+```yaml
+# audit-policy.yaml
+apiVersion: audit.k8s.io/v1
+kind: Policy
+rules:
+  # 记录所有 Secret 的访问
+  - level: RequestResponse
+    resources:
+      - group: ""
+        resources: ["secrets"]
+  # 记录所有写操作
+  - level: Request
+    verbs: ["create", "update", "patch", "delete"]
+  # 读操作只记 metadata
+  - level: Metadata
+    verbs: ["get", "list", "watch"]
+```
+
+审计日志是事后追查的关键数据来源。出了安全事件，第一个看的就是审计日志。
+
+### 不要在日常操作中用 kubectl edit
+
+`kubectl edit` 直接修改集群状态，不会留下 Git 记录。所有的配置变更应该通过 Git 提交，由 ArgoCD 同步到集群。
+
+```bash
+# 不好：直接修改集群
+kubectl edit deployment flowapi -n production
+
+# 好：修改 Git 仓库中的 YAML，提交 PR，ArgoCD 自动同步
+git checkout -b update-flowapi-replicas
+# 修改 deployment.yaml
+git commit -am "increase replicas to 5"
+git push
+# 创建 PR，review 后合并
+```
+
+这样每次变更都有 Git 记录——谁改的、什么时候改的、为什么改。出了问题可以快速定位和回滚。
+
+## 安全加固的优先级
+
+如果时间有限，按以下优先级做：
+
+1. **密钥管理**（不要提交到 Git、不要硬编码）—— 影响最大
+2. **SSH 加固**（密钥认证、禁用 root）—— 第 1 篇已完成
+3. **HTTPS**（Let's Encrypt）—— 第 2 篇已完成
+4. **镜像扫描**（Trivy）—— 防止已知漏洞
+5. **资源限制和 SecurityContext**—— 第 5 篇已完成
+6. **NetworkPolicy**—— 限制 Pod 间通信
+7. **RBAC**—— 第 5 篇已完成
+8. **审计日志**—— 事后追查
+
+前 4 项是"不做就有大问题"的级别。后 4 项是"做了更好"的级别。
+
+安全加固没有终点——新的漏洞每天都在被发现，新的攻击手法也在持续演进。你能做的是建立一套流程，让安全检查成为日常工作的一部分：每次部署前扫描镜像、每次 PR 检查密钥泄露、定期审查集群的 RBAC 和 NetworkPolicy。
+
+下一篇是系列的最后一篇，从"建设者"视角切换到"维护者"视角——日常运维要做什么、故障怎么排查。

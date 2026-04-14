@@ -1,0 +1,291 @@
+---
+title: "09 安全与监控：加固你的容器"
+date: "2025-03-30"
+summary: "从非 root 运行、漏洞扫描、敏感信息管理到资源监控，系统性地加固订单 API 的容器安全。"
+tags: ["Docker", "安全", "监控", "漏洞扫描"]
+category: "docker"
+cover: ""
+draft: false
+series: "Docker 从入门到实战"
+seriesOrder: 9
+---
+
+上一篇我们把镜像从 468MB 缩到了 138MB。但有一个问题一直被忽略：容器里的进程默认以 root 用户运行。
+
+```bash
+docker exec order-api whoami
+# root
+```
+
+你的 Node.js 进程在容器里拥有 root 权限。如果攻击者通过某个 API 漏洞拿到了容器内的执行权限，他就能在容器里做任何事——修改文件、安装软件、扫描内网。虽然容器有隔离，但 root 容器被攻破后攻击面远大于非 root 容器。
+
+这篇文章从几个维度加固容器安全：运行权限、镜像漏洞、敏感信息、资源监控。
+
+## 非 root 运行
+
+让容器以非 root 用户运行，只需要两步：在 Dockerfile 里创建用户，然后用 `USER` 切换。
+
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+
+# 创建专用用户和用户组
+RUN addgroup -g 1001 -S appgroup && \
+    adduser -S appuser -u 1001 -G appgroup
+
+# 先以 root 安装依赖（有些 npm 包安装时需要写系统目录）
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+# 复制代码并修改所有者
+COPY . .
+RUN chown -R appuser:appgroup /app
+
+# 切换到非 root 用户
+USER appuser
+
+EXPOSE 3000
+CMD ["node", "src/index.js"]
+```
+
+关键点：`USER appuser` 必须放在 `COPY` 和 `RUN chown` 之后。如果先切换用户，后续的 `COPY` 和 `RUN` 会因为权限不足而失败。
+
+验证：
+
+```bash
+docker exec order-api whoami
+# appuser
+
+docker exec order-api id
+# uid=1001(appuser) gid=1001(appgroup) groups=1001(appgroup)
+```
+
+进程不再以 root 运行。如果应用尝试监听 80 端口（需要 root 权限），会直接报错。这也是为什么大多数 Node.js 应用监听 3000、8080 等高位端口——不需要 root 权限。
+
+有一个容易踩的坑：以非 root 用户运行时，Volume 挂载的目录权限可能不对。PostgreSQL 官方镜像内部会自动处理这个问题（如果数据目录的所有者不是 postgres 用户，会自动 `chown`），但如果你自己写的应用挂载了 Volume，要确保目录的所有者是你创建的用户。
+
+## 镜像漏洞扫描
+
+你的基础镜像 `node:20-alpine` 里包含了 Alpine Linux 的系统库、Node.js 运行时、npm 安装的依赖——这些都有可能存在已知的安全漏洞。
+
+Docker 内置了扫描工具 `docker scout`：
+
+```bash
+# 扫描镜像
+docker scout cves order-api:latest
+
+# 快速扫描（只显示摘要）
+docker scout quickview order-api:latest
+```
+
+输出类似这样：
+
+```
+CVE-2024-1234  HIGH    Alpine Linux - openssl  libcrypto.so.3  1.1.1k
+CVE-2024-5678  MEDIUM  npm - express       middleware          4.18.2
+```
+
+每个 CVE 对应一个已知漏洞，标注了严重等级和受影响的组件。你需要根据这些信息决定怎么处理：
+
+- **HIGH/CRITICAL**：尽快修复。通常通过更新基础镜像或依赖版本解决。
+- **MEDIUM/LOW**：评估影响。如果受影响的功能你没有用到，可以先忽略。
+
+另一个常用的扫描工具是 [Trivy](https://github.com/aquasecurity/trivy)（Aqua Security 开源的）：
+
+```bash
+# 安装 Trivy（macOS）
+brew install trivy
+
+# 扫描镜像
+trivy image order-api:latest
+```
+
+Trivy 的输出比 docker scout 更详细，会按严重等级分类显示。
+
+修复漏洞的思路很简单：
+
+1. **更新基础镜像**：`node:20-alpine` 更新到最新补丁版本。Alpine 的安全补丁通常很快。
+2. **更新依赖版本**：`npm audit fix` 或手动更新 `package.json` 里的版本。
+3. **重新构建镜像**：依赖更新后重新构建。
+
+```bash
+# 更新基础镜像版本并重新构建
+# Dockerfile 里 FROM node:20-alpine 改为 FROM node:20.11.1-alpine
+docker build -t order-api:latest .
+```
+
+漏洞扫描应该集成到 CI/CD 流程里——每次构建镜像后自动扫描，如果有 HIGH/CRITICAL 漏洞就阻止发布。这个在下一篇 CI/CD 里会讲到。
+
+## 敏感信息管理
+
+你的 Compose 配置里可能有这样的内容：
+
+```yaml
+services:
+  db:
+    environment:
+      - POSTGRES_PASSWORD=order_secret_2025
+```
+
+密码明文写在配置文件里。如果你把 `docker-compose.yml` 提交到 Git 仓库，密码就泄露了。
+
+**方案一：.env 文件**。上一篇已经讲过，把敏感配置放在 `.env` 文件里，`.env` 加入 `.gitignore`：
+
+```bash
+# .env
+POSTGRES_PASSWORD=order_secret_2025
+```
+
+```yaml
+# docker-compose.yml
+services:
+  db:
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+```
+
+**方案二：Docker Secrets**。Docker Swarm 模式下提供的加密存储：
+
+```yaml
+services:
+  db:
+    secrets:
+      - db_password
+    environment:
+      - POSTGRES_PASSWORD_FILE=/run/secrets/db_password
+
+secrets:
+  db_password:
+    file: ./secrets/db_password.txt
+```
+
+Secrets 会以加密形式存储，挂载到容器的 `/run/secrets/` 目录下。应用读取文件内容作为密码。比 `.env` 更安全，但配置更复杂。
+
+**方案三：环境变量注入**。在部署时通过 CI/CD 工具注入环境变量，不写入任何文件：
+
+```bash
+# 部署时设置环境变量
+export POSTGRES_PASSWORD=$(cat /path/to/vault/secret)
+docker compose up -d
+```
+
+三种方案各有适用场景：`.env` 适合开发环境，Docker Secrets 适合 Docker Swarm，环境变量注入适合 CI/CD。对于大多数用 Compose 部署的项目，`.env` + `.gitignore` 就够了。
+
+## 不要在镜像里装调试工具
+
+有些人在 Dockerfile 里装 `curl`、`vim`、`net-tools` 等工具，方便进入容器调试：
+
+```dockerfile
+# 不好的做法
+RUN apk add --no-cache curl vim net-tools
+```
+
+这些工具增加了镜像体积，也增加了攻击面。攻击者拿到了容器权限后，可以用 `curl` 发起内网探测，用 `net-tools` 扫描端口。
+
+生产镜像里不应该有调试工具。需要调试时，临时启动一个带工具的容器：
+
+```bash
+# 用一个调试容器连接到目标容器的网络
+docker run --rm -it --network order-api_default alpine sh
+
+# 在调试容器里安装工具
+apk add curl
+curl http://order-api:3000/health
+```
+
+这样调试工具只在调试时存在，不会进入生产镜像。
+
+## 资源监控
+
+安全不只是防攻击，还包括保证服务稳定运行。一个内存泄漏的 API 如果没人发现，最终会 OOM 被杀掉。
+
+`docker stats` 提供实时的资源使用情况：
+
+```bash
+docker stats
+# CONTAINER ID   NAME        CPU %   MEM USAGE / LIMIT   MEM %   NET I/O           BLOCK I/O
+# a1b2c3d4e5f6   order-api   2.3%    85MiB / 512MiB      16.6%   1.2kB / 890B      12MB / 0B
+# f6e5d4c3b2a1   order-db    0.8%    45MiB / 1GiB        4.4%    890B / 1.2kB      5.8MB / 16MB
+# 1234abcd56ef   cache       0.1%    12MiB / 256MiB      4.7%    1.5kB / 0B        0B / 0B
+```
+
+重点关注这几列：
+
+- **CPU %**：持续超过 80% 说明可能需要扩容或优化。
+- **MEM USAGE / LIMIT**：接近 limit 说明内存压力大，有 OOM 风险。
+- **NET I/O**：异常高的网络流量可能是被攻击了，或者有循环调用。
+
+`docker stats` 是实时查看，如果你想看历史数据，需要搭建监控系统。
+
+## Prometheus + Grafana 监控栈
+
+对于需要持续监控的生产环境，可以用 Prometheus + Grafana。用 Compose 快速跑起来：
+
+```yaml
+# docker-compose.monitoring.yml
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:latest
+    volumes:
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3001:3000" # 避免和 API 的 3000 端口冲突
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin_password_here
+
+volumes:
+  prometheus-data:
+  grafana-data:
+```
+
+Prometheus 需要一个配置文件告诉它从哪里采集数据：
+
+```yaml
+# prometheus.yml
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: "docker"
+    static_configs:
+      - targets: ["host.docker.internal:9323"] # Docker 的 metrics 端点
+```
+
+Grafana 默认用 `admin` / `admin_password_here` 登录，然后导入 Docker 相关的 Dashboard 模板就能看到漂亮的监控图表了。
+
+这套监控栈本身也占资源（Prometheus 约 200MB 内存，Grafana 约 100MB），适合中等规模的项目。如果你的项目只有两三个服务，`docker stats` 手动查看可能就够了。监控系统的投入要和项目规模匹配。
+
+## 安全加固清单
+
+总结一下容器安全的核心措施：
+
+1. **非 root 运行**：Dockerfile 里创建专用用户并 `USER` 切换。这是成本最低、收益最高的安全措施。
+2. **定期扫描漏洞**：`docker scout` 或 `trivy`，更新基础镜像和依赖。
+3. **最小化镜像内容**：不装调试工具，用 Alpine 或 distroless。
+4. **敏感信息不入库**：`.env` + `.gitignore`，密码不写在 Compose 文件里。
+5. **固定基础镜像版本**：用 `node:20.11.1-alpine` 而不是 `node:20-alpine`，避免意外升级引入问题。
+6. **资源限制**：上一篇讲的 `deploy.resources.limits`，防止资源耗尽。
+7. **网络隔离**：数据库不暴露端口到宿主机，服务之间通过内部网络通信。
+
+这些措施不需要全部实施。优先级建议：非 root 运行 > 敏感信息管理 > 漏洞扫描 > 资源限制 > 监控系统。前两项是必须做的，后面的根据项目规模逐步完善。
+
+## 回顾
+
+这篇我们从四个维度加固了容器安全：
+
+- **运行权限**：非 root 运行，减小被攻破后的攻击面。
+- **镜像安全**：定期漏洞扫描，更新基础镜像和依赖。
+- **敏感信息**：密码不入 Git 仓库，用 `.env` 或 Docker Secrets 管理。
+- **资源监控**：`docker stats` 实时查看，Prometheus + Grafana 做持续监控。
+
+安全不是一次性的配置，而是持续的过程。每次更新基础镜像、每次添加新依赖，都可能引入新的安全风险。把漏洞扫描集成到 CI/CD 里，让安全检查自动化。
+
+下一篇就是 CI/CD 了——让代码推送后自动构建、扫描、部署。

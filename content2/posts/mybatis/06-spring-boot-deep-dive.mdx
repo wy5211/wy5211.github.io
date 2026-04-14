@@ -1,0 +1,468 @@
+---
+title: "06. Spring Boot 深度整合：多数据源与事务"
+date: "2026-04-12"
+summary: "项目需要连接多个数据库——主库写、从库读。MyBatis 怎么配多数据源？Spring 事务和 MyBatis 事务怎么配合？"
+tags: ["MyBatis", "Spring Boot", "多数据源", "事务"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 实战指南"
+seriesOrder: 6
+---
+
+前 5 篇用的都是单数据源——一个 MySQL 实例，所有操作都走同一个连接。但到了生产环境，情况就不同了。
+
+BookHive 上线后，订单量增长很快。单台 MySQL 抗不住并发查询了，需要一主多从的读写分离架构。写操作走主库，读操作走从库。这意味着你的应用要同时连接多个数据库。
+
+另一个常见问题是事务管理。Spring 的 `@Transactional` 大家都会用，但你可能遇到过一些诡异的现象：同一个类里方法 A 调用方法 B，B 上的 `@Transactional` 不生效；只读事务里意外执行了写操作……这些问题和 MyBatis 与 Spring 事务的配合机制有关。
+
+## 多数据源配置
+
+MyBatis 本身不支持多数据源——它只有一个 `SqlSessionFactory`。但 Spring Boot 可以创建多个 `SqlSessionFactory`，每个对应一个数据源。
+
+### 基本思路
+
+Spring Boot 默认自动配置一个数据源和一个 `SqlSessionFactory`。多数据源需要手动配置：
+
+1. 定义多个 `DataSource` Bean
+2. 为每个数据源创建一个 `SqlSessionFactory`
+3. 为每个 `SqlSessionFactory` 配置对应的 `MapperScan`
+
+BookHive 的场景：主库（写）和从库（读）。
+
+### 数据源配置
+
+```yaml
+# application.yml
+spring:
+  datasource:
+    # 主库（写）
+    master:
+      url: jdbc:mysql://master.db.bookhive.com:3306/bookhive
+      username: app_writer
+      password: ${MASTER_DB_PASSWORD}
+      driver-class-name: com.mysql.cj.jdbc.Driver
+    # 从库（读）
+    slave:
+      url: jdbc:mysql://slave.db.bookhive.com:3306/bookhive
+      username: app_reader
+      password: ${SLAVE_DB_PASSWORD}
+      driver-class-name: com.mysql.cj.jdbc.Driver
+```
+
+### Java 配置类
+
+```java
+package com.bookhive.config;
+
+import org.apache.ibatis.session.SqlSessionFactory;
+import org.mybatis.spring.SqlSessionFactoryBean;
+import org.mybatis.spring.SqlSessionTemplate;
+import org.mybatis.spring.annotation.MapperScan;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.context.annotation.Primary;
+import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
+import javax.sql.DataSource;
+
+@Configuration
+public class DataSourceConfig {
+
+    // ---- 主库配置 ----
+
+    @Primary  // 标记为主数据源，Spring 自动注入时优先选择
+    @Bean(name = "masterDataSource")
+    @ConfigurationProperties(prefix = "spring.datasource.master")
+    public DataSource masterDataSource() {
+        return new HikariDataSource();
+    }
+
+    @Primary
+    @Bean(name = "masterSqlSessionFactory")
+    public SqlSessionFactory masterSqlSessionFactory(
+            @Qualifier("masterDataSource") DataSource dataSource) throws Exception {
+        SqlSessionFactoryBean bean = new SqlSessionFactoryBean();
+        bean.setDataSource(dataSource);
+        bean.setMapperLocations(new PathMatchingResourcePatternResolver()
+                .getResources("classpath:mapper/master/*.xml"));
+
+        org.apache.ibatis.session.Configuration configuration =
+                new org.apache.ibatis.session.Configuration();
+        configuration.setMapUnderscoreToCamelCase(true);
+        bean.setConfiguration(configuration);
+
+        return bean.getObject();
+    }
+
+    @Primary
+    @Bean(name = "masterSqlSessionTemplate")
+    public SqlSessionTemplate masterSqlSessionTemplate(
+            @Qualifier("masterSqlSessionFactory") SqlSessionFactory factory) {
+        return new SqlSessionTemplate(factory);
+    }
+
+    // ---- 从库配置 ----
+
+    @Bean(name = "slaveDataSource")
+    @ConfigurationProperties(prefix = "spring.datasource.slave")
+    public DataSource slaveDataSource() {
+        return new HikariDataSource();
+    }
+
+    @Bean(name = "slaveSqlSessionFactory")
+    public SqlSessionFactory slaveSqlSessionFactory(
+            @Qualifier("slaveDataSource") DataSource dataSource) throws Exception {
+        SqlSessionFactoryBean bean = new SqlSessionFactoryBean();
+        bean.setDataSource(dataSource);
+        bean.setMapperLocations(new PathMatchingResourcePatternResolver()
+                .getResources("classpath:mapper/slave/*.xml"));
+
+        org.apache.ibatis.session.Configuration configuration =
+                new org.apache.ibatis.session.Configuration();
+        configuration.setMapUnderscoreToCamelCase(true);
+        bean.setConfiguration(configuration);
+
+        return bean.getObject();
+    }
+
+    @Bean(name = "slaveSqlSessionTemplate")
+    public SqlSessionTemplate slaveSqlSessionTemplate(
+            @Qualifier("slaveSqlSessionFactory") SqlSessionFactory factory) {
+        return new SqlSessionTemplate(factory);
+    }
+}
+```
+
+注意 `@Primary` 注解。Spring 自动注入时（比如 `@Autowired DataSource`），如果有多个同类型 Bean 会报错。`@Primary` 告诉 Spring 默认用哪个。
+
+### Mapper 分包扫描
+
+把 Mapper 接口按用途分到不同的包：
+
+```
+com.bookhive.mapper.master/    # 写操作的 Mapper
+├── OrderMapper.java           # 创建订单、更新订单状态
+├── BookMapper.java            # 新增书籍、更新库存
+└── UserMapper.java            # 注册用户、修改信息
+
+com.bookhive.mapper.slave/     # 读操作的 Mapper
+├── OrderReadMapper.java       # 查询订单列表
+├── BookReadMapper.java        # 搜索书籍、查询详情
+└── UserReadMapper.java        # 查询用户信息
+```
+
+用 `@MapperScan` 分别扫描：
+
+```java
+@Configuration
+@MapperScan(basePackages = "com.bookhive.mapper.master",
+        sqlSessionFactoryRef = "masterSqlSessionFactory")
+public class MasterMapperConfig {
+}
+
+@Configuration
+@MapperScan(basePackages = "com.bookhive.mapper.slave",
+        sqlSessionFactoryRef = "slaveSqlSessionFactory")
+public class SlaveMapperConfig {
+}
+```
+
+每个 `@MapperScan` 指定扫描的包和对应的 `SqlSessionFactory`。这样 `master` 包下的 Mapper 走主库，`slave` 包下的 Mapper 走从库。
+
+XML 文件也对应分目录：
+
+```
+src/main/resources/mapper/
+├── master/
+│   ├── OrderMapper.xml
+│   ├── BookMapper.xml
+│   └── UserMapper.xml
+└── slave/
+    ├── OrderReadMapper.xml
+    ├── BookReadMapper.xml
+    └── UserReadMapper.xml
+```
+
+### Service 层使用
+
+```java
+@Service
+public class OrderService {
+
+    private final OrderMapper orderMapper;       // 走主库
+    private final OrderReadMapper orderReadMapper; // 走从库
+
+    public OrderService(OrderMapper orderMapper, OrderReadMapper orderReadMapper) {
+        this.orderMapper = orderMapper;
+        this.orderReadMapper = orderReadMapper;
+    }
+
+    // 写操作 → 主库
+    @Transactional
+    public Order createOrder(Long userId, List<CartItem> items) {
+        Order order = new Order();
+        order.setOrderNo(generateOrderNo());
+        order.setUserId(userId);
+        orderMapper.insert(order);
+        // ...
+        return order;
+    }
+
+    // 读操作 → 从库
+    public OrderDTO getOrderDetail(Long orderId) {
+        return orderReadMapper.findDetailById(orderId);
+    }
+}
+```
+
+写操作注入 `OrderMapper`，读操作注入 `OrderReadMapper`。数据源的路由在 Mapper 扫描阶段就确定了，Service 层不需要关心。
+
+### 多数据源的代价
+
+多数据源带来了灵活性，但也增加了复杂度：
+
+- 配置代码量大（上面的配置类有将近 100 行）
+- 读写 Mapper 要分两套，接口设计时要考虑哪些是读、哪些是写
+- 跨数据源的事务不生效（`@Transactional` 只能管理一个数据源的事务）
+- 主从延迟可能导致刚写入的数据在读库查不到
+
+如果你的项目暂时没有读写分离的需求，不要提前配置多数据源。YAGNI 原则——等到真的需要时再加。
+
+更轻量的替代方案是使用 MyBatis 的**插件机制**做读写分离：在一个 `SqlSessionFactory` 内，通过拦截器根据 SQL 类型（SELECT/INSERT/UPDATE/DELETE）动态切换数据源。ShardingSphere 等中间件也提供了透明的读写分离支持，不需要手动配置多数据源。
+
+## 事务管理
+
+Spring 的 `@Transactional` 是声明式事务的标准方式。但和 MyBatis 配合使用时，有几个容易踩的坑。
+
+### 基本用法
+
+```java
+@Service
+public class OrderService {
+
+    private final OrderMapper orderMapper;
+    private final OrderItemMapper orderItemMapper;
+
+    @Transactional  // 所有 public 方法都在事务中执行
+    public void createOrder(Long userId, List<CartItem> items) {
+        // 1. 创建订单
+        Order order = new Order();
+        order.setOrderNo(generateOrderNo());
+        order.setUserId(userId);
+        orderMapper.insert(order);
+
+        // 2. 创建订单项
+        for (CartItem item : items) {
+            OrderItem orderItem = new OrderItem();
+            orderItem.setOrderId(order.getId());
+            orderItem.setBookId(item.getBookId());
+            orderItem.setQuantity(item.getQuantity());
+            orderItem.setUnitPrice(item.getPrice());
+            orderItemMapper.insert(orderItem);
+        }
+
+        // 如果中间任何一步抛异常，所有插入都会回滚
+    }
+}
+```
+
+`@Transactional` 默认的传播行为是 `REQUIRED`——如果当前没有事务，创建一个新事务；如果已经有事务，加入当前事务。对于大部分业务场景，这个默认值就够了。
+
+### 传播行为
+
+传播行为控制的是：一个事务方法调用另一个事务方法时，事务怎么处理。
+
+最常用的两个：
+
+- `REQUIRED`（默认）：加入当前事务。调用链上的所有方法在同一个事务中。
+- `REQUIRES_NEW`：创建新事务。即使调用方有事务，也挂起调用方的事务，创建一个独立的新事务。
+
+```java
+@Service
+public class OrderService {
+
+    @Autowired
+    private InventoryLogService inventoryLogService;
+
+    @Transactional
+    public void createOrder(Long userId, List<CartItem> items) {
+        // ... 创建订单和订单项 ...
+
+        // 记录库存变动日志——即使订单创建失败，日志也应该保存
+        inventoryLogService.logInventoryChange(order.getId(), items);
+    }
+}
+
+@Service
+public class InventoryLogService {
+
+    // REQUIRES_NEW：独立事务，不受调用方事务回滚的影响
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void logInventoryChange(Long orderId, List<CartItem> items) {
+        for (CartItem item : items) {
+            InventoryLog log = new InventoryLog();
+            log.setOrderId(orderId);
+            log.setBookId(item.getBookId());
+            log.setQuantity(-item.getQuantity());
+            inventoryLogMapper.insert(log);
+        }
+    }
+}
+```
+
+如果 `createOrder` 在创建订单项时抛了异常，订单和订单项会回滚。但 `logInventoryChange` 用了 `REQUIRES_NEW`，它的事务已经独立提交了——日志不会被回滚。
+
+其他传播行为（`SUPPORTS`、`NOT_SUPPORTED`、`MANDATORY`、`NEVER`、`NESTED`）在特定场景下有用，但日常开发中 90% 的情况用 `REQUIRED` 就够了。
+
+### 自调用导致事务失效
+
+这是一个经典坑。看这段代码：
+
+```java
+@Service
+public class OrderService {
+
+    @Transactional
+    public void batchCreateOrders(List<OrderRequest> requests) {
+        for (OrderRequest request : requests) {
+            createSingleOrder(request);
+        }
+    }
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void createSingleOrder(OrderRequest request) {
+        // 创建单个订单...
+    }
+}
+```
+
+你期望 `createSingleOrder` 每次都在独立事务中执行——一个失败了不影响其他。但实际效果是：所有订单都在同一个事务中。
+
+原因：`batchCreateOrders` 调用 `createSingleOrder` 时，调用的是 `this.createSingleOrder()`，不经过 Spring 的代理对象。`@Transactional` 是通过 AOP 代理实现的，绕过代理就绕过了事务切面。
+
+解决方法：
+
+```java
+// 方法 1：注入自身（不推荐，但简单）
+@Service
+public class OrderService {
+    @Autowired
+    private OrderService self;
+
+    public void batchCreateOrders(List<OrderRequest> requests) {
+        for (OrderRequest request : requests) {
+            self.createSingleOrder(request);  // 通过代理调用
+        }
+    }
+}
+
+// 方法 2：拆到另一个 Service 类（推荐）
+@Service
+public class OrderBatchService {
+    @Autowired
+    private OrderService orderService;
+
+    public void batchCreateOrders(List<OrderRequest> requests) {
+        for (OrderRequest request : requests) {
+            orderService.createSingleOrder(request);
+        }
+    }
+}
+```
+
+方法 2 更干净。把需要不同事务边界的方法拆到不同的 Service 类中，通过依赖注入调用——这样一定经过代理，事务配置一定生效。
+
+### 只读事务
+
+```java
+@Transactional(readOnly = true)
+public List<OrderDTO> getUserOrders(Long userId) {
+    return orderReadMapper.findByUserId(userId);
+}
+```
+
+`readOnly = true` 告诉 Spring 和数据库驱动：这个事务只读不写。MySQL 的 InnoDB 引擎可以跳过一些加锁操作，提高查询性能。同时，如果你不小心在只读事务里执行了写操作，会抛异常——这是额外的安全检查。
+
+建议：查询方法都加上 `readOnly = true`。虽然性能提升不大，但能防止意外的写操作。
+
+### 事务和 MyBatis 一级缓存
+
+MyBatis 的一级缓存是 SqlSession 级别的。在 Spring 中，每次调用 Mapper 方法都会创建（或复用）一个 SqlSession。
+
+在 `@Transactional` 事务中，同一个 SqlSession 会被复用。这意味着在同一个事务中，两次调用 `findById(1L)` 只会执行一次 SQL——第二次从缓存返回。
+
+```java
+@Transactional
+public void testCache() {
+    Book book1 = bookMapper.findById(1L);  // 执行 SQL 查询数据库
+    Book book2 = bookMapper.findById(1L);  // 直接从缓存返回，不执行 SQL
+    // book1 == book2（同一个对象引用）
+}
+```
+
+如果中间执行了写操作（insert、update、delete），MyBatis 会清空该 SqlSession 的缓存：
+
+```java
+@Transactional
+public void testCacheInvalidation() {
+    Book book1 = bookMapper.findById(1L);  // 查询数据库
+    bookMapper.updatePrice(1L, new BigDecimal("39.99"));  // 清空缓存
+    Book book2 = bookMapper.findById(1L);  // 再次查询数据库
+}
+```
+
+这个行为通常是对的。但如果你在事务中先查后改再查，可能预期的是查到修改后的数据——MyBatis 一级缓存确保了这一点，因为它在写操作后清空了缓存。
+
+### 事务不生效的常见原因
+
+排查清单：
+
+1. **方法不是 public**。`@Transactional` 只能加在 public 方法上。private/protected 方法加了这个注解不会报错，但事务不生效。
+
+2. **异常被 catch 住了**。`@Transactional` 默认只在 `RuntimeException` 和 `Error` 时回滚。如果你 catch 了异常且没有重新抛出，事务不会回滚。
+
+```java
+@Transactional
+public void createOrder(OrderRequest request) {
+    try {
+        orderMapper.insert(order);
+    } catch (Exception e) {
+        log.error("创建订单失败", e);
+        // 异常被 catch 了，事务不会回滚！
+        // 需要 throw e 或者手动回滚：TransactionAspectSupport.currentTransactionStatus().setRollbackOnly();
+    }
+}
+```
+
+3. **数据库引擎不支持事务**。MySQL 的 MyISAM 引擎不支持事务，必须用 InnoDB。
+
+4. **多数据源场景下用错了 SqlSessionFactory**。`@Transactional` 绑定的是主数据源的事务管理器，从库的操作不受它管理。
+
+## Spring Boot 自动配置原理
+
+`mybatis-spring-boot-starter` 做了什么？
+
+1. 根据 `spring.datasource.*` 配置创建 `DataSource`
+2. 用 `DataSource` 创建 `SqlSessionFactory`（读取 `mybatis.*` 配置）
+3. 扫描 `@Mapper` 注解的接口或 `@MapperScan` 指定的包，注册 Mapper Bean
+4. 自动配置 `SqlSessionTemplate`
+
+理解这个流程有助于排查问题。比如 Mapper 找不到，可能是扫描路径配错了；SqlSessionFactory 配置没生效，可能是 starter 的自动配置被其他配置覆盖了。
+
+如果需要覆盖自动配置（比如自定义 `SqlSessionFactory`），直接定义一个 `@Bean SqlSessionFactory` 就行——Spring Boot 会用你的定义替代自动配置的。
+
+多数据源的场景下，我们手动创建了多个 `SqlSessionFactory`，相当于完全接管了自动配置。这时候要确保所有配置项（驼峰转换、Mapper 位置等）都在手动配置中设置好。
+
+## 什么时候需要多数据源
+
+不是所有项目都需要多数据源。需要多数据源的场景：
+
+- 读写分离（主库写、从库读）
+- 分库分表（不同的业务模块用不同的数据库）
+- 集成第三方系统（自己的数据库 + 第三方的数据库）
+- 数据迁移（同时连接新旧两个数据库）
+
+如果只是简单的单库应用，一个数据源就够了。多数据源引入的复杂度（配置代码、事务管理、数据一致性）是实实在在的，不要为了"将来可能需要"而提前引入。
+
+对于 BookHive 来说，读写分离是真实的需求——订单查询量远大于写入量。但如果你的项目 QPS 不高，单库完全够用。读写分离引入的主从延迟问题（刚下的订单在从库查不到）可能比性能问题更难处理。

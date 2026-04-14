@@ -1,0 +1,410 @@
+---
+title: "03. 迁移实战：Webpack 到 Vite 8"
+date: "2026-04-12"
+summary: "340+ 文件的项目，有 4 个 Webpack 配置文件。怎么一步步迁移到 Vite 8？哪些地方会踩坑？"
+tags: ["Vite", "Webpack", "迁移"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战指南"
+seriesOrder: 3
+---
+
+上一篇理解了 Vite 的开发服务器原理，这一篇动手把 TaskFlow Dashboard 迁过去。
+
+## 迁移的第一步：先跑起来，再慢慢改
+
+很多人做迁移的时候会犯一个错误：试图一次性把所有配置都改好。4 个 Webpack 配置文件里的每一项都要在 Vite 里找到对应方案，全部改完再跑。
+
+这样做的问题是你不知道哪些配置是必要的、哪些是历史遗留的。一个维护了两年的项目，配置文件里通常有很多"保险"设置——当初为了解决某个问题加的，后来问题早就不是问题了，但配置一直留着。如果你全部翻译过去，就是在用 Vite 复制 Webpack 的问题。
+
+正确的方法是：**从最小的配置开始，让项目跑起来，然后根据实际遇到的问题逐个添加配置**。
+
+## 第一步：安装 Vite 8，创建最小配置
+
+先把 Vite 8 和必要的插件装上。
+
+```bash
+# 安装 Vite 核心和常用插件
+npm install -D vite @vitejs/plugin-react
+```
+
+`@vitejs/plugin-react` 提供 JSX 转换和 React Fast Refresh（Vite 的 HMR 方案）。TaskFlow Dashboard 是 React 项目，所以需要这个插件。
+
+创建 `vite.config.ts`，先只写最基础的配置：
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+});
+```
+
+就这些。没有 loader 配置，没有 resolve 配置，没有环境变量处理。Vite 开箱支持 TypeScript、JSX、CSS、CSS Modules、静态资源（图片、字体、SVG）。这些在 Webpack 里需要分别配置 `babel-loader`、`css-loader`、`style-loader`、`file-loader` 的东西，Vite 默认就支持。
+
+## 第二步：移动 index.html
+
+这是迁移中最容易被忽略的改动。
+
+Webpack 的 HTML 处理方式是：`index.html` 放在某个源码目录（比如 `public/` 或 `src/`），通过 `HtmlWebpackPlugin` 注入 script 标签。Webpack 自己决定 bundle 的输出路径和文件名。
+
+```html
+<!-- Webpack 时代的 index.html -->
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>TaskFlow Dashboard</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <!-- HtmlWebpackPlugin 会在这里注入 <script> 标签 -->
+  </body>
+</html>
+```
+
+Vite 不用 HtmlWebpackPlugin。`index.html` 是项目的入口，必须放在**项目根目录**。你在 HTML 里直接写 `<script type="module">` 标签指向你的入口文件。
+
+```html
+<!-- Vite 的 index.html，放在项目根目录 -->
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TaskFlow Dashboard</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
+```
+
+注意两个关键点：`<script type="module">` 告诉浏览器这是 ES Module；`src="/src/main.tsx"` 直接指向源码文件。Vite 会在开发模式下拦截这个请求，即时编译返回；在生产构建时，会把这个路径替换成打包后的产物路径。
+
+## 第三步：配置路径别名
+
+TaskFlow Dashboard 的 Webpack 配置里有一组路径别名：
+
+```javascript
+// webpack.common.js 中的路径别名配置
+module.exports = {
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "src"),
+      "@components": path.resolve(__dirname, "src/components"),
+      "@hooks": path.resolve(__dirname, "src/hooks"),
+      "@utils": path.resolve(__dirname, "src/utils"),
+      "@services": path.resolve(__dirname, "src/services"),
+    },
+  },
+};
+```
+
+这些别名在项目中被大量使用——几乎每个文件都有 `import { xxx } from '@utils/format'` 这样的导入。如果别名不配好，所有文件都会报错。
+
+Vite 的路径别名配置方式几乎一样，只是写法稍有不同：
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+import path from "path";
+
+export default defineConfig({
+  plugins: [react()],
+  resolve: {
+    alias: {
+      "@": path.resolve(__dirname, "src"),
+      "@components": path.resolve(__dirname, "src/components"),
+      "@hooks": path.resolve(__dirname, "src/hooks"),
+      "@utils": path.resolve(__dirname, "src/utils"),
+      "@services": path.resolve(__dirname, "src/services"),
+    },
+  },
+});
+```
+
+但光配 Vite 还不够。你的 `tsconfig.json` 里也需要声明这些路径别名，否则 TypeScript 编译器不认识 `@/`，编辑器会报红线。
+
+```json
+// tsconfig.json
+{
+  "compilerOptions": {
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"],
+      "@components/*": ["src/components/*"],
+      "@hooks/*": ["src/hooks/*"],
+      "@utils/*": ["src/utils/*"],
+      "@services/*": ["src/services/*"]
+    }
+  }
+}
+```
+
+这一步改完，路径别名就能正常工作了。WebStorm 和 VSCode 也会正确识别这些路径，支持跳转和自动补全。
+
+## 第四步：环境变量
+
+TaskFlow Dashboard 用了三个环境变量：
+
+```bash
+# .env.development
+REACT_APP_API_URL=http://localhost:8080/api
+REACT_APP_WS_URL=ws://localhost:8080/ws
+REACT_APP_SENTRY_DSN=
+```
+
+Webpack 用的是 `Create React App` 的约定，环境变量必须以 `REACT_APP_` 开头，通过 `process.env.REACT_APP_XXX` 访问。
+
+Vite 的约定不同：环境变量以 `VITE_` 开头，通过 `import.meta.env.VITE_XXX` 访问。
+
+这意味着两件事要做：**改 `.env` 文件的前缀**，**改代码里的访问方式**。
+
+```bash
+# .env.development（Vite 版本）
+VITE_API_URL=http://localhost:8080/api
+VITE_WS_URL=ws://localhost:8080/ws
+VITE_SENTRY_DSN=
+```
+
+```bash
+# .env.production
+VITE_API_URL=https://api.taskflow.example.com
+VITE_WS_URL=wss://api.taskflow.example.com/ws
+VITE_SENTRY_DSN=https://xxx@sentry.example.com/1
+```
+
+代码里的改动：
+
+```typescript
+// 之前（Webpack）
+const apiUrl = process.env.REACT_APP_API_URL;
+
+// 之后（Vite）
+const apiUrl = import.meta.env.VITE_API_URL;
+```
+
+Vite 内置支持 `.env`、`.env.local`、`.env.[mode]`、`.env.[mode].local` 四个层级的文件。运行 `vite dev` 时加载 `.env` 和 `.env.development`，运行 `vite build` 时加载 `.env` 和 `.env.production`。
+
+Vite 还内置了几个常用的环境变量，不需要你自己定义：
+
+- `import.meta.env.MODE`：当前模式（`development` 或 `production`）
+- `import.meta.env.DEV`：是否是开发模式
+- `import.meta.env.PROD`：是否是生产模式
+- `import.meta.env.BASE_URL`：应用的 base URL
+
+### 批量替换 process.env
+
+如果项目里有很多 `process.env.REACT_APP_XXX`，手动一个一个改太慢。可以用正则表达式批量替换：
+
+```bash
+# 用 sed 批量替换（macOS）
+find src -name '*.ts' -o -name '*.tsx' | xargs sed -i '' \
+  's/process\.env\.REACT_APP_/import.meta.env.VITE_/g'
+```
+
+但要注意，如果有些地方是动态拼接的环境变量名（比如 `process.env['REACT_APP_' + key]`），这种正则替换处理不了，需要手动检查。
+
+TaskFlow Dashboard 有 47 处 `process.env.REACT_APP_` 引用，用 sed 批量替换之后，手动检查了 3 处动态拼接的情况。
+
+## 第五步：代理配置
+
+TaskFlow Dashboard 的前端开发服务器需要把 API 请求代理到后端服务。
+
+Webpack 的代理配置：
+
+```javascript
+// webpack.dev.js
+module.exports = merge(common, {
+  devServer: {
+    proxy: {
+      "/api": {
+        target: "http://localhost:8080",
+        changeOrigin: true,
+      },
+      "/ws": {
+        target: "ws://localhost:8080",
+        ws: true,
+      },
+    },
+  },
+});
+```
+
+Vite 的代理配置写法几乎一样（因为都用了 `http-proxy`）：
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    proxy: {
+      "/api": {
+        target: "http://localhost:8080",
+        changeOrigin: true,
+      },
+      "/ws": {
+        target: "ws://localhost:8080",
+        ws: true,
+      },
+    },
+  },
+});
+```
+
+代理配置是最不需要费心迁移的部分——两者的写法几乎完全一致。如果你用了 `pathRewrite`、`headers`、`bypass` 这些高级选项，在 Vite 里也直接可用。
+
+## 第六步：处理特殊的 Webpack 功能
+
+到这一步，TaskFlow Dashboard 基本上已经能跑了。但还有几个 Webpack 特有的功能需要在 Vite 里找到替代方案。
+
+### SVG 作为 React 组件
+
+Webpack 时代用了 `@svgr/webpack` loader，可以 `import Icon from './icon.svg'` 然后把 Icon 当 React 组件用。Vite 需要安装对应的插件：
+
+```bash
+npm install -D vite-plugin-svgr
+```
+
+```typescript
+// vite.config.ts
+import svgr from "vite-plugin-svgr";
+
+export default defineConfig({
+  plugins: [react(), svgr()],
+});
+```
+
+配置之后，`import Icon from './icon.svg?react'` 就可以把 SVG 当 React 组件使用了。注意 Vite 版本需要在文件名后面加 `?react` 后缀，这是 Vite 的约定。
+
+### 全局变量注入
+
+TaskFlow Dashboard 有几个全局变量通过 Webpack 的 `DefinePlugin` 注入：
+
+```javascript
+// webpack.common.js
+new webpack.DefinePlugin({
+  "process.env.APP_VERSION": JSON.stringify(require("./package.json").version),
+  __APP_NAME__: JSON.stringify("TaskFlow Dashboard"),
+});
+```
+
+Vite 用 `define` 配置实现同样的功能：
+
+```typescript
+// vite.config.ts
+import pkg from "./package.json";
+
+export default defineConfig({
+  define: {
+    "process.env.APP_VERSION": JSON.stringify(pkg.version),
+    __APP_NAME__: JSON.stringify("TaskFlow Dashboard"),
+  },
+});
+```
+
+### CSS Modules
+
+Webpack 需要 `css-loader` 配置 `[name]__[local]___[hash:base64:5]` 的命名规则。Vite 原生支持 CSS Modules，约定文件名为 `xxx.module.css`。
+
+TaskFlow Dashboard 的 CSS Modules 文件本来就用 `.module.css` 后缀，所以直接就能用。Vite 默认的命名规则是 `[name]_[local]_[hash]`，和 Webpack 的不同，但只要不依赖具体的类名做选择器就没影响。
+
+### PostCSS 配置
+
+Webpack 时代 PostCSS 通过 `postcss-loader` 配置。Vite 直接读取项目根目录的 `postcss.config.js`，不需要额外配置。
+
+```javascript
+// postcss.config.js（Vite 和 Webpack 都能用这个文件）
+export default {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+};
+```
+
+TaskFlow Dashboard 用 Tailwind CSS，PostCSS 配置完全不需要改。
+
+## 第七步：调整 package.json 的 scripts
+
+Webpack 时代的脚本：
+
+```json
+{
+  "scripts": {
+    "dev": "webpack serve --config webpack.dev.js",
+    "build": "webpack --config webpack.prod.js",
+    "lint": "eslint src --ext .ts,.tsx"
+  }
+}
+```
+
+迁移到 Vite：
+
+```json
+{
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "lint": "eslint src --ext .ts,.tsx"
+  }
+}
+```
+
+注意 `build` 脚本里加了 `tsc`——Vite 不做类型检查（为了速度），所以在构建前需要先用 TypeScript 编译器做一次完整的类型检查。如果你觉得每次构建都做类型检查太慢，可以把 `tsc` 去掉，改为在 CI 里单独运行类型检查。
+
+`vite preview` 是 Vite 提供的本地预览服务器，用来预览生产构建的产物。在本地模拟生产环境的行为非常有用。
+
+## 踩坑记录
+
+迁移过程中遇到的实际问题和解决方案。
+
+### import 顺序导致样式异常
+
+现象：迁移后，某些页面的样式不对。排查发现是 CSS 加载顺序变了。Webpack 会按照 `import` 的顺序把 CSS 注入到 `<head>` 中，Vite 也是——但 Vite 的模块加载顺序和 Webpack 的 bundle 顺序可能不同。
+
+解决方案：用 CSS 的 `@layer` 控制样式层级，而不是依赖 `import` 顺序。这是一个好的实践，无论用什么构建工具都应该这样做。
+
+### require() 不支持
+
+现象：有几个工具文件用了 `require()` 动态加载模块。Vite 的开发模式只支持 ESM 的 `import`，不支持 CommonJS 的 `require()`。
+
+解决方案：把 `require()` 改成动态 `import()`。大部分情况下，`const mod = require('./module')` 可以直接改成 `const mod = await import('./module')`。注意 `import()` 是异步的，返回 Promise。
+
+TaskFlow Dashboard 有 3 处用了 `require()`，其中 2 处可以改成动态 `import()`，还有 1 处是条件导入（根据环境加载不同的模块），需要用 `await import()` 替代。
+
+### Non-code assets 的路径问题
+
+Webpack 用 `file-loader` 处理静态资源，输出的文件名带 contenthash。Vite 内置了静态资源处理，文件名也带 hash，但 hash 的计算方式不同。
+
+影响：部署时如果 CDN 缓存策略依赖了旧的 hash 格式，需要调整。TaskFlow Dashboard 的 CDN 缓存策略是基于"文件名变化就重新缓存"的原则，所以没有影响。
+
+### Webpack 特有的注释魔法
+
+有些库通过 Webpack 的魔法注释（`/* webpackChunkName: "xxx" */`）来控制代码分割。Vite 不识别这些注释。
+
+解决方案：Vite 用 `/* @vite-ignore */` 或 `/* vite-ignore */` 来控制动态导入行为。大部分情况下，去掉 Webpack 的魔法注释就行——Vite 的代码分割策略不需要手动指定 chunk 名称。
+
+## 渐进式迁移策略
+
+如果项目太大，一次性迁移风险太高，可以考虑渐进式迁移。
+
+Webpack 有一个叫 `ModuleFederationPlugin` 的功能，允许你把应用拆分成多个独立构建的部分。你可以先把某个模块（比如设置页面）用 Vite 构建，其他部分继续用 Webpack。两者通过 Module Federation 对接。
+
+但这增加了复杂度。对于 TaskFlow Dashboard 这种规模的项目（340 个文件），直接迁移的风险是可控的。我们选择的做法是：
+
+1. 创建一个新分支
+2. 按上面的步骤完成迁移
+3. 在新分支上完整测试所有功能
+4. 合并到主分支
+
+整个迁移花了 3 天。其中第 1 天做配置和基本迁移，第 2 天解决各种兼容性问题，第 3 天做全面测试。
+
+迁移完成后，4 个 Webpack 配置文件（`webpack.common.js`、`webpack.dev.js`、`webpack.prod.js`、`webpack.ssr.js`）全部删除。取而代之的是一个不到 80 行的 `vite.config.ts`。加上不需要的 Webpack loader 和 plugin，`package.json` 的 `devDependencies` 从 42 个减少到 27 个。
+
+下一篇我们看生产构建优化——开发服务器跑通了只是第一步，最终交付的是生产环境的产物。

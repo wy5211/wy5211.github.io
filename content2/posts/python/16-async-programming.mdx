@@ -1,0 +1,273 @@
+---
+title: "16 异步编程"
+date: "2026-03-30"
+summary: "Python async/await 和 Java CompletableFuture 有什么区别？理解 asyncio 事件循环、异步数据库操作和 FastAPI 的异步优势。"
+tags: ["Python", "异步", "asyncio", "FastAPI"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 实战"
+seriesOrder: 16
+---
+
+## 一个真实的问题
+
+CMS 首页需要同时加载文章列表、侧边栏的标签云、用户的通知数、热门评论。如果用同步请求逐个调用，4 个接口每个 200ms，用户要等 800ms 才能看到页面。异步并发可以把等待时间压缩到 200ms 左右（取最慢的那个）。
+
+Java 开发者对这个场景不陌生：用 `CompletableFuture.allOf()` 或者 `@Async` 注解就能实现。Python 的 `async/await` 也能做同样的事，但底层的并发模型完全不同。Java 依赖线程池（每个任务占一个线程），Python 用协程（单线程内切换）。理解这个区别，是写出高性能 FastAPI 应用的关键。
+
+---
+
+## 同步与异步的本质区别
+
+先用一个直白的对比来说明问题：
+
+```python
+import time, asyncio
+
+# 同步：3 个请求依次执行，总耗时 = 3s + 3s + 3s = 9s
+def fetch_sync(url: str) -> dict:
+    time.sleep(3)
+    return {"url": url}
+
+def sync_main():
+    results = [fetch_sync("/users"), fetch_sync("/posts"), fetch_sync("/tags")]
+    # 总耗时 ~9s
+
+# 异步：3 个请求并发执行，总耗时 ~3s（取最慢的）
+async def fetch_async(url: str) -> dict:
+    await asyncio.sleep(3)
+    return {"url": url}
+
+async def async_main():
+    results = await asyncio.gather(
+        fetch_async("/users"), fetch_async("/posts"), fetch_async("/tags")
+    )
+    # 总耗时 ~3s
+```
+
+核心区别不在语法（`def` vs `async def`），而在执行模型：
+
+| 维度       | Java 线程池                       | Python asyncio 协程                  |
+| ---------- | --------------------------------- | ------------------------------------ |
+| 并发单位   | 线程（OS 级，每线程 ~1MB 栈空间） | 协程（用户级，每协程 ~几百字节）     |
+| 切换方式   | OS 调度，抢占式                   | 事件循环调度，协作式（await 时让出） |
+| 并发规模   | 几十到几百个线程                  | 几万到几十万个协程                   |
+| 适用场景   | CPU 密集 + I/O 密集               | I/O 密集型（Web、数据库、HTTP）      |
+| 编程复杂度 | 需要处理线程安全、锁、竞态        | 不需要锁（单线程），但需理解异步思维 |
+
+Java 的 `CompletableFuture` 底层是 ForkJoinPool 线程池，每个异步任务占一个线程。Python 的 `asyncio.gather` 底层是事件循环在一个线程内调度多个协程。两种方案在 I/O 密集型场景下都能提升吞吐量，但 Python 协程的内存开销小得多。
+
+---
+
+## asyncio 事件循环
+
+事件循环是 asyncio 的引擎，它的职责很简单：不断检查哪些任务可以执行，执行它们，遇到 `await` 就切换到其他任务。
+
+```
+事件循环运行流程：
+
+1. 检查就绪任务（I/O 完成、定时器到期）
+2. 执行就绪任务，直到遇到 await
+3. 被挂起的任务进入等待队列
+4. 回到步骤 1
+```
+
+在 FastAPI 中，你不需要手动管理事件循环 -- Uvicorn 在启动时自动创建。但理解它的运行机制有助于避免常见的性能陷阱。
+
+---
+
+## async def 路由：FastAPI 的异步优势
+
+FastAPI 的路由函数可以是 `async def` 也可以是普通 `def`。两者的区别很重要：
+
+```python
+from fastapi import FastAPI
+import time
+
+app = FastAPI()
+
+# 异步路由：在事件循环中执行，不占用线程池
+@app.get("/posts")
+async def list_posts():
+    posts = await PostService.get_list(db)  # await 异步数据库操作
+    return posts
+
+# 同步路由：自动放到线程池中执行
+@app.get("/posts-sync")
+def list_posts_sync():
+    posts = PostService.get_list_sync(db)  # 同步数据库操作
+    return posts
+```
+
+FastAPI 的处理策略是：如果路由是 `async def`，就在事件循环中直接执行；如果是普通 `def`，就放到线程池里运行（`run_in_executor`）。这意味着同步路由也能正常工作，但会多一次线程切换的开销。
+
+对应 Java 的视角：Spring MVC 的 `@GetMapping` 方法默认在 Servlet 线程池中执行（一个请求占一个线程），WebFlux 的 `@GetMapping` 返回 `Mono/Flux`，在事件循环中执行。FastAPI 的 `async def` 更接近 WebFlux 的模型。
+
+---
+
+## 异步数据库操作
+
+CMS 使用 SQLAlchemy 2.0 的异步模式，配合 `asyncpg` 驱动：
+
+```python
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+
+engine = create_async_engine("postgresql+asyncpg://user:pass@localhost/blog", pool_size=10)
+AsyncSessionFactory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+async def get_db():
+    async with AsyncSessionFactory() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+```
+
+关键的异步 CRUD 操作：
+
+```python
+from sqlalchemy import select, func
+
+async def get_post_detail(session: AsyncSession, post_id: int) -> Post:
+    result = await session.execute(select(Post).where(Post.id == post_id))
+    return result.scalar_one_or_none()
+
+async def get_posts_with_stats(session: AsyncSession, page: int = 1, page_size: int = 10):
+    """并发执行 COUNT 和 SELECT 查询"""
+    count_query = select(func.count(Post.id)).where(Post.is_published == True)
+    posts_query = (
+        select(Post)
+        .where(Post.is_published == True)
+        .order_by(Post.created_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    count_result, posts_result = await asyncio.gather(
+        session.execute(count_query),
+        session.execute(posts_query),
+    )
+    return list(posts_result.scalars().all()), count_result.scalar()
+```
+
+`asyncio.gather` 并发执行 COUNT 和 SELECT 是一个实用的优化：两个查询不互相依赖，串行执行要两次网络往返，并发执行只需要一次。
+
+对应 Java 的等价写法：
+
+```java
+// Spring Boot + JPA（同步）
+public Page<Post> getPosts(int page, int size) {
+    return postRepository.findByPublishedTrue(PageRequest.of(page, size));
+    // COUNT 和 SELECT 在 Pageable 内部串行执行
+}
+
+// Spring WebFlux + R2DBC（异步）
+public Mono<Page<Post>> getPostsReactive(int page, int size) {
+    Mono<Long> count = postRepository.countByPublishedTrue();
+    Flux<Post> posts = postRepository.findByPublishedTrue(PageRequest.of(page, size));
+    return Mono.zip(count, posts.collectList())
+        .map(tuple -> new PageImpl<>(tuple.getT2(), PageRequest.of(page, size), tuple.getT1()));
+}
+```
+
+Python 的 `asyncio.gather` 比 Java 的 `Mono.zip` 更直观 -- 不需要理解 `Mono` 和 `Flux` 的响应式流概念，直接把协程传进去就行。
+
+---
+
+## 并发控制：Semaphore vs ThreadPoolExecutor
+
+CMS 的文章批量导入功能需要并发处理，但不能一次性发送太多数据库写入请求。Python 用 `asyncio.Semaphore` 控制并发数：
+
+```python
+import asyncio
+
+semaphore = asyncio.Semaphore(5)  # 最多 5 个并发
+
+async def import_post(session: AsyncSession, post_data: dict):
+    async with semaphore:
+        await asyncio.sleep(0.1)  # 模拟数据库写入
+        # ... 创建文章逻辑
+
+async def batch_import(posts: list[dict]):
+    await asyncio.gather(*[import_post(session, p) for p in posts])
+```
+
+Java 中的等价方案：
+
+```java
+// 方式 1：CompletableFuture + 线程池
+ExecutorService pool = Executors.newFixedThreadPool(5);
+List<CompletableFuture<Void>> futures = posts.stream()
+    .map(p -> CompletableFuture.runAsync(() -> importPost(p), pool))
+    .toList();
+CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+// 方式 2：Spring @Async + 线程池配置
+@Async("taskExecutor")  // 线程池配置为 corePoolSize=5
+public CompletableFuture<Void> importPost(PostData data) { ... }
+```
+
+两者效果一样，但 Python 的 Semaphore 更轻量 -- 不需要创建线程池，不需要管理线程生命周期，一个对象就控制了并发数。
+
+---
+
+## 同步库的桥接：run_in_executor
+
+CMS 可能需要调用一些不支持异步的库（比如 `Pillow` 处理图片、`requests` 调用外部 API）。`run_in_executor` 把同步函数扔到线程池里执行，不阻塞事件循环：
+
+```python
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+import requests  # 同步 HTTP 库
+
+# 创建专用线程池
+http_pool = ThreadPoolExecutor(max_workers=10)
+
+async def fetch_external_api(url: str) -> dict:
+    loop = asyncio.get_running_loop()
+    # 在线程池中执行同步的 requests.get，不阻塞事件循环
+    response = await loop.run_in_executor(http_pool, requests.get, url)
+    return response.json()
+```
+
+这和 Java 中在异步代码里调用同步方法的情况类似 -- Spring WebFlux 中如果调用了阻塞的 JDBC 操作，需要用 `Schedulers.boundedElastic()` 包装。思路完全一致：把阻塞操作从事件循环线程中剥离出去。
+
+---
+
+## 常见陷阱
+
+**`time.sleep` vs `asyncio.sleep`**：在 `async def` 中使用 `time.sleep` 会阻塞整个事件循环，所有请求都会卡住。必须用 `await asyncio.sleep`。这是 Python 异步编程最容易犯的错误。
+
+**`await` 只能在 `async def` 中使用**：不能在普通函数里写 `await`，也不能在 `async def` 外面调用 `asyncio.run()`（一个线程只能有一个事件循环）。
+
+**数据库连接池要设合理上限**：`pool_size=10` 意味着最多 10 个并发数据库连接。如果用 `asyncio.gather` 并发 100 个查询，其中 90 个会排队等待连接。这在 Java 的 HikariCP 中也是同样的道理。
+
+---
+
+## 对比总结
+
+| 维度     | Java (CompletableFuture / WebFlux)               | Python (asyncio)        |
+| -------- | ------------------------------------------------ | ----------------------- |
+| 并发模型 | 线程池 / 响应式流                                | 事件循环 + 协程         |
+| 并发语法 | `CompletableFuture.supplyAsync()` / `Mono.zip()` | `asyncio.gather()`      |
+| 控制并发 | `ThreadPoolExecutor(max)` / `Semaphore`          | `asyncio.Semaphore`     |
+| 桥接同步 | `Schedulers.boundedElastic()`                    | `run_in_executor()`     |
+| Web 框架 | Spring MVC（同步）/ WebFlux（异步）              | FastAPI（异步优先）     |
+| 数据库   | JPA（同步）/ R2DBC（异步）                       | SQLAlchemy AsyncSession |
+| 学习曲线 | 需理解线程安全、响应式流                         | 需理解事件循环、协程    |
+
+---
+
+## Trade-off
+
+Python asyncio 的优势在于**轻量和直观**：协程的创建和切换成本极低，代码读起来和同步代码几乎没有区别（多了个 `await` 关键字）。在 I/O 密集型的 CMS 场景中，单进程就能支撑数千并发。
+
+代价是 asyncio 不能加速 CPU 密集型操作（图像处理、数据计算），这类任务仍然需要多进程。另外，Python 的异步生态不如 Java 成熟 -- 很多第三方库只提供同步接口，需要 `run_in_executor` 桥接。Java 的优势在于线程模型对 CPU 和 I/O 密集型任务都能胜任，且 `CompletableFuture` 可以和现有的同步代码无缝混用。
+
+---
+
+## 回顾与预告
+
+从第 12 篇到本篇，我们完成了 CMS 的数据层（SQLAlchemy）、API 层（CRUD）、安全层（JWT）、验证层（Pydantic）和性能层（asyncio）。下一篇将讨论 FastAPI 的中间件与依赖注入系统，对比 Spring 的 `@Autowired` 和 Interceptor，理解 Python 的依赖注入模型。

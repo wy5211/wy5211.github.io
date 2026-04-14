@@ -1,0 +1,301 @@
+---
+title: "16 Docker 部署"
+date: "2026-03-30"
+summary: "Node.js Dockerfile 和 Java 的有什么不同？给 CMS 写多阶段构建的 Dockerfile，用 docker-compose 编排应用、MySQL 和 Redis。"
+tags: ["Spring Boot", "Docker", "容器化", "部署"]
+category: "springboot"
+cover: ""
+draft: false
+series: "Spring Boot 实战"
+seriesOrder: 16
+---
+
+CMS 在开发环境跑得好好的，现在要部署到服务器上。你把 jar 包 scp 到服务器，装个 JDK，`nohup java -jar cms.jar &`，能用。但服务器重启了怎么办？要升级版本怎么办？MySQL 和 Redis 也得手动装？这些手动操作每做一次就多一分出错的可能。
+
+Docker 解决的就是"在我机器上能跑"到"在任何机器上都能跑"的问题。如果你写过 Node.js 的 Dockerfile，大概长这样：
+
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci --production
+COPY . .
+EXPOSE 3000
+CMD ["node", "server.js"]
+```
+
+五步，完事。Spring Boot 的 Dockerfile 不止五步，因为 Java 有编译环节。而且 Java 的运行时镜像比 Node.js 大得多——一个 Alpine 版的 Node.js 镜像大概 50MB，一个 JRE 镜像大概 200MB。这个差异不是随意的，背后是 JVM 和 V8 的根本区别。
+
+## Java Dockerfile vs Node.js Dockerfile
+
+先对比两个完整的多阶段构建 Dockerfile：
+
+**Node.js（多阶段构建）：**
+
+```dockerfile
+# 构建阶段
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build          # TypeScript 编译
+
+# 运行阶段
+FROM node:20-alpine
+WORKDIR /app
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package.json ./
+EXPOSE 3000
+USER node
+CMD ["node", "dist/server.js"]
+```
+
+**Spring Boot（多阶段构建）：**
+
+```dockerfile
+# 构建阶段
+FROM maven:3.9-eclipse-temurin-21 AS builder
+WORKDIR /app
+COPY pom.xml .
+RUN mvn dependency:go-offline    # 先下载依赖，利用 Docker 缓存层
+COPY src ./src
+RUN mvn clean package -DskipTests
+
+# 运行阶段
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+COPY --from=builder /app/target/cms-0.0.1-SNAPSHOT.jar app.jar
+EXPOSE 8080
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+USER appuser
+ENTRYPOINT ["java", "-jar", "app.jar"]
+```
+
+关键差异：
+
+| 维度         | Node.js                         | Spring Boot                                  |
+| ------------ | ------------------------------- | -------------------------------------------- |
+| 构建工具     | npm/pnpm                        | Maven/Gradle                                 |
+| 编译产物     | JS 文件（或无）                 | 可执行 jar（内嵌 Tomcat）                    |
+| 运行时       | node 二进制                     | JRE（Java 运行时）                           |
+| 基础镜像大小 | ~50MB (node:20-alpine)          | ~200MB (temurin:21-jre-alpine)               |
+| 依赖缓存     | `COPY package*.json` + `npm ci` | `COPY pom.xml` + `mvn dependency:go-offline` |
+| 启动命令     | `node server.js`                | `java -jar app.jar`                          |
+
+镜像大小的差异主要来自运行时：Node.js 只需要一个 V8 引擎（~50MB），JRE 包含了完整的类库、JIT 编译器、垃圾回收器（~200MB）。这个差距在生产环境中通常不是问题——现代服务器的磁盘和带宽都够用——但如果你的 CI/CD 流水线需要频繁推送镜像，这个大小差异会直接影响构建和部署速度。
+
+## 依赖缓存优化
+
+两个 Dockerfile 都利用了 Docker 的层缓存机制。核心思路一样：先复制依赖声明文件（`pom.xml` 或 `package*.json`），安装依赖，再复制源代码。这样只要你没改依赖，Docker 就会复用缓存层，跳过依赖下载步骤。
+
+Node.js 的 `npm ci` 比较直接——读 `package-lock.json`，下载，装完。Maven 的 `dependency:go-offline` 会下载所有声明依赖及其传递依赖到本地仓库。如果项目依赖多（Spring Boot 的 starter 依赖通常有几十个传递依赖），这一步可能需要几分钟。
+
+## JVM 参数配置
+
+Node.js 通常不需要额外的运行时参数。Java 不同——JVM 的默认堆大小是物理内存的 1/4，在容器里可能分配过多或过少。Docker 部署时需要显式设置 JVM 参数：
+
+```dockerfile
+FROM eclipse-temurin:21-jre-alpine
+WORKDIR /app
+COPY --from=builder /app/target/cms-0.0.1-SNAPSHOT.jar app.jar
+
+ENV JAVA_OPTS="-Xms256m -Xmx512m -XX:+UseG1GC -XX:MaxGCPauseMillis=200"
+
+EXPOSE 8080
+ENTRYPOINT ["sh", "-c", "java $JAVA_OPTS -jar app.jar"]
+```
+
+`-Xms256m -Xmx512m` 把初始堆和最大堆都固定了，避免 JVM 根据运行时负载动态调整导致的不确定性。`UseG1GC` 指定 G1 垃圾回收器，适合容器环境（暂停时间可控）。`MaxGCPauseMillis=200` 告诉 GC 尽量把暂停时间控制在 200ms 以内。
+
+Node.js 里没有等价的概念——V8 的内存管理对开发者几乎透明，你不需要（也很难）手动调。这是 JVM 的双刃剑：给了你调优的能力，但也要求你知道怎么调。
+
+## docker-compose 编排
+
+单个容器能跑不代表部署完成。CMS 依赖 MySQL 和 Redis，三个容器需要一起启动、互相通信。docker-compose 就是干这个的：
+
+```yaml
+services:
+  app:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - SPRING_PROFILES_ACTIVE=prod
+      - SPRING_DATASOURCE_URL=jdbc:mysql://db:3306/cms
+      - SPRING_DATASOURCE_USERNAME=cms_user
+      - SPRING_DATASOURCE_PASSWORD=cms_password
+      - SPRING_DATA_REDIS_HOST=redis
+      - SPRING_DATA_REDIS_PORT=6379
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "wget",
+          "--spider",
+          "-q",
+          "http://localhost:8080/actuator/health",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  db:
+    image: mysql:8.0
+    environment:
+      - MYSQL_ROOT_PASSWORD=root_password
+      - MYSQL_DATABASE=cms
+      - MYSQL_USER=cms_user
+      - MYSQL_PASSWORD=cms_password
+    volumes:
+      - db-data:/var/lib/mysql
+    ports:
+      - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  db-data:
+  redis-data:
+```
+
+几个关键设计决策：
+
+**`depends_on` + `condition: service_healthy`**：应用容器在 MySQL 和 Redis 都健康后才启动。这比简单的 `depends_on`（只等容器启动，不等服务就绪）可靠得多。Spring Boot 启动时如果连不上数据库会直接报错退出，`service_healthy` 确保了数据库已经可以接受连接。
+
+**健康检查**：三个服务都配了 `healthcheck`。应用的检查用的是 Spring Boot Actuator 的 `/actuator/health` 端点（上一篇日志监控里已经配置了）。MySQL 用 `mysqladmin ping`，Redis 用 `redis-cli ping`。Docker 根据健康检查状态决定是否重启容器。
+
+**数据卷**：`db-data` 和 `redis-data` 持久化数据。容器删除后数据不丢。这在生产环境中是必须的——否则每次 `docker-compose down -v` 数据就清空了。
+
+**环境变量**：数据库密码、Redis 地址等通过 `environment` 注入，不写死在 application.yml 里。Spring Boot 的配置优先级是：环境变量 > application-{profile}.yml > application.yml。所以 application-prod.yml 里可以写 `${SPRING_DATASOURCE_URL}`，运行时从环境变量读取。
+
+## 生产环境配置
+
+application-prod.yml 专门用于生产环境：
+
+```yaml
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: ${SPRING_DATASOURCE_URL}
+    username: ${SPRING_DATASOURCE_USERNAME}
+    password: ${SPRING_DATASOURCE_PASSWORD}
+    hikari:
+      maximum-pool-size: 20
+      minimum-idle: 5
+      connection-timeout: 30000
+      max-lifetime: 1800000
+
+  jpa:
+    hibernate:
+      ddl-auto: validate # 生产环境用 validate，不用 update
+    show-sql: false # 关闭 SQL 日志
+    properties:
+      hibernate:
+        format_sql: false
+
+  data:
+    redis:
+      host: ${SPRING_DATA_REDIS_HOST}
+      port: ${SPRING_DATA_REDIS_PORT}
+
+logging:
+  level:
+    root: WARN
+    com.example.cms: INFO
+  file:
+    name: /app/logs/cms.log
+    max-size: 50MB
+    max-history: 30
+```
+
+两个值得注意的点：
+
+**`ddl-auto: validate`**：开发环境用 `update` 或 `create-drop` 让 Hibernate 自动建表很方便。但生产环境用 `validate`——只验证实体和表结构是否匹配，不修改表结构。数据库变更应该通过 Flyway 或 Liquibase 等迁移工具管理，而不是让 Hibernate 自己改。这和 Node.js + Sequelize 的 `sync({ alter: true })` 一样——开发时能用，生产环境绝对不行。
+
+**`show-sql: false`**：关闭 SQL 日志输出。开发时 `show-sql: true` 方便调试，生产环境每条 SQL 打一行日志会把磁盘打满。
+
+## .env 文件管理敏感信息
+
+密码不应该明文写在 docker-compose.yml 里。用 `.env` 文件：
+
+```bash
+# .env
+SPRING_DATASOURCE_PASSWORD=your_secure_password_here
+SPRING_DATASOURCE_USERNAME=cms_user
+MYSQL_ROOT_PASSWORD=your_root_password_here
+```
+
+docker-compose 自动读取同目录的 `.env` 文件。`.env` 加入 `.gitignore`，不提交到代码仓库。服务器上单独管理。
+
+等价的 Node.js 项目里，你用 `.env` + `dotenv` 加载环境变量，做法完全一样。
+
+## 完整对比
+
+| 维度       | Node.js 容器化               | Spring Boot 容器化                       |
+| ---------- | ---------------------------- | ---------------------------------------- |
+| 基础镜像   | node:20-alpine (~50MB)       | temurin:21-jre-alpine (~200MB)           |
+| 构建步骤   | npm install + npm run build  | mvn package（编译 + 打包）               |
+| 运行时参数 | 通常不需要                   | 需要设置 JVM 堆大小和 GC                 |
+| 依赖缓存   | COPY package\*.json + npm ci | COPY pom.xml + mvn dependency:go-offline |
+| 端口暴露   | 3000                         | 8080                                     |
+| 健康检查   | 自定义脚本或 /health 路由    | Actuator /actuator/health                |
+| 启动时间   | < 1 秒                       | 10-30 秒（JVM 预热）                     |
+| 内存占用   | 50-200MB                     | 300MB-1GB+（取决于堆配置）               |
+
+启动时间是一个显著差异。Node.js 应用启动几乎是瞬时的——V8 加载 JS 文件，执行，开始监听端口。Spring Boot 启动需要：加载几十个 starter 的自动配置类、扫描组件、建立数据库连接池、初始化 Hibernate、启动内嵌 Tomcat。在容器环境中，这个启动时间意味着你需要更长的 `start_period`（健康检查的初始等待时间），否则应用还没启动完就被 Docker 判定为不健康。
+
+## Trade-off 分析
+
+**Spring Boot 容器化的收益：**
+
+- 可执行 jar 的自包含特性让部署非常简单。一个 jar 包含了所有依赖和内嵌 Tomcat，不需要在运行环境安装 JDK 以外的任何东西。Node.js 项目通常需要 `node_modules` 目录，虽然可以用多阶段构建把 `node_modules` 打进镜像，但产物目录比单个 jar 碎
+- Actuator 提供了标准化的健康检查端点。`/actuator/health` 报告数据库连接、Redis 连接、磁盘空间等状态，比 Node.js 项目里自己写 `/health` 路由更全面
+- `@Profile` 和环境变量的配合让配置管理更结构化。`application-prod.yml` 定义生产环境的默认值，环境变量用于覆盖敏感信息
+
+**代价：**
+
+- 镜像大。200MB vs 50MB，在 CI/CD 频繁构建的场景下会增加镜像仓库的存储和推送时间
+- 启动慢。10-30 秒的启动时间在需要快速扩缩容的场景下是劣势。Node.js 几乎可以瞬时启动新实例
+- JVM 参数调优增加了部署复杂度。Node.js 的 V8 引擎几乎不需要调参，JVM 的堆大小、GC 策略、线程数等参数需要根据负载场景调整
+- 内存占用高。即使是一个简单的 CRUD 应用，JVM 的基础内存占用也在 300MB 以上。Node.js 同等应用可能只需要 50-100MB
+
+## 回顾与预告
+
+到这篇为止，CMS 已经可以完整地容器化部署了：
+
+- 理解了 Java Dockerfile 和 Node.js Dockerfile 的差异——编译环节、运行时大小、JVM 参数
+- 多阶段构建把构建环境和运行环境分离，利用 Docker 层缓存加速构建
+- docker-compose 编排了 CMS 应用、MySQL、Redis 三个服务，通过健康检查和依赖管理保证启动顺序
+- `application-prod.yml` + 环境变量的配置管理方式，确保敏感信息不入代码仓库
+
+CMS 能跑了，但跑得快不快？10 篇文章堆下来的功能，有没有隐藏的性能问题？
+
+下一篇讲性能优化——从 CMS 的 N+1 查询问题出发，理解 `@EntityGraph`、HikariCP 连接池调优和 JVM 基础调优。

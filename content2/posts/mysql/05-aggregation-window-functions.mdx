@@ -1,0 +1,453 @@
+---
+title: "05 聚合、窗口函数与子查询"
+date: "2026-03-23"
+tags: ["MySQL"]
+category: "mysql"
+cover: ""
+draft: false
+series: "MySQL 渐进式学习指南"
+seriesOrder: 5
+---
+
+## 运营要报表，你只会 SELECT \*
+
+周一早上，运营丢过来一句话："帮我出一份运营报表——每月销售趋势、品类排名、用户消费 Top10、还有连续 7 天下单的活跃用户。"你盯着数据库里的 orders、products、users 三张表，脑子里想的是：关联查询上一篇刚学会，但"连续 7 天下单"这种需求，一条 SELECT 怎么写？
+
+这正是本篇要解决的问题。上一篇我们用 JOIN 把多张表关联在一起，查出了"张三买了什么、订单状态是什么"。但业务需要的远不止"查出来"——还需要"算出来"。从日销售额到品类排名，从累计消费到连续下单识别，MySQL 提供了聚合函数、窗口函数、CTE 和子查询一整套工具。接下来我们以电商运营报表为主线，把这些工具逐个用到真实场景里。
+
+## 聚合函数：把一堆数据变成一个数
+
+MySQL 提供五个核心聚合函数，它们的作用是把多行数据"压缩"成一个结果：
+
+| 函数  | 作用   | 电商场景举例       |
+| ----- | ------ | ------------------ |
+| COUNT | 计数   | 今天有多少笔订单   |
+| SUM   | 求和   | 本月总销售额       |
+| AVG   | 平均值 | 平均客单价是多少   |
+| MAX   | 最大值 | 单笔最高消费多少   |
+| MIN   | 最小值 | 最低商品价格是多少 |
+
+先看最基本的用法。运营要的"今日订单数和总销售额"，一条 SQL 就够了：
+
+```sql
+-- 今日已完成订单的基本统计
+SELECT
+  COUNT(*)           AS order_count,      -- 订单总数
+  SUM(total_amount)  AS total_sales,      -- 总销售额
+  AVG(total_amount)  AS avg_order_value,  -- 平均客单价
+  MAX(total_amount)  AS max_order,        -- 单笔最高消费
+  MIN(total_amount)  AS min_order         -- 单笔最低消费
+FROM orders
+WHERE status = 'completed'
+  AND DATE(created_at) = CURDATE();
+```
+
+这条查询把今天所有已完成订单"压缩"成了五个数字。但有几个细节值得注意：
+
+COUNT(_) 和 COUNT(字段) 的行为不同。COUNT(_) 统计所有行，包括含 NULL 的行；COUNT(字段) 只统计该字段非 NULL 的行。COUNT(DISTINCT 字段) 则是先去重再计数，适合统计"有多少个不同的用户下过单"这种场景。
+
+```sql
+-- 有多少个不同的用户下过单（去重计数）
+SELECT COUNT(DISTINCT user_id) AS buyer_count
+FROM orders
+WHERE status = 'completed';
+
+-- AVG 会自动跳过 NULL 值，但如果需要精确控制，用 SUM/COUNT 手动算
+SELECT
+  SUM(total_amount) / COUNT(*)  AS manual_avg
+FROM orders;
+```
+
+## GROUP BY：按维度拆分统计
+
+运营不只是要一个总数，还需要按维度看数据——每天卖了多少、每个品类卖了多少、每个用户消费了多少。这时就需要 GROUP BY。
+
+GROUP BY 的核心规则只有一条：**SELECT 中出现的非聚合字段，必须出现在 GROUP BY 里**。换句话说，分组之后，MySQL 只能返回"分组维度"和"聚合结果"，不能返回分组维度以外的原始字段。
+
+```sql
+-- 按日期统计每日销售趋势
+SELECT
+  DATE(created_at)                        AS order_date,
+  COUNT(*)                                AS order_count,       -- 当日订单数
+  SUM(total_amount)                       AS daily_sales,       -- 当日销售额
+  ROUND(AVG(total_amount), 2)             AS avg_order_value    -- 当日客单价
+FROM orders
+WHERE status = 'completed'
+GROUP BY DATE(created_at)                -- 按日期分组
+ORDER BY order_date DESC;                -- 最新的日期排前面
+```
+
+也可以同时按多个维度分组。比如运营想看"每个月 + 每个城市"的销售交叉表：
+
+```sql
+-- 按月份和城市交叉分组
+SELECT
+  DATE_FORMAT(o.created_at, '%Y-%m')      AS month,
+  u.city                                   AS city,
+  COUNT(*)                                 AS order_count,
+  SUM(o.total_amount)                      AS total_sales
+FROM orders o
+INNER JOIN users u ON o.user_id = u.id
+WHERE o.status = 'completed'
+GROUP BY DATE_FORMAT(o.created_at, '%Y-%m'), u.city
+ORDER BY month DESC, total_sales DESC;
+```
+
+## HAVING：过滤分组结果
+
+WHERE 在分组之前过滤行，HAVING 在分组之后过滤组。两者的区别是面试高频题，也是实际开发中容易搞混的地方。
+
+一个典型场景：运营要找出"累计消费超过 5000 元的 VIP 用户"。先按 user_id 分组求和，再过滤掉总额不够的用户——这就是 HAVING 的工作：
+
+```sql
+-- 找出累计消费超过 5000 元的用户
+SELECT
+  user_id,
+  COUNT(*)               AS order_count,
+  SUM(total_amount)      AS total_spent
+FROM orders
+WHERE status = 'completed'           -- 第一步：先过滤掉未完成的订单（分组前）
+GROUP BY user_id
+HAVING total_spent > 5000            -- 第二步：再过滤消费不足 5000 的组（分组后）
+ORDER BY total_spent DESC;
+```
+
+为什么不能用 WHERE 代替 HAVING？因为 WHERE 执行时分组还没发生，`total_spent` 这个聚合值还不存在。反过来，能用 WHERE 过滤的条件就不要放到 HAVING 里，因为 WHERE 先执行、能利用索引、减少参与分组的数据量，性能更好。
+
+## 窗口函数：聚合但不压缩行
+
+GROUP BY 的问题在于它会"压缩"行——10 天的订单变成 1 行汇总。但运营有时候需要既看到每天的数据，又看到累计数据。比如"每天的销售额"和"从年初到今天的累计销售额"要同时出现在一行里。这就需要窗口函数。
+
+窗口函数的语法结构是 `函数名() OVER (窗口定义)`，它对一组相关行做计算，但不会把多行压缩成一行。MySQL 8.0 开始支持窗口函数。
+
+### 排名：ROW_NUMBER、RANK、DENSE_RANK
+
+运营要做"品类销售排名"。三个排名函数的区别在于处理并列的方式：
+
+```sql
+-- 各品类的销售额排名
+SELECT
+  c.name                          AS category_name,
+  SUM(oi.quantity * oi.unit_price) AS total_sales,
+  ROW_NUMBER() OVER (ORDER BY SUM(oi.quantity * oi.unit_price) DESC) AS row_num,
+  RANK()       OVER (ORDER BY SUM(oi.quantity * oi.unit_price) DESC) AS rank_num,
+  DENSE_RANK() OVER (ORDER BY SUM(oi.quantity * oi.unit_price) DESC) AS dense_rank
+FROM order_items oi
+INNER JOIN products p ON oi.product_id = p.id
+INNER JOIN categories c ON p.category_id = c.id
+INNER JOIN orders o ON oi.order_id = o.id
+WHERE o.status = 'completed'
+GROUP BY c.name
+ORDER BY total_sales DESC;
+```
+
+假设手机卖了 100 万、笔记本卖了 80 万、平板也卖了 80 万、耳机卖了 50 万。三个函数的结果分别是：
+
+| 品类   | 销售额 | ROW_NUMBER | RANK | DENSE_RANK |
+| ------ | ------ | ---------- | ---- | ---------- |
+| 手机   | 100 万 | 1          | 1    | 1          |
+| 笔记本 | 80 万  | 2          | 2    | 2          |
+| 平板   | 80 万  | 3          | 2    | 2          |
+| 耳机   | 50 万  | 4          | 4    | 3          |
+
+ROW_NUMBER 始终递增，即使值相同也给不同编号；RANK 遇到并列就跳号；DENSE_RANK 遇到并列但不跳号。大多数业务场景用 RANK 就够了。
+
+### LAG / LEAD：看前一行和后一行
+
+LAG 和 LEAD 用于访问"当前行的前 N 行"或"后 N 行"的数据。这在计算环比、识别连续行为时非常有用。
+
+比如运营想看"每天的销售额"以及"相比前一天涨了多少"：
+
+```sql
+WITH daily_sales AS (
+  -- 第一步：先算出每天的销售额
+  SELECT
+    DATE(created_at)                        AS sale_date,
+    SUM(total_amount)                       AS sales
+  FROM orders
+  WHERE status = 'completed'
+  GROUP BY DATE(created_at)
+)
+-- 第二步：用 LAG 拿前一天的销售额，计算环比
+SELECT
+  sale_date,
+  sales,
+  LAG(sales, 1) OVER (ORDER BY sale_date)            AS prev_day_sales,
+  sales - LAG(sales, 1) OVER (ORDER BY sale_date)    AS day_over_day_diff,
+  ROUND(
+    (sales - LAG(sales, 1) OVER (ORDER BY sale_date))
+    / LAG(sales, 1) OVER (ORDER BY sale_date) * 100,
+    2
+  ) AS growth_pct
+FROM daily_sales
+ORDER BY sale_date;
+```
+
+LAG(sales, 1) 表示"向前看 1 行"的销售额。第一行没有前一天，所以 prev_day_sales 为 NULL，计算环比时需要用 IFNULL 或 COALESCE 处理。LEAD 的用法完全对称，只是方向相反——向后看 N 行。
+
+### SUM OVER：累计值与移动平均
+
+运营要的"累计销售额"是窗口函数最经典的应用。SUM() OVER() 配合窗口范围，可以在每一行上计算"从第一行到当前行的总和"：
+
+```sql
+WITH daily_sales AS (
+  SELECT
+    DATE(created_at)   AS sale_date,
+    SUM(total_amount)  AS sales
+  FROM orders
+  WHERE status = 'completed'
+  GROUP BY DATE(created_at)
+)
+SELECT
+  sale_date,
+  sales,
+  -- 累计销售额：从最早日期到当前日期的总和
+  SUM(sales) OVER (
+    ORDER BY sale_date
+    ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+  ) AS cumulative_sales,
+  -- 7 日移动平均：当前行和前 6 行的平均值
+  ROUND(AVG(sales) OVER (
+    ORDER BY sale_date
+    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+  ), 2) AS moving_avg_7d
+FROM daily_sales
+ORDER BY sale_date;
+```
+
+`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` 是窗口范围的定义，意思是"从第一行到当前行"。改成 `ROWS BETWEEN 6 PRECEDING AND CURRENT ROW` 就是"前 6 行 + 当前行"，也就是 7 日移动平均。窗口范围让你精确控制"参与计算的是哪些行"，这是 GROUP BY 做不到的。
+
+## CTE：把复杂查询拆成步骤
+
+当查询嵌套了子查询之后，SQL 会变得像俄罗斯套娃一样难读。CTE（Common Table Expression，公用表表达式）用 `WITH` 关键字给中间结果起名字，让查询像写代码一样分步进行。
+
+比如运营要一份综合报表：先找出高消费用户，再找出这些用户的品类偏好，最后合并输出。用子查询写会嵌套三层，用 CTE 写就像三个步骤：
+
+```sql
+WITH
+-- 第一步：找出累计消费超过 5000 元的用户
+vip_users AS (
+  SELECT
+    user_id,
+    SUM(total_amount) AS total_spent
+  FROM orders
+  WHERE status = 'completed'
+  GROUP BY user_id
+  HAVING SUM(total_amount) > 5000
+),
+-- 第二步：统计这些 VIP 用户在各个品类的消费
+vip_category_prefs AS (
+  SELECT
+    v.user_id,
+    c.name AS category_name,
+    SUM(oi.quantity * oi.unit_price) AS category_spent
+  FROM vip_users v
+  INNER JOIN orders o ON v.user_id = o.user_id
+  INNER JOIN order_items oi ON o.id = oi.order_id
+  INNER JOIN products p ON oi.product_id = p.id
+  INNER JOIN categories c ON p.category_id = c.id
+  GROUP BY v.user_id, c.name
+)
+-- 第三步：合并输出
+SELECT
+  u.username,
+  v.total_spent,
+  p.category_name,
+  p.category_spent,
+  ROUND(p.category_spent / v.total_spent * 100, 2) AS percentage
+FROM vip_users v
+INNER JOIN users u ON v.user_id = u.id
+INNER JOIN vip_category_prefs p ON v.user_id = p.user_id
+ORDER BY v.total_spent DESC, p.category_spent DESC;
+```
+
+CTE 的优势在于可读性和可维护性：每个步骤有清晰的名字，你可以在第三步引用第一步的结果，修改某个步骤时不会牵一发动全身。CTE 和派生表（FROM 里的子查询）在功能上是等价的，但 CTE 更容易理解和调试。
+
+### 递归 CTE：处理树形结构
+
+电商平台的商品分类是树形结构：电子产品 -> 手机 -> 智能手机，服装 -> 男装 -> 外套。要查询"某个分类及其所有子分类"，就需要递归 CTE。
+
+```sql
+-- 查询"电子产品"分类下的所有子分类（含自身）
+WITH RECURSIVE category_tree AS (
+  -- 锚点：起点是"电子产品"这个分类
+  SELECT
+    id,
+    name,
+    parent_id,
+    0 AS depth
+  FROM categories
+  WHERE name = '电子产品'
+
+  UNION ALL
+
+  -- 递归：根据 parent_id 找子分类，depth + 1
+  SELECT
+    c.id,
+    c.name,
+    c.parent_id,
+    ct.depth + 1
+  FROM categories c
+  INNER JOIN category_tree ct ON c.parent_id = ct.id
+)
+SELECT * FROM category_tree
+ORDER BY depth;
+```
+
+递归 CTE 由两部分组成：锚点（UNION ALL 之前）定义起始行，递归部分（UNION ALL 之后）引用自身的上一次结果，不断向下展开，直到找不到匹配行为止。这个模式同样适用于组织架构查询、菜单权限树等层级结构场景。
+
+## 子查询：嵌入查询中的查询
+
+子查询是嵌套在另一个查询里的 SELECT 语句。它和 CTE 的关系类似于"匿名函数"和"命名函数"——功能一样，但 CTE 有名字、可复用。
+
+### 子查询的几种形态
+
+根据返回值的类型，子查询分为四类：
+
+| 类型       | 返回值   | 典型用法                        |
+| ---------- | -------- | ------------------------------- |
+| 标量子查询 | 单个值   | WHERE price > (SELECT AVG...)   |
+| 列子查询   | 单列多行 | WHERE id IN (SELECT user_id...) |
+| 行子查询   | 单行多列 | WHERE (a, b) = (SELECT a, b...) |
+| 表子查询   | 多行多列 | FROM (SELECT ...) AS t          |
+
+在电商场景中，最常见的用法是"找超过平均值的商品"或"找有订单的用户"：
+
+```sql
+-- 标量子查询：找价格高于平均价的商品
+SELECT id, name, price
+FROM products
+WHERE price > (SELECT AVG(price) FROM products);
+
+-- 列子查询：找有已完成订单的用户
+SELECT id, username
+FROM users
+WHERE id IN (
+  SELECT DISTINCT user_id
+  FROM orders
+  WHERE status = 'completed'
+);
+```
+
+### EXISTS：比 IN 更高效的关联检查
+
+当子查询需要和外查询做关联时，EXISTS 通常比 IN 性能更好。EXISTS 只关心"有没有匹配的行"，一旦找到就停止扫描：
+
+```sql
+-- EXISTS：找到一条匹配就停，不用扫完全部
+SELECT u.id, u.username
+FROM users u
+WHERE EXISTS (
+  SELECT 1
+  FROM orders o
+  WHERE o.user_id = u.id
+    AND o.total_amount > 10000
+);
+
+-- NOT EXISTS：找"零下单"的用户（适合做用户召回）
+SELECT u.id, u.username
+FROM users u
+WHERE NOT EXISTS (
+  SELECT 1
+  FROM orders o
+  WHERE o.user_id = u.id
+);
+```
+
+经验法则：子查询结果集较大时用 EXISTS，较小时用 IN；需要关联外查询字段时用 EXISTS。
+
+## 综合实战：连续下单用户识别
+
+回到开头运营提的需求——"连续 7 天下单的活跃用户"。这个问题综合了 CTE、窗口函数、LAG 的能力，是一个很好的实战案例。思路是：先用 CTE 算出每个用户每天的订单数，再用 LAG 判断"和前一天相比是不是连续的"，最后统计最长连续天数。
+
+```sql
+WITH
+-- 第一步：每个用户、每天是否有下单
+user_daily_orders AS (
+  SELECT
+    user_id,
+    DATE(created_at) AS order_date,
+    COUNT(*) AS order_count
+  FROM orders
+  WHERE status = 'completed'
+  GROUP BY user_id, DATE(created_at)
+),
+-- 第二步：给每个用户的下单日期编连续序号，并算日期差
+user_streaks AS (
+  SELECT
+    user_id,
+    order_date,
+    -- 当前日期和"该用户第一次下单日期"之间差了几天
+    DATEDIFF(order_date, MIN(order_date) OVER (
+      PARTITION BY user_id ORDER BY order_date
+    )) AS date_diff,
+    -- 按日期排序的行号
+    ROW_NUMBER() OVER (
+      PARTITION BY user_id ORDER BY order_date
+    ) AS row_num
+  FROM user_daily_orders
+),
+-- 第三步：如果 date_diff == row_num - 1，说明中间没有断过
+consecutive_groups AS (
+  SELECT
+    user_id,
+    order_date,
+    -- 用 date_diff - row_num 算出一个"连续组标识"，值相同说明是同一段连续
+    date_diff - row_num AS group_id
+  FROM user_streaks
+)
+-- 第四步：统计每段连续天数的长度，筛选 >= 7 天的用户
+SELECT
+  user_id,
+  MIN(order_date) AS streak_start,
+  MAX(order_date) AS streak_end,
+  COUNT(*) AS consecutive_days
+FROM consecutive_groups
+GROUP BY user_id, group_id
+HAVING consecutive_days >= 7
+ORDER BY consecutive_days DESC;
+```
+
+这段查询的逻辑值得仔细理解：如果一个人在 1 月 1 日、2 日、3 日下了单，那么 date_diff 分别是 0、1、2，row_num 分别是 1、2、3，`date_diff - row_num` 都是 -1，说明这三天的"连续组标识"相同，属于同一段连续下单。如果 1 月 5 日又下了单，date_diff 变成 4，row_num 变成 4，`date_diff - row_num` 是 0，和之前不同了，说明连续被打断了，属于新的连续段。
+
+## 子查询 vs JOIN vs CTE：什么时候用哪个
+
+这三个工具都能解决"多表关联 + 聚合"的问题，但适用场景不同。用一个对比来说明：
+
+**用 JOIN 的场景**——需要把两张表的行"拼接"在一起，取两边的字段。比如"用户 + 订单明细"：
+
+```sql
+-- JOIN：两表行拼接，保留两边的列
+SELECT u.username, o.order_no, o.total_amount
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id;
+```
+
+**用子查询的场景**——只需要用一个查询的结果做过滤条件。比如"找消费超过平均值的用户"：
+
+```sql
+-- 子查询：内层算平均值，外层做过滤
+SELECT username, total_amount
+FROM (
+  SELECT u.username, SUM(o.total_amount) AS total_amount
+  FROM users u INNER JOIN orders o ON u.id = o.user_id
+  GROUP BY u.id
+) t
+WHERE total_amount > (SELECT AVG(total_amount) FROM orders);
+```
+
+**用 CTE 的场景**——查询逻辑需要分多个步骤，中间结果要复用。比如上面"连续下单用户"的例子，每个 CTE 步骤的结果都会被下一步引用。
+
+一个简单的判断原则：一步能搞定的用 JOIN，需要中间结果做过滤的用子查询，三步以上的用 CTE。
+
+## 何时用哪个工具
+
+MySQL 提供了聚合函数、GROUP BY + HAVING、窗口函数、CTE、子查询等一系列工具。它们不是互相替代的关系，而是各有所长：
+
+- **GROUP BY** 适合"把数据压缩成一个统计结果"——每日销售额、品类汇总。但它会丢失行级细节，无法同时展示明细和汇总。
+- **窗口函数** 适合"保留明细的同时做聚合"——累计值、排名、环比。它是 GROUP BY 的补充，解决了"既要又要"的问题。
+- **CTE** 适合"多步骤的复杂查询"——可读性好、可调试、中间结果可复用。但 MySQL 的 CTE 默认是物化的（会生成临时表），简单场景下性能不如直接写子查询。
+- **子查询** 适合"一步到位的简单过滤"——标量子查询做条件、列子查询配合 IN。但嵌套超过两层之后可读性急剧下降，这时就该换成 CTE。
+- **JOIN** 适合"多表数据拼接"——它的执行计划通常最优，MySQL 优化器对 JOIN 的优化最成熟。
+
+实际开发中，一个复杂报表往往会同时用到这些工具。关键是理解每种工具"压缩"还是"保留"行数据、是"一步"还是"多步"、是"过滤"还是"拼接"，然后根据需求选择最合适的方案。性能方面，简单聚合用 GROUP BY，多步逻辑用 CTE，避免相关子查询（每行执行一次内层查询，性能差），能用 JOIN 解决的就不要写成子查询。

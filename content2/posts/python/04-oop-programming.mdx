@@ -1,0 +1,462 @@
+---
+title: "04 OOP：Python 的类和 Java 有什么不同"
+date: "2026-03-30"
+summary: "Python 竟然没有 private？从 Java 开发者的视角看 Python 的 OOP：命名约定代替访问修饰符、多重继承与 MRO、dataclass 对比 Lombok。"
+tags: ["Python", "OOP", "类", "继承"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 实战"
+seriesOrder: 4
+---
+
+# OOP：Python 的类和 Java 有什么不同
+
+你刚写完一个 Java 类，习惯性地敲下 `private String title;`，然后切到 Python 项目——没有 `private` 关键字。`__title` 算私有吗？还是只是约定？Python 的 OOP 看起来和 Java 长得很像，但你很快会发现：没有访问修饰符、支持多重继承、`self` 必须显式传递、构造器不叫构造器。这些差异不是语法层面的偶然，而是两种语言对"封装"和"复用"有完全不同的理解。
+
+上一篇我们用 list、dict、set 处理了文章数据——用字典存文章信息、用 `defaultdict` 按标签分组、用推导式做过滤和映射。这些数据结构足以应对脚本和小型任务，但当业务逻辑变复杂（文章需要校验、序列化、状态管理），你需要类来组织代码。今天我们就从 Java 开发者的视角，重新认识 Python 的类系统。
+
+---
+
+## 没有访问修饰符：`_` 和 `__` 的约定
+
+Java 用 `public`/`private`/`protected` 三个关键字在编译器层面强制执行访问控制。Python 的回应是：**没有关键字，靠命名约定**。
+
+```python
+class Article:
+    def __init__(self, title: str, content: str, status: str = "draft"):
+        self.title = title                # 公开属性
+        self.content = content
+        self._status = status             # 单下划线："内部使用，但我不阻止你"
+        self.__view_count = 0             # 双下划线：触发 name mangling
+
+    def _validate_content(self):
+        """单下划线方法：约定内部使用，子类可以覆盖"""
+        if len(self.content) < 10:
+            raise ValueError("内容至少 10 个字符")
+
+    def __increment_view(self):
+        """双下划线方法：名称会被改写，防止意外覆盖"""
+        self.__view_count += 1
+
+    def view(self):
+        self.__increment_view()
+        return self.__view_count
+```
+
+单下划线 `_status` 纯粹是约定——Python 不会阻止你访问 `article._status`，IDE 也不会报错。它等价于 Java 里没有 `private` 修饰但注释写了"internal use only"的字段。团队协作中大家遵守这个约定就够了。
+
+双下划线 `__view_count` 触发的是 **name mangling**（名称改写）。Python 会在属性名前加上类名前缀：
+
+```python
+article = Article("Python 入门", "这是一篇关于 Python 的入门教程")
+print(article._Article__view_count)  # 0 — 改写后的名称可以直接访问
+print(article.view())                 # 1
+```
+
+`__view_count` 被改写成了 `_Article__view_count`。这能防止子类意外覆盖同名属性，但**不是真正的私有**——任何知道改写规则的人都能访问。Java 的 `private` 是编译器级别的强制，Python 的 `__` 是运行时的命名技巧。
+
+| 层级   | Python         | Java                         | 实际效果               |
+| ------ | -------------- | ---------------------------- | ---------------------- |
+| 公开   | `title`        | `public`                     | 完全开放               |
+| 内部   | `_status`      | (无对应，用 package-private) | 约定不直接访问，不强制 |
+| "私有" | `__view_count` | `private`                    | name mangling，可绕过  |
+
+Java 开发者常问：那怎么保证封装？答案是 **`@property`**——用方法包装属性访问，在赋值时加校验逻辑。这个稍后展开。
+
+---
+
+## `__init__` 不是构造器，`self` 不是 `this`
+
+Java 里构造器和类同名，`this` 隐式传递。Python 里初始化方法叫 `__init__`，`self` 必须显式声明为第一个参数。
+
+```python
+class Article:
+    # 类属性 — 类级别的，所有实例共享
+    default_status = "draft"
+
+    def __init__(self, title: str, content: str):
+        # self 是显式参数，指向当前实例
+        self.title = title          # 实例属性
+        self.content = content
+        self.status = Article.default_status
+        self.created_at = None      # 后续赋值
+
+    # 实例方法 — 第一个参数永远是 self
+    def publish(self):
+        self.status = "published"
+        self.created_at = "2026-03-30"
+
+    # 类方法 — 第一个参数是 cls（类本身），不是实例
+    @classmethod
+    def from_dict(cls, data: dict):
+        """工厂方法：通过字典创建实例"""
+        return cls(title=data["title"], content=data["content"])
+
+    # 静态方法 — 不需要 self 也不需要 cls
+    @staticmethod
+    def is_valid_title(title: str) -> bool:
+        return 1 <= len(title) <= 200
+```
+
+用 Java 写同样的类，`__init__` 对应构造器，`@classmethod` 对应 `static` 工厂方法，`@staticmethod` 对应 `static` 工具方法。关键区别：
+
+- `self` 必须显式写出来——Java 的 `this` 是隐式的，Python 的 `self` 是参数列表的一部分。这不是冗余，而是让 Python 的方法调用机制更透明：`article.publish()` 实际上是 `Article.publish(article)` 的语法糖。
+- `__init__` 是**初始化方法**，不是构造方法。真正的构造方法是 `__new__`（负责分配内存），`__init__` 在 `__new__` 之后被调用，负责设置属性。99% 的情况下你只需要 `__init__`。
+- 类属性 `default_status` 通过类名访问，所有实例共享同一个值。Java 里用 `static final`，Python 没有这个限制——类属性可以被修改，修改后所有实例都会看到新值。
+
+```python
+# Java 的 this 是隐式的
+// article.publish() → 内部自动传入 this
+
+# Python 的 self 是显式的
+# article.publish() → 实际调用 Article.publish(article)
+```
+
+`@classmethod` 在 Python 中比在 Java 中更常用，因为它接收 `cls` 参数——你可以用 `cls()` 创建实例，工厂方法模式因此更加自然。Java 的静态方法无法做到这一点，你需要额外的工厂类。
+
+---
+
+## 继承：单继承 vs 多重继承
+
+Java 只支持单继承（接口可以多实现），Python 支持多重继承。这不是简单的"Python 更强大"——多重继承带来的是复杂的**方法解析顺序（MRO）**问题。
+
+### 基本继承和 `super()` 的差异
+
+先看一个简单的继承场景——`PublishedArticle` 继承 `Article`，增加了发布相关的能力：
+
+```python
+class Article:
+    def __init__(self, title: str, content: str):
+        self.title = title
+        self.content = content
+        self.status = "draft"
+
+    def __str__(self):
+        return f"[{self.status}] {self.title}"
+
+
+class PublishedArticle(Article):
+    def __init__(self, title: str, content: str, published_at: str):
+        super().__init__(title, content)   # Python 3 的 super() 无需传参
+        self.published_at = published_at
+        self.status = "published"
+
+
+article = PublishedArticle("Python 入门", "内容...", "2026-03-30")
+print(article)  # [published] Python 入门
+```
+
+Python 3 的 `super()` 不需要传参数，Java 的 `super()` 也一样简洁。但区别在多重继承时才会显现——Python 3 的 `super()` 遵循 MRO 链，不是简单地调用"直接父类"。
+
+### MRO：C3 线性化算法
+
+当一个类有多个父类时，Python 用 **C3 线性化算法**确定方法查找顺序：
+
+```python
+class TimestampMixin:
+    """Mixin：为类添加时间戳能力"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.created_at = "2026-03-30"
+        self.updated_at = "2026-03-30"
+
+    def touch(self):
+        self.updated_at = "2026-03-31"
+
+
+class ViewCountMixin:
+    """Mixin：为类添加浏览计数能力"""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.view_count = 0
+
+    def view(self):
+        self.view_count += 1
+        return self.view_count
+
+
+class Article(TimestampMixin, ViewCountMixin):
+    def __init__(self, title: str, content: str):
+        super().__init__()  # 按 MRO 链依次调用所有父类的 __init__
+        self.title = title
+        self.content = content
+
+    def __str__(self):
+        return f"[{self.view_count} views] {self.title}"
+
+
+print(Article.__mro__)
+# (Article, TimestampMixin, ViewCountMixin, object)
+# 查找顺序：Article → TimestampMixin → ViewCountMixin → object
+
+article = Article("Python 入门", "内容...")
+print(article.created_at)  # "2026-03-30"
+print(article.view_count)  # 0
+print(article.view())      # 1
+```
+
+MRO 的查找顺序是：先 Article 自己，然后 TimestampMixin，再 ViewCountMixin，最后 object。`super().__init__()` 不是调用"父类"的 `__init__`，而是调用 MRO 链中的**下一个**类的 `__init__`。这就是为什么每个 Mixin 的 `__init__` 里都要调 `super().__init__()`——它形成了一条链。
+
+Java 没有多重继承，自然不需要 MRO。Java 用接口 + 默认方法来组合能力，但接口不能有状态（没有实例字段），所以 Mixin 在 Java 里需要用组合（Composition）模式实现，代码量更大。
+
+Mixin 有一个设计原则：**不应该定义 `__init__`**。上面的例子为了演示 MRO 才让 Mixin 定义了 `__init__`。在实际项目中，更常见的做法是让 Mixin 只提供方法，不管理状态：
+
+```python
+class JsonSerializableMixin:
+    """只提供方法，不管理状态"""
+    def to_dict(self):
+        return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}
+
+    def to_json(self):
+        import json
+        return json.dumps(self.to_dict(), ensure_ascii=False)
+```
+
+---
+
+## `@property`：Python 的 getter/setter
+
+Java 里你会给私有字段写 getter/setter（或者用 Lombok 的 `@Data` 自动生成）。Python 的做法不同——先用公开属性，需要控制访问时再用 `@property` 包装，**不需要一开始就写 getter/setter**。
+
+```python
+class Article:
+    def __init__(self, title: str, content: str):
+        self.title = title
+        self._status = "draft"
+
+    @property
+    def status(self) -> str:
+        """读取 status 时自动调用"""
+        return self._status
+
+    @status.setter
+    def status(self, value: str):
+        """赋值 status 时自动调用"""
+        valid = {"draft", "published", "archived"}
+        if value not in valid:
+            raise ValueError(f"无效状态: {value}，允许值: {valid}")
+        self._status = value
+
+    @property
+    def summary(self) -> str:
+        """只读计算属性 — 没有 setter"""
+        return self.content[:50] + ("..." if len(self.content) > 50 else "")
+
+
+article = Article("Python 入门", "这是一篇关于 Python 面向对象编程的详细教程")
+print(article.status)   # "draft" — 调用 getter
+article.status = "published"  # 调用 setter
+# article.status = "invalid"  # ValueError
+
+print(article.summary)  # "这是一篇关于 Python 面向对象编程的详细教程"
+# article.summary = "new"    # AttributeError — 没有 setter，只读
+```
+
+`@property` 的价值在于：你可以从公开属性平滑过渡到受控属性，调用方不需要改代码。Java 里你要从 `public String status` 改成 `private String status` + getter/setter，所有调用方都要从 `article.status` 改成 `article.getStatus()`——这是破坏性变更。
+
+`summary` 是一个**只读计算属性**，没有定义 setter，赋值时会抛出 `AttributeError`。这在 Java 里需要写只有 getter 没有 setter 的方法，Python 用 `@property` 声明更简洁。
+
+---
+
+## dataclass vs Lombok `@Data`
+
+Java 里定义一个数据类，你通常用 Lombok 的 `@Data` 注解来自动生成 getter/setter/toString/equals/hashCode。Python 3.7+ 的 `@dataclass` 做的是同一件事。
+
+先看 Java 端：
+
+```java
+// Java + Lombok
+@Data
+public class Article {
+    private String title;
+    private String content;
+    private String status = "draft";
+    private List<String> tags;
+}
+```
+
+Python 端：
+
+```python
+from dataclasses import dataclass, field
+
+@dataclass
+class Article:
+    title: str
+    content: str
+    status: str = "draft"
+    tags: list[str] = field(default_factory=list)  # 可变默认值必须用 factory
+```
+
+两行代码各自生成了 `__init__`、`__repr__`、`__eq__`。但有几个值得注意的差异：
+
+**默认值的陷阱**。Python 里 `tags: list[str] = []` 是错误的——所有实例会共享同一个列表。必须用 `field(default_factory=list)` 让每次创建实例时都调用 `list()` 生成新列表。Java 的 `List<String> tags = new ArrayList<>()` 在 Lombok `@Data` 里也有同样的问题（共享引用），但 Java 开发者更习惯用构造器注入而不是字段默认值，所以踩坑的概率更低。
+
+**不可变数据类**。`@dataclass(frozen=True)` 创建的实例不能修改属性，类似 Java 的 `record`。`frozen=True` 的实例可以作为 dict 的 key，因为 Python 自动为它生成了 `__hash__`：
+
+```python
+@dataclass(frozen=True)
+class ArticleId:
+    id: int
+    slug: str
+
+# 可以作为 dict 的 key
+index = {ArticleId(1, "python-intro"): "Python 入门"}
+```
+
+**排序支持**。`@dataclass(order=True)` 自动生成 `__lt__`、`__le__` 等比较方法，按字段顺序比较：
+
+```python
+@dataclass(order=True)
+class Article:
+    view_count: int
+    title: str = field(compare=False)  # 不参与比较
+
+articles = [Article(1200, "Python"), Article(850, "Docker"), Article(2100, "FastAPI")]
+articles.sort()  # 按 view_count 升序排列
+```
+
+| 特性       | Java Lombok `@Data`                    | Python `@dataclass`            |
+| ---------- | -------------------------------------- | ------------------------------ |
+| 自动生成   | getter/setter/toString/equals/hashCode | `__init__`/`__repr__`/`__eq__` |
+| 访问控制   | 保留 `private` 修饰符                  | 属性默认公开                   |
+| 不可变     | `@Value`（单独注解）                   | `frozen=True`                  |
+| 排序       | 需实现 `Comparable`                    | `order=True`                   |
+| 类型验证   | 无                                     | 无（用 Pydantic 替代）         |
+| 可变默认值 | 需手动处理                             | `field(default_factory=...)`   |
+
+`@dataclass` 没有 setter——属性直接赋值，不走方法。如果你需要赋值时做校验，结合 `@property` 使用，或者直接用 Pydantic 的 `BaseModel`（第 07 篇会详细讲）。
+
+---
+
+## 抽象基类 vs Java 接口
+
+Java 用 `interface` + `implements` 定义契约，Python 用 `abc` 模块的抽象基类（ABC）：
+
+```python
+from abc import ABC, abstractmethod
+
+class StorageBackend(ABC):
+    """抽象基类 — 类似 Java 的 interface + abstract class"""
+
+    @abstractmethod
+    def save(self, article: dict) -> int:
+        """保存文章，返回 ID — 子类必须实现"""
+        ...
+
+    @abstractmethod
+    def get(self, article_id: int) -> dict | None:
+        """根据 ID 获取文章 — 子类必须实现"""
+        ...
+
+    def save_and_get(self, article: dict) -> dict:
+        """非抽象方法 — 子类可以直接使用，类似 Java 接口的 default 方法"""
+        article_id = self.save(article)
+        return self.get(article_id)
+
+
+class MemoryStorage(StorageBackend):
+    """内存实现"""
+
+    def __init__(self):
+        self._store: dict[int, dict] = {}
+
+    def save(self, article: dict) -> int:
+        article_id = max(self._store.keys(), default=0) + 1
+        self._store[article_id] = article
+        return article_id
+
+    def get(self, article_id: int) -> dict | None:
+        return self._store.get(article_id)
+
+# storage = StorageBackend()  # TypeError — 不能实例化抽象类
+storage = MemoryStorage()
+```
+
+Python 3.8+ 还提供了 `typing.Protocol`，支持**结构化子类型**（类似 Go 的 interface）。只要一个类实现了 Protocol 定义的方法签名，就算"实现了"这个接口，不需要显式声明继承关系。这和 Java 的接口完全不同——Java 要求显式 `implements`，`Protocol` 不需要。这个特性在写通用函数时非常有用，但超出了本篇的范围。
+
+---
+
+## 魔术方法：让类融入 Python 生态
+
+Java 用 `implements Comparable`、`implements Serializable` 让类适配框架。Python 用**魔术方法**（双下划线开头结尾的方法）让类融入语言本身的操作体系。`__str__` 控制 `print()` 的输出，`__eq__` 控制 `==` 的行为，`__len__` 让 `len()` 生效。
+
+以一个简单的文章集合类为例：
+
+```python
+class ArticleCollection:
+    def __init__(self, articles: list[dict] | None = None):
+        self._articles = articles or []
+
+    def __len__(self):
+        """让 len(collection) 生效"""
+        return len(self._articles)
+
+    def __getitem__(self, index: int | slice):
+        """让 collection[0] 和 collection[1:3] 生效"""
+        return self._articles[index]
+
+    def __contains__(self, title: str):
+        """让 'title' in collection 生效"""
+        return any(a["title"] == title for a in self._articles)
+
+    def __iter__(self):
+        """让 for article in collection 生效"""
+        return iter(self._articles)
+
+    def __str__(self):
+        return f"ArticleCollection({len(self._articles)} 篇文章)"
+
+
+collection = ArticleCollection([
+    {"title": "Python 入门", "views": 1200},
+    {"title": "Docker 部署", "views": 850},
+])
+
+print(len(collection))           # 2
+print(collection[0])            # {"title": "Python 入门", ...}
+print(collection[1:])           # [{"title": "Docker 部署", ...}]
+print("Python 入门" in collection)  # True
+for article in collection:
+    print(article["title"])
+```
+
+魔术方法不需要继承任何接口，只要定义在类中就生效。这让你的自定义类能和 Python 的内置函数（`len()`、`sorted()`、`in`）无缝协作——Java 的 `List` 之所以能用 `for-each`，是因为它实现了 `Iterable`；Python 的对象能用 `for ... in`，是因为它实现了 `__iter__`。概念一样，Python 的实现更轻量。
+
+---
+
+## 对比总览
+
+把今天涉及的核心差异汇总：
+
+| 特性          | Java                                         | Python                                  |
+| ------------- | -------------------------------------------- | --------------------------------------- |
+| 访问控制      | `public`/`private`/`protected`（编译器强制） | `_` 约定内部 / `__` name mangling       |
+| 构造器        | 与类同名的方法                               | `__init__`（初始化），`__new__`（构造） |
+| 实例引用      | 隐式 `this`                                  | 显式 `self`（第一个参数）               |
+| 继承          | 单继承 + 多接口实现                          | 多重继承 + MRO（C3 线性化）             |
+| 接口/抽象     | `interface` + `abstract class`               | `ABC` + `@abstractmethod` / `Protocol`  |
+| getter/setter | Lombok `@Data` 或手写                        | `@property`（按需包装）                 |
+| 数据类        | Lombok `@Data` / `record`                    | `@dataclass`                            |
+| 代码复用      | 接口默认方法 / 组合                          | Mixin（多重继承的一种用法）             |
+| 类方法        | `static` 方法                                | `@staticmethod` / `@classmethod`        |
+| 运算符重载    | 不支持                                       | 魔术方法（`__add__`、`__eq__` 等）      |
+
+---
+
+## Trade-off：Python OOP 的设计取舍
+
+Python 的"没有访问修饰符"看起来像是缺陷，实际上是 **"成年人语言"哲学**的体现。Java 的 `private` 通过编译器强制封装，防止开发者犯错；Python 信任开发者的判断，用 `_` 和 `__` 约定代替编译器检查。在小型团队和快速迭代的项目中，这种信任文化确实能减少样板代码、提高开发效率。但在大型团队（几十人以上）或需要严格 API 边界的场景下，缺少编译器级别的访问控制会增加维护成本——你只能靠代码审查和团队规范来弥补。
+
+多重继承是 Python 最受争议的设计之一。Java 明确禁止多重继承，用接口 + 默认方法来避免"菱形问题"。Python 用 MRO（C3 线性化）解决了菱形问题，但 MRO 本身增加了理解成本——当继承层级超过三层，调试方法查找顺序变成一件需要打印 `__mro__` 才能搞清楚的事。实际项目中，Mixin 模式（只提供方法、不管理状态）是最安全的多重继承用法。如果你发现自己需要频繁用到深层多重继承，这通常意味着设计有问题，该用组合而不是继承了。
+
+`@dataclass` 和 Lombok `@Data` 解决的是同一个问题：减少数据类的样板代码。但 `@dataclass` 不会生成 setter，属性默认公开——这在需要细粒度控制（比如赋值时做校验）时不如 Java 的 getter/setter 灵活。Python 的应对方式是 `@property`，但 `@property` 是方法级的，不是类级的——你得逐个属性声明。在数据验证需求复杂的场景下（比如 Web API 的请求体），Pydantic 的 `BaseModel` 比 `@dataclass` 更合适，第 07 篇会详细对比。
+
+---
+
+## 下一步
+
+上一篇我们用 list、dict、set 处理了文章数据，今天用类把这些数据和行为组织了起来——`Article` 封装了状态和校验逻辑，`PublishedArticle` 通过继承扩展了发布能力，`@dataclass` 消除了样板代码。但 Python OOP 还有一些"隐含前提"我们没有展开：`@property` 和 `@classmethod` 上的 `@` 符号到底是什么？`@dataclass` 里的 `@` 和它们是同一个机制吗？
+
+下一篇我们来解开这个谜题——Python 的装饰器、生成器和上下文管理器。装饰器是 Python 最独特的特性之一，它和 Java 的注解（Annotation）看起来相似但本质不同：Java 注解是标记（metadata），由框架在运行时读取；Python 装饰器是高阶函数，直接修改被装饰对象的行为。理解了这个区别，你就理解了为什么 Flask 和 FastAPI 的路由声明看起来那么简洁。

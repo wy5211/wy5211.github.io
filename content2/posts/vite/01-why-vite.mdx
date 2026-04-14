@@ -1,0 +1,131 @@
+---
+title: "01. 为什么是 Vite 8：从 Webpack 迁移的决策"
+date: "2026-04-12"
+summary: "团队的 Webpack 配置已经没人敢动了。Vite 8 带来了 Rolldown + Oxc 的完整 Rust 工具链，生产构建速度提升 10-30 倍。但迁移有风险，值不值得做？"
+tags: ["Vite", "前端工程化", "Rolldown"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战指南"
+seriesOrder: 1
+---
+
+你们团队的 TaskFlow Dashboard 项目用 Webpack 5 构建了两年。刚接手的时候，启动开发服务器要等 18 秒，改一行 CSS 要等 3 秒才能看到效果。你忍了。
+
+后来新来了一个同事，不小心改了 `webpack.common.js` 里的一个 loader 配置，构建直接挂了。排查了一下午，发现是一个 loader 的版本和 Webpack 5 不兼容。没人敢动那 4 个配置文件了。
+
+再后来，产品团队要求加 SSR 支持。你查了一下 Webpack 的 SSR 方案——需要引入 `webpack-node-externals`、配置 `output.library`、处理 CSS 的服务端渲染、管理两套入口……改完之后，配置文件从 4 个变成了 6 个。
+
+这时候你开始认真考虑：是不是该换到 Vite 了？
+
+## Webpack 的真实痛点
+
+Webpack 的问题不只是"慢"。
+
+**配置复杂度**。Webpack 的配置是声明式的——你告诉它"要做什么"，但它内部怎么执行你控制不了。一个中等复杂度的项目，配置文件通常需要 4-6 个（common、dev、prod、ssr、test）。每个文件几百行，改一个地方可能影响另一个地方。
+
+**HMR 不稳定**。大项目里，改一个被 20 个模块间接引用的工具函数，HMR 可能要更新整个模块图。有时候改了代码但页面没变化，得手动刷新——你不确定是 HMR 失效了还是你改错了文件。
+
+**生态碎片化**。Webpack 的 loader 和 plugin 生态很庞大，但质量参差不齐。同一个功能（比如处理 CSS），有 `css-loader`、`style-loader`、`mini-css-extract-plugin`、`postcss-loader` 四个包要配合使用。版本升级经常互相不兼容。
+
+**构建慢**。你的项目 4 分 12 秒的构建时间在 Webpack 项目里不算特别慢——很多大型项目的构建时间在 10 分钟以上。但 4 分钟意味着每次 CI/CD 都要等这么久，一天 20 次 commit 就是 80 分钟的等待。
+
+这些问题的根本原因是：Webpack 的架构决定了它需要先打包再服务。开发模式下要做的事情和生产模式下做的事情差异很大，两套逻辑的维护成本很高。
+
+## Vite 8 做了什么不同
+
+Vite 的核心思路是：**开发模式和构建模式用不同的策略**。
+
+开发模式下，Vite 不打包你的源码。它利用浏览器的原生 ESM 支持，让浏览器直接加载你的 TypeScript/JSX 文件——当然，在传输前会做快速的编译转换。只有 node_modules 里的依赖需要预构建（因为它们通常是 CommonJS 格式，不是 ESM）。
+
+生产模式下，Vite 用 Rolldown（Vite 8 的默认打包器）做完整的打包和优化——代码分割、Tree Shaking、压缩、hash 文件名。
+
+这两套逻辑是完全独立的。开发模式追求的是"快"——启动快、HMR 快。构建模式追求的是"小"——产物体积小、加载快。
+
+### Rolldown：Rust 写的打包器
+
+Vite 8 最大的变化是 Rolldown 取代了 esbuild 和 Rollup。Rolldown 是 VoidZero 团队用 Rust 写的打包器，兼容 Rollup 的插件 API。
+
+这意味着什么？Vite 8 的整个工具链都是 Rust 的：
+
+- **Rolldown**：打包和代码分割（替代 esbuild + Rollup）
+- **Oxc**：JSX 转换、TypeScript 编译、代码压缩（替代 Babel + terser）
+- **lightningcss**：CSS 处理和压缩
+
+三个工具全部用 Rust 编写，共享 AST 解析，避免了不同工具之间的序列化开销。
+
+实际效果怎么样？一些公开的数据：
+
+- Linear：生产构建从 46 秒降到 6 秒
+- Mercedes-Benz.io：构建时间减少 38%
+- Hacker News 社区报告：从 4 分钟降到 30 秒
+
+代价是安装体积增加了约 15 MB（主要是 Rolldown 的二进制文件和 lightningcss 的依赖）。对于 CI/CD 来说，这意味着 Docker 镜像会大一些，缓存策略需要调整。
+
+### 环境不再分"dev"和"build"
+
+Vite 8 的另一个重要变化是 Environment API（仍然标记为实验性）。在 Vite 5 及之前，只有两个隐式环境：`client`（浏览器）和 `ssr`（服务端）。如果你要部署到边缘运行时（Cloudflare Workers、Deno Deploy），没有好的方式配置第三种环境。
+
+Environment API 让你定义任意数量的命名环境，每个环境有独立的配置：
+
+```typescript
+export default defineConfig({
+  environments: {
+    client: {
+      /* 浏览器配置 */
+    },
+    ssr: {
+      /* Node.js SSR 配置 */
+    },
+    edge: {
+      /* 边缘运行时配置 */
+    },
+  },
+});
+```
+
+这在多部署目标的场景下很有用。不过目前还是实验性的，生态支持还在完善中。
+
+## 2026 年的构建工具格局
+
+Vite 不是唯一的选择。2026 年，构建工具市场有三个主要玩家。
+
+**Vite 8**：65M 周下载量，最大的插件生态，框架无关。适合所有类型的 Web 项目，从简单 SPA 到复杂的 SSR 应用。
+
+**Turbopack**：Vercel 出品，和 Next.js 深度集成。在大型 Next.js 项目中 HMR 速度最快，但独立使用能力有限。如果你用 Next.js，Turbopack 是默认选择，不需要考虑其他方案。
+
+**Rspack**：字节跳动出品，兼容 Webpack 的插件 API。适合从 Webpack 迁移的企业——现有的 loader 和 plugin 大部分可以直接复用。在字节内部支撑了 TikTok 级别的应用。
+
+怎么选？如果你的项目用 Next.js，用 Turbopack。如果你有一个复杂的 Webpack 项目想要现代化但不想重写配置，考虑 Rspack。如果你的项目是框架无关的或者用 Vue/Svelte/React（非 Next.js），Vite 是最成熟的选择。
+
+## 什么项目适合迁移到 Vite
+
+适合迁移的：
+
+- Webpack 配置已经变得难以维护的项目
+- 开发体验差（启动慢、HMR 不稳定）影响团队效率
+- 不重度依赖 Webpack 特有的 loader/plugin（比如 `raw-loader`、`thread-loader` 这些 Webpack 特有的功能）
+- 团队愿意花 1-2 周时间做迁移和验证
+
+不适合迁移的：
+
+- 高度定制化的 Webpack 配置，有大量自写 loader，迁移成本极高
+- 项目用 Next.js——直接用 Turbopack
+- 构建流程中有复杂的后处理（比如自定义的代码混淆、特殊的 chunk 命名规则）
+- 项目即将下线或重构——不值得在旧代码上投入迁移成本
+
+TaskFlow Dashboard 属于"适合迁移"的类型。配置文件没人敢动、开发体验差、技术栈是标准的 React + TypeScript + Tailwind CSS，没有太多 Webpack 特有的依赖。
+
+## 迁移的成本和风险
+
+迁移不是免费的。你需要考虑：
+
+**配置重写**。Vite 的配置格式和 Webpack 完全不同。你不需要翻译——而是要重新理解"我要实现什么"，然后用 Vite 的方式表达。大部分配置在 Vite 里都比 Webpack 简单。
+
+**插件兼容性**。Webpack 的 loader 和 plugin 不能直接在 Vite 中使用。大部分功能有 Vite 原生替代方案，少部分需要重写为 Vite 插件。
+
+**团队学习成本**。团队需要学习 Vite 的配置方式、调试方法、插件 API。不过 Vite 的学习曲线比 Webpack 平缓很多——大部分项目只需要一个不到 50 行的 `vite.config.ts`。
+
+**安装体积**。Vite 8 比 Vite 5 大约大 15 MB。对于本地开发影响不大，但 Docker 镜像和 CI 缓存策略需要调整。
+
+我们的判断是：这些成本在 TaskFlow Dashboard 的场景下是可接受的。下一篇我们深入理解 Vite 的开发服务器机制，为迁移做准备。

@@ -1,0 +1,405 @@
+---
+title: "04. Redis 键设计规范：构建可维护的数据结构"
+date: "2026-03-23"
+summary: "学习 Redis 键的命名规范、设计模式和最佳实践，构建高效、易维护的 Redis 数据结构。"
+tags: ["Redis", "键设计", "最佳实践"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 4
+---
+
+## 为什么要关注键设计
+
+前几篇文章我们学习了 Redis 的数据类型，你可能会觉得：知道怎么用 HSET、ZADD 不就行了吗，键名随便取不行吗？
+
+键名确实可以随便取，Redis 不会报错。但随便取的代价是什么？
+
+想象一下，你接手了一个直播平台的 Redis 数据，看到这些键：
+
+```
+user_888
+User:999
+usr_1000
+room.abc123
+room:def456
+livestream_room_ghi789
+```
+
+你能快速知道这些键存的是什么吗？你能安全地删除所有测试数据吗？你能避免键名冲突吗？你能知道哪些键什么时候会过期吗？
+
+答案都是不能。这就是糟糕的键设计带来的问题：难以理解、难以维护、容易出错。
+
+好的键设计就像好的变量命名，它能让你的代码自解释，让团队协作更顺畅，让运维更安全。更重要的是，它能让你的 Redis 数据结构更清晰、更高效。
+
+## 命名规范
+
+### 使用冒号分隔层级
+
+最常见的规范是用冒号 `:` 分隔不同的层级：
+
+```typescript
+// 好的命名
+"livestream:room:abc123";
+"livestream:user:user_888";
+"livestream:session:usr_a1b2c3";
+
+// 不好的命名
+"livestream_room_abc123";
+"livestream-room-abc123";
+"livestream.room.abc123";
+```
+
+为什么用冒号？因为它清晰地表达了层级关系。`livestream:room:abc123` 表示"直播平台的房间 abc123"，每一层都有明确的含义。
+
+更重要的是，冒号分隔的键名方便用模式匹配查询。比如你想找所有房间相关的键：
+
+```bash
+# 查找所有房间键
+KEYS livestream:room:*
+
+# 查找所有用户键
+KEYS livestream:user:*
+
+# 查找所有会话键
+KEYS livestream:session:*
+```
+
+### 使用小写字母和数字
+
+```typescript
+// 好的命名
+"livestream:room:abc123";
+"livestream:user:user_888";
+
+// 不好的命名
+"Livestream:Room:ABC123";
+"LIVESTREAM:ROOM:ABC123";
+```
+
+为什么用小写？因为 Redis 的键名是区分大小写的。如果你混用大小写，很容易出错。而且 `KEYS` 命令默认不区分大小写（取决于模式），你用 `Keys livestream:*` 可能匹配不到 `Livestream:*`。
+
+### 使用有意义的名称
+
+```typescript
+// 好的命名
+"livestream:room:abc123:likes";
+"livestream:user:user_888:followers";
+"livestream:session:usr_a1b2c3";
+
+// 不好的命名
+"lr:r:abc123:l";
+"lu:u:888:f";
+"k1";
+"k2";
+```
+
+键名不需要太短，但也不需要太长。平衡可读性和内存占用。每个键都会占用内存，键名太长会浪费空间。
+
+但可读性更重要。`livestream:room:abc123:likes` 虽然长，但一眼就知道是"房间 abc123 的点赞数"。`lr:r:abc123:l` 虽然短，但一个月后你根本不知道它存的是什么。
+
+### 保持一致性
+
+```typescript
+// 好的命名：风格统一
+"livestream:room:abc123:info";
+"livestream:room:abc123:likes";
+"livestream:user:user_888:profile";
+"livestream:user:user_888:followers";
+
+// 不好的命名：风格混乱
+"livestream:room:abc123:info";
+"livestream_room_abc123_likes";
+"Livestream:User:user_888:Profile";
+```
+
+统一风格很重要。如果团队里有人用 `livestream:room:xxx`，有人用 `livestream_room_xxx`，最后会混乱不堪。
+
+制定一个团队规范，然后严格遵守。不要自己发明规范，除非你有充分的理由。
+
+## 常见命名模式
+
+### 对象-属性模式
+
+这是最常见的模式，用于存储对象的属性：
+
+```typescript
+// 存储房间的基本信息
+"livestream:room:abc123:info"; // Hash: { name, description, tags }
+"livestream:room:abc123:likes"; // String: 计数器
+"livestream:room:abc123:online"; // String: 在线人数
+
+// 或者用 Hash 存储所有属性
+"livestream:room:abc123"; // Hash
+// {
+//   name: "wang_dev的直播间",
+//   description: "...",
+//   likes: "128",
+//   online: "42"
+// }
+```
+
+选择哪种方式取决于你如何访问数据。如果总是整体访问，用一个 Hash。如果经常单独访问某个属性，分开存更合适。
+
+### 实体-关系模式
+
+用于表示实体之间的关系：
+
+```typescript
+// 用户的关注列表
+"livestream:user:user_888:following"; // Set
+// 值：["usr_a1b2c3", "usr_d4e5f6", ...]
+
+// 用户的粉丝列表
+"livestream:user:user_888:followers"; // Set
+// 值：["usr_a1b2c3", "usr_g7h8i9", ...]
+
+// 房间的标签
+"livestream:room:abc123:tags"; // Set
+// 值：["技术", "前端", "Redis"]
+```
+
+社交关系、标签系统都是多对多关系，用 Set 存储很合适。
+
+### 类型-对象-标识模式
+
+在键名中包含数据类型，方便识别：
+
+```typescript
+// 缓存数据
+"livestream:cache:user:user_888";
+"livestream:cache:room:abc123";
+
+// 锁
+"livestream:lock:room:abc123:gift_process";
+
+// 队列
+"livestream:queue:email:notifications";
+"livestream:queue:gift:process";
+
+// 计数器
+"livestream:counter:room:abc123:likes";
+"livestream:counter:room:abc123:views";
+```
+
+这种方式的好处是一眼就能看出键的用途。`cache` 表示缓存数据，`lock` 表示分布式锁，`queue` 表示队列，`counter` 表示计数器。
+
+### 时间序列模式
+
+用于存储时间序列数据：
+
+```typescript
+// 按日期存储统计数据
+"livestream:stats:2026-04-12:room_count";
+"livestream:stats:2026-04-12:user_count";
+
+// 或用 Sorted Set，分数是时间戳
+"livestream:metrics:cpu"; // Sorted Set，member 是时间，score 是 CPU 使用率
+```
+
+时间序列数据用 Sorted Set 更合适，可以按时间范围查询。
+
+## 过期策略设计
+
+### 为什么要设置过期时间
+
+Redis 是内存数据库，内存是有限的。如果不设置过期时间，无用数据会一直占用内存，最终导致内存溢出。
+
+另一个问题是数据一致性。如果你用 Redis 缓存数据库的数据，当数据库更新后，Redis 的缓存就过期了。如果缓存不过期，用户就会读到旧数据。
+
+所以，除了长期保存的数据（比如统计信息），其他数据都应该设置过期时间。
+
+### 不同数据的过期时间
+
+不同类型的数据应该设置不同的过期时间：
+
+```typescript
+// 热点数据：短过期时间（1-5 分钟）
+async function cacheHotData(key: string, value: any) {
+  await redis.setex(`livestream:cache:hot:${key}`, 300, JSON.stringify(value));
+}
+
+// 普通缓存：中等过期时间（1-6 小时）
+async function cacheNormalData(key: string, value: any) {
+  await redis.setex(
+    `livestream:cache:normal:${key}`,
+    3600,
+    JSON.stringify(value)
+  );
+}
+
+// 用户会话：长过期时间（24 小时）
+async function createSession(userId: string) {
+  const sessionId = `usr_${generateId()}`;
+  await redis.setex(
+    `livestream:session:${sessionId}`,
+    86400,
+    JSON.stringify({ userId })
+  );
+  return sessionId;
+}
+
+// 验证码：短过期时间（5-15 分钟）
+async function saveCode(phone: string, code: string) {
+  await redis.setex(`livestream:code:${phone}`, 600, code);
+}
+
+// 临时锁：短过期时间（10-30 秒）
+async function acquireLock(resourceId: string) {
+  return await redis.set(`livestream:lock:${resourceId}`, "1", "EX", 30, "NX");
+}
+
+// 统计数据：长期保存或每天重置
+async function incrementDailyCounter(date: string) {
+  const key = `livestream:stats:daily:${date}:views`;
+  await redis.incr(key);
+  // 第二天会自动用新的键，旧键可以设置 7 天后过期
+  await redis.expire(key, 86400 * 7);
+}
+```
+
+### 过期时间的选择原则
+
+选择过期时间要考虑几个因素：
+
+- 数据变化频率：变化快的用短过期时间，变化慢的用长过期时间
+- 数据重要性：重要的数据用短过期时间，确保及时更新
+- 内存压力：内存紧张时用短过期时间，快速释放内存
+- 重建成本：重建成本高的用长过期时间，减少数据库压力
+
+记住，过期时间是 Trade-off：太短会增加数据库压力，太长会浪费内存和降低数据新鲜度。
+
+## 直播平台键设计实战
+
+让我们用直播平台的场景来实战一下键设计。
+
+### 用户系统
+
+```typescript
+// 用户基本信息
+"livestream:user:user_888"; // Hash
+// {
+//   username: "wang_dev",
+//   email: "wang@example.com",
+//   role: "streamer",
+//   createdAt: "1679529600"
+// }
+// 过期时间：不过期（长期保存）
+
+// 用户会话
+"livestream:session:usr_a1b2c3"; // Hash
+// {
+//   userId: "user_888",
+//   createdAt: "1679529600",
+//   lastActivity: "1679530000"
+// }
+// 过期时间：24 小时
+
+// 用户关注列表
+"livestream:user:user_888:following"; // Set
+// 值：["usr_a1b2c3", "usr_d4e5f6", ...]
+// 过期时间：不过期（长期保存）
+
+// 用户粉丝列表
+"livestream:user:user_888:followers"; // Set
+// 值：["usr_a1b2c3", "usr_g7h8i9", ...]
+// 过期时间：不过期（长期保存）
+
+// 用户缓存
+"livestream:cache:user:user_888"; // String (JSON)
+// 值：完整的用户对象 JSON
+// 过期时间：1 小时
+```
+
+### 房间系统
+
+```typescript
+// 房间基本信息
+"livestream:room:abc123"; // Hash
+// {
+//   name: "wang_dev的直播间",
+//   description: "...",
+//   ownerId: "user_888",
+//   tags: "技术,前端,Redis"
+// }
+// 过期时间：不过期（长期保存）
+
+// 房间点赞数
+"livestream:room:abc123:likes"; // String
+// 值：点赞计数
+// 过期时间：24 小时
+
+// 房间在线人数
+"livestream:room:abc123:online"; // String
+// 值：在线人数
+// 过期时间：1 小时（没人观看时自然过期）
+
+// 房间礼物排行榜
+"livestream:room:abc123:gift:leaderboard"; // Sorted Set
+// 值：{member: userId, score: giftValue}
+// 过期时间：7 天
+
+// 房间弹幕队列
+"livestream:room:abc123:danmaku"; // List
+// 值：弹幕消息列表
+// 过期时间：1 小时
+
+// 房间标签
+"livestream:room:abc123:tags"; // Set
+// 值：["技术", "前端", "Redis"]
+// 过期时间：不过期（长期保存）
+
+// 标签下的房间（反向索引）
+"livestream:tag:技术:rooms"; // Set
+// 值：["room_abc123", "room_def456", ...]
+// 过期时间：不过期（长期保存）
+```
+
+### 统计系统
+
+```typescript
+// 每日统计
+"livestream:stats:daily:2026-04-12:room_count"; // String
+// 过期时间：30 天
+
+"livestream:stats:daily:2026-04-12:user_count"; // String
+// 过期时间：30 天
+
+"livestream:stats:daily:2026-04-12:gift_count"; // String
+// 过期时间：30 天
+
+// 实时统计
+"livestream:stats:realtime:active_rooms"; // String
+// 过期时间：1 分钟
+
+"livestream:stats:realtime:active_users"; // String
+// 过期时间：1 分钟
+```
+
+## Trade-off：键名长度 vs 内存占用
+
+你可能会问：键名那么长，不会浪费内存吗？
+
+确实会浪费内存。每个键都会占用内存，键名越长，占用越多。但你要权衡：可读性 vs 内存占用。
+
+`livestream:room:abc123:likes` 虽然比 `lr:r:abc123:l` 长，但前者一眼就知道是什么，后者需要查文档。
+
+一个折中方案是用短前缀：`ls:room:abc123:likes`（ls = livestream）。但这样会降低可读性，谨慎使用。
+
+另一个考虑是内存并不是那么贵。现代服务器内存都很大，键名占用的内存相对整个数据集来说是很小的。与其为了省几 KB 内存而牺牲可读性，不如关注数据结构的优化。
+
+## 小结
+
+好的键设计是 Redis 数据结构的基础。记住几个原则：
+
+1. 用冒号分隔层级，表达清晰的层级关系
+2. 用小写字母和数字，避免大小写混乱
+3. 用有意义的名称，让键名自解释
+4. 保持一致的命名风格
+5. 合理设置过期时间，避免内存泄漏
+6. 选择合适的命名模式，表达数据的语义
+
+但不要过度设计。键设计的目的是让数据结构更清晰、更易维护，而不是为了设计而设计。
+
+下一篇文章我们会讨论 Redis 的持久化机制，看看如何把内存数据保存到磁盘，确保数据不丢失。

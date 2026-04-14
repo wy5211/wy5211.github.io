@@ -1,0 +1,370 @@
+---
+title: "08 拦截器与 AOP"
+date: "2026-03-30"
+summary: "Express middleware 和 Spring Interceptor 有什么区别？用 AOP 给 CMS 加上阅读量统计，理解 Spring 面向切面编程的实战价值。"
+tags: ["Spring Boot", "AOP", "拦截器", "面向切面"]
+category: "springboot"
+cover: ""
+draft: false
+series: "Spring Boot 实战"
+seriesOrder: 8
+---
+
+CMS 的文章详情页需要一个阅读量统计功能。每次用户 `GET /api/posts/{id}` 拿到一篇文章，这篇文章的 `viewCount` 应该自动加 1。
+
+这个需求听起来简单，但放代码里会发现一个尴尬的问题。如果放在 Controller 里：
+
+```java
+@GetMapping("/{id}")
+public Post getPost(@PathVariable Long id) {
+    Post post = postService.getById(id);
+    post.setViewCount(post.getViewCount() + 1); // 查询方法产生了写副作用
+    postRepository.save(post);
+    return post;
+}
+```
+
+查询接口不应该修改数据。而且如果这个 `save` 操作失败了呢？用户本来只是想看文章，结果因为阅读量更新失败返回了 500 错误——这说不通。
+
+如果放在 Service 里，`getById` 方法也会产生同样的副作用问题，而且让单元测试变得复杂——你本来只想验证"根据 ID 查到了正确的文章"，现在还得验证 viewCount 是否增加了。
+
+你需要一个**在请求处理过程中自动执行、但不侵入业务逻辑**的机制。在 Express 里这叫 middleware，在 Spring Boot 里有两层：HandlerInterceptor（拦截器）和 AOP（面向切面编程）。
+
+## Spring Boot 的请求处理链路
+
+在讲拦截器之前，先搞清楚一个请求在 Spring Boot 里经过哪些环节：
+
+```
+HTTP 请求
+  │
+  ▼
+Servlet Filter（Servlet 规范，不属于 Spring）
+  │
+  ▼
+DispatcherServlet（Spring MVC 的核心）
+  │
+  ▼
+HandlerInterceptor.preHandle()  ← 请求到达 Controller 之前
+  │
+  ▼
+Controller 方法执行
+  │
+  ▼
+HandlerInterceptor.postHandle()  ← Controller 执行完、视图渲染前
+  │
+  ▼
+View 渲染（REST API 场景通常跳过）
+  │
+  ▼
+HandlerInterceptor.afterCompletion()  ← 请求完成后（无论成功失败）
+  │
+  ▼
+HTTP 响应
+```
+
+Filter、Interceptor、AOP 三层都能在请求前后加逻辑，但作用范围和切入时机不同。先记住这个分层，后面会逐个对比。
+
+## HandlerInterceptor：Spring 的 middleware
+
+`HandlerInterceptor` 是 Spring MVC 提供的请求拦截机制，和 Express 的 middleware 最接近。它有三个钩子方法：
+
+```java
+@Component
+public class ViewCountInterceptor implements HandlerInterceptor {
+
+    @Autowired
+    private PostRepository postRepository;
+
+    @Override
+    public boolean preHandle(HttpServletRequest request,
+                            HttpServletResponse response,
+                            Object handler) {
+        // Controller 方法执行之前
+        // 返回 true = 继续执行，返回 false = 中断请求
+        return true;
+    }
+
+    @Override
+    public void postHandle(HttpServletRequest request,
+                           HttpServletResponse response,
+                           Object handler,
+                           ModelAndView modelAndView) {
+        // Controller 方法执行完、视图渲染前
+        // REST API 场景很少用这个方法
+    }
+
+    @Override
+    public void afterCompletion(HttpServletRequest request,
+                                HttpServletResponse response,
+                                Object handler,
+                                Exception ex) {
+        // 请求完成之后（无论成功或失败）
+        // 适合做资源清理
+    }
+}
+```
+
+用 Interceptor 实现阅读量统计的思路是：在 `postHandle` 里更新 viewCount，因为此时 Controller 已经成功返回了文章对象。
+
+但这里有一个问题——`postHandle` 的参数里没有 Controller 方法的返回值。在 REST API 场景下，`ModelAndView` 通常是 null（因为不涉及视图渲染），你拿不到文章 ID。要在 `postHandle` 里知道当前请求的是哪篇文章，只能从 `HttpServletRequest` 里解析 URL：
+
+```java
+@Override
+public void postHandle(HttpServletRequest request,
+                       HttpServletResponse response,
+                       Object handler,
+                       ModelAndView modelAndView) {
+    String path = request.getRequestURI();
+    // 手动从 /api/posts/123 里提取 123
+    Matcher matcher = Pattern.compile("^/api/posts/(\\d+)$").matcher(path);
+    if (matcher.matches() && "GET".equalsIgnoreCase(request.getMethod())) {
+        Long postId = Long.parseLong(matcher.group(1));
+        postRepository.incrementViewCount(postId);
+    }
+}
+```
+
+能用，但不够优雅。URL 的正则匹配是脆弱的——如果路由规则改了（比如把 `/api/posts/{id}` 改成 `/api/articles/{slug}`），拦截器里的正则也要跟着改。而且 Interceptor 的粒度是"拦截某个 URL 模式下的所有请求"，如果你只想拦截"获取已发布文章"的请求而不拦截"获取草稿"的请求，判断逻辑会变得复杂。
+
+注册拦截器的方式是在 `WebMvcConfigurer` 里配置：
+
+```java
+@Configuration
+public class WebConfig implements WebMvcConfigurer {
+
+    @Autowired
+    private ViewCountInterceptor viewCountInterceptor;
+
+    @Override
+    public void addInterceptors(InterceptorRegistry registry) {
+        registry.addInterceptor(viewCountInterceptor)
+                .addPathPatterns("/api/posts/{id}")
+                .excludePathPatterns("/api/posts", "/api/admin/**");
+    }
+}
+```
+
+`addPathPatterns` 和 `excludePathPatterns` 用 Ant 风格的路径匹配（`*`、`**`、`?`），不支持正则。这比 Express 的路径匹配灵活度低——Express 可以用正则或字符串模式：
+
+```typescript
+app.get("/api/posts/:id", viewCountMiddleware, getPostHandler);
+// 或者精确匹配某个路由
+app.use("/api/posts/:id", viewCountMiddleware);
+```
+
+Express 的 middleware 可以精确地绑定到某个路由上，Spring Interceptor 只能按 URL 模式批量匹配。
+
+## AOP：更精确的切面编程
+
+HandlerInterceptor 的粒度是 HTTP 请求级别，它只能看到 URL、HTTP 方法、请求头这些信息。如果你想在一个特定的 Service 方法执行前后加逻辑，Interceptor 做不到——它根本不知道 Controller 内部调了哪个 Service 方法。
+
+AOP（Aspect-Oriented Programming）解决这个问题的方式是：**直接拦截方法调用。** 不管这个方法是被哪个 Controller、哪个 URL 触发的，只要方法签名匹配，切面逻辑就会执行。
+
+用 AOP 实现阅读量统计，思路完全不同——不去拦截 HTTP 请求，而是拦截 `PostService.getById()` 方法：
+
+```xml
+<!-- pom.xml 添加 AOP 依赖 -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-aop</artifactId>
+</dependency>
+```
+
+```java
+@Aspect
+@Component
+@Slf4j
+public class ViewCountAspect {
+
+    @Autowired
+    private PostRepository postRepository;
+
+    // 拦截 PostService.getById() 的执行
+    @AfterReturning(
+        pointcut = "execution(* com.example.cms.service.PostService.getById(..)) && args(id)",
+        returning = "result"
+    )
+    public void incrementViewCount(Long id, Post result) {
+        if (result != null && result.getStatus() == PostStatus.PUBLISHED) {
+            postRepository.incrementViewCount(id);
+            log.debug("文章 [id={}] 阅读量 +1", id);
+        }
+    }
+}
+```
+
+`@AfterReturning` 表示在目标方法正常返回后执行。`pointcut` 表达式指定了拦截哪个方法，`args(id)` 把方法参数绑定到切面方法的参数上，`returning = "result"` 把返回值绑定到 `result` 参数上。
+
+和 Interceptor 的方案对比：
+
+- 不需要解析 URL，直接拿到方法参数和返回值
+- 只拦截已发布文章（`result.getStatus() == PUBLISHED`），草稿不计数
+- 如果 `getById` 抛出异常（文章不存在），`@AfterReturning` 不会执行——这正好是我们想要的（文章不存在时不应该 +1）
+- `PostService.getById()` 被任何地方调用都会触发计数，不只是 HTTP 请求
+
+`incrementViewCount` 方法需要在 Repository 里实现：
+
+```java
+@Repository
+public interface PostRepository extends JpaRepository<Post, Long> {
+    @Modifying
+    @Query("UPDATE Post p SET p.viewCount = p.viewCount + 1 WHERE p.id = :id")
+    void incrementViewCount(@Param("id") Long id);
+}
+```
+
+`@Modifying` 告诉 Spring Data JPA 这是一个写操作，不是查询。用 `UPDATE ... SET viewCount = viewCount + 1` 而不是先 SELECT 再 UPDATE，避免并发问题——两个请求同时读到的 viewCount 是 100，各自 +1 再写回去，结果是 101 而不是 102。数据库层面的 `SET viewCount = viewCount + 1` 是原子操作，不存在这个问题。
+
+## AOP 核心概念速览
+
+上面用了一个 `@AfterReturning`，AOP 还有其他几种通知类型：
+
+```
+@Before          ──→  目标方法执行前
+@Around          ──→  包裹目标方法（可以决定是否执行、修改参数和返回值）
+@AfterReturning  ──→  目标方法正常返回后
+@AfterThrowing   ──→  目标方法抛出异常后
+@After           ──→  目标方法完成后（无论成功失败，类似 finally）
+```
+
+其中 `@Around` 最强大也最常用。它用一个 `ProceedingJoinPoint` 对象来控制目标方法的执行：
+
+```java
+@Around("execution(* com.example.cms.service.*.*(..))")
+public Object logExecutionTime(ProceedingJoinPoint joinPoint) throws Throwable {
+    String methodName = joinPoint.getSignature().getName();
+    long start = System.currentTimeMillis();
+
+    Object result = joinPoint.proceed(); // 执行目标方法
+
+    long duration = System.currentTimeMillis() - start;
+    log.info("{}.{}() 耗时 {}ms",
+        joinPoint.getTarget().getClass().getSimpleName(),
+        methodName, duration);
+    return result;
+}
+```
+
+如果你调用 `joinPoint.proceed()`，目标方法正常执行。如果你不调用它（或者抛出异常），目标方法不会执行——这相当于 Interceptor 的 `preHandle` 返回 `false`。
+
+`@Around` 和 Interceptor 的 `preHandle` + `afterCompletion` 组合功能类似，但粒度不同：
+
+| 维度         | HandlerInterceptor          | @Around (AOP)                                   |
+| ------------ | --------------------------- | ----------------------------------------------- |
+| 拦截目标     | HTTP 请求（按 URL 模式）    | 任意方法（按方法签名或注解）                    |
+| 能拿到的信息 | HttpServletRequest/Response | 方法参数、返回值、异常对象                      |
+| 适用范围     | 只能在 Web 层使用           | 可以拦截 Service、Repository 等任何 Spring Bean |
+| 粒度控制     | URL 模式匹配                | 方法签名匹配或自定义注解                        |
+
+## 自定义注解 + AOP：声明式切面
+
+如果只想给某些方法加切面逻辑，用自定义注解比写 pointcut 表达式更清晰。比如你想给所有"需要审计日志"的方法加日志：
+
+```java
+@Target(ElementType.METHOD)
+@Retention(RetentionPolicy.RUNTIME)
+public @interface Auditable {
+    String action() default "";
+}
+```
+
+```java
+@Aspect
+@Component
+@Slf4j
+public class AuditAspect {
+
+    @AfterReturning("@annotation(auditable)")
+    public void audit(JoinPoint joinPoint, Auditable auditable) {
+        String action = auditable.action();
+        String method = joinPoint.getSignature().getName();
+        Object[] args = joinPoint.getArgs();
+        log.info("[审计] action={}, method={}, args={}", action, method, args);
+    }
+}
+```
+
+```java
+@Service
+public class PostService {
+
+    @Auditable(action = "发布文章")
+    public Post publish(Long id) {
+        // ...
+    }
+
+    @Auditable(action = "删除文章")
+    public void delete(Long id) {
+        // ...
+    }
+}
+```
+
+这种方式比写 `@Around("execution(* ...PostService.publish(..))")` 可读性好得多。注解本身就是文档——你看到 `@Auditable(action = "发布文章")` 就知道这个方法有审计日志，不需要去翻 AOP 配置。
+
+在 Express 里实现类似功能需要用装饰器（如果用 NestJS）或者手动在路由函数里调用日志函数。AOP + 自定义注解的优势是：被增强的方法完全不知道切面的存在，没有侵入性。
+
+## Filter vs Interceptor vs AOP：三层横切机制
+
+Spring Boot 里做"请求前后加逻辑"有三种方式，很多人分不清什么时候用哪个。用 CMS 的场景来对比：
+
+| 机制             | Filter                                        | HandlerInterceptor                   | AOP                          |
+| ---------------- | --------------------------------------------- | ------------------------------------ | ---------------------------- |
+| **规范**         | Servlet 规范                                  | Spring MVC                           | Spring AOP                   |
+| **拦截目标**     | HTTP 请求/响应                                | Controller 方法调用                  | 任意 Spring Bean 方法调用    |
+| **能拿到的信息** | HttpServletRequest, HttpServletResponse       | 同左 + handler 对象                  | 方法参数、返回值、异常       |
+| **典型用途**     | 编码转换、CORS、请求日志                      | 认证、权限、性能日志                 | 业务切面（阅读量、审计）     |
+| **配置方式**     | `@Component` + `@Bean FilterRegistrationBean` | `WebMvcConfigurer.addInterceptors()` | `@Aspect` + `@Component`     |
+| **执行顺序**     | 在 Spring MVC 之前                            | 在 Controller 前后                   | 在方法调用前后               |
+| **能中断请求**   | `chain.doFilter()` 不调用                     | `preHandle` 返回 false               | `@Around` 不调用 `proceed()` |
+
+选择标准很简单：
+
+- 如果你的逻辑只和 HTTP 请求有关（CORS、编码、请求头处理），用 Filter
+- 如果你的逻辑和 Controller 层有关（认证、权限检查），用 Interceptor
+- 如果你的逻辑和具体业务方法有关（阅读量统计、审计日志、性能监控），用 AOP
+
+阅读量统计用 AOP 而不是 Interceptor 的原因：它需要知道方法返回的 Post 对象的状态（只给已发布的文章计数），这个信息 Interceptor 拿不到。
+
+## Express middleware vs Spring Interceptor vs AOP
+
+| 维度               | Express middleware     | Spring Interceptor                | Spring AOP                         |
+| ------------------ | ---------------------- | --------------------------------- | ---------------------------------- |
+| **粒度**           | 路由级别               | URL 模式级别                      | 方法级别                           |
+| **注册方式**       | `app.use()` 或路由参数 | `WebMvcConfigurer`                | `@Aspect` + pointcut               |
+| **匹配方式**       | 路径字符串/正则        | Ant 模式                          | 方法签名/注解                      |
+| **执行顺序**       | 注册顺序               | 注册顺序 + `order`                | `@Order` 或 `@Priority`            |
+| **异步支持**       | 原生 async/await       | 需要配置 `asyncSupported`         | 同步为主                           |
+| **能否拿到返回值** | 不能（只拿到 req/res） | 不能（`postHandle` 拿不到返回值） | 能（`@AfterReturning` 拿到返回值） |
+| **非 Web 场景**    | 不适用                 | 不适用                            | 适用（可以拦截任何 Bean 方法）     |
+
+Express 的 middleware 是一个统一的抽象——所有横切逻辑都通过 middleware 实现，没有 Filter/Interceptor/AOP 的分层。这更简单，但在大型项目里粒度不够——Express 没有等价于 `@Around` + 方法参数注入的机制。
+
+## Trade-off 分析
+
+**AOP 的收益：**
+
+- 横切关注点（日志、审计、性能监控、阅读量统计）从业务代码中完全分离，Service 层只关心业务逻辑
+- 自定义注解 + `@Around` 的组合表达能力很强，能精确控制"拦截哪些方法、拿到什么参数、在什么时机执行"
+- 不限于 Web 层——Service 层、Repository 层的方法都可以拦截，这是 Interceptor 做不到的
+
+**代价：**
+
+- AOP 的调用链是隐式的——读 `PostService.getById()` 的代码时，你看不出有阅读量统计逻辑在执行。如果项目里切面很多，排查问题时需要先搞清楚"哪些切面可能影响这个方法"。Express 的 middleware 至少是显式写在路由链上的
+- Pointcut 表达式是一种字符串 DSL，IDE 支持有限。写错了不会编译报错，只有运行时才发现切面没生效
+- `@Around` + `@AfterReturning` 改变了方法的执行上下文——如果在切面里抛出异常，会掩盖原始方法的返回值。调试时需要特别注意异常的来源
+- AOP 底层是动态代理（JDK Proxy 或 CGLIB），有一些限制：不能拦截 `private` 方法、不能拦截 `final` 方法、同类内部调用不走代理。这是 Java 动态代理的固有限制，不是 Spring 的 bug
+
+**实际选择建议：** 阅读量统计这种"在方法成功返回后执行一个副作用"的场景，`@AfterReturning` 是最合适的选择——它只在方法正常返回时执行，不会吞掉异常，也不需要你手动调 `proceed()`。`@Around` 更适合需要修改参数或返回值的场景（比如缓存、权限检查）。
+
+## 回顾与预告
+
+到这篇为止，CMS 的核心功能已经比较完整了：
+
+- 数据持久化（JPA + MySQL）
+- RESTful API 设计（分页、状态码、统一响应格式）
+- 参数校验（`@Valid` + Hibernate Validator）
+- 全局异常处理（`@RestControllerAdvice`）
+- 横切关注点（AOP 实现阅读量统计）
+
+这些是构建 REST API 的基础设施。接下来进入安全阶段——CMS 目前是裸奔的，任何人都可以创建、删除文章。下一篇引入 Spring Security，用过滤器链实现用户认证和权限控制，对应 Node.js 生态里的 passport.js。

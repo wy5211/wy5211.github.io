@@ -1,0 +1,282 @@
+---
+title: "15 Stream API"
+date: "2026-03-30"
+summary: "Java 的 Stream 和 JS 的数组方法有多像？从 CMS 文章的过滤、统计和分组出发，理解 Stream 的惰性求值和管道操作。"
+tags: ["Java", "Stream", "函数式编程"]
+category: "java"
+cover: ""
+draft: false
+series: "Java 渐进式实战"
+seriesOrder: 15
+---
+
+CMS 后台需要一个"文章统计面板"：显示已发布文章数量、总浏览量、按标签分组的热门文章。如果用 for 循环写，你需要三个独立循环——一个过滤、一个求和、一个分组。代码能跑，但每加一个统计维度就多一个循环，嵌套越来越深。
+
+JS 开发者会立刻想到链式调用：`posts.filter(...).map(...).reduce(...)`。Java 8 也引入了类似的 API——Stream。语法看起来很像，但有一个根本区别：**Java Stream 是惰性求值的**。你写 `.filter(p -> p.isPublished())` 时，它不会立刻遍历集合，而是把这个操作"记住"，等到终端操作（比如 `collect`）触发时才一起执行。
+
+理解惰性求值，是理解 Java Stream 的第一步。
+
+## JS 数组方法：即时求值
+
+先回顾 JS 的做法。JS 数组的 `filter`、`map`、`reduce` 都是即时执行的——调用之后立刻返回一个新数组：
+
+```js
+const published = posts.filter((p) => p.status === "PUBLISHED");
+// 立刻遍历 posts，返回一个新数组
+
+const titles = published.map((p) => p.title);
+// 立刻遍历 published，返回又一个新数组
+
+const totalViews = titles.reduce((sum, t) => sum + 1, 0);
+// 遍历 titles
+```
+
+三个操作产生了两个中间数组。对于 10000 篇文章，`published` 是一个新数组，`titles` 又是一个新数组。数据量小时没感觉，数据量大时内存开销明显。
+
+JS 没有原生的惰性求值方案（社区有 Lazy.js 等库，但不是语言特性）。TypeScript 也没有——TS 的类型系统在运行时完全消失，不会改变任何执行行为。
+
+## Java Stream：惰性求值的管道
+
+Java Stream 把操作分成两类：**中间操作**（intermediate）和**终端操作**（terminal）。中间操作不会立刻执行，而是构建一个操作管道；只有终端操作触发时，整个管道才会从头到尾执行一次。
+
+```java
+List<Post> posts = postRepository.findAll();
+
+long count = posts.stream()
+    .filter(p -> p.getStatus() == PostStatus.PUBLISHED)  // 中间操作，不执行
+    .count();                                             // 终端操作，触发整个管道
+```
+
+`filter` 被调用时什么都没做——它只是返回一个新的 Stream 对象，记录了"需要过滤"这个意图。`count()` 是终端操作，这时才真正遍历 `posts`，对每个元素执行 `filter` 的判断条件，并计数。
+
+这意味着上面的代码只遍历了一次集合，而不是"先遍历一遍过滤，再遍历一遍计数"。
+
+### 中间操作 vs 终端操作
+
+中间操作的共同特征：返回值是 `Stream<T>`，可以继续链式调用。常见的有：
+
+- `filter(Predicate)` —— 过滤
+- `map(Function)` —— 映射
+- `sorted(Comparator)` —— 排序
+- `distinct()` —— 去重
+- `limit(long)` —— 截断
+- `skip(long)` —— 跳过
+- `flatMap(Function)` —— 扁平化
+
+终端操作的共同特征：返回值不再是 Stream，通常是具体结果或副作用。常见的有：
+
+- `collect(Collector)` —— 收集为集合
+- `count()` —— 计数
+- `reduce(BinaryOperator)` —— 归约
+- `forEach(Consumer)` —— 遍历
+- `toArray()` —— 转为数组
+- `anyMatch(Predicate)` / `allMatch(Predicate)` —— 匹配检查
+
+一个 Stream 只能使用一次终端操作。如果你试图对一个已消费的 Stream 再次调用终端操作，会抛出 `IllegalStateException`。这和 JS 不同——JS 的 `filter` 返回一个新数组，你可以反复使用；Java Stream 是一次性的管道。
+
+## CMS 场景：过滤已发布文章
+
+从最简单的需求开始：获取所有已发布文章的标题列表。
+
+```java
+List<String> publishedTitles = posts.stream()
+    .filter(p -> p.getStatus() == PostStatus.PUBLISHED)
+    .map(Post::getTitle)
+    .collect(Collectors.toList());
+```
+
+对应的 JS 写法几乎一样：
+
+```js
+const publishedTitles = posts
+  .filter((p) => p.status === "PUBLISHED")
+  .map((p) => p.title);
+```
+
+区别在于 Java 的 `map` 需要显式 `collect(Collectors.toList())` 来触发执行并收集结果，而 JS 的 `map` 立刻返回数组。在 Java 中，`map` 后面如果不接终端操作，什么都不会发生。
+
+### 方法引用
+
+`Post::getTitle` 是 Java 的方法引用语法，等价于 lambda `p -> p.getTitle()`。JS 没有直接对应物，但概念类似 `p => p.title`。方法引用在 Stream 链式调用中很常见，因为很多中间操作接收的都是单参数函数。
+
+## CMS 场景：统计总浏览量
+
+需要计算所有已发布文章的浏览量总和：
+
+```java
+int totalViews = posts.stream()
+    .filter(p -> p.getStatus() == PostStatus.PUBLISHED)
+    .mapToInt(Post::getViews)
+    .sum();
+```
+
+`mapToInt` 把 `Stream<Post>` 转换成 `IntStream`，它有 `sum()`、`average()`、`max()`、`min()` 等便捷方法。如果不转换，用 `reduce` 也能实现：
+
+```java
+int totalViews = posts.stream()
+    .filter(p -> p.getStatus() == PostStatus.PUBLISHED)
+    .map(Post::getViews)
+    .reduce(0, Integer::sum);
+```
+
+`reduce(0, Integer::sum)` 的第一个参数是初始值，第二个参数是累加函数。等价于 JS 的：
+
+```js
+const totalViews = posts
+  .filter((p) => p.status === "PUBLISHED")
+  .reduce((sum, p) => sum + p.views, 0);
+```
+
+但 Java 的 `reduce` 不带初始值时返回 `Optional<Integer>`，因为集合可能为空。JS 的 `reduce` 不带初始值时会抛 `TypeError`——行为类似，但 Java 用 `Optional` 给了更优雅的空值处理方式。
+
+## CMS 场景：按标签分组
+
+CMS 需要按标签统计文章数量，展示"Java: 12 篇，Spring: 8 篇，Docker: 5 篇"这样的面板。这是 `Collectors.groupingBy` 的典型用例：
+
+```java
+Map<String, List<Post>> postsByTag = posts.stream()
+    .filter(p -> p.getStatus() == PostStatus.PUBLISHED)
+    .flatMap(p -> p.getTags().stream().map(tag -> Map.entry(tag, p)))
+    .collect(Collectors.groupingBy(
+        Map.Entry::getKey,
+        Collectors.mapping(Map.Entry::getValue, Collectors.toList())
+    ));
+```
+
+这段代码做了三件事：过滤已发布、把每篇文章和它的标签展开成键值对、按标签分组。`flatMap` 是关键——它把"一篇文章对应多个标签"的一对多关系"拍平"成一维的 `(tag, post)` 流。
+
+如果只需要计数而不是列表，更简洁：
+
+```java
+Map<String, Long> countByTag = posts.stream()
+    .filter(p -> p.getStatus() == PostStatus.PUBLISHED)
+    .flatMap(p -> p.getTags().stream())
+    .collect(Collectors.groupingBy(
+        Function.identity(),
+        Collectors.counting()
+    ));
+```
+
+JS 的等价写法：
+
+```js
+const countByTag = posts
+  .filter((p) => p.status === "PUBLISHED")
+  .flatMap((p) => p.tags)
+  .reduce((acc, tag) => {
+    acc[tag] = (acc[tag] || 0) + 1;
+    return acc;
+  }, {});
+```
+
+Java 用 `Collectors.groupingBy` 一行搞定，JS 需要手写 reduce 的累加逻辑。这是 Java Stream 的优势之一——`Collectors` 工具类提供了 `groupingBy`、`partitioningBy`、`joining`、`toMap` 等常用收集器，覆盖了大部分聚合场景。
+
+## sorted 和 distinct
+
+排序和去重也是 CMS 面板的常见需求。按浏览量降序取 Top 5：
+
+```java
+List<Post> top5 = posts.stream()
+    .filter(p -> p.getStatus() == PostStatus.PUBLISHED)
+    .sorted(Comparator.comparingInt(Post::getViews).reversed())
+    .limit(5)
+    .collect(Collectors.toList());
+```
+
+`Comparator.comparingInt(Post::getViews).reversed()` 构建了一个按 views 降序的比较器。JS 的写法：
+
+```js
+const top5 = posts
+  .filter((p) => p.status === "PUBLISHED")
+  .sort((a, b) => b.views - a.views)
+  .slice(0, 5);
+```
+
+注意：JS 的 `sort` 会**修改原数组**（就地排序），Java Stream 的 `sorted` 不会修改源数据。这是 Stream 的设计原则之一——不修改源数据，只产生新结果。
+
+对标签列表去重：
+
+```java
+List<String> allTags = posts.stream()
+    .flatMap(p -> p.getTags().stream())
+    .distinct()
+    .sorted()
+    .collect(Collectors.toList());
+```
+
+`distinct()` 内部用了 `equals()` 和 `hashCode()` 来判断重复，所以你的 Post 和 Tag 类需要正确实现这两个方法。JS 的去重通常用 `Set`：`[...new Set(tags)]`，更简洁但语义一样。
+
+## 惰性求值的实际影响
+
+理解惰性求值最好的方式是看一个"短路"场景。假设你要检查是否存在标题包含"Java"的已发布文章：
+
+```java
+boolean found = posts.stream()
+    .filter(p -> p.getStatus() == PostStatus.PUBLISHED)
+    .anyMatch(p -> p.getTitle().contains("Java"));
+```
+
+`anyMatch` 是一个短路终端操作——找到第一个匹配就停止。因为 Stream 是惰性的，它不会先遍历所有文章过滤出已发布列表，再遍历已发布列表找匹配。而是从头到尾逐个检查，每个元素先经过 `filter`，如果通过再经过 `anyMatch`，一旦匹配就停止。整个过程只遍历到匹配的那篇文章为止。
+
+如果 `posts` 有 10000 篇，已发布的有 8000 篇，"Java"相关文章在第 3 篇——那么只检查了前 3 篇（假设前 3 篇都是已发布的），而不是先过滤 10000 篇再搜索 8000 篇。
+
+JS 的写法功能相同，但实现不同：
+
+```js
+const found = posts
+  .filter((p) => p.status === "PUBLISHED") // 立刻遍历全部 10000 篇
+  .some((p) => p.title.includes("Java")); // 然后遍历过滤后的 8000 篇（最坏情况）
+```
+
+`filter` 是即时执行的，它必须先遍历完整个数组才能返回结果。即使 `some` 在第 3 个元素就找到了，`filter` 阶段已经遍历了全部 10000 篇。这就是惰性求值和即时求值的实际性能差异。
+
+不过需要诚实地说：对于大多数 CMS 场景，数据量不大（几百到几千篇文章），这个性能差异可以忽略不计。惰性求值的主要好处是**语义上的清晰**——你描述的是"做什么"而不是"怎么做"，执行引擎帮你优化遍历次数。
+
+## Stream 不能做什么
+
+Stream 有一些 JS 数组方法没有的限制，需要了解：
+
+**Stream 是一次性的**。消费过就不能再用：
+
+```java
+Stream<Post> stream = posts.stream();
+stream.filter(p -> p.getStatus() == PostStatus.PUBLISHED).count();
+stream.filter(p -> p.getViews() > 1000).count(); // IllegalStateException!
+```
+
+JS 数组没有这个问题——`filter` 返回新数组，原数组不受影响。
+
+**Stream 不能通过索引访问元素**。JS 的 `arr[3]`、`arr.slice(2, 5)` 在 Stream 上没有直接对应物。Java Stream 有 `skip()` 和 `limit()`，但它们是按数量而非索引操作。
+
+**Stream 不修改源数据**。你不能在 Stream 中做原地修改（虽然技术上可以通过 lambda 的副作用做到，但这违反了 Stream 的设计原则，也不推荐）。
+
+## JS vs Java 对比
+
+| 特性              | JavaScript Array             | Java Stream                    |
+| ----------------- | ---------------------------- | ------------------------------ |
+| 求值方式          | 即时求值，每个方法返回新数组 | 惰性求值，终端操作触发管道     |
+| filter/map/sorted | 立刻执行，产生中间数组       | 延迟执行，不产生中间结果       |
+| reduce            | 即时执行                     | 即时执行（是终端操作）         |
+| 按索引访问        | `arr[0]`, `arr.slice(1, 3)`  | 不支持，用 `skip()`/`limit()`  |
+| 原地排序          | `arr.sort()` 修改原数组      | `sorted()` 不修改源数据        |
+| 分组              | 手写 reduce 或用 lodash      | `Collectors.groupingBy()`      |
+| 复用性            | 返回新数组，可反复使用       | 一次性管道，消费后不能复用     |
+| 并行处理          | 无原生支持                   | `parallelStream()`（谨慎使用） |
+
+语法上 Java Stream 和 JS 数组方法非常接近，核心差异在于求值策略。JS 的数组链式调用是"每个操作独立执行"，Java Stream 是"构建管道，一次执行"。
+
+## Trade-off
+
+Stream API 让 Java 的集合操作变得声明式和可读，和 JS 数组方法的语法相似度很高，从 JS 转过来的开发者上手很快。`Collectors` 工具类提供的内置收集器（`groupingBy`、`partitioningBy`、`joining` 等）比 JS 手写 reduce 更简洁。
+
+惰性求值在理论上可以减少不必要的遍历，但在实际 CMS 开发中，数据量通常不足以体现这个优势。真正有价值的是"声明式语义"——你描述的是意图，而不是循环的细节。
+
+Stream 的代价是学习曲线。`Collectors` 的组合写法（比如嵌套的 `groupingBy` + `mapping` + `counting`）初看不太直观。`flatMap` 需要理解流的"扁平化"概念。`Optional` 在 reduce 场景中增加了额外的解包步骤。
+
+`parallelStream()` 看起来很诱人——一行代码就能并行处理，但线程安全问题、排序开销、 ForkJoinPool 共享等陷阱让它在生产环境中需要格外谨慎。大多数 CMS 场景下，单线程的 `stream()` 就够了。
+
+## 回顾与预告
+
+上一篇讲了泛型——从 CMS 的通用 Repository 出发，理解了泛型类、泛型方法、通配符和类型擦除。本篇讲了 Stream API——从 CMS 文章的过滤、统计和分组出发，理解了 Java Stream 的惰性求值机制和管道操作。中间操作构建管道，终端操作触发执行，`Collectors` 工具类封装了常见的聚合模式。
+
+下一篇进入 IO 操作——Java 的 IO 类体系比 JS 的 `fs` 模块复杂得多，字节流和字符流、InputStream 和 Reader 的关系，以及 try-with-resources 自动资源管理，都是在 CMS 的 Markdown 文件读写中会直接用到的知识。

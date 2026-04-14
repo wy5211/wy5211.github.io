@@ -1,0 +1,557 @@
+---
+title: "16. Deno Deploy 部署"
+date: "2026-03-20"
+summary: "将 Hono 应用部署到 Deno Deploy，学习 Deno 运行时配置、环境变量、Deno KV 使用，以及实现零配置持续部署。"
+tags: ["Hono", "Deno Deploy", "Deployment", "Deno KV", "Edge Computing"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 16
+---
+
+## 前言
+
+在上一篇文章中，我们将博客 API 部署到了 Cloudflare Workers。Cloudflare 的全球边缘网络确实强大，但不是唯一选择。Deno Deploy 是另一个优秀的边缘计算平台，它有一些独特的优势。
+
+为什么考虑 Deno Deploy？如果你喜欢原生的 TypeScript 支持、想要一个更简洁的开发体验，或者对 Deno KV 的强一致性有需求，Deno Deploy 可能是更好的选择。与 Cloudflare Workers 不同，Deno Deploy 使用 Deno 运行时，这意味着你可以直接使用 TypeScript，无需构建步骤。
+
+Deno Deploy 和 Cloudflare Workers 都支持 Hono，这意味着我们不需要修改应用代码，只需要调整部署配置。在这篇文章中，我会带你将博客 API 部署到 Deno Deploy，并学习 Deno 的特有功能。
+
+## 理解 Deno Deploy
+
+先说说 Deno Deploy 的独特之处：
+
+**原生 TypeScript 支持**：Deno 从设计之初就支持 TypeScript，不需要任何配置或构建步骤。你写的 TypeScript 代码可以直接运行，这对于快速开发非常友好。
+
+**零冷启动**：和 Cloudflare Workers 类似，Deno Deploy 也使用 V8 Isolates，启动时间几乎为零。不同的是，Deno 的实现更加透明，你可以更好地理解和优化。
+
+**Deno KV**：这是 Deno 的原生键值存储，一个显著优势是强一致性。Cloudflare KV 是最终一致性的，意味着写入后可能需要几秒才能在全球所有节点读取到，而 Deno KV 提供即时一致性，适合需要严格数据一致性的场景。
+
+**免费额度**：每天 100,000 次请求，1GB 存储，100GB 数据传输。对于个人项目和小型应用完全够用。
+
+**简化配置**：Deno Deploy 的配置非常简单，很多时候甚至不需要配置文件，连接 GitHub 仓库就能自动部署。
+
+## 配置 Deno 项目
+
+Deno 使用 deno.json 作为配置文件，类似于 Node.js 的 package.json：
+
+```json
+{
+  "tasks": {
+    "dev": "deno run --allow-net --allow-env --watch src/main.ts",
+    "start": "deno run --allow-net --allow-env src/main.ts",
+    "test": "deno test --allow-net --allow-env",
+    "check": "deno check **/*.ts"
+  },
+  "imports": {
+    "hono": "npm:hono",
+    "hono/": "npm:hono/",
+    "@hono/zod-validator": "npm:@hono/zod-validator",
+    "zod": "npm:zod"
+  },
+  "compilerOptions": {
+    "strict": true
+  }
+}
+```
+
+这里有几个关键点：
+
+**imports**：Deno 支持直接导入 npm 包，使用 npm: 前缀。这意味着你不需要 package.json 或 node_modules，Deno 会自动下载和缓存依赖。
+
+**tasks**：定义了常用的命令，类似 npm scripts。
+
+**compilerOptions**：配置 TypeScript 编译选项，strict 模式启用更严格的类型检查。
+
+## Hono 在 Deno 中的入口文件
+
+Deno Deploy 需要一个默认导出的 fetch 处理器。Hono 已经提供了这个功能，只需要稍微调整入口文件：
+
+```typescript
+// src/main.ts
+import { Hono } from "hono";
+import { serve } from "https://deno.land/std@0.208.0/http/server.ts";
+
+// 定义环境变量类型
+type Bindings = {
+  KV: Deno.Kv;
+  DATABASE_URL: string;
+  JWT_SECRET: string;
+  ENVIRONMENT: "development" | "production";
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+app.get("/", (c) => {
+  return c.json({
+    message: "Blog API is running",
+    timestamp: new Date().toISOString(),
+    environment: c.env.ENVIRONMENT,
+  });
+});
+
+// Deno Deploy 需要导出 app
+export default app;
+
+// 本地开发时启动服务器
+if (import.meta.main) {
+  await serve(app.fetch, {
+    port: 8000,
+    onListen: ({ port, hostname }) => {
+      console.log(`Server running on http://${hostname}:${port}`);
+    },
+  });
+}
+```
+
+这个设计很巧妙：export default app 供 Deno Deploy 使用，而 import.meta.main 检查让我们可以在本地直接运行文件。
+
+## 使用 Deno KV
+
+Deno KV 是 Deno 的原生键值存储，非常适合缓存、会话存储和简单的数据持久化。与 Cloudflare KV 不同，Deno KV 提供强一致性。
+
+**本地开发**：
+
+首先需要在本地启动 KV 服务器：
+
+```bash
+deno kv --allow-net --allow-read
+```
+
+这会在本地启动一个 KV 服务器，默认使用 ~/.deno/deno_kv.db 作为存储。
+
+**在代码中使用 KV**：
+
+```typescript
+// 打开 KV 连接
+const kv = await Deno.openKv();
+
+// 设置值
+await kv.set(["users", "123"], {
+  name: "张三",
+  email: "zhangsan@example.com",
+  createdAt: new Date().toISOString(),
+});
+
+// 获取值
+const user = await kv.get(["users", "123"]);
+console.log(user.value); // { name: "张三", email: "...", createdAt: "..." }
+
+// 删除值
+await kv.delete(["users", "123"]);
+
+// 列出特定前缀的所有键
+const users = await kv.list({ prefix: ["users"] });
+for await (const entry of users) {
+  console.log(entry.key, entry.value);
+}
+```
+
+**在 Hono 中集成 KV**：
+
+```typescript
+// 使用 KV 缓存文章
+app.get("/posts/:id", async (c) => {
+  const { id } = c.req.param();
+  const kv = await Deno.openKv();
+
+  // 先从缓存读取
+  const cached = await kv.get(["cache", "posts", id]);
+  if (cached.value) {
+    return c.json({
+      success: true,
+      data: cached.value,
+      cached: true,
+    });
+  }
+
+  // 从数据库查询（这里简化为模拟）
+  const post = {
+    id,
+    title: "示例文章",
+    content: "这是文章内容...",
+  };
+
+  // 写入缓存，5分钟过期
+  await kv.set(["cache", "posts", id], post, {
+    expireIn: 5 * 60 * 1000, // 毫秒
+  });
+
+  return c.json({
+    success: true,
+    data: post,
+    cached: false,
+  });
+});
+```
+
+**KV 的原子操作**：
+
+Deno KV 支持原子操作，这对于计数器、并发控制等场景非常有用：
+
+```typescript
+// 原子递增（用于文章浏览量）
+app.post("/posts/:id/view", async (c) => {
+  const { id } = c.req.param();
+  const kv = await Deno.openKv();
+
+  // 原子递增
+  const result = await kv
+    .atomic()
+    .mutate({
+      type: "increment",
+      key: ["posts", id, "views"],
+      value: new BigInt(1),
+    })
+    .commit();
+
+  if (!result.ok) {
+    return c.json({ success: false, message: "Failed to increment" }, 500);
+  }
+
+  return c.json({ success: true });
+});
+
+// 条件更新（乐观锁）
+app.post("/posts/:id/like", async (c) => {
+  const { id } = c.req.param();
+  const kv = await Deno.openKv();
+
+  const key = ["posts", id, "likes"];
+  const current = await kv.get(key);
+
+  const result = await kv
+    .atomic()
+    .check({
+      key,
+      versionstamp: current.versionstamp, // 版本检查
+    })
+    .set(key, ((current.value as bigint) || 0n) + 1n)
+    .commit();
+
+  if (!result.ok) {
+    return c.json({ success: false, message: "Conflict" }, 409);
+  }
+
+  return c.json({ success: true });
+});
+```
+
+## 数据库集成
+
+虽然 Deno KV 很适合缓存和简单数据，但博客 API 还是需要关系型数据库。Deno Deploy 支持连接外部数据库，如 PostgreSQL、MySQL 等。
+
+**使用 Drizzle ORM**：
+
+Drizzle 对 Deno 有很好的支持：
+
+```typescript
+// src/db/index.ts
+import { drizzle } from "drizzle-orm/postgres-js";
+import postgres from "postgres";
+
+const connectionString = Deno.env.get("DATABASE_URL");
+
+if (!connectionString) {
+  throw new Error("DATABASE_URL is not set");
+}
+
+const client = postgres(connectionString);
+export const db = drizzle(client);
+
+// src/db/schema.ts
+import { pgTable, text, integer, boolean } from "drizzle-orm/pg-core";
+
+export const posts = pgTable("posts", {
+  id: text("id").primaryKey(),
+  title: text("title").notNull(),
+  slug: text("slug").notNull().unique(),
+  content: text("content").notNull(),
+  excerpt: text("excerpt"),
+  published: boolean("published").notNull().default(false),
+  authorId: text("author_id").notNull(),
+  views: integer("views").notNull().default(0),
+  createdAt: text("created_at").notNull(),
+  updatedAt: text("updated_at").notNull(),
+});
+```
+
+**在路由中使用**：
+
+```typescript
+import { db } from "../db/index.ts";
+import { posts } from "../db/schema.ts";
+import { eq } from "drizzle-orm";
+
+app.get("/posts", async (c) => {
+  const allPosts = await db
+    .select()
+    .from(posts)
+    .where(eq(posts.published, true));
+
+  return c.json({ success: true, data: allPosts });
+});
+```
+
+## 环境变量管理
+
+Deno Deploy 的环境变量通过 Dashboard 设置，代码中通过 Deno.env.get 访问：
+
+```typescript
+// 获取环境变量
+const dbUrl = Deno.env.get("DATABASE_URL");
+const jwtSecret = Deno.env.get("JWT_SECRET");
+const environment = Deno.env.get("ENVIRONMENT");
+
+// 类型安全的访问
+const getEnv = (key: string): string => {
+  const value = Deno.env.get(key);
+  if (!value) {
+    throw new Error(`Environment variable ${key} is not set`);
+  }
+  return value;
+};
+
+const db = drizzle(postgres(getEnv("DATABASE_URL")));
+```
+
+在 Hono 中，可以通过 Bindings 类型让环境变量更安全：
+
+```typescript
+type Bindings = {
+  KV: Deno.Kv;
+  DATABASE_URL: string;
+  JWT_SECRET: string;
+  ENVIRONMENT: "development" | "production";
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+app.get("/config", (c) => {
+  return c.json({
+    environment: c.env.ENVIRONMENT,
+    hasDb: !!c.env.DATABASE_URL,
+  });
+});
+```
+
+## 本地开发
+
+Deno 的本地开发体验非常简洁：
+
+```bash
+# 开发模式（自动重载）
+deno task dev
+
+# 运行测试
+deno task test
+
+# 类型检查
+deno task check
+```
+
+不需要 npm install，不需要 node_modules，Deno 会自动下载和缓存依赖。
+
+**权限管理**：
+
+Deno 默认是安全的，需要显式授予权限：
+
+```bash
+# 允许网络访问
+--allow-net
+
+# 允许读取环境变量
+--allow-env
+
+# 允许读写文件
+--allow-read --allow-write
+
+# 允许所有（仅用于开发）
+--allow-all
+```
+
+在 deno.json 的 tasks 中配置好这些权限，以后就不需要每次输入。
+
+## 部署到 Deno Deploy
+
+Deno Deploy 提供了两种部署方式：通过 Dashboard 连接 GitHub，或使用 CLI。
+
+**GitHub 连接方式**（推荐）：
+
+1. 访问 https://dash.deno.com
+2. 点击 "New Project"
+3. 连接你的 GitHub 账户
+4. 选择博客 API 的仓库
+5. 配置入口点（如 src/main.ts）
+6. 设置环境变量
+7. 部署
+
+每次你 push 到 GitHub，Deno Deploy 会自动重新部署。
+
+**CLI 部署方式**：
+
+```bash
+# 安装 deployctl
+deno install --allow-net --allow-read https://deno.land/x/deployctl/deployctl.ts
+
+# 登录
+deployctl login
+
+# 部署
+deployctl deploy --project=blog-api src/main.ts
+
+# 部署并包含静态文件
+deployctl deploy --project=blog-api --include=static/* src/main.ts
+```
+
+**设置环境变量**：
+
+在 Dashboard 的 Project Settings 中添加：
+
+- KV：选择或创建 KV 数据库
+- DATABASE_URL：PostgreSQL 连接字符串
+- JWT_SECRET：JWT 密钥
+- ENVIRONMENT：production
+
+## 监控和日志
+
+Deno Deploy Dashboard 提供了实时日志和监控：
+
+**查看日志**：
+
+在 Dashboard 的 Logs 页面可以看到所有 console.log 和错误信息。
+
+**结构化日志**：
+
+```typescript
+app.use("*", async (c, next) => {
+  const start = Date.now();
+
+  await next();
+
+  const duration = Date.now() - start;
+
+  // 结构化日志
+  console.log(
+    JSON.stringify({
+      method: c.req.method,
+      path: c.req.path,
+      status: c.res.status,
+      duration,
+      timestamp: new Date().toISOString(),
+    })
+  );
+});
+```
+
+**性能监控**：
+
+Dashboard 的 Analytics 页面显示请求数、响应时间、错误率等指标。
+
+## CI/CD 集成
+
+虽然 GitHub 连接方式已经提供自动部署，但你可能想要更精细的控制，比如先运行测试：
+
+```yaml
+# .github/workflows/deploy-deno.yml
+name: Deploy to Deno Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v1
+        with:
+          deno-version: v1.x
+
+      - name: Run tests
+        run: deno task test
+
+      - name: Type check
+        run: deno task check
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Deploy to Deno Deploy
+        uses: denoland/deployctl@v1
+        with:
+          project: blog-api
+          entrypoint: src/main.ts
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+## Cloudflare Workers vs Deno Deploy
+
+既然两个平台都能部署 Hono 应用，如何选择？
+
+**Cloudflare Workers 优势**：
+
+- 更成熟的边缘网络（300+ 节点）
+- D1 数据库（SQLite）集成更简单
+- R2 对象存储更便宜
+- 更丰富的生态系统（Workers AI、Queues 等）
+
+**Deno Deploy 优势**：
+
+- 原生 TypeScript，开发体验更好
+- Deno KV 强一致性
+- 更简洁的配置
+- 更透明的运行时
+
+**选择建议**：
+
+- 需要关系型数据库且不想自建：选 Cloudflare（D1）
+- 需要强一致性 KV：选 Deno
+- 更关注开发体验：选 Deno
+- 需要更成熟的生态：选 Cloudflare
+
+对于博客 API，两个平台都是不错的选择。如果你已经用了 Cloudflare 的其他服务（如 CDN、DNS），用 Workers 更方便；如果你更喜欢 Deno 的开发体验，选 Deno Deploy。
+
+## 权衡与取舍
+
+Deno Deploy 让部署变得极其简单，但也有一些限制需要了解：
+
+**优势**：
+
+- 零配置 TypeScript 支持
+- 强一致性的 KV 存储
+- 简单的开发和部署流程
+- GitHub 自动集成
+
+**限制**：
+
+- 边缘节点比 Cloudflare 少（约 50 个）
+- 没有内置的关系型数据库（需要外部服务）
+- 冷启动偶尔比 Cloudflare 慢一点
+- 免费额度相同，但付费选项较少
+
+**适合场景**：
+
+- 需要快速开发和部署的项目
+- 对数据一致性要求高的应用
+- 已有外部数据库的项目
+- 喜欢 Deno 开发体验的团队
+
+**不适合场景**：
+
+- 需要全球覆盖的应用
+- 大量使用 Node.js 特定 API 的项目
+- 需要长时间运行的任务
+
+## 下一步
+
+博客 API 现在可以部署到两个边缘平台了。但部署只是第一步，如何确保应用在生产环境中运行良好？这需要性能优化。
+
+下一篇文章会深入探讨 Hono 应用的性能优化，包括如何分析性能瓶颈、优化数据库查询、实现高效的缓存策略，以及边缘环境的特殊优化技巧。

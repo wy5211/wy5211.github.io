@@ -1,0 +1,419 @@
+---
+title: "07. Hash 实战：对象存储与购物车"
+date: "2026-03-23"
+summary: "掌握 Redis Hash 类型的实际应用，实现高效的对象存储和购物车系统。"
+tags: ["Redis", "Hash"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 7
+---
+
+上一篇我们讲了 String 类型的计数器和限流。String 虽然通用，但在存储对象时有些不够灵活。比如用户信息，有 name、email、age、city 等多个字段，用 String 存需要整个 JSON 序列化，更新一个字段也要重写整个对象。
+
+Hash 类型可以解决这个问题。它像一个嵌套的键值对，一个 Hash 键下可以有多个字段，每个字段有独立的值。
+
+## Hash vs String(JSON)
+
+为什么需要 Hash？看个例子就明白了。
+
+假设要存储用户信息：
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+// 用 String 存储用户信息（JSON 格式）
+async function saveUserString(userId: string, userData: any) {
+  const key = `user:${userId}`;
+  await redis.set(key, JSON.stringify(userData));
+}
+
+// 用 Hash 存储用户信息
+async function saveUserHash(userId: string, userData: Record<string, string>) {
+  const key = `user:${userId}`;
+  await redis.hset(key, userData);
+}
+```
+
+表面上看差不多，但区别在更新时：
+
+```typescript
+// String 方式：需要获取、修改、写回
+async function updateUserEmailString(userId: string, newEmail: string) {
+  const key = `user:${userId}`;
+  const data = JSON.parse((await redis.get(key)) || "{}");
+  data.email = newEmail;
+  await redis.set(key, JSON.stringify(data));
+}
+
+// Hash 方式：直接更新字段
+async function updateUserEmailHash(userId: string, newEmail: string) {
+  const key = `user:${userId}`;
+  await redis.hset(key, "email", newEmail);
+}
+```
+
+Hash 方式不需要读取整个对象，直接修改指定字段。当对象很大时，这个差异很明显。
+
+但也有代价：Hash 的每个字段值都是字符串，不能存嵌套对象。如果要存复杂结构，还是得用 JSON。
+
+## 直播平台用户信息
+
+让我们在直播平台中用 Hash 存储用户信息：
+
+```typescript
+class UserManager {
+  constructor(private redis: Redis) {}
+
+  // 创建用户
+  async createUser(
+    userId: string,
+    userData: {
+      username: string;
+      email: string;
+      role: string;
+      createdAt: string;
+    }
+  ) {
+    const key = `user:${userId}`;
+    await redis.hset(key, {
+      username: userData.username,
+      email: userData.email,
+      role: userData.role,
+      createdAt: userData.createdAt,
+    });
+  }
+
+  // 获取用户信息
+  async getUser(userId: string) {
+    const key = `user:${userId}`;
+    return await redis.hgetall(key);
+  }
+
+  // 只获取需要的字段
+  async getUserFields(userId: string, fields: string[]) {
+    const key = `user:${userId}`;
+    const values = await redis.hmget(key, ...fields);
+
+    const result: Record<string, string | null> = {};
+    fields.forEach((field, index) => {
+      result[field] = values[index];
+    });
+
+    return result;
+  }
+
+  // 更新单个字段
+  async updateUserField(userId: string, field: string, value: string) {
+    const key = `user:${userId}`;
+    await redis.hset(key, field, value);
+  }
+
+  // 检查字段是否存在
+  async fieldExists(userId: string, field: string): Promise<boolean> {
+    const key = `user:${userId}`;
+    return (await redis.hexists(key, field)) === 1;
+  }
+}
+
+// 使用示例
+const users = new UserManager(redis);
+
+await users.createUser("usr_a1b2c3", {
+  username: "wang_dev",
+  email: "wang@example.com",
+  role: "streamer",
+  createdAt: "2026-04-12T10:00:00Z",
+});
+
+// 只获取用户名和角色
+const info = await users.getUserFields("usr_a1b2c3", ["username", "role"]);
+console.log(info); // { username: "wang_dev", role: "streamer" }
+```
+
+HMGET 可以一次性获取多个字段，比多次 HGET 效率高。这在需要查询多个字段时很有用。
+
+## 数值字段的原子操作
+
+Hash 也有类似 INCR 的原子操作，叫 HINCRBY：
+
+```typescript
+class UserStatsManager {
+  constructor(private redis: Redis) {}
+
+  // 增加用户积分
+  async addPoints(userId: string, points: number): Promise<number> {
+    const key = `user:${userId}:stats`;
+    return await redis.hincrby(key, "points", points);
+  }
+
+  // 增加关注数
+  async incrementFollowers(userId: string): Promise<number> {
+    const key = `user:${userId}:stats`;
+    return await redis.hincrby(key, "followers", 1);
+  }
+
+  // 获取用户统计数据
+  async getStats(userId: string) {
+    const key = `user:${userId}:stats`;
+    return await redis.hgetall(key);
+  }
+}
+```
+
+HINCRBY 和 INCRBY 一样，都是原子操作。可以用来实现积分系统、粉丝计数等。
+
+## 购物车实现
+
+Hash 的一个经典应用是购物车。为什么适合？因为购物车的特点是：
+
+1. 商品 ID 作为字段，数量作为值
+2. 可以增减数量
+3. 可以删除商品
+4. 可以清空购物车
+
+```typescript
+class ShoppingCart {
+  constructor(private redis: Redis) {}
+
+  // 添加商品到购物车
+  async addItem(userId: string, productId: string, quantity: number = 1) {
+    const key = `cart:${userId}`;
+    // HINCRBY 可以处理新增和更新两种情况
+    return await redis.hincrby(key, productId, quantity);
+  }
+
+  // 获取购物车所有商品
+  async getCart(userId: string) {
+    const key = `cart:${userId}`;
+    const items = await redis.hgetall(key);
+
+    // 转换成更易读的格式
+    const result: Record<string, number> = {};
+    for (const [productId, quantity] of Object.entries(items)) {
+      result[productId] = parseInt(quantity);
+    }
+
+    return result;
+  }
+
+  // 更新商品数量
+  async updateQuantity(userId: string, productId: string, quantity: number) {
+    const key = `cart:${userId}`;
+
+    if (quantity <= 0) {
+      // 数量为 0 或负数时，删除商品
+      return await redis.hdel(key, productId);
+    }
+
+    return await redis.hset(key, productId, quantity);
+  }
+
+  // 删除商品
+  async removeItem(userId: string, productId: string) {
+    const key = `cart:${userId}`;
+    return await redis.hdel(key, productId);
+  }
+
+  // 清空购物车
+  async clearCart(userId: string) {
+    const key = `cart:${userId}`;
+    return await redis.del(key);
+  }
+
+  // 获取购物车商品种类数
+  async getCartSize(userId: string) {
+    const key = `cart:${userId}`;
+    return await redis.hlen(key);
+  }
+
+  // 检查商品是否在购物车中
+  async hasItem(userId: string, productId: string): Promise<boolean> {
+    const key = `cart:${userId}`;
+    return (await redis.hexists(key, productId)) === 1;
+  }
+}
+
+// 使用示例
+const cart = new ShoppingCart(redis);
+
+// 添加商品
+await cart.addItem("usr_a1b2c3", "gift_rocket", 2);
+await cart.addItem("usr_a1b2c3", "gift_car", 1);
+
+// 查看购物车
+const items = await cart.getCart("usr_a1b2c3");
+console.log(items);
+// { gift_rocket: 2, gift_car: 1 }
+
+// 增加商品数量
+await cart.addItem("usr_a1b2c3", "gift_rocket", 3);
+
+// 移除商品
+await cart.removeItem("usr_a1b2c3", "gift_car");
+```
+
+这个实现利用了 HINCRBY 的特性：如果字段不存在，会从 0 开始增加；如果存在，会在原值基础上增加。这样添加商品和增加数量可以用同一个方法。
+
+## Session 管理
+
+Hash 的另一个应用是存储 Session。Session 需要存储多个字段（用户 ID、角色、权限等），并且需要设置过期时间。
+
+```typescript
+class SessionManager {
+  constructor(private redis: Redis) {}
+
+  // 创建 Session
+  async createSession(
+    userId: string,
+    data: Record<string, string>,
+    ttl: number = 86400
+  ): Promise<string> {
+    const sessionId = this.generateSessionId();
+    const key = `session:${sessionId}`;
+
+    // 存储 Session 数据
+    await redis.hset(key, {
+      userId,
+      ...data,
+      createdAt: Date.now().toString(),
+    });
+
+    // 设置过期时间（默认 24 小时）
+    await redis.expire(key, ttl);
+
+    return sessionId;
+  }
+
+  // 获取 Session
+  async getSession(sessionId: string) {
+    const key = `session:${sessionId}`;
+    const session = await redis.hgetall(key);
+
+    if (Object.keys(session).length === 0) {
+      return null;
+    }
+
+    return session;
+  }
+
+  // 更新 Session 字段
+  async updateSession(sessionId: string, field: string, value: string) {
+    const key = `session:${sessionId}`;
+    await redis.hset(key, field, value);
+  }
+
+  // 刷新 Session 过期时间
+  async refreshSession(sessionId: string, ttl: number = 86400) {
+    const key = `session:${sessionId}`;
+    return await redis.expire(key, ttl);
+  }
+
+  // 删除 Session
+  async deleteSession(sessionId: string) {
+    const key = `session:${sessionId}`;
+    return await redis.del(key);
+  }
+
+  // 验证 Session
+  async validateSession(sessionId: string): Promise<boolean> {
+    const session = await this.getSession(sessionId);
+    return session !== null;
+  }
+
+  private generateSessionId(): string {
+    return `${Date.now()}-${Math.random().toString(36).substr(2, 16)}`;
+  }
+}
+
+// 使用示例
+const sessions = new SessionManager(redis);
+
+// 用户登录时创建 Session
+const sessionId = await sessions.createSession("usr_a1b2c3", {
+  role: "streamer",
+  permissions: "stream,chat,manage",
+});
+
+// 请求时验证 Session
+const session = await sessions.getSession(sessionId);
+if (!session) {
+  throw new Error("Session 已过期，请重新登录");
+}
+
+// 活动时刷新过期时间
+await sessions.refreshSession(sessionId);
+```
+
+Session 的关键是要有过期时间，否则用户退出后 Session 还在，会有安全问题。每次用户活动时刷新过期时间，可以实现"自动延长"的效果。
+
+## 内存占用比较
+
+Hash 和 String 存储对象，内存占用有什么区别？
+
+一般来说：
+
+- 对象字段少（< 10 个）：两者差不多
+- 对象字段多（10-100 个）：Hash 更省内存
+- 对象字段很多（> 100 个）：Hash 明显更省内存
+
+原因有两个：
+
+1. Hash 的字段名也会存储，如果字段名很长，会占用较多空间
+2. Hash 有编码优化（ziplist/intset），小 Hash 会用更紧凑的结构
+
+如果字段名很长，可以考虑缩短：
+
+```typescript
+// 原始字段名
+await redis.hset("user:123", {
+  emailAddress: "user@example.com",
+  phoneNumber: "1234567890",
+});
+
+// 缩短字段名
+await redis.hset("user:123", {
+  email: "user@example.com",
+  phone: "1234567890",
+});
+```
+
+但要在可读性和内存占用之间权衡。字段名太短会降低代码可读性。
+
+## 不适合 Hash 的场景
+
+Hash 也不是万能的。以下场景不适合用 Hash：
+
+1. 需要嵌套对象：Hash 的值只能是字符串，不能存对象或数组
+2. 字段经常变动：如果字段名经常变化，Hash 不如 JSON 灵活
+3. 需要部分查询复杂结构：比如查询"所有 email 包含 'example' 的用户"，Hash 做不到
+
+这些场景还是用关系数据库或搜索引擎更合适。
+
+## 总结与 Trade-off
+
+Hash 类型适合存储字段固定的对象，比如用户信息、购物车、Session。
+
+**Hash 的优点：**
+
+- 可以部分获取和更新字段，不需要读取整个对象
+- 内存占用相对较少（字段多时更明显）
+- 支持原子操作（HINCRBY）
+
+**Hash 的缺点：**
+
+- 值只能是字符串，不能存嵌套结构
+- 字段名也会占用内存，字段名长时不划算
+- 不支持复杂的查询条件
+
+**Hash vs String 的选择：**
+
+- 需要部分获取/更新：用 Hash
+- 对象字段很多（> 10 个）：用 Hash
+- 对象字段少且很少修改：用 String(JSON)
+- 需要存嵌套结构：用 String(JSON)
+
+下一篇我们会讲 List 类型，看看如何用 List 实现消息队列，处理直播平台的弹幕和通知。

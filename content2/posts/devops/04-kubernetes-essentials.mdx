@@ -1,0 +1,493 @@
+---
+title: "04. 容器编排：Kubernetes 入门"
+date: "2026-04-12"
+summary: "一台服务器扛不住了，需要水平扩展。Kubernetes 怎么管理多个容器实例？Pod、Deployment、Service 这些概念是什么？"
+tags: ["Kubernetes", "K8s", "容器编排", "DevOps"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战指南"
+seriesOrder: 4
+---
+
+前 3 篇，FlowAPI 跑在了一台 2 核 4G 的服务器上：Linux 基础配置、Nginx 反向代理加 HTTPS、GitHub Actions 自动化部署。一条龙搞定，每次 push 到 main 分支，流水线自动构建镜像、部署到服务器。
+
+上个月 FlowAPI 的日均请求量从 5 万涨到了 30 万。CPU 经常跑到 80%，高峰期响应时间从 50ms 飙到 800ms。用户开始反馈"系统很慢"。
+
+加机器。再租两台 2 核 4G 的服务器，用 Nginx 做负载均衡，把请求分到三台服务器上。思路很简单，但操作起来你会发现一堆问题：
+
+三台服务器上各跑一个 FlowAPI 容器，其中一个挂了，Nginx 还会把请求转发给它——502。你得手动上去重启容器。流量高峰过了要缩容，又得手动停掉多余的容器。每次更新镜像，三台服务器都要操作一遍。数据库连接池配置改了，三台容器都要重启才能生效。
+
+这种手动管理方式在两三台服务器时还能忍，到十台、五十台时就完全是灾难。你需要一个系统来自动管理这些容器实例——什么时候启、什么时候停、挂了怎么恢复、怎么分发配置。这个系统就是 Kubernetes。
+
+## Kubernetes 解决什么问题
+
+Kubernetes（简称 K8s）是一个容器编排系统。所谓"编排"，就是帮你管理大量容器的生命周期：部署、扩缩容、故障恢复、滚动更新。
+
+回到刚才的场景，如果用 K8s：
+
+- 你告诉 K8s"我要 3 个 FlowAPI 实例"，K8s 会自动在集群中调度并启动 3 个 Pod
+- 某个 Pod 挂了，K8s 自动检测到并重新启动一个替代的
+- 流量高峰来了，改一下配置就能扩到 6 个实例；高峰过了再缩回 3 个
+- 更新镜像时，K8s 自动做滚动更新——先启动新版本，确认健康后再停掉旧版本，零停机
+- 配置集中管理，修改一处，所有实例自动生效
+
+你不需要告诉 K8s "在服务器 A 上启动容器"，而是告诉它"我需要 3 个实例，每个需要 0.5 核 CPU 和 256MB 内存"，K8s 自己决定把容器放在哪台服务器上。这就是声明式管理的思路——你描述期望状态，K8s 负责把实际状态调整到期望状态。
+
+## 几个核心概念
+
+K8s 的概念不少，但入门只需要理解以下几个。
+
+### Pod
+
+Pod 是 K8s 中最小的调度单元。一个 Pod 里可以包含一个或多个容器，这些容器共享网络和存储。大多数情况下，一个 Pod 里只跑一个容器——这就是 FlowAPI 的场景。
+
+你可以把 Pod 理解为一台"虚拟机"，里面跑着你的应用。和虚拟机不同的是，Pod 很轻量，启动只需要几秒。
+
+### Deployment
+
+Deployment 管理 Pod 的副本数量和更新策略。你告诉 Deployment"我要 3 个 FlowAPI Pod"，Deployment 就会确保集群中始终有 3 个健康的 Pod 在运行。Pod 挂了，Deployment 会自动补一个新的。更新镜像时，Deployment 负责滚动更新。
+
+Deployment 就像一个项目经理，手下管着一组工人（Pod），有人请假了就找人顶上，项目需求变了就逐步培训新人替换老人。
+
+### Service
+
+Pod 的 IP 地址是不固定的——每次重建 Pod 都会分配新的 IP。如果其他服务要访问 FlowAPI，不能依赖 Pod 的 IP。Service 就是解决这个问题的，它提供一个稳定的访问入口，后端对接一组 Pod，自动做负载均衡。
+
+Service 就像公司的前台电话号码，不管后台换了多少员工，对外号码不变，来电自动分配给空闲的人接听。
+
+### Namespace
+
+Namespace 是逻辑隔离。一个 K8s 集群可以划分多个 Namespace，比如 `dev`、`staging`、`production`。不同 Namespace 里的资源互相隔离，避免开发环境的配置影响到生产环境。
+
+## 用 minikube 搭建本地环境
+
+学习 K8s 不需要买一堆服务器。minikube 在你的电脑上启动一个单节点的 K8s 集群，足够练习用。
+
+```bash
+# macOS（用 Homebrew 安装）
+brew install minikube kubectl
+
+# 启动集群（首次启动会拉取镜像，需要几分钟）
+minikube start --cpus=4 --memory=4096
+
+# 查看节点状态
+kubectl get nodes
+```
+
+`minikube start` 会在本机启动一个虚拟机（默认用 Docker 驱动），在里面运行一个完整的 K8s 集群。`--cpus=4 --memory=4096` 分配 4 核 CPU 和 4GB 内存，对于运行 FlowAPI 几个 Pod 来说足够了。
+
+`kubectl get nodes` 应该看到一个名为 `minikube` 的节点，状态为 `Ready`：
+
+```
+NAME       STATUS   ROLES           AGE   VERSION
+minikube   Ready    control-plane   5m    v1.29.x
+```
+
+minikube 还自带一个 Web UI，方便可视化查看集群状态：
+
+```bash
+# 打开 Dashboard（会在浏览器中打开）
+minikube dashboard
+```
+
+Dashboard 能看到集群中的所有资源——Pod、Service、Deployment 等，对于初学者理解 K8s 的资源关系很有帮助。
+
+## 编写 Deployment
+
+现在把 FlowAPI 部署到 K8s 上。首先创建一个 Namespace，把 FlowAPI 相关的资源都放在里面：
+
+```yaml
+# namespace.yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: flowapi
+```
+
+然后写 FlowAPI 的 Deployment：
+
+```yaml
+# deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flowapi
+  namespace: flowapi
+  labels:
+    app: flowapi
+spec:
+  replicas: 3 # 运行 3 个 Pod 副本
+  selector:
+    matchLabels:
+      app: flowapi # Deployment 管理哪些 Pod
+  template:
+    metadata:
+      labels:
+        app: flowapi # Pod 的标签，必须和 selector 匹配
+    spec:
+      containers:
+        - name: flowapi
+          image: your-registry.com/flowapi:latest # Docker 镜像地址
+          ports:
+            - containerPort: 3000 # 容器监听端口
+          resources:
+            requests: # 最低资源需求（调度依据）
+              cpu: "250m" # 0.25 核 CPU
+              memory: "128Mi" # 128MB 内存
+            limits: # 资源上限（超出会被限制或杀掉）
+              cpu: "500m" # 0.5 核 CPU
+              memory: "256Mi" # 256MB 内存
+          env:
+            - name: NODE_ENV
+              value: "production"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: flowapi-secret # 从 Secret 中读取
+                  key: database-url
+```
+
+这个 YAML 看起来有点长，拆开看其实很直观：
+
+`replicas: 3` 告诉 K8s 要运行 3 个 Pod。`selector.matchLabels` 和 `template.metadata.labels` 是关联机制——Deployment 通过标签匹配来识别哪些 Pod 是它管的。`resources` 限制了每个 Pod 能用多少 CPU 和内存，防止单个 Pod 吃掉整个节点的资源。`env` 里配置环境变量，其中敏感信息（数据库连接串）从 Secret 中读取，不直接写在 YAML 里。
+
+把这个 YAML 提交给 K8s：
+
+```bash
+# 先创建 Namespace
+kubectl apply -f namespace.yaml
+
+# 部署 FlowAPI
+kubectl apply -f deployment.yaml
+
+# 查看 Pod 状态
+kubectl get pods -n flowapi
+
+# 查看 Deployment 状态
+kubectl get deployment -n flowapi
+```
+
+`kubectl get pods` 的输出类似：
+
+```
+NAME                       READY   STATUS    RESTARTS   AGE
+flowapi-7d8f9c6b5-x2kjp   1/1     Running   0          30s
+flowapi-7d8f9c6b5-m3nq7   1/1     Running   0          30s
+flowapi-7d8f9c6b5-p9r2w   1/1     Running   0          30s
+```
+
+三个 Pod 都是 `Running` 状态，`READY` 为 `1/1` 表示容器已经就绪。
+
+注意 Pod 名称后面的随机字符串（`7d8f9c6b5-x2kjp`）。这是 Deployment 自动生成的——每次创建 Pod 都会带上 ReplicaSet 的哈希值和随机后缀，保证 Pod 名称唯一。
+
+## 用 Service 暴露服务
+
+Pod 跑起来了，但怎么从外部访问呢？Pod 的 IP 是集群内部 IP，从集群外部访问不到。需要一个 Service 来暴露访问入口。
+
+先看最常用的 ClusterIP 类型的 Service：
+
+```yaml
+# service.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: flowapi
+  namespace: flowapi
+spec:
+  type: ClusterIP # 默认类型，只能在集群内部访问
+  selector:
+    app: flowapi # 把流量转发给带这个标签的 Pod
+  ports:
+    - port: 80 # Service 暴露的端口
+      targetPort: 3000 # Pod 的端口
+```
+
+`selector.app: flowapi` 把 Service 和 Deployment 中的 Pod 关联起来。外部请求打到 Service 的 80 端口，Service 自动转发到后端某个 Pod 的 3000 端口。如果后端有多个 Pod，Service 自动做轮询负载均衡。
+
+```bash
+# 创建 Service
+kubectl apply -f service.yaml
+
+# 查看 Service
+kubectl get svc -n flowapi
+
+# 在集群内部测试访问
+kubectl exec -it flowapi-7d8f9c6b5-x2kjp -n flowapi -- curl http://flowapi/health
+```
+
+ClusterIP Service 只能在集群内部访问。在 minikube 环境中，你可以用 `port-forward` 把 Service 端口映射到本机来测试：
+
+```bash
+# 把 Service 的 80 端口映射到本机的 8080 端口
+kubectl port-forward svc/flowapi 8080:80 -n flowapi
+
+# 在另一个终端窗口测试
+curl http://localhost:8080/health
+```
+
+### Service 的三种类型
+
+K8s 有三种 Service 类型，适用不同场景：
+
+**ClusterIP**（默认）：只能在集群内部访问。适合微服务之间的互相调用——比如订单服务调用用户服务，不需要暴露到公网。
+
+**NodePort**：在每个节点上开放一个端口（30000-32767），外部可以通过 `节点IP:端口` 访问。适合测试环境或者没有云厂商 LoadBalancer 的场景。
+
+**LoadBalancer**：向云厂商申请一个负载均衡器，自动分配一个公网 IP。适合生产环境对外暴露服务。
+
+```yaml
+# NodePort 类型的 Service（适合本地开发测试）
+apiVersion: v1
+kind: Service
+metadata:
+  name: flowapi-nodeport
+  namespace: flowapi
+spec:
+  type: NodePort
+  selector:
+    app: flowapi
+  ports:
+    - port: 80
+      targetPort: 3000
+      nodePort: 30080 # 节点上的端口（如果不指定，K8s 会自动分配）
+```
+
+在 minikube 中，NodePort 可以直接访问：
+
+```bash
+# minikube 会告诉你怎么访问 NodePort 服务
+minikube service flowapi-nodeport -n flowapi --url
+```
+
+## 用 ConfigMap 管理配置
+
+之前 Deployment 的 YAML 里直接写了 `NODE_ENV=production`，如果还有更多配置项（日志级别、缓存大小、连接池大小等），都写在 Deployment 里会让 YAML 变得臃肿。更重要的，改配置就要改 Deployment，重新部署。ConfigMap 解决这个问题——把配置从应用定义中分离出来。
+
+```yaml
+# configmap.yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: flowapi-config
+  namespace: flowapi
+data:
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+  PORT: "3000"
+  # 也可以存整个配置文件
+  app-config.json: |
+    {
+      "cacheTTL": 300,
+      "maxConnections": 100,
+      "requestTimeout": 30
+    }
+```
+
+Deployment 中引用 ConfigMap：
+
+```yaml
+# deployment.yaml（修改 env 部分）
+envFrom:
+  - configMapRef:
+      name: flowapi-config # 引用 ConfigMap，自动注入所有 key 为环境变量
+  - name: DATABASE_URL
+    valueFrom:
+      secretKeyRef:
+        name: flowapi-secret
+        key: database-url
+```
+
+改配置时，只需要更新 ConfigMap，然后重启 Pod 就能生效：
+
+```bash
+# 修改 ConfigMap
+kubectl edit configmap flowapi-config -n flowapi
+
+# 重启 Pod 让新配置生效（ rollout restart 会滚动重启所有 Pod）
+kubectl rollout restart deployment flowapi -n flowapi
+```
+
+ConfigMap 存的是非敏感的配置。日志级别、端口号、功能开关这些放 ConfigMap 没问题。数据库密码、API Key 这类敏感信息要放 Secret。
+
+## 用 Secret 管理密钥
+
+Secret 和 ConfigMap 结构类似，但专门存敏感数据。数据会以 base64 编码存储（注意，base64 不是加密，只是编码，生产环境应该配合加密方案使用）。
+
+```bash
+# 创建 Secret（推荐用命令行，避免把明文写进 YAML 文件）
+kubectl create secret generic flowapi-secret \
+  --from-literal=database-url="postgresql://flowapi:yourpassword@db-host:5432/flowapi" \
+  --from-literal=jwt-secret="your-jwt-secret-key" \
+  -n flowapi
+
+# 查看创建的 Secret（值会显示为 base64 编码）
+kubectl get secret flowapi-secret -n flowapi -o yaml
+```
+
+Deployment 中通过 `secretKeyRef` 引用 Secret 的值：
+
+```yaml
+env:
+  - name: DATABASE_URL
+    valueFrom:
+      secretKeyRef:
+        name: flowapi-secret
+        key: database-url
+  - name: JWT_SECRET
+    valueFrom:
+      secretKeyRef:
+        name: flowapi-secret
+        key: jwt-secret
+```
+
+关键原则：**永远不要把 Secret 的明文提交到 Git 仓库**。用 `kubectl create secret` 命令创建，或者用 Sealed Secrets、External Secrets Operator 这类工具管理。
+
+## kubectl 常用命令
+
+kubectl 是操作 K8s 的命令行工具。日常使用频率最高的命令：
+
+```bash
+# 查看资源状态
+kubectl get pods -n flowapi                  # 查看 Pod 列表
+kubectl get deployment -n flowapi            # 查看 Deployment 状态
+kubectl get svc -n flowapi                   # 查看 Service 列表
+kubectl get all -n flowapi                   # 查看该 Namespace 下的所有资源
+
+# 查看详细信息（排查问题时很有用）
+kubectl describe pod flowapi-7d8f9c6b5-x2kjp -n flowapi
+kubectl describe deployment flowapi -n flowapi
+
+# 查看日志
+kubectl logs flowapi-7d8f9c6b5-x2kjp -n flowapi
+kubectl logs -f flowapi-7d8f9c6b5-x2kjp -n flowapi   # 实时跟踪日志（类似 tail -f）
+
+# 部署和更新
+kubectl apply -f deployment.yaml             # 创建或更新资源
+kubectl delete -f deployment.yaml            # 删除资源
+
+# 滚动更新和回滚
+kubectl rollout status deployment flowapi -n flowapi    # 查看滚动更新进度
+kubectl rollout history deployment flowapi -n flowapi    # 查看历史版本
+kubectl rollout undo deployment flowapi -n flowapi       # 回滚到上一个版本
+
+# 进入容器内部调试
+kubectl exec -it flowapi-7d8f9c6b5-x2kjp -n flowapi -- /bin/sh
+
+# 端口转发（本地调试用）
+kubectl port-forward svc/flowapi 8080:80 -n flowapi
+```
+
+`describe` 是排查问题的利器。Pod 启动失败时，`kubectl describe pod <pod-name>` 会告诉你失败原因——镜像拉不下来、资源不够、健康检查不通过等。养成用 `describe` 看详情的习惯，比只看 `get pods` 的状态有用得多。
+
+## 模拟故障：看看 K8s 的自愈能力
+
+K8s 最大的价值之一是自愈。手动杀掉一个 Pod，看看会发生什么：
+
+```bash
+# 查看当前 Pod
+kubectl get pods -n flowapi
+
+# 删除其中一个 Pod
+kubectl delete pod flowapi-7d8f9c6b5-x2kjp -n flowapi
+
+# 立刻再看
+kubectl get pods -n flowapi
+```
+
+你会发现，被删除的 Pod 消失了，但很快（几秒内）一个新的 Pod 出现了，总数还是 3 个。这就是 Deployment 的自愈能力——它不断检查实际 Pod 数量和期望数量（replicas: 3）是否一致，不一致就自动调整。
+
+这种自愈能力在半夜服务器宕机时尤其重要。没有 K8s，你得被告警电话叫醒，SSH 上去手动重启。有了 K8s，Pod 在其他健康的节点上自动重建，你甚至不需要知道发生了什么。
+
+## 滚动更新
+
+更新 FlowAPI 的镜像版本时，不需要手动停旧起新：
+
+```bash
+# 修改 Deployment 中的镜像版本
+kubectl set image deployment/flowapi \
+  flowapi=your-registry.com/flowapi:v2.0.0 \
+  -n flowapi
+
+# 查看更新进度
+kubectl rollout status deployment flowapi -n flowapi
+```
+
+Deployment 会先创建一个新版本的 Pod，等它健康检查通过后，再逐步停掉旧版本的 Pod。整个过程是渐进式的，任何时候都有足够的 Pod 在提供服务，不会出现全部不可用的情况。
+
+如果新版本有问题，一键回滚：
+
+```bash
+# 回滚到上一个版本
+kubectl rollout undo deployment flowapi -n flowapi
+
+# 查看回滚状态
+kubectl rollout status deployment flowapi -n flowapi
+```
+
+## 和 Docker Compose 的对比
+
+如果你之前用过 Docker Compose，可能会觉得 K8s 做的事情和 Compose 差不多——都是管理多个容器。但两者的定位和复杂度完全不同。
+
+Docker Compose 适合**单机**场景。你在一台服务器上定义多个服务，`docker compose up` 就能全部启动。配置简单（一个 docker-compose.yml），上手快，但没有跨主机的调度能力，没有自愈能力，也没有自动扩缩容。
+
+K8s 适合**集群**场景。它管理多台服务器，决定把容器放在哪台机器上运行，能自动处理故障恢复和负载均衡。代价是复杂度高得多——要理解 Pod、Deployment、Service、ConfigMap、Secret 等一堆概念，YAML 配置也更繁琐。
+
+一个简单的判断标准：
+
+- **开发和测试环境**、单台服务器上跑几个服务 → Docker Compose
+- **生产环境**、需要多台服务器、需要高可用和自动扩缩容 → Kubernetes
+- 团队就你一个人，流量不大，单机够用 → 先用 Compose，等流量上来再考虑 K8s
+
+## 把所有 YAML 整理到一起
+
+到目前为止，我们创建了 4 个文件。在生产实践中，通常会把一个应用相关的所有 K8s 资源放在一个目录里统一管理：
+
+```
+k8s/
+├── namespace.yaml
+├── configmap.yaml
+├── deployment.yaml
+└── service.yaml
+```
+
+一次性部署所有资源：
+
+```bash
+kubectl apply -f k8s/
+```
+
+清理所有资源：
+
+```bash
+kubectl delete -f k8s/
+```
+
+如果不想维护多个文件，也可以用 `---` 分隔符把多个资源写在同一个文件里。但对于实际项目，分开管理更清晰——ConfigMap 改了不影响 Deployment，团队协作时不容易产生冲突。
+
+## 学习曲线和后续方向
+
+K8s 的入门成本确实不低。光是理解 Pod、Deployment、Service 这几个核心概念，加上 YAML 的语法，就需要一些时间。这还没算上 PersistentVolume（持久化存储）、Ingress（HTTP 路由）、HPA（自动扩缩容）、NetworkPolicy（网络策略）等进阶概念。
+
+但入门之后你会发现，K8s 的核心思路其实很统一：**你用 YAML 描述期望状态，K8s 负责把实际状态调整到期望状态**。不管是管理 Pod 数量、更新镜像版本、还是管理配置，都是这个模式。理解了这一点，其他概念学起来会快很多。
+
+这个系列后面还有几篇和 K8s 相关的文章，按顺序推进：
+
+- **第 5 篇**会把 FlowAPI 的 K8s 配置从"能跑"升级到"生产就绪"——加上健康检查、资源限制调优、Pod 安全配置
+- **第 6 篇**引入 ArgoCD，实现 GitOps——把 K8s 的 YAML 存在 Git 仓库里，自动同步到集群，不再手动 `kubectl apply`
+
+如果你是第一次接触 K8s，建议先在 minikube 上把这篇文章里的操作都跑一遍——创建 Deployment、创建 Service、杀掉 Pod 观察自愈、做一次滚动更新和回滚。亲手操作一遍比看十遍文档都有用。
+
+## Trade-off
+
+K8s 解决了多机容器管理的核心问题——自动调度、故障自愈、滚动更新、服务发现。对于一个需要水平扩展的应用来说，这些能力是刚需。
+
+但 K8s 不是万能药。它的代价也很明确：
+
+**复杂度显著增加。** Docker Compose 一个 YAML 文件搞定的事，K8s 至少需要 Deployment + Service + ConfigMap 三个文件。学习曲线陡峭，排查问题的链路更长——Pod 启动失败可能是镜像拉不下来、资源不足、配置错误、权限问题等多种原因。
+
+**资源开销。** K8s 控制面本身需要资源，minikube 至少需要 2 核 4GB 内存。小规模场景下，管理开销可能超过了收益。如果两台服务器就能搞定，直接用 Docker Compose + Nginx 负载均衡可能是更务实的选择。
+
+**运维门槛。** K8s 集群本身也需要维护——版本升级、证书轮换、etcd 备份。如果你的团队没有专门的人来管理 K8s，托管方案（云厂商的 EKS / GKE / ACK）比自建省心得多。
+
+**什么时候值得引入 K8s**：应用需要跑在多台服务器上、需要自动扩缩容、团队有一定规模需要标准化部署流程。如果你还在单机阶段，先把 Docker Compose 用好，等真正需要集群时再上 K8s，不要为了用而用。

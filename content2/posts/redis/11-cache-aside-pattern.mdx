@@ -1,0 +1,329 @@
+---
+title: "11. Cache-Aside 缓存模式：构建高效的缓存系统"
+date: "2026-03-23"
+summary: "深入理解 Cache-Aside 及其他缓存模式，掌握构建高效缓存系统的方法和最佳实践。"
+tags: ["Redis", "缓存模式", "Cache-Aside"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 11
+---
+
+上篇文章我们实现了直播平台的礼物排行榜，用户每次查看榜单都要从 Sorted Set 读取数据，响应很快。但还有一个问题没解决：用户查看主播信息时，每次都要查询数据库，主播粉丝多了以后，数据库压力很大。
+
+这时候就该考虑用缓存了。但 Redis 和数据库怎么配合？先查 Redis 还是先查数据库？更新时先更新哪个？这些问题处理不好，轻则缓存失效，重则数据不一致。
+
+今天我们就来聊聊最常用的 Cache-Aside 缓存模式，以及它在直播平台中的应用。
+
+## 为什么要用缓存模式
+
+你可能觉得这很简单：查数据时先看 Redis 有没有，有就直接返回，没有就查数据库再存到 Redis。更新数据时先更新数据库，再删除 Redis。
+
+但实际场景中有很多坑：
+
+- 更新数据库成功但删除缓存失败，导致缓存里是旧数据
+- 并发更新时，缓存和数据库的更新顺序错乱
+- 缓存什么时候更新？什么时候删除？
+- 缓存热点数据时怎么避免缓存击穿？
+
+这些问题需要一套完整的缓存模式来解决。
+
+## Cache-Aside 模式
+
+Cache-Aside（旁路缓存）是最常用的缓存模式，应用代码直接管理缓存和数据库。
+
+### 读流程
+
+先看代码：
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+// 直播平台用户信息缓存
+async function getUserInfo(userId: string) {
+  const cacheKey = `user:info:${userId}`;
+
+  // 第一步：先查缓存
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    console.log(`缓存命中：${userId}`);
+    return JSON.parse(cached);
+  }
+
+  // 第二步：缓存未命中，查数据库
+  console.log(`缓存未命中，查询数据库：${userId}`);
+  const user = await db.query(
+    `
+    SELECT id, username, avatar, role, created_at
+    FROM users WHERE id = ?
+  `,
+    [userId]
+  );
+
+  if (!user) {
+    return null;
+  }
+
+  // 第三步：写入缓存，设置 1 小时过期
+  await redis.setex(cacheKey, 3600, JSON.stringify(user));
+
+  return user;
+}
+```
+
+这个流程很好理解：读的时候先看缓存，命中就直接返回，没命中就去查数据库然后回填缓存。
+
+### 写流程
+
+写的时候要注意，我们选择删除缓存而不是更新缓存：
+
+```typescript
+async function updateUserInfo(userId: string, data: any) {
+  // 第一步：更新数据库
+  await db.execute(
+    `
+    UPDATE users
+    SET username = ?, avatar = ?
+    WHERE id = ?
+  `,
+    [data.username, data.avatar, userId]
+  );
+
+  // 第二步：删除缓存
+  const cacheKey = `user:info:${userId}`;
+  await redis.del(cacheKey);
+
+  // 为什么删除而不是更新？
+  // 1. 删除更简单，不需要构造缓存数据
+  // 2. 避免并发更新时的数据不一致
+  // 3. 下次读取时自然会回填缓存
+}
+```
+
+为什么要删除而不是更新缓存？假设有两个请求同时更新同一个用户的数据：
+
+- 请求 A 更新数据库 username = "alice_v2"
+- 请求 B 更新数据库 username = "alice_v3"
+- 请求 B 更新缓存 username = "alice_v3"
+- 请求 A 更新缓存 username = "alice_v2"
+
+最后缓存里是 alice_v2，但数据库里是 alice_v3，数据不一致了。
+
+删除缓存就能避免这个问题，因为下次读取时会从数据库拉取最新数据。
+
+### 删除缓存的时机问题
+
+上面的代码有个问题：如果删除缓存失败了怎么办？数据库更新了但缓存还在，用户读到的还是旧数据。
+
+有个解决方案叫延迟双删：
+
+```typescript
+async function updateUserInfoWithDelay(userId: string, data: any) {
+  const cacheKey = `user:info:${userId}`;
+
+  // 第一步：先删除缓存
+  await redis.del(cacheKey);
+
+  // 第二步：更新数据库
+  await db.execute(
+    `
+    UPDATE users
+    SET username = ?, avatar = ?
+    WHERE id = ?
+  `,
+    [data.username, data.avatar, userId]
+  );
+
+  // 第三步：延迟 500ms 后再删除一次
+  // 这是为了清除延迟期间可能产生的旧缓存
+  setTimeout(async () => {
+    await redis.del(cacheKey);
+  }, 500);
+}
+```
+
+为什么要延迟再删一次？假设删除缓存后，有个请求正好来读数据，这时候缓存是空的，它会把数据库的旧数据读到缓存里。然后我们更新了数据库，但缓存里还是旧数据。延迟双删就是为了解决这个问题。
+
+但延迟双删也有问题：如果数据库更新很慢，延迟时间不够怎么办？这个需要根据实际业务调整。
+
+## 其他缓存模式
+
+除了 Cache-Aside，还有几种缓存模式，了解它们有助于你做出更好的选择。
+
+### Read-Through（读穿透）
+
+Read-Through 模式下，应用代码只和缓存层交互，缓存层负责自动回填：
+
+```typescript
+class ReadThroughCache {
+  async get(key: string) {
+    let data = await redis.get(key);
+    if (data) {
+      return JSON.parse(data);
+    }
+
+    // 缓存未命中，自动查数据库
+    data = await db.query(key);
+    if (data) {
+      await redis.setex(key, 3600, JSON.stringify(data));
+    }
+
+    return data;
+  }
+}
+
+// 使用时更简单
+const cache = new ReadThroughCache();
+const user = await cache.get(`user:info:${userId}`);
+```
+
+Read-Through 的好处是应用代码不需要关心缓存逻辑，都由缓存层处理。适合统一数据访问层的场景。
+
+### Write-Through（写穿透）
+
+Write-Through 先写缓存，缓存层同步写数据库：
+
+```typescript
+class WriteThroughCache {
+  async set(key: string, data: any) {
+    // 先写缓存
+    await redis.setex(key, 3600, JSON.stringify(data));
+
+    // 同步写数据库
+    await db.update(key, data);
+  }
+}
+```
+
+Write-Through 保证缓存和数据库的强一致性，但写入性能较差，因为要等两步都完成。
+
+### Write-Behind（异步写回）
+
+Write-Behind 先写缓存，然后异步写数据库：
+
+```typescript
+class WriteBehindCache {
+  private writeQueue = new Map();
+
+  async set(key: string, data: any) {
+    // 立即写缓存
+    await redis.setex(key, 3600, JSON.stringify(data));
+
+    // 加入写队列，异步批量写数据库
+    this.writeQueue.set(key, data);
+  }
+
+  // 定时批量写入数据库
+  private async flushToDatabase() {
+    const batch = Array.from(this.writeQueue.entries());
+    this.writeQueue.clear();
+
+    await db.batchUpdate(batch);
+  }
+}
+```
+
+Write-Behind 写入性能很高，但可能丢失数据，适合写多读少且能容忍短暂数据不一致的场景。
+
+## 缓存预热
+
+系统启动时，可以提前把热点数据加载到缓存：
+
+```typescript
+async function warmupCache() {
+  // 预热热门主播信息
+  const hotStreamers = await db.query(`
+    SELECT user_id FROM streamers
+    WHERE status = 'live'
+    ORDER BY viewers DESC
+    LIMIT 100
+  `);
+
+  for (const streamer of hotStreamers) {
+    const userInfo = await db.query(
+      `
+      SELECT * FROM users WHERE id = ?
+    `,
+      [streamer.user_id]
+    );
+
+    if (userInfo) {
+      const cacheKey = `user:info:${streamer.user_id}`;
+      // 设置不同的过期时间，避免同时失效
+      const ttl = 3600 + Math.random() * 600;
+      await redis.setex(cacheKey, Math.floor(ttl), JSON.stringify(userInfo));
+    }
+  }
+}
+
+// 应用启动时预热
+warmupCache();
+```
+
+预热的好处是用户进来时缓存已经准备好了，不会出现冷启动时的流量打爆数据库。
+
+## 缓存粒度
+
+还有一个问题：缓存应该存整个对象还是只存需要的字段？
+
+假设用户信息有 20 个字段，但大部分接口只需要 username 和 avatar：
+
+```typescript
+// 粗粒度：缓存整个用户对象
+async function getUserInfo(userId: string) {
+  const key = `user:info:${userId}`;
+  let user = await redis.get(key);
+  if (user) return JSON.parse(user);
+
+  user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+  await redis.setex(key, 3600, JSON.stringify(user));
+  return user;
+}
+
+// 细粒度：只缓存需要的字段
+async function getUserBasicInfo(userId: string) {
+  const key = `user:basic:${userId}`;
+  let basic = await redis.get(key);
+  if (basic) return JSON.parse(basic);
+
+  basic = await db.query(
+    `
+    SELECT id, username, avatar FROM users WHERE id = ?
+  `,
+    [userId]
+  );
+  await redis.setex(key, 3600, JSON.stringify(basic));
+  return basic;
+}
+```
+
+细粒度缓存更省内存，但缓存键更多，管理复杂。粗粒度缓存简单但浪费内存。需要根据业务场景选择。
+
+## Trade-off 分析
+
+Cache-Aside 模式在直播平台中很实用，但也有一些权衡：
+
+**优势**：
+
+- 实现简单，应用代码直接控制
+- 灵活性高，可以根据业务调整策略
+- 缓存失效时自动回填，不会影响可用性
+
+**劣势**：
+
+- 需要应用代码管理缓存和数据库的一致性
+- 删除缓存失败可能导致数据不一致
+- 第一次访问时缓存未命中，响应较慢
+
+**适用场景**：
+
+- 读多写少的业务（用户信息、商品详情）
+- 能容忍短暂数据不一致
+- 有完善的监控和告警机制
+
+如果需要更强的数据一致性，可以考虑 Read-Through/Write-Through 模式，或者使用分布式事务。但要注意，强一致性通常意味着性能损失。
+
+在直播平台的用户信息场景中，Cache-Aside 是合适的选择：用户信息读多写少，即使短时间数据不一致也不影响核心业务，而且实现简单易于维护。

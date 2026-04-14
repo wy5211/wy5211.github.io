@@ -1,0 +1,1131 @@
+---
+title: "09. 文件上传与媒体管理"
+date: "2026-03-23"
+summary: "用户想在任务描述里贴截图、在评论里上传附件。文件上传看似简单，实则暗藏大文件、并发、安全和存储的坑。这篇文章帮你用 Next.js 实现可靠的上传方案。"
+tags: ["Next.js", "文件上传", "图片优化", "云存储", "媒体管理"]
+category: "nextjs"
+cover: ""
+draft: false
+series: "Next.js 渐进式全栈开发"
+seriesOrder: 9
+---
+
+## 从一个真实痛点说起
+
+上一篇文章我们搞定了身份验证和授权，用户可以登录系统、管理权限了。现在假设你的团队任务管理平台上线了，第一个反馈就来了：产品经理在提 Bug 的时候想贴一张截图，后端同学在评审技术方案时想附上一个 PDF。你发现，没有文件上传功能的任务系统，基本等于没有灵魂。
+
+文件上传这个需求看起来很简单 -- 一个 `<input type="file">` 就能搞定。但真正做起来，你会发现坑一个接一个：用户传了一张 15MB 的 iPhone 原图直接把服务器内存撑爆了；有人把 `.exe` 改成 `.png` 绕过了前端校验；上传到一半网络断了，文件残留在磁盘上没人管；三个月后存储桶里积攒了几万张没人引用的孤儿图片，云存储账单让你肉疼。
+
+这篇文章我们就围绕团队任务管理平台这个场景，把文件上传这件事从头到尾做对。
+
+## 文件上传的挑战
+
+在写代码之前，先想清楚文件上传到底有哪些需要处理的问题：
+
+**安全性**。永远不要信任客户端传过来的任何东西。浏览器上的 `accept="image/*"` 只是个提示，用户完全可以手动改文件后缀绕过。必须在服务端验证文件的 MIME 类型、文件头（magic bytes），甚至对图片做内容扫描。
+
+**大小与并发**。Next.js 默认的 Server Action body 大小是 1MB（可以通过 `serverActions.bodySizeLimit` 调大），但即使调大了，一个大文件上传也会长时间占用一个服务器连接。如果 10 个用户同时上传 50MB 的附件，你的服务器内存可能就不够用了。
+
+**存储策略**。存本地是最简单的方案，但 Next.js 部署在 Vercel 上时，文件系统是只读的，没法写文件。就算你用 Docker 自建，本地存储也有容量上限和备份的问题。生产环境基本都得接云存储。
+
+**生命周期管理**。用户上传了文件又删掉了任务，文件还留在存储桶里。预览时生成的临时文件没人清理。日积月累，这些孤儿文件就是一笔不小的开销。
+
+想清楚了这些，我们再动手。
+
+## Server Actions 处理文件上传
+
+我们先用最直接的方式 -- 通过 Server Action 接收 FormData 中的文件。这个方案适合小文件（10MB 以内），也是最常见的场景。
+
+### 上传组件：带预览和校验的前端
+
+先看客户端组件。用户选择文件后，我们做本地预览和基本校验，然后通过表单提交到 Server Action。
+
+```tsx
+// components/AttachmentUpload.tsx
+"use client";
+
+import { useState, useRef } from "react";
+import { useFormStatus } from "react-dom";
+import { uploadAttachment } from "@/app/actions/upload";
+
+// 允许上传的文件类型白名单
+const ALLOWED_TYPES = [
+  "image/jpeg",
+  "image/png",
+  "image/webp",
+  "image/gif",
+  "application/pdf",
+  "application/zip",
+  "text/plain",
+  "text/csv",
+];
+
+// 不同场景的大小限制（单位：字节）
+const SIZE_LIMITS = {
+  avatar: 2 * 1024 * 1024, // 用户头像：2MB
+  screenshot: 10 * 1024 * 1024, // 任务截图：10MB
+  attachment: 50 * 1024 * 1024, // 评论附件：50MB
+} as const;
+
+type UploadScene = keyof typeof SIZE_LIMITS;
+
+interface AttachmentUploadProps {
+  taskId: string;
+  scene: UploadScene;
+  onUploaded?: (url: string, fileName: string) => void;
+}
+
+export function AttachmentUpload({
+  taskId,
+  scene,
+  onUploaded,
+}: AttachmentUploadProps) {
+  const [preview, setPreview] = useState<string | null>(null);
+  const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // 客户端文件校验（前端快速反馈，服务端仍需二次校验）
+  function validateFile(file: File): string | null {
+    // 1. 检查文件类型
+    if (!ALLOWED_TYPES.includes(file.type)) {
+      return "不支持的文件格式，仅允许 JPG、PNG、WebP、GIF、PDF、ZIP、TXT、CSV";
+    }
+
+    // 2. 检查文件大小
+    const maxSize = SIZE_LIMITS[scene];
+    if (file.size > maxSize) {
+      const maxMB = (maxSize / 1024 / 1024).toFixed(0);
+      return `文件大小不能超过 ${maxMB}MB，当前文件 ${(file.size / 1024 / 1024).toFixed(1)}MB`;
+    }
+
+    // 3. 文件名安全检查（防止路径遍历攻击）
+    if (file.name.includes("..") || file.name.includes("/")) {
+      return "文件名包含非法字符";
+    }
+
+    return null;
+  }
+
+  // 用户选择文件时的处理
+  function handleFileChange(e: React.ChangeEvent<HTMLInputElement>) {
+    setError(null);
+    setPreview(null);
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // 执行客户端校验
+    const validationError = validateFile(file);
+    if (validationError) {
+      setError(validationError);
+      e.target.value = ""; // 清空输入框，让用户重新选择
+      return;
+    }
+
+    setSelectedFile(file);
+
+    // 如果是图片，生成本地预览
+    if (file.type.startsWith("image/")) {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        setPreview(reader.result as string);
+      };
+      reader.readAsDataURL(file);
+    }
+  }
+
+  // 上传成功后的回调
+  function handleComplete(result: {
+    success?: boolean;
+    url?: string;
+    fileName?: string;
+    error?: string;
+  }) {
+    if (result.error) {
+      setError(result.error);
+    } else if (result.success && result.url && onUploaded) {
+      onUploaded(result.url, result.fileName || "");
+      // 重置表单状态
+      setSelectedFile(null);
+      setPreview(null);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    }
+  }
+
+  return (
+    <div>
+      <form
+        action={async (formData: FormData) => {
+          if (!selectedFile) return;
+          const result = await uploadAttachment(formData);
+          handleComplete(result);
+        }}
+      >
+        {/* taskId 和 scene 作为隐藏字段传给 Server Action */}
+        <input type="hidden" name="taskId" value={taskId} />
+        <input type="hidden" name="scene" value={scene} />
+
+        {/* 拖拽区域 + 文件选择 */}
+        <div
+          onClick={() => fileInputRef.current?.click()}
+          style={{
+            border: "2px dashed #d1d5db",
+            borderRadius: "8px",
+            padding: "24px",
+            textAlign: "center",
+            cursor: "pointer",
+          }}
+        >
+          {selectedFile ? (
+            <div>
+              {preview && (
+                <img
+                  src={preview}
+                  alt="预览"
+                  style={{ maxWidth: 240, maxHeight: 180, borderRadius: 4 }}
+                />
+              )}
+              <p style={{ marginTop: 8, fontSize: 14 }}>
+                {selectedFile.name} ({(selectedFile.size / 1024).toFixed(1)} KB)
+              </p>
+            </div>
+          ) : (
+            <p style={{ color: "#6b7280", fontSize: 14 }}>
+              点击或拖拽文件到此处上传
+              <br />
+              <span style={{ fontSize: 12 }}>
+                支持 JPG、PNG、WebP、GIF、PDF、ZIP，最大{" "}
+                {SIZE_LIMITS[scene] / 1024 / 1024}MB
+              </span>
+            </p>
+          )}
+        </div>
+
+        <input
+          ref={fileInputRef}
+          type="file"
+          name="file"
+          onChange={handleFileChange}
+          accept={ALLOWED_TYPES.join(",")}
+          style={{ display: "none" }}
+        />
+
+        {error && (
+          <p style={{ color: "#ef4444", fontSize: 13, marginTop: 8 }}>
+            {error}
+          </p>
+        )}
+
+        {/* 上传按钮：利用 useFormStatus 显示 pending 状态 */}
+        {selectedFile && <SubmitButton />}
+      </form>
+    </div>
+  );
+}
+
+function SubmitButton() {
+  const { pending } = useFormStatus();
+  return (
+    <button
+      type="submit"
+      disabled={pending}
+      style={{
+        marginTop: 12,
+        padding: "8px 20px",
+        background: pending ? "#9ca3af" : "#3b82f6",
+        color: "#fff",
+        border: "none",
+        borderRadius: 6,
+        cursor: pending ? "not-allowed" : "pointer",
+      }}
+    >
+      {pending ? "上传中..." : "确认上传"}
+    </button>
+  );
+}
+```
+
+这段组件做了几件重要的事：第一，在客户端就做了类型和大小校验，给用户即时反馈，不用等提交到服务端才报错；第二，区分了不同场景的大小限制，头像和附件显然不应该用同一个上限；第三，用 `useFormStatus` 处理了上传中的状态，避免用户重复点击。
+
+### Server Action：服务端校验与存储
+
+客户端校验只是第一道防线。真正安全的校验必须在服务端完成。
+
+```typescript
+// app/actions/upload.ts
+"use server";
+
+import { z } from "zod";
+
+// ============================
+// 1. 定义上传参数的校验规则
+// ============================
+const uploadSchema = z.object({
+  taskId: z.string().min(1, "缺少任务 ID"),
+  scene: z.enum(["avatar", "screenshot", "attachment"]),
+});
+
+// 允许的 MIME 类型白名单（与前端保持一致，但这是真正的校验）
+const ALLOWED_MIME_TYPES: Record<string, number> = {
+  "image/jpeg": 10 * 1024 * 1024,
+  "image/png": 10 * 1024 * 1024,
+  "image/webp": 10 * 1024 * 1024,
+  "image/gif": 10 * 1024 * 1024,
+  "application/pdf": 50 * 1024 * 1024,
+  "application/zip": 50 * 1024 * 1024,
+  "text/plain": 5 * 1024 * 1024,
+  "text/csv": 10 * 1024 * 1024,
+};
+
+// 文件头魔数校验：防止用户修改后缀名伪装文件类型
+const MAGIC_BYTES: Record<string, number[]> = {
+  "image/jpeg": [0xff, 0xd8, 0xff],
+  "image/png": [0x89, 0x50, 0x4e, 0x47],
+  "image/webp": [0x52, 0x49, 0x46, 0x46], // "RIFF"
+  "image/gif": [0x47, 0x49, 0x46], // "GIF"
+  "application/pdf": [0x25, 0x50, 0x44, 0x46], // "%PDF"
+  "application/zip": [0x50, 0x4b, 0x03, 0x04], // "PK"
+};
+
+export async function uploadAttachment(formData: FormData) {
+  // ============================
+  // 2. 校验基本参数
+  // ============================
+  const taskId = formData.get("taskId") as string | null;
+  const scene = formData.get("scene") as string | null;
+  const file = formData.get("file") as File | null;
+
+  const paramsResult = uploadSchema.safeParse({ taskId, scene });
+  if (!paramsResult.success) {
+    return { error: paramsResult.error.issues[0].message };
+  }
+
+  if (!file || file.size === 0) {
+    return { error: "请选择要上传的文件" };
+  }
+
+  // ============================
+  // 3. 服务端文件类型校验
+  // ============================
+  const maxAllowedSize = ALLOWED_MIME_TYPES[file.type];
+  if (!maxAllowedSize) {
+    return { error: `不支持的文件类型: ${file.type}` };
+  }
+
+  // 根据场景进一步限制大小
+  const sceneSizeLimits = {
+    avatar: 2 * 1024 * 1024,
+    screenshot: 10 * 1024 * 1024,
+    attachment: 50 * 1024 * 1024,
+  };
+  const sceneLimit = sceneSizeLimits[paramsResult.data.scene];
+  if (file.size > sceneLimit) {
+    return {
+      error: `文件大小 ${(file.size / 1024 / 1024).toFixed(1)}MB 超过限制 ${sceneLimit / 1024 / 1024}MB`,
+    };
+  }
+
+  // ============================
+  // 4. 魔数校验：读取文件头验证真实类型
+  // ============================
+  const buffer = Buffer.from(await file.arrayBuffer());
+  const expectedMagic = MAGIC_BYTES[file.type];
+
+  if (expectedMagic) {
+    const actualMagic = Array.from(buffer.subarray(0, expectedMagic.length));
+    const magicMatch = expectedMagic.every(
+      (byte, i) => byte === actualMagic[i]
+    );
+    if (!magicMatch) {
+      return { error: "文件内容与声明类型不符，可能是伪造的文件类型" };
+    }
+  }
+
+  // ============================
+  // 5. 生成安全的存储路径
+  // ============================
+  const ext = file.name.split(".").pop() || "bin";
+  // 使用 crypto.randomUUID() 生成唯一文件名，避免路径遍历和文件名冲突
+  const { randomUUID } = await import("crypto");
+  const safeFileName = `${randomUUID()}.${ext}`;
+  // 按场景分目录：avatars/、screenshots/、attachments/
+  const storageKey = `${paramsResult.data.scene}s/${safeFileName}`;
+
+  try {
+    // ============================
+    // 6. 上传到对象存储（S3 兼容接口）
+    // ============================
+    const { uploadToObjectStorage } = await import("@/lib/storage");
+    const url = await uploadToObjectStorage({
+      key: storageKey,
+      body: buffer,
+      contentType: file.type,
+      metadata: {
+        originalName: file.name,
+        taskId: paramsResult.data.taskId,
+        uploadedAt: new Date().toISOString(),
+      },
+    });
+
+    // ============================
+    // 7. 在数据库中记录文件信息（便于后续管理和清理）
+    // ============================
+    const { prisma } = await import("@/lib/prisma");
+    await prisma.attachment.create({
+      data: {
+        taskId: paramsResult.data.taskId,
+        fileName: file.name,
+        storageKey,
+        url,
+        mimeType: file.type,
+        sizeBytes: file.size,
+        scene: paramsResult.data.scene,
+      },
+    });
+
+    return {
+      success: true,
+      url,
+      fileName: file.name,
+    };
+  } catch (err) {
+    console.error("[uploadAttachment] 上传失败:", err);
+    return { error: "文件上传失败，请稍后重试" };
+  }
+}
+```
+
+注意这里做了三层校验：Zod 校验参数、MIME 类型白名单、文件头魔数验证。三层防线确保即使攻击者伪造了文件后缀和 Content-Type，也无法上传恶意文件。最后我们把文件元信息写入数据库，这步很关键 -- 后续的清理策略全靠这条记录。
+
+## 图片优化：Next.js Image 与 sharp
+
+上传是第一步。图片真正展示给用户时，如果直接用原始尺寸，页面加载会慢到让人怀疑人生。一张 iPhone 拍的 HEIC 转成 JPEG 可能就有 8MB，但任务列表里只需要一张 400px 宽的缩略图。
+
+### Next.js Image 组件
+
+Next.js 的 `<Image>` 组件会自动做几件事：根据视口大小选择合适的图片尺寸、自动转成 WebP/AVIF 等现代格式、懒加载不在视口内的图片。
+
+```tsx
+// components/TaskScreenshot.tsx
+import Image from "next/image";
+
+interface TaskScreenshotProps {
+  src: string;
+  alt: string;
+  /** 显示宽度，不同位置使用不同尺寸 */
+  displaySize?: "thumbnail" | "preview" | "full";
+}
+
+// 不同场景的尺寸配置
+const SIZE_CONFIG = {
+  // 任务列表里的缩略图
+  thumbnail: { width: 400, height: 300 },
+  // 任务详情里的预览图
+  preview: { width: 800, height: 600 },
+  // 点击放大后的完整图
+  full: { width: 1920, height: 1080 },
+};
+
+export function TaskScreenshot({
+  src,
+  alt,
+  displaySize = "thumbnail",
+}: TaskScreenshotProps) {
+  const { width, height } = SIZE_CONFIG[displaySize];
+
+  return (
+    <Image
+      src={src}
+      alt={alt}
+      width={width}
+      height={height}
+      // sizes 告诉浏览器在不同视口宽度下图片的实际显示尺寸
+      // 这样浏览器可以选择下载合适分辨率的图片，而不是永远下载最大的
+      sizes={
+        displaySize === "thumbnail"
+          ? "(max-width: 768px) 100vw, 400px"
+          : "(max-width: 768px) 100vw, (max-width: 1200px) 50vw, 800px"
+      }
+      // priority 仅用于首屏关键图片（如用户头像）
+      // 非首屏图片保持默认的懒加载行为
+      priority={displaySize === "thumbnail"}
+      // 占位样式：图片加载完成前显示灰色背景，避免布局偏移
+      style={{ backgroundColor: "#f3f4f6", objectFit: "cover" }}
+    />
+  );
+}
+```
+
+`sizes` 属性是最容易被忽略但又很重要的配置。没有它，浏览器会默认认为图片始终占满整个视口宽度，然后下载最大的版本。加上 `sizes` 后，在手机上任务列表只需要下载 400px 宽的版本就够了。
+
+### 使用 sharp 服务端预处理图片
+
+`<Image>` 组件在运行时做优化，但第一次访问某个尺寸时会有延迟。对于头像这种被频繁访问的图片，更好的做法是在上传时就生成多套尺寸。
+
+```typescript
+// lib/image-processing.ts
+import sharp from "sharp";
+
+// 预定义的图片尺寸配置
+const IMAGE_VARIANTS = {
+  // 用户头像
+  avatar: [
+    { suffix: "sm", width: 48, height: 48 },
+    { suffix: "md", width: 128, height: 128 },
+    { suffix: "lg", width: 256, height: 256 },
+  ],
+  // 任务截图
+  screenshot: [
+    { suffix: "thumb", width: 400, fit: "inside" as const },
+    { suffix: "preview", width: 800, fit: "inside" as const },
+  ],
+} as const;
+
+/**
+ * 处理上传的图片：裁剪、压缩、生成多尺寸变体
+ * @param buffer 原始图片的二进制数据
+ * @param variantType 图片用途（avatar / screenshot）
+ * @returns 各尺寸变体的 Buffer 数组
+ */
+export async function processImage(
+  buffer: Buffer,
+  variantType: keyof typeof IMAGE_VARIANTS
+) {
+  const variants = IMAGE_VARIANTS[variantType];
+  const results: Array<{
+    suffix: string;
+    buffer: Buffer;
+    width: number;
+    height: number;
+  }> = [];
+
+  for (const variant of variants) {
+    let pipeline = sharp(buffer)
+      // 转为 WebP 格式，在同等画质下比 JPEG 小 25-35%
+      .webp({ quality: 80 });
+
+    if (variant.fit === "inside") {
+      // screenshot 场景：保持原始比例，缩放到指定宽度以内
+      pipeline = pipeline.resize(variant.width, null, {
+        fit: "inside",
+        withoutEnlargement: true, // 图片比目标小时不放大
+      });
+    } else {
+      // avatar 场景：裁剪为正方形
+      pipeline = pipeline.resize(variant.width!, variant.height!, {
+        fit: "cover",
+        // 居中裁剪：取图片中心区域
+        position: "centre",
+      });
+    }
+
+    const output = await pipeline.toBuffer();
+    const metadata = await sharp(output).metadata();
+
+    results.push({
+      suffix: variant.suffix,
+      buffer: output,
+      width: metadata.width!,
+      height: metadata.height!,
+    });
+  }
+
+  return results;
+}
+```
+
+上传流程中集成图片处理：
+
+```typescript
+// 在 uploadAttachment 中，图片类型文件走处理流程
+import { processImage } from "@/lib/image-processing";
+
+// ... 在第 6 步"上传到对象存储"之前加入图片处理逻辑
+if (file.type.startsWith("image/")) {
+  const variants = await processImage(buffer, scene as "avatar" | "screenshot");
+
+  // 并行上传所有尺寸变体
+  await Promise.all(
+    variants.map(async (variant) => {
+      const variantKey = storageKey.replace(
+        `.${ext}`,
+        `_${variant.suffix}.webp`
+      );
+      await uploadToObjectStorage({
+        key: variantKey,
+        body: variant.buffer,
+        contentType: "image/webp",
+        metadata: {
+          originalName: file.name,
+          taskId: paramsResult.data.taskId,
+          variant: variant.suffix,
+        },
+      });
+    })
+  );
+}
+```
+
+这样用户上传一张 8MB 的头像，存储桶里会同时有 48px、128px、256px 三个 WebP 文件，总大小可能不到 100KB。任务列表里用 48px 的小图，个人设置页用 256px 的大图，各取所需。
+
+## 云存储集成：S3 兼容接口
+
+刚才代码里的 `uploadToObjectStorage` 还是个抽象。我们来把它实现出来。这里用 AWS S3 SDK 对接 Cloudflare R2，接口完全兼容，但 R2 没有出口流量费，对博客和中小项目更友好。
+
+```typescript
+// lib/storage.ts
+import {
+  S3Client,
+  PutObjectCommand,
+  DeleteObjectCommand,
+  HeadObjectCommand,
+} from "@aws-sdk/client-s3";
+
+// ============================
+// S3 客户端初始化（懒加载，避免冷启动时不必要的连接）
+// ============================
+let s3Client: S3Client | null = null;
+
+function getS3Client() {
+  if (s3Client) return s3Client;
+
+  s3Client = new S3Client({
+    // R2 使用 "auto" 作为 region
+    region: "auto",
+    endpoint: process.env.STORAGE_ENDPOINT!, // 例如 https://xxx.r2.cloudflarestorage.com
+    credentials: {
+      accessKeyId: process.env.STORAGE_ACCESS_KEY_ID!,
+      secretAccessKey: process.env.STORAGE_SECRET_ACCESS_KEY!,
+    },
+    // 请求超时配置
+    requestTimeout: 30000, // 30 秒超时
+  });
+
+  return s3Client;
+}
+
+export interface UploadParams {
+  key: string; // 存储路径，例如 "avatars/abc123_lg.webp"
+  body: Buffer; // 文件二进制数据
+  contentType: string; // MIME 类型
+  metadata?: Record<string, string>; // 自定义元数据
+}
+
+/**
+ * 上传文件到对象存储
+ */
+export async function uploadToObjectStorage(
+  params: UploadParams
+): Promise<string> {
+  const client = getS3Client();
+
+  await client.send(
+    new PutObjectCommand({
+      Bucket: process.env.STORAGE_BUCKET_NAME!, // 存储桶名称
+      Key: params.key,
+      Body: params.body,
+      ContentType: params.contentType,
+      Metadata: params.metadata,
+      // 缓存策略：
+      // - 头像等不常变化的资源缓存 30 天
+      // - 其他文件缓存 1 天
+      CacheControl: params.contentType.startsWith("image/")
+        ? "public, max-age=2592000, immutable"
+        : "public, max-age=86400",
+    })
+  );
+
+  // 返回公开访问的 URL（需要存储桶配置了公开访问或绑定了自定义域名）
+  return `${process.env.STORAGE_PUBLIC_URL}/${params.key}`;
+}
+
+/**
+ * 从对象存储删除文件
+ */
+export async function deleteFromObjectStorage(key: string): Promise<void> {
+  const client = getS3Client();
+
+  try {
+    await client.send(
+      new DeleteObjectCommand({
+        Bucket: process.env.STORAGE_BUCKET_NAME!,
+        Key: key,
+      })
+    );
+  } catch (err) {
+    // 删除失败只记录日志，不抛异常（可能文件已经被删除了）
+    console.warn(`[storage] 删除文件失败: ${key}`, err);
+  }
+}
+
+/**
+ * 检查文件是否存在（用于清理策略中的孤儿文件检测）
+ */
+export async function objectExists(key: string): Promise<boolean> {
+  const client = getS3Client();
+  try {
+    await client.send(
+      new HeadObjectCommand({
+        Bucket: process.env.STORAGE_BUCKET_NAME!,
+        Key: key,
+      })
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+```
+
+对应的 `.env` 配置：
+
+```env
+# 对象存储配置（S3 兼容接口，支持 AWS S3 / Cloudflare R2 / MinIO）
+STORAGE_ENDPOINT=https://your-account.r2.cloudflarestorage.com
+STORAGE_ACCESS_KEY_ID=your-access-key-id
+STORAGE_SECRET_ACCESS_KEY=your-secret-access-key
+STORAGE_BUCKET_NAME=taskflow-assets
+STORAGE_PUBLIC_URL=https://assets.yourdomain.com
+```
+
+关于 `CacheControl` 的设置值得多说两句。头像这类资源上传后几乎不会变，设置 `immutable` 可以让 CDN 和浏览器放心缓存 30 天。而其他附件文件虽然缓存时间短一些，但 1 天的缓存也能大幅减少回源请求。
+
+## 大文件上传与进度追踪
+
+前面的方案对 50MB 以内的文件够用了。但如果你的平台需要支持更大的文件（比如设计稿、视频预览），直接一次性上传就有问题了：网络不稳定时整个请求失败需要重头来过，用户完全不知道上传到了什么进度。
+
+解决方案是分块上传：把大文件切成固定大小的块，逐块上传，支持断点续传。
+
+### 服务端：分块上传 API
+
+```typescript
+// app/api/upload-chunk/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { writeFile, mkdir } from "fs/promises";
+import { join } from "path";
+import { existsSync } from "fs";
+
+// 每个分块的大小：5MB
+const CHUNK_SIZE = 5 * 1024 * 1024;
+
+// 临时目录：存放分块文件
+const TEMP_DIR = join(process.cwd(), ".tmp", "uploads");
+
+export async function POST(request: NextRequest) {
+  const formData = await request.formData();
+  const uploadId = formData.get("uploadId") as string; // 上传会话唯一 ID
+  const chunkIndex = parseInt(formData.get("chunkIndex") as string); // 当前分块索引
+  const totalChunks = parseInt(formData.get("totalChunks") as string); // 总分块数
+  const fileName = formData.get("fileName") as string; // 原始文件名
+  const chunk = formData.get("chunk") as File; // 分块文件数据
+
+  // 安全校验：uploadId 只允许字母数字和连字符，防止路径遍历
+  if (!/^[a-zA-Z0-9-]+$/.test(uploadId)) {
+    return NextResponse.json({ error: "非法的上传 ID" }, { status: 400 });
+  }
+
+  // 确保临时目录存在
+  if (!existsSync(TEMP_DIR)) {
+    await mkdir(TEMP_DIR, { recursive: true });
+  }
+
+  // 将分块写入临时文件
+  const chunkPath = join(TEMP_DIR, `${uploadId}_${chunkIndex}`);
+  const bytes = await chunk.arrayBuffer();
+  await writeFile(chunkPath, Buffer.from(bytes));
+
+  return NextResponse.json({
+    success: true,
+    chunkIndex,
+    message: `分块 ${chunkIndex + 1}/${totalChunks} 上传完成`,
+  });
+}
+
+/**
+ * 合并分块：所有分块上传完成后调用
+ */
+export async function PUT(request: NextRequest) {
+  const { uploadId, fileName } = await request.json();
+
+  // 安全校验
+  if (!/^[a-zA-Z0-9-]+$/.test(uploadId)) {
+    return NextResponse.json({ error: "非法的上传 ID" }, { status: 400 });
+  }
+
+  // 找到所有分块文件，按索引排序
+  const { readdir, stat, unlink } = await import("fs/promises");
+  const files = await readdir(TEMP_DIR);
+  const chunkFiles = files
+    .filter((f) => f.startsWith(`${uploadId}_`))
+    .sort((a, b) => {
+      const indexA = parseInt(a.split("_").pop()!);
+      const indexB = parseInt(b.split("_").pop()!);
+      return indexA - indexB;
+    });
+
+  if (chunkFiles.length === 0) {
+    return NextResponse.json({ error: "未找到任何分块文件" }, { status: 400 });
+  }
+
+  // 按顺序合并分块
+  const finalBuffer = Buffer.concat(
+    await Promise.all(
+      chunkFiles.map(async (chunkFile) => {
+        const chunkPath = join(TEMP_DIR, chunkFile);
+        const chunkData = await readFile(chunkPath);
+        // 读取后立即删除分块文件，释放磁盘空间
+        await unlink(chunkPath);
+        return chunkData;
+      })
+    )
+  );
+
+  // TODO: 将 finalBuffer 上传到对象存储，写入数据库记录
+  // ...与前面的 uploadToObjectStorage 逻辑类似
+
+  return NextResponse.json({
+    success: true,
+    size: finalBuffer.length,
+    message: `文件 ${fileName} 合并完成`,
+  });
+}
+```
+
+### 客户端：带进度条的断点续传
+
+```tsx
+// components/ChunkedUploader.tsx
+"use client";
+
+import { useState, useRef, useCallback } from "react";
+
+interface ChunkedUploaderProps {
+  file: File;
+  taskId: string;
+  onUploaded?: (url: string) => void;
+}
+
+const CHUNK_SIZE = 5 * 1024 * 1024; // 5MB，与服务端保持一致
+
+export function ChunkedUploader({
+  file,
+  taskId,
+  onUploaded,
+}: ChunkedUploaderProps) {
+  const [progress, setProgress] = useState(0); // 总进度 0-100
+  const [status, setStatus] = useState<
+    "idle" | "uploading" | "merging" | "done" | "error"
+  >("idle");
+  const abortRef = useRef<AbortController | null>(null);
+
+  const startUpload = useCallback(async () => {
+    const uploadId = `upload_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE);
+    let uploadedChunks = 0;
+
+    setStatus("uploading");
+    abortRef.current = new AbortController();
+
+    try {
+      for (let i = 0; i < totalChunks; i++) {
+        // 检查是否被用户取消
+        if (abortRef.current.signal.aborted) {
+          setStatus("idle");
+          return;
+        }
+
+        const start = i * CHUNK_SIZE;
+        const end = Math.min(start + CHUNK_SIZE, file.size);
+        const chunk = file.slice(start, end);
+
+        const formData = new FormData();
+        formData.append("chunk", chunk);
+        formData.append("chunkIndex", i.toString());
+        formData.append("totalChunks", totalChunks.toString());
+        formData.append("uploadId", uploadId);
+        formData.append("fileName", file.name);
+
+        const response = await fetch("/api/upload-chunk", {
+          method: "POST",
+          body: formData,
+          signal: abortRef.current.signal,
+        });
+
+        if (!response.ok) {
+          throw new Error(`分块 ${i} 上传失败: ${await response.text()}`);
+        }
+
+        uploadedChunks++;
+        // 更新进度条：已上传字节数 / 总字节数 * 100
+        const uploadedBytes = Math.min(uploadedChunks * CHUNK_SIZE, file.size);
+        setProgress(Math.round((uploadedBytes / file.size) * 100));
+      }
+
+      // 所有分块上传完成，通知服务端合并
+      setStatus("merging");
+      const mergeResponse = await fetch("/api/upload-chunk", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ uploadId, fileName: file.name, taskId }),
+      });
+
+      if (!mergeResponse.ok) {
+        throw new Error("合并文件失败");
+      }
+
+      const result = await mergeResponse.json();
+      setStatus("done");
+      onUploaded?.(result.url);
+    } catch (err) {
+      if ((err as Error).name !== "AbortError") {
+        console.error("[ChunkedUploader] 上传出错:", err);
+        setStatus("error");
+      }
+    }
+  }, [file, taskId, onUploaded]);
+
+  // 取消上传
+  const cancelUpload = () => {
+    abortRef.current?.abort();
+    setStatus("idle");
+    setProgress(0);
+  };
+
+  return (
+    <div style={{ padding: 16, border: "1px solid #e5e7eb", borderRadius: 8 }}>
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          marginBottom: 8,
+        }}
+      >
+        <span style={{ fontSize: 14 }}>{file.name}</span>
+        <span style={{ fontSize: 13, color: "#6b7280" }}>
+          {(file.size / 1024 / 1024).toFixed(1)} MB
+        </span>
+      </div>
+
+      {/* 进度条 */}
+      <div
+        style={{
+          width: "100%",
+          height: 6,
+          backgroundColor: "#e5e7eb",
+          borderRadius: 3,
+          overflow: "hidden",
+        }}
+      >
+        <div
+          style={{
+            width: `${progress}%`,
+            height: "100%",
+            backgroundColor: status === "error" ? "#ef4444" : "#3b82f6",
+            transition: "width 0.3s ease",
+          }}
+        />
+      </div>
+
+      <div
+        style={{
+          display: "flex",
+          justifyContent: "space-between",
+          marginTop: 8,
+        }}
+      >
+        <span style={{ fontSize: 12, color: "#6b7280" }}>
+          {status === "uploading" && `${progress}% 上传中...`}
+          {status === "merging" && "正在合并文件..."}
+          {status === "done" && "上传完成"}
+          {status === "error" && "上传失败"}
+          {status === "idle" && "准备就绪"}
+        </span>
+
+        <div style={{ display: "flex", gap: 8 }}>
+          {status === "uploading" && (
+            <button
+              onClick={cancelUpload}
+              style={{ fontSize: 12, color: "#ef4444" }}
+            >
+              取消
+            </button>
+          )}
+          {(status === "idle" || status === "error") && (
+            <button
+              onClick={startUpload}
+              style={{ fontSize: 12, color: "#3b82f6" }}
+            >
+              {status === "error" ? "重试" : "开始上传"}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+```
+
+这里有几个设计细节值得注意。进度条的计算是基于已上传字节数而不是分块数，这样即使最后一个分块比前面的分块小，进度条也不会出现突然跳变。`AbortController` 让用户可以随时取消上传，不会浪费带宽。取消后保留 uploadId，理论上可以实现断点续传 -- 重新上传时先检查已有分块，跳过已完成的。
+
+## CDN 加速
+
+文件上传到对象存储后，用户访问时默认直接请求存储源站。如果存储源站在美国，而用户在国内，一次图片加载可能要 2-3 秒。CDN 的作用就是把文件缓存到离用户最近的边缘节点。
+
+对于 Cloudflare R2，最简单的方案是直接绑定 Cloudflare 的自定义域名，Cloudflare 会自动提供 CDN 加速（而且不收出口流量费）。如果是 AWS S3，可以用 CloudFront 做分发。
+
+在 `next.config.ts` 中配置远程图片域名，让 `<Image>` 组件能正常工作：
+
+```typescript
+// next.config.ts
+const nextConfig = {
+  images: {
+    // 配置允许的远程图片域名（用于 <Image> 组件的 src）
+    remotePatterns: [
+      {
+        protocol: "https",
+        hostname: "assets.yourdomain.com", // CDN 域名
+        // 允许所有路径下的图片
+        pathname: "/**",
+      },
+    ],
+  },
+};
+
+export default nextConfig;
+```
+
+关于缓存策略，前面在 `uploadToObjectStorage` 中已经设置了 `CacheControl` 头。CDN 会遵守这个头来决定缓存时长。一个容易犯的错误是：如果用户重新上传了同名头像，CDN 还在返回旧版本。解决方案是在 URL 中加入内容哈希（content hash）作为版本号，比如 `avatar_abc123_md_a1b2c3.webp`，内容变了哈希就变，CDN 自然会回源拉取新文件。我们的实现里已经用了 UUID 作为文件名的一部分，天然就有这个效果。
+
+## 清理策略：别让孤儿文件吃掉你的预算
+
+文件上传后，如果用户删除了任务或重新上传了头像，旧文件就成了孤儿 -- 数据库记录已经删了，但存储桶里的文件还在。三个月下来，可能有 30-40% 的存储空间被孤儿文件占用。
+
+### 定时清理孤儿文件
+
+```typescript
+// lib/cleanup.ts
+import { prisma } from "@/lib/prisma";
+import { deleteFromObjectStorage, objectExists } from "@/lib/storage";
+
+/**
+ * 清理孤儿文件：找出存储桶中存在但数据库中无记录的文件
+ * 建议每天凌晨运行一次（通过 cron job 或 serverless function 调度）
+ */
+export async function cleanupOrphanFiles() {
+  const startTime = Date.now();
+  let deletedCount = 0;
+  let errorCount = 0;
+
+  try {
+    // 1. 获取数据库中所有已记录的存储 key
+    const recordedAttachments = await prisma.attachment.findMany({
+      select: { storageKey: true },
+    });
+    const recordedKeys = new Set(recordedAttachments.map((a) => a.storageKey));
+
+    // 2. 获取存储桶中所有的文件 key（需要对象存储支持 list 操作）
+    const { listObjects } = await import("@/lib/storage");
+    const allKeys = await listObjects();
+
+    // 3. 找出孤儿文件：存储桶中存在但数据库中无记录的
+    const orphanKeys = allKeys.filter((key) => !recordedKeys.has(key));
+
+    console.log(
+      `[cleanup] 存储桶共 ${allKeys.length} 个文件，` +
+        `数据库记录 ${recordedKeys.size} 个，` +
+        `发现 ${orphanKeys.length} 个孤儿文件`
+    );
+
+    // 4. 批量删除孤儿文件（控制并发，避免打爆存储 API 限流）
+    const BATCH_SIZE = 50;
+    for (let i = 0; i < orphanKeys.length; i += BATCH_SIZE) {
+      const batch = orphanKeys.slice(i, i + BATCH_SIZE);
+
+      await Promise.allSettled(
+        batch.map(async (key) => {
+          try {
+            await deleteFromObjectStorage(key);
+            deletedCount++;
+          } catch (err) {
+            console.warn(`[cleanup] 删除失败: ${key}`, err);
+            errorCount++;
+          }
+        })
+      );
+    }
+
+    // 5. 反向检查：数据库有记录但存储桶中不存在的文件
+    // 这类情况可能是手动删除或上传失败的残留记录
+    const missingKeys = [...recordedKeys].filter(
+      (key) => !allKeys.includes(key)
+    );
+    if (missingKeys.length > 0) {
+      console.warn(
+        `[cleanup] 发现 ${missingKeys.length} 条数据库记录指向不存在的文件，已标记`
+      );
+      await prisma.attachment.updateMany({
+        where: { storageKey: { in: missingKeys } },
+        data: { deletedAt: new Date() }, // 软删除标记
+      });
+    }
+  } catch (err) {
+    console.error("[cleanup] 清理任务执行失败:", err);
+  } finally {
+    const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+    console.log(
+      `[cleanup] 完成，耗时 ${duration}s，` +
+        `删除 ${deletedCount} 个文件，失败 ${errorCount} 个`
+    );
+  }
+}
+```
+
+调用这个清理函数可以用 Vercel Cron Jobs（如果你部署在 Vercel 上）：
+
+```typescript
+// app/api/cron/cleanup/route.ts
+import { NextResponse } from "next/server";
+import { cleanupOrphanFiles } from "@/lib/cleanup";
+
+// Vercel Cron Job 会按配置的时间间隔自动调用这个接口
+// vercel.json 中配置: { "crons": [{ "path": "/api/cron/cleanup", "schedule": "0 3 * * *" }] }
+// 每天 UTC 时间凌晨 3 点执行
+export async function GET(request: Request) {
+  // 验证调用来源：Vercel Cron 请求会带上 Authorization: Bearer <CRON_SECRET>
+  const authHeader = request.headers.get("authorization");
+  if (authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  // 异步执行清理，立即返回响应（Vercel serverless 函数有 10s 超时限制）
+  cleanupOrphanFiles();
+
+  return NextResponse.json({ status: "cleanup started" });
+}
+```
+
+清理策略的核心思路是双向校验：既检查存储桶里有没有多余的文件（孤儿文件），也检查数据库里有没有指向已删除文件的记录（悬空引用）。两个方向都清理才能保持数据一致性。
+
+## Trade-off 分析
+
+做了这么多，我们来回顾一下各方案的取舍：
+
+**Server Action vs Route Handler 处理上传**。Server Action 写起来更简洁，和表单集成更自然，适合 50MB 以内的小文件。但 Server Action 有 body 大小限制（默认 1MB，需要手动调大），且不支持流式处理。Route Handler 更灵活，适合分块上传和需要精细控制响应的场景。我们的方案是两者都用：小文件走 Server Action，大文件走 Route Handler 的分块上传。
+
+**本地存储 vs 云存储**。本地存储在开发阶段够用，部署到 Vercel 或容器环境后就不可行了。云存储（R2/S3）是生产环境的必然选择，但引入了额外的复杂度：需要管理访问密钥、配置 CDN、处理清理策略。对于个人项目或 MVP，Vercel Blob 是最简单的方案（一行代码上传，自带 CDN），但长期来看费用会比较高。
+
+**实时处理 vs 上传后处理**。我们在上传时就用 sharp 生成了多尺寸变体，好处是用户访问时不需要等待处理。代价是上传请求会变慢，而且如果生成了 3 个尺寸，实际上传的数据量是原来的 3 倍多。另一种方案是"懒处理"：先存原图，第一次访问某个尺寸时才生成并缓存。Next.js 的 `<Image>` 组件就是这种模式。两种方案可以结合：头像这种高频访问的图片上传时就处理，任务截图这种低频的走懒处理。
+
+**安全 vs 体验**。魔数校验、文件类型白名单、文件名清理这些安全措施是必须做的，但它们增加了代码复杂度。一个好的做法是把校验逻辑抽成独立的函数或中间件，在不同上传入口复用，而不是每个地方都写一遍。
+
+## 小结
+
+这篇文章我们从团队任务管理平台的实际需求出发，完整实现了文件上传的解决方案：
+
+- 通过 Server Action + FormData 实现小文件上传，配合客户端和服务端双重校验
+- 使用 sharp 在上传时生成多尺寸图片变体，减少 CDN 流量
+- 通过 S3 兼容接口对接 Cloudflare R2，配合 CDN 加速全球访问
+- 分块上传 + 进度条解决了大文件上传的体验问题
+- 定时清理策略避免了孤儿文件占用存储空间
+
+到目前为止，我们的任务管理平台已经具备了用户认证、文件上传、数据校验等核心功能。但如果你用 Lighthouse 跑一下性能评分，可能会发现分数并不理想 -- 图片太多、JS bundle 太大、首屏加载慢。下一篇文章我们就来聊性能优化，看看怎么让这个平台跑得更快。

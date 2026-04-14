@@ -1,0 +1,1003 @@
+---
+title: "19. Context：优雅地管理任务生命周期"
+date: "2026-03-23"
+summary: "深入理解 Go 语言的 context 包，学习如何在任务队列中实现超时控制、取消操作和传递请求范围的数据。"
+tags: ["Go", "Golang", "context", "超时控制", "并发"]
+category: "golang"
+cover: ""
+draft: false
+series: "Go 语言渐进式学习"
+seriesOrder: 19
+---
+
+## 问题引入
+
+我们的任务队列系统遇到了几个实际问题：
+
+1. **任务执行时间过长**：某些任务可能因为网络问题或资源不足而无限期等待
+2. **无法优雅关闭**：停止服务时，正在执行的任务被强制中断，导致资源泄漏
+3. **请求追踪困难**：一个任务经过多个 worker 处理，无法关联这些操作
+4. **超时控制缺失**：无法为不同类型的任务设置不同的超时时间
+
+这些问题都指向同一个需求：**我们需要一种机制来管理操作的生命周期**。
+
+Go 的 `context` 包正是为此而生。它提供了一种标准的方式来传递截止日期、取消信号和请求范围的值。
+
+---
+
+## Context 基础
+
+### Context 接口
+
+```go
+type Context interface {
+    // Deadline 返回 context 的截止时间
+    Deadline() (deadline time.Time, ok bool)
+
+    // Done 返回一个 channel，当 context 被取消时关闭
+    Done() <-chan struct{}
+
+    // Err 返回 context 被取消的原因
+    Err() error
+
+    // Value 返回与 key 关联的值
+    Value(key interface{}) interface{}
+}
+```
+
+### 创建 Context
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+func main() {
+	// Background 是最顶层的 context，永不取消
+	ctx := context.Background()
+
+	// TODO 用于不确定应该使用什么 context 时
+	ctx = context.TODO()
+
+	fmt.Println("Background context created")
+}
+```
+
+---
+
+## 取消控制
+
+### WithCancel
+
+`WithCancel` 创建一个可以手动取消的 context：
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// Worker worker
+type Worker struct {
+	id int
+}
+
+// NewWorker 创建 worker
+func NewWorker(id int) *Worker {
+	return &Worker{id: id}
+}
+
+// ProcessTask 处理任务
+func (w *Worker) ProcessTask(ctx context.Context, taskID string) error {
+	fmt.Printf("Worker %d 开始处理任务 %s\n", w.id, taskID)
+
+	// 创建一个子任务
+	subtaskCtx, cancel := context.WithCancel(ctx)
+	defer cancel() // 确保取消函数被调用
+
+	// 启动子 goroutine
+	done := make(chan error, 1)
+	go func() {
+		// 模拟任务处理
+		time.Sleep(2 * time.Second)
+		done <- nil
+	}()
+
+	// 等待任务完成或被取消
+	select {
+	case <-subtaskCtx.Done():
+		// context 被取消
+		fmt.Printf("Worker %d 任务 %s 被取消: %v\n", w.id, taskID, subtaskCtx.Err())
+		return subtaskCtx.Err()
+
+	case err := <-done:
+		// 任务完成
+		if err != nil {
+			return fmt.Errorf("任务执行失败: %w", err)
+		}
+		fmt.Printf("Worker %d 任务 %s 完成\n", w.id, taskID)
+		return nil
+	}
+}
+
+func main() {
+	// 创建可取消的 context
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// 创建 worker
+	worker := NewWorker(1)
+
+	// 在 goroutine 中处理任务
+	go func() {
+		err := worker.ProcessTask(ctx, "task-1")
+		if err != nil {
+			fmt.Println("任务处理出错:", err)
+		}
+	}()
+
+	// 等待一秒后取消
+	time.Sleep(1 * time.Second)
+	fmt.Println("取消任务...")
+	cancel()
+
+	// 等待 goroutine 结束
+	time.Sleep(500 * time.Millisecond)
+}
+```
+
+### 级联取消
+
+当父 context 被取消时，所有子 context 也会被取消：
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// TaskQueue 任务队列
+type TaskQueue struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
+
+// NewTaskQueue 创建任务队列
+func NewTaskQueue() *TaskQueue {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &TaskQueue{
+		ctx:    ctx,
+		cancel: cancel,
+	}
+}
+
+// Start 启动任务队列
+func (q *TaskQueue) Start() {
+	// 创建子 context 用于管理 goroutine
+	workerCtx, cancel := context.WithCancel(q.ctx)
+
+	// 启动多个 worker
+	for i := 1; i <= 3; i++ {
+		go q.worker(workerCtx, i)
+	}
+
+	// 模拟运行一段时间后停止
+	time.AfterFunc(2*time.Second, func() {
+		fmt.Println("停止任务队列...")
+		cancel() // 取消所有 worker
+	})
+}
+
+// worker worker
+func (q *TaskQueue) worker(ctx context.Context, id int) {
+	fmt.Printf("Worker %d 启动\n", id)
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			// context 被取消，退出
+			fmt.Printf("Worker %d 收到停止信号，正在退出...\n", id)
+			return
+
+		case <-ticker.C:
+			// 处理任务
+			fmt.Printf("Worker %d 处理任务\n", id)
+		}
+	}
+}
+
+// Stop 停止任务队列
+func (q *TaskQueue) Stop() {
+	q.cancel()
+}
+
+func main() {
+	queue := NewTaskQueue()
+	queue.Start()
+
+	// 等待足够时间让所有 goroutine 退出
+	time.Sleep(3 * time.Second)
+	fmt.Println("主程序退出")
+}
+```
+
+---
+
+## 超时控制
+
+### WithTimeout
+
+`WithTimeout` 创建一个会在指定时间后自动取消的 context：
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// TaskExecutor 任务执行器
+type TaskExecutor struct{}
+
+// NewTaskExecutor 创建任务执行器
+func NewTaskExecutor() *TaskExecutor {
+	return &TaskExecutor{}
+}
+
+// ExecuteWithTimeout 带超时的任务执行
+func (e *TaskExecutor) ExecuteWithTimeout(taskName string, timeout time.Duration) error {
+	// 创建带超时的 context
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel() // 确保资源被释放
+
+	// 创建结果 channel
+	resultCh := make(chan error, 1)
+
+	// 在 goroutine 中执行任务
+	go func() {
+		// 模拟任务执行
+		time.Sleep(2 * time.Second)
+		resultCh <- nil
+	}()
+
+	// 等待任务完成或超时
+	select {
+	case <-ctx.Done():
+		// 超时或被取消
+		return fmt.Errorf("任务 %s 超时: %w", taskName, ctx.Err())
+
+	case err := <-resultCh:
+		// 任务完成
+		if err != nil {
+			return fmt.Errorf("任务 %s 执行失败: %w", taskName, err)
+		}
+		fmt.Printf("任务 %s 完成\n", taskName)
+		return nil
+	}
+}
+
+func main() {
+	executor := NewTaskExecutor()
+
+	// 测试短超时
+	fmt.Println("测试短超时任务...")
+	err := executor.ExecuteWithTimeout("fast-task", 1*time.Second)
+	if err != nil {
+		fmt.Println("错误:", err)
+	}
+
+	// 测试长超时
+	fmt.Println("\n测试长超时任务...")
+	err = executor.ExecuteWithTimeout("slow-task", 3*time.Second)
+	if err != nil {
+		fmt.Println("错误:", err)
+	}
+}
+```
+
+### WithDeadline
+
+`WithDeadline` 创建一个会在指定时间点取消的 context：
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// ScheduledTask 定时任务
+type ScheduledTask struct {
+	name      string
+	deadline time.Time
+}
+
+// Execute 执行任务
+func (t *ScheduledTask) Execute() error {
+	// 创建带截止时间的 context
+	ctx, cancel := context.WithDeadline(context.Background(), t.deadline)
+	defer cancel()
+
+	fmt.Printf("任务 %s 开始执行，截止时间: %v\n", t.name, t.deadline)
+
+	// 模拟任务执行
+	time.Sleep(2 * time.Second)
+
+	// 检查是否已超时
+	select {
+	case <-ctx.Done():
+		return fmt.Errorf("任务 %s 已超过截止时间: %w", t.name, ctx.Err())
+	default:
+		fmt.Printf("任务 %s 在截止时间前完成\n", t.name)
+		return nil
+	}
+}
+
+func main() {
+	// 创建一个即将到期的任务
+	task := &ScheduledTask{
+		name:      "urgent-task",
+		deadline: time.Now().Add(1 * time.Second),
+	}
+
+	err := task.Execute()
+	if err != nil {
+		fmt.Println("错误:", err)
+	}
+}
+```
+
+---
+
+## 传递值
+
+### WithValue
+
+`WithValue` 创建一个携带键值对的 context，用于传递请求范围的数据：
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+)
+
+// context key 类型（避免冲突）
+type contextKey string
+
+const (
+	// TraceIDKey 追踪 ID
+	TraceIDKey contextKey = "trace-id"
+	// UserIDKey 用户 ID
+	UserIDKey contextKey = "user-id"
+	// RequestIDKey 请求 ID
+	RequestIDKey contextKey = "request-id"
+)
+
+// RequestContext 请求上下文
+type RequestContext struct {
+	TraceID   string
+	UserID    string
+	RequestID string
+}
+
+// NewRequestContext 创建请求上下文
+func NewRequestContext(traceID, userID, requestID string) *RequestContext {
+	return &RequestContext{
+		TraceID:   traceID,
+		UserID:    userID,
+		RequestID: requestID,
+	}
+}
+
+// ContextWithRequestContext 将请求上下文存入 context
+func ContextWithRequestContext(ctx context.Context, rc *RequestContext) context.Context {
+	ctx = context.WithValue(ctx, TraceIDKey, rc.TraceID)
+	ctx = context.WithValue(ctx, UserIDKey, rc.UserID)
+	ctx = context.WithValue(ctx, RequestIDKey, rc.RequestID)
+	return ctx
+}
+
+// TraceIDFromContext 从 context 获取追踪 ID
+func TraceIDFromContext(ctx context.Context) string {
+	if traceID, ok := ctx.Value(TraceIDKey).(string); ok {
+		return traceID
+	}
+	return ""
+}
+
+// UserIDFromContext 从 context 获取用户 ID
+func UserIDFromContext(ctx context.Context) string {
+	if userID, ok := ctx.Value(UserIDKey).(string); ok {
+		return userID
+	}
+	return ""
+}
+
+// TaskProcessor 任务处理器
+type TaskProcessor struct {
+	name string
+}
+
+// NewTaskProcessor 创建任务处理器
+func NewTaskProcessor(name string) *TaskProcessor {
+	return &TaskProcessor{name: name}
+}
+
+// ProcessTask 处理任务
+func (p *TaskProcessor) ProcessTask(ctx context.Context, taskID string) error {
+	// 从 context 获取追踪信息
+	traceID := TraceIDFromContext(ctx)
+	userID := UserIDFromContext(ctx)
+
+	fmt.Printf("[%s] 处理任务 %s (trace-id: %s, user-id: %s)\n",
+		p.name, taskID, traceID, userID)
+
+	// 模拟任务处理
+	return nil
+}
+
+func main() {
+	// 创建请求上下文
+	rc := NewRequestContext("trace-123", "user-456", "req-789")
+
+	// 创建带请求上下文的 context
+	ctx := ContextWithRequestContext(context.Background(), rc)
+
+	// 创建任务处理器
+	processor := NewTaskProcessor("worker-1")
+
+	// 处理任务
+	err := processor.ProcessTask(ctx, "task-1")
+	if err != nil {
+		fmt.Println("错误:", err)
+	}
+}
+```
+
+---
+
+## 在任务队列中的应用
+
+### 优雅关闭
+
+实现可以优雅关闭的任务队列：
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"time"
+)
+
+// Task 任务
+type Task struct {
+	ID   string
+	Name string
+	Data interface{}
+}
+
+// TaskQueue 任务队列
+type TaskQueue struct {
+	tasks    chan *Task
+	workers  []*Worker
+	wg       sync.WaitGroup
+	ctx      context.Context
+	cancel   context.CancelFunc
+}
+
+// NewTaskQueue 创建任务队列
+func NewTaskQueue(workerCount int, queueSize int) *TaskQueue {
+	ctx, cancel := context.WithCancel(context.Background())
+
+	return &TaskQueue{
+		tasks:   make(chan *Task, queueSize),
+		ctx:     ctx,
+		cancel:  cancel,
+		workers: make([]*Worker, workerCount),
+	}
+}
+
+// Start 启动任务队列
+func (q *TaskQueue) Start() {
+	fmt.Printf("启动任务队列，worker 数量: %d\n", len(q.workers))
+
+	// 创建并启动 workers
+	for i := 0; i < len(q.workers); i++ {
+		worker := NewWorker(i, q.tasks)
+		q.workers[i] = worker
+
+		q.wg.Add(1)
+		go worker.Run(&q.wg, q.ctx)
+	}
+}
+
+// Submit 提交任务
+func (q *TaskQueue) Submit(task *Task) error {
+	select {
+	case <-q.ctx.Done():
+		// 队列已关闭
+		return fmt.Errorf("任务队列已关闭")
+
+	case q.tasks <- task:
+		// 任务已提交
+		return nil
+	}
+}
+
+// Shutdown 优雅关闭
+func (q *TaskQueue) Shutdown(timeout time.Duration) error {
+	fmt.Println("开始关闭任务队列...")
+
+	// 关闭任务通道
+	close(q.tasks)
+
+	// 等待所有 worker 完成当前任务
+	done := make(chan struct{})
+	go func() {
+		q.wg.Wait()
+		close(done)
+	}()
+
+	// 等待或超时
+	select {
+	case <-done:
+		fmt.Println("所有 worker 已完成")
+		return nil
+
+	case <-time.After(timeout):
+		// 超时，强制取消
+		fmt.Println("关闭超时，强制取消...")
+		q.cancel()
+		<-done // 等待取消完成
+		return fmt.Errorf("关闭超时")
+	}
+}
+
+// Worker worker
+type Worker struct {
+	id     int
+	taskCh <-chan *Task
+}
+
+// NewWorker 创建 worker
+func NewWorker(id int, taskCh <-chan *Task) *Worker {
+	return &Worker{
+		id:     id,
+		taskCh: taskCh,
+	}
+}
+
+// Run 运行 worker
+func (w *Worker) Run(wg *sync.WaitGroup, ctx context.Context) {
+	defer wg.Done()
+
+	fmt.Printf("Worker %d 启动\n", w.id)
+
+	for {
+		select {
+		case <-ctx.Done():
+			// 收到停止信号
+			fmt.Printf("Worker %d 收到停止信号\n", w.id)
+			return
+
+		case task, ok := <-w.taskCh:
+			if !ok {
+				// 任务通道已关闭
+				fmt.Printf("Worker %d 任务通道已关闭\n", w.id)
+				return
+			}
+			// 处理任务
+			w.processTask(task)
+		}
+	}
+}
+
+// processTask 处理任务
+func (w *Worker) processTask(task *Task) {
+	fmt.Printf("Worker %d 开始处理任务 %s\n", w.id, task.ID)
+
+	// 模拟任务处理
+	time.Sleep(500 * time.Millisecond)
+
+	fmt.Printf("Worker %d 完成任务 %s\n", w.id, task.ID)
+}
+
+func main() {
+	// 创建任务队列
+	queue := NewTaskQueue(3, 10)
+	queue.Start()
+
+	// 提交一些任务
+	for i := 1; i <= 10; i++ {
+		task := &Task{
+			ID:   fmt.Sprintf("task-%d", i),
+			Name: fmt.Sprintf("Task %d", i),
+		}
+		if err := queue.Submit(task); err != nil {
+			fmt.Printf("提交任务失败: %v\n", err)
+		}
+	}
+
+	// 等待一段时间
+	time.Sleep(2 * time.Second)
+
+	// 优雅关闭
+	err := queue.Shutdown(5 * time.Second)
+	if err != nil {
+		fmt.Println("关闭出错:", err)
+	}
+
+	fmt.Println("程序退出")
+}
+```
+
+### 带超时的任务执行
+
+为每个任务设置独立的超时：
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// TaskExecutor 任务执行器
+type TaskExecutor struct {
+	defaultTimeout time.Duration
+}
+
+// NewTaskExecutor 创建任务执行器
+func NewTaskExecutor(defaultTimeout time.Duration) *TaskExecutor {
+	return &TaskExecutor{
+		defaultTimeout: defaultTimeout,
+	}
+}
+
+// Execute 执行任务
+func (e *TaskExecutor) Execute(ctx context.Context, task *Task) error {
+	// 从 context 获取超时时间
+	if deadline, ok := ctx.Deadline(); ok {
+		// 计算剩余时间
+		timeout := time.Until(deadline)
+		if timeout <= 0 {
+			return fmt.Errorf("任务 %s 已超时", task.ID)
+		}
+		fmt.Printf("任务 %s 剩余时间: %v\n", task.ID, timeout)
+	}
+
+	// 创建带超时的 context
+	timeout := e.defaultTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+	}
+
+	taskCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	// 创建结果 channel
+	resultCh := make(chan error, 1)
+
+	// 执行任务
+	go func() {
+		resultCh <- e.doWork(task)
+	}()
+
+	// 等待任务完成或超时
+	select {
+	case <-taskCtx.Done():
+		return fmt.Errorf("任务 %s 超时或取消: %w", task.ID, taskCtx.Err())
+
+	case err := <-resultCh:
+		return err
+	}
+}
+
+// doWork 执行实际工作
+func (e *TaskExecutor) doWork(task *Task) error {
+	// 模拟不同任务的不同执行时间
+	sleepTime := time.Duration(task.ID[len(task.ID)-1]-'0') * 200 * time.Millisecond
+	time.Sleep(sleepTime)
+	fmt.Printf("任务 %s 完成，耗时 %v\n", task.ID, sleepTime)
+	return nil
+}
+
+func main() {
+	executor := NewTaskExecutor(1 * time.Second)
+
+	// 创建父 context
+	ctx := context.Background()
+
+	// 执行多个任务
+	for i := 1; i <= 5; i++ {
+		task := &Task{
+			ID:   fmt.Sprintf("task-%d", i),
+			Name: fmt.Sprintf("Task %d", i),
+		}
+
+		// 为每个任务设置不同的超时
+		var taskCtx context.Context
+		if i%2 == 0 {
+			// 偶数任务：短超时
+			taskCtx, _ = context.WithTimeout(ctx, 500*time.Millisecond)
+		} else {
+			// 奇数任务：长超时
+			taskCtx, _ = context.WithTimeout(ctx, 2*time.Second)
+		}
+
+		err := executor.Execute(taskCtx, task)
+		if err != nil {
+			fmt.Printf("任务 %s 失败: %v\n", task.ID, err)
+		}
+	}
+}
+```
+
+### 请求追踪
+
+使用 context 实现分布式追踪：
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// TraceIDKey 追踪 ID key
+type TraceIDKey struct{}
+
+// NewContextWithTraceID 创建带追踪 ID 的 context
+func NewContextWithTraceID(ctx context.Context, traceID string) context.Context {
+	return context.WithValue(ctx, TraceIDKey{}, traceID)
+}
+
+// TraceIDFromContext 从 context 获取追踪 ID
+func TraceIDFromContext(ctx context.Context) string {
+	if traceID, ok := ctx.Value(TraceIDKey{}).(string); ok {
+		return traceID
+	}
+	return "unknown"
+}
+
+// TaskWithTrace 带追踪的任务
+type TaskWithTrace struct {
+	ID      string
+	TraceID string
+}
+
+// TaskProcessor 任务处理器
+type TaskProcessor struct {
+	name string
+}
+
+// NewTaskProcessor 创建任务处理器
+func NewTaskProcessor(name string) *TaskProcessor {
+	return &TaskProcessor{name: name}
+}
+
+// ProcessTask 处理任务
+func (p *TaskProcessor) ProcessTask(ctx context.Context, task *TaskWithTrace) error {
+	// 从 context 获取追踪 ID
+	traceID := TraceIDFromContext(ctx)
+
+	fmt.Printf("[%s] 处理任务 %s (trace-id: %s)\n", p.name, task.ID, traceID)
+
+	// 创建子 context，传递追踪 ID
+	childCtx := NewContextWithTraceID(ctx, traceID)
+
+	// 调用子处理器
+	subProcessor := NewTaskProcessor(p.name + ".sub")
+	if err := subProcessor.ProcessTask(childCtx, task); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func main() {
+	// 创建追踪 ID
+	traceID := "trace-12345"
+
+	// 创建带追踪 ID 的 context
+	ctx := NewContextWithTraceID(context.Background(), traceID)
+
+	// 创建任务
+	task := &TaskWithTrace{
+		ID:      "task-1",
+		TraceID: traceID,
+	}
+
+	// 创建处理器
+	processor := NewTaskProcessor("main-processor")
+
+	// 处理任务
+	err := processor.ProcessTask(ctx, task)
+	if err != nil {
+		fmt.Println("处理失败:", err)
+	}
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. Context 作为第一个参数
+
+```go
+// ✅ 推荐：Context 作为第一个参数
+func ProcessTask(ctx context.Context, task *Task) error {
+    // ...
+}
+
+// ❌ 避免：Context 不是第一个参数
+func ProcessTask(task *Task, ctx context.Context) error {
+    // ...
+}
+```
+
+### 2. 不要存储 Context
+
+```go
+// ❌ 避免：在结构体中存储 Context
+type Server struct {
+    ctx context.Context
+}
+
+// ✅ 推荐：每个方法传递 Context
+func (s *Server) Process(ctx context.Context, data string) error {
+    // ...
+}
+```
+
+### 3. 及时调用 cancel 函数
+
+```go
+// ✅ 推荐：使用 defer 确保 cancel 被调用
+func doWork() error {
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel() // 确保资源被释放
+
+    // 使用 ctx
+    return nil
+}
+
+// ❌ 避免：忘记调用 cancel
+func doWork() error {
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    // 忘记调用 cancel，会导致资源泄漏
+    return nil
+}
+```
+
+### 4. 使用自定义 key 类型
+
+```go
+// ✅ 推荐：使用自定义类型避免冲突
+type userIDKey struct{}
+type traceIDKey struct{}
+
+ctx = context.WithValue(ctx, userIDKey{}, "user-123")
+
+// ❌ 避免：使用内置类型可能导致冲突
+ctx = context.WithValue(ctx, "userID", "user-123")
+ctx = context.WithValue(ctx, "userID", "user-456") // 覆盖了之前的值
+```
+
+---
+
+## Trade-off 分析
+
+### Context 的优势
+
+1. **统一的生命周期管理**
+   - 标准化的取消机制
+   - 超时控制
+   - 优雅关闭
+
+2. **请求追踪**
+   - 分布式追踪支持
+   - 日志关联
+   - 调试便利
+
+3. **取消传播**
+   - 自动级联取消
+   - 资源清理
+   - 避免泄漏
+
+### Context 的劣势
+
+1. **传递开销**
+   - 每层都需要传递
+   - 代码冗长
+   - 容易遗忘
+
+2. **类型不安全**
+   - Value 是 interface{}
+   - 运行时错误
+   - 需要类型断言
+
+3. **滥用风险**
+   - 存储不该存的数据
+   - 作为可选参数
+   - 替代函数参数
+
+### 使用建议
+
+**应该使用 Context 的场景：**
+
+- RPC 调用和 HTTP 请求
+- 长时间运行的操作
+- 需要取消的 goroutine
+- 请求追踪和日志
+
+**不应该使用 Context 的场景：**
+
+- 短暂的函数调用
+- 不需要取消的操作
+- 结构体字段
+- 函数的可选参数
+
+---
+
+## 总结
+
+我们学习了：
+
+1. **Context 基础**：
+   - Context 接口
+   - 创建 Context
+   - Background 和 TODO
+
+2. **取消控制**：
+   - WithCancel
+   - 级联取消
+   - 优雅关闭
+
+3. **超时控制**：
+   - WithTimeout
+   - WithDeadline
+   - 超时处理
+
+4. **传递值**：
+   - WithValue
+   - 自定义 key 类型
+   - 请求追踪
+
+5. **在任务队列中的应用**：
+   - 优雅关闭任务队列
+   - 带超时的任务执行
+   - 分布式追踪
+
+6. **最佳实践**：
+   - Context 作为第一个参数
+   - 不存储 Context
+   - 及时调用 cancel
+
+Context 是 Go 并发编程的重要组成部分，它提供了一种标准的方式来管理操作的生命周期。在任务队列系统中，Context 帮助我们实现了优雅关闭、超时控制和请求追踪，这些都是生产级系统必备的功能。

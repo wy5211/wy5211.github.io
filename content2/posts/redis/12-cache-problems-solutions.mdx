@@ -1,0 +1,553 @@
+---
+title: "12. 缓存三大问题解决方案：穿透、击穿与雪崩"
+date: "2026-03-23"
+summary: "深入理解缓存穿透、击穿、雪崩三大问题及其解决方案，构建高可用缓存系统。"
+tags: ["Redis", "缓存问题", "布隆过滤器"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 12
+---
+
+上篇文章我们实现了 Cache-Aside 缓存模式，用户信息接口性能提升了不少。但上线后监控发现几个问题：
+
+- 有个用户疯狂请求一个不存在的用户 ID，每次都打到数据库
+- 某个大主播开播时，缓存刚好过期，大量请求瞬间打到数据库
+- 凌晨缓存集中过期，数据库 CPU 飙升
+
+这就是经典的缓存三大问题：穿透、击穿、雪崩。今天我们就来分析这些问题，并给出解决方案。
+
+## 缓存穿透
+
+缓存穿透是指查询一个不存在的数据，缓存没有，数据库也没有。每次请求都会穿透缓存打到数据库。
+
+假设有个恶意用户一直请求不存在的用户 ID：
+
+```typescript
+// 正常的查询逻辑
+async function getUserInfo(userId: string) {
+  const cacheKey = `user:info:${userId}`;
+
+  // 查缓存
+  let user = await redis.get(cacheKey);
+  if (user) {
+    return JSON.parse(user);
+  }
+
+  // 查数据库
+  user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+  if (!user) {
+    return null; // 数据库也没有
+  }
+
+  // 写缓存
+  await redis.setex(cacheKey, 3600, JSON.stringify(user));
+  return user;
+}
+```
+
+如果请求的是不存在的用户 ID（比如 usr_fake999），每次都会查数据库，数据库压力很大。
+
+### 方案一：缓存空值
+
+最简单的解决方案是缓存空值：
+
+```typescript
+async function getUserInfoWithNullCache(userId: string) {
+  const cacheKey = `user:info:${userId}`;
+
+  let user = await redis.get(cacheKey);
+  if (user) {
+    // 判断是否是空值标记
+    if (user === "NULL") {
+      return null;
+    }
+    return JSON.parse(user);
+  }
+
+  // 查数据库
+  user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+  if (!user) {
+    // 缓存空值，过期时间短一点（比如 60 秒）
+    await redis.setex(cacheKey, 60, "NULL");
+    return null;
+  }
+
+  // 写缓存
+  await redis.setex(cacheKey, 3600, JSON.stringify(user));
+  return user;
+}
+```
+
+这样下次再查询同一个不存在的用户 ID 时，直接从缓存返回 null，不会打到数据库。
+
+但这个方案也有问题：如果有大量不同的不存在的 ID，会把缓存撑满。而且空值的过期时间设置是个问题，太短容易失效，太长占用内存。
+
+### 方案二：布隆过滤器
+
+布隆过滤器是一个空间效率很高的数据结构，可以快速判断一个元素是否在集合中：
+
+```typescript
+import { BloomFilter } from "bloom-filters";
+
+// 初始化布隆过滤器
+const bloomFilter = new BloomFilter(100000, 0.01); // 10 万元素，1% 误判率
+
+// 系统启动时预加载所有存在的用户 ID
+async function initBloomFilter() {
+  const allUserIds = await db.query("SELECT id FROM users");
+  for (const row of allUserIds) {
+    bloomFilter.add(row.id);
+  }
+}
+
+async function getUserInfoWithBloomFilter(userId: string) {
+  // 先用布隆过滤器判断用户 ID 是否存在
+  if (!bloomFilter.has(userId)) {
+    // 肯定不存在，直接返回
+    console.log(`布隆过滤器拦截：${userId}`);
+    return null;
+  }
+
+  // 可能存在，继续正常流程
+  const cacheKey = `user:info:${userId}`;
+  let user = await redis.get(cacheKey);
+  if (user) {
+    return JSON.parse(user);
+  }
+
+  user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+  if (user) {
+    await redis.setex(cacheKey, 3600, JSON.stringify(user));
+  }
+
+  return user;
+}
+```
+
+布隆过滤器的优势是空间效率高，100 万个用户 ID 只需要几 MB 内存。但它有个缺点：有误判率，可能把不存在的元素判断为存在（但不会把存在的判断为不存在）。
+
+布隆过滤器适合数据量大、可以接受少量误判的场景。
+
+### 方案三：Redis 布隆过滤器
+
+Redis 4.0+ 提供了布隆过滤器模块，比自己实现更可靠：
+
+```bash
+# 添加元素
+redis-cli BF.ADD user_filter usr_a1b2c3
+redis-cli BF.ADD user_filter usr_d4e5f6
+
+# 判断元素是否存在
+redis-cli BF.EXISTS user_filter usr_a1b2c3  # 1
+redis-cli BF.EXISTS user_filter usr_fake999  # 0
+```
+
+```typescript
+// 使用 ioredis 调用
+async function initUserFilter() {
+  // 预加载所有用户 ID
+  const userIds = await db.query("SELECT id FROM users");
+
+  for (const row of userIds) {
+    await redis.call("BF.ADD", "user_filter", row.id);
+  }
+}
+
+async function getUserInfo(userId: string) {
+  // 先检查布隆过滤器
+  const exists = await redis.call("BF.EXISTS", "user_filter", userId);
+  if (exists === 0) {
+    return null;
+  }
+
+  // 继续正常流程
+  // ...
+}
+```
+
+## 缓存击穿
+
+缓存击穿是指热点数据过期时，大量请求同时打到数据库。
+
+比如直播平台有个大主播 wang_dev 正在直播，有几万人在线。他的用户信息缓存在某个时刻过期了，刚好有大量请求同时进来，全部打到数据库。
+
+### 方案一：互斥锁
+
+用分布式锁保证只有一个请求去查数据库，其他请求等待：
+
+```typescript
+async function getUserInfoWithLock(userId: string) {
+  const cacheKey = `user:info:${userId}`;
+
+  // 先查缓存
+  let user = await redis.get(cacheKey);
+  if (user) {
+    return JSON.parse(user);
+  }
+
+  // 缓存未命中，尝试获取锁
+  const lockKey = `lock:user:${userId}`;
+  const lockValue = Date.now().toString();
+  const lock = await redis.set(lockKey, lockValue, "NX", "EX", 10);
+
+  if (lock === "OK") {
+    try {
+      // 获取锁成功，查询数据库
+      console.log(`获取锁成功，查询数据库：${userId}`);
+      user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+      if (user) {
+        await redis.setex(cacheKey, 3600, JSON.stringify(user));
+      }
+      return user;
+    } finally {
+      // 释放锁（使用 Lua 脚本保证原子性）
+      const script = `
+        if redis.call("get", KEYS[1]) == ARGV[1] then
+          return redis.call("del", KEYS[1])
+        else
+          return 0
+        end
+      `;
+      await redis.eval(script, 1, lockKey, lockValue);
+    }
+  }
+
+  // 获取锁失败，等待 50ms 后重试
+  console.log(`获取锁失败，等待重试：${userId}`);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  return await getUserInfoWithLock(userId);
+}
+```
+
+这个方案能避免大量请求同时打到数据库，但增加了响应延迟（获取锁失败的请求要等待）。
+
+### 方案二：热点数据永不过期
+
+给热点数据设置逻辑过期时间，物理上不过期：
+
+```typescript
+interface CacheData<T> {
+  value: T;
+  expireTime: number; // 逻辑过期时间
+}
+
+async function getUserInfoWithLogicalExpire(userId: string) {
+  const cacheKey = `user:info:${userId}`;
+
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    const data = JSON.parse(cached) as CacheData<any>;
+
+    // 检查逻辑过期时间
+    if (data.expireTime > Date.now()) {
+      // 未过期，返回数据
+      return data.value;
+    }
+
+    // 过期了，异步刷新缓存
+    refreshCacheAsync(userId);
+    return data.value; // 先返回旧数据
+  }
+
+  // 缓存不存在，直接查询并缓存（物理不过期）
+  const user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+  if (user) {
+    await redis.set(
+      cacheKey,
+      JSON.stringify({
+        value: user,
+        expireTime: Date.now() + 3600 * 1000, // 逻辑过期 1 小时
+      })
+    );
+  }
+
+  return user;
+}
+
+// 异步刷新缓存
+async function refreshCacheAsync(userId: string) {
+  const lockKey = `refresh:user:${userId}`;
+  const lock = await redis.set(lockKey, "1", "NX", "EX", 10);
+
+  if (lock === "OK") {
+    try {
+      console.log(`异步刷新缓存：${userId}`);
+      const user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+      if (user) {
+        const cacheKey = `user:info:${userId}`;
+        await redis.set(
+          cacheKey,
+          JSON.stringify({
+            value: user,
+            expireTime: Date.now() + 3600 * 1000,
+          })
+        );
+      }
+    } finally {
+      await redis.del(lockKey);
+    }
+  }
+}
+```
+
+这个方案的好处是请求不会等待，但缺点是可能返回短时间内的旧数据。
+
+## 缓存雪崩
+
+缓存雪崩是指大量缓存同时失效，导致请求全部打到数据库。
+
+假设你批量预热了 100 个热门主播的缓存，都设置了 3600 秒过期。系统运行 1 小时后，这些缓存同时失效，大量请求同时打到数据库。
+
+### 方案一：过期时间加随机值
+
+在设置过期时间时加上一个随机值，让失效时间错开：
+
+```typescript
+async function setCacheWithRandomTTL(
+  key: string,
+  value: any,
+  baseTTL: number = 3600
+) {
+  // 添加 ±10% 的随机值
+  const randomTTL = baseTTL + Math.random() * baseTTL * 0.2 - baseTTL * 0.1;
+  await redis.setex(key, Math.floor(randomTTL), JSON.stringify(value));
+}
+
+async function warmupCache() {
+  const hotUsers = await db.query(`
+    SELECT * FROM users WHERE is_hot = 1 LIMIT 100
+  `);
+
+  for (const user of hotUsers) {
+    const cacheKey = `user:info:${user.id}`;
+    // 每个缓存的过期时间都不同
+    await setCacheWithRandomTTL(cacheKey, user, 3600);
+  }
+}
+```
+
+这样即使同时预热，缓存的失效时间也会错开，不会同时失效。
+
+### 方案二：缓存预热
+
+系统启动时提前加载热点数据：
+
+```typescript
+async function warmupCacheOnStartup() {
+  console.log("开始预热缓存...");
+
+  // 预热热门主播
+  const hotStreamers = await db.query(`
+    SELECT u.* FROM users u
+    JOIN streamers s ON s.user_id = u.id
+    WHERE s.status = 'live'
+    ORDER BY s.viewers DESC
+    LIMIT 100
+  `);
+
+  for (const user of hotStreamers) {
+    const cacheKey = `user:info:${user.id}`;
+    // 错开过期时间
+    const ttl = 3600 + Math.random() * 600;
+    await redis.setex(cacheKey, Math.floor(ttl), JSON.stringify(user));
+  }
+
+  console.log(`缓存预热完成，共加载 ${hotStreamers.length} 条数据`);
+}
+```
+
+预热的好处是用户进来时缓存已经准备好了，不会出现冷启动问题。
+
+### 方案三：熔断降级
+
+当数据库压力过大时，暂时降级服务：
+
+```typescript
+class CircuitBreaker {
+  private failures = 0;
+  private lastFailTime = 0;
+  private state: "CLOSED" | "OPEN" | "HALF_OPEN" = "CLOSED";
+
+  async execute<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.state === "OPEN") {
+      // 熔断开启，检查是否可以恢复
+      if (Date.now() - this.lastFailTime > 60000) {
+        this.state = "HALF_OPEN";
+        console.log("熔断器进入半开状态");
+      } else {
+        throw new Error("服务熔断，请稍后再试");
+      }
+    }
+
+    try {
+      const result = await fn();
+      this.onSuccess();
+      return result;
+    } catch (error) {
+      this.onFailure();
+      throw error;
+    }
+  }
+
+  private onSuccess() {
+    this.failures = 0;
+    if (this.state === "HALF_OPEN") {
+      this.state = "CLOSED";
+      console.log("熔断器恢复");
+    }
+  }
+
+  private onFailure() {
+    this.failures++;
+    this.lastFailTime = Date.now();
+
+    if (this.failures >= 5) {
+      this.state = "OPEN";
+      console.log("熔断器开启");
+    }
+  }
+}
+
+// 使用熔断器
+const breaker = new CircuitBreaker();
+
+async function getUserInfoWithCircuitBreaker(userId: string) {
+  return await breaker.execute(async () => {
+    const cacheKey = `user:info:${userId}`;
+
+    let user = await redis.get(cacheKey);
+    if (user) {
+      return JSON.parse(user);
+    }
+
+    user = await db.query("SELECT * FROM users WHERE id = ?", [userId]);
+    if (user) {
+      await redis.setex(cacheKey, 3600, JSON.stringify(user));
+    }
+
+    return user;
+  });
+}
+```
+
+熔断器可以在数据库压力大时保护系统，避免雪崩。
+
+## 完整的缓存方案
+
+把上面的方案组合起来，就是一个完整的缓存解决方案：
+
+```typescript
+class RobustCache {
+  private bloomFilter: BloomFilter;
+  private circuitBreaker: CircuitBreaker;
+
+  constructor(
+    private redis: Redis,
+    private db: any
+  ) {
+    this.bloomFilter = new BloomFilter(100000, 0.01);
+    this.circuitBreaker = new CircuitBreaker();
+    this.initBloomFilter();
+  }
+
+  private async initBloomFilter() {
+    const allUserIds = await this.db.query("SELECT id FROM users");
+    for (const row of allUserIds) {
+      this.bloomFilter.add(row.id);
+    }
+  }
+
+  async get(userId: string) {
+    // 1. 布隆过滤器检查（防穿透）
+    if (!this.bloomFilter.has(userId)) {
+      console.log(`布隆过滤器拦截：${userId}`);
+      return null;
+    }
+
+    // 2. 查询缓存
+    const cacheKey = `user:info:${userId}`;
+    let user = await this.redis.get(cacheKey);
+    if (user) {
+      if (user === "NULL") return null;
+      return JSON.parse(user);
+    }
+
+    // 3. 使用互斥锁查询数据库（防击穿）
+    return await this.getWithLock(userId);
+  }
+
+  private async getWithLock(userId: string) {
+    const cacheKey = `user:info:${userId}`;
+    const lockKey = `lock:user:${userId}`;
+    const lockValue = Date.now().toString();
+
+    const lock = await this.redis.set(lockKey, lockValue, "NX", "EX", 10);
+
+    if (lock === "OK") {
+      try {
+        // 使用熔断器（防雪崩）
+        return await this.circuitBreaker.execute(async () => {
+          const user = await this.db.query("SELECT * FROM users WHERE id = ?", [
+            userId,
+          ]);
+
+          if (!user) {
+            // 缓存空值
+            await this.redis.setex(cacheKey, 60, "NULL");
+            return null;
+          }
+
+          // 设置随机过期时间
+          const ttl = 3600 + Math.random() * 600;
+          await this.redis.setex(
+            cacheKey,
+            Math.floor(ttl),
+            JSON.stringify(user)
+          );
+
+          return user;
+        });
+      } finally {
+        const script = `
+          if redis.call("get", KEYS[1]) == ARGV[1] then
+            return redis.call("del", KEYS[1])
+          else
+            return 0
+          end
+        `;
+        await this.redis.eval(script, 1, lockKey, lockValue);
+      }
+    }
+
+    // 获取锁失败，等待重试
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    return await this.get(userId);
+  }
+}
+```
+
+## Trade-off 分析
+
+缓存问题的解决方案都有各自的权衡：
+
+**缓存穿透**：
+
+- 缓存空值：简单但占用内存
+- 布隆过滤器：高效但有误判率，需要预加载
+
+**缓存击穿**：
+
+- 互斥锁：安全但增加延迟
+- 逻辑过期：快速但可能返回旧数据
+
+**缓存雪崩**：
+
+- 随机过期时间：简单有效
+- 缓存预热：增加启动时间
+- 熔断降级：保护系统但影响可用性
+
+在实际应用中，需要根据业务场景选择合适的方案组合。直播平台的用户信息场景，推荐使用：布隆过滤器防穿透 + 互斥锁防击穿 + 随机过期时间防雪崩。
+
+这些方案不是银弹，需要配合完善的监控和告警，才能构建一个真正高可用的缓存系统。

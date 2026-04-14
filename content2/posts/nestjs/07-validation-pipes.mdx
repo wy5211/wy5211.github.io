@@ -1,0 +1,622 @@
+---
+title: "07 别让脏数据进来：数据验证"
+date: "2026-03-30"
+summary: "用 ValidationPipe + class-validator 给博客平台的注册和发布接口加上数据验证，拦住邮箱 hello、密码 123 这类垃圾输入"
+tags: ["NestJS", "验证", "管道", "class-validator", "DTO"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式学习"
+seriesOrder: 7
+---
+
+## 一个真实的翻车现场
+
+上周博客平台上线了注册功能。我打开数据库看了一眼用户表，差点没绷住：
+
+```
+| id              | email         | name      | password     |
+|-----------------|---------------|-----------|--------------|
+| usr_a1x9k2m     | hello         | 张三      | 123          |
+| usr_b2y3l4n     |               | 😂😂😂    | qwerty       |
+| usr_c3z4m5p     | not-an-email  | a         | abc          |
+```
+
+邮箱不是邮箱，密码三个字符，用户名一个 emoji。全是垃圾数据。
+
+更糟糕的是，我们的文章创建接口也没做验证。有人往 `title` 字段塞了 2000 个字符的乱码，直接把首页渲染搞崩了。
+
+上一篇我们搭好了完整的 CRUD API，但所有接口都是"来者不拒"——什么数据都往数据库里写。这篇就解决这个问题：在数据进入业务逻辑之前，把它们拦住。
+
+## 为什么在管道层验证
+
+你可能想问：为什么不直接在 Service 里写 `if` 判断？
+
+```typescript
+// 在 Service 里验证——看起来可以，但问题很多
+async register(email: string, password: string) {
+  if (!email.includes('@')) throw new Error('邮箱格式不对');
+  if (password.length < 8) throw new Error('密码太短');
+  if (password.length > 50) throw new Error('密码太长');
+  if (!/[A-Z]/.test(password)) throw new Error('需要大写字母');
+  if (!/[0-9]/.test(password)) throw new Error('需要数字');
+  // ... 每个接口都要写一堆 if
+}
+```
+
+问题有三个：
+
+1. **验证逻辑和业务逻辑混在一起**。改一个验证规则要动 Service 代码，容易引入 bug。
+2. **无法复用**。注册要验证邮箱，修改邮箱也要验证邮箱，同样的代码写两遍。
+3. **无法统一拦截**。Service 抛的错误格式不统一，前端很难处理。
+
+NestJS 的管道（Pipe）就是干这个的——它夹在请求到达 Controller 之前，专门负责数据转换和验证。验证不通过，请求根本不会进 Controller，直接返回错误。
+
+整个请求处理链路是这样的：
+
+```
+请求进来
+  → Guard（身份检查）
+    → Interceptor（前半段）
+      → Pipe（数据验证和转换）    ← 我们这一篇的重点
+        → Controller
+          → Service
+        → Interceptor（后半段）
+      → ExceptionFilter（如果有异常）
+```
+
+Pipe 负责把关，不合格的数据在这里就被拦住了。
+
+## 管道的两个角色
+
+在开始写代码之前，先搞清楚管道到底做什么。NestJS 的管道（Pipe）有两个职责：
+
+1. **转换（Transformation）**：把输入数据从一种形式转成另一种。比如把字符串 `"123"` 转成数字 `123`，把 `"true"` 转成布尔值 `true`。
+2. **验证（Validation）**：检查输入数据是否符合规则。不符合就抛异常，请求不会继续往下走。
+
+这两个职责可以分开实现，也可以合在一个管道里。NestJS 内置的 `ValidationPipe` 就是两者兼备的。
+
+## 安装依赖
+
+上一篇的 CRUD 项目里我们已经装了 `class-validator` 和 `class-transformer`，但如果没有，跑一下：
+
+```bash
+pnpm add class-validator class-transformer
+```
+
+NestJS 的 `ValidationPipe` 就是通过这两个库协同工作的：
+
+- **class-validator** 提供装饰器，让你在 DTO 类上声明验证规则
+- **class-transformer** 负责把 plain object（从 HTTP 请求解析出来的）转成 DTO 类实例，这样装饰器才能生效
+
+一个关键的理解：HTTP 请求体被 `express.json()` 中间件解析后，得到的是一个普通 JavaScript 对象（plain object），不是 `RegisterDto` 的实例。class-validator 的装饰器是挂在类定义上的，只有类的实例才会触发验证。所以需要 class-transformer 先把 plain object 转成 DTO 实例，class-validator 才能工作。
+
+## 先给注册接口加验证
+
+博客平台的注册接口需要三个字段：邮箱、用户名、密码。我们用一个 DTO 类来定义它们。
+
+```typescript
+// src/users/dto/register.dto.ts
+import {
+  IsEmail,
+  IsNotEmpty,
+  IsString,
+  MinLength,
+  MaxLength,
+  Matches,
+} from "class-validator";
+
+export class RegisterDto {
+  @IsEmail({}, { message: "请输入有效的邮箱地址" })
+  @IsNotEmpty({ message: "邮箱不能为空" })
+  email: string;
+
+  @IsString()
+  @IsNotEmpty({ message: "用户名不能为空" })
+  @MinLength(2, { message: "用户名至少 2 个字符" })
+  @MaxLength(20, { message: "用户名最多 20 个字符" })
+  @Matches(/^[\u4e00-\u9fa5a-zA-Z0-9_]+$/, {
+    message: "用户名只能包含中文、字母、数字和下划线",
+  })
+  name: string;
+
+  @IsString()
+  @IsNotEmpty({ message: "密码不能为空" })
+  @MinLength(8, { message: "密码至少 8 个字符" })
+  @MaxLength(50, { message: "密码最多 50 个字符" })
+  password: string;
+}
+```
+
+逐行看一下在做什么：
+
+- `@IsEmail` 验证邮箱格式。zhang_wei 注册时填 `hello`，直接被拦住。
+- `@Matches(/^[\u4e00-\u9fa5a-zA-Z0-9_]+$/)` 这行正则限制了用户名只能包含中文、字母、数字和下划线。那个填 emoji 的用户再也无法注册了。
+- `@MinLength(8)` 和 `@MaxLength(50)` 控制密码长度范围。
+
+然后在 Controller 里指定 body 的类型：
+
+```typescript
+@Post('register')
+async register(@Body() dto: RegisterDto) {
+  return this.authService.register(dto);
+}
+```
+
+光有 DTO 还不够。如果你现在启动项目发个请求，什么都不会验证——因为 `ValidationPipe` 还没启用。
+
+## 启用 ValidationPipe
+
+在 `main.ts` 里加一行全局管道配置：
+
+```typescript
+// src/main.ts
+import { ValidationPipe } from "@nestjs/common";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true, // 自动剥离 DTO 中未定义的字段
+      forbidNonWhitelisted: true, // 有未定义字段时直接报错
+      transform: true, // 自动类型转换
+    })
+  );
+
+  await app.listen(3000);
+}
+```
+
+三个配置选项值得细说。
+
+**whitelist: true**。用户提交了 DTO 里没有的字段，比如注册时偷偷塞一个 `role: 'admin'`，这个字段会被静默删除。数据库里不会存进去。
+
+**forbidNonWhitelisted: true**。比 whitelist 更严格——有未定义字段时不是静默删除，而是直接返回 400 错误。生产环境建议两个都开，开发阶段可以只开 whitelist 方便调试。
+
+**transform: true**。这个选项经常被忽略，但它解决了 TypeScript 开发者最常见的一个坑。
+
+## transform: true 为什么重要
+
+从 HTTP 请求里拿到的参数，类型永远是 `string`。
+
+```typescript
+// 查询参数 DTO
+export class QueryPostsDto {
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  page?: number = 1;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  limit?: number = 10;
+}
+```
+
+用户访问 `GET /posts?page=2&limit=10`，`page` 和 `limit` 的值其实是字符串 `"2"` 和 `"10"`。如果不开 `transform: true`，你在 Controller 里拿到的 `page` 就是 `"2"`，不是数字 `2`。
+
+`@Type(() => Number)` 告诉 class-transformer 把字符串转成数字。但这个转换只有在 `transform: true` 的时候才会执行。
+
+如果 DTO 里有布尔值字段，同样需要处理：
+
+```typescript
+@IsOptional()
+@Type(() => Boolean)
+@IsBoolean()
+published?: boolean;
+```
+
+用户传 `?published=true`，这是字符串 `"true"`，需要转成布尔值 `true`。
+
+## 自定义验证器：密码强度规则
+
+前面的 `RegisterDto` 里，密码只做了长度检查。但 `12345678` 这样的密码显然不安全。我们需要密码至少包含一个大写字母、一个小写字母和一个数字。
+
+用 `@Matches` 写正则可以做到，但正则可读性差，改规则时要重新理解一长串符号。更好的做法是写一个自定义验证器。
+
+```typescript
+// src/common/validators/password-strength.validator.ts
+import {
+  ValidatorConstraint,
+  ValidatorConstraintInterface,
+  registerDecorator,
+  ValidationOptions,
+} from "class-validator";
+
+@ValidatorConstraint({ name: "isStrongPassword", async: false })
+export class IsStrongPasswordConstraint implements ValidatorConstraintInterface {
+  validate(password: string): boolean {
+    if (password.length < 8) return false;
+    if (!/[A-Z]/.test(password)) return false; // 至少一个大写
+    if (!/[a-z]/.test(password)) return false; // 至少一个小写
+    if (!/[0-9]/.test(password)) return false; // 至少一个数字
+    return true;
+  }
+
+  defaultMessage(): string {
+    return "密码必须至少 8 个字符，且包含大写字母、小写字母和数字";
+  }
+}
+
+// 装饰器函数，方便在 DTO 中使用
+export function IsStrongPassword(validationOptions?: ValidationOptions) {
+  return function (object: object, propertyName: string) {
+    registerDecorator({
+      target: object.constructor,
+      propertyName,
+      options: validationOptions,
+      constraints: [],
+      validator: IsStrongPasswordConstraint,
+    });
+  };
+}
+```
+
+使用的时候，它和内置装饰器一样：
+
+```typescript
+import { IsStrongPassword } from "../../common/validators/password-strength.validator";
+
+export class RegisterDto {
+  // ...其他字段
+
+  @IsStrongPassword()
+  password: string;
+}
+```
+
+zhang_wei 如果尝试注册密码 `password`，会收到明确的错误提示："密码必须至少 8 个字符，且包含大写字母、小写字母和数字"。用 `P@ssw0rd` 就能通过。
+
+为什么用自定义验证器而不是直接 `@Matches`？三个原因：
+
+1. **可读性**。任何人看 `@IsStrongPassword()` 都知道在验证什么，不需要理解正则。
+2. **可维护性**。以后要加"必须包含特殊字符"的规则，改一个类就行，所有用到的地方自动生效。
+3. **错误信息统一**。`defaultMessage()` 返回的错误信息是一致的，不用在每个 `@Matches` 里重复写。
+
+## 异步验证器：检查邮箱是否已注册
+
+有些验证规则没法只看字段本身，需要查数据库。比如"这个邮箱是否已经被注册了"。
+
+class-validator 支持异步验证器：
+
+```typescript
+// src/users/validators/unique-email.validator.ts
+import {
+  ValidatorConstraint,
+  ValidatorConstraintInterface,
+  registerDecorator,
+  ValidationOptions,
+} from "class-validator";
+import { Injectable } from "@nestjs/common";
+import { PrismaService } from "../../database/prisma.service";
+
+@Injectable()
+@ValidatorConstraint({ name: "isEmailUnique", async: true })
+export class IsEmailUniqueConstraint implements ValidatorConstraintInterface {
+  constructor(private prisma: PrismaService) {}
+
+  async validate(email: string): Promise<boolean> {
+    const user = await this.prisma.user.findUnique({
+      where: { email },
+    });
+    return !user;
+  }
+
+  defaultMessage(): string {
+    return "该邮箱已被注册";
+  }
+}
+
+export function IsEmailUnique(validationOptions?: ValidationOptions) {
+  return function (object: object, propertyName: string) {
+    registerDecorator({
+      target: object.constructor,
+      propertyName,
+      options: validationOptions,
+      constraints: [],
+      validator: IsEmailUniqueConstraint,
+      async: true,
+    });
+  };
+}
+```
+
+注意 `@ValidatorConstraint` 里的 `async: true`——这告诉 class-validator 这是一个异步验证器，验证函数返回的是 Promise。
+
+但有一个坑：class-validator 需要能实例化这个约束类。因为我们的验证器依赖 `PrismaService`，需要通过依赖注入获取实例。NestJS 的 `ValidationPipe` 默认不会从 IoC 容器拿验证器实例。
+
+解决办法是在 `main.ts` 里手动传入验证器：
+
+```typescript
+// src/main.ts
+import { useContainer } from "class-validator";
+import { AppModule } from "./app.module";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  // 让 class-validator 从 NestJS 容器获取验证器实例
+  useContainer(app.select(AppModule), { fallbackOnErrors: true });
+
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      transform: true,
+    })
+  );
+
+  await app.listen(3000);
+}
+```
+
+`useContainer` 这行是关键。没有它，异步验证器里的 `PrismaService` 拿不到，验证会报错。
+
+## 给发布文章接口加验证
+
+注册搞定了，接下来是文章发布接口。zhang_wei 想发布一篇「从 Express 迁移到 NestJS 的踩坑记录」，我们需要确保标题、内容、摘要都符合要求。
+
+```typescript
+// src/posts/dto/create-post.dto.ts
+import {
+  IsString,
+  IsNotEmpty,
+  IsOptional,
+  MaxLength,
+  MinLength,
+  IsUrl,
+  IsArray,
+  ArrayMaxSize,
+} from "class-validator";
+
+export class CreatePostDto {
+  @IsString()
+  @IsNotEmpty({ message: "文章标题不能为空" })
+  @MinLength(5, { message: "标题至少 5 个字符" })
+  @MaxLength(200, { message: "标题最多 200 个字符" })
+  title: string;
+
+  @IsString()
+  @IsNotEmpty({ message: "文章内容不能为空" })
+  @MinLength(50, { message: "正文至少 50 个字符，写详细一点" })
+  content: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(500, { message: "摘要最多 500 个字符" })
+  excerpt?: string;
+
+  @IsOptional()
+  @IsUrl({}, { message: "封面图必须是有效的 URL" })
+  coverImage?: string;
+
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(5, { message: "最多 5 个标签" })
+  @IsString({ each: true })
+  tags?: string[];
+}
+```
+
+几个值得注意的点：
+
+- **内容最少 50 字符**。防止有人发空文章或者一句话文章占位。
+- **摘要可选但有上限**。如果用户不填摘要，前端可以自动截取内容的前 200 字。
+- **标签用数组**，最多 5 个。`@IsString({ each: true })` 确保数组里每个元素都是字符串。
+- **封面图验证 URL 格式**。防止存入无效的图片链接。
+
+## 更新接口的验证：PartialType 的坑
+
+文章更新接口和创建接口共用大部分字段，但区别在于：创建时标题和内容是必填的，更新时所有字段都应该是可选的——用户可能只想改个摘要。
+
+NestJS 提供了 `PartialType` 来处理这个场景：
+
+```typescript
+// src/posts/dto/update-post.dto.ts
+import { PartialType } from "@nestjs/swagger";
+import { CreatePostDto } from "./create-post.dto";
+
+export class UpdatePostDto extends PartialType(CreatePostDto) {}
+```
+
+`PartialType` 把 `CreatePostDto` 的所有字段变成可选的。但有一个细节要注意：`@IsNotEmpty()` 和 `@IsOptional()` 的关系。
+
+`@IsOptional()` 的含义是"如果字段不存在或为 `null`/`undefined`，跳过验证"。而 `@IsNotEmpty()` 的含义是"字段不能为空字符串"。
+
+当你用 `PartialType` 时，NestJS 实际上是在父类的每个属性上加上了 `@IsOptional()`。这意味着用户更新时如果不传某个字段，验证会跳过；但如果传了空字符串 `""`，`@IsNotEmpty()` 仍然会报错。
+
+这正好是我们想要的行为——不传就不验证，传了就要符合规则。
+
+还有一个细节：`PartialType` 不只是把必填变可选，它还会继承所有的装饰器。所以 `CreatePostDto` 上的 `@MaxLength(200)`、`@MinLength(5)` 等规则在 `UpdatePostDto` 里一样生效。不需要重复声明。
+
+如果更新接口需要排除某些字段（比如标题不允许单独修改），可以用 `OmitType`：
+
+```typescript
+import { PartialType, OmitType } from "@nestjs/swagger";
+
+// 继承 CreatePostDto 但排除 title 字段
+export class UpdatePostDto extends PartialType(
+  OmitType(CreatePostDto, ["title"] as const)
+) {}
+```
+
+这样用户更新文章时不能修改标题，只能改内容、摘要、封面图等。
+
+## 验证嵌套对象
+
+如果 DTO 里有嵌套对象，需要额外处理。比如用户注册时带了一个地址信息：
+
+```typescript
+import { Type } from "class-transformer";
+import { ValidateNested } from "class-validator";
+
+export class AddressDto {
+  @IsString()
+  @IsNotEmpty()
+  city: string;
+
+  @IsString()
+  @Matches(/^\d{5,6}$/, { message: "邮编格式不正确" })
+  postalCode: string;
+}
+
+export class RegisterWithAddressDto {
+  @IsEmail()
+  email: string;
+
+  @ValidateNested()
+  @Type(() => AddressDto) // 必须加 @Type
+  address: AddressDto;
+}
+```
+
+`@ValidateNested()` 告诉 class-validator 这个嵌套对象也需要验证。`@Type(() => AddressDto)` 告诉 class-transformer 把 plain object 转成 `AddressDto` 实例——否则验证装饰器不会生效。
+
+忘了加 `@Type(() => ...)` 是最常见的坑之一。嵌套对象的验证会静默失败，不会报错，但也不会验证。
+
+如果嵌套的是数组，需要用 `{ each: true }`：
+
+```typescript
+export class CreatePostDto {
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => TagDto)
+  tags?: TagDto[];
+}
+
+export class TagDto {
+  @IsString()
+  @IsNotEmpty()
+  name: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(20)
+  description?: string;
+}
+```
+
+`{ each: true }` 让 `@ValidateNested` 验证数组里的每个元素。`@Type(() => TagDto)` 确保数组里的每个 plain object 都被转成 `TagDto` 实例。
+
+## 全局管道 vs 局部管道
+
+到目前为止我们用的是全局管道，在 `main.ts` 里配置，所有接口都生效。但有些场景需要差异化配置。
+
+**场景 1：某些接口需要更宽松的验证**
+
+```typescript
+// 在 Controller 方法上覆盖全局配置
+@Post('draft')
+@UsePipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: false }))
+createDraft(@Body() dto: CreateDraftDto) {
+  // 允许传入额外字段，比如前端的草稿标记
+}
+```
+
+**场景 2：全局管道的 transform 影响了某个接口**
+
+如果你的某个接口接收的数据格式比较特殊，全局的 `transform: true` 可能会把它转坏。这时候可以在那个方法上单独配置管道。
+
+**场景 3：用内置的 ParseIntPipe 处理路径参数**
+
+```typescript
+@Get(':id')
+findOne(@Param('id', ParseIntPipe) id: number) {
+  return this.postsService.findOne(id);
+}
+```
+
+`ParseIntPipe` 是 NestJS 内置的管道，专门用来把路径参数转成整数。如果 `id` 不是数字，直接返回 400 错误。
+
+实际项目中，我建议全局管道处理 90% 的场景，局部管道只处理特殊情况。维护一个全局配置比在每个 Controller 上重复配置要省心得多。
+
+## 验证组：同一个 DTO，不同场景不同规则
+
+有一种场景比较棘手：创建和更新用同一个 DTO 类，但验证规则不同。比如创建时密码是必填的，更新时密码是可选的——如果用户传了密码才验证强度。
+
+class-validator 提供了验证组（Validation Groups）来解决：
+
+```typescript
+import { IsNotEmpty, MinLength, IsEmail } from "class-validator";
+
+export class UserDto {
+  @IsEmail({}, { message: "请输入有效的邮箱地址" })
+  email: string;
+
+  @IsNotEmpty({ groups: ["create"], message: "用户名不能为空" })
+  @MinLength(2, {
+    groups: ["create", "update"],
+    message: "用户名至少 2 个字符",
+  })
+  name: string;
+
+  @IsNotEmpty({ groups: ["create"], message: "密码不能为空" })
+  @MinLength(8, { groups: ["create", "update"], message: "密码至少 8 个字符" })
+  password?: string;
+}
+```
+
+`groups: ['create']` 表示这个规则只在 `create` 组生效。`groups: ['create', 'update']` 表示两个组都生效。
+
+在 Controller 里指定用哪个组：
+
+```typescript
+@Post()
+@UsePipes(new ValidationPipe({ groups: ['create'] }))
+create(@Body() dto: UserDto) {
+  // 密码必填，用户名必填
+}
+
+@Patch(':id')
+@UsePipes(new ValidationPipe({ groups: ['update'] }))
+update(@Param('id') id: string, @Body() dto: UserDto) {
+  // 密码可选，用户名至少 2 个字符
+}
+```
+
+验证组在字段少的时候很方便，但字段多了之后维护成本会升高——你得记住每个字段在哪个组里有什么规则。实际项目中，更常见的做法是用两个独立的 DTO（`CreateXxxDto` 和 `UpdateXxxDto`），职责更清晰。
+
+## 验证失败时返回什么
+
+现在我们的接口验证失败时，ValidationPipe 会抛出一个 `BadRequestException`，NestJS 默认返回这样的格式：
+
+```json
+{
+  "statusCode": 400,
+  "message": [
+    "email must be an email",
+    "password must be longer than or equal to 8 characters"
+  ],
+  "error": "Bad Request"
+}
+```
+
+信息是英文的，而且格式是 NestJS 的默认格式，不是我们博客平台的统一格式。但别急，统一错误响应是下一篇的内容。这一篇我们先把验证逻辑写对，下一篇用全局异常过滤器统一输出格式。
+
+## 小结
+
+回顾一下这一篇做了什么：
+
+1. **用 ValidationPipe + class-validator** 在管道层拦截脏数据，而不是在 Service 里写 if 判断
+2. **whitelist + forbidNonWhitelisted** 防止用户传入未定义字段（比如偷偷塞 `role: 'admin'`）
+3. **transform: true** 解决了查询参数全是字符串的问题
+4. **自定义验证器** 处理复杂的密码强度规则，比正则更可读更可维护
+5. **异步验证器** 查数据库检查邮箱唯一性
+6. **PartialType** 复用创建 DTO 来生成更新 DTO
+
+核心思路就一句话：**验证是管道的职责，不是 Service 的职责**。把验证逻辑从业务逻辑中剥离出来，代码更干净，验证规则更集中，前端拿到的错误信息也更一致。
+
+## 踩坑清单
+
+最后总结几个在实际项目中经常踩的坑：
+
+1. **忘了开 transform**。查询参数永远是字符串，DTO 里声明的 `number` 类型拿到的还是字符串。`@Type(() => Number)` 和 `transform: true` 缺一不可。
+2. **忘了加 @Type 给嵌套对象**。嵌套对象的验证会静默通过，不报错也不验证。这个 bug 很难排查，因为没有任何错误信息。
+3. **@IsOptional 和 @IsNotEmpty 冲突**。加了 `@IsOptional()` 后，字段为 `undefined` 时所有验证都会跳过。如果你希望"传了空字符串也要报错"，确保 `@IsNotEmpty()` 和 `@IsOptional()` 的搭配是对的。
+4. **PartialType 不会复制元数据**。`PartialType` 来自 `@nestjs/swagger`，它会继承 class-validator 的装饰器，但如果你的类上有自定义装饰器，可能不会被继承。遇到这种情况可以手动复制装饰器。
+5. **验证顺序**。class-validator 按照装饰器的声明顺序验证。如果你想先验证格式再验证长度，注意装饰器的顺序。
+
+验证加好了，但验证失败时抛出的错误格式还是 NestJS 默认的。下一篇我们要解决的问题是：让所有接口——无论成功还是失败——都返回统一的响应格式，让前端同学不再崩溃。

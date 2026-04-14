@@ -1,0 +1,397 @@
+---
+title: "03 依赖注入与自动配置"
+date: "2026-03-30"
+summary: "Node.js 的 require 和 Spring 的 DI 有本质区别。从 Controller 里堆积的业务逻辑出发，理解 IoC 容器、Bean 生命周期和 @Autowired 的真正含义。"
+tags: ["Spring Boot", "IoC", "DI", "Bean"]
+category: "springboot"
+cover: ""
+draft: false
+series: "Spring Boot 实战"
+seriesOrder: 3
+---
+
+上一篇我们实现了文章的完整 CRUD，所有逻辑——数据存储、分页计算、状态设置——都写在 `PostController` 里。对于一个两三个接口的演示项目，这没问题。但当接口数量增长到几十个、业务逻辑变得复杂（创建文章时要校验 slug 唯一性、自动生成摘要、触发通知），Controller 会迅速膨胀成不可维护的怪物。
+
+在 Express 里，拆分的方式很直接：建一个 `postService.js`，用 `require('./service/postService')` 引入，然后在路由 handler 里调用。Spring Boot 的做法完全不同——你不需要手动引入任何东西，只需要声明"我需要 PostService"，框架会在启动时自动把它注入进来。
+
+这个机制就是依赖注入（Dependency Injection），它是 Spring 的灵魂。
+
+## Express 里的依赖管理：手动 require
+
+先回顾一下 Express 是怎么拆分层的。假设我们从 `PostController`（路由文件）里抽出业务逻辑到 `PostService`：
+
+```js
+// service/postService.js
+const posts = [];
+
+function createPost(title, slug, content) {
+  const post = {
+    id: posts.length + 1,
+    title,
+    slug,
+    content,
+    status: "DRAFT",
+    viewCount: 0,
+    createdAt: new Date().toISOString(),
+  };
+  posts.push(post);
+  return post;
+}
+
+module.exports = { createPost };
+```
+
+```js
+// routes/posts.js
+const postService = require("../service/postService");
+
+router.post("/posts", (req, res) => {
+  const { title, slug, content } = req.body;
+  const post = postService.createPost(title, slug, content);
+  res.status(201).json(post);
+});
+```
+
+这个模式在 Express 里工作得很好——清晰、直观、容易理解。但它有一个根本性的局限：**依赖关系是硬编码的**。
+
+假设 `PostService` 依赖一个 `NotificationService`，`NotificationService` 又依赖一个 `EmailService`。每加一层依赖，你就多一个 `require`。当项目变大、同一个 Service 被多个路由文件引用时，模块之间的依赖关系会变得难以追踪。更关键的是，如果你想替换 `EmailService` 的实现（比如测试时换成 mock），你需要手动修改每一处 `require` 或者用复杂的 proxyquire hack。
+
+Spring 的 IoC 容器用另一种方式解决这个问题：你不需要关心对象从哪里来，只需要声明你需要什么。
+
+## IoC 容器：管理对象的大工厂
+
+IoC（Inversion of Control，控制反转）的核心思想就一句话：**把对象的创建权从你的代码手里拿走，交给容器。**
+
+在 Express 里，你用 `new` 或 `require` 自己创建对象，你控制了对象的创建过程。在 Spring 里，你把创建权交给了 IoC 容器——你需要一个 `PostService`，容器给你一个现成的；你不需要知道它是怎么创建的、它内部依赖了什么。
+
+Spring 的 IoC 容器有两个核心接口：
+
+**`BeanFactory`** 是最基本的容器，提供 Bean 的注册和获取。它采用懒加载策略——容器启动时不会创建所有 Bean，而是在第一次使用时才实例化。
+
+**`ApplicationContext`** 是 `BeanFactory` 的扩展，加了事件发布、资源加载、国际化等企业级功能。它默认在容器启动时就创建所有单例 Bean（`preInstantiateSingletons`）。实际项目中几乎都用 `ApplicationContext`，因为启动时的创建能让你更早发现问题，而不是在请求处理到一半时才抛出 `NoSuchBeanDefinitionException`。
+
+用 Express 的类比来理解：`BeanFactory` 像是按需加载的 `require()`，用到才加载；`ApplicationContext` 像是在 `app.listen` 之前就把所有模块初始化一遍，确保启动时就能发现问题。
+
+## Bean 的生命周期
+
+IoC 容器管理的对象叫 Bean。一个 Bean 从创建到销毁，经历以下阶段：
+
+```
+实例化（调用构造方法）
+  ↓
+属性赋值（注入依赖）
+  ↓
+初始化（调用 @PostConstruct 方法或实现 InitializingBean）
+  ↓
+使用（处理请求）
+  ↓
+销毁（容器关闭时调用 @PreDestroy 或实现 DisposableBean）
+```
+
+用一个实际的例子来理解。假设我们的 `PostService` 在启动时需要预热一些数据：
+
+```java
+@Service
+public class PostService {
+
+    private final List<Post> posts = new ArrayList<>();
+    private long nextId = 3;
+
+    public PostService() {
+        // 1. 实例化：构造方法被调用
+    }
+
+    @PostConstruct
+    public void init() {
+        // 3. 初始化：构造完成、依赖注入完成后执行
+        // 适合做数据预热、缓存加载等一次性操作
+        posts.add(new Post(1L, "深入理解 Java 内存模型", "java-memory-model",
+            "JMM 定义了线程如何与内存交互...", PostStatus.PUBLISHED,
+            1L, 1520, LocalDateTime.of(2026, 3, 15, 10, 0)));
+        posts.add(new Post(2L, "Spring Boot 3 新特性详解", "spring-boot-3-features",
+            "Spring Boot 3 带来了诸多改进...", PostStatus.DRAFT,
+            2L, 0, LocalDateTime.of(2026, 3, 20, 14, 30)));
+    }
+
+    @PreDestroy
+    public void cleanup() {
+        // 5. 销毁：容器关闭前执行
+        // 适合释放资源、关闭连接等
+        posts.clear();
+    }
+}
+```
+
+注意 `@PostConstruct` 和构造方法的区别。构造方法只负责创建对象本身，此时依赖还没注入完毕。`@PostConstruct` 在依赖注入完成之后执行，所以你可以在里面安全地使用注入进来的依赖。在 Express 里没有等价的概念——模块顶层的代码在 `require` 时就执行了，至于依赖是否就绪，需要你自己保证。
+
+## @Component 家族：分层注解
+
+Spring 用注解来标记哪些类需要被容器管理。`@Component` 是最基础的注解，其他注解都是它的派生：
+
+| 注解              | 用途                     | 等价于 Express 里的   |
+| ----------------- | ------------------------ | --------------------- |
+| `@Component`      | 通用组件                 | 任意模块              |
+| `@Controller`     | Web 控制器（返回视图）   | 路由文件              |
+| `@RestController` | REST 控制器（返回 JSON） | 路由文件 + res.json() |
+| `@Service`        | 业务逻辑层               | service 层模块        |
+| `@Repository`     | 数据访问层               | dao/repository 模块   |
+| `@Configuration`  | 配置类                   | config.js             |
+
+这些注解在功能上完全等价——它们都是 `@Component`，都会被 `@ComponentScan` 扫描并注册为 Bean。区别只在语义上：`@Service` 告诉读代码的人"这是业务逻辑"，`@Repository` 告诉你"这是数据访问层"。Spring 还会对 `@Repository` 做一些额外处理（自动转换数据库异常为 Spring 的 `DataAccessException`）。
+
+这种语义化注解和 Express 的文件组织有本质区别。Express 里你把文件放在 `routes/`、`services/`、`models/` 目录下是约定俗成，但框架不关心你放哪里——你完全可以把所有代码塞进一个 `index.js`。Spring 的注解是框架级别的约束，`@ComponentScan` 只扫描指定包下的注解类，放错位置就扫描不到。
+
+## 三种注入方式
+
+Spring 支持三种依赖注入方式，但只有一种被推荐。
+
+### 字段注入（不推荐）
+
+```java
+@RestController
+@RequestMapping("/api/posts")
+public class PostController {
+
+    @Autowired
+    private PostService postService;
+}
+```
+
+写起来最简单，但问题很多：依赖不能用 `final` 修饰（意味着运行时可能被修改），无法在构造时保证依赖不为 null，单元测试时需要用反射来注入 mock 对象。在 Express 里，这相当于在模块顶部 `const postService = require(...)` 然后 `module.exports.postService = postService`——简单但不灵活。
+
+### 构造器注入（推荐）
+
+```java
+@RestController
+@RequestMapping("/api/posts")
+public class PostController {
+
+    private final PostService postService;
+
+    public PostController(PostService postService) {
+        this.postService = postService;
+    }
+}
+```
+
+Spring 4.3 之后，如果类只有一个构造方法，连 `@Autowired` 都可以省略——框架自动用这个构造方法注入。所有依赖声明为 `final`，保证了不可变性；构造方法参数列表清晰表达了类的依赖关系；单元测试时直接 `new PostController(mockPostService)` 就能创建实例，不需要启动 Spring 容器。
+
+### @Configuration + @Bean：手动注册
+
+当你要管理的对象来自第三方库（没有 `@Component` 注解），就需要用 `@Bean` 手动注册：
+
+```java
+@Configuration
+public class AppConfig {
+
+    @Bean
+    public SlugGenerator slugGenerator() {
+        return new SlugGenerator("-", 80);
+    }
+}
+```
+
+在 `@Configuration` 类里，每个 `@Bean` 方法返回的对象都会被 Spring 容器管理。方法的参数会自动从容器中查找匹配的 Bean 注入进来——这和构造器注入的原理一样，只是注册方式不同。
+
+## CMS 演进：抽取 PostService
+
+现在把上一篇堆积在 Controller 里的业务逻辑抽出来。上一篇的 `PostController` 直接在类里维护了一个 `List<Post>`，分页、创建、更新逻辑全写在 handler 方法中。我们要做三件事：
+
+1. 创建 `PostService`，把数据存储和业务逻辑搬过去
+2. 在 `PostService` 中加入业务规则（创建时自动生成 slug、设置默认值）
+3. Controller 只负责接收请求、调用 Service、返回响应
+
+先看 Service 层：
+
+```java
+@Service
+public class PostService {
+
+    private final List<Post> posts = new ArrayList<>();
+    private long nextId = 3;
+
+    @PostConstruct
+    public void init() {
+        posts.add(new Post(1L, "深入理解 Java 内存模型", "java-memory-model",
+            "JMM 定义了线程如何与内存交互...", PostStatus.PUBLISHED,
+            1L, 1520, LocalDateTime.of(2026, 3, 15, 10, 0)));
+        posts.add(new Post(2L, "Spring Boot 3 新特性详解", "spring-boot-3-features",
+            "Spring Boot 3 带来了诸多改进...", PostStatus.DRAFT,
+            2L, 0, LocalDateTime.of(2026, 3, 20, 14, 30)));
+    }
+
+    public List<Post> findAll(int page, int size) {
+        int from = Math.max(0, (page - 1) * size);
+        int to = Math.min(posts.size(), from + size);
+        return posts.subList(from, to);
+    }
+
+    public Optional<Post> findById(Long id) {
+        return posts.stream()
+            .filter(p -> p.getId().equals(id))
+            .findFirst();
+    }
+
+    public Post create(String title, String content, String slug) {
+        // 业务规则：如果没传 slug，根据标题自动生成
+        String finalSlug = (slug != null && !slug.isBlank())
+            ? slug
+            : generateSlug(title);
+
+        // 业务规则：校验 slug 唯一性
+        boolean slugExists = posts.stream()
+            .anyMatch(p -> p.getSlug().equals(finalSlug));
+        if (slugExists) {
+            throw new IllegalArgumentException("Slug '" + finalSlug + "' 已存在");
+        }
+
+        Post post = new Post(
+            nextId++, title, finalSlug, content,
+            PostStatus.DRAFT, 1L, 0, LocalDateTime.now()
+        );
+        posts.add(post);
+        return post;
+    }
+
+    public Optional<Post> update(Long id, String title, String content,
+                                  String slug, PostStatus status) {
+        return findById(id).map(existing -> {
+            if (title != null) existing.setTitle(title);
+            if (content != null) existing.setContent(content);
+            if (slug != null) existing.setSlug(slug);
+            if (status != null) existing.setStatus(status);
+            return existing;
+        });
+    }
+
+    public boolean delete(Long id) {
+        return posts.removeIf(p -> p.getId().equals(id));
+    }
+
+    private String generateSlug(String title) {
+        return title.toLowerCase()
+            .replaceAll("[^a-z0-9\\u4e00-\\u9fa5]+", "-")
+            .replaceAll("^-|-$", "");
+    }
+}
+```
+
+注意 `create` 方法里加了两条业务规则：slug 为空时自动从标题生成，slug 重复时抛出异常。这些逻辑放在 Service 层是正确的位置——它们是业务约束，不应该散落在 Controller 里。
+
+然后是重构后的 Controller：
+
+```java
+@RestController
+@RequestMapping("/api/posts")
+public class PostController {
+
+    private final PostService postService;
+
+    // 构造器注入：Spring 自动把 PostService 注入进来
+    public PostController(PostService postService) {
+        this.postService = postService;
+    }
+
+    @GetMapping
+    public List<Post> getPosts(
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "20") int size) {
+        return postService.findAll(page, size);
+    }
+
+    @GetMapping("/{id}")
+    public ResponseEntity<Post> getPost(@PathVariable Long id) {
+        return postService.findById(id)
+            .map(ResponseEntity::ok)
+            .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PostMapping
+    public ResponseEntity<Post> createPost(
+            @RequestBody @Valid CreatePostRequest request) {
+        Post post = postService.create(
+            request.getTitle(), request.getContent(), request.getSlug()
+        );
+        return ResponseEntity.status(HttpStatus.CREATED).body(post);
+    }
+
+    @PutMapping("/{id}")
+    public ResponseEntity<Post> updatePost(
+            @PathVariable Long id,
+            @RequestBody @Valid UpdatePostRequest request) {
+        return postService.update(
+            id, request.getTitle(), request.getContent(),
+            request.getSlug(), request.getStatus()
+        ).map(ResponseEntity::ok)
+         .orElse(ResponseEntity.notFound().build());
+    }
+
+    @DeleteMapping("/{id}")
+    public ResponseEntity<Void> deletePost(@PathVariable Long id) {
+        return postService.delete(id)
+            ? ResponseEntity.noContent().build()
+            : ResponseEntity.notFound().build();
+    }
+}
+```
+
+对比上一篇的 Controller，每个方法都瘦了一截。Controller 现在只做三件事：接收参数、调用 Service、返回响应。它不知道数据存在哪里（内存、MySQL、MongoDB？），不知道业务规则是什么（slug 怎么生成？状态怎么校验？）。这些细节被 Service 层封装了。
+
+在 Express 里达到同样的效果，你需要手动引入 Service 模块。在 Spring Boot 里，你只需要在构造方法的参数里声明依赖，容器在启动时自动完成注入——你甚至不需要在 Controller 里 import `PostService` 所在的包（当然 Java 语法上需要 import，但依赖的实例化完全由容器负责）。
+
+## 自动配置：启动时发生了什么
+
+上一篇提到 `@SpringBootApplication` 是三个注解的组合，其中 `@EnableAutoConfiguration` 负责自动配置。现在有了 IoC 容器和 Bean 生命周期的概念，可以更准确地理解自动配置到底做了什么。
+
+Spring Boot 启动时，`@EnableAutoConfiguration` 会扫描 classpath 上的 `META-INF/spring/org.springframework.boot.autoconfigure.AutoConfiguration.imports` 文件（Spring Boot 3.x），里面列出了所有自动配置类的全限定名。每个自动配置类用条件注解来决定是否生效：
+
+```java
+@Configuration
+@ConditionalOnClass(DataSource.class)       // classpath 上有 DataSource 才生效
+@ConditionalOnMissingBean(DataSource.class)  // 容器里没有自定义的 DataSource 才生效
+class DataSourceAutoConfiguration {
+    @Bean
+    public DataSource dataSource(DataSourceProperties properties) {
+        return properties.initializeDataSourceBuilder().build();
+    }
+}
+```
+
+这意味着：如果你引入了 `spring-boot-starter-data-jpa`，classpath 上就有 `DataSource` 类，自动配置会帮你创建一个 `DataSource` Bean。但如果你自己在 `@Configuration` 类里定义了一个 `@Bean DataSource`，自动配置发现容器里已经有了，就自动让路——`@ConditionalOnMissingBean` 确保了你的配置优先级高于默认配置。
+
+这就是"约定优于配置"的落地方式：框架提供合理的默认行为，同时给你覆盖的能力。Express 没有等价机制——你引入了 `pg` 包，还得自己写连接池配置、写 SQL 客户端封装。Spring Boot 帮你把这一步自动化了。
+
+## 对比总结
+
+| 概念     | Express              | NestJS                     | Spring Boot                  |
+| -------- | -------------------- | -------------------------- | ---------------------------- |
+| 依赖管理 | `require()` 手动引入 | IoC 容器 + `@Injectable()` | IoC 容器 + `@Component` 家族 |
+| 对象创建 | 开发者手动 `new`     | 容器管理                   | 容器管理                     |
+| 依赖注入 | 手动传递参数         | 构造器注入                 | 构造器注入（推荐）           |
+| 生命周期 | 无统一管理           | 容器管理（单一生命周期）   | 完整生命周期（init/destroy） |
+| 分层约定 | 目录结构（无强制）   | 模块 + 注解（框架级）      | 注解 + 包扫描（框架级）      |
+| 自动配置 | 无                   | 有限（内置模块）           | 条件注解驱动的自动配置       |
+
+NestJS 的 DI 模式和 Spring 非常接近——它直接借鉴了 Angular 和 Spring 的设计。如果你用过 NestJS，Spring Boot 的 IoC 容器不会有理解障碍。如果你只用过 Express，核心要转变的观念是：**你不再负责创建和组装对象，你只需要声明依赖关系。**
+
+## Trade-off：DI 的代价
+
+依赖注入不是免费的午餐。
+
+**启动变慢。** Spring Boot 需要扫描所有注解、分析依赖关系、创建 Bean 实例。对于一个有几百个 Bean 的项目，启动时间可能在 5-10 秒。Express 的启动几乎是即时的——require 完所有模块就能开始接收请求。这在本地开发时影响不大，但在 CI/CD 流水线和容器编排中，启动时间会显著影响部署速度和弹性扩容的响应速度。
+
+**隐式行为增加调试难度。** Express 里你 `require` 了一个模块，模块顶部的代码立即执行，出了问题你能从堆栈里清楚看到是哪一行。Spring Boot 里，Bean 的创建和注入发生在框架的内部流程中，如果注入失败（比如循环依赖、类型不匹配），报错信息可能很长，需要理解 Spring 的内部机制才能定位。这也是为什么 Bean 的命名规范和包的组织方式在 Spring Boot 里比在 Express 里更重要——它们直接影响可读性。
+
+**过度设计风险。** 对于一个 5 个接口的微服务，Controller 里直接写逻辑比抽出 Service 层更简单。Spring Boot 的分层架构是为大型项目设计的，在小项目里套用全套模式反而增加代码量和认知负担。这也是为什么很多 Node.js 开发者转 Java 后感到"杀鸡用牛刀"——不是 Spring Boot 设计得不好，而是它服务的场景和你之前的项目规模不同。
+
+## 回顾
+
+上一篇我们完成了文章 CRUD，所有逻辑堆在 Controller 里。这篇引入了 Spring 的核心机制——IoC 容器和依赖注入：
+
+- IoC 容器接管了对象的创建和生命周期管理，你通过注解声明依赖，容器负责注入
+- `@Component` 家族（`@Service`、`@Repository`、`@Controller`）提供了语义化的分层标记
+- 构造器注入是推荐的方式，`final` 字段保证了不可变性，单构造方法时 `@Autowired` 可省略
+- `@PostConstruct` / `@PreDestroy` 提供了 Bean 初始化和销毁的钩子
+- 自动配置通过条件注解实现了"默认好用，需要时覆盖"的约定优于配置
+
+CMS 项目现在有了 Controller 和 Service 两层。Controller 负责接收请求和返回响应，Service 负责业务逻辑和数据存储。下一篇我们会给 API 套上 RESTful 设计规范——用更合理的方式组织 URL、状态码和分页响应。

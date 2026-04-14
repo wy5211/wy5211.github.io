@@ -1,0 +1,369 @@
+---
+title: "08. 分页查询与性能优化"
+date: "2026-04-12"
+summary: "书籍列表有上万条数据，一次全查出来不行。PageHelper 怎么实现物理分页？深分页为什么慢？怎么优化？"
+tags: ["MyBatis", "PageHelper", "分页", "性能优化"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 实战指南"
+seriesOrder: 8
+---
+
+BookHive 上线后，书籍表有了 5 万条数据。首页的书籍列表展示 20 条，用户翻到第 50 页时，页面加载要 3 秒。
+
+你打开慢查询日志一看，这条 SQL 执行了 2.8 秒：
+
+```sql
+SELECT * FROM books ORDER BY created_at DESC LIMIT 1000, 20
+```
+
+这不是 MyBatis 的问题——问题出在分页方式上。MySQL 的 `LIMIT offset, size` 在 offset 大的时候性能急剧下降。这篇聊怎么高效地做分页，以及怎么定位和优化慢 SQL。
+
+## PageHelper 分页插件
+
+PageHelper 是 MyBatis 最流行的分页插件。它的原理是利用 MyBatis 的拦截器机制，在你的 SQL 执行前自动加上分页语句。
+
+### 基本使用
+
+```java
+// 引入依赖
+// implementation 'com.github.pagehelper:pagehelper-spring-boot-starter:2.1.0'
+
+@Service
+public class BookService {
+
+    private final BookMapper bookMapper;
+
+    // 分页查询书籍列表
+    public PageInfo<Book> getBooksByPage(int pageNum, int pageSize) {
+        // 1. 紧接着的第一个查询会被分页
+        PageHelper.startPage(pageNum, pageSize);
+
+        // 2. 执行查询（这个查询会被 PageHelper 拦截并改写 SQL）
+        List<Book> books = bookMapper.selectList(null);
+
+        // 3. 用 PageInfo 包装结果，包含分页信息
+        return new PageInfo<>(books);
+    }
+}
+```
+
+`PageHelper.startPage(pageNum, pageSize)` 之后的第一个查询会被分页。PageHelper 会把你的 SQL 改写成：
+
+```sql
+-- 原始 SQL
+SELECT * FROM books
+
+-- PageHelper 改写后
+SELECT * FROM books LIMIT 0, 20
+
+-- 同时执行一条 COUNT 查询获取总数
+SELECT COUNT(1) FROM books
+```
+
+`PageInfo` 包含了分页元数据：总记录数、总页数、当前页码、每页大小、是否有下一页等。
+
+### PageHelper 和 MyBatis-Plus 分页
+
+MyBatis-Plus 也有内置的分页插件，不需要额外引入 PageHelper。
+
+```java
+// MyBatis-Plus 分页配置
+@Configuration
+public class MybatisPlusConfig {
+
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+        interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.MYSQL));
+        return interceptor;
+    }
+}
+
+// 使用
+public IPage<Book> getBooksByPage(int pageNum, int pageSize) {
+    Page<Book> page = new Page<>(pageNum, pageSize);
+    LambdaQueryWrapper<Book> wrapper = new LambdaQueryWrapper<>();
+    wrapper.orderByDesc(Book::getCreatedAt);
+    return bookMapper.selectPage(page, wrapper);
+}
+```
+
+两者的区别：
+
+| 维度             | PageHelper                           | MyBatis-Plus 分页           |
+| ---------------- | ------------------------------------ | --------------------------- |
+| 依赖             | 需要额外引入                         | 内置，不需要额外依赖        |
+| 使用方式         | `PageHelper.startPage()`             | 传入 `Page` 对象            |
+| 和条件构造器配合 | 需要先 startPage 再查询              | `selectPage(page, wrapper)` |
+| 自定义 SQL 分页  | 支持（拦截器自动改写）               | 支持（传入 `Page` 参数）    |
+| 多次查询问题     | `startPage` 只对紧跟的第一次查询生效 | 每次 `selectPage` 独立分页  |
+
+如果你的项目已经用了 MyBatis-Plus，用内置分页就行，不需要再引入 PageHelper。如果你用原生 MyBatis（没有 MyBatis-Plus），PageHelper 是更好的选择。
+
+BookHive 用的是 MyBatis-Plus，所以后面用 MyBatis-Plus 的分页方式。
+
+### 分页查询的返回值
+
+```java
+Page<Book> page = bookMapper.selectPage(new Page<>(2, 20), wrapper);
+
+page.getRecords();   // 当前页的数据列表
+page.getCurrent();   // 当前页码
+page.getSize();      // 每页大小
+page.getTotal();     // 总记录数
+page.getPages();     // 总页数
+page.hasNext();      // 是否有下一页
+page.hasPrevious();  // 是否有上一页
+```
+
+### 不需要总页数的场景
+
+有时候你不需要总记录数——比如"加载更多"功能，只需要知道有没有下一页。COUNT 查询在大表上可能很慢。
+
+MyBatis-Plus 的 `Page` 对象可以设置 `searchCount = false` 跳过 COUNT 查询：
+
+```java
+Page<Book> page = new Page<>(pageNum, pageSize, false); // 第三个参数 false = 不查总数
+```
+
+或者多查一条来判断是否有下一页：
+
+```java
+Page<Book> page = new Page<>(pageNum, pageSize + 1); // 多查一条
+List<Book> books = bookMapper.selectPage(page, wrapper).getRecords();
+boolean hasNext = books.size() > pageSize;
+if (hasNext) {
+    books.remove(books.size() - 1); // 去掉多查的那条
+}
+```
+
+对于 BookHive 的"加载更多"功能，这种方式比 COUNT 查询快得多。
+
+## 深分页问题
+
+回到开头的问题：`LIMIT 1000, 20` 为什么慢？
+
+MySQL 的 `LIMIT offset, size` 执行过程是：先扫描前 `offset + size` 行，然后丢弃前 `offset` 行，返回剩下的 `size` 行。`offset` 越大，扫描的行数越多，性能越差。
+
+```sql
+-- 快：只扫描 20 行
+SELECT * FROM books ORDER BY created_at DESC LIMIT 0, 20
+
+-- 慢：扫描 10020 行，丢弃 10000 行
+SELECT * FROM books ORDER BY created_at DESC LIMIT 10000, 20
+
+-- 更慢：扫描 100020 行
+SELECT * FROM books ORDER BY created_at DESC LIMIT 100000, 20
+```
+
+### 方案 1：游标分页（推荐）
+
+不用 `LIMIT offset, size`，而是记住上一页最后一条记录的 ID，下一页从那个 ID 之后开始查。
+
+```xml
+<!-- Mapper XML -->
+<select id="selectBooksWithCursor" resultType="Book">
+    SELECT * FROM books
+    <where>
+        <if test="lastId != null">
+            AND id &lt; #{lastId}
+        </if>
+        <if test="categoryId != null">
+            AND category_id = #{categoryId}
+        </if>
+    </where>
+    ORDER BY id DESC
+    LIMIT #{pageSize}
+</select>
+```
+
+```java
+// 查第一页
+List<Book> page1 = bookMapper.selectBooksWithCursor(null, null, 20);
+Long lastId = page1.get(page1.size() - 1).getId();
+
+// 查下一页
+List<Book> page2 = bookMapper.selectBooksWithCursor(lastId, null, 20);
+```
+
+这个方案的前提是：排序字段有索引，且排序字段的值是唯一的。用 `id` 排序（自增主键）是最简单的情况。
+
+优点：不管翻到第几页，查询速度都一样快——每次只扫描 `pageSize` 行。
+
+缺点：不支持跳页（直接跳到第 N 页），只能上一页/下一页。
+
+对于 BookHive 的书籍列表、"加载更多"这种场景，游标分页是最优方案。对于需要跳页的场景（比如后台管理系统的分页表格），只能用 `LIMIT offset, size`。
+
+### 方案 2：子查询优化
+
+如果必须用 offset 分页，可以通过子查询减少扫描行数：
+
+```sql
+-- 直接 LIMIT（慢）
+SELECT * FROM books ORDER BY created_at DESC LIMIT 10000, 20
+
+-- 子查询优化（快）
+SELECT * FROM books
+WHERE id >= (
+    SELECT id FROM books
+    ORDER BY created_at DESC
+    LIMIT 10000, 1
+)
+ORDER BY created_at DESC
+LIMIT 20
+```
+
+子查询先通过主键索引快速定位到第 10000 条记录的 id，然后从这个 id 开始取 20 条。因为主键索引的扫描效率远高于全表扫描，所以快很多。
+
+前提是 `ORDER BY` 的字段和 `id` 有相关性。如果 `ORDER BY created_at DESC` 和 `id DESC` 的顺序不一致（比如有人手动修改了 `created_at`），这个优化可能不准确。
+
+### 方案 3：延迟关联
+
+如果查询的列很多（包含 TEXT 字段），先通过覆盖索引查出 id，再回表查完整数据：
+
+```sql
+-- 先通过覆盖索引查出 id（快，不需要回表）
+SELECT id FROM books
+ORDER BY created_at DESC
+LIMIT 10000, 20
+
+-- 再根据 id 查完整数据（只查 20 条，很快）
+SELECT * FROM books WHERE id IN (1, 2, 3, ..., 20)
+```
+
+在 MyBatis 中实现：
+
+```xml
+<select id="selectBookIdsByPage" resultType="long">
+    SELECT id FROM books
+    ORDER BY created_at DESC
+    LIMIT #{offset}, #{pageSize}
+</select>
+
+<select id="selectBooksByIds" resultType="Book">
+    SELECT * FROM books
+    WHERE id IN
+    <foreach collection="ids" item="id" open="(" separator="," close=")">
+        #{id}
+    </foreach>
+</select>
+```
+
+```java
+// Service 层
+public List<Book> getBooksByPage(int pageNum, int pageSize) {
+    int offset = (pageNum - 1) * pageSize;
+    List<Long> ids = bookMapper.selectBookIdsByPage(offset, pageSize);
+    if (ids.isEmpty()) return Collections.emptyList();
+    return bookMapper.selectBooksByIds(ids);
+}
+```
+
+## EXPLAIN：定位慢查询
+
+分页优化只是性能优化的一个方面。更通用的方法是：用 `EXPLAIN` 分析查询计划，找出问题所在。
+
+### 基本用法
+
+```sql
+EXPLAIN SELECT * FROM books WHERE title LIKE '%Java%' ORDER BY created_at DESC LIMIT 20;
+```
+
+关注几个关键字段：
+
+**type**。访问类型，从好到坏：`const > eq_ref > ref > range > index > ALL`。`ALL` 是全表扫描，通常意味着需要加索引。
+
+**key**。实际使用的索引。如果 `key` 为 `NULL`，说明没有用到索引。
+
+**rows**。预估要扫描的行数。越小越好。
+
+**Extra**。额外信息。`Using filesort`（需要额外排序）、`Using temporary`（使用了临时表）通常意味着需要优化。
+
+### 常见慢查询场景
+
+**LIKE '%xxx%' 前缀模糊匹配**。`title LIKE '%Java%'` 无法使用索引，因为索引是从左到右匹配的。解决方案：如果业务允许，用 `title LIKE 'Java%'`（前缀匹配，可以用索引）。如果必须全文搜索，考虑 Elasticsearch 或 MySQL 的全文索引。
+
+**ORDER BY 和 WHERE 用不同的索引**。`WHERE category_id = 1 ORDER BY created_at DESC`——如果 `category_id` 和 `created_at` 各自有索引，MySQL 只能用其中一个。创建联合索引 `(category_id, created_at)` 可以同时覆盖两个条件。
+
+**SELECT \* 查了很多不需要的列**。特别是包含 TEXT/BLOB 字段的大字段。只查询需要的列，或者用延迟关联。
+
+**索引失效**。对索引列使用函数（`WHERE YEAR(created_at) = 2024`）、隐式类型转换（`WHERE id = '1'`，id 是数字类型）、`OR` 连接不同字段的条件——这些都会导致索引失效。
+
+### 在 MyBatis 中记录慢 SQL
+
+MyBatis-Plus 提供了性能分析拦截器，可以在开发环境中记录每条 SQL 的执行时间：
+
+```java
+@Bean
+public MybatisPlusInterceptor mybatisPlusInterceptor() {
+    MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+    // 性能分析（仅开发环境使用）
+    interceptor.addInnerInterceptor(new PerformanceInnerInterceptor());
+    // 分页
+    interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.MYSQL));
+    return interceptor;
+}
+```
+
+生产环境不建议用这个拦截器——每个查询都记录时间会影响性能。生产环境用 MySQL 的慢查询日志（`long_query_time`）来发现慢查询。
+
+## 索引友好的查询设计
+
+写 SQL 时考虑索引，能避免大部分性能问题。
+
+### 原则 1：WHERE 条件列建索引
+
+```sql
+-- 经常作为查询条件的列，建索引
+CREATE INDEX idx_books_status ON books(status);
+CREATE INDEX idx_books_publisher ON books(publisher_id);
+```
+
+### 原则 2：联合索引注意顺序
+
+联合索引遵循最左前缀原则。`(category_id, status, created_at)` 这个索引能用于：
+
+- `WHERE category_id = 1`
+- `WHERE category_id = 1 AND status = 1`
+- `WHERE category_id = 1 AND status = 1 ORDER BY created_at DESC`
+
+但不能用于：
+
+- `WHERE status = 1`（跳过了最左列）
+- `WHERE created_at > '2024-01-01'`（跳过了前面的列）
+
+索引的顺序应该把区分度高的列放前面。
+
+### 原则 3：避免在索引列上做计算
+
+```sql
+-- 索引失效
+SELECT * FROM books WHERE price * 0.9 > 50;
+
+-- 索引有效
+SELECT * FROM books WHERE price > 50 / 0.9;
+
+-- 索引失效
+SELECT * FROM books WHERE DATE(created_at) = '2024-01-01';
+
+-- 索引有效
+SELECT * FROM books WHERE created_at >= '2024-01-01' AND created_at < '2024-01-02';
+```
+
+### 原则 4：用覆盖索引减少回表
+
+如果查询的列都在索引中，MySQL 不需要回表查数据，直接从索引返回。
+
+```sql
+-- 创建联合索引
+CREATE INDEX idx_books_category_status ON books(category_id, status, title);
+
+-- 这个查询的所有列都在索引中（覆盖索引），不需要回表
+SELECT title FROM books WHERE category_id = 1 AND status = 1;
+```
+
+覆盖索引特别适合分页查询中的 COUNT 统计——COUNT 只需要知道行数，不需要回表查数据。
+
+分页查询看起来简单，但涉及数据库索引、查询计划、应用层设计等多个方面。游标分页适合"加载更多"类场景，offset 分页适合需要跳页的场景，子查询和延迟关联可以缓解深分页的性能问题。但最根本的优化还是索引设计——好的索引能让大部分查询都快起来。下一篇聊 MyBatis 的缓存机制和批量操作优化。

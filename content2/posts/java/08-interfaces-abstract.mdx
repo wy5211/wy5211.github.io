@@ -1,0 +1,474 @@
+---
+title: "08 接口与抽象类"
+date: "2026-03-30"
+summary: "TS 的 interface 和 Java 的 interface 是一回事吗？从 CMS 的 Taggable 接口出发，理解 Java 接口的契约本质、default 方法、以及接口与抽象类的选择。"
+tags: ["Java", "接口", "抽象类", "多态"]
+category: "java"
+cover: ""
+draft: false
+series: "Java 渐进式实战"
+seriesOrder: 8
+---
+
+上一篇我们给 CMS 抽取了 Content 基类，让 Post 继承它，省掉了一批重复的字段和方法。结尾留了一个问题：如果 Comment 也需要继承 Content，但同时 Post 和 Comment 都需要"打标签"的能力，怎么办？
+
+Java 只允许单继承——Post 已经 extends Content 了，不能再 extends 一个 Taggable 类。你可能会想：用 JS 的 mixin 不就行了？Java 没有 mixin。用组合？可以，但那就不是类型系统层面的约束了。
+
+Java 的答案是：**接口（interface）**。
+
+如果你有 TypeScript 背景，看到"接口"这个词可能会觉得"我懂"。但 Java 的 interface 和 TS 的 interface 是两个几乎不同的东西——它们共享一个名字，却服务于完全不同的目的。这篇文章就从 CMS 的 Taggable 接口出发，搞清楚它们的本质差异。
+
+## TS interface vs Java interface：同名不同命
+
+先看 TypeScript 怎么用 interface：
+
+```ts
+// TypeScript: interface 只是类型声明
+interface Taggable {
+  tags: Tag[];
+  addTag(tag: Tag): void;
+  removeTag(name: string): void;
+}
+
+class Post implements Taggable {
+  tags: Tag[] = [];
+  addTag(tag: Tag) {
+    this.tags.push(tag);
+  }
+  removeTag(name: string) {
+    this.tags = this.tags.filter((t) => t.name !== name);
+  }
+}
+```
+
+这段 TS 代码编译成 JavaScript 之后，`Taggable` 接口**完全消失**。它只在编译期做类型检查，运行时没有任何痕迹。你可以把 `implements Taggable` 删掉，运行结果完全一样。TS 的 interface 本质上是"给编译器看的注释"。
+
+Java 的 interface 不是这样：
+
+```java
+// Java: interface 是运行时存在的类型
+public interface Taggable {
+    void addTag(Tag tag);
+    void removeTag(String tagName);
+    List<Tag> getTags();
+}
+
+public class Post extends Content implements Taggable {
+    private List<Tag> tags = new ArrayList<>();
+
+    @Override
+    public void addTag(Tag tag) {
+        this.tags.add(tag);
+    }
+
+    @Override
+    public void removeTag(String tagName) {
+        this.tags.removeIf(t -> t.getName().equals(tagName));
+    }
+
+    @Override
+    public List<Tag> getTags() {
+        return new ArrayList<>(this.tags); // 返回副本，防止外部修改
+    }
+}
+```
+
+`Taggable` 在 Java 里是一个实实在在的类型。编译后，`Post.class` 的字节码里会记录"Post 实现了 Taggable 接口"。你可以在运行时通过反射拿到这个信息，可以用 `instanceof` 判断一个对象是否实现了某个接口，可以在方法参数里声明接口类型做多态调度。
+
+```java
+// 运行时类型检查：Taggable 是真正的类型
+if (post instanceof Taggable) {
+    Taggable taggable = (Taggable) post;
+    taggable.addTag(new Tag("Java", "java"));
+}
+
+// 方法参数用接口类型：接受任何实现了 Taggable 的对象
+public void printAllTags(Taggable item) {
+    for (Tag tag : item.getTags()) {
+        System.out.println(tag.getName());
+    }
+}
+```
+
+| 特性               | TypeScript interface              | Java interface                          |
+| ------------------ | --------------------------------- | --------------------------------------- |
+| 编译后是否存在     | 消失（纯类型声明）                | 存在（字节码中有记录）                  |
+| 运行时能否检查     | 不能（`typeof` 不认 interface）   | 能（`instanceof`）                      |
+| 能否有方法实现     | 不能                              | 能（default 方法，Java 8+）             |
+| 能否有 static 方法 | 不能                              | 能（Java 8+）                           |
+| 能否有字段         | 不能                              | 能，但只能是 `public static final` 常量 |
+| 一个类能实现几个   | 任意多个                          | 任意多个                                |
+| 核心用途           | 描述对象形状（structural typing） | 定义行为契约（nominal typing）          |
+
+最后一点值得展开。TS 是 structural typing（结构化类型）——只要对象的结构匹配 interface，就算实现了它，不需要显式 `implements`。Java 是 nominal typing（名义类型）——必须用 `implements` 关键字显式声明，编译器才认。这是两种不同的类型哲学。
+
+## CMS 演进：定义 Taggable 接口
+
+回到 CMS 的场景。我们的 Post 已经继承了 Content，现在需要给内容添加标签功能。先定义 Taggable 接口：
+
+```java
+public interface Taggable {
+    void addTag(Tag tag);
+    void removeTag(String tagName);
+    List<Tag> getTags();
+
+    // default 方法：所有实现类自动获得这个方法
+    default boolean hasTag(String tagName) {
+        return getTags().stream()
+                .anyMatch(t -> t.getName().equals(tagName));
+    }
+}
+```
+
+这个接口声明了三个必须实现的方法：`addTag`、`removeTag`、`getTags`。同时提供了一个 default 方法 `hasTag`——它不要求实现类重写，直接就能用。
+
+default 方法是 Java 8 引入的，解决了接口演进的核心问题。假设你在 Java 7 的时候定义了 Taggable，后来很多类实现了它。到了 Java 8 你想加一个 `hasTag` 方法，如果不提供默认实现，所有已存在的实现类都会编译失败。default 方法让接口可以在不破坏现有实现的情况下扩展。
+
+在 TS 里不存在这个问题——TS 的 interface 没有运行时存在感，加一个方法声明只影响类型检查，不会破坏运行时行为。
+
+再看一个更完整的场景。CMS 里除了 Post 需要打标签，Comment（评论）也可能需要标签（比如"精华评论"、"待审核"）。Comment 也会继承 Content，所以也需要用接口来获得标签能力：
+
+```java
+public class Comment extends Content implements Taggable {
+    private String content;
+    private Long postId;
+    private Long authorId;
+    private List<Tag> tags = new ArrayList<>();
+
+    // ... 构造器和 getter/setter ...
+
+    @Override
+    public void addTag(Tag tag) {
+        this.tags.add(tag);
+    }
+
+    @Override
+    public void removeTag(String tagName) {
+        this.tags.removeIf(t -> t.getName().equals(tagName));
+    }
+
+    @Override
+    public List<Tag> getTags() {
+        return new ArrayList<>(this.tags);
+    }
+
+    // hasTag 不需要重写，直接用 Taggable 接口的 default 实现
+}
+```
+
+Post 和 Comment 继承了不同的父类（虽然目前都是 Content，但将来 Comment 可能继承一个不同的基类），但它们都实现了 Taggable 接口。这就是接口的核心价值：**跨越继承体系的横向能力扩展**。
+
+## Publishable 接口：一个类实现多个接口
+
+CMS 里还有一个能力需要抽象：发布。目前 `publish()` 方法写在 Post 类里，但如果将来有 Page（页面）也需要发布功能呢？Page 可能继承另一个基类。
+
+定义 Publishable 接口：
+
+```java
+public interface Publishable {
+    void publish();
+    void unpublish();
+    boolean isPublished();
+
+    // default 方法：提供通用的发布逻辑框架
+    default String getPublishStatus() {
+        return isPublished() ? "已发布" : "草稿";
+    }
+}
+```
+
+Post 同时实现两个接口：
+
+```java
+public class Post extends Content implements Taggable, Publishable {
+    private String content;
+    private String status = "DRAFT";
+    private String publishedAt;
+    private Long authorId;
+    private List<Tag> tags = new ArrayList<>();
+
+    // Taggable 的实现
+    @Override
+    public void addTag(Tag tag) {
+        this.tags.add(tag);
+    }
+
+    @Override
+    public void removeTag(String tagName) {
+        this.tags.removeIf(t -> t.getName().equals(tagName));
+    }
+
+    @Override
+    public List<Tag> getTags() {
+        return new ArrayList<>(this.tags);
+    }
+
+    // Publishable 的实现
+    @Override
+    public void publish() {
+        if ("PUBLISHED".equals(this.status)) {
+            throw new IllegalStateException("文章已经发布过了");
+        }
+        this.status = "PUBLISHED";
+        this.publishedAt = java.time.LocalDateTime.now().toString();
+    }
+
+    @Override
+    public void unpublish() {
+        this.status = "DRAFT";
+        this.publishedAt = null;
+    }
+
+    @Override
+    public boolean isPublished() {
+        return "PUBLISHED".equals(this.status);
+    }
+
+    // getPublishStatus() 用接口的 default 实现，不需要重写
+}
+```
+
+注意 Post 之前的 `publish()` 方法现在变成了 `Publishable` 接口的一部分。这样做的好处是：任何需要"发布"功能的类，只要实现 Publishable 接口就行，不需要关心具体的实现细节。而且你可以用 Publishable 类型来编写通用代码：
+
+```java
+// 接受任何可发布的内容
+public void publishAll(List<Publishable> items) {
+    for (Publishable item : items) {
+        if (!item.isPublished()) {
+            item.publish();
+            System.out.println("发布成功，状态：" + item.getPublishStatus());
+        }
+    }
+}
+```
+
+这就是多态在接口层面的应用。上一篇讲的多态是基于继承的（Content 引用指向 Post 对象），这里的多态是基于接口的（Publishable 引用指向 Post 对象）。两种多态在 Java 里并存，但接口多态更灵活，因为它不受继承体系的限制。
+
+## 抽象类：当"is-a"比"has-ability"更合适
+
+接口解决的是"能力扩展"的问题。但有些情况下，你需要的是"共享实现"——不仅是方法签名相同，连方法体都要复用。
+
+回头看 Content 基类。它有字段（id, title, slug, createdAt, viewCount），有具体方法（`getExcerpt()`），有构造器。这些东西接口做不到（Java 8 之前，接口不能有字段和构造器；Java 8 之后可以有 default 方法和 static 方法，但仍然不能有实例字段和构造器）。
+
+把 Content 改成抽象类：
+
+```java
+public abstract class Content {
+    protected Long id;
+    protected String title;
+    protected String slug;
+    protected long viewCount;
+    protected String createdAt;
+
+    protected Content(String title, String slug) {
+        this.title = title;
+        this.slug = slug;
+        this.createdAt = java.time.LocalDateTime.now().toString();
+    }
+
+    // 具体方法：所有子类共享这个实现
+    public String getExcerpt(int maxLength) {
+        return "摘要在子类中实现";
+    }
+
+    // 抽象方法：子类必须实现
+    public abstract String getContentForExcerpt();
+
+    // getter/setter ...
+    public Long getId() { return id; }
+    public void setId(Long id) { this.id = id; }
+    public String getTitle() { return title; }
+    public long getViewCount() { return viewCount; }
+    public void incrementViewCount() { this.viewCount++; }
+}
+```
+
+`abstract` 关键字做两件事：第一，标记这个类不能被直接实例化（`new Content()` 会编译错误）；第二，标记 `getContentForExcerpt()` 是抽象方法，子类必须实现。
+
+抽象类和接口的关键区别在于**状态**。抽象类可以有实例字段（`id`, `title` 等），可以定义构造器来初始化这些字段，子类通过 `super()` 调用构造器。接口不能有实例字段——它只能声明常量（`public static final`），不能维护可变状态。
+
+## 接口 vs 抽象类：怎么选
+
+现在 CMS 里同时有接口和抽象类，什么时候用哪个？
+
+一个实用的判断标准是问自己：**"这个东西是在描述'是什么'还是'能做什么'？"**
+
+Content 是一个"东西"——文章、评论、页面都是 Content。它们共享一套字段和基础行为，属于 is-a 关系。适合用抽象类。
+
+Taggable 是一种"能力"——Post 能打标签，Comment 也能打标签，但标签能力不是它们的本质属性。属于 has-ability 关系。适合用接口。
+
+Publishable 同理——能发布不代表"是一个发布物"，它只是一个行为。适合用接口。
+
+| 判断维度             | 用抽象类                      | 用接口                               |
+| -------------------- | ----------------------------- | ------------------------------------ |
+| 关系类型             | is-a（是什么）                | has-ability（能做什么）              |
+| 是否需要共享字段     | 是（id, title, createdAt 等） | 否（接口没有实例字段）               |
+| 是否需要构造器       | 是（初始化共享字段）          | 否（接口没有构造器）                 |
+| 是否需要提供默认实现 | 部分方法有具体实现            | 全部方法默认无实现（除非用 default） |
+| 一个类能继承几个     | 只能一个                      | 能实现多个                           |
+| CMS 示例             | Content（文章、评论的基类）   | Taggable、Publishable（能力扩展）    |
+
+CMS 的类层次结构现在长这样：
+
+```
+                    Content (abstract class)
+                   /                        \
+            Post extends Content    Comment extends Content
+            implements               implements
+            Taggable, Publishable    Taggable
+```
+
+Post 和 Comment 都继承了 Content 的共有字段和行为，同时各自获得了 Taggable 能力。Post 额外实现了 Publishable，因为 Comment 一般不需要发布。这种组合让类型体系既清晰又灵活。
+
+如果 Java 允许多继承，你可能会写 `class Post extends Content, Taggable`。但它不允许，所以接口就成了唯一的选择。这不是 Java 的缺陷，而是有意为之——多继承会带来菱形继承问题（两个父类有同名方法，子类该调用哪个），C++ 遇到过，Java 直接回避了。
+
+## 接口的 static 方法和 private 方法
+
+Java 8 给接口加了 default 方法和 static 方法，Java 9 又加了 private 方法。这些能力让接口越来越像抽象类，但本质区别仍然存在。
+
+static 方法属于接口本身，不属于任何实例。它最常见的用途是提供工厂方法：
+
+```java
+public interface Publishable {
+    void publish();
+    void unpublish();
+    boolean isPublished();
+
+    // static 工厂方法
+    static Publishable createDraft() {
+        // 返回一个匿名实现类
+        return new Publishable() {
+            private boolean published = false;
+            @Override public void publish() { this.published = true; }
+            @Override public void unpublish() { this.published = false; }
+            @Override public boolean isPublished() { return this.published; }
+        };
+    }
+}
+```
+
+这里的 `createDraft()` 是通过接口直接调用的：`Publishable.createDraft()`。它不需要任何实例就能工作。在 TS 里没有等价的概念，因为 TS 的 interface 根本不存在于运行时。
+
+private 方法（Java 9+）主要用于在接口内部组织代码——多个 default 方法之间有重复逻辑时，可以抽成一个 private 方法：
+
+```java
+public interface Taggable {
+    void addTag(Tag tag);
+    void removeTag(String tagName);
+    List<Tag> getTags();
+
+    default boolean hasTag(String tagName) {
+        return findTag(tagName) != null;
+    }
+
+    default Tag getTag(String tagName) {
+        Tag tag = findTag(tagName);
+        if (tag == null) {
+            throw new IllegalArgumentException("标签不存在: " + tagName);
+        }
+        return tag;
+    }
+
+    // private 方法：只在接口内部使用，实现类看不到
+    private Tag findTag(String tagName) {
+        return getTags().stream()
+                .filter(t -> t.getName().equals(tagName))
+                .findFirst()
+                .orElse(null);
+    }
+}
+```
+
+`findTag` 是两个 default 方法的公共逻辑。把它抽成 private 方法，实现类不会被迫实现它，也不会在接口的"公开 API"中看到它。
+
+## CMS 模型当前状态
+
+经过本篇的演进，CMS 的类型体系如下：
+
+```java
+// 抽象基类：所有内容类型的共同基础
+public abstract class Content {
+    protected Long id;
+    protected String title;
+    protected String slug;
+    protected long viewCount;
+    protected String createdAt;
+    // 构造器、getter/setter、getExcerpt() ...
+}
+
+// 接口：标签能力
+public interface Taggable {
+    void addTag(Tag tag);
+    void removeTag(String tagName);
+    List<Tag> getTags();
+    default boolean hasTag(String tagName) { ... }
+}
+
+// 接口：发布能力
+public interface Publishable {
+    void publish();
+    void unpublish();
+    boolean isPublished();
+    default String getPublishStatus() { ... }
+}
+
+// Post：文章
+public class Post extends Content implements Taggable, Publishable {
+    private String content;
+    private String status;
+    private String publishedAt;
+    private Long authorId;
+    private List<Tag> tags;
+    // 实现 Taggable 和 Publishable 的所有方法 ...
+}
+
+// Tag：标签（不变）
+public class Tag {
+    private Long id;
+    private String name;
+    private String slug;
+    private String color;
+    // getter/setter ...
+}
+```
+
+Post 现在同时拥有继承来的字段和行为（来自 Content）、标签能力（来自 Taggable 接口）、发布能力（来自 Publishable 接口）。这三种机制各司其职：继承处理纵向的"is-a"关系，接口处理横向的"has-ability"关系。
+
+## Trade-off：接口的灵活与代价
+
+接口解决了 Java 单继承的限制，让类可以同时具备多种能力。`instanceof` 检查 + 接口类型引用，构成了比继承更灵活的多态机制。在 CMS 这种需要频繁扩展能力的场景下，接口是必不可少的工具。
+
+但接口也有代价。default 方法引入了一个新问题：**菱形冲突**。如果一个类实现了两个接口，两个接口都有同名的 default 方法，编译器会报错，你必须显式重写来解决冲突：
+
+```java
+// 两个接口有同名的 default 方法
+public interface Taggable {
+    default void display() { System.out.println("Taggable"); }
+}
+
+public interface Publishable {
+    default void display() { System.out.println("Publishable"); }
+}
+
+// 编译错误！必须显式选择
+public class Post extends Content implements Taggable, Publishable {
+    @Override
+    public void display() {
+        Taggable.super.display();  // 显式选择调用哪个接口的 default 方法
+    }
+}
+```
+
+这种冲突在 TS 里不存在——TS 的 interface 没有方法实现，自然不会冲突。但在 Java 里，接口的 default 方法越多，出现冲突的可能性越大。所以 Java 社区的一个经验法则是：**接口的 default 方法应该是"辅助性"的，核心逻辑仍然由实现类提供。**
+
+另一个代价是间接性。接口只定义了"能做什么"，不定义"怎么做"。当你读一段 `taggable.addTag(...)` 的代码，想看具体实现时，必须跳到实现类里找。在一个大型项目里，可能有十几个类实现了同一个接口，你要找到当前运行的是哪个实现。IDE 的"跳转到实现"功能能缓解这个问题，但它增加了代码的理解成本。
+
+## 回顾
+
+上一篇我们学了继承与多态。关键收获：Java 的 `extends` 是编译期的类型关系，JS 的 prototype 是运行时的链式查找；`@Override` 注解让编译器帮你检查方法签名；多态让 Content 引用可以指向 Post 对象。结尾留了一个问题——当 Post 和 Comment 需要共享"标签"能力但已经继承了不同的类，怎么办。本篇给出了答案：接口。
+
+本篇的核心认知是 Java interface 和 TS interface 的根本差异。TS 的 interface 是编译期的类型注解，编译后消失；Java 的 interface 是运行时存在的类型，可以用 `instanceof` 检查，可以作为方法参数类型做多态调度。Java 8 之后，接口通过 default 方法获得了"提供默认实现"的能力，这让它比抽象类更像了——但它们的核心区别仍然存在：抽象类有实例字段和构造器，接口没有。
+
+CMS 的类型体系现在有了三个层次：抽象类 Content 提供纵向的共有基础，接口 Taggable 和 Publishable 提供横向的能力扩展，Post 通过继承 + 实现接口把三者组合在一起。
+
+下一篇是内部类与枚举——Post 的 `status` 字段目前用字符串表示（"DRAFT" / "PUBLISHED"），这在 Java 里既不安全也不优雅。Java 的 enum 类型比 JS 的对象常量强得多，它可以有字段、方法、甚至实现接口。同时我们也会看到 Java 内部类的几种形式，理解它们各自解决什么问题。

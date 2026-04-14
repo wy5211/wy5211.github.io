@@ -1,0 +1,930 @@
+---
+title: "12. 并发模式"
+date: "2026-03-23"
+summary: "掌握 Go 语言中常见的并发模式，包括 worker pool、pipeline、fan-in/fan-out 等模式。"
+tags: ["Go", "Golang", "并发模式", "worker pool", "pipeline"]
+category: "golang"
+cover: ""
+draft: false
+series: "Go 语言渐进式学习"
+seriesOrder: 12
+---
+
+## 为什么需要并发模式？
+
+在构建任务队列 API 时，你发现简单地启动 goroutine 并不够。你需要考虑：如何限制并发数量避免资源耗尽？如何优雅地关闭所有 worker？如何处理任务依赖和优先级？
+
+这些问题都有成熟的解决方案，也就是所谓的"并发模式"。Go 的 channel 和 goroutine 组合，让实现这些模式变得相对简单。本文将结合任务队列 API，介绍四种最常用的并发模式：Worker Pool、Pipeline、Fan-out/Fan-in 和 Context 取消。
+
+---
+
+## Worker Pool 模式
+
+Worker Pool 是最实用的并发模式，它控制并发数量，避免创建过多 goroutine。
+
+### 问题背景
+
+假设你的任务队列 API 需要处理 1000 个任务，如果每个任务都启动一个 goroutine，会创建 1000 个 goroutine，可能导致：
+
+1. 内存消耗过大
+2. 上下文切换频繁，降低性能
+3. 资源竞争（如数据库连接数限制）
+
+Worker Pool 的思路是：创建固定数量的 worker（比如 10 个），让这 10 个 worker 从任务队列中取任务处理。
+
+### 基础实现
+
+```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+// Task 表示一个待处理的任务
+type Task struct {
+    ID       int
+    Payload  string
+    Priority int  // 优先级，0 最高
+}
+
+// Result 表示任务处理结果
+type Result struct {
+    TaskID int
+    Output string
+    Err    error
+}
+
+func main() {
+    const numWorkers = 3  // worker 数量
+    const numTasks = 10   // 任务数量
+
+    tasks := make(chan Task, numTasks)
+    results := make(chan Result, numTasks)
+
+    // 使用 WaitGroup 等待所有 worker 完成
+    var wg sync.WaitGroup
+
+    // 启动 worker pool
+    for i := 1; i <= numWorkers; i++ {
+        wg.Add(1)
+        go worker(i, tasks, results, &wg)
+    }
+
+    // 发送任务
+    for j := 1; j <= numTasks; j++ {
+        tasks <- Task{
+            ID:       j,
+            Payload:  fmt.Sprintf("数据 %d", j),
+            Priority: j % 3,
+        }
+    }
+    close(tasks)  // 关闭 tasks channel，通知 worker 没有更多任务
+
+    // 启动一个 goroutine 等待所有 worker 完成
+    // 必须在单独的 goroutine 中执行，否则会阻塞主 goroutine
+    go func() {
+        wg.Wait()
+        close(results)  // 所有 worker 完成后关闭 results channel
+    }()
+
+    // 收集结果
+    for result := range results {
+        if result.Err != nil {
+            fmt.Printf("任务 %d 失败: %v\n", result.TaskID, result.Err)
+        } else {
+            fmt.Printf("任务 %d 成功: %s\n", result.TaskID, result.Output)
+        }
+    }
+}
+
+// worker 从 tasks channel 接收任务，处理后将结果发送到 results channel
+func worker(id int, tasks <-chan Task, results chan<- Result, wg *sync.WaitGroup) {
+    defer wg.Done()  // 完成时通知 WaitGroup
+
+    for task := range tasks {
+        fmt.Printf("Worker %d 开始处理任务 %d (优先级: %d)\n", id, task.ID, task.Priority)
+
+        // 模拟处理任务
+        time.Sleep(100 * time.Millisecond)
+
+        // 发送结果
+        results <- Result{
+            TaskID: task.ID,
+            Output: fmt.Sprintf("Worker %d 完成任务 %d: %s", id, task.ID, task.Payload),
+            Err:    nil,
+        }
+    }
+
+    fmt.Printf("Worker %d 退出\n", id)
+}
+```
+
+这个实现的关键点：
+
+1. **固定数量的 worker**：只创建 3 个 goroutine，而不是每个任务一个
+2. **channel 作为队列**：tasks channel 是任务队列，results channel 是结果队列
+3. **优雅关闭**：使用 WaitGroup 确保所有 worker 完成后才关闭 results channel
+4. **自动负载均衡**：多个 worker 竞争从 tasks channel 接收，Go 自动调度
+
+### 支持优先级的 Worker Pool
+
+```go
+package main
+
+import (
+    "container/heap"
+    "fmt"
+    "time"
+)
+
+// 优先级队列实现
+type Task struct {
+    ID       int
+    Payload  string
+    Priority int  // 优先级，0 最高
+    index    int  // heap 内部使用
+}
+
+// PriorityQueue 实现 heap.Interface 接口
+type PriorityQueue []*Task
+
+func (pq PriorityQueue) Len() int { return len(pq) }
+
+func (pq PriorityQueue) Less(i, j int) bool {
+    // 优先级小的排在前面
+    return pq[i].Priority < pq[j].Priority
+}
+
+func (pq PriorityQueue) Swap(i, j int) {
+    pq[i], pq[j] = pq[j], pq[i]
+    pq[i].index = i
+    pq[j].index = j
+}
+
+func (pq *PriorityQueue) Push(x interface{}) {
+    n := len(*pq)
+    task := x.(*Task)
+    task.index = n
+    *pq = append(*pq, task)
+}
+
+func (pq *PriorityQueue) Pop() interface{} {
+    old := *pq
+    n := len(old)
+    task := old[n-1]
+    old[n-1] = nil  // 避免内存泄漏
+    task.index = -1 // for safety
+    *pq = old[0 : n-1]
+    return task
+}
+
+func main() {
+    tasks := make(chan Task, 20)
+    results := make(chan Result, 20)
+
+    // 启动一个调度器 goroutine，按优先级调度任务
+    go func() {
+        pq := make(PriorityQueue, 0)
+        heap.Init(&pq)
+
+        // 接收任务并放入优先级队列
+        for task := range tasks {
+            heap.Push(&pq, &task)
+        }
+
+        // 按优先级分发任务
+        for pq.Len() > 0 {
+            task := heap.Pop(&pq).(*Task)
+            // 这里简化处理，实际应该发送给 worker
+            fmt.Printf("调度任务 %d (优先级: %d)\n", task.ID, task.Priority)
+        }
+        close(results)
+    }()
+
+    // 发送任务
+    for j := 1; j <= 10; j++ {
+        tasks <- Task{
+            ID:       j,
+            Payload:  fmt.Sprintf("数据 %d", j),
+            Priority: j % 3,
+        }
+    }
+    close(tasks)
+
+    // 等待结果
+    for range results {
+    }
+}
+```
+
+---
+
+## Pipeline 模式
+
+Pipeline（流水线）模式将复杂处理分解为多个阶段，每个阶段由独立的 goroutine 处理，阶段之间通过 channel 连接。
+
+### 问题背景
+
+在任务队列 API 中，一个完整的任务处理流程可能是：
+
+1. 接收任务（验证格式）
+2. 处理任务（执行业务逻辑）
+3. 保存结果（写入数据库）
+
+如果这些步骤串行执行，总耗时是各步骤之和。Pipeline 模式让每个步骤在不同 goroutine 中并行执行，提高吞吐量。
+
+### 基础 Pipeline
+
+```go
+package main
+
+import "fmt"
+
+// 阶段1：生成任务
+func generate(tasks ...int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)  // 发送完毕后关闭 channel
+        for _, task := range tasks {
+            out <- task
+        }
+    }()
+    return out
+}
+
+// 阶段2：处理任务（平方）
+func square(in <-chan int) <-chan int {
+    out := make(chan int)
+    go func() {
+        defer close(out)
+        for n := range in {
+            out <- n * n
+        }
+    }()
+    return out
+}
+
+// 阶段3：格式化结果
+func format(in <-chan int) <-chan string {
+    out := make(chan string)
+    go func() {
+        defer close(out)
+        for n := range in {
+            out <- fmt.Sprintf("结果: %d", n)
+        }
+    }()
+    return out
+}
+
+func main() {
+    // 构建 pipeline: generate -> square -> format
+    numbers := generate(1, 2, 3, 4, 5)
+    squares := square(numbers)
+    formatted := format(squares)
+
+    // 消费最终结果
+    for result := range formatted {
+        fmt.Println(result)
+    }
+}
+```
+
+这个 pipeline 的优点：
+
+1. **并发执行**：三个阶段同时运行，当 stage1 处理第二个任务时，stage2 可能正在处理第一个任务
+2. **解耦**：每个阶段是独立的，可以单独修改和测试
+3. **背压控制**：如果某个阶段慢了，会自动阻塞上游，避免内存爆炸
+
+### 在任务队列中的应用
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "time"
+)
+
+// 任务处理 pipeline
+type RawTask struct {
+    Data []byte
+}
+
+type ValidatedTask struct {
+    ID     int
+    Input  string
+}
+
+type ProcessedTask struct {
+    ID     int
+    Result string
+}
+
+// 阶段1：验证和解析
+func validate(in <-chan RawTask) <-chan ValidatedTask {
+    out := make(chan ValidatedTask)
+    go func() {
+        defer close(out)
+        for raw := range in {
+            var task struct {
+                ID    int    `json:"id"`
+                Input string `json:"input"`
+            }
+
+            if err := json.Unmarshal(raw.Data, &task); err != nil {
+                fmt.Printf("验证失败: %v\n", err)
+                continue
+            }
+
+            out <- ValidatedTask{
+                ID:    task.ID,
+                Input: task.Input,
+            }
+        }
+    }()
+    return out
+}
+
+// 阶段2：处理业务逻辑
+func process(in <-chan ValidatedTask) <-chan ProcessedTask {
+    out := make(chan ProcessedTask)
+    go func() {
+        defer close(out)
+        for task := range in {
+            // 模拟业务处理
+            time.Sleep(50 * time.Millisecond)
+            out <- ProcessedTask{
+                ID:     task.ID,
+                Result: fmt.Sprintf("处理结果: %s", task.Input),
+            }
+        }
+    }()
+    return out
+}
+
+// 阶段3：保存结果
+func save(in <-chan ProcessedTask) <-chan bool {
+    out := make(chan bool)
+    go func() {
+        defer close(out)
+        for task := range in {
+            // 模拟保存到数据库
+            fmt.Printf("保存任务 %d: %s\n", task.ID, task.Result)
+            out <- true
+        }
+    }()
+    return out
+}
+
+func main() {
+    rawTasks := make(chan RawTask, 10)
+
+    // 启动 pipeline
+    validated := validate(rawTasks)
+    processed := process(validated)
+    saved := save(processed)
+
+    // 发送原始任务
+    go func() {
+        defer close(rawTasks)
+        for i := 1; i <= 5; i++ {
+            data, _ := json.Marshal(map[string]interface{}{
+                "id":    i,
+                "input": fmt.Sprintf("输入 %d", i),
+            })
+            rawTasks <- RawTask{Data: data}
+        }
+    }()
+
+    // 等待所有任务完成
+    count := 0
+    for range saved {
+        count++
+    }
+    fmt.Printf("共处理 %d 个任务\n", count)
+}
+```
+
+---
+
+## Fan-out / Fan-in 模式
+
+Fan-out 是将一个输入分发给多个 worker 并行处理，Fan-in 是将多个 worker 的结果合并到一个输出。
+
+### 问题背景
+
+在任务队列中，有些任务可以并行处理（如批量下载图片），有些任务需要合并结果（如汇总统计）。Fan-out/Fan-in 模式非常适合这种场景。
+
+### Fan-out：并行下载
+
+```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+func main() {
+    urls := []string{
+        "https://example.com/file1",
+        "https://example.com/file2",
+        "https://example.com/file3",
+        "https://example.com/file4",
+        "https://example.com/file5",
+    }
+
+    // Fan-out: 将任务分发给多个 worker
+    results := make(chan string, len(urls))
+    var wg sync.WaitGroup
+
+    for _, url := range urls {
+        wg.Add(1)
+        go func(u string) {
+            defer wg.Done()
+            // 模拟下载
+            time.Sleep(100 * time.Millisecond)
+            results <- fmt.Sprintf("已下载: %s", u)
+        }(url)
+    }
+
+    // 等待所有下载完成
+    go func() {
+        wg.Wait()
+        close(results)
+    }()
+
+    // 收集结果
+    for result := range results {
+        fmt.Println(result)
+    }
+}
+```
+
+### Fan-in：合并多个 worker 的结果
+
+```go
+package main
+
+import (
+    "fmt"
+    "sync"
+)
+
+func main() {
+    // 启动多个 producer
+    ch1 := make(chan int)
+    ch2 := make(chan int)
+    ch3 := make(chan int)
+
+    go producer(ch1, 1, 5)
+    go producer(ch2, 10, 15)
+    go producer(ch3, 20, 25)
+
+    // Fan-in: 合并多个 channel
+    out := fanIn(ch1, ch2, ch3)
+
+    // 消费合并后的结果
+    for val := range out {
+        fmt.Println("收到:", val)
+    }
+}
+
+func producer(ch chan<- int, start, end int) {
+    defer close(ch)
+    for i := start; i <= end; i++ {
+        ch <- i
+    }
+}
+
+func fanIn(inputs ...<-chan int) <-chan int {
+    out := make(chan int)
+    var wg sync.WaitGroup
+
+    // 为每个输入 channel 启动一个 goroutine
+    for _, in := range inputs {
+        wg.Add(1)
+        go func(ch <-chan int) {
+            defer wg.Done()
+            for val := range ch {
+                out <- val
+            }
+        }(in)
+    }
+
+    // 所有输入关闭后，关闭输出
+    go func() {
+        wg.Wait()
+        close(out)
+    }()
+
+    return out
+}
+```
+
+### 完整的 Fan-out/Fan-in 示例
+
+```go
+package main
+
+import (
+    "fmt"
+    "sync"
+    "time"
+)
+
+func main() {
+    // 生成输入数据
+    input := make(chan int, 100)
+    go func() {
+        defer close(input)
+        for i := 1; i <= 10; i++ {
+            input <- i
+        }
+    }()
+
+    // Fan-out: 启动多个 worker 并行处理
+    const numWorkers = 3
+    workerOutputs := make([]<-chan int, numWorkers)
+
+    for i := 0; i < numWorkers; i++ {
+        workerOutputs[i] = worker(i+1, input)
+    }
+
+    // Fan-in: 合并所有 worker 的输出
+    finalOutput := fanIn(workerOutputs...)
+
+    // 消费最终结果
+    for result := range finalOutput {
+        fmt.Println("最终结果:", result)
+    }
+}
+
+func worker(id int, input <-chan int) <-chan int {
+    output := make(chan int)
+    go func() {
+        defer close(output)
+        for val := range input {
+            // 模拟处理
+            time.Sleep(50 * time.Millisecond)
+            result := val * val
+            fmt.Printf("Worker %d: %d -> %d\n", id, val, result)
+            output <- result
+        }
+    }()
+    return output
+}
+
+func fanIn(inputs ...<-chan int) <-chan int {
+    output := make(chan int)
+    var wg sync.WaitGroup
+
+    for _, in := range inputs {
+        wg.Add(1)
+        go func(ch <-chan int) {
+            defer wg.Done()
+            for val := range ch {
+                output <- val
+            }
+        }(in)
+    }
+
+    go func() {
+        wg.Wait()
+        close(output)
+    }()
+
+    return output
+}
+```
+
+---
+
+## Context 取消模式
+
+在实际应用中，你需要能够取消正在执行的任务，比如用户取消请求或超时。Go 的 context 包提供了标准的取消机制。
+
+### 问题背景
+
+任务队列 API 中，可能需要：
+
+1. 客户端取消长时间运行的任务
+2. 请求超时后自动取消
+3. 级联取消（取消父任务时，所有子任务也被取消）
+
+### 基础取消
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+)
+
+func main() {
+    // 创建可取消的 context
+    ctx, cancel := context.WithCancel(context.Background())
+
+    go func() {
+        // 模拟 2 秒后取消
+        time.Sleep(2 * time.Second)
+        cancel()
+    }()
+
+    // 启动 worker
+    worker(ctx)
+}
+
+func worker(ctx context.Context) {
+    for {
+        select {
+        case <-ctx.Done():
+            // 收到取消信号
+            fmt.Println("Worker 被取消:", ctx.Err())
+            return
+        default:
+            // 正常工作
+            fmt.Println("Working...")
+            time.Sleep(500 * time.Millisecond)
+        }
+    }
+}
+```
+
+### 超时取消
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+)
+
+func main() {
+    // 创建 3 秒超时的 context
+    ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+    defer cancel()  // 确保 context 被取消，释放资源
+
+    // 启动任务
+    result := make(chan string, 1)
+
+    go func() {
+        // 模拟长时间任务
+        time.Sleep(5 * time.Second)
+        result <- "完成"
+    }()
+
+    // 等待结果或超时
+    select {
+    case res := <-result:
+        fmt.Println("任务完成:", res)
+    case <-ctx.Done():
+        fmt.Println("任务超时:", ctx.Err())
+    }
+}
+```
+
+### 级联取消
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "time"
+)
+
+func main() {
+    // 父 context
+    parentCtx, parentCancel := context.WithCancel(context.Background())
+
+    // 子 context
+    childCtx, childCancel := context.WithCancel(parentCtx)
+    defer childCancel()
+
+    // 启动子任务
+    go childWorker(childCtx)
+
+    // 2 秒后取消父 context
+    time.Sleep(2 * time.Second)
+    parentCancel()
+
+    // 等待子任务退出
+    time.Sleep(1 * time.Second)
+}
+
+func childWorker(ctx context.Context) {
+    for {
+        select {
+        case <-ctx.Done():
+            fmt.Println("子任务收到取消信号:", ctx.Err())
+            return
+        default:
+            fmt.Println("子任务运行中...")
+            time.Sleep(500 * time.Millisecond)
+        }
+    }
+}
+```
+
+### 在 Worker Pool 中使用 Context
+
+```go
+package main
+
+import (
+    "context"
+    "fmt"
+    "sync"
+    "time"
+)
+
+type Task struct {
+    ID      int
+    Payload string
+}
+
+type Result struct {
+    TaskID int
+    Output string
+    Err    error
+}
+
+func main() {
+    // 创建 5 秒超时的 context
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+
+    tasks := make(chan Task, 10)
+    results := make(chan Result, 10)
+
+    var wg sync.WaitGroup
+
+    // 启动 worker
+    for i := 1; i <= 3; i++ {
+        wg.Add(1)
+        go workerWithContext(ctx, i, tasks, results, &wg)
+    }
+
+    // 发送任务
+    go func() {
+        defer close(tasks)
+        for j := 1; j <= 10; j++ {
+            select {
+            case <-ctx.Done():
+                fmt.Println("发送任务被取消")
+                return
+            case tasks <- Task{ID: j, Payload: fmt.Sprintf("数据 %d", j)}:
+            }
+        }
+    }()
+
+    // 等待 worker 完成
+    go func() {
+        wg.Wait()
+        close(results)
+    }()
+
+    // 收集结果
+    for result := range results {
+        if result.Err != nil {
+            fmt.Printf("任务 %d 失败: %v\n", result.TaskID, result.Err)
+        } else {
+            fmt.Printf("任务 %d 成功: %s\n", result.TaskID, result.Output)
+        }
+    }
+}
+
+func workerWithContext(ctx context.Context, id int, tasks <-chan Task, results chan<- Result, wg *sync.WaitGroup) {
+    defer wg.Done()
+
+    for {
+        select {
+        case <-ctx.Done():
+            // 收到取消信号
+            fmt.Printf("Worker %d 收到取消信号，退出\n", id)
+            return
+
+        case task, ok := <-tasks:
+            if !ok {
+                // tasks channel 已关闭
+                fmt.Printf("Worker %d 发现任务 channel 关闭，退出\n", id)
+                return
+            }
+
+            // 处理任务（需要定期检查 ctx）
+            done := make(chan struct{})
+            go func() {
+                time.Sleep(200 * time.Millisecond)  // 模拟处理
+                close(done)
+            }()
+
+            select {
+            case <-done:
+                results <- Result{
+                    TaskID: task.ID,
+                    Output: fmt.Sprintf("Worker %d 完成任务 %d", id, task.ID),
+                }
+            case <-ctx.Done():
+                results <- Result{
+                    TaskID: task.ID,
+                    Err:    ctx.Err(),
+                }
+                return
+            }
+        }
+    }
+}
+```
+
+---
+
+## Trade-off 分析
+
+### Worker Pool vs 为每个任务创建 goroutine
+
+**Worker Pool 优势**：
+
+- 控制资源使用，避免创建过多 goroutine
+- 复用 goroutine，减少创建销毁开销
+- 更容易监控和限流
+
+**Worker Pool 劣势**：
+
+- 复杂度更高，需要管理 channel 和同步
+- 可能出现某个 worker 阻塞导致整个 pool 饥饿
+
+**何时选择 Worker Pool**：
+
+- 任务数量大（>100）
+- 每个任务处理时间较长（>10ms）
+- 需要限制并发数量（如数据库连接）
+
+### Pipeline vs 串行处理
+
+**Pipeline 优势**：
+
+- 提高吞吐量，多个阶段并行执行
+- 解耦处理逻辑，每个阶段独立
+- 自然的背压控制
+
+**Pipeline 劣势**：
+
+- 增加复杂度，需要管理多个 channel
+- 每个 stage 的 goroutine 开销
+- 调试困难，goroutine 之间异步交互
+
+**何时选择 Pipeline**：
+
+- 处理步骤清晰且相互独立
+- 需要高吞吐量
+- 每个 stage 的处理时间相近
+
+### Channel vs 共享内存
+
+**Channel 优势**：
+
+- 类型安全，避免数据竞争
+- 代码清晰，数据流向明确
+- 天然支持并发模式
+
+**Channel 劣势**：
+
+- 性能开销（锁、拷贝、调度）
+- 不适合细粒度的并发控制
+- 内存占用（缓冲 channel）
+
+**何时选择 Channel**：
+
+- goroutine 之间需要传递数据
+- 构建流水线或任务队列
+- 优先代码可读性
+
+**何时选择锁**：
+
+- 保护复杂的共享数据结构
+- 性能敏感的代码
+- 需要细粒度的并发控制
+
+---
+
+## 总结
+
+Go 的并发模式是 goroutine 和 channel 的组合应用，它们让你能够用相对简单的代码实现复杂的并发控制。在任务队列 API 中：
+
+1. **Worker Pool**：控制并发数量，避免资源耗尽
+2. **Pipeline**：将任务处理分解为多个阶段，提高吞吐量
+3. **Fan-out/Fan-in**：并行处理独立任务，合并结果
+4. **Context**：实现取消和超时控制，保证优雅关闭
+
+这些模式不是银弹，选择时需要权衡复杂度和收益。记住 Go 的并发哲学："不要通过共享内存来通信，而要通过通信来共享内存。"

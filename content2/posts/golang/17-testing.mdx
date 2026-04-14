@@ -1,0 +1,1124 @@
+---
+title: "17. 测试：保证任务队列的可靠性"
+date: "2026-03-23"
+summary: "学习如何在 Go 中编写单元测试、表格驱动测试、基准测试和集成测试，确保任务队列系统的可靠性。"
+tags: ["Go", "Golang", "测试", "单元测试", "TDD"]
+category: "golang"
+cover: ""
+draft: false
+series: "Go 语言渐进式学习"
+seriesOrder: 17
+---
+
+## 问题引入
+
+我们的任务队列系统越来越复杂了：
+
+- 任务调度逻辑
+- 数据库操作
+- 并发控制
+- 错误处理和重试
+
+**问题来了：如何确保这些功能正常工作？**
+
+手动测试不仅耗时，而且容易遗漏边界情况。我们需要自动化测试来：
+
+1. 验证功能正确性
+2. 防止回归错误
+3. 重构时有安全网
+4. 文档化代码行为
+
+Go 内置了强大的测试框架，让我们为任务队列编写全面的测试。
+
+---
+
+## 基础测试
+
+### 测试文件组织
+
+Go 的测试文件命名为 `*_test.go`，与被测试的文件放在同一目录：
+
+```
+task-queue/
+├── task.go          # 任务相关代码
+├── task_test.go     # 任务测试
+├── worker.go        # worker 代码
+└── worker_test.go   # worker 测试
+```
+
+### 第一个测试
+
+为任务的核心逻辑编写测试：
+
+```go
+// task.go
+package main
+
+import (
+	"errors"
+	"time"
+)
+
+// Task 任务结构
+type Task struct {
+	ID         int
+	Name       string
+	Status     string
+	MaxRetries int
+	RetryCount int
+	CreatedAt  time.Time
+}
+
+// CanRetry 判断任务是否可以重试
+func (t *Task) CanRetry() bool {
+	// 如果重试次数小于最大重试次数，可以重试
+	return t.RetryCount < t.MaxRetries
+}
+
+// Execute 执行任务
+func (t *Task) Execute() error {
+	// 模拟任务执行
+	if t.Name == "error_task" {
+		return errors.New("任务执行失败")
+	}
+	return nil
+}
+
+// MarkCompleted 标记任务为完成
+func (t *Task) MarkCompleted() {
+	t.Status = "completed"
+}
+
+// MarkFailed 标记任务为失败
+func (t *Task) MarkFailed() {
+	t.Status = "failed"
+	t.RetryCount++
+}
+
+// IncrementRetry 增加重试次数
+func (t *Task) IncrementRetry() {
+	t.RetryCount++
+}
+```
+
+```go
+// task_test.go
+package main
+
+import (
+	"testing"
+	"time"
+)
+
+// TestCanRetry 测试任务是否可以重试
+func TestCanRetry(t *testing.T) {
+	tests := []struct {
+		name      string
+		task      Task
+		want      bool
+	}{
+		{
+			name: "可以重试 - 重试次数未达到上限",
+			task: Task{
+				RetryCount: 2,
+				MaxRetries: 3,
+			},
+			want: true,
+		},
+		{
+			name: "不可以重试 - 重试次数达到上限",
+			task: Task{
+				RetryCount: 3,
+				MaxRetries: 3,
+			},
+			want: false,
+		},
+		{
+			name: "可以重试 - 从未重试过",
+			task: Task{
+				RetryCount: 0,
+				MaxRetries: 3,
+			},
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.task.CanRetry(); got != tt.want {
+				t.Errorf("CanRetry() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestExecute 测试任务执行
+func TestExecute(t *testing.T) {
+	tests := []struct {
+		name    string
+		task    Task
+		wantErr bool
+	}{
+		{
+			name: "正常任务",
+			task: Task{
+				Name: "normal_task",
+			},
+			wantErr: false,
+		},
+		{
+			name: "错误任务",
+			task: Task{
+				Name: "error_task",
+			},
+			wantErr: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.task.Execute()
+			if (err != nil) != tt.wantErr {
+				t.Errorf("Execute() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+// TestMarkCompleted 测试标记任务完成
+func TestMarkCompleted(t *testing.T) {
+	task := Task{
+		Status: "pending",
+	}
+
+	task.MarkCompleted()
+
+	if task.Status != "completed" {
+		t.Errorf("MarkCompleted() status = %v, want %v", task.Status, "completed")
+	}
+}
+
+// TestMarkFailed 测试标记任务失败
+func TestMarkFailed(t *testing.T) {
+	task := Task{
+		Status:     "processing",
+		RetryCount: 1,
+	}
+
+	task.MarkFailed()
+
+	// 检查状态
+	if task.Status != "failed" {
+		t.Errorf("MarkFailed() status = %v, want %v", task.Status, "failed")
+	}
+
+	// 检查重试次数是否增加
+	if task.RetryCount != 2 {
+		t.Errorf("MarkFailed() retryCount = %v, want %v", task.RetryCount, 2)
+	}
+}
+```
+
+运行测试：
+
+```bash
+# 运行所有测试
+go test ./...
+
+# 运行指定包的测试
+go test ./task-queue
+
+# 详细输出
+go test -v ./task-queue
+
+# 运行特定测试
+go test -run TestCanRetry ./task-queue
+```
+
+---
+
+## 表格驱动测试
+
+表格驱动测试是 Go 中的常见模式，特别适合测试多个场景：
+
+```go
+// task_repository_test.go
+package main
+
+import (
+	"errors"
+	"testing"
+)
+
+// MockTaskRepository 模拟任务仓库
+type MockTaskRepository struct {
+	tasks map[int]*Task
+	err   error
+}
+
+// NewMockTaskRepository 创建模拟仓库
+func NewMockTaskRepository() *MockTaskRepository {
+	return &MockTaskRepository{
+		tasks: make(map[int]*Task),
+	}
+}
+
+// Create 创建任务
+func (m *MockTaskRepository) Create(task *Task) error {
+	if m.err != nil {
+		return m.err
+	}
+	task.ID = len(m.tasks) + 1
+	m.tasks[task.ID] = task
+	return nil
+}
+
+// GetByID 根据 ID 获取任务
+func (m *MockTaskRepository) GetByID(id int) (*Task, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	task, ok := m.tasks[id]
+	if !ok {
+		return nil, errors.New("任务不存在")
+	}
+	return task, nil
+}
+
+// SetError 设置错误（用于测试错误情况）
+func (m *MockTaskRepository) SetError(err error) {
+	m.err = err
+}
+
+// TaskService 任务服务
+type TaskService struct {
+	repo TaskRepository
+}
+
+// NewTaskService 创建任务服务
+func NewTaskService(repo TaskRepository) *TaskService {
+	return &TaskService{repo: repo}
+}
+
+// CreateTask 创建任务
+func (s *TaskService) CreateTask(name string, maxRetries int) (*Task, error) {
+	if name == "" {
+		return nil, errors.New("任务名称不能为空")
+	}
+
+	if maxRetries < 0 {
+		return nil, errors.New("最大重试次数不能为负数")
+	}
+
+	task := &Task{
+		Name:       name,
+		Status:     "pending",
+		MaxRetries: maxRetries,
+		RetryCount: 0,
+	}
+
+	if err := s.repo.Create(task); err != nil {
+		return nil, err
+	}
+
+	return task, nil
+}
+
+// GetTask 获取任务
+func (s *TaskService) GetTask(id int) (*Task, error) {
+	if id <= 0 {
+		return nil, errors.New("无效的任务 ID")
+	}
+
+	return s.repo.GetByID(id)
+}
+
+// TaskRepository 任务仓库接口
+type TaskRepository interface {
+	Create(task *Task) error
+	GetByID(id int) (*Task, error)
+}
+
+// TestCreateTask 测试创建任务
+func TestCreateTask(t *testing.T) {
+	tests := []struct {
+		name       string
+		taskName   string
+		maxRetries int
+		mockErr    error
+		wantErr    bool
+		errMsg     string
+	}{
+		{
+			name:       "成功创建任务",
+			taskName:   "test_task",
+			maxRetries: 3,
+			mockErr:    nil,
+			wantErr:    false,
+		},
+		{
+			name:       "任务名称为空",
+			taskName:   "",
+			maxRetries: 3,
+			mockErr:    nil,
+			wantErr:    true,
+			errMsg:     "任务名称不能为空",
+		},
+		{
+			name:       "重试次数为负数",
+			taskName:   "test_task",
+			maxRetries: -1,
+			mockErr:    nil,
+			wantErr:    true,
+			errMsg:     "最大重试次数不能为负数",
+		},
+		{
+			name:       "仓库错误",
+			taskName:   "test_task",
+			maxRetries: 3,
+			mockErr:    errors.New("数据库错误"),
+			wantErr:    true,
+			errMsg:     "数据库错误",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 创建 mock 仓库
+			mockRepo := NewMockTaskRepository()
+			mockRepo.SetError(tt.mockErr)
+
+			// 创建服务
+			service := NewTaskService(mockRepo)
+
+			// 调用方法
+			task, err := service.CreateTask(tt.taskName, tt.maxRetries)
+
+			// 验证结果
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("CreateTask() expected error, got nil")
+					return
+				}
+				if tt.errMsg != "" && err.Error() != tt.errMsg {
+					t.Errorf("CreateTask() error = %v, want %v", err.Error(), tt.errMsg)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("CreateTask() unexpected error: %v", err)
+					return
+				}
+				if task == nil {
+					t.Errorf("CreateTask() returned nil task")
+					return
+				}
+				if task.Name != tt.taskName {
+					t.Errorf("CreateTask() task.Name = %v, want %v", task.Name, tt.taskName)
+				}
+				if task.MaxRetries != tt.maxRetries {
+					t.Errorf("CreateTask() task.MaxRetries = %v, want %v", task.MaxRetries, tt.maxRetries)
+				}
+				if task.Status != "pending" {
+					t.Errorf("CreateTask() task.Status = %v, want %v", task.Status, "pending")
+				}
+			}
+		})
+	}
+}
+
+// TestGetTask 测试获取任务
+func TestGetTask(t *testing.T) {
+	tests := []struct {
+		name    string
+		taskID  int
+		setup   func(*MockTaskRepository)
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:   "成功获取任务",
+			taskID: 1,
+			setup: func(repo *MockTaskRepository) {
+				repo.Create(&Task{ID: 1, Name: "test_task"})
+			},
+			wantErr: false,
+		},
+		{
+			name:   "任务不存在",
+			taskID: 999,
+			setup:  func(repo *MockTaskRepository) {},
+			wantErr: true,
+			errMsg:  "任务不存在",
+		},
+		{
+			name:   "无效的任务 ID",
+			taskID: -1,
+			setup:  func(repo *MockTaskRepository) {},
+			wantErr: true,
+			errMsg:  "无效的任务 ID",
+		},
+		{
+			name:   "零值 ID",
+			taskID: 0,
+			setup:  func(repo *MockTaskRepository) {},
+			wantErr: true,
+			errMsg:  "无效的任务 ID",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// 创建 mock 仓库
+			mockRepo := NewMockTaskRepository()
+			tt.setup(mockRepo)
+
+			// 创建服务
+			service := NewTaskService(mockRepo)
+
+			// 调用方法
+			task, err := service.GetTask(tt.taskID)
+
+			// 验证结果
+			if tt.wantErr {
+				if err == nil {
+					t.Errorf("GetTask() expected error, got nil")
+					return
+				}
+				if tt.errMsg != "" && err.Error() != tt.errMsg {
+					t.Errorf("GetTask() error = %v, want %v", err.Error(), tt.errMsg)
+				}
+			} else {
+				if err != nil {
+					t.Errorf("GetTask() unexpected error: %v", err)
+					return
+				}
+				if task == nil {
+					t.Errorf("GetTask() returned nil task")
+				}
+			}
+		})
+	}
+}
+```
+
+---
+
+## 基准测试
+
+基准测试用于测量代码的性能：
+
+```go
+// task_benchmark_test.go
+package main
+
+import (
+	"testing"
+)
+
+// BenchmarkTaskExecute 基准测试任务执行
+func BenchmarkTaskExecute(b *testing.B) {
+	task := Task{Name: "normal_task"}
+
+	// 重置计时器，排除初始化时间
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = task.Execute()
+	}
+}
+
+// BenchmarkCanRetry 基准测试 CanRetry 方法
+func BenchmarkCanRetry(b *testing.B) {
+	task := Task{
+		RetryCount: 1,
+		MaxRetries: 3,
+	}
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = task.CanRetry()
+	}
+}
+
+// BenchmarkTaskCreation 基准测试任务创建
+func BenchmarkTaskCreation(b *testing.B) {
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_ = Task{
+			Name:       "test_task",
+			Status:     "pending",
+			MaxRetries: 3,
+			RetryCount: 0,
+		}
+	}
+}
+```
+
+运行基准测试：
+
+```bash
+# 运行基准测试
+go test -bench=. -benchmem
+
+# 输出示例：
+# BenchmarkTaskExecute-8         1000000    1023 ns/op    0 B/op    0 allocs/op
+# BenchmarkCanRetry-8            30000000    45.2 ns/op    0 B/op    0 allocs/op
+# BenchmarkTaskCreation-8        20000000    78.5 ns/op    0 B/op    0 allocs/op
+```
+
+---
+
+## 测试覆盖率
+
+测试覆盖率告诉我们代码被测试了多少：
+
+```bash
+# 生成覆盖率报告
+go test -coverprofile=coverage.out ./...
+
+# 查看覆盖率
+go tool cover -func=coverage.out
+
+# 输出示例：
+# task.go:15:    CanRetry         100.0%
+# task.go:20:    Execute          100.0%
+# task.go:28:    MarkCompleted    100.0%
+# task.go:33:    MarkFailed       100.0%
+# task.go:39:    IncrementRetry   100.0%
+# total:         100.0%
+
+# 生成 HTML 覆盖率报告
+go tool cover -html=coverage.out
+```
+
+---
+
+## 使用 Testify
+
+Testify 是一个流行的测试库，提供更丰富的断言和 mocking 功能：
+
+```bash
+go get github.com/stretchr/testify
+```
+
+### 使用断言
+
+```go
+// task_testify_test.go
+package main
+
+import (
+	"testing"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// TestCanRetryWithTestify 使用 Testify 断言
+func TestCanRetryWithTestify(t *testing.T) {
+	tests := []struct {
+		name      string
+		task      Task
+		want      bool
+	}{
+		{
+			name: "可以重试",
+			task: Task{
+				RetryCount: 2,
+				MaxRetries: 3,
+			},
+			want: true,
+		},
+		{
+			name: "不可以重试",
+			task: Task{
+				RetryCount: 3,
+				MaxRetries: 3,
+			},
+			want: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Equal 断言两个值相等
+			assert.Equal(t, tt.want, tt.task.CanRetry())
+		})
+	}
+}
+
+// TestCreateTaskWithTestify 使用 Testify 断言
+func TestCreateTaskWithTestify(t *testing.T) {
+	mockRepo := NewMockTaskRepository()
+	service := NewTaskService(mockRepo)
+
+	// 正常情况
+	task, err := service.CreateTask("test_task", 3)
+
+	// require 系列断言失败时会立即停止测试
+	require.NoError(t, err, "创建任务不应返回错误")
+	require.NotNil(t, task, "任务不应为 nil")
+
+	// assert 系列断言失败时会记录错误但继续测试
+	assert.Equal(t, "test_task", task.Name, "任务名称应匹配")
+	assert.Equal(t, 3, task.MaxRetries, "最大重试次数应匹配")
+	assert.Equal(t, "pending", task.Status, "初始状态应为 pending")
+
+	// 错误情况
+	_, err = service.CreateTask("", 3)
+	assert.Error(t, err, "空任务名称应返回错误")
+	assert.Contains(t, err.Error(), "任务名称不能为空", "错误信息应包含提示")
+}
+```
+
+### Mock 对象
+
+```go
+// worker.go
+package main
+
+import (
+	"context"
+	"log"
+	"time"
+)
+
+// Worker worker
+type Worker struct {
+	id     int
+	taskCh chan *Task
+}
+
+// NewWorker 创建 worker
+func NewWorker(id int, taskCh chan *Task) *Worker {
+	return &Worker{
+		id:     id,
+		taskCh: taskCh,
+	}
+}
+
+// Start 启动 worker
+func (w *Worker) Start(ctx context.Context) {
+	log.Printf("Worker %d 启动", w.id)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Worker %d 停止", w.id)
+			return
+		case task := <-w.taskCh:
+			w.processTask(task)
+		}
+	}
+}
+
+// processTask 处理任务
+func (w *Worker) processTask(task *Task) {
+	log.Printf("Worker %d 处理任务 %s", w.id, task.Name)
+	time.Sleep(100 * time.Millisecond)
+}
+
+// worker_test.go
+package main
+
+import (
+	"context"
+	"testing"
+	"time"
+	"github.com/stretchr/testify/mock"
+)
+
+// MockTask 模拟任务
+type MockTask struct {
+	mock.Mock
+}
+
+func (m *MockTask) Execute() error {
+	args := m.Called()
+	return args.Error(0)
+}
+
+// TestWorkerProcessTask 测试 worker 处理任务
+func TestWorkerProcessTask(t *testing.T) {
+	// 创建 context
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+
+	// 创建任务通道
+	taskCh := make(chan *Task, 10)
+
+	// 创建 worker
+	worker := NewWorker(1, taskCh)
+
+	// 启动 worker
+	go worker.Start(ctx)
+
+	// 发送测试任务
+	task := &Task{
+		ID:   1,
+		Name: "test_task",
+	}
+	taskCh <- task
+
+	// 等待任务被处理
+	time.Sleep(200 * time.Millisecond)
+
+	// 验证任务已被处理（这里只是简单验证）
+	assert.NotNil(t, task)
+}
+```
+
+---
+
+## 集成测试
+
+集成测试验证多个组件一起工作：
+
+```go
+// integration_test.go
+package main
+
+import (
+	"context"
+	"database/sql"
+	"testing"
+	"time"
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+// setupTestDB 设置测试数据库
+func setupTestDB(t *testing.T) *sql.DB {
+	db, err := sql.Open("mysql", "root:password@tcp(localhost:3306)/test_task_queue")
+	require.NoError(t, err, "连接测试数据库失败")
+
+	// 创建测试表
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS tasks (
+			id INT AUTO_INCREMENT PRIMARY KEY,
+			name VARCHAR(255) NOT NULL,
+			status VARCHAR(50) NOT NULL DEFAULT 'pending',
+			max_retries INT NOT NULL DEFAULT 3,
+			retry_count INT NOT NULL DEFAULT 0,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)
+	`)
+	require.NoError(t, err, "创建测试表失败")
+
+	// 清空测试表
+	_, err = db.Exec("DELETE FROM tasks")
+	require.NoError(t, err, "清空测试表失败")
+
+	return db
+}
+
+// TestTaskQueueIntegration 集成测试任务队列
+func TestTaskQueueIntegration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("跳过集成测试")
+	}
+
+	// 设置测试数据库
+	db := setupTestDB(t)
+	defer db.Close()
+
+	// 创建任务仓库
+	repo := NewSQLTaskRepository(db)
+
+	// 创建任务服务
+	service := NewTaskService(repo)
+
+	// 测试创建任务
+	t.Run("创建并获取任务", func(t *testing.T) {
+		task, err := service.CreateTask("integration_test", 3)
+		require.NoError(t, err)
+		assert.NotZero(t, task.ID)
+
+		// 获取任务
+		fetched, err := service.GetTask(task.ID)
+		require.NoError(t, err)
+		assert.Equal(t, task.Name, fetched.Name)
+		assert.Equal(t, task.Status, fetched.Status)
+	})
+
+	// 测试任务状态更新
+	t.Run("更新任务状态", func(t *testing.T) {
+		task, err := service.CreateTask("status_test", 3)
+		require.NoError(t, err)
+
+		// 更新状态
+		err = repo.UpdateStatus(task.ID, "processing")
+		require.NoError(t, err)
+
+		// 验证状态
+		updated, err := repo.GetByID(task.ID)
+		require.NoError(t, err)
+		assert.Equal(t, "processing", updated.Status)
+	})
+}
+```
+
+运行集成测试：
+
+```bash
+# 跳过集成测试
+go test -short ./...
+
+# 运行集成测试
+go test ./...
+```
+
+---
+
+## 并发测试
+
+测试并发代码的正确性：
+
+```go
+// task_concurrent_test.go
+package main
+
+import (
+	"sync"
+	"testing"
+	"github.com/stretchr/testify/assert"
+)
+
+// TestConcurrentTaskCreation 测试并发创建任务
+func TestConcurrentTaskCreation(t *testing.T) {
+	mockRepo := NewMockTaskRepository()
+	service := NewTaskService(mockRepo)
+
+	const numGoroutines = 100
+	const tasksPerGoroutine = 10
+
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	// 并发创建任务
+	for i := 0; i < numGoroutines; i++ {
+		go func(goroutineID int) {
+			defer wg.Done()
+			for j := 0; j < tasksPerGoroutine; j++ {
+				_, err := service.CreateTask(
+					fmt.Sprintf("task_%d_%d", goroutineID, j),
+					3,
+				)
+				assert.NoError(t, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// 验证创建的任务数量
+	expectedTasks := numGoroutines * tasksPerGoroutine
+	assert.Equal(t, expectedTasks, len(mockRepo.tasks))
+}
+
+// TestConcurrentTaskRetrieval 测试并发获取任务
+func TestConcurrentTaskRetrieval(t *testing.T) {
+	mockRepo := NewMockTaskRepository()
+	service := NewTaskService(mockRepo)
+
+	// 创建测试任务
+	task, err := service.CreateTask("concurrent_test", 3)
+	require.NoError(t, err)
+
+	const numGoroutines = 100
+	var wg sync.WaitGroup
+	wg.Add(numGoroutines)
+
+	// 并发获取任务
+	for i := 0; i < numGoroutines; i++ {
+		go func() {
+			defer wg.Done()
+			fetched, err := service.GetTask(task.ID)
+			assert.NoError(t, err)
+			assert.Equal(t, task.Name, fetched.Name)
+		}()
+	}
+
+	wg.Wait()
+}
+```
+
+---
+
+## 最佳实践
+
+### 1. 测试命名
+
+```go
+// ✅ 好的命名：清晰表达测试意图
+func TestTaskCanRetryWhenRetriesBelowMax(t *testing.T) { ... }
+func TestTaskCannotRetryWhenRetriesReachMax(t *testing.T) { ... }
+
+// ❌ 不好的命名：模糊不清
+func TestTask1(t *testing.T) { ... }
+func TestTask2(t *testing.T) { ... }
+```
+
+### 2. 表格驱动测试
+
+```go
+// ✅ 推荐：使用表格驱动测试
+func TestTask(t *testing.T) {
+	tests := []struct {
+		name string
+		task Task
+		want bool
+	}{
+		// 测试用例
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) { ... })
+	}
+}
+```
+
+### 3. 测试隔离
+
+```go
+// ✅ 每个测试独立，不依赖其他测试
+func TestCreateTask(t *testing.T) {
+	// 设置独立的测试环境
+	repo := NewMockTaskRepository()
+	// 测试代码
+}
+
+// ❌ 测试之间有依赖
+var globalRepo *TaskRepository
+
+func Test1(t *testing.T) {
+	globalRepo = NewTaskRepository()
+}
+
+func Test2(t *testing.T) {
+	// 依赖 Test1 的执行
+	globalRepo.Create(...)
+}
+```
+
+### 4. 使用 t.Cleanup 清理
+
+```go
+func TestWithCleanup(t *testing.T) {
+	// 设置测试环境
+	file := createTempFile(t)
+
+	// 使用 Cleanup 确保清理
+	t.Cleanup(func() {
+		os.Remove(file.Name())
+	})
+
+	// 测试代码
+}
+```
+
+---
+
+## Trade-off 分析
+
+### 测试覆盖率的平衡
+
+**高覆盖率的优势：**
+
+- 更多的 bug 被发现
+- 重构更安全
+- 代码质量更高
+
+**高覆盖率的劣势：**
+
+- 编写测试耗时
+- 维护成本高
+- 可能产生"假阳性"（测试通过但功能仍有问题）
+
+**建议：**
+
+- 核心业务逻辑：80-100% 覆盖率
+- 工具函数：60-80% 覆盖率
+- 简单代码：30-50% 覆盖率
+
+### Mock vs 真实依赖
+
+**Mock 的优势：**
+
+- 测试运行快
+- 隔离外部依赖
+- 易于模拟边界情况
+
+**Mock 的劣势：**
+
+- 可能与真实行为不一致
+- 维护 Mock 代码成本高
+- 过度 Mock 导致测试脆弱
+
+**建议：**
+
+- 单元测试：使用 Mock
+- 集成测试：使用真实依赖
+- 关键路径：必须有集成测试
+
+### Table-Driven vs 独立测试
+
+**Table-Driven 优势：**
+
+- 代码简洁
+- 易于添加新用例
+- 统一的风格
+
+**Table-Driven 劣势：**
+
+- 调试时定位困难
+- 所有用例共享设置代码
+
+**建议：**
+
+- 相似逻辑：使用 Table-Driven
+- 复杂设置：使用独立测试
+
+---
+
+## 总结
+
+我们学习了：
+
+1. **基础测试**：编写和运行测试
+   - 测试文件组织
+   - 测试函数命名
+   - 错误验证
+
+2. **表格驱动测试**：高效测试多个场景
+   - 测试用例结构
+   - t.Run 子测试
+   - 共享验证逻辑
+
+3. **基准测试**：测量性能
+   - b.N 循环
+   - ResetTimer
+   - 内存统计
+
+4. **测试覆盖率**：评估测试完整性
+   - 生成覆盖率报告
+   - HTML 报告查看
+
+5. **Testify**：增强测试功能
+   - 丰富的断言
+   - Mock 支持
+
+6. **集成测试**：测试组件协作
+   - 测试数据库设置
+   - 完整流程测试
+
+7. **并发测试**：验证并发安全性
+   - sync.WaitGroup
+   - 竞态检测
+
+8. **最佳实践**：
+   - 清晰的命名
+   - 测试隔离
+   - 适当的覆盖率
+
+通过这些测试技术，我们可以构建可靠、高质量的任务队列系统。测试不仅是质量保证，更是代码文档和设计工具。

@@ -1,0 +1,560 @@
+---
+title: "05. 工具类型实现原理：读懂内置工具类型的源码"
+date: "2026-04-12"
+summary: "从 Mapped Types 出发，手写 Partial、Pick、Omit 等内置工具类型，再用递归实现 DeepReadonly 等深度变换，最后为 API 客户端定制一套类型变换工具。"
+tags: ["TypeScript"]
+category: "typescript"
+cover: ""
+draft: false
+series: "TypeScript 类型系统进阶"
+seriesOrder: 5
+---
+
+## 前言
+
+上一篇我们用品牌类型解决了"单个值的类型精度"问题——`UserId` 和 `OrderId` 不再是傻傻分不清的 `string`。但实际开发中，你面临的更多是**一整个对象**的变换需求：后端返回了 20 个字段，表单只需要 5 个；创建时某些字段必填，更新时全部变成可选；接口返回的数据需要整体标记为只读……
+
+每次都手写一遍新的类型定义？太累了。TypeScript 提供了一组内置工具类型（`Partial`、`Pick`、`Omit`、`Readonly` 等），专门干这件事。但会用和会写是两回事——理解它们的实现原理，你才能在需要的时候自己造工具。
+
+这篇文章我们从一个核心概念出发：**映射类型**（Mapped Types）。它是所有工具类型的底层引擎。搞懂它，Partial、Required、Readonly 这些内置类型对你来说就是小菜一碟。然后我们会实现递归版本的深度工具类型，最后为我们的 API 客户端定制一套实用的类型变换工具。
+
+## 映射类型：所有工具类型的底层引擎
+
+先看一个日常场景。假设你的 API 客户端里有一个用户类型，后端返回的数据长这样：
+
+```typescript
+interface ApiUser {
+  id: string;
+  name: string;
+  email: string;
+  avatar: string;
+  role: "admin" | "user" | "guest";
+  createdAt: string;
+  updatedAt: string;
+}
+```
+
+现在前端有一个"编辑用户信息"的表单，只需要 `name`、`email`、`avatar` 三个字段，而且全部是可选的。你需要一个新的类型，把原来的 7 个字段砍到 3 个，再把它们变成可选的。
+
+手动写当然可以，但如果类似的需求有十几个呢？你需要一种**批量变换**类型的机制。这就是映射类型。
+
+映射类型的语法核心是 `in` 关键字，它的工作方式类似 JavaScript 的 `for...in` 循环——遍历一个类型的所有属性键，然后对每个属性应用某种变换：
+
+```typescript
+// 映射类型的基本语法：
+// [P in K]: T
+// P 是当前遍历到的属性名
+// K 是要遍历的属性名集合（通常是 keyof 某个类型）
+// T 是每个属性的值类型
+type Stringify<T> = {
+  [P in keyof T]: string;
+};
+
+// 使用：把 ApiUser 的所有属性值都变成 string
+type UserStrings = Stringify<ApiUser>;
+// 等价于 { id: string; name: string; email: string; ... }
+```
+
+这段代码做的事情很直观：取出 `T` 的所有属性名（`keyof T`），逐个遍历（`in`），然后把每个属性的值类型都改成 `string`。就像用 `for...in` 遍历对象，然后把每个值都替换成字符串一样。
+
+但光能改值类型还不够。TypeScript 还提供了两个修饰符——`?` 和 `readonly`——让你在遍历时添加或移除属性的可选性和只读性。
+
+**`?` 修饰符**控制属性是否可选。加 `?` 让属性变成可选，减 `?` 让属性变成必填：
+
+```typescript
+// 加 ? —— 所有属性变成可选
+type AllOptional<T> = {
+  [P in keyof T]?: T[P];
+};
+
+// 减 ? —— 所有属性变成必填（通过 -? 移除已有的可选标记）
+type AllRequired<T> = {
+  [P in keyof T]-?: T[P];
+};
+```
+
+**`readonly` 修饰符**控制属性是否只读。逻辑和 `?` 一样，可以加也可以减：
+
+```typescript
+// 加 readonly —— 所有属性变成只读
+type AllReadonly<T> = {
+  readonly [P in keyof T]: T[P];
+};
+
+// 减 readonly —— 移除只读限制
+type AllMutable<T> = {
+  -readonly [P in keyof T]: T[P];
+};
+```
+
+这三个概念——遍历键、变换值类型、控制修饰符——就是映射类型的全部。下面我们就用它们来"还原" TypeScript 内置的工具类型。
+
+## 手写 Partial、Required、Readonly：修饰符的增删
+
+### Partial：让所有属性变成可选
+
+`Partial` 大概是最常用的内置工具类型。它接收一个类型，返回一个所有属性都变成可选的新类型。源码只有一行：
+
+```typescript
+// TypeScript 内置的 Partial 源码
+type Partial<T> = {
+  [P in keyof T]?: T[P];
+};
+```
+
+逐字解读：遍历 `T` 的所有属性名 `P`，对每个属性加上 `?` 修饰符，值类型保持不变（`T[P]` 就是原来那个属性的类型）。
+
+用在我们的 API 客户端场景里，`Partial` 可以用来表示"更新用户"的请求体——更新时不需要传全部字段，只传要改的就行：
+
+```typescript
+// 更新用户的请求体：所有字段都是可选的
+type UpdateUserRequest = Partial<ApiUser>;
+
+// 实际使用：只更新用户的邮箱和头像
+const updatePayload: UpdateUserRequest = {
+  email: "new@example.com",
+  avatar: "https://example.com/new-avatar.jpg",
+  // id、name、role 等字段不需要传
+};
+```
+
+`T[P]` 这个写法叫**索引访问类型**（Indexed Access Types），和 JavaScript 里用 `obj[key]` 访问对象属性值是同一个思路。在类型层面，`T[P]` 就是从类型 `T` 中取出属性名 `P` 对应的值类型。
+
+### Required：和 Partial 反着来
+
+`Required` 是 `Partial` 的反面，把所有可选属性变成必填：
+
+```typescript
+type Required<T> = {
+  [P in keyof T]-?: T[P];
+};
+```
+
+注意那个 `-?`，它的意思是"移除可选标记"。`+?`（简写为 `?`）是添加，`-?` 是移除。`+` 可以省略但 `-` 不能。
+
+适用场景：后端的"创建资源"接口通常要求必填字段，但如果你的基础类型里某些字段被定义成了可选的，`Required` 就能帮你把要求拉满。
+
+### Readonly：冻结对象
+
+`Readonly` 把所有属性标记为 `readonly`，赋值后就不能再改了：
+
+```typescript
+type Readonly<T> = {
+  readonly [P in keyof T]: T[P];
+};
+```
+
+在我们的 API 客户端里，从服务器拿回来的数据不应该被前端代码随意修改。用 `Readonly` 包一层就能防止意外赋值：
+
+```typescript
+// API 响应的数据类型：全部只读，防止意外修改
+type ApiUserResponse = Readonly<ApiUser>;
+
+const user: ApiUserResponse = await fetchUser("usr_a1x9k2m");
+user.name = "hacker"; // 编译错误：Cannot assign to 'name' because it is a read-only property
+```
+
+这三个类型的共同点很明确：它们只做**修饰符的增删**，不改变属性集合和值类型。接下来看一组会"增删属性"的工具类型。
+
+## 手写 Record、Pick、Omit：属性集合的过滤
+
+### Record：快速构造对象类型
+
+`Record` 用两个参数构造一个新的对象类型——第一个参数指定有哪些键，第二个参数指定所有键对应的值类型：
+
+```typescript
+type Record<K extends string | number | symbol, T> = {
+  [P in K]: T;
+};
+```
+
+这个类型和前面几个稍有不同：它不是"变换"现有类型，而是"凭空构造"新类型。`K` 是键的集合（通常是一个联合类型），`T` 是统一的值类型。
+
+在 API 客户端里，`Record` 非常适合表示"映射"类数据，比如 HTTP 状态码到描述的映射：
+
+```typescript
+// HTTP 状态码描述映射
+type HttpStatusDescription = Record<number, string>;
+
+const statusMap: HttpStatusDescription = {
+  200: "OK",
+  201: "Created",
+  400: "Bad Request",
+  401: "Unauthorized",
+  404: "Not Found",
+  500: "Internal Server Error",
+};
+```
+
+或者更常见的场景——用字符串字面量联合类型作为键，构建枚举式的对象：
+
+```typescript
+// 用联合类型约束键名，值统一为配置对象
+type RolePermissions = Record<
+  "admin" | "user" | "guest",
+  {
+    canRead: boolean;
+    canWrite: boolean;
+    canDelete: boolean;
+  }
+>;
+
+const permissions: RolePermissions = {
+  admin: { canRead: true, canWrite: true, canDelete: true },
+  user: { canRead: true, canWrite: true, canDelete: false },
+  guest: { canRead: true, canWrite: false, canDelete: false },
+};
+```
+
+### Pick：从一个类型里挑几个属性
+
+`Pick` 从现有类型中选出指定的属性，组成一个新类型：
+
+```typescript
+type Pick<T, K extends keyof T> = {
+  [P in K]: T[P];
+};
+```
+
+`K extends keyof T` 这个约束确保你只能挑 `T` 里存在的属性名。如果写 `Pick<ApiUser, "foo">`，编译器会直接报错。
+
+回到编辑用户表单的场景，用 `Pick` 比手动定义类型简洁得多：
+
+```typescript
+// 只取 name、email、avatar 三个字段
+type UserFormData = Pick<ApiUser, "name" | "email" | "avatar">;
+
+// 等价于手动写：
+// type UserFormData = {
+//   name: string;
+//   email: string;
+//   avatar: string;
+// }
+```
+
+### Omit：排除指定的属性
+
+`Omit` 和 `Pick` 相反，从类型中排除指定的属性：
+
+```typescript
+type Omit<T, K extends keyof T> = {
+  [P in Exclude<keyof T, K>]: T[P];
+};
+```
+
+这里出现了一个新的内置类型 `Exclude`（下一节会讲）。它的作用是从联合类型中排除指定的成员。`Exclude<keyof T, K>` 就是"从 T 的所有属性名中，去掉 K 指定的那些"。
+
+在 API 客户端里，`Omit` 常用于"创建资源时排除只读字段"。比如 `id`、`createdAt` 是后端自动生成的，创建请求不应该包含它们：
+
+```typescript
+// 创建用户的请求体：排除 id 和 createdAt
+type CreateUserRequest = Omit<ApiUser, "id" | "createdAt" | "updatedAt">;
+
+// 实际使用：不需要传 id（后端生成）和 createdAt（后端生成）
+const createPayload: CreateUserRequest = {
+  name: "张三",
+  email: "zhangsan@example.com",
+  avatar: "https://example.com/avatar.jpg",
+  role: "user",
+};
+```
+
+## 手写 Exclude、Extract：联合类型的操作
+
+前面的 `Omit` 用到了 `Exclude`，这里我们就来实现它。`Exclude` 和 `Extract` 操作的是**联合类型**，不是对象类型。
+
+### Exclude：从联合类型中排除
+
+```typescript
+type Exclude<U, T> = U extends T ? never : U;
+```
+
+这个类型用到了我们在第一篇文章学过的**条件类型**。它遍历联合类型 `U` 的每个成员，如果某个成员能赋值给 `T`（即 `U extends T`），就替换成 `never`（从联合中消失）；否则保留原值。
+
+举个具体的例子：
+
+```typescript
+type Result = Exclude<"a" | "b" | "c" | "d", "a" | "c">;
+// 分发过程：
+//   "a" extends "a" | "c" ? never : "a"  → never
+//   "b" extends "a" | "c" ? never : "b"  → "b"
+//   "c" extends "a" | "c" ? never : "c"  → never
+//   "d" extends "a" | "c" ? never : "d"  → "d"
+// 最终结果："b" | "d"
+```
+
+条件类型作用在联合类型上时会**自动分发**——对联合的每个成员分别执行条件判断。`never` 在联合类型中会被自动忽略（`"b" | never | "d"` 等价于 `"b" | "d"`），所以排除的效果就实现了。
+
+### Extract：从联合类型中提取
+
+`Extract` 是 `Exclude` 的反面，只保留能匹配上的成员：
+
+```typescript
+type Extract<T, U> = T extends U ? T : never;
+```
+
+逻辑和 `Exclude` 完全对称：匹配的保留，不匹配的变成 `never` 消失。
+
+```typescript
+type StringKeys = Extract<keyof ApiUser, string>;
+// keyof ApiUser 本身就是 string（因为所有属性名都是 string），
+// 所以结果就是 "id" | "name" | "email" | "avatar" | "role" | "createdAt" | "updatedAt"
+```
+
+在实际开发中，`Exclude` 和 `Extract` 更多是被其他工具类型内部使用（比如 `Omit` 内部就用到了 `Exclude`），很少直接拿来用。但理解它们的原理，能帮你读懂更复杂的类型代码。
+
+## 递归映射类型：DeepReadonly、DeepPartial、DeepOmit
+
+前面实现的工具类型都是"浅层"的——只处理第一层属性。如果你的对象有嵌套结构，它们就无能为力了：
+
+```typescript
+interface ApiOrder {
+  id: string;
+  items: {
+    productId: string;
+    quantity: number;
+    price: number;
+  }[];
+  shipping: {
+    address: string;
+    city: string;
+    zipCode: string;
+  };
+}
+
+// Readonly 只能让第一层只读
+type ShallowReadonlyOrder = Readonly<ApiOrder>;
+// shipping.address 可以被修改！因为 shipping 的属性没有被标记 readonly
+```
+
+要处理嵌套，需要**递归映射类型**。思路和递归函数一样：如果属性值是对象，就继续往下递归；如果不是，就停止。
+
+### DeepReadonly：深度只读
+
+```typescript
+// 如果 T 是 object（排除 null 和 undefined），递归处理；否则直接标记 readonly
+type DeepReadonly<T> = {
+  readonly [P in keyof T]: T[P] extends object
+    ? DeepReadonly<T[P]> // 值是对象，递归
+    : T[P]; // 值是原始类型，直接保留
+};
+```
+
+但这里有个坑：`Array` 和 `Date` 也是 `object`，它们不应该被展开递归。更严谨的实现需要排除这些特殊类型：
+
+```typescript
+// 判断一个类型是否需要递归：是对象，但不是数组、不是 Date、不是函数
+type IsPlainObject<T> = T extends object
+  ? T extends any[] | Date | Function
+    ? false
+    : true
+  : false;
+
+type DeepReadonly<T> = {
+  readonly [P in keyof T]: IsPlainObject<T[P]> extends true
+    ? DeepReadonly<T[P]>
+    : T[P];
+};
+```
+
+现在 `DeepReadonly` 能正确处理嵌套对象，同时放过数组和日期：
+
+```typescript
+const order: DeepReadonly<ApiOrder> = await fetchOrder("ord_8x9k2m");
+
+order.shipping.address = "新地址"; // 编译错误：readonly
+order.shipping.city = "北京";      // 编译错误：readonly（嵌套的第二层也被保护了）
+order.items.push({ ... });         // 编译错误：readonly（数组本身被冻结）
+// 但 items[0].productId 这种访问本身是可以的（只是不能修改）
+```
+
+### DeepPartial：深度可选
+
+同样的递归思路，把 `readonly` 换成 `?`：
+
+```typescript
+type DeepPartial<T> = {
+  [P in keyof T]?: IsPlainObject<T[P]> extends true ? DeepPartial<T[P]> : T[P];
+};
+```
+
+这在处理"部分更新"场景时特别有用。比如 PATCH 请求允许只传需要修改的字段，嵌套对象里的字段也应该是可选的：
+
+```typescript
+// PATCH /users/:id 的请求体：所有层级都可选
+type PatchUserRequest = DeepPartial<ApiUser>;
+
+// 只更新 shipping.address，其他全部不传
+const patchPayload: PatchUserRequest = {
+  shipping: {
+    address: "北京市朝阳区xxx",
+    // city 和 zipCode 不需要传
+  },
+};
+```
+
+### DeepOmit：深度排除属性
+
+`DeepOmit` 的实现稍微复杂一些，因为需要把路径（比如 `"shipping.address"`）拆开，逐层处理：
+
+```typescript
+// 先实现一个辅助类型：把点分隔的路径拆成属性名的联合
+type SplitPath<S extends string> = S extends `${infer Head}.${infer Tail}`
+  ? Head | SplitPath<Tail>
+  : S;
+
+// DeepOmit：从 T 中排除 paths 指定的嵌套属性
+type DeepOmit<T, Paths extends string> = {
+  [P in keyof T as P extends SplitPath<Paths> ? never : P]: IsPlainObject<
+    T[P]
+  > extends true
+    ? DeepOmit<T[P], Paths>
+    : T[P];
+};
+```
+
+这里用到了映射类型的**键重映射**（Key Remapping）——`as` 子句。`[P in keyof T as NewKey]` 允许你在遍历时改变（或过滤）属性名。当 `NewKey` 是 `never` 时，这个属性就会被从结果中移除。
+
+```typescript
+// 从订单类型中排除 shipping.address 和 items.quantity
+type CleanOrder = DeepOmit<ApiOrder, "shipping.address" | "items.quantity">;
+```
+
+递归映射类型是工具类型中的"高级货"，但理解了递归和映射类型的组合，代码读起来就不难了。
+
+## 为 API 客户端定制工具类型
+
+现在把前面的知识串起来，为我们的 HTTP API 客户端构建一套实用的类型工具。
+
+### SafeApiResponse：给 API 响应加一层只读和可选
+
+后端返回的 JSON 数据有两个特点：不应该被前端修改（只读），某些字段可能不存在（可选）。我们用工具类型组合来表示：
+
+```typescript
+// API 响应的通用包装：只读 + 顶层字段可选
+type SafeApiResponse<T> = Readonly<Partial<T>>;
+
+// 实际使用
+type UserResponse = SafeApiResponse<ApiUser>;
+
+const response: UserResponse = await apiClient.get("/users/usr_a1x9k2m");
+// response 的所有属性都是只读且可选的
+```
+
+### ApiRequest：排除自动生成的字段
+
+创建资源时，`id`、`createdAt` 等字段由后端生成，请求体不应该包含它们：
+
+```typescript
+// 创建请求：排除 id、createdAt、updatedAt
+type CreateRequest<T> = Omit<T, "id" | "createdAt" | "updatedAt">;
+
+// 更新请求：排除自动生成的字段 + 所有字段可选
+type UpdateRequest<T> = Partial<Omit<T, "id" | "createdAt" | "updatedAt">>;
+
+type CreateUserBody = CreateRequest<ApiUser>;
+type UpdateUserBody = UpdateRequest<ApiUser>;
+```
+
+### TransformResponse：把 snake_case 转成 camelCase
+
+后端经常返回 snake_case 的字段名（`created_at`），前端习惯用 camelCase（`createdAt`）。用模板字面量类型（第二篇文章学过的）配合映射类型可以自动完成转换：
+
+```typescript
+// 将 snake_case 属性名转为 camelCase
+// "created_at" → "createdAt"
+type SnakeToCamel<S extends string> = S extends `${infer Head}_${infer Tail}`
+  ? `${Head}${Capitalize<SnakeToCamel<Tail>>}`
+  : S;
+
+// 批量转换对象的所有属性名
+type CamelCaseKeys<T> = {
+  [P in keyof T as SnakeToCamel<P & string>]: T[P];
+};
+
+// 后端返回的类型（snake_case）
+interface RawApiUser {
+  user_id: string;
+  full_name: string;
+  email_address: string;
+  created_at: string;
+}
+
+// 前端使用的类型（camelCase）
+type FrontendUser = CamelCaseKeys<RawApiUser>;
+// { userId: string; fullName: string; emailAddress: string; createdAt: string }
+```
+
+这个工具类型把第二篇文章的模板字面量类型和本文的映射类型组合在了一起。`as SnakeToCamel<P & string>` 这个写法把原来的属性名通过 `SnakeToCamel` 转换后重新映射，实现了属性名的批量重命名。
+
+## 组合工具类型：像搭积木一样
+
+工具类型最强大的地方在于**组合**。单个工具类型做的事情很简单，但组合起来就能处理复杂的类型变换需求。
+
+来看一个真实的例子：我们需要一个"用户列表查询"接口的类型定义。这个接口有分页、筛选、排序参数，后端返回的列表数据需要去掉内部字段，然后转换属性命名风格。
+
+```typescript
+// 1. 定义原始的后端返回类型
+interface RawUserListItem {
+  user_id: string;
+  full_name: string;
+  email_address: string;
+  role: string;
+  is_active: boolean;
+  _internal_score: number; // 前端不需要的内部字段
+  created_at: string;
+}
+
+// 2. 组合变换：
+//    - Omit 去掉 _internal_score
+//    - CamelCaseKeys 转换属性命名
+//    - Pick 只保留列表需要的字段
+//    - Readonly 防止意外修改
+type UserListItem = Readonly<
+  Pick<
+    CamelCaseKeys<Omit<RawUserListItem, "_internal_score">>,
+    "userId" | "fullName" | "emailAddress" | "role" | "isActive"
+  >
+>;
+
+// UserListItem 最终等价于：
+// {
+//   readonly userId: string;
+//   readonly fullName: string;
+//   readonly emailAddress: string;
+//   readonly role: string;
+//   readonly isActive: boolean;
+// }
+```
+
+从内到外阅读这个类型变换链：先 `Omit` 去掉不需要的字段，再 `CamelCaseKeys` 转命名风格，然后 `Pick` 精选出需要的字段，最后 `Readonly` 加上只读保护。每一步做的事情都很简单，组合起来就完成了一个复杂的类型变换。
+
+这种"分步组合"的写法还有一个好处：**每一步都可以单独测试**。如果最终类型不对，你可以从内到外逐步检查，快速定位是哪一步出了问题。
+
+## 什么时候自己写，什么时候用库
+
+TypeScript 内置的工具类型覆盖了最常见的场景（`Partial`、`Required`、`Readonly`、`Pick`、`Omit`、`Record`、`Exclude`、`Extract`），但更复杂的工具类型需要自己实现或借助第三方库。
+
+**适合自己写的场景**：
+
+- 需求简单明确，十行以内能搞定的（比如 `CamelCaseKeys`）
+- 和业务逻辑强绑定的（比如 `CreateRequest<T>`、`UpdateRequest<T>`）
+- 需要精确控制的（比如排除特定字段的 `DeepOmit`）
+
+**适合用库的场景**：
+
+- `type-fest`：提供了大量高质量的实用工具类型（`DeepPartial`、`Merge`、`Exact` 等）
+- `utility-types`：对内置工具类型的补充（`$Pick`、`$Diff` 等）
+- 需要的类型变换逻辑非常复杂（比如深度的 merge、路径安全的类型访问）
+
+我的建议是：先用内置工具类型解决 80% 的需求，剩下的 20% 自己写简单的工具类型，只有当自己写变得很痛苦时才引入第三方库。过度依赖类型库会让代码变得难以理解——你的队友不一定熟悉那些库的 API，但 `Partial` 和 `Omit` 大家都认识。
+
+## 小结
+
+这篇文章我们从一个核心概念出发——映射类型，然后一步步实现了 TypeScript 的内置工具类型。回顾一下关键脉络：
+
+映射类型用 `[P in keyof T]` 的语法遍历一个类型的所有属性，配合 `?`、`readonly`、`-`、`as` 等修饰符，可以对属性做增删改查。`Partial`、`Required`、`Readonly` 只操作修饰符；`Pick`、`Omit`、`Record` 操作属性集合；`Exclude`、`Extract` 操作联合类型。当需要处理嵌套结构时，递归映射类型（`DeepReadonly`、`DeepPartial`）就派上了用场。
+
+更重要的是**组合**的思路。单个工具类型很简单，但像搭积木一样组合起来，就能处理复杂的类型变换。在我们的 API 客户端里，`CreateRequest`、`UpdateRequest`、`CamelCaseKeys` 这些工具类型就是组合的产物，它们让类型定义变得简洁、可维护。
+
+理解了工具类型的实现原理，下一篇我们来看映射类型的一个进阶特性——**键重映射**（Key Remapping），它可以让你在遍历属性时动态地改变属性名和过滤属性，是实现更复杂类型变换的关键能力。

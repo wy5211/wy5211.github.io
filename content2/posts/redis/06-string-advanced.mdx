@@ -1,0 +1,273 @@
+---
+title: "06. String 进阶：计数器与限流"
+date: "2026-03-23"
+summary: "深入掌握 Redis String 类型的实战应用，实现计数器、分布式锁、限流等功能。"
+tags: ["Redis", "String", "分布式锁"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 6
+---
+
+上一篇我们讲了 Redis 的持久化机制，了解了如何通过 RDB 和 AOF 把内存数据保存到磁盘。从这一篇开始，我们要深入每种数据类型的实战应用。
+
+先从最基础的 String 说起。你可能觉得 String 不就是简单的键值对吗？但实际上，通过 String 的原子操作，我们可以实现很多实用功能。
+
+## 为什么需要计数器
+
+想象一个直播场景：主播 wang_dev 正在直播，观众疯狂点赞。如果每次点赞都去数据库更新，数据库压力会非常大。而且并发高的时候，可能会出现计数不准确的问题。
+
+Redis 的 String 类型提供了 INCR 命令，可以原子性地递增数值。什么是原子性？就是多个客户端同时执行 INCR，Redis 会保证顺序执行，不会出现计数错误。
+
+## 基础计数器实现
+
+让我们先看一个简单的点赞计数器：
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+// 直播间点赞计数
+async function likeRoom(roomId: string): Promise<number> {
+  const key = `livestream:room:${roomId}:likes`;
+  return await redis.incr(key);
+}
+
+// 使用示例
+const count = await likeRoom("abc123");
+console.log("当前点赞数:", count);
+```
+
+这段代码做了什么？每次调用 likeRoom，Redis 会把 livestream:room:abc123:likes 这个键的值加 1，并返回新值。如果键不存在，Redis 会先创建它，初始值为 0，然后加 1 返回 1。
+
+## 带过期时间的计数器
+
+但有个问题：如果这个直播间永远存在，点赞数就会一直累积。实际上我们更关心的是"当前直播间的实时点赞数"，而不是历史总点赞数。
+
+可以这样改进：
+
+```typescript
+// 带过期时间的点赞计数（每天重置）
+async function likeRoomDaily(roomId: string): Promise<number> {
+  const today = new Date().toISOString().split("T")[0];
+  const key = `livestream:room:${roomId}:likes:${today}`;
+
+  const count = await redis.incr(key);
+
+  // 第一次设置时添加过期时间（7 天后清理）
+  if (count === 1) {
+    await redis.expire(key, 7 * 24 * 3600);
+  }
+
+  return count;
+}
+```
+
+现在每天的点赞数会分开统计。键名中加入了日期，比如 livestream:room:abc123:likes:2026-04-12。这样可以轻松查询"今天点赞了多少"或"昨天点赞了多少"。
+
+## 礼物积分统计
+
+直播平台还有个常见场景：观众送礼物获得积分。不同礼物的积分不同，比如火箭 50000 分，跑车 30000 分。用 INCRBY 可以批量增加：
+
+```typescript
+// 送礼物增加积分
+async function sendGift(
+  roomId: string,
+  userId: string,
+  points: number
+): Promise<number> {
+  const key = `livestream:room:${roomId}:gift_points`;
+  // INCRBY 可以一次增加指定的数值
+  return await redis.incrby(key, points);
+}
+
+// 使用示例
+await sendGift("abc123", "user_888", 50000); // 送火箭
+await sendGift("abc123", "user_999", 30000); // 送跑车
+```
+
+INCRBY 和 INCR 的区别是，INCR 每次只加 1，INCRBY 可以加任意整数。如果需要减法，可以用 DECR 和 DECRBY。
+
+## 分布式限流
+
+现在换个场景。假设你的直播平台提供了查询直播间信息的 API，恶意用户可能疯狂请求，把服务器打爆。这时候就需要限流。
+
+最简单的限流方式是固定窗口：比如每分钟最多 100 次请求。
+
+```typescript
+class RateLimiter {
+  constructor(private redis: Redis) {}
+
+  // 检查是否允许请求（固定窗口算法）
+  async checkLimit(
+    userId: string,
+    limit: number,
+    window: number
+  ): Promise<boolean> {
+    // 把当前时间戳按窗口大小切分，比如每分钟一个窗口
+    const windowId = Math.floor(Date.now() / (window * 1000));
+    const key = `ratelimit:api:${userId}:${windowId}`;
+
+    const current = await redis.incr(key);
+
+    // 第一次设置时添加过期时间
+    if (current === 1) {
+      await redis.expire(key, window);
+    }
+
+    return current <= limit;
+  }
+}
+
+// 使用示例：每分钟最多 100 次请求
+const limiter = new RateLimiter(redis);
+
+async function handleAPIRequest(userId: string) {
+  const allowed = await limiter.checkLimit(userId, 100, 60);
+
+  if (!allowed) {
+    throw new Error("请求过于频繁，请稍后再试");
+  }
+
+  // 处理请求...
+}
+```
+
+这个实现有个问题：在窗口边界会出现"突刺"。比如用户在第 59 秒请求了 100 次，第 60 秒开始新窗口，又可以请求 100 次。短短 2 秒内请求了 200 次。
+
+更平滑的做法是滑动窗口，但需要用 Sorted Set 实现，我们会在后面讲到。
+
+## 分布式锁
+
+最后一个场景：假设直播间礼物结算需要跑一个定时任务，每小时统计一次榜单。但你有 3 台服务器，都部署了这个定时任务。怎么保证只有一台执行？
+
+这就需要分布式锁。
+
+```typescript
+class DistributedLock {
+  constructor(private redis: Redis) {}
+
+  // 尝试获取锁
+  async acquire(lockName: string, ttl: number = 30): Promise<string | null> {
+    const lockKey = `lock:${lockName}`;
+    // 生成一个唯一标识，防止误删别人的锁
+    const lockValue = `${Date.now()}-${Math.random()}`;
+
+    // SET 的 NX 参数表示"只有键不存在时才设置"
+    // EX 参数表示设置过期时间（秒）
+    const result = await this.redis.set(lockKey, lockValue, "EX", ttl, "NX");
+
+    if (result === "OK") {
+      return lockValue;
+    }
+
+    return null; // 获取锁失败
+  }
+
+  // 释放锁
+  async release(lockName: string, lockValue: string): Promise<boolean> {
+    const lockKey = `lock:${lockName}`;
+
+    // 使用 Lua 脚本确保只删除自己的锁
+    const script = `
+      if redis.call("get", KEYS[1]) == ARGV[1] then
+        return redis.call("del", KEYS[1])
+      else
+        return 0
+      end
+    `;
+
+    const result = await this.redis.eval(script, 1, lockKey, lockValue);
+    return result === 1;
+  }
+}
+
+// 使用示例
+const lock = new DistributedLock(redis);
+
+async function giftSettlementJob(roomId: string) {
+  const lockValue = await lock.acquire(`gift_settlement:${roomId}`, 30);
+
+  if (!lockValue) {
+    console.log("任务正在执行，跳过");
+    return;
+  }
+
+  try {
+    // 执行礼物结算
+    console.log("开始礼物结算...");
+    await doSettlement(roomId);
+  } finally {
+    // 无论成功失败，都要释放锁
+    await lock.release(`gift_settlement:${roomId}`, lockValue);
+  }
+}
+```
+
+这个实现的几个关键点：
+
+1. 锁设置了过期时间，防止进程崩溃导致锁永远不释放
+2. 每个锁有一个唯一值，释放时用 Lua 脚本检查，确保不会删除别人的锁
+3. 用 try-finally 确保锁一定会被释放
+
+过期时间设置多少合适？太短可能导致任务没执行完锁就过期了，太长可能导致任务失败后锁很久才释放。一般建议设置为"预估任务耗时的 2-3 倍"。
+
+## 批量操作优化
+
+如果需要获取多个直播间的点赞数，用 MGET 可以减少网络往返：
+
+```typescript
+// 批量获取多个直播间的点赞数
+async function getMultipleLikes(
+  roomIds: string[]
+): Promise<Record<string, number>> {
+  const keys = roomIds.map((id) => `livestream:room:${id}:likes`);
+  const values = await redis.mget(...keys);
+
+  const result: Record<string, number> = {};
+  roomIds.forEach((id, index) => {
+    result[id] = parseInt(values[index] || "0");
+  });
+
+  return result;
+}
+
+// 使用示例
+const likes = await getMultipleLikes(["abc123", "def456", "ghi789"]);
+console.log(likes);
+// { abc123: 3421, def456: 1205, ghi789: 89 }
+```
+
+MGET 一次可以获取多个键的值，只需要一次网络往返，比循环调用 GET 快得多。
+
+## 数值溢出处理
+
+INCR 的值是 64 位有符号整数，范围是 -2^63 到 2^63-1。如果超过这个范围，Redis 会返回错误。实际应用中，如果要存储的数值可能超过这个范围，建议用字符串存储，或者拆分成多个键。
+
+## 总结与 Trade-off
+
+String 类型的原子操作很强大，但也要注意它的局限性。
+
+**计数器的 Trade-off：**
+
+- 优点：性能极高，原子性保证，实现简单
+- 缺点：数据在 Redis 中，需要考虑持久化；重启后可能丢失（取决于持久化配置）
+- 适用场景：高频计数、实时统计、临时计数
+
+**分布式锁的 Trade-off：**
+
+- 优点：跨进程互斥，实现相对简单
+- 缺点：依赖 Redis 可用性；极端情况下可能出现锁竞争；需要合理设置过期时间
+- 适用场景：定时任务互斥、资源抢占控制
+
+**限流的 Trade-off：**
+
+- 固定窗口：实现简单，但有窗口突刺问题
+- 滑动窗口：更平滑，但实现复杂，需要更多内存
+- 令牌桶：可以处理突发流量，但实现更复杂
+
+选择哪种方案，取决于你的业务需求。如果你只是想防刷，固定窗口就够了；如果需要精确控制，用滑动窗口。
+
+下一篇我们会讲 Hash 类型，看看它和 String 存储对象有什么区别，以及如何用 Hash 实现购物车功能。

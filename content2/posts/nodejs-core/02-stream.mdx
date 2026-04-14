@@ -1,0 +1,275 @@
+---
+title: "02 Stream：流式处理实战"
+date: "2026-03-29"
+summary: "从内存限制问题出发，理解 Stream 的四种类型、背压机制、pipe 与 pipeline 的区别，用流式处理搞定大文件。"
+tags: ["Node.js", "Stream", "流式处理", "背压"]
+category: "nodejs-core"
+cover: ""
+draft: false
+series: "Node.js 核心概念深度解析"
+seriesOrder: 2
+---
+
+你写了一个数据分析脚本，从 CSV 文件中提取特定列的数据。测试时用的 100KB 样本文件一切正常，上了生产遇到 2GB 的 CSV 导出文件，`fs.readFile` 一执行，服务器直接 OOM 了——2GB 内存根本不够用。
+
+你需要一种方式：不用把整个文件放进内存，而是读一块、处理一块、写一块。这就是 Stream。
+
+## 为什么需要 Stream
+
+问题的本质是**数据量和内存之间的矛盾**。一个 2GB 的文件，用 `fs.readFile` 会创建一个 2GB 的 Buffer——整个文件的数据都在内存里。如果你同时处理 4 个文件，就是 8GB 内存，服务器扛不住。
+
+Stream 的思路完全不同：它把数据分成小块（chunk），一块一块地流过处理管线：
+
+```
+readFile 方式：
+磁盘 → [2GB Buffer 全部加载到内存] → 处理 → 写入
+
+Stream 方式：
+磁盘 → [64KB chunk] → 处理 → 写入
+     → [64KB chunk] → 处理 → 写入
+     → [64KB chunk] → 处理 → 写入
+     → ...（内存中始终只有 64KB）
+```
+
+内存占用从 2GB 降到了 64KB（默认 chunk 大小），而且不管文件多大，内存占用都不会增长。
+
+## 四种流类型
+
+Node.js 的流分为四种，按数据流向和功能划分：
+
+| 类型      | 简称   | 数据方向       | 典型场景                          |
+| --------- | ------ | -------------- | --------------------------------- |
+| Readable  | 可读流 | 生产数据       | `fs.createReadStream`、HTTP 请求  |
+| Writable  | 可写流 | 消费数据       | `fs.createWriteStream`、HTTP 响应 |
+| Duplex    | 双工流 | 双向传输       | TCP Socket（同时读和写）          |
+| Transform | 转换流 | 读入→转换→写出 | 压缩、加密、协议解析              |
+
+这四种流不是孤立的，它们可以像管道一样串联起来：一个 Readable 流的输出作为 Transform 流的输入，Transform 流的输出再连到 Writable 流。
+
+## pipe：最简单的流连接
+
+`pipe` 是最基础的流连接方法。把一个文件复制到另一个文件，一行代码就够了：
+
+```js
+import { createReadStream, createWriteStream } from "node:fs";
+
+createReadStream("data.csv").pipe(createWriteStream("data-backup.csv"));
+```
+
+`pipe` 做了三件事：自动从可读流取数据、自动写入可写流、自动管理流量（背压）。看起来很完美，但它有一个致命问题。
+
+## 背压：快生产者和慢消费者
+
+假设你的可读流每秒产生 10MB 数据，但可写流每秒只能写入 2MB（比如写磁盘很慢）。如果不管不顾地读，数据就会堆积在内存中，最终 OOM。
+
+背压（backpressure）就是解决这个问题的机制：当消费者处理不过来时，告诉生产者"暂停一下"。
+
+```
+无背压：生产者 → [内存堆积 → 堆积 → 堆积] → 消费者（内存爆炸）
+
+有背压：生产者 → [缓冲区满 → 暂停] → 消费者 → [缓冲区有空间 → 恢复]
+```
+
+在 Node.js 的流中，`highWaterMark` 控制缓冲区大小（默认 16KB 或 64KB，取决于流类型）。当缓冲区达到这个阈值，Writable 流会通过 `write()` 返回 `false` 告诉上游"慢一点"。
+
+## pipe 的致命问题：错误不传播
+
+`pipe` 看起来方便，但有一个大坑：如果下游流出错，`pipe` 不会自动关闭上游流，也不会触发错误回调。
+
+```js
+// 这个 pipe 的问题：如果目标目录不存在，createWriteStream 会报错
+// 但 createReadStream 不会被关闭，文件句柄会泄露
+createReadStream("big.csv").pipe(createWriteStream("/nonexistent/path.csv"));
+```
+
+这就是为什么 Node.js 12 引入了 `stream.pipeline`。
+
+## pipeline：生产推荐的流连接方式
+
+`pipeline` 解决了 `pipe` 的所有问题：
+
+```js
+import { createReadStream, createWriteStream } from "node:fs";
+import { pipeline } from "node:stream/promises";
+
+try {
+  await pipeline(createReadStream("big.csv"), createWriteStream("backup.csv"));
+  console.log("复制完成");
+} catch (err) {
+  // 任何环节出错都会到这里，所有流都会被正确关闭
+  console.error("处理失败:", err.message);
+}
+```
+
+`pipeline` 和 `pipe` 的关键区别：
+
+| 特性         | `pipe`             | `pipeline`         |
+| ------------ | ------------------ | ------------------ |
+| 错误传播     | 不传播下游错误     | 统一错误回调       |
+| 流清理       | 出错后流可能不关闭 | 自动关闭所有流     |
+| 回调/Promise | 不支持             | 支持回调和 Promise |
+| 推荐程度     | 不推荐用于新代码   | 生产首选           |
+
+一个实用的经验法则：**永远用 `pipeline`，不要用 `pipe`**。
+
+## 实战：CSV 列提取管线
+
+回到数据分析的场景。你需要从一个 2GB 的 CSV 文件中提取 `email` 和 `signup_date` 两列，写入新文件。用 Stream 实现"读一块、处理一块、写一块"：
+
+### 自定义 Transform 流
+
+用 Transform 流实现 CSV 列提取：
+
+```js
+import { Transform } from "node:stream";
+
+class CsvColumnExtractor extends Transform {
+  constructor(columns) {
+    super({ objectMode: true });
+    this.columns = columns;
+    this.headerProcessed = false;
+  }
+
+  _transform(chunk, encoding, callback) {
+    const line = chunk.toString("utf-8").trim();
+    if (!line) return callback();
+
+    if (!this.headerProcessed) {
+      // 第一行是表头，记录目标列的索引
+      const headers = line.split(",");
+      this.columnIndices = this.columns.map((col) => headers.indexOf(col));
+      this.headerProcessed = true;
+      return callback();
+    }
+
+    // 提取目标列的数据
+    const fields = line.split(",");
+    const selected = this.columnIndices.map((i) => fields[i] ?? "");
+    this.push(selected.join(",") + "\n");
+    callback();
+  }
+}
+```
+
+注意这里启用了 `objectMode`。默认情况下，流处理的是 Buffer/字符串。启用 `objectMode` 后，每次 `_transform` 接收和输出的都是 JavaScript 对象（这里是字符串）。
+
+### 组装管线
+
+把按行分割和列提取组合成完整管线：
+
+```js
+import { createReadStream, createWriteStream } from "node:fs";
+import { createGzip } from "node:zlib";
+import { pipeline } from "node:stream/promises";
+import { Transform } from "node:stream";
+
+// 按行分割的 Transform
+class LineSplitter extends Transform {
+  constructor() {
+    super();
+    this.remainder = "";
+  }
+
+  _transform(chunk, encoding, callback) {
+    const data = this.remainder + chunk.toString("utf-8");
+    const lines = data.split("\n");
+    // 最后一段可能是不完整的行，留到下次处理
+    this.remainder = lines.pop();
+    for (const line of lines) {
+      if (line.trim()) this.push(line);
+    }
+    callback();
+  }
+
+  _flush(callback) {
+    // 处理最后剩余的数据
+    if (this.remainder.trim()) this.push(this.remainder);
+    callback();
+  }
+}
+
+// 组装完整管线：读取 → 按行分割 → 提取列 → gzip 压缩 → 写入
+await pipeline(
+  createReadStream("users-export.csv", { highWaterMark: 256 * 1024 }),
+  new LineSplitter(),
+  new CsvColumnExtractor(["email", "signup_date"]),
+  createGzip(),
+  createWriteStream("users-clean.csv.gz")
+);
+```
+
+这个管线的内存占用始终很小——`highWaterMark` 设为 256KB 意味着读缓冲区最大 256KB，LineSplitter 只保留一行剩余数据，CsvColumnExtractor 不缓存任何数据。不管输入文件多大，内存占用都是可控的。
+
+### highWaterMark 的影响
+
+`highWaterMark` 控制流的内部缓冲区大小。调大它可以提高吞吐量（减少系统调用次数），但会增加内存占用：
+
+```js
+// 默认值
+createReadStream("file.csv"); // highWaterMark: 64KB
+
+// 高吞吐场景
+createReadStream("file.csv", { highWaterMark: 1024 * 1024 }); // 1MB
+
+// 低内存场景（比如嵌入式设备）
+createReadStream("file.csv", { highWaterMark: 16 * 1024 }); // 16KB
+```
+
+选择多大的 `highWaterMark` 取决于你的场景。对于本地文件处理，256KB-1MB 通常是一个好的平衡点。对于网络流，默认的 16KB 就够了——网络本身就有延迟，缓冲区再大也不会更快。
+
+## flowing 模式 vs paused 模式
+
+可读流有两种工作模式：
+
+**flowing 模式**：数据自动从流中流出，通过 `data` 事件或 `pipe` 消费。你不需要手动取数据，流会"推"给你。
+
+```js
+const stream = createReadStream("file.csv");
+stream.on("data", (chunk) => {
+  console.log(`收到 ${chunk.length} 字节`);
+});
+```
+
+**paused 模式**：你需要手动调用 `stream.read()` 来取数据。流会"等"你来取。
+
+```js
+const stream = createReadStream("file.csv");
+stream.on("readable", () => {
+  let chunk;
+  while ((chunk = stream.read()) !== null) {
+    console.log(`读取 ${chunk.length} 字节`);
+  }
+});
+```
+
+`pipe` 和 `pipeline` 内部会自动管理模式切换。如果你手动消费流，需要注意：一旦监听了 `data` 事件，流就会进入 flowing 模式，此时再调用 `read()` 可能拿到 `null`。
+
+## Stream vs 一次性读取：性能对比
+
+用数据说话。处理一个 2GB 的 CSV 文件，只统计行数：
+
+```js
+// 方式 1：一次性读取（内存占用 ~2GB）
+import { readFile } from "node:fs/promises";
+const data = await readFile("big.csv", "utf-8");
+const lineCount = data.split("\n").length;
+
+// 方式 2：Stream（内存占用 ~64KB）
+import { createReadStream } from "node:fs";
+let lineCount = 0;
+await pipeline(
+  createReadStream("big.csv"),
+  new Transform({
+    transform(chunk, enc, cb) {
+      lineCount += chunk.toString("utf-8").split("\n").length;
+      cb();
+    },
+  })
+);
+```
+
+方式 1 的 `data.split('\n')` 会创建一个包含几百万个字符串的数组，内存峰值可能是文件大小的 2-3 倍。方式 2 的内存占用始终只有 chunk 大小。
+
+但 Stream 不总是更快的。对于小文件（几 KB），一次性读取反而更快——因为 Stream 有创建、切换模式的额外开销。选择哪种方式，取决于文件大小和你对内存的敏感程度。
+
+Stream 是 Buffer 的自然延伸。Buffer 解决了"怎么操作二进制数据"的问题，Stream 解决了"怎么处理大量数据"的问题。它们一起构成了 Node.js 数据处理的基础。下一篇我们来看 Node.js 最核心的机制——事件循环：这些异步的 Stream 操作，到底是怎么被调度的？

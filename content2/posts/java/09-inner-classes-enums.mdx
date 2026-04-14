@@ -1,0 +1,225 @@
+---
+title: "09 内部类与枚举"
+date: "2026-03-30"
+summary: "Java 的 enum 比 JS 的对象常量强在哪？把 Post 的 status 从字符串升级为枚举，理解 Java 枚举的类型安全、字段方法和内部类的实用场景。"
+tags: ["Java", "枚举", "内部类", "类型安全"]
+category: "java"
+cover: ""
+draft: false
+series: "Java 渐进式实战"
+seriesOrder: 9
+---
+
+Post 类有个字段叫 `status`，从第 5 篇开始就一直是 String 类型，值要么是 `"DRAFT"` 要么是 `"PUBLISHED"`。这没问题，但存在一个隐患：没有任何东西阻止你写出 `post.setStatus("PUBLSIHED")`——拼错一个字母，编译器不会报错，运行时逻辑就悄悄错了。
+
+上一篇文章结尾提到过这个话题：status 这种只有有限几个合法值的字段，用字符串表示太脆弱了。今天来做两件事——用枚举（enum）彻底解决这个问题，以及顺带认识内部类（inner class），它是实现 Builder 模式的基础。
+
+## JS 里怎么表示有限值集合
+
+在 JavaScript 中，表示有限值集合有几种常见做法。
+
+最朴素的方式是用纯字符串：`post.status = "DRAFT"`。简单，但 `post.status = "PUBLSIHED"`（拼错了）和 `post.status = "DELETE"`（不存在的状态）编译器都不会报错，运行时才出问题。
+
+稍微好一点，用常量对象 `const PostStatus = { DRAFT: "draft", PUBLISHED: "published" }`，但 JS 中 `post.status = "any string"` 依然合法，没有任何类型约束。TypeScript 用联合类型能加上编译期检查（`type PostStatus = "DRAFT" | "PUBLISHED"`），赋值 `"DELETED"` 时 TS 编译器会报错。但 TS 的联合类型本质上是字符串的子集，运行时不存在 `PostStatus.DRAFT` 这样的实体对象。你无法给 `"DRAFT"` 附加额外信息（比如中文显示名），也无法定义方法（比如"当前状态是否允许转到另一个状态"）。
+
+Java 的 enum 能同时解决这两个问题。
+
+## Java enum：不只是常量集合
+
+先看最简单的枚举定义和使用方式：
+
+```java
+public enum PostStatus {
+    DRAFT,
+    PUBLISHED,
+    ARCHIVED
+}
+```
+
+把它用在 Post 类里替代原来的 String——`private String status` 改为 `private PostStatus status`。`setStatus` 的参数类型变为 `PostStatus`，传入任何其他类型编译器直接拒绝。调用方写 `post.setStatus(PostStatus.DRAFT)` 时，IDE 会自动补全枚举值，不用去记有哪些合法状态。
+
+有一个细节：枚举比较用 `==` 就够了，不需要 `equals()`。每个枚举值在 JVM 中只有一个实例（类似单例），所以 `==` 比较的就是同一个对象引用。这和字符串恰好相反——字符串必须用 `equals()`，枚举值用 `==` 更简洁也更安全。
+
+## 枚举携带数据和行为
+
+如果 enum 只能做到"限定合法值"，那它和 TypeScript 的联合类型差别不大。Java enum 的真正威力在于：**枚举值本身可以携带数据和方法**。
+
+CMS 的文章有三种状态，每种状态有中文显示名，而且状态之间的转换有规则——草稿可以发布，已发布可以归档，但不能从草稿直接跳到归档。
+
+```java
+public enum PostStatus {
+    DRAFT("草稿"),
+    PUBLISHED("已发布"),
+    ARCHIVED("已归档");
+
+    private final String displayName;
+
+    // 枚举构造器：每个枚举值在定义时确定自己的 displayName
+    PostStatus(String displayName) {
+        this.displayName = displayName;
+    }
+
+    public String getDisplayName() {
+        return displayName;
+    }
+
+    // 状态转换规则：DRAFT→PUBLISHED, PUBLISHED→ARCHIVED
+    public boolean canTransitionTo(PostStatus target) {
+        return switch (this) {
+            case DRAFT -> target == PUBLISHED;
+            case PUBLISHED -> target == ARCHIVED;
+            default -> false;
+        };
+    }
+}
+```
+
+这段代码有几个 JS/TS 开发者可能觉得新鲜的地方。
+
+**枚举的构造器是私有的**。你不能写 `new PostStatus("草稿")`——枚举值在类加载时就已经创建好了，`DRAFT`、`PUBLISHED`、`ARCHIVED` 就是全部实例。每个实例通过 `DRAFT("草稿")` 这种语法调用构造器，括号里的参数传给 `PostStatus(String displayName)` 构造器。
+
+**switch 表达式**。`switch (this)` 用了 Java 14 引入的箭头语法。和传统的 switch 语句不同，switch 表达式有返回值且不需要 break。更重要的是，当 switch 的目标是枚举类型时，**IDE 和编译器会检查是否穷举了所有枚举值**。如果你只处理了 `DRAFT` 和 `PUBLISHED` 而漏了 `ARCHIVED`，IDE 会给出警告。JS 的 switch 对字符串值没有任何穷举检查，TS 也只能通过 never 类型间接实现，远不如 Java 直接。
+
+把状态转换逻辑放在枚举里，Post 类的代码就变得非常干净：
+
+```java
+public void transitionTo(PostStatus target) {
+    if (!this.status.canTransitionTo(target)) {
+        throw new IllegalStateException(
+            "不能从 " + this.status.getDisplayName()
+            + " 转换到 " + target.getDisplayName()
+        );
+    }
+    this.status = target;
+    if (target == PostStatus.PUBLISHED) {
+        this.publishedAt = java.time.LocalDateTime.now().toString();
+    }
+}
+```
+
+`transitionTo` 不知道也不关心具体的转换规则——它只问枚举"能不能转"。如果以后新增一个 `REVIEWING` 状态，只需在 `PostStatus` 里加一行枚举值、调整 `canTransitionTo` 的逻辑，Post 类一行都不用改。这就是**把行为放在数据旁边**的思想。
+
+对比 TS 的做法——同样的逻辑你得写在外部函数里：`function canTransition(from: PostStatus, to: PostStatus)`，状态转换规则散落在工具函数或 Post 类的条件判断里。TS 的字符串联合类型只是值的约束，行为只能游离在外面。Java enum 把值和行为绑在了一起。
+
+## 枚举的高级能力：实现接口与覆写方法
+
+enum 还可以实现接口。假设我们希望所有"可显示的枚举"都提供统一的 `getDisplayName()` 方法：
+
+```java
+public interface Displayable {
+    String getDisplayName();
+}
+
+public enum PostStatus implements Displayable {
+    DRAFT("草稿"), PUBLISHED("已发布"), ARCHIVED("已归档");
+    private final String displayName;
+    PostStatus(String displayName) { this.displayName = displayName; }
+    @Override
+    public String getDisplayName() { return displayName; }
+}
+```
+
+实现接口后，`PostStatus` 就可以被当作 `Displayable` 类型使用。后续讲集合框架时，你可以有一个 `List<Displayable>`，里面放 `PostStatus`、`UserRole` 等各种实现了 `Displayable` 的枚举，统一调用 `getDisplayName()`。
+
+更进一步的技巧是让每个枚举值覆写方法——每个枚举值可以有自己的方法实现。比如在 `PostStatus` 中定义一个抽象方法 `public abstract String getActionText()`，然后 `DRAFT { ... getActionText() { return "提交审核"; } }`、`PUBLISHED { ... return "归档文章"; }`，每个值返回不同的操作按钮文案。这种"每个枚举值有不同的行为"的模式，其实就是策略模式的简写。在 JS 里你需要写一个映射对象来实现类似效果：`const actionText = { DRAFT: "提交审核", PUBLISHED: "归档文章" }`。Java 把这个映射直接内建到了语言类型系统中。
+
+## 内部类：嵌套在类中的类
+
+Java 允许在一个类的内部定义另一个类，称为内部类（inner class）。内部类有四种形态，日常开发中最常用的是两种：**静态内部类**和**匿名内部类**。
+
+### 静态内部类与 Builder 模式
+
+静态内部类用 `static` 修饰，它和外部类的关系是"命名空间上的归属"，不依赖外部类的实例。最典型的用途是 Builder 模式。
+
+Post 的字段越来越多，构造器参数列表也越来越长。Builder 模式用链式调用逐步设置每个字段，最后调用 `build()` 生成对象。Builder 作为 Post 的静态内部类，可以访问 Post 的私有构造器：
+
+```java
+public class Post {
+    // ... 所有字段 ...
+    private Post() { /* 私有构造器，只能通过 Builder 创建 */ }
+
+    public static class Builder {
+        private String title, slug, content;
+        private PostStatus status = PostStatus.DRAFT;
+        private Long authorId;
+
+        public Builder title(String title)   { this.title = title;   return this; }
+        public Builder slug(String slug)     { this.slug = slug;     return this; }
+        public Builder content(String content) { this.content = content; return this; }
+        public Builder authorId(Long authorId) { this.authorId = authorId; return this; }
+
+        public Post build() {
+            Post post = new Post();
+            post.title = this.title;
+            post.slug = this.slug;
+            post.content = this.content;
+            post.status = this.status;
+            post.authorId = this.authorId;
+            post.createdAt = java.time.LocalDateTime.now().toString();
+            return post;
+        }
+    }
+}
+```
+
+使用时代码读起来几乎像自然语言：`new Post.Builder().title("...").slug("...").content("...").build()`。
+
+`Post.Builder` 放在 Post 内部的好处是命名空间清晰（一看就知道是给 Post 服务的），而且 Builder 可以访问 Post 的私有构造器和私有字段，不用额外暴露 setter。在 JS/TS 里没有内部类概念，类似的 Builder 通常写成一个独立的顶级类，功能上没有本质区别，但缺少归属感。
+
+### 匿名内部类
+
+匿名内部类没有名字，用于"只需要用一次"的场景。它最常见的身份是 Lambda 表达式的前身。在 CMS 中对文章列表排序：
+
+```java
+// 匿名内部类：就地创建一个 Comparator 实现
+posts.sort(new Comparator<Post>() {
+    @Override
+    public int compare(Post a, Post b) {
+        return b.getViewCount() - (int) a.getViewCount();
+    }
+});
+
+// Java 8+ Lambda 简写
+posts.sort((a, b) -> (int) (b.getViewCount() - a.getViewCount()));
+```
+
+`new Comparator<Post>() { ... }` 是一个匿名内部类——实现了 `Comparator` 接口但没有名字。Java 8 之后大部分场景可以用 Lambda 替代，但理解匿名内部类仍然重要：它是 Lambda 的底层机制，而且在需要实现多个方法、或者需要 `this` 指向匿名类自身而非外部类时，匿名内部类仍然是唯一选择。
+
+JS 没有匿名内部类的概念，类似的需求用回调函数解决。JS 的异步回调（`fs.readFile(path, (err, data) => { ... })`）在概念上和匿名内部类很相似——都是"传一段代码作为参数，在某个时机执行"。
+
+### 非静态内部类和局部内部类
+
+另外两种内部类用得较少，简单提一下。**非静态内部类**持有外部类的实例引用，可以直接访问外部类的字段和方法。创建时必须依赖外部类实例：`Outer.Inner inner = outer.new Inner()`。这种隐式持有的外部类引用容易造成内存泄漏，所以除非确实需要访问外部类实例状态，否则优先用静态内部类。**局部内部类**定义在方法内部，作用域仅限该方法，现在基本被 Lambda 取代。
+
+## JS vs Java 对比
+
+| 特性            | JavaScript        | TypeScript            | Java                        |
+| --------------- | ----------------- | --------------------- | --------------------------- |
+| 有限值集合      | 字符串 / 常量对象 | 联合类型 `"A" \| "B"` | enum（真正的类型）          |
+| 编译期值检查    | 无                | 有（TS 编译器）       | 有（javac 编译器）          |
+| 运行时类型安全  | 无                | 无（编译后都是 JS）   | 有（JVM 类型检查）          |
+| 枚举携带数据    | 需要额外对象      | 需要额外对象          | 枚举自带字段                |
+| 枚举定义行为    | 需要外部函数      | 需要外部函数          | 枚举自带方法                |
+| switch 穷举检查 | 无                | 部分（TS never 类型） | 有（IDE + 编译器）          |
+| 内部类          | 无                | 无                    | 静态 / 非静态 / 匿名 / 局部 |
+| Builder 模式    | 独立类或工厂函数  | 独立类或工厂函数      | 静态内部类                  |
+
+这张表的核心信息是：JS/TS 对"有限值集合"的支持停留在"值的约束"层面，Java 的 enum 把值、数据、行为打包成了一个完整的类型。这不是语法糖层面的差异，而是类型系统能力的差异。
+
+## Trade-off
+
+enum 的代价是什么？
+
+首先是序列化。枚举序列化（比如存到数据库、转成 JSON）时，默认存储的是枚举值的名称字符串（`"DRAFT"`、`"PUBLISHED"`）。如果有一天你把 `DRAFT` 改名成 `NEW_DRAFT`，数据库里的旧数据就反序列化不回来了。Java 开发者需要特别注意：一旦 enum 值被外部系统依赖，就不要改名，只能废弃（加 `@Deprecated`）并新增。这个问题在 JS 的常量对象中同样存在，但 JS 开发者通常不关心，因为反正存的就是字符串值。
+
+其次是枚举的单例特性。每个枚举值在 JVM 中只有一个实例，不能 clone、不能反射创建新实例、不能反序列化出新实例。这通常是优点（节省内存、可以用 `==` 比较），但如果你的业务需要"同名的不同状态实例"，enum 做不到。
+
+内部类的 trade-off 更直接：它让代码组织更内聚，但也增加了类的嵌套层级，阅读时需要跳来跳去。静态内部类几乎没有副作用，可以放心用。非静态内部类要小心内存泄漏，Android 开发中这是经典坑点。
+
+## 回顾
+
+上一篇我们学了接口与抽象类，给 CMS 引入了 `Taggable` 和 `Publishable` 两个接口，Post 同时实现了它们。我们理解了 Java 的 interface 是运行时类型（JVM 通过接口类型做方法分派），而 TypeScript 的 interface 只是编译期的类型声明。default 方法让接口可以提供默认实现，避免了"加一个方法所有实现类都要改"的问题。
+
+本篇做了两件事。第一，把 Post 的 status 从 String 升级为 `PostStatus` 枚举——编译器现在能拦住所有非法状态值，枚举自身携带了 `displayName` 数据和 `canTransitionTo()` 方法，状态转换规则不再散落在 Post 类的条件判断里。第二，认识了内部类，重点是用静态内部类实现了 Post.Builder 构建者模式。
+
+下一篇是异常处理——CMS 的文章发布流程中有很多可能出错的地方：标题为空、状态转换不合法、slug 格式不对。Java 的 checked exception 机制强制你显式处理这些错误，这在 JS/TS 中是没有对应概念的，也是 Java 和 JS 最大的设计分歧之一。

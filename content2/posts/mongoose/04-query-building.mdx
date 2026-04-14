@@ -1,0 +1,583 @@
+---
+title: "04 查询构建器与筛选"
+date: "2026-03-23"
+summary: "掌握 Mongoose 强大的查询构建器，学习比较运算符、逻辑运算符、正则表达式和文本搜索"
+tags: ["Mongoose", "查询", "运算符", "文本搜索"]
+category: "mongoose"
+draft: false
+series: "Mongoose 渐进式学习"
+seriesOrder: 4
+---
+
+上一篇文章我们学习了基础的 CRUD 操作，掌握了简单的查询。但实际项目中，查询需求要复杂得多。
+
+比如 CMS 的文章搜索功能：用户想找"标题包含 MongoDB 且浏览量大于 100"的文章，或者"最近 7 天发布的包含 TypeScript 标签的文章"。这些复杂条件怎么表达？
+
+Mongoose 的查询构建器提供了强大的链式 API 和丰富的查询运算符。这篇文章我们围绕 CMS 的文章搜索场景，系统讲解各种查询技巧。
+
+## 查询构建器链式调用
+
+Mongoose 的查询构建器支持链式调用，让代码更易读：
+
+```typescript
+const posts = await Post.find({ status: "published" })
+  .where("views")
+  .gte(100)
+  .where("tags")
+  .in(["mongodb", "nodejs"])
+  .select("title views")
+  .sort({ createdAt: -1 })
+  .limit(10)
+  .lean();
+```
+
+这种写法比把所有条件塞进 find 里要清晰得多。每个方法都有明确的语义，代码可读性高。
+
+## 比较运算符
+
+CMS 中经常需要按数值范围筛选文章，比如浏览量、点赞数、时间范围。Mongoose 提供了丰富的比较运算符：
+
+- **$eq**：等于（可省略）
+- **$ne**：不等于
+- **$gt**：大于
+- **$gte**：大于等于
+- **$lt**：小于
+- **$lte**：小于等于
+
+```typescript
+// 大于
+const popularPosts = await Post.find({
+  views: { $gt: 200 },
+}).select("title views");
+
+// 范围查询
+const rangePosts = await Post.find({
+  views: { $gte: 100, $lte: 400 },
+}).select("title views");
+
+// 多字段比较
+const multiComparePosts = await Post.find({
+  views: { $gte: 100 },
+  likes: { $gte: 20 },
+}).select("title views likes");
+
+// 不等于
+const activePosts = await Post.find({
+  status: { $ne: "archived" },
+});
+```
+
+这些运算符可以组合使用，实现复杂的筛选逻辑。
+
+## 逻辑运算符
+
+实际场景中，经常需要组合多个条件。Mongoose 提供了逻辑运算符：
+
+- **$and**：逻辑与（所有条件都满足）
+- **$or**：逻辑或（任一条件满足）
+- **$not**：逻辑非（条件不满足）
+- **$nor**：逻辑或非（所有条件都不满足）
+
+```typescript
+// $or：草稿文章 OR 低浏览量文章
+const orPosts = await Post.find({
+  $or: [{ status: "draft" }, { views: { $lt: 100 } }],
+});
+
+// $and：已发布 AND 浏览量>=100 AND 包含 mongodb 标签
+const andPosts = await Post.find({
+  $and: [
+    { status: "published" },
+    { views: { $gte: 100 } },
+    { tags: "mongodb" },
+  ],
+});
+
+// $not：状态不是 draft
+const notPosts = await Post.find({
+  status: {
+    $not: { $eq: "draft" },
+  },
+});
+
+// 配合正则使用
+const notRegexPosts = await Post.find({
+  title: {
+    $not: /Mongoose/i,
+  },
+});
+
+// $nor：不是草稿 AND 不是低浏览量
+const norPosts = await Post.find({
+  $nor: [{ status: "draft" }, { views: { $lt: 100 } }],
+});
+```
+
+逻辑运算符可以嵌套使用，实现更复杂的条件组合：
+
+```typescript
+// 嵌套逻辑：((已发布 AND 高浏览) OR (草稿 AND 包含 mongodb))
+const nestedPosts = await Post.find({
+  $or: [
+    {
+      $and: [{ status: "published" }, { views: { $gte: 200 } }],
+    },
+    {
+      $and: [{ status: "draft" }, { tags: "mongodb" }],
+    },
+  ],
+});
+```
+
+## 元素运算符
+
+有时候需要检查字段是否存在、字段类型是什么，这时用元素运算符：
+
+- **$exists**：字段是否存在
+- **$type**：字段类型
+- **$mod**：取模运算
+
+```typescript
+// 字段存在
+const hasMetadataPosts = await Post.find({
+  "metadata.seoTitle": { $exists: true },
+});
+
+// 字段不存在
+const noDescriptionPosts = await Post.find({
+  "metadata.seoDescription": { $exists: false },
+});
+
+// 字段存在且不为 null
+const existsNotNullPosts = await Post.find({
+  comments: { $exists: true, $not: { $size: 0 } },
+});
+
+// 字段类型
+const objectIdPosts = await Post.find({
+  _id: { $type: "objectId" },
+});
+
+// 取模运算（浏览量是 100 的倍数）
+const modPosts = await Post.find({
+  views: { $mod: [100, 0] },
+});
+```
+
+## 数组查询
+
+文章的 tags 和 comments 是数组，需要专门的数组查询运算符：
+
+- **$in**：包含在数组中
+- **$nin**：不包含在数组中
+- **$all**：包含所有值
+- **$size**：数组长度
+- **$elemMatch**：数组元素匹配
+
+```typescript
+// $in：标签包含 mongodb、nodejs 或 javascript
+const inPosts = await Post.find({
+  tags: { $in: ["mongodb", "nodejs", "javascript"] },
+});
+
+// $nin：标签不包含 draft 或 test
+const ninPosts = await Post.find({
+  tags: { $nin: ["draft", "test"] },
+});
+
+// $all：同时包含 mongodb 和 nodejs 标签
+const allPosts = await Post.find({
+  tags: { $all: ["mongodb", "nodejs"] },
+});
+
+// $size：有 3 个标签的文章
+const sizePosts = await Post.find({
+  tags: { $size: 3 },
+});
+
+// $elemMatch：最近7天有特定用户评论的文章
+const elemMatchPosts = await Post.find({
+  comments: {
+    $elemMatch: {
+      author: "usr_8x9k2m",
+      createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) },
+    },
+  },
+});
+
+// 数组位置操作符（第一个标签是 mongodb）
+const arrayPosts = await Post.find({
+  "tags.0": "mongodb",
+});
+```
+
+## 正则表达式查询
+
+CMS 的搜索功能经常需要模糊匹配标题或内容，正则表达式查询就派上用场了：
+
+```typescript
+// 基本正则（忽略大小写）
+const regexPosts1 = await Post.find({
+  title: { $regex: /Mongoose/i },
+});
+
+// 锚点匹配（以 Node.js 开头）
+const regexPosts2 = await Post.find({
+  title: { $regex: /^Node.js/ },
+});
+
+// 模式匹配（以"教程"结尾）
+const regexPosts3 = await Post.find({
+  title: { $regex: /.*教程.*$/ },
+});
+
+// 使用字符串（自动转换为正则）
+const stringPosts = await Post.find({
+  title: { $regex: "教程" },
+});
+
+// 带选项的正则
+const optionsPosts = await Post.find({
+  title: {
+    $regex: "mongoose",
+    $options: "i", // i: 忽略大小写, m: 多行模式, x: 忽略空格
+  },
+});
+```
+
+正则查询很灵活，但要注意性能。前缀匹配（以 xxx 开头）可以使用索引，性能较好；后缀匹配（以 xxx 结尾）无法使用索引，性能较差。
+
+```typescript
+// 前缀匹配（性能好）
+const prefixPosts = await Post.find({
+  title: { $regex: /^MongoDB/ },
+});
+
+// 后缀匹配（性能差）
+const suffixPosts = await Post.find({
+  title: { $regex: /指南$/ },
+});
+```
+
+## 文本搜索
+
+正则查询虽然灵活，但对于全文搜索来说不够强大。MongoDB 提供了文本搜索功能，支持相关性排序和语言分析。
+
+首先需要创建文本索引：
+
+```typescript
+try {
+  await Post.collection.createIndex({
+    title: "text",
+    content: "text",
+    tags: "text",
+  });
+  console.log("文本索引创建成功");
+} catch (error: any) {
+  if (error.code === 85) {
+    console.log("文本索引已存在");
+  }
+}
+```
+
+然后就可以使用 $text 进行搜索：
+
+```typescript
+// 基础文本搜索
+const textPosts1 = await Post.find({
+  $text: { $search: "Mongoose 教程" },
+});
+
+// 精确短语搜索
+const textPosts2 = await Post.find({
+  $text: { $search: '"Node.js 实战"' },
+});
+
+// 排除词
+const textPosts3 = await Post.find({
+  $text: { $search: "MongoDB -数据库" },
+});
+```
+
+文本搜索最强大的功能是相关性排序，可以按匹配度排序：
+
+```typescript
+const sortedTextPosts = await Post.find(
+  {
+    $text: { $search: "Mongoose" },
+  },
+  {
+    score: { $meta: "textScore" },
+  }
+)
+  .sort({ score: { $meta: "textScore" } })
+  .select("title score")
+  .limit(5);
+```
+
+还可以为不同字段设置权重，影响相关性计算：
+
+```typescript
+await Post.collection.createIndex(
+  {
+    title: "text",
+    content: "text",
+    tags: "text",
+  },
+  {
+    weights: {
+      title: 10,
+      content: 5,
+      tags: 3,
+    },
+    name: "text_weight_index",
+  }
+);
+```
+
+这样标题匹配的文章会排得更靠前。
+
+## 综合示例：文章搜索功能
+
+把上面的知识整合起来，为 CMS 实现一个完整的文章搜索功能：
+
+```typescript
+import Post from "../models/Post";
+
+class ArticleSearch {
+  // 高级搜索
+  async advancedSearch(filters: {
+    keyword?: string;
+    status?: string;
+    tags?: string[];
+    minViews?: number;
+    maxViews?: number;
+    author?: string;
+    dateFrom?: Date;
+    dateTo?: Date;
+    page?: number;
+    limit?: number;
+  }) {
+    const {
+      keyword,
+      status = "published",
+      tags,
+      minViews,
+      maxViews,
+      author,
+      dateFrom,
+      dateTo,
+      page = 1,
+      limit = 10,
+    } = filters;
+
+    const skip = (page - 1) * limit;
+
+    // 构建查询条件
+    const query: any = { status };
+
+    // 关键词搜索
+    if (keyword) {
+      query.$or = [
+        { title: { $regex: keyword, $options: "i" } },
+        { content: { $regex: keyword, $options: "i" } },
+      ];
+    }
+
+    // 标签筛选
+    if (tags && tags.length > 0) {
+      query.tags = { $in: tags };
+    }
+
+    // 浏览量范围
+    if (minViews !== undefined || maxViews !== undefined) {
+      query.views = {};
+      if (minViews !== undefined) query.views.$gte = minViews;
+      if (maxViews !== undefined) query.views.$lte = maxViews;
+    }
+
+    // 作者筛选
+    if (author) {
+      query.author = author;
+    }
+
+    // 日期范围
+    if (dateFrom || dateTo) {
+      query.createdAt = {};
+      if (dateFrom) query.createdAt.$gte = dateFrom;
+      if (dateTo) query.createdAt.$lte = dateTo;
+    }
+
+    // 执行查询
+    const [articles, total] = await Promise.all([
+      Post.find(query)
+        .skip(skip)
+        .limit(limit)
+        .sort({ createdAt: -1 })
+        .populate("author", "name avatar")
+        .lean(),
+      Post.countDocuments(query),
+    ]);
+
+    return {
+      articles,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  // 全文搜索
+  async fullTextSearch(keyword: string, page = 1, limit = 10) {
+    const skip = (page - 1) * limit;
+
+    const [articles, total] = await Promise.all([
+      Post.find(
+        {
+          $text: { $search: keyword },
+        },
+        {
+          score: { $meta: "textScore" },
+        }
+      )
+        .skip(skip)
+        .limit(limit)
+        .sort({ score: { $meta: "textScore" } })
+        .populate("author", "name avatar")
+        .lean(),
+      Post.countDocuments({
+        $text: { $search: keyword },
+      }),
+    ]);
+
+    return {
+      articles,
+      pagination: {
+        page,
+        limit,
+        total,
+        totalPages: Math.ceil(total / limit),
+      },
+    };
+  }
+
+  // 热门文章搜索
+  async findPopularArticles(minViews = 100, limit = 10) {
+    return await Post.find({
+      status: "published",
+      views: { $gte: minViews },
+    })
+      .sort({ views: -1, createdAt: -1 })
+      .limit(limit)
+      .populate("author", "name avatar")
+      .lean();
+  }
+
+  // 相关文章推荐
+  async findRelatedArticles(postId: string, limit = 5) {
+    const post = await Post.findById(postId);
+
+    if (!post || !post.tags || post.tags.length === 0) {
+      return [];
+    }
+
+    return await Post.find({
+      _id: { $ne: postId },
+      status: "published",
+      tags: { $in: post.tags },
+    })
+      .sort({ views: -1 })
+      .limit(limit)
+      .populate("author", "name avatar")
+      .lean();
+  }
+}
+
+// 使用示例
+const search = new ArticleSearch();
+
+// 高级搜索
+const results1 = await search.advancedSearch({
+  keyword: "MongoDB",
+  tags: ["mongodb", "nodejs"],
+  minViews: 100,
+  dateFrom: new Date("2026-01-01"),
+  page: 1,
+  limit: 10,
+});
+
+// 全文搜索
+const results2 = await search.fullTextSearch("Mongoose 教程", 1, 10);
+
+// 热门文章
+const popular = await search.findPopularArticles(100, 5);
+
+// 相关文章
+const related = await search.findRelatedArticles("post_a1b2c3d4");
+```
+
+这个搜索类封装了 CMS 中常见的搜索场景，代码复用性强。
+
+## 性能优化建议
+
+### 使用索引
+
+为常查询字段创建索引：
+
+```typescript
+postSchema.index({ status: 1, createdAt: -1 });
+postSchema.index({ tags: 1 });
+postSchema.index({ author: 1 });
+```
+
+### 避免过深的嵌套
+
+```typescript
+// 避免
+const posts = await Post.find({
+  $and: [{ $or: [{ a: 1 }, { b: 2 }] }, { $or: [{ c: 3 }, { d: 4 }] }],
+});
+
+// 推荐
+const posts = await Post.find({
+  $or: [
+    { $and: [{ a: 1 }, { c: 3 }] },
+    { $and: [{ a: 1 }, { d: 4 }] },
+    { $and: [{ b: 2 }, { c: 3 }] },
+    { $and: [{ b: 2 }, { d: 4 }] },
+  ],
+});
+```
+
+### 使用 lean
+
+```typescript
+const posts = await Post.find().lean();
+```
+
+### 限制返回字段和数量
+
+```typescript
+const posts = await Post.find()
+  .select("title views createdAt")
+  .limit(20)
+  .lean();
+```
+
+## 总结与思考
+
+这篇文章我们掌握了 Mongoose 的查询构建器，学习了比较运算符、逻辑运算符、数组查询、正则表达式、文本搜索等丰富的查询能力。这些运算符可以组合使用，实现几乎任何复杂的查询需求。
+
+你可能觉得运算符太多了，记不住。其实常用的就那么几个：比较运算符（$gt、$gte、$lt、$lte）、逻辑运算符（$and、$or）、数组运算符（$in、$all）、正则表达式（$regex）。
+
+关键是要理解每种运算符的适用场景和性能特点。比如正则查询灵活但要注意索引，文本搜索强大但需要创建索引，数组查询要选择合适的运算符。
+
+下一篇文章，我们会学习关系设计与建模，探讨如何在 MongoDB 中设计用户、文章、评论之间的关系，以及 populate 的使用。
+
+---
+
+上一篇：[03 基础 CRUD 操作](./03-crud-basics.mdx)
+下一篇：[05 关系设计与建模](./05-relationships.mdx)

@@ -1,0 +1,647 @@
+---
+title: "04 中间件系统与错误处理"
+date: "2026-03-23"
+summary: "掌握 tRPC 中间件的编写和使用，学会处理认证、日志等横切关注点，构建企业级应用的错误处理机制。"
+tags: ["tRPC", "中间件", "错误处理", "认证", "日志"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 4
+---
+
+上一篇文章我们了解了 tRPC 的类型推断机制，知道了类型是如何从后端传到前端的。今天我们聊聊中间件系统和错误处理。
+
+在实际开发中，你会发现很多逻辑是重复的：用户认证、请求日志、权限检查、错误处理...如果每个接口都写一遍这些逻辑，代码会变得冗长且难以维护。
+
+中间件就是解决这类问题的方案。它让你可以在接口执行前后插入通用逻辑，避免代码重复。
+
+## 为什么需要中间件
+
+想象一下，如果我们的协作任务管理平台有 50 个接口，其中 30 个需要用户认证。如果没有中间件，代码会是这样：
+
+```typescript
+// 每个需要认证的接口都要检查用户
+const getProjects = t.procedure.query(async ({ ctx }) => {
+  if (!ctx.user) {
+    throw new TRPCError({ code: "UNAUTHORIZED" });
+  }
+  // 实际逻辑
+  return db.project.findMany();
+});
+
+const createProject = t.procedure.mutation(async ({ ctx, input }) => {
+  if (!ctx.user) {
+    throw new TRPCError({ code: "UNAUTHORIZED" });
+  }
+  // 实际逻辑
+  return db.project.create({ data: input });
+});
+
+// ... 重复 28 次
+```
+
+这种写法有几个问题：
+
+1. **代码重复**：同样的认证逻辑写了很多遍
+2. **难以维护**：如果要修改认证逻辑，需要改很多地方
+3. **容易遗漏**：新增接口时可能忘记加认证检查
+4. **可读性差**：业务逻辑被横切关注点干扰
+
+中间件解决了这些问题：它让你把认证逻辑写一次，然后应用到所有需要的接口上。
+
+## 中间件的基本概念
+
+中间件是一个函数，它可以在 Procedure 执行前后运行。中间件可以：
+
+- 修改请求的上下文（Context）
+- 验证请求
+- 记录日志
+- 处理错误
+- 提前返回响应
+
+我们来看一个简单的日志中间件：
+
+```typescript
+import { initTRPC } from "@trpc/server";
+
+const t = initTRPC.create();
+
+// 创建日志中间件
+const loggerMiddleware = t.middleware(async ({ path, type, next }) => {
+  // 在 Procedure 执行之前
+  const start = Date.now();
+  console.log(`[${type}] ${path} - 开始处理`);
+
+  // 调用下一个中间件或 Procedure
+  const result = await next();
+
+  // 在 Procedure 执行之后
+  const duration = Date.now() - start;
+  console.log(`[${type}] ${path} - 完成 (${duration}ms)`);
+
+  return result;
+});
+```
+
+这个中间件记录了请求的开始和结束时间，可以用来监控接口性能。
+
+## 应用中间件
+
+中间件创建后，需要应用到 Procedure 上才能生效。有几种应用方式。
+
+### 应用到单个 Procedure
+
+```typescript
+const loggedProcedure = t.procedure.use(loggerMiddleware);
+
+const getProjects = loggedProcedure.query(async () => {
+  return db.project.findMany();
+});
+
+const createProject = loggedProcedure.mutation(async ({ input }) => {
+  return db.project.create({ data: input });
+});
+```
+
+### 链式调用多个中间件
+
+```typescript
+const authenticatedProcedure = t.procedure
+  .use(loggerMiddleware)
+  .use(authMiddleware);
+
+const createProject = authenticatedProcedure.mutation(
+  async ({ ctx, input }) => {
+    // ctx.user 已经被 authMiddleware 添加到 Context 中
+    return db.project.create({
+      data: {
+        ...input,
+        ownerId: ctx.user.id,
+      },
+    });
+  }
+);
+```
+
+中间件按顺序执行，先 `loggerMiddleware`，后 `authMiddleware`，最后是 Procedure 本身。
+
+## Context 传递
+
+中间件的一个重要用途是向 Context 添加数据。Context 是在请求生命周期中共享的数据对象。
+
+### 创建带 Context 的 tRPC
+
+```typescript
+// 定义 Context 类型
+interface Context {
+  user?: {
+    id: string;
+    name: string;
+    role: "admin" | "member";
+  };
+  requestId: string;
+}
+
+// 创建带 Context 的 tRPC 实例
+const t = initTRPC.context<Context>().create();
+
+// 创建 Context
+const createContext = async (): Promise<Context> => {
+  // 从请求中提取用户信息
+  const user = await getCurrentUserFromRequest();
+
+  // 生成请求 ID
+  const requestId = crypto.randomUUID();
+
+  return {
+    user,
+    requestId,
+  };
+};
+```
+
+### 在中间件中修改 Context
+
+```typescript
+const authMiddleware = t.middleware(async ({ ctx, next }) => {
+  // 检查用户是否登录
+  if (!ctx.user) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "请先登录",
+    });
+  }
+
+  // 可以在 Context 中添加额外信息
+  return next({
+    ctx: {
+      ...ctx,
+      // 确保 user 不为 undefined
+      user: ctx.user,
+    },
+  });
+});
+
+// 创建需要认证的 Procedure
+const protectedProcedure = t.procedure.use(authMiddleware);
+
+const createProject = protectedProcedure.mutation(async ({ ctx, input }) => {
+  // ctx.user 的类型是 { id: string; name: string; role: "admin" | "member" }
+  // TypeScript 知道它不会是 undefined
+  return db.project.create({
+    data: {
+      ...input,
+      ownerId: ctx.user.id,
+    },
+  });
+});
+```
+
+注意这里的一个关键点：`authMiddleware` 中使用了类型断言，告诉 TypeScript `ctx.user` 不是 undefined。这样在 `protectedProcedure` 中，TypeScript 就知道 `ctx.user` 一定存在。
+
+## 常见中间件实战
+
+让我们看看在实际项目中常用的几种中间件。
+
+### 认证中间件
+
+在协作任务管理平台中，大部分操作都需要用户登录：
+
+```typescript
+import jwt from "jsonwebtoken";
+
+const authMiddleware = t.middleware(async ({ ctx, next }) => {
+  // 从请求头中获取 Token
+  const token = ctx.req?.headers.get("authorization")?.replace("Bearer ", "");
+
+  if (!token) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "未提供认证令牌",
+    });
+  }
+
+  try {
+    // 验证 Token
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as {
+      userId: string;
+    };
+
+    // 从数据库获取用户信息
+    const user = await db.user.findUnique({
+      where: { id: payload.userId },
+    });
+
+    if (!user) {
+      throw new TRPCError({
+        code: "UNAUTHORIZED",
+        message: "用户不存在",
+      });
+    }
+
+    // 将用户信息添加到 Context
+    return next({
+      ctx: {
+        ...ctx,
+        user,
+      },
+    });
+  } catch (error) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "认证令牌无效",
+    });
+  }
+});
+
+export const protectedProcedure = t.procedure.use(authMiddleware);
+```
+
+### 角色授权中间件
+
+除了认证，我们还需要授权检查。比如只有管理员才能删除项目：
+
+```typescript
+type Role = "admin" | "member";
+
+// 创建角色检查工厂函数
+const createRoleGuard = (allowedRoles: Role[]) => {
+  return t.middleware(async ({ ctx, next }) => {
+    if (!ctx.user) {
+      throw new TRPCError({
+        code: "UNAUTHORIZED",
+        message: "未登录",
+      });
+    }
+
+    if (!allowedRoles.includes(ctx.user.role)) {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message: `需要以下角色之一：${allowedRoles.join(", ")}`,
+      });
+    }
+
+    return next();
+  });
+};
+
+// 创建特定角色的 Procedure
+export const adminProcedure = protectedProcedure.use(
+  createRoleGuard(["admin"])
+);
+
+// 使用示例
+const deleteProject = adminProcedure
+  .input(z.object({ id: z.string() }))
+  .mutation(async ({ input }) => {
+    return await db.project.delete({
+      where: { id: input.id },
+    });
+  });
+```
+
+### 日志中间件
+
+记录所有请求的信息，方便问题排查：
+
+```typescript
+const loggingMiddleware = t.middleware(async ({ path, type, ctx, next }) => {
+  const start = Date.now();
+  const requestId = ctx.requestId;
+
+  try {
+    console.log(`[${requestId}] ${type} ${path} - 开始`);
+
+    const result = await next();
+
+    const duration = Date.now() - start;
+    console.log(`[${requestId}] ${type} ${path} - 成功 (${duration}ms)`);
+
+    return result;
+  } catch (error) {
+    const duration = Date.now() - start;
+    console.error(
+      `[${requestId}] ${type} ${path} - 失败 (${duration}ms)`,
+      error
+    );
+    throw error;
+  }
+});
+```
+
+### 限流中间件
+
+防止 API 被滥用：
+
+```typescript
+const rateLimiter = (config: { windowMs: number; maxRequests: number }) => {
+  const requests = new Map<string, number[]>();
+
+  return t.middleware(async ({ ctx, next }) => {
+    const userId = ctx.user?.id || "anonymous";
+    const now = Date.now();
+
+    // 获取用户的历史请求时间戳
+    let userRequests = requests.get(userId) || [];
+
+    // 清理过期的请求记录
+    userRequests = userRequests.filter(
+      (timestamp) => now - timestamp < config.windowMs
+    );
+
+    // 检查是否超过限制
+    if (userRequests.length >= config.maxRequests) {
+      throw new TRPCError({
+        code: "TOO_MANY_REQUESTS",
+        message: `请求过于频繁，请在 ${config.windowMs / 1000} 秒后重试`,
+      });
+    }
+
+    // 记录当前请求
+    userRequests.push(now);
+    requests.set(userId, userRequests);
+
+    return next();
+  });
+};
+
+// 创建限流的 Procedure
+export const rateLimitedProcedure = t.procedure.use(
+  rateLimiter({ windowMs: 60000, maxRequests: 100 })
+);
+```
+
+## 错误处理
+
+中间件的另一个重要用途是统一错误处理。tRPC 提供了标准的 `TRPCError` 类。
+
+### TRPCError 的使用
+
+```typescript
+import { TRPCError } from "@trpc/server";
+
+const getProject = t.procedure
+  .input(z.object({ id: z.string() }))
+  .query(async ({ input }) => {
+    const project = await db.project.findUnique({
+      where: { id: input.id },
+    });
+
+    if (!project) {
+      throw new TRPCError({
+        code: "NOT_FOUND",
+        message: "项目不存在",
+      });
+    }
+
+    return project;
+  });
+```
+
+tRPC 支持的错误码对应 HTTP 状态码：
+
+- `BAD_REQUEST` (400)：请求参数错误
+- `UNAUTHORIZED` (401)：未认证
+- `FORBIDDEN` (403)：无权限
+- `NOT_FOUND` (404)：资源不存在
+- `TOO_MANY_REQUESTS` (429)：请求过于频繁
+- `INTERNAL_SERVER_ERROR` (500)：服务器内部错误
+
+### 全局错误处理中间件
+
+```typescript
+const errorHandlingMiddleware = t.middleware(async ({ next }) => {
+  try {
+    return await next();
+  } catch (error) {
+    // 处理 Prisma 错误
+    if (error instanceof Prisma.PrismaClientKnownRequestError) {
+      if (error.code === "P2002") {
+        throw new TRPCError({
+          code: "CONFLICT",
+          message: "该记录已存在",
+        });
+      }
+    }
+
+    // 处理 Zod 验证错误
+    if (error instanceof z.ZodError) {
+      throw new TRPCError({
+        code: "BAD_REQUEST",
+        message: "输入数据验证失败",
+      });
+    }
+
+    // 重新抛出 TRPCError
+    if (error instanceof TRPCError) {
+      throw error;
+    }
+
+    // 其他未知错误
+    console.error("未处理的错误：", error);
+    throw new TRPCError({
+      code: "INTERNAL_SERVER_ERROR",
+      message: "服务器内部错误",
+    });
+  }
+});
+```
+
+### 客户端错误处理
+
+```typescript
+import { TRPCClientError } from "@trpc/client";
+
+// 使用 try-catch
+try {
+  const project = await client.projects.get.query({ id: "123" });
+} catch (error) {
+  if (error instanceof TRPCClientError) {
+    switch (error.code) {
+      case "UNAUTHORIZED":
+        console.log("请先登录");
+        break;
+      case "FORBIDDEN":
+        console.log("权限不足");
+        break;
+      case "NOT_FOUND":
+        console.log("项目不存在");
+        break;
+      default:
+        console.log("发生错误：", error.message);
+    }
+  }
+}
+```
+
+## 完整示例
+
+让我们用协作任务管理平台的例子，把中间件系统串起来：
+
+```typescript
+import { initTRPC, TRPCError } from "@trpc/server";
+import { z } from "zod";
+import jwt from "jsonwebtoken";
+
+// Context 类型定义
+interface Context {
+  user?: {
+    id: string;
+    name: string;
+    role: "admin" | "member";
+  };
+  requestId: string;
+}
+
+// 创建 Context
+const createContext = async (): Promise<Context> => {
+  const token = getAuthToken();
+  let user;
+
+  if (token) {
+    try {
+      const payload = jwt.verify(token, process.env.JWT_SECRET!) as {
+        userId: string;
+      };
+      user = await db.user.findUnique({
+        where: { id: payload.userId },
+      });
+    } catch {
+      // Token 无效，user 保持为 undefined
+    }
+  }
+
+  return {
+    user,
+    requestId: crypto.randomUUID(),
+  };
+};
+
+const t = initTRPC.context<Context>().create();
+
+// 1. 日志中间件
+const logger = t.middleware(async ({ path, type, next }) => {
+  const start = Date.now();
+  const result = await next();
+
+  const duration = Date.now() - start;
+  if (duration > 1000) {
+    console.warn(`慢查询：${path} (${duration}ms)`);
+  }
+
+  return result;
+});
+
+// 2. 认证中间件
+const auth = t.middleware(async ({ ctx, next }) => {
+  if (!ctx.user) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "请先登录",
+    });
+  }
+
+  return next({
+    ctx: {
+      ...ctx,
+      user: ctx.user,
+    },
+  });
+});
+
+// 3. 角色检查中间件
+const createRoleGuard = (roles: Context["user"]["role"][]) => {
+  return t.middleware(async ({ ctx, next }) => {
+    if (!ctx.user || !roles.includes(ctx.user.role)) {
+      throw new TRPCError({
+        code: "FORBIDDEN",
+        message: "权限不足",
+      });
+    }
+    return next();
+  });
+};
+
+// 创建可重用的 Procedure
+export const publicProcedure = t.procedure.use(logger);
+export const protectedProcedure = publicProcedure.use(auth);
+export const adminProcedure = protectedProcedure.use(
+  createRoleGuard(["admin"])
+);
+
+// 使用示例
+export const appRouter = t.router({
+  // 公开 API
+  health: publicProcedure.query(() => ({ status: "ok" })),
+
+  // 需要认证的 API
+  projects: t.router({
+    list: protectedProcedure.query(async ({ ctx }) => {
+      return db.project.findMany({
+        where: { ownerId: ctx.user.id },
+      });
+    }),
+
+    create: protectedProcedure
+      .input(
+        z.object({
+          name: z.string().min(1),
+          description: z.string().optional(),
+        })
+      )
+      .mutation(async ({ ctx, input }) => {
+        return db.project.create({
+          data: {
+            ...input,
+            ownerId: ctx.user.id,
+          },
+        });
+      }),
+
+    // 只有管理员可以删除
+    delete: adminProcedure
+      .input(z.object({ id: z.string() }))
+      .mutation(async ({ input }) => {
+        return db.project.delete({
+          where: { id: input.id },
+        });
+      }),
+  }),
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+这段代码展示了一个完整的中间件系统：日志、认证、授权，所有这些逻辑都被封装在中间件中，业务逻辑保持简洁。
+
+## Trade-off 分析
+
+中间件系统带来了很多好处，但也有一些需要权衡的地方。
+
+**代码复用 vs 复杂度**：
+
+- 中间件避免了代码重复，但也增加了一层抽象
+- 对于简单项目，中间件可能过度设计
+- 我的建议：项目有 5+ 个接口、需要认证或日志时，使用中间件
+
+**类型安全 vs 灵活性**：
+
+- 中间件修改 Context 后，TypeScript 类型需要正确反映这些变化
+- 需要仔细设计 Context 类型，避免类型断言
+- 我的建议：明确定义 Context 类型，使用类型断言要谨慎
+
+**性能 vs 功能**：
+
+- 中间件会增加请求的处理时间
+- 多个中间件的链式调用会累积开销
+- 我的建议：保持中间件轻量，避免在中间件中做重操作
+
+**全局 vs 局部**：
+
+- 全局中间件影响所有接口，可能不适合某些场景
+- 局部中间件更灵活，但需要在每个接口上应用
+- 我的建议：日志、错误处理用全局中间件；认证、授权用局部中间件
+
+中间件系统是构建企业级应用的基础设施。它让你把横切关注点从业务逻辑中分离出来，代码更清晰、更易维护。掌握了中间件，你就能构建出更专业、更可靠的 tRPC 应用。
+
+下一步，我们将学习 tRPC 和 Prisma 的集成，看看如何构建类型安全的数据库访问层。

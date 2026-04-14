@@ -1,0 +1,313 @@
+---
+title: "06. 插件开发：Vite 插件 API 与实战"
+date: "2026-04-12"
+summary: "团队有自定义 Webpack loader 需要重写。Vite 插件怎么写？和 Webpack 插件有什么区别？"
+tags: ["Vite", "插件开发", "Rolldown"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战指南"
+seriesOrder: 6
+---
+
+前两篇处理了标准构建流程，这一篇处理自定义需求——开发一个 Vite 插件。
+
+TaskFlow Dashboard 有一个自己写的 Webpack loader，叫 `svg-icon-loader`。它的功能很简单：在代码里写 `import icon from '@/icons/check.svg'` 的时候，不返回 SVG 文件的 URL，而是返回一个 React 组件，这个组件会渲染对应的 SVG 图标，并且支持通过 `className` 和 `size` props 控制样式和尺寸。
+
+这个 loader 用了两年，整个项目里有 120 多处引用。迁移到 Vite 之后，这个 loader 不能直接用了——Webpack loader 和 Vite 插件的 API 完全不同。
+
+有两个选择：一是不用这个 loader了，把 120 多处引用改成手动导入 SVG 文件然后用 `<img>` 标签渲染；二是写一个 Vite 插件实现同样的功能。
+
+120 多处改动显然不现实。那就写插件。
+
+## 先理解 Vite 插件的本质
+
+Webpack 的插件系统是基于 `Tapable` 的事件机制——你注册一系列的钩子函数（`compiler.hooks.emit.tap()`、`compilation.hooks.optimizeChunks.tap()`），Webpack 在构建的各个阶段触发这些钩子。
+
+Vite 的插件系统更简洁。它基于 Rollup 的插件 API，定义了一组标准的钩子函数。核心的钩子有这几个：
+
+**`resolveId`**：当 Vite 遇到一个 `import` 语句时，调用这个钩子来解析模块的路径。你可以在这里拦截特定的导入路径，返回自定义的模块 ID。
+
+**`load`**：根据模块 ID 加载模块内容。你可以在这里返回自定义的模块代码，而不是从文件系统读取。
+
+**`transform`**：对模块内容做转换。Vite 已经读取了文件内容，你在这一步可以修改它。
+
+这三个钩子的执行顺序是固定的：先 `resolveId`，再 `load`，最后 `transform`。理解这个顺序很重要——如果你在 `resolveId` 里返回了 `null`，Vite 会继续用默认的文件系统解析，然后到 `load` 阶段再给你一次处理的机会。
+
+和 Webpack loader 对比一下。Webpack 的 `svg-icon-loader` 做的事情是：接收 SVG 文件的原始内容（一个 XML 字符串），转换成一个 JavaScript 模块的代码（导出一个 React 组件）。在 Vite 里，这个逻辑可以拆成两步：`resolveId` 识别出 `.svg` 的导入，`load` 返回转换后的代码。
+
+## 插件的基本结构
+
+一个 Vite 插件就是一个导出了 `name` 属性和若干钩子函数的对象。
+
+```typescript
+import type { Plugin } from "vite";
+
+function svgIconPlugin(): Plugin {
+  return {
+    name: "svg-icon-plugin",
+
+    // 告诉 Vite：.svg 文件的导入由我处理
+    enforce: "pre",
+
+    // 第一步：解析模块 ID
+    resolveId(source, importer) {
+      // 只处理 .svg 结尾的导入
+      if (!source.endsWith(".svg")) return null;
+
+      // 返回一个唯一的模块 ID
+      return { id: `svg-icon:${source}`, moduleSideEffects: false };
+    },
+
+    // 第二步：加载模块内容
+    async load(id) {
+      // 只处理我们自己标记的 ID
+      if (!id.startsWith("svg-icon:")) return null;
+
+      // 从原始路径读取 SVG 文件内容
+      const filePath = id.replace("svg-icon:", "");
+      const svgContent = await readFile(filePath);
+
+      // 转换成 React 组件代码
+      return generateReactComponent(filePath, svgContent);
+    },
+  };
+}
+```
+
+这段代码展示了插件的基本骨架。`enforce: 'pre'` 表示这个插件在 Vite 内置插件之前执行——这确保了我们的 `.svg` 处理不会被 Vite 内置的资源处理插件抢先拦截。
+
+`resolveId` 返回的 `{ id, moduleSideEffects: false }` 告诉 Vite 两件事：这个模块的 ID 是 `svg-icon:xxx`，而且这个模块没有副作用（不会被 Tree Shaking 误删）。
+
+`load` 函数负责读取 SVG 文件并转换成 React 组件代码。实际的 `generateReactComponent` 函数稍后实现。
+
+## 和 Webpack 插件的核心区别
+
+写插件之前，先理清 Vite 插件和 Webpack 插件的区别。这不是 API 层面的差异——而是设计理念上的不同。
+
+**运行时模型不同**。Webpack 的 loader 是管道式的——一个文件经过一串 loader，每个 loader 接收上一个 loader 的输出，做处理，然后传给下一个。Vite 的插件是钩子式的——每个插件在特定的时机执行，互相之间没有直接的输入输出关系。
+
+这意味着 Webpack 里一个 loader 只需要关心"输入是什么、输出是什么"。Vite 里一个插件需要关心"我在什么时机介入、其他插件可能在做什么"。
+
+**钩子名称不同**。Webpack 用 `tapable` 的事件名称（`beforeCompile`、`emit`、`afterOptimizeTree`），Vite 用 Rollup 的钩子名称（`resolveId`、`load`、`transform`、`buildEnd`）。如果你熟悉 Rollup 的插件 API，Vite 的插件 API 几乎一样。
+
+**开发模式和构建模式**。Webpack 的 loader 在开发模式和构建模式下执行的是同一套代码。Vite 的插件在两种模式下可能有不同的行为——`resolveId` 和 `load` 在两种模式下都会执行，但 `buildStart`、`generateBundle` 这些钩子只在构建模式下执行。Vite 还有一些独有的钩子，比如 `configureServer`（用于扩展开发服务器）。
+
+**模块格式**。Webpack 的 loader 返回的是字符串（转换后的代码），Vite 的 `load` 钩子返回的也是字符串，但格式有要求——如果返回的代码包含 `export default`，Vite 会把它当作 ESM 模块处理。
+
+## 实现 SVG 图标自动引入插件
+
+回到 TaskFlow Dashboard 的需求。我们要实现的插件功能是：
+
+1. 识别 `import icon from '@/icons/xxx.svg'` 这样的导入语句
+2. 读取 SVG 文件内容
+3. 返回一个 React 组件的代码，这个组件渲染 SVG 并支持 `className` 和 `size` props
+
+```typescript
+import type { Plugin } from "vite";
+import { readFileSync } from "fs";
+import { resolve, basename } from "path";
+
+function svgIconPlugin(): Plugin {
+  return {
+    name: "svg-icon-plugin",
+    enforce: "pre",
+
+    resolveId(source, importer) {
+      if (!source.endsWith(".svg")) return null;
+
+      // 解析绝对路径，处理路径别名（@/ -> src/）
+      const absolutePath = resolve(__dirname, "src", source.replace("@/", ""));
+      return {
+        id: `svg-icon:${absolutePath}`,
+        moduleSideEffects: false,
+      };
+    },
+
+    load(id) {
+      if (!id.startsWith("svg-icon:")) return null;
+
+      const filePath = id.replace("svg-icon:", "");
+      const svgContent = readFileSync(filePath, "utf-8");
+      const iconName = basename(filePath, ".svg");
+
+      // 从 SVG 中提取 viewBox 和内容
+      const viewBoxMatch = svgContent.match(/viewBox="([^"]+)"/);
+      const viewBox = viewBoxMatch ? viewBoxMatch[1] : "0 0 24 24";
+
+      // 提取 SVG 内部的 path/circle/rect 等元素
+      const contentMatch = svgContent.match(/<svg[^>]*>([\s\S]*)<\/svg>/);
+      const innerContent = contentMatch ? contentMatch[1].trim() : "";
+
+      // 生成 React 组件代码
+      const componentCode = `
+import React from 'react';
+
+const Svg${capitalize(iconName)} = React.forwardRef(
+  function Svg${capitalize(iconName)}(
+    { size = 24, className = '', ...props },
+    ref
+  ) {
+    return (
+      <svg
+        ref={ref}
+        width={size}
+        height={size}
+        viewBox="${viewBox}"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+        className={className}
+        {...props}
+      >
+        ${innerContent}
+      </svg>
+    );
+  }
+);
+
+export default Svg${capitalize(iconName)};
+`;
+      return componentCode;
+    },
+  };
+}
+
+function capitalize(str: string): string {
+  return str
+    .split("-")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join("");
+}
+
+export default svgIconPlugin;
+```
+
+这段代码的核心逻辑在 `load` 函数里。它读取 SVG 文件，用正则提取 `viewBox` 和内部元素，然后拼接一段 React 组件代码。生成的组件使用 `React.forwardRef` 包装，支持 `size`、`className` 和其他 SVG 原生属性。
+
+在 `vite.config.ts` 中注册这个插件：
+
+```typescript
+import { defineConfig } from "vite";
+import svgIconPlugin from "./plugins/svgIconPlugin";
+
+export default defineConfig({
+  plugins: [svgIconPlugin()],
+});
+```
+
+在组件中使用：
+
+```tsx
+import CheckIcon from "@/icons/check.svg";
+import WarningIcon from "@/icons/warning.svg";
+
+export function TaskStatus({ status }: { status: string }) {
+  return (
+    <span className="flex items-center gap-1">
+      {status === "done" && <CheckIcon size={16} className="text-green-500" />}
+      {status === "warning" && (
+        <WarningIcon size={16} className="text-yellow-500" />
+      )}
+      {status}
+    </span>
+  );
+}
+```
+
+效果和 Webpack 时期的 `svg-icon-loader` 完全一样，但实现方式完全不同。Webpack loader 是在文件加载阶段做转换，Vite 插件是在模块解析阶段做转换。对使用方来说没有区别。
+
+## 插件排序和作用域
+
+当一个项目里有多个插件时，执行顺序很重要。
+
+Vite 插件通过 `enforce` 属性控制执行顺序：
+
+- `enforce: 'pre'`：在 Vite 内置插件之前执行
+- `enforce: 'post'`：在 Vite 内置插件之后执行
+- 不设置 `enforce`：在 Vite 内置插件和 `pre` 插件之间执行
+
+TaskFlow Dashboard 的插件顺序是这样的：`svgIconPlugin`（`pre`）先拦截 `.svg` 文件，然后 Vite 内置插件处理 `.css`、`.ts`、`.tsx` 等标准文件。
+
+如果你有多个 `pre` 插件，它们按照在 `plugins` 数组中的顺序执行。所以 `plugins: [pluginA(), pluginB()]` 中，`pluginA` 先执行。
+
+除了 `enforce`，还有 `apply` 属性可以限制插件的作用域：
+
+```typescript
+function myPlugin(): Plugin {
+  return {
+    name: "my-plugin",
+    apply: "build", // 只在构建模式下生效
+    // apply: 'serve', // 只在开发模式下生效
+    // apply: (config, { command }) => command === 'build', // 自定义条件
+  };
+}
+```
+
+这在一些场景下很有用。比如你写了一个分析构建产物的插件，它只在 `build` 模式下才有意义，就没必要在开发模式下加载。
+
+## Rolldown 的兼容性
+
+Vite 8 用 Rolldown 替代了 esbuild 和 Rollup。这对插件开发意味着什么？
+
+好消息是 Rolldown 兼容大部分 Rollup 的插件 API。`resolveId`、`load`、`transform` 这些核心钩子在 Rolldown 中正常工作。我们上面写的 `svgIconPlugin` 不需要任何修改就能在 Vite 8 中运行。
+
+但有一个变化需要注意：Rolldown 的 `transform` 钩子接收的参数格式和 Rollup 略有不同。如果你写的插件在 `transform` 中处理了 AST（抽象语法树），需要确认使用的解析器兼容 Rolldown 的输出格式。
+
+对于简单的字符串替换和代码生成（像我们的 SVG 插件），不需要担心这个问题。只有在处理复杂的 AST 转换时才需要考虑兼容性。
+
+Vite 8 提供了一个兼容层，会在检测到不兼容的插件时给出警告。如果你看到了类似 "Plugin xxx uses Rollup-specific APIs that are not fully supported by Rolldown" 的警告，说明这个插件可能需要更新。
+
+## 插件调试技巧
+
+开发插件时，调试是个问题。几个实用的方法。
+
+用 `debug` 库输出日志。Vite 内部用 `debug` 库输出调试信息，你的插件也可以这样做：
+
+```typescript
+import { createDebugger } from "vite";
+
+const debug = createDebugger("vite:svg-icon");
+
+function svgIconPlugin(): Plugin {
+  return {
+    name: "svg-icon-plugin",
+    resolveId(source) {
+      if (!source.endsWith(".svg")) return null;
+      debug(`Resolving SVG import: ${source}`);
+      // ...
+    },
+    load(id) {
+      if (!id.startsWith("svg-icon:")) return null;
+      debug(`Loading SVG module: ${id}`);
+      // ...
+    },
+  };
+}
+```
+
+运行时设置环境变量 `DEBUG=vite:svg-icon` 就能看到调试输出。
+
+另一个方法是利用 Vite 的 `configResolved` 钩子，在插件初始化时打印配置信息：
+
+```typescript
+function svgIconPlugin(): Plugin {
+  return {
+    name: "svg-icon-plugin",
+    configResolved(config) {
+      console.log("SVG Icon Plugin initialized");
+      console.log("Root:", config.root);
+      console.log("Resolve alias:", config.resolve.alias);
+    },
+  };
+}
+```
+
+## 案例总结
+
+TaskFlow Dashboard 的 SVG 图标插件，从 Webpack loader 迁移到 Vite 插件，大约花了半天时间。其中大部分时间花在理解 Vite 插件 API 上，实际编码只用了不到两小时。
+
+迁移后的对比：Webpack 的 `svg-icon-loader` 大约 80 行代码，Vite 的 `svgIconPlugin` 大约 90 行。代码量差不多，但 Vite 版本不需要额外安装 `loader-utils`、`schema-utils` 这些 Webpack 生态的辅助包。而且 Vite 插件同时支持开发模式和构建模式，Webpack loader 在开发模式下需要配合 `webpack-dev-server` 的配置才能正常工作。
+
+不过 Vite 插件也有不如 Webpack 的地方。Webpack 的 loader 管道可以组合——一个文件可以经过多个 loader 依次处理。Vite 的 `load` 钩子只有一个插件能返回结果（先返回的生效，后面的跳过）。如果你的需求是多个插件协作处理同一个文件，Webpack 的管道模型更灵活。但在大多数场景下，一个插件处理一种文件类型就够了。
+
+下一篇我们离开 SPA 模式，给 TaskFlow Dashboard 加上 SSR 支持——产品团队要求任务页面能被搜索引擎收录。

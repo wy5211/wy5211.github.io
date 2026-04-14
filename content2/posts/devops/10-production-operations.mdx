@@ -1,0 +1,274 @@
+---
+title: "10. 生产运维实战与综合回顾"
+date: "2026-04-12"
+summary: "所有组件都就位了。日常运维要做什么？出了故障怎么排查？扩缩容怎么配？从建设者切换到维护者视角。"
+tags: ["DevOps", "运维", "故障排查", "Kubernetes"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战指南"
+seriesOrder: 10
+---
+
+FlowAPI 上线一个月了。每天早上你打开 Grafana Dashboard 看一眼——QPS 正常、错误率在阈值内、Pod 都是 Running 状态。今天也一样，没什么异常。
+
+然后你收到一条 Slack 告警：`FlowAPI P99 延迟超过 2 秒`。
+
+这不是假设场景——这是生产运维的日常。前 9 篇完成了 DevOps 体系的建设，这篇切换到维护者视角：日常运维要做什么、故障怎么排查、怎么让系统更自动化地运行。
+
+## 日常运维清单
+
+### 每日巡检（5 分钟）
+
+- Grafana Dashboard：QPS、错误率、P95/P99 延迟、CPU/内存使用率
+- 告警记录：昨天有没有触发告警，有没有被忽略的告警
+- 部署记录：昨天有没有部署，部署后指标是否正常
+
+大部分日子，这个巡检的结果是"一切正常"。但这个习惯很重要——它能让你在问题变严重之前发现它。一个缓慢上升的错误率，可能在一周后变成一个严重的故障。
+
+### 每周检查（30 分钟）
+
+- 证书过期时间：HTTPS 证书、K8s API 证书是否快过期
+- 磁盘使用率：日志盘、数据盘是否快满了
+- 依赖更新：npm audit 有没有新的高危漏洞
+- 成本账单：云资源花费是否异常
+
+### 每月审计（2 小时）
+
+- 安全审计：第 9 篇的安全清单过一遍
+- RBAC 审查：有没有不再需要的服务账号
+- 备份验证：数据库备份能不能正常恢复
+- 容量规划：下个月要不要加机器
+
+## 故障排查思路
+
+回到那条告警：`FlowAPI P99 延迟超过 2 秒`。怎么排查？
+
+### 第一步：确认影响范围
+
+```
+问题是全局的还是局部的？
+- 所有接口都慢，还是某个特定接口？
+- 所有用户都受影响，还是某个地区？
+- 什么时候开始的？
+```
+
+打开 Grafana，看按接口维度的延迟分布。如果只有 `/api/reports` 这个接口慢，那问题大概率在这个接口的实现上（比如数据库慢查询）。如果所有接口都慢，问题可能在基础设施层（CPU、网络、数据库连接池）。
+
+### 第二步：定位瓶颈
+
+```
+延迟高在哪里？
+- 应用层：代码逻辑慢（算法问题、锁竞争）
+- 数据库层：查询慢（慢查询、索引缺失）
+- 网络层：带宽不够、DNS 解析慢
+- 资源层：CPU/内存不够，Pod 被 throttle
+```
+
+看 K8s 的资源指标：
+
+```bash
+# 查看 Pod 的资源使用
+kubectl top pods -n production
+
+# 查看节点资源使用
+kubectl top nodes
+
+# 查看 Pod 的事件（OOM、驱逐等）
+kubectl get events -n production --sort-by='.lastTimestamp'
+```
+
+看数据库的慢查询日志：
+
+```sql
+-- PostgreSQL 的慢查询
+SELECT query, calls, total_exec_time, mean_exec_time
+FROM pg_stat_statements
+ORDER BY mean_exec_time DESC
+LIMIT 10;
+```
+
+### 第三步：应急处理
+
+确认了问题后，先恢复服务，再排查根因。
+
+**如果是数据库慢查询导致的**：
+
+```bash
+# 临时方案：给数据库加资源（如果用的是云 RDS）
+# 在云控制台上修改实例规格
+
+# 或者：优化查询、加索引
+CREATE INDEX idx_orders_created_at ON orders(created_at);
+```
+
+**如果是 Pod 资源不够导致的**：
+
+```bash
+# 临时方案：增加副本数
+kubectl scale deployment/flowapi --replicas=5 -n production
+
+# 更好的方案：配置 HPA 自动扩缩容（下一节讲）
+```
+
+**如果是部署导致的**：
+
+```bash
+# 回滚到上一个版本
+kubectl rollout undo deployment/flowapi -n production
+
+# 如果用 ArgoCD，在 Git 中 revert 提交
+git revert <commit-hash>
+git push  # ArgoCD 自动同步回滚
+```
+
+### 第四步：复盘
+
+故障恢复后，写一个简单的复盘：
+
+```
+时间：2026-04-12 14:30 - 15:15
+影响：P99 延迟从 200ms 涨到 3000ms，持续 45 分钟
+原因：某个新加的报表查询没有索引，扫描了 500 万行数据
+修复：加了索引，查询时间从 8 秒降到 50ms
+预防：CI 中加上慢查询检测，PR 合并前运行 EXPLAIN
+```
+
+复盘不是为了追责，是为了防止同样的故障再次发生。
+
+## 自动扩缩容：HPA
+
+手动 `kubectl scale` 不是长久之计。K8s 的 HPA（Horizontal Pod Autoscaler）根据指标自动调整 Pod 数量：
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: flowapi-hpa
+  namespace: production
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: flowapi
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70 # CPU 使用率超过 70% 就扩容
+    - type: Pods
+      pods:
+        metric:
+          name: http_requests_per_second
+        target:
+          type: AverageValue
+          averageValue: "1000" # 每个 Pod QPS 超过 1000 就扩容
+```
+
+`minReplicas: 3` 确保始终有 3 个 Pod 在运行。`maxReplicas: 10` 防止无限扩容（成本失控）。HPA 根据 CPU 使用率和 QPS 两个指标做扩缩容决策。
+
+HPA 需要 Metrics Server 提供指标数据：
+
+```bash
+# 安装 Metrics Server
+kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+# 验证
+kubectl top pods -n production
+```
+
+## 备份与恢复
+
+### 数据库备份
+
+```bash
+# PostgreSQL 全量备份
+pg_dump -h $DB_HOST -U $DB_USER -d flowapi -Fc > backup_$(date +%Y%m%d).dump
+
+# 恢复
+pg_restore -h $DB_HOST -U $DB_USER -d flowapi backup_20260412.dump
+```
+
+用 cron 每天自动备份：
+
+```bash
+# 每天凌晨 3 点备份
+0 3 * * * /home/deploy/scripts/backup-db.sh >> /var/log/db-backup.log 2>&1
+```
+
+如果用云 RDS，云厂商通常提供自动备份功能——开箱即用，比自己写脚本可靠。
+
+### 验证备份
+
+备份了不等于能恢复。定期验证备份的可用性：
+
+```bash
+# 每月验证一次：把备份恢复到一个临时数据库，运行几条查询
+pg_restore --dbname=flowapi_test backup_20260412.dump
+psql -h localhost -d flowapi_test -c "SELECT COUNT(*) FROM users;"
+```
+
+## 成本优化
+
+云资源是按量计费的，不注意就会浪费。
+
+### 资源使用率分析
+
+```bash
+# 查看 Pod 的实际资源使用 vs 请求的资源
+kubectl top pods -n production
+```
+
+如果 Pod 请求了 500m CPU 但实际只用 100m，说明 requests 设高了，可以调低。requests 决定了调度器的决策——设高了浪费节点资源，设低了可能导致调度不上去。
+
+### Spot/抢占式实例
+
+对于非关键的工作负载（比如 CI/CD runner、批处理任务），可以用 Spot 实例，价格是按需实例的 20-30%。代价是可能随时被回收。
+
+FlowAPI 的生产流量不适合跑在 Spot 实例上，但 CI/CD runner 完全可以。在 Terraform 中配置：
+
+```hcl
+resource "aws_instance" "ci_runner" {
+  instance_market_options {
+    market_type = "spot"
+    spot_options {
+      max_price = "0.05"
+    }
+  }
+  # ...
+}
+```
+
+## 系列回顾
+
+10 篇文章，从一台空服务器开始，逐步搭建出完整的 DevOps 体系。
+
+```
+基础篇（01-03）：从一台服务器到自动化部署
+  01 Linux 服务器基础配置
+  02 Nginx 反向代理与 HTTPS
+  03 GitHub Actions CI/CD
+
+编排篇（04-06）：从单机到集群
+  04 Kubernetes 入门
+  05 K8s 生产就绪配置
+  06 GitOps + ArgoCD 声明式部署
+
+可观测与自动化（07-08）：从黑盒到可见
+  07 Prometheus + Grafana 监控告警
+  08 Terraform 基础设施即代码
+
+安全与运维（09-10）：从能用到的安全
+  09 全链路安全加固
+  10 生产运维实战
+```
+
+回顾这条链路：你从 SSH 登录一台空服务器开始，配置了安全的基础环境。然后给应用加了一层 Nginx 反向代理和 HTTPS。手动部署太痛苦，于是搭建了 CI/CD 流水线。流量增长后引入了 K8s 做容器编排，用 ArgoCD 实现 GitOps 部署。上线后加了监控告警，用 Terraform 管理基础设施。最后做了全链路的安全加固。
+
+每一步都解决了一个真实的痛点，每一步都是在上一步的基础上自然演进的。这就是 DevOps 的核心思路：**不是一开始就把所有东西都搭好，而是根据实际的痛点和需求，逐步迭代。**
+
+对于一个刚起步的项目，也许只需要前 3 篇的内容——一台服务器、Nginx、CI/CD。K8s、ArgoCD、Terraform 这些是在项目达到一定规模后才需要的。不要过度工程化——用最简单的方案解决眼前的问题，等痛了再引入更复杂的工具。

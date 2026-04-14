@@ -1,0 +1,298 @@
+---
+title: "03. 泛型高级应用：让函数通用又安全"
+date: "2026-04-12"
+summary: "泛型不只是 <T>。递归泛型处理嵌套结构，const 类型参数保留字面量精度，satisfies 验证类型不丢失信息。掌握这些，你写的工具函数才能既通用又类型安全。"
+tags: ["TypeScript"]
+category: "typescript"
+cover: ""
+draft: false
+series: "TypeScript 类型系统进阶"
+seriesOrder: 3
+---
+
+前两篇我们学了条件类型和模板字面量类型。它们各自很强，但有一个共同的问题：都是"定义类型"的工具，还没怎么用在"函数签名"上。日常开发中你更多面对的是"我要写一个通用函数，参数类型要灵活，但返回值类型要精确"。
+
+这就是泛型的主战场。你可能已经会基本的泛型用法——`function identity<T>(arg: T): T`。但当你遇到递归泛型、多个泛型参数协作、泛型约束的时候，可能还是会卡住。
+
+这篇文章聊泛型的进阶用法，重点讲三个在实际开发中最有价值的能力。
+
+## 问题驱动：为什么简单泛型不够用
+
+先看一个真实场景。你在写一个 API 客户端，需要一个配置对象：
+
+```typescript
+const config = {
+  baseUrl: "https://api.example.com",
+  timeout: 5000,
+  retries: 3,
+  endpoints: {
+    users: "/users",
+    orders: "/orders",
+  },
+};
+```
+
+你想让 `config.baseUrl` 的类型是 `"https://api.example.com"` 而不是宽泛的 `string`。这样当你写 `fetch(config.baseUrl + path)` 时，编译器知道 baseUrl 是一个字面量。
+
+但如果你用类型注解：
+
+```typescript
+const config: { baseUrl: string; timeout: number; retries: number } = {
+  baseUrl: "https://api.example.com",
+  // ...
+};
+// config.baseUrl 是 string，字面量信息丢了
+```
+
+如果用泛型推导呢？
+
+```typescript
+function createConfig<T>(config: T): T {
+  return config;
+}
+const config = createConfig({
+  baseUrl: "https://api.example.com",
+  // ...
+});
+// 推导结果取决于 TypeScript 的推断策略
+```
+
+TypeScript 可能会把 `"https://api.example.com"` 推断为 `string`，也可能保留为字面量类型——取决于上下文和版本。你需要一种方式**既验证类型正确，又不丢失字面量精度**。
+
+## satisfies 操作符：验证但不丢失（TS 4.9）
+
+`satisfies` 是 TS 4.9 引入的操作符，专门解决这个问题。它的作用是：检查值是否符合某个类型，但保留值本身的推断类型。
+
+```typescript
+type ApiConfig = {
+  baseUrl: string;
+  timeout: number;
+  retries: number;
+  endpoints: Record<string, string>;
+};
+
+// satisfies：验证类型正确，但保留字面量精度
+const config = {
+  baseUrl: "https://api.example.com",
+  timeout: 5000,
+  retries: 3,
+  endpoints: {
+    users: "/users",
+    orders: "/orders",
+  },
+} satisfies ApiConfig;
+
+// config.baseUrl 的类型是 "https://api.example.com"，不是 string
+// config.endpoints.users 的类型是 "/users"，不是 string
+// 但如果你写 config.baseUrl = 123，编译器会报错（因为不满足 ApiConfig）
+```
+
+对比三种写法的区别：
+
+```typescript
+// 方式 1：类型注解——类型安全但丢失字面量
+const a: ApiConfig = { baseUrl: "https://api.example.com", ... };
+// a.baseUrl: string
+
+// 方式 2：无注解——保留字面量但无类型检查
+const b = { baseUrl: "https://api.example.com", ... };
+// b.baseUrl: "https://api.example.com"，但如果少写了某个字段，编译器不管
+
+// 方式 3：satisfies——既有类型检查又保留字面量
+const c = { baseUrl: "https://api.example.com", ... } satisfies ApiConfig;
+// c.baseUrl: "https://api.example.com"，少写字段也会报错
+```
+
+什么时候用 `satisfies` 而不是类型注解？**当你既需要类型验证，又需要保留值的精确类型时**。配置对象、路由表、事件映射表——这些都是典型的使用场景。
+
+## const 类型参数：保留字面量的泛型（TS 5.0）
+
+`satisfies` 解决的是"常量定义"的问题。但如果你在函数参数中传递数组或对象，字面量信息同样会丢失：
+
+```typescript
+function createEndpoints(paths: string[]) {
+  return paths;
+}
+
+const endpoints = createEndpoints(["/users", "/orders", "/products"]);
+// endpoints 的类型是 string[]，不是 ["/users", "/orders", "/products"]
+```
+
+TS 5.0 引入了 `const` 类型参数，解决这个问题：
+
+```typescript
+function createEndpoints<const T extends readonly string[]>(paths: T): T {
+  return paths;
+}
+
+const endpoints = createEndpoints(["/users", "/orders", "/products"]);
+// endpoints 的类型是 readonly ["/users", "/orders", "/products"]
+// 每个元素都是字面量类型
+```
+
+`const T` 告诉编译器："对传入的参数，像 const 声明一样推断——尽可能保留字面量类型，把数组推断为 readonly"。
+
+这个特性和 `as const` 的效果类似，但更精确：
+
+```typescript
+// as const：把所有值都冻结为字面量
+const a = ["/users", "/orders"] as const;
+// readonly ["/users", "/orders"]
+
+// const 类型参数：只在函数签名层面要求推断为字面量
+function make<const T>(value: T): T {
+  return value;
+}
+const b = make(["/users", "/orders"]);
+// readonly ["/users", "/orders"]
+```
+
+区别在于：`as const` 是在调用侧使用的，`const` 类型参数是在函数定义侧使用的。如果你在写一个库函数，想让调用方自动获得字面量类型，用 `const` 类型参数。
+
+## 递归泛型：处理嵌套结构
+
+回到开头提到的场景——你要写一个工具函数，处理任意深度的嵌套对象。这时候需要递归泛型：泛型的定义中引用自身。
+
+### 深度 Readonly
+
+TypeScript 内置了 `Readonly<T>`，但它只作用一层。如果你想让所有嵌套属性都变成 readonly：
+
+```typescript
+type DeepReadonly<T> = T extends Function
+  ? T
+  : T extends object
+    ? { readonly [K in keyof T]: DeepReadonly<T[K]> }
+    : T;
+
+interface AppConfig {
+  database: {
+    host: string;
+    port: number;
+    credentials: {
+      username: string;
+      password: string;
+    };
+  };
+}
+
+type ReadonlyConfig = DeepReadonly<AppConfig>;
+// 所有属性都是 readonly，包括嵌套的 database.credentials.password
+```
+
+递归逻辑：如果 T 是对象，遍历它的所有属性，对每个属性递归应用 `DeepReadonly`。如果 T 是函数或原始类型，直接返回 T 本身（不需要递归）。
+
+注意这里对 `Function` 的特殊处理——如果不排除函数，递归会进入函数的属性（如 `length`、`prototype`），导致无限递归。
+
+### 类型安全的路径访问
+
+lodash 的 `_.get(obj, 'a.b.c')` 很好用，但没有任何类型安全。用递归泛型可以实现类型安全的版本：
+
+```typescript
+type PathKeys<T> = T extends object
+  ? {
+      [K in keyof T & string]: T[K] extends object
+        ? `${K}.${PathKeys<T[K]>}`
+        : K;
+    }[keyof T & string]
+  : never;
+
+type GetValue<T, Path extends string> =
+  Path extends `${infer Key}.${infer Rest}`
+    ? Key extends keyof T
+      ? GetValue<T[Key], Rest>
+      : never
+    : Path extends keyof T
+      ? T[Path]
+      : never;
+
+// 使用
+interface User {
+  userId: string;
+  profile: {
+    email: string;
+    address: {
+      city: string;
+      zipCode: string;
+    };
+  };
+}
+
+// 自动推导出所有合法路径
+type Paths = PathKeys<User>;
+// "userId" | "profile" | "profile.email" | "profile.address" | "profile.address.city" | "profile.address.zipCode"
+
+// 根据路径推导出值的类型
+type City = GetValue<User, "profile.address.city">;  // string
+type Zip = GetValue<User, "profile.address.zipCode">  // string
+type Bad = GetValue<User, "profile.phone">;           // never — 不存在的路径
+
+// 实际的函数
+function get<T, P extends PathKeys<T>>(obj: T, path: P): GetValue<T, P> {
+  return path.split('.').reduce((acc: any, key) => acc?.[key], obj);
+}
+
+const user: User = { ... };
+const city = get(user, "profile.address.city");  // string
+const bad = get(user, "profile.phone");          // 编译错误：不是合法路径
+```
+
+这个实现用了 `PathKeys` 递归展开所有合法路径，再用 `GetValue` 根据路径字符串推导值的类型。`get` 函数通过泛型约束 `P extends PathKeys<T>` 确保只能传入合法路径，返回类型通过 `GetValue<T, P>` 自动推导。
+
+## 泤型约束：限制范围
+
+泛型不应该是完全自由的。`<T>` 表示"任何类型"，但在实际开发中，你通常需要限制泛型的范围。
+
+```typescript
+// 无约束：T 可以是任何类型，包括 number、boolean 等
+function merge<T>(a: T, b: T): T { ... }
+
+// 有约束：T 必须是对象
+function merge<T extends object>(a: T, b: T): T { ... }
+```
+
+`extends` 在泛型参数中不是"继承"，是"约束"——T 必须满足后面的类型条件。
+
+多个泛型参数之间的约束也很有用：
+
+```typescript
+// K 必须是 T 的属性名
+function getProperty<T, K extends keyof T>(obj: T, key: K): T[K] {
+  return obj[key];
+}
+
+const user = { userId: "usr_a1x9k2m", plan: "pro" as const };
+const id = getProperty(user, "userId"); // "usr_a1x9k2m"
+const bad = getProperty(user, "name"); // 编译错误："name" 不是 user 的属性
+```
+
+## 默认泛型参数
+
+有时候你想让泛型有一个默认值，调用方不需要每次都指定：
+
+```typescript
+// 默认 T 是 unknown（最安全的类型）
+function safeParse<T = unknown>(json: string): T | null {
+  try {
+    return JSON.parse(json);
+  } catch {
+    return null;
+  }
+}
+
+const data = safeParse('{"userId":"usr_a1x9k2m"}'); // unknown
+const user = safeParse<User>('{"userId":"usr_a1x9k2m"}'); // User | null
+```
+
+默认泛型参数在库开发中特别常见。比如 `Promise<T>` 的泛型参数默认是 `unknown`，`Array<T>` 的默认类型你需要自己指定。给你的工具函数加上合理的默认值，调用方会轻松很多。
+
+## 泛型 vs 联合类型：什么时候用哪个
+
+有时候同一个问题既可以用泛型解决，也可以用联合类型解决。怎么选？
+
+**泛型**适合：函数的实现是通用的，但类型需要根据输入变化。比如 `getProperty(obj, key)` 的实现只有一行，但它能处理任何对象和任何属性。
+
+**联合类型**适合：类型是有限的、可枚举的。比如 `status: 'pending' | 'paid' | 'shipped'`。
+
+一个判断标准：**如果类型的可能性在定义时就能完全列举，用联合类型。如果类型取决于调用方的输入，用泛型**。
+
+`satisfies` 让你能验证配置不丢精度，`const` 类型参数让函数参数保留字面量，递归泛型让你处理嵌套结构。这三件武器加上条件类型和模板字面量，你的类型工具箱已经相当丰富了。下一篇我们把这些能力用在 API 客户端上，解决一个实际问题：怎么让 `UserId` 和 `OrderId` 这两个都是 string 的类型不再混淆。

@@ -1,0 +1,362 @@
+---
+title: "05. Kubernetes 生产就绪"
+date: "2026-04-12"
+summary: "FlowAPI 在 K8s 上跑起来了，但 Pod 没有资源限制、Secret 是明文的、网络没有隔离。怎么从能跑到能上生产？"
+tags: ["Kubernetes", "K8s", "安全", "生产配置", "DevOps"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战指南"
+seriesOrder: 5
+---
+
+上一篇把 FlowAPI 部署到了 Kubernetes 上。minikube 跑得好好的，三个 Pod 都在服务，Service 把流量分发得均匀。你准备把它推到生产环境了。
+
+但在上线之前，先看看你的 Deployment YAML——Pod 没有资源限制（一个 Pod 可能吃掉整个节点的内存）、没有健康检查（Pod 启动了但应用还没准备好就接收流量）、容器用 root 用户运行、Secret 直接写在 YAML 里。
+
+这些在 minikube 上不会出问题，但在生产环境——多租户集群、高并发流量、随时可能发生故障——它们就是定时炸弹。
+
+## 资源请求和限制
+
+K8s 的调度器根据 Pod 声明的资源需求来决定把它放在哪个节点上。如果你不声明资源需求，调度器只能盲猜——可能把一个内存密集型的 Pod 和一个 CPU 密集型的 Pod 放在同一个节点上，导致其中一个 OOM。
+
+```yaml
+# flowapi-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: flowapi
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: flowapi
+  template:
+    metadata:
+      labels:
+        app: flowapi
+    spec:
+      containers:
+        - name: flowapi
+          image: your-registry.com/flowapi:1.0.0
+          ports:
+            - containerPort: 3000
+          # 资源请求：调度时的最低保障
+          resources:
+            requests:
+              cpu: "100m" # 0.1 核 CPU
+              memory: "128Mi" # 128 MiB 内存
+            limits:
+              cpu: "500m" # 最多用 0.5 核
+              memory: "256Mi" # 最多用 256 MiB
+```
+
+**requests** 是调度器用的——K8s 保证 Pod 至少能拿到这么多资源。100m CPU = 0.1 核，128Mi 内存 = 128 MiB。
+
+**limits** 是运行时限制——Pod 最多能用这么多资源。CPU 超过 limits 会被限速（throttle），内存超过 limits 会被 OOM Kill。
+
+`requests` 和 `limits` 的差距决定了资源的"超卖"程度。如果 requests 很小、limits 很大，节点上可以调度更多 Pod，但可能出现资源争抢。如果 requests 和 limits 一样（Guaranteed QoS），Pod 的资源是独占的，最稳定但最费钱。
+
+对于 FlowAPI 这种 API 服务，建议 requests 和 limits 差距在 2-3 倍：
+
+```yaml
+resources:
+  requests:
+    cpu: "100m"
+    memory: "128Mi"
+  limits:
+    cpu: "300m" # 3 倍
+    memory: "256Mi" # 2 倍
+```
+
+怎么确定合理的值？先给一个保守的估计，上线后用监控数据（第 7 篇会讲 Prometheus）调整。
+
+## 健康检查
+
+K8s 需要知道你的应用是否健康。没有健康检查，K8s 只能靠 Pod 进程是否存活来判断——进程还在但应用卡死了（比如死锁），K8s 不会重启它。
+
+两种探针：
+
+**livenessProbe**：检查应用是否存活。失败时 K8s 重启 Pod。
+
+**readinessProbe**：检查应用是否准备好接收流量。失败时 K8s 把 Pod 从 Service 的负载均衡中移除，但不重启。
+
+```yaml
+containers:
+  - name: flowapi
+    image: your-registry.com/flowapi:1.0.0
+    ports:
+      - containerPort: 3000
+    livenessProbe:
+      httpGet:
+        path: /health
+        port: 3000
+      initialDelaySeconds: 10 # 容器启动后等 10 秒再开始检查
+      periodSeconds: 15 # 每 15 秒检查一次
+      failureThreshold: 3 # 连续失败 3 次才认为不健康
+    readinessProbe:
+      httpGet:
+        path: /ready
+        port: 3000
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+```
+
+两个探针的区别很重要：livenessProbe 失败 → 重启 Pod；readinessProbe 失败 → 停止发流量，但不重启。
+
+FlowAPI 需要两个端点：`/health` 检查进程是否存活（简单的 200 OK），`/ready` 检查是否准备好接收请求（比如数据库连接是否正常）。
+
+```typescript
+// FlowAPI 的健康检查端点
+app.get("/health", (req, res) => {
+  res.status(200).send("ok");
+});
+
+app.get("/ready", async (req, res) => {
+  try {
+    await db.query("SELECT 1"); // 检查数据库连接
+    res.status(200).send("ready");
+  } catch {
+    res.status(503).send("not ready"); // 数据库连接失败，不接收流量
+  }
+});
+```
+
+`/ready` 比 `/health` 多了一个数据库连接检查。这样，数据库不可用时，Pod 不会被重启（因为进程还活着），但流量不会发到这个 Pod 上——K8s 会把请求发给其他 healthy 的 Pod。
+
+## Pod 安全：SecurityContext
+
+默认情况下，容器用 root 用户运行。这在生产环境是安全风险——如果攻击者通过应用漏洞拿到了容器的 shell，他就是 root。
+
+```yaml
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: true # 不允许 root 运行
+        runAsUser: 1000 # 用 UID 1000 的用户运行
+        runAsGroup: 1000
+        fsGroup: 1000 # 文件系统组
+      containers:
+        - name: flowapi
+          securityContext:
+            allowPrivilegeEscalation: false # 不允许提权
+            readOnlyRootFilesystem: true # 只读文件系统
+            capabilities:
+              drop: ["ALL"] # 删除所有 Linux capabilities
+```
+
+`readOnlyRootFilesystem: true` 意味着容器的根文件系统是只读的，应用不能写入 `/` 下的任何目录。但很多应用需要写临时文件或日志。解决方案是挂载 emptyDir：
+
+```yaml
+containers:
+  - name: flowapi
+    volumeMounts:
+      - name: tmp
+        mountPath: /tmp
+      - name: cache
+        mountPath: /app/.cache
+volumes:
+  - name: tmp
+    emptyDir: {}
+  - name: cache
+    emptyDir: {}
+```
+
+emptyDir 是一个临时目录，Pod 被删除时数据也会消失。但对于临时文件和缓存来说，这正是你想要的。
+
+这些安全配置不是银弹——它们不能防止所有攻击，但能显著提高攻击者的门槛。一个只读文件系统 + 非 root 用户 + 零 capabilities 的容器，攻击者能做的事非常有限。
+
+## Secret 管理
+
+上一篇用 ConfigMap 和 Secret 管理配置，但 Secret 只是 Base64 编码——不是加密。任何能访问集群的人都能 `kubectl get secret` 看到 Secret 的内容。
+
+生产环境的 Secret 管理有几种方案：
+
+**方案 1：外部密钥管理服务**。用 AWS Secrets Manager、HashiCorp Vault 或 Azure Key Vault 存储密钥，通过 external-secrets-operator 同步到 K8s Secret。
+
+**方案 2：Sealed Secrets**。用 Bitnami 的 Sealed Secrets Controller——把 Secret 加密后存在 Git 仓库里，只有集群内的 Controller 能解密。
+
+**方案 3：云厂商的 KMS**。GCP、AWS、阿里云都提供密钥管理服务，配合 K8s 的 CSI Secrets Store 使用。
+
+对于 FlowAPI 来说，如果用的是云上的 K8s（EKS、GKE、ACK），直接用云厂商的方案最简单。如果用的是自建集群，Sealed Secrets 是最轻量的选择。
+
+这里不展开每种方案的配置细节——选型取决于你的基础设施。关键原则：**不要把密钥提交到 Git 仓库**（包括 Secret YAML 文件）。
+
+## 网络策略：NetworkPolicy
+
+默认情况下，K8s 集群内所有 Pod 可以互相通信。这意味着如果某个 Pod 被攻破了，攻击者可以访问集群内的任何服务——包括你的数据库。
+
+NetworkPolicy 可以限制 Pod 之间的网络访问：
+
+```yaml
+# 只允许 flowapi Pod 访问 PostgreSQL Pod 的 5432 端口
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: flowapi-to-postgres
+  namespace: production
+spec:
+  podSelector:
+    matchLabels:
+      app: postgres
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app: flowapi
+      ports:
+        - port: 5432
+```
+
+这个策略只允许带 `app: flowapi` 标签的 Pod 访问 `app: postgres` Pod 的 5432 端口。其他 Pod 访问会被拒绝。
+
+NetworkPolicy 的生效依赖 CNI 插件的支持。Calico、Cilium、Weave 都支持。minikube 默认可能不支持——生产集群才需要关心。
+
+## RBAC：ServiceAccount 和 Role
+
+RBAC（Role-Based Access Control）控制的是"谁能在集群里做什么"。在多团队共享的集群中，RBAC 是必须的。
+
+```yaml
+# 创建 FlowAPI 专用的 ServiceAccount
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: flowapi
+  namespace: production
+
+---
+# 定义 Role：只允许读取 ConfigMap 和 Secret
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: flowapi-reader
+  namespace: production
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps", "secrets"]
+    verbs: ["get", "list"]
+
+---
+# 绑定 ServiceAccount 和 Role
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: flowapi-reader-binding
+  namespace: production
+subjects:
+  - kind: ServiceAccount
+    name: flowapi
+roleRef:
+  kind: Role
+  name: flowapi-reader
+  apiGroup: rbac.authorization.k8s.io
+```
+
+然后在 Deployment 中引用这个 ServiceAccount：
+
+```yaml
+spec:
+  template:
+    spec:
+      serviceAccountName: flowapi # 不用默认的 default ServiceAccount
+```
+
+默认的 ServiceAccount 可能有你不想要的权限。给每个应用创建专用的 ServiceAccount，只授予必要的权限——最小权限原则。
+
+## 滚动更新策略
+
+更新 FlowAPI 版本时，K8s 默认会滚动更新——先创建新 Pod，再删除旧 Pod。可以通过策略控制更新速度：
+
+```yaml
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1 # 更新时最多多创建 1 个 Pod
+      maxUnavailable: 0 # 更新过程中不允许有 Pod 不可用
+```
+
+`maxUnavailable: 0` 确保更新过程中始终有足够的 Pod 在服务——新 Pod 通过 readinessProbe 后，才删除旧 Pod。代价是更新过程中会有 4 个 Pod（3 个旧 + 1 个新），需要节点有足够的资源。
+
+如果资源紧张，可以改成 `maxUnavailable: 1`——允许更新过程中少一个 Pod，但资源占用不会增加。
+
+回滚到上一个版本：
+
+```bash
+kubectl rollout undo deployment/flowapi -n production
+kubectl rollout history deployment/flowapi -n production  # 查看历史版本
+```
+
+## 多环境管理
+
+dev、staging、production 三个环境的配置不同（副本数、资源限制、数据库地址）。用 Namespace 隔离：
+
+```
+cluster/
+├── base/                    # 公共配置
+│   ├── deployment.yaml
+│   ├── service.yaml
+│   └── configmap.yaml
+├── overlays/
+│   ├── dev/
+│   │   └── kustomization.yaml   # dev 的差异配置
+│   ├── staging/
+│   │   └── kustomization.yaml
+│   └── production/
+│       └── kustomization.yaml   # production 的差异配置
+```
+
+Kustomize 是 K8s 原生的配置管理工具（kubectl 内置支持）。base 目录放公共配置，overlays 目录放各环境的差异：
+
+```yaml
+# overlays/production/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+patches:
+  - target:
+      kind: Deployment
+      name: flowapi
+    patch: |
+      apiVersion: apps/v1
+      kind: Deployment
+      metadata:
+        name: flowapi
+      spec:
+        replicas: 3  # production 用 3 个副本
+        template:
+          spec:
+            containers:
+              - name: flowapi
+                resources:
+                  requests:
+                    cpu: "100m"
+                    memory: "128Mi"
+                  limits:
+                    cpu: "500m"
+                    memory: "256Mi"
+```
+
+这样 dev 可以用 1 个副本 + 小资源，production 用 3 个副本 + 大资源，公共配置只维护一份。
+
+## 从"能跑"到"能上生产"
+
+回顾一下这篇做的改动：
+
+- 资源限制：防止 Pod 吃掉整个节点的资源
+- 健康检查：让 K8s 知道应用的真实状态
+- SecurityContext：非 root 运行、只读文件系统
+- Secret 管理：不提交到 Git，用外部密钥管理
+- NetworkPolicy：限制 Pod 间的网络访问
+- RBAC：最小权限原则
+- 滚动更新策略：零停机更新
+- 多环境管理：Kustomize
+
+这些配置不是一上来就要全加的。如果你刚开始用 K8s，先加资源限制和健康检查——这两个对稳定性影响最大。其他的在生产环境逐步加上去。
+
+K8s 的生产配置是一个持续迭代的过程。随着你的应用和团队规模增长，会有越来越多的配置需要调整。下一篇引入 GitOps，让这些配置的变更也变成自动化的。

@@ -1,0 +1,461 @@
+---
+title: "10 异常处理"
+date: "2026-03-30"
+summary: "Java 的 checked exception 到底是好是坏？从 CMS 文章发布流程出发，理解 try-catch-finally、checked vs unchecked 异常、自定义异常的设计。"
+tags: ["Java", "异常处理", "checked exception"]
+category: "java"
+cover: ""
+draft: false
+series: "Java 渐进式实战"
+seriesOrder: 10
+---
+
+用户点击"发布"按钮，你的代码执行到 `post.transitionTo(PostStatus.PUBLISHED)`，然后——失败了。可能是 slug 重复了，可能是数据库连接断了，可能是标题为空。不管哪种情况，代码需要告诉调用方"出了什么问题"，而不是悄悄吞掉错误让页面显示一片空白。
+
+上一篇给 Post 加了 `PostStatus` 枚举和 `transitionTo()` 方法，状态转换不合法时会抛出 `IllegalStateException`。但 `IllegalStateException` 太笼统了——调用方拿到这个异常，只知道"状态不对"，不知道是"不能从 DRAFT 直接到 ARCHIVED"还是"不能发布一篇已经归档的文章"。CMS 需要更精确的异常类型，让每一层代码都能做出正确的响应：Service 层决定要不要重试，Controller 层决定返回 400 还是 500，前端决定显示"slug 已存在"还是"服务器开小差了"。
+
+这就是 Java 异常处理要解决的核心问题：**让错误信息在调用链中准确传播，让每一层代码各司其职**。
+
+## JS 的异常处理：只有 unchecked
+
+先回顾 JavaScript 的做法。JS 只有一种异常，没有"编译器强制你处理"这种概念：
+
+```js
+function publishPost(post) {
+  if (!post.title) {
+    throw new Error("标题不能为空");
+  }
+  if (post.status === "PUBLISHED") {
+    throw new Error("文章已经发布过了");
+  }
+  post.status = "PUBLISHED";
+}
+
+// 调用方可以 catch，也可以不 catch
+publishPost(post); // 如果抛异常，程序直接崩溃（或被全局错误处理器捕获）
+```
+
+JS 的 `throw` 可以抛任何值——字符串、数字、对象、甚至 `undefined`。虽然最佳实践是抛 `Error` 实例，但语言层面没有任何约束：
+
+```js
+throw "出错了"; // 合法，但不推荐
+throw 404; // 合法
+throw { code: "DUPLICATE_SLUG" }; // 合法
+```
+
+调用方选择 catch 或不 catch，完全靠自觉。如果你不 catch，异常会沿着调用栈冒泡，直到被 `window.onerror` 之类的全局处理器接住，或者直接让 Node.js 进程崩溃。TypeScript 也不做任何强制——TS 的 `try-catch` 和 JS 完全一样，TS 编译器不会因为"某个函数可能抛异常但你没 catch"而报错。
+
+这种模型简单直接，但有一个隐患：**你不知道自己调用的函数会不会抛异常，也不知道会抛什么异常**。你只能去看文档（如果文档写了的话），或者去看源码。
+
+## Java 的异常体系：Throwable 的家族
+
+Java 把"可能出错这件事"变成了类型系统的一部分。所有异常都继承自 `java.lang.Throwable`：
+
+```
+                    Throwable
+                      /    \
+                    /        \
+                 Error      Exception
+                            /    \
+                    Checked       Unchecked
+                   (编译期检查)    (RuntimeException)
+```
+
+这个体系有三个分支，各有不同的用途：
+
+**Error**：JVM 层面的严重错误，程序通常无法恢复。`OutOfMemoryError`（内存耗尽）、`StackOverflowError`（栈溢出）。你不需要 catch Error——如果 JVM 内存都不够了，你的 catch 代码大概率也跑不动。Error 不是本文的重点。
+
+**Checked Exception**：继承自 `Exception` 但不是 `RuntimeException` 的子类。编译器强制你处理——要么用 `try-catch` 捕获，要么在方法签名上用 `throws` 声明。最典型的是 `IOException`：
+
+```java
+import java.io.FileInputStream;
+import java.io.IOException;
+
+public void readFile(String path) throws IOException {
+    FileInputStream fis = new FileInputStream(path);
+    // 编译器要求：要么在这里 try-catch，要么在方法签名上声明 throws IOException
+}
+```
+
+如果既不 catch 也不声明，javac 直接拒绝编译。这是 Java 和 JS 最大的分歧——JS 信任开发者的自觉，Java 用编译器强制你面对每一个可能出错的地方。
+
+**Unchecked Exception**：`RuntimeException` 及其子类。编译器不强制处理，你爱 catch 不 catch。`NullPointerException`、`IllegalArgumentException`、`IndexOutOfBoundsException` 都属于这一类。上一篇 CMS 代码里抛的 `IllegalStateException` 也是 unchecked。
+
+为什么 unchecked 不强制？因为它们通常是编程错误，应该通过修改代码来避免，而不是通过 catch 来处理。比如 `NullPointerException` 说明你没做空值检查，正确的做法是加 `if (obj != null)` 而不是 `try { obj.method() } catch (NullPointerException e) { }`。
+
+## checked vs unchecked：二十年的争论
+
+这是 Java 社区持续时间最长的设计争论之一。Bruce Eckel（Thinking in Java 作者）、Rod Johnson（Spring 框架创始人）、Anders Hejlsberg（C# 设计者）都公开批评过 checked exception。但 Joshua Bloch（Effective Java 作者）认为它在库设计中仍然有价值。
+
+争论的核心是：**强制处理到底是在帮你还是在烦你？**
+
+支持方认为，checked exception 让方法的契约更明确。你看到 `throws IOException`，就知道调用这个方法必须处理 IO 失败的情况，编译器确保你不会遗漏。在大型项目中，这种强制力能防止"某个异常没人处理导致静默失败"的问题。
+
+反对方认为，checked exception 导致了大量的"异常吞没"（exception swallowing）——开发者嫌麻烦，写一个空的 catch 块了事：
+
+```java
+// 到处可见的反模式
+try {
+    riskyOperation();
+} catch (IOException e) {
+    // TODO: 以后处理
+    e.printStackTrace(); // 或者什么都不写，直接吞掉
+}
+```
+
+更糟糕的是，checked exception 会污染调用链。底层方法声明了 `throws IOException`，调用它的方法也得声明，一路往上传播，直到最顶层。改一个底层方法的 throws 声明，可能要改十几个上层方法的签名。Spring 框架的解决方案是把所有 checked exception 包装成 unchecked 的 `RuntimeException` 重新抛出，让调用链保持干净。
+
+实践中的主流做法是：**业务异常用 unchecked，只有在你明确希望调用方必须处理时才用 checked**。后文会通过 CMS 的例子具体说明怎么选。
+
+## CMS 的自定义异常
+
+回到 CMS 场景。文章发布流程中可能出错的几种情况：
+
+1. **文章不存在**——通过 ID 查文章，查不到
+2. **状态转换不合法**——从 ARCHIVED 直接转 PUBLISHED
+3. **slug 重复**——slug 是文章的 URL 标识，必须唯一
+
+为每种情况定义一个异常类：
+
+```java
+// 业务异常的基类，继承 RuntimeException（unchecked）
+public class CMSException extends RuntimeException {
+
+    private final String errorCode;
+
+    public CMSException(String errorCode, String message) {
+        super(message);
+        this.errorCode = errorCode;
+    }
+
+    public String getErrorCode() {
+        return errorCode;
+    }
+}
+```
+
+先定义一个 `CMSException` 基类，所有 CMS 业务异常都继承它。它携带一个 `errorCode`，方便前端根据错误码做不同的 UI 展示。
+
+三个具体异常：
+
+```java
+public class PostNotFoundException extends CMSException {
+
+    private final Long postId;
+
+    public PostNotFoundException(Long postId) {
+        super("POST_NOT_FOUND", "文章不存在: " + postId);
+        this.postId = postId;
+    }
+
+    public Long getPostId() {
+        return postId;
+    }
+}
+
+public class InvalidStatusTransitionException extends CMSException {
+
+    private final String from;
+    private final String to;
+
+    public InvalidStatusTransitionException(String from, String to) {
+        super(
+            "INVALID_STATUS_TRANSITION",
+            "不能从 " + from + " 转换到 " + to
+        );
+        this.from = from;
+        this.to = to;
+    }
+}
+
+public class DuplicateSlugException extends CMSException {
+
+    private final String slug;
+
+    public DuplicateSlugException(String slug) {
+        super("DUPLICATE_SLUG", "slug 已存在: " + slug);
+        this.slug = slug;
+    }
+}
+```
+
+三个异常都继承 `CMSException`，都是 unchecked（因为 `CMSException` 继承的是 `RuntimeException`）。这样做的原因是：Service 层通常会统一捕获 `CMSException`，转换成 HTTP 响应，不需要每一层都 try-catch。
+
+注意异常类的字段。`PostNotFoundException` 携带 `postId`，`DuplicateSlugException` 携带 `slug`——这些信息在日志记录和错误响应中很有用。异常不只是"报错"，它本身就是一种数据载体。
+
+## 在 Post 中使用自定义异常
+
+改造上一篇的 `transitionTo()` 方法，用 `InvalidStatusTransitionException` 替代 `IllegalStateException`：
+
+```java
+public class Post {
+    private PostStatus status = PostStatus.DRAFT;
+    private String slug;
+
+    public void transitionTo(PostStatus target) {
+        if (!this.status.canTransitionTo(target)) {
+            throw new InvalidStatusTransitionException(
+                this.status.getDisplayName(),
+                target.getDisplayName()
+            );
+        }
+        this.status = target;
+
+        if (target == PostStatus.PUBLISHED) {
+            this.publishedAt = java.time.LocalDateTime.now().toString();
+        }
+    }
+}
+```
+
+方法签名没有变化——因为 `InvalidStatusTransitionException` 是 unchecked，不需要在方法签名上加 `throws`。调用方如果需要处理，就 catch；如果不需要（比如让上层统一处理），就不 catch。这就是 unchecked 的优势：不污染方法签名。
+
+## Service 层的异常处理策略
+
+在 CMS 的分层架构中，Repository 层负责数据存取，Service 层负责业务逻辑，Controller 层负责 HTTP 请求响应。异常通常在 Service 层抛出，在 Controller 层或全局异常处理器中捕获。
+
+```java
+public class PostService {
+
+    private final PostRepository postRepository;
+
+    public PostService(PostRepository postRepository) {
+        this.postRepository = postRepository;
+    }
+
+    /**
+     * 发布文章：查找文章 -> 检查 slug 唯一性 -> 转换状态
+     */
+    public void publishPost(Long postId) {
+        Post post = postRepository.findById(postId)
+            .orElseThrow(() -> new PostNotFoundException(postId));
+
+        if (postRepository.existsBySlug(post.getSlug())) {
+            throw new DuplicateSlugException(post.getSlug());
+        }
+
+        post.transitionTo(PostStatus.PUBLISHED);
+        postRepository.save(post);
+    }
+
+    /**
+     * 归档文章
+     */
+    public void archivePost(Long postId) {
+        Post post = postRepository.findById(postId)
+            .orElseThrow(() -> new PostNotFoundException(postId));
+
+        post.transitionTo(PostStatus.ARCHIVED);
+        postRepository.save(post);
+    }
+}
+```
+
+`publishPost` 方法里可能抛出三种异常：`PostNotFoundException`（文章不存在）、`DuplicateSlugException`（slug 重复）、`InvalidStatusTransitionException`（状态转换不合法）。Service 层不 catch 它们，让异常往上传播到 Controller 层。
+
+Controller 层（或全局异常处理器）统一捕获 `CMSException`：
+
+```java
+public class PostController {
+
+    private final PostService postService;
+
+    public PostController(PostService postService) {
+        this.postService = postService;
+    }
+
+    // 简化的 HTTP 响应处理
+    public Map<String, Object> publish(Long postId) {
+        try {
+            postService.publishPost(postId);
+            return Map.of("success", true);
+        } catch (PostNotFoundException e) {
+            return Map.of("success", false, "code", e.getErrorCode(), "message", e.getMessage());
+        } catch (DuplicateSlugException e) {
+            return Map.of("success", false, "code", e.getErrorCode(), "message", e.getMessage());
+        } catch (InvalidStatusTransitionException e) {
+            return Map.of("success", false, "code", e.getErrorCode(), "message", e.getMessage());
+        }
+    }
+}
+```
+
+或者更简洁，统一捕获 `CMSException` 基类：
+
+```java
+public Map<String, Object> publish(Long postId) {
+    try {
+        postService.publishPost(postId);
+        return Map.of("success", true);
+    } catch (CMSException e) {
+        // 所有 CMS 业务异常都用相同格式返回
+        return Map.of(
+            "success", false,
+            "code", e.getErrorCode(),
+            "message", e.getMessage()
+        );
+    }
+}
+```
+
+这就是异常类继承体系的用处——你可以 catch 具体类型做差异化处理，也可以 catch 基类做统一处理。两种策略可以混合使用。
+
+## try-catch-finally 与 try-with-resources
+
+基本的 try-catch 语法和 JS 几乎一样，Java 多了一个 `finally` 块和 try-with-resources 语法。
+
+`finally` 块无论是否发生异常都会执行，通常用于资源清理：
+
+```java
+public String readPostContent(String filePath) {
+    BufferedReader reader = null;
+    try {
+        reader = new BufferedReader(new java.io.FileReader(filePath));
+        return reader.readLine();
+    } catch (java.io.IOException e) {
+        throw new CMSException("FILE_READ_ERROR", "读取文章内容失败: " + e.getMessage());
+    } finally {
+        // 无论是否异常，都要关闭 reader
+        if (reader != null) {
+            try {
+                reader.close();
+            } catch (java.io.IOException e) {
+                // 关闭失败，记录日志即可
+            }
+        }
+    }
+}
+```
+
+这段代码很啰嗦——finally 里还得再 try-catch，因为 `close()` 本身也可能抛 `IOException`。Java 7 引入了 try-with-resources 来解决这个问题：
+
+```java
+public String readPostContent(String filePath) {
+    try (BufferedReader reader = new BufferedReader(new java.io.FileReader(filePath))) {
+        return reader.readLine();
+    } catch (java.io.IOException e) {
+        throw new CMSException("FILE_READ_ERROR", "读取文章内容失败: " + e.getMessage());
+    }
+    // reader 自动关闭，不需要 finally
+}
+```
+
+只要类实现了 `AutoCloseable` 接口（`BufferedReader` 实现了），放在 `try()` 括号里就会自动关闭。这比 JS 的 `fs.readFile` 回调模式或 `fs.promises.readFile` 的 `finally` 块都更干净。
+
+JS/TS 没有对应的 try-with-resources 语法。如果你用了需要手动关闭的资源（比如数据库连接），得自己在 finally 里关闭：
+
+```ts
+async function readPostContent(filePath: string): Promise<string> {
+  const file = await fs.open(filePath, "r");
+  try {
+    return (await file.readFile()).toString();
+  } finally {
+    await file.close(); // 必须手动关闭
+  }
+}
+```
+
+逻辑一样，但 Java 的 try-with-resources 是语言级别的支持，不用你操心 finally 的细节。
+
+## 多 catch 和异常链
+
+Java 7 还支持在一个 catch 块中捕获多种异常，以及将一个异常包装成另一个异常（异常链）。
+
+多 catch 用于多种异常的处理逻辑相同时：
+
+```java
+try {
+    postService.publishPost(postId);
+} catch (PostNotFoundException | DuplicateSlugException e) {
+    // 两种异常的处理逻辑一样
+    return Map.of("success", false, "code", e.getErrorCode());
+}
+```
+
+用 `|` 分隔多个异常类型。注意：多 catch 的异常类型不能有继承关系（不能同时 catch `CMSException` 和 `PostNotFoundException`，因为后者是前者的子类）。
+
+异常链（exception chaining）用于"底层异常包装成上层异常"的场景。Service 层的 `publishPost` 可能因为数据库操作失败而抛出 `SQLException`（checked），但你不希望把数据库层面的异常暴露给 Controller：
+
+```java
+public void publishPost(Long postId) {
+    try {
+        Post post = postRepository.findById(postId)
+            .orElseThrow(() -> new PostNotFoundException(postId));
+        post.transitionTo(PostStatus.PUBLISHED);
+        postRepository.save(post);
+    } catch (java.sql.SQLException e) {
+        // 用 CMSException 包装，同时保留原始异常作为 cause
+        throw new CMSException("DB_ERROR", "发布失败: " + e.getMessage());
+    }
+}
+```
+
+`CMSException` 的构造器调用了 `super(message)`，把异常信息传给了 `RuntimeException`。如果你想保留完整的异常链（原始异常的堆栈信息不丢失），可以用带 cause 参数的构造器：
+
+```java
+public class CMSException extends RuntimeException {
+
+    public CMSException(String errorCode, String message, Throwable cause) {
+        super(message, cause);
+        this.errorCode = errorCode;
+    }
+}
+
+// 使用
+throw new CMSException("DB_ERROR", "发布失败", e); // e 是原始的 SQLException
+```
+
+这样异常堆栈里就能看到完整的因果链：`CMSException` -> `SQLException` -> 具体的数据库错误。JS 的 `Error` 也支持类似机制（`new Error("msg", { cause: originalError })`），但这是 ES2022 才引入的，Java 从 1.4 就有了。
+
+## 什么时候用 checked，什么时候用 unchecked
+
+CMS 的异常全用了 unchecked，这是大多数现代 Java 项目的选择。但 checked exception 在某些场景下仍然有价值。这里给一个决策框架：
+
+**用 unchecked（RuntimeException）**：
+
+- 编程错误：`NullPointerException`、`IllegalArgumentException`
+- 业务规则违反：`InvalidStatusTransitionException`、`DuplicateSlugException`
+- 资源未找到：`PostNotFoundException`
+- 大多数自定义业务异常
+
+**用 checked（Exception）**：
+
+- 调用方必须处理的可恢复错误：文件不存在（`FileNotFoundException`）、网络超时
+- 你明确希望调用方感知并做出决策的场景
+- 库的公共 API，希望调用者知道这里可能失败
+
+一个实用的判断标准：**如果调用方 catch 之后能做有意义的恢复，用 checked；如果 catch 之后也只能打印日志或返回错误页面，用 unchecked**。
+
+在 CMS 中，`DuplicateSlugException` 用户可以修改 slug 重试，按理说应该用 checked。但实际项目中，异常通常在 Controller 层统一处理，返回 JSON 错误响应，Service 层根本不会 catch。所以用 unchecked 更合理——避免方法签名上到处都是 `throws` 声明，同时通过统一的异常处理器来保证所有异常都被正确处理。
+
+## JS vs Java 异常处理对比
+
+| 特性               | JavaScript / TypeScript                 | Java                                            |
+| ------------------ | --------------------------------------- | ----------------------------------------------- |
+| 异常类型           | 只有 `Error`（语言层面）                | Error / Checked Exception / Unchecked Exception |
+| 编译器强制处理     | 无                                      | Checked exception 必须处理                      |
+| throw 的值         | 任何值（字符串、数字、对象）            | 必须是 `Throwable` 或其子类                     |
+| finally            | 有                                      | 有                                              |
+| try-with-resources | 无，需手动在 finally 中关闭             | 有（`AutoCloseable`）                           |
+| 异常链             | `new Error("msg", { cause })`（ES2022） | `new Exception("msg", cause)`（Java 1.4+）      |
+| 多 catch           | 无对应语法                              | `catch (A \| B e)`                              |
+| 方法签名声明       | 无（JS 无方法签名）                     | `throws` 关键字                                 |
+| 类型安全           | 无                                      | catch 块的异常类型在编译期检查                  |
+
+最核心的差异是第一行和第二行：Java 把异常分成了 checked 和 unchecked，checked exception 让编译器帮你"查漏补缺"。这是 JS/TS 完全没有的机制。TypeScript 的 `try-catch` 和 JS 一模一样，TS 编译器不会检查你有没有处理异常。TS 社区有些人用 `Result<T, E>` 模式（类似 Rust 的 `Result`）来弥补这个缺陷，但那是社区约定，不是语言特性。
+
+## Trade-off
+
+checked exception 的设计初衷是好的——强制开发者面对每一个可能出错的地方。但实际项目中的体验往往不理想：throws 声明污染调用链，checked exception 在 Lambda 表达式中尤其难受（Lambda 的函数式接口方法不能抛 checked exception），最终很多开发者选择全部包装成 unchecked 异常。
+
+unchecked exception 的代价是：调用方看不到方法签名就知道哪些异常可能被抛出。你必须靠文档或代码注释来说明。Spring 框架的做法是"默认 unchecked，用 `@ResponseStatus` 注解标记 HTTP 状态码"——这是一种务实的折中。
+
+自定义异常类的代价是类数量膨胀。CMS 目前只有 3 个自定义异常加 1 个基类，如果每个业务操作都定义一个异常类，很快就会积累几十个。一种缓解方式是合并相似场景——比如 `PostNotFoundException` 和 `CommentNotFoundException` 可以合并为 `EntityNotFoundException`，通过泛型或字段来区分实体类型。
+
+## 回顾
+
+上一篇我们用 `PostStatus` 枚举替代了字符串类型的 status，并实现了 Builder 模式。枚举提供了编译期的类型安全和 switch 穷举检查，内部类让 Builder 自然地归属于 Post。
+
+本篇围绕 CMS 的文章发布流程，完整走了一遍 Java 异常处理。从 `Throwable` 的体系结构出发，区分了 Error、Checked Exception 和 Unchecked Exception 三种类型。通过 `CMSException` 基类和三个具体异常类，展示了自定义异常的设计——异常不只是错误信号，也是数据载体，可以携带 errorCode、postId、slug 等上下文信息。在 Service 层抛出异常、Controller 层统一捕获的模式，是 Java Web 项目的标准做法。
+
+下一篇是集合框架——CMS 里的文章列表、标签集合、slug 去重，都离不开 Java 的 `List`、`Set`、`Map`。这是 Java 日常开发中使用频率最高的 API 之一，也是从"会写 Java"到"写好 Java"的关键一步。

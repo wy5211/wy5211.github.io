@@ -1,0 +1,436 @@
+---
+title: "05. 注解开发 vs XML 开发：怎么选"
+date: "2026-04-12"
+summary: "MyBatis 支持注解和 XML 两种方式写 SQL。简单查询用注解更简洁，复杂查询用 XML 更清晰。实际项目中怎么搭配使用？"
+tags: ["MyBatis", "Java", "注解", "XML"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 实战指南"
+seriesOrder: 5
+---
+
+前四篇我们全部用 XML 方式定义 SQL。XML 方式功能强大，动态 SQL、关联映射、复杂结果集都能处理。但有一个问题一直没提：对于简单的 CRUD 操作，每次都要写一个 XML 文件、配置 namespace、写 `<select>` 标签，流程有点繁琐。
+
+BookHive 项目现在要加一个书籍评论功能。评论模块的需求很简单——按 ID 查、按书 ID 查列表、新增评论、删除评论。就这几行 SQL，要不要单独建一个 XML 文件？
+
+MyBatis 其实支持直接在 Mapper 接口上用注解写 SQL，不依赖 XML。对于这种简单场景，注解方式确实更轻量。但注解不是万能的，复杂查询还是 XML 更合适。这篇把两种方式都讲清楚，给你一个明确的选择策略。
+
+## 评论模块：用注解开发
+
+先看评论模块的表结构：
+
+```sql
+-- 书籍评论表
+CREATE TABLE book_reviews (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    book_id BIGINT NOT NULL,
+    user_id BIGINT NOT NULL,
+    rating TINYINT NOT NULL CHECK (rating BETWEEN 1 AND 5),
+    content TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (book_id) REFERENCES books(id),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+```
+
+评论表结构很简洁，字段不多，查询场景也简单。实体类：
+
+```java
+package com.bookhive.entity;
+
+import java.time.LocalDateTime;
+
+public class BookReview {
+    private Long id;
+    private Long bookId;
+    private Long userId;
+    private Integer rating;      // 1-5 星评分
+    private String content;       // 评论内容
+    private LocalDateTime createdAt;
+    // getter/setter 省略
+}
+```
+
+### 基础 CRUD 注解
+
+MyBatis 提供了四个基础注解对应 SQL 的四种操作：`@Select`、`@Insert`、`@Update`、`@Delete`。直接写在 Mapper 接口的方法上：
+
+```java
+package com.bookhive.mapper;
+
+import com.bookhive.entity.BookReview;
+import org.apache.ibatis.annotations.*;
+
+import java.util.List;
+
+@Mapper
+public interface BookReviewMapper {
+
+    // 根据 ID 查询一条评论
+    @Select("SELECT id, book_id, user_id, rating, content, created_at " +
+            "FROM book_reviews WHERE id = #{id}")
+    BookReview findById(Long id);
+
+    // 查询某本书的所有评论，按创建时间倒序
+    @Select("SELECT id, book_id, user_id, rating, content, created_at " +
+            "FROM book_reviews WHERE book_id = #{bookId} ORDER BY created_at DESC")
+    List<BookReview> findByBookId(Long bookId);
+
+    // 新增评论
+    // @Options 注解等价于 XML 中的 useGeneratedKeys + keyProperty
+    @Insert("INSERT INTO book_reviews (book_id, user_id, rating, content) " +
+            "VALUES (#{bookId}, #{userId}, #{rating}, #{content})")
+    @Options(useGeneratedKeys = true, keyProperty = "id")
+    int insert(BookReview review);
+
+    // 更新评论内容和评分
+    @Update("UPDATE book_reviews SET rating = #{rating}, content = #{content} " +
+            "WHERE id = #{id}")
+    int update(BookReview review);
+
+    // 删除评论
+    @Delete("DELETE FROM book_reviews WHERE id = #{id}")
+    int deleteById(Long id);
+}
+```
+
+不需要 XML 文件，不需要 namespace 配置，SQL 就写在方法上面。点进 Mapper 接口就能看到 SQL，不用在 Java 文件和 XML 文件之间跳来跳去。
+
+`@Options` 注解值得注意。在 XML 里我们用 `useGeneratedKeys="true" keyProperty="id"` 来回填主键，注解方式用 `@Options(useGeneratedKeys = true, keyProperty = "id")` 达到同样的效果。插入之后 `review.getId()` 就能拿到数据库生成的主键值。
+
+### 结果映射注解：@Results 和 @Result
+
+如果数据库列名和 Java 属性名之间不是简单的下划线转驼峰关系（虽然全局配置开了 `map-underscore-to-camel-case` 能处理大部分情况），或者需要做一些特殊映射，可以用 `@Results` 注解。
+
+它等价于 XML 中的 `<resultMap>`：
+
+```java
+@Mapper
+public interface BookReviewMapper {
+
+    // 定义一个可复用的结果映射
+    // id 属性给这个映射起个名字，后续可以用 @ResultMap 引用
+    @Results(id = "reviewResultMap", value = {
+        @Result(property = "id", column = "id", id = true),        // id=true 标记主键
+        @Result(property = "bookId", column = "book_id"),
+        @Result(property = "userId", column = "user_id"),
+        @Result(property = "rating", column = "rating"),
+        @Result(property = "content", column = "content"),
+        @Result(property = "createdAt", column = "created_at")
+    })
+    @Select("SELECT * FROM book_reviews WHERE id = #{id}")
+    BookReview findById(Long id);
+
+    // 用 @ResultMap 引用上面定义的映射，不用重复写 @Results
+    @ResultMap("reviewResultMap")
+    @Select("SELECT * FROM book_reviews WHERE book_id = #{bookId} ORDER BY created_at DESC")
+    List<BookReview> findByBookId(Long bookId);
+}
+```
+
+`@Results` 上的 `id = "reviewResultMap"` 给这个映射定义起了个名字。另一个方法想用同样的映射规则，加上 `@ResultMap("reviewResultMap")` 就行，不用重复写。这和 XML 中一个 `<resultMap>` 被多个 `<select>` 引用是同一个道理。
+
+实际上，如果全局开了驼峰转换，这里的 `@Results` 是多余的。我列出它是为了让你知道这个注解存在、怎么用。实际开发中，简单查询直接用 `@Select` + `resultType` 就够了。
+
+### 关联映射注解：@One 和 @Many
+
+XML 里的 `<association>` 和 `<collection>` 在注解中有对应的 `@One` 和 `@Many`。
+
+假设评论详情需要带出评论者（用户）信息，这是一对一关系：
+
+```java
+// 评论详情 DTO：包含评论内容 + 评论者的用户名
+public class BookReviewDetail {
+    private Long id;
+    private Long bookId;
+    private Long userId;
+    private Integer rating;
+    private String content;
+    private LocalDateTime createdAt;
+
+    private String username;  // 来自 users 表，不是 book_reviews 表的字段
+    // getter/setter 省略
+}
+```
+
+用 `@One` 实现嵌套查询（等价于 XML 中的 `<association>` + `select`）：
+
+```java
+@Mapper
+public interface BookReviewMapper {
+
+    // @One 指定嵌套查询的 Mapper 方法
+    // column = "user_id" 表示把 user_id 列的值传给 UserMapper.findById
+    // fetchType = FetchType.LAZY 表示延迟加载，访问 username 时才查用户表
+    @Results(id = "reviewDetailMap", value = {
+        @Result(property = "id", column = "id", id = true),
+        @Result(property = "bookId", column = "book_id"),
+        @Result(property = "userId", column = "user_id"),
+        @Result(property = "rating", column = "rating"),
+        @Result(property = "content", column = "content"),
+        @Result(property = "createdAt", column = "created_at"),
+        // 一对一关联：通过 user_id 查用户表获取 username
+        @Result(property = "username", column = "user_id",
+                one = @One(select = "com.bookhive.mapper.UserMapper.findUsernameById",
+                           fetchType = FetchType.LAZY))
+    })
+    @Select("SELECT * FROM book_reviews WHERE id = #{id}")
+    BookReviewDetail findDetailById(Long id);
+}
+```
+
+对应的 UserMapper 中需要有一个方法接收 user_id：
+
+```java
+@Mapper
+public interface UserMapper {
+    // 只查 username，不需要返回整个 User 对象
+    @Select("SELECT username FROM users WHERE id = #{id}")
+    String findUsernameById(Long id);
+}
+```
+
+`@Many` 的用法类似，用于一对多关系。比如查询一本书时带出它的所有评论：
+
+```java
+@Results(id = "bookWithReviewsMap", value = {
+    @Result(property = "id", column = "id", id = true),
+    @Result(property = "title", column = "title"),
+    // 一对多关联：通过 book_id 查评论表
+    @Result(property = "reviews", column = "id",
+            many = @Many(select = "com.bookhive.mapper.BookReviewMapper.findByBookId",
+                         fetchType = FetchType.LAZY))
+})
+@Select("SELECT * FROM books WHERE id = #{id}")
+Book findBookWithReviews(Long id);
+```
+
+说实话，关联映射用注解写可读性不太好。`@One` 和 `@Many` 嵌套在 `@Result` 里面，层级很深，看着费劲。同样的逻辑用 XML 写会清晰很多。所以关联映射更推荐用 XML（下一篇专门讲），这里只是让你知道注解也能做。
+
+## 动态 SQL 注解：@SelectProvider
+
+注解方式的硬伤是动态 SQL。XML 里有 `<if>`、`<where>`、`<foreach>` 这些标签，写动态查询很方便。注解方式怎么办？MyBatis 提供了 Provider 类机制。
+
+以书籍搜索模块为例。BookHive 的书籍搜索需要支持按标题模糊搜索、按价格区间筛选、按出版社筛选、按出版日期范围筛选——条件是可选的，用户填了哪些就按哪些查。
+
+如果用 XML，我们之前已经写过类似的动态 SQL。用注解的话，需要一个 Provider 类来构建 SQL：
+
+```java
+package com.bookhive.provider;
+
+import org.apache.ibatis.builder.annotation.ProviderMethodResolver;
+import org.apache.ibatis.jdbc.SQL;
+
+// Provider 类：专门负责构建动态 SQL
+// 实现 ProviderMethodResolver 接口后，MyBatis 会自动找到对应的构建方法
+public class BookSearchProvider implements ProviderMethodResolver {
+
+    // 方法名必须和 Mapper 接口中的方法名一致
+    // MyBatis 通过反射调用这个方法，拿到生成的 SQL 字符串
+    public String searchByCondition(BookSearchQuery query) {
+        return new SQL() {{
+            // SELECT 子句：用 new SQL() 的链式 API 构建 SQL 的各个部分
+            SELECT("b.id, b.title, b.isbn, b.price, b.stock, " +
+                   "b.publisher_id, b.published_date, b.description, " +
+                   "b.created_at, b.updated_at");
+            FROM("books b");
+
+            // LEFT JOIN 出版社表，因为搜索条件可能包含出版社名称
+            LEFT_OUTER_JOIN("publishers p ON b.publisher_id = p.id");
+
+            // WHERE 条件：每个条件用 if 判断，非空才追加
+            // 这里的 WHERE() 方法不会生成多余的 "AND" 关键字
+            if (query.getTitle() != null && !query.getTitle().isEmpty()) {
+                WHERE("b.title LIKE CONCAT('%', #{title}, '%')");
+            }
+            if (query.getMinPrice() != null) {
+                WHERE("b.price >= #{minPrice}");
+            }
+            if (query.getMaxPrice() != null) {
+                WHERE("b.price <= #{maxPrice}");
+            }
+            if (query.getPublisherId() != null) {
+                WHERE("b.publisher_id = #{publisherId}");
+            }
+            if (query.getPublisherName() != null && !query.getPublisherName().isEmpty()) {
+                WHERE("p.name LIKE CONCAT('%', #{publisherName}, '%')");
+            }
+            if (query.getStartDate() != null) {
+                WHERE("b.published_date >= #{startDate}");
+            }
+            if (query.getEndDate() != null) {
+                WHERE("b.published_date <= #{endDate}");
+            }
+
+            // ORDER BY：默认按价格升序，用户可以指定
+            if (query.getSortBy() != null && !query.getSortBy().isEmpty()) {
+                // 注意：ORDER BY 的列名不能用 #{}，因为它是 SQL 结构的一部分
+                // 这里用字符串拼接，所以 sortBy 的值必须在 Java 代码中校验
+                ORDER_BY(query.getSortBy() + " " + query.getSortDirection());
+            } else {
+                ORDER_BY("b.price ASC");
+            }
+        }}.toString();
+    }
+}
+```
+
+`new SQL() {{ ... }}` 是 MyBatis 提供的 SQL 构建器。`SELECT()`、`FROM()`、`WHERE()`、`LEFT_OUTER_JOIN()`、`ORDER_BY()` 每个方法对应 SQL 的一部分。`WHERE()` 方法会自动处理 `AND` 的拼接，不会在第一个条件前面加 `AND`，也不会在条件之间加多余的 `AND`。
+
+Mapper 接口上用 `@SelectProvider` 引用这个 Provider：
+
+```java
+public class BookSearchQuery {
+    private String title;
+    private BigDecimal minPrice;
+    private BigDecimal maxPrice;
+    private Long publisherId;
+    private String publisherName;
+    private LocalDate startDate;
+    private LocalDate endDate;
+    private String sortBy;       // 排序字段，如 "b.price"
+    private String sortDirection; // "ASC" 或 "DESC"
+    // getter/setter 省略
+}
+```
+
+```java
+@Mapper
+public interface BookMapper {
+
+    // type 指定 Provider 类，method 指定构建 SQL 的方法名
+    @SelectProvider(type = BookSearchProvider.class, method = "searchByCondition")
+    List<Book> searchByCondition(BookSearchQuery query);
+}
+```
+
+同样的搜索逻辑，用 XML 写是这样的：
+
+```xml
+<!-- BookMapper.xml -->
+<select id="searchByCondition" resultType="Book">
+    SELECT b.id, b.title, b.isbn, b.price, b.stock,
+           b.publisher_id, b.published_date, b.description,
+           b.created_at, b.updated_at
+    FROM books b
+    LEFT OUTER JOIN publishers p ON b.publisher_id = p.id
+    <where>
+        <if test="title != null and title != ''">
+            AND b.title LIKE CONCAT('%', #{title}, '%')
+        </if>
+        <if test="minPrice != null">
+            AND b.price >= #{minPrice}
+        </if>
+        <if test="maxPrice != null">
+            AND b.price <= #{maxPrice}
+        </if>
+        <if test="publisherId != null">
+            AND b.publisher_id = #{publisherId}
+        </if>
+        <if test="publisherName != null and publisherName != ''">
+            AND p.name LIKE CONCAT('%', #{publisherName}, '%')
+        </if>
+        <if test="startDate != null">
+            AND b.published_date >= #{startDate}
+        </if>
+        <if test="endDate != null">
+            AND b.published_date <= #{endDate}
+        </if>
+    </where>
+    <choose>
+        <when test="sortBy != null and sortBy != ''">
+            ORDER BY ${sortBy} ${sortDirection}
+        </when>
+        <otherwise>
+            ORDER BY b.price ASC
+        </otherwise>
+    </choose>
+</select>
+```
+
+把两种方式放在一起对比，差异很明显：
+
+**XML 方式的优势**。结构清晰，一眼就能看出 SELECT 了哪些列、JOIN 了哪些表、有哪些条件。`<where>` 标签自动处理 `AND`，`<choose>` 处理分支逻辑，这些标签就是为动态 SQL 设计的。修改 SQL 的时候直接改 XML，不用重新编译 Java 代码。DBA 审查 SQL 时，打开 XML 文件就能看到完整的语句。
+
+**注解方式（Provider）的劣势**。SQL 被拆散在 Java 代码的各个方法调用中，`SELECT()`、`FROM()`、`WHERE()` 分开写，不如 XML 直观。条件判断用 Java 的 `if` 语句，逻辑和 SQL 结构混在一起。修改 SQL 需要改 Java 代码、重新编译。而且 Provider 类本质上是把 SQL 当字符串拼接——虽然 MyBatis 的 `SQL` 类做了封装，比纯字符串拼接好很多，但还是不如 XML 标签直观。
+
+## 注解 vs XML：逐项对比
+
+上面的例子已经展示了两种方式的实际体验。下面从几个维度做一个系统对比。
+
+### 开发效率
+
+简单的 CRUD 操作，注解方式明显更快。不需要创建 XML 文件，不需要配 namespace，SQL 直接写在接口方法上面。以 BookReviewMapper 为例，5 个 CRUD 方法全用注解写，一个 Java 文件就搞定了。如果用 XML，还得额外建一个 `BookReviewMapper.xml`。
+
+但查询一旦复杂起来，XML 的优势就出来了。动态条件、多表关联、分组统计——这些用 XML 标签写更清晰，调试也更方便（IDE 对 XML 的 SQL 语法高亮支持比注解里的字符串好得多）。
+
+### 可读性
+
+注解方式：SQL 在方法签名上面，看代码的时候不用跳转到其他文件。但对于长 SQL，注解里的字符串拼接可读性很差，一行放不下要用 `+` 连接，缩进也不整齐。
+
+XML 方式：SQL 有完整的缩进和格式，长查询也能保持清晰。IDE 对 XML 的支持更好，有语法高亮、自动补全、错误提示。缺点是需要在 Java 接口和 XML 文件之间跳转。
+
+### 可维护性
+
+注解方式：SQL 分散在各个 Mapper 接口中。想了解某张表的所有 SQL 操作，要 grep 搜一遍。DBA 想审查 SQL，需要打开一堆 Java 文件。
+
+XML 方式：SQL 集中在 XML 文件中。一张表的所有 SQL 都在同一个 XML 文件里，一目了然。DBA 审查 SQL 只需要看 XML 文件，不用碰 Java 代码。团队协作时这个差异更明显——改 SQL 不需要改 Java 代码，减少合并冲突。
+
+### 动态 SQL
+
+这是两种方式差距最大的地方。XML 的 `<if>`、`<where>`、`<set>`、`<foreach>`、`<choose>` 标签就是为动态 SQL 设计的，语义清晰，功能完整。
+
+注解方式要用 Provider 类，用 Java 代码构建 SQL。简单条件还好，条件多了之后代码量不比 XML 少，而且可读性更差。更重要的是，Provider 类里写的是 Java 代码而不是 SQL，排查问题的时候需要在脑子里把 Java 代码"翻译"成 SQL。
+
+### 混合使用
+
+MyBatis 允许同一个 Mapper 混合使用注解和 XML。简单的 CRUD 用注解写在接口上，复杂的查询用 XML 定义。但有一个限制：**同一个方法不能同时用注解和 XML 定义**。如果接口方法上加了 `@Select`，XML 里又有一个 `<select id="同名">`，启动时会报错。
+
+实际操作上，可以在 Mapper 接口上用注解定义简单方法，XML 里只定义复杂方法。MyBatis 启动时会合并两种来源的定义。
+
+## BookHive 的选择策略
+
+回到 BookHive 项目，我的选择策略是这样的：
+
+**简单 CRUD 用注解**。BookReviewMapper 的五个方法（findById、findByBookId、insert、update、deleteById）全用注解。SQL 简单，注解写起来快，看代码时 SQL 就在眼前，不用跳文件。
+
+**复杂查询用 XML**。书籍搜索（多条件动态 SQL）、订单统计（分组聚合）、库存报表（多表关联）这些用 XML。查询条件多、SQL 长，XML 的标签语法更清晰，维护更方便。
+
+**关联映射用 XML**。`@One`、`@Many` 嵌套在 `@Result` 里面层级太深，可读性不好。XML 的 `<association>`、`<collection>` 结构更清晰，尤其是嵌套结果映射（一次 JOIN 查询）。
+
+**动态 SQL 用 XML**。没有例外。Provider 类能写，但不如 XML 直观，维护成本更高。
+
+用一张表总结：
+
+| 场景                       | 推荐方式 | 原因                                     |
+| -------------------------- | -------- | ---------------------------------------- |
+| 按 ID 查询、简单列表查询   | 注解     | SQL 就一行，注解最简洁                   |
+| 简单的增删改               | 注解     | `@Insert`、`@Update`、`@Delete` 够用     |
+| 多条件动态查询             | XML      | `<if>`、`<where>` 标签更直观             |
+| 多表关联查询               | XML      | JOIN + resultMap，XML 结构更清晰         |
+| 关联映射（一对多、多对多） | XML      | `<association>`、`<collection>` 可读性好 |
+| 统计和聚合查询             | XML      | SQL 复杂，XML 格式化后更易读             |
+| DBA 审查 SQL               | XML      | SQL 集中管理，审查方便                   |
+
+## 什么时候需要统一
+
+上面说的是默认策略。有些情况下团队会选择统一用一种方式，而不是混合使用。
+
+**全用 XML 的场景**。团队有 DBA 参与审查——DBA 不想看 Java 代码，只想看 SQL 文件。或者公司有规范要求所有 SQL 必须写在 XML 里。这种情况下，即使简单的 CRUD 也统一用 XML，保持一致性。一致性本身也有价值——团队里每个人都知道去哪里找 SQL。
+
+**全用注解的场景**。项目很小，表不多，查询也不复杂。或者团队已经在用 MyBatis-Plus（后面会讲），大部分简单 SQL 由 MyBatis-Plus 自动生成，只需要对少量特殊查询写注解。这种情况下维护 XML 文件的成本大于收益。
+
+两种极端都不完美。全用 XML，简单 CRUD 也要建文件，略显啰嗦。全用注解，复杂查询的可读性和可维护性会打折扣。大部分实际项目选择混合使用——简单的用注解，复杂的用 XML。
+
+## Trade-off 分析
+
+**注解方式适合**：查询 SQL 简单（一两行就能写完）、团队规模小没有 DBA 审查需求、项目处于快速迭代阶段需要快速出活、或者已经在用 MyBatis-Plus 只需要补充少量自定义 SQL。它的核心优势是开发速度快——不需要在 Java 和 XML 之间跳转，SQL 就在方法旁边。
+
+**注解方式不适合**：SQL 超过三行、有动态条件、涉及多表关联、需要频繁的 SQL 调优。在这些场景下，注解里的字符串拼接会变成维护负担，调试时也不如 XML 方便。
+
+**XML 方式适合**：SQL 复杂（动态条件、多表 JOIN、子查询）、团队有 DBA 审查流程、SQL 需要独立于 Java 代码管理（比如 DBA 可以直接改 XML 里的 SQL 而不用改 Java 代码再重新编译）。它的核心优势是 SQL 集中管理和更好的可读性。
+
+**XML 方式不适合**：极度简单的 CRUD——为了一个 `SELECT * FROM table WHERE id = #{id}` 建一个 XML 文件，确实没有必要。不过如果你的团队选择了全 XML 策略，这个"不适合"可以忽略——一致性比省几行代码更重要。
+
+实际选择时，不必纠结于"哪种方式更好"。MyBatis 两种都支持，而且可以混合使用，那就按场景选择最合适的。BookHive 项目后续的代码会遵循这个策略：简单 CRUD 走注解，复杂查询走 XML。下一篇我们专门讲关联映射，用 XML 方式处理一对一和一对多关系。

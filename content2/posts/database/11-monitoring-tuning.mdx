@@ -1,0 +1,600 @@
+---
+title: "11. 监控与调优：构建生产级数据库运维体系"
+date: "2026-04-12"
+summary: "掌握 PostgreSQL 监控和性能调优，构建生产级高可用架构"
+tags: ["PostgreSQL", "监控", "性能调优", "高可用"]
+category: "数据库"
+cover: ""
+draft: false
+series: "PostgreSQL 渐进式学习路线"
+seriesOrder: 11
+---
+
+上一篇文章我们讲了备份与恢复，这是数据安全的保障。但除了数据安全，你还要关心数据库的健康状况：连接数是不是太多了？有没有慢查询？磁盘够不够用？监控就是在问题发生前发现苗头，调优就是让数据库跑得更快更稳。
+
+## 为什么需要监控
+
+真实案例：某电商系统在双11当天突然崩溃，查日志发现连接数被打满了。原因是程序有个 bug，连接没释放。如果有监控，提前看到连接数异常，就不会出这事。
+
+监控不是出问题后才看，而是提前发现问题。就像体检，不是等病危了才治，而是早发现早处理。
+
+## 核心监控指标
+
+### 连接数
+
+```sql
+-- 查看当前连接数
+SELECT count(*) FROM pg_stat_activity;
+
+-- 查看每个数据库的连接数
+SELECT
+  datname,
+  count(*) as connections,
+  count(*) FILTER (WHERE state = 'active') as active,
+  count(*) FILTER (WHERE state = 'idle') as idle
+FROM pg_stat_activity
+GROUP BY datname;
+
+-- 查看最大连接数
+SHOW max_connections;
+```
+
+如果连接数接近 max_connections，说明有连接泄漏或者需要增加连接池。
+
+### 慢查询
+
+```sql
+-- 启用 pg_stat_statements（需要重启数据库）
+shared_preload_libraries = 'pg_stat_statements'
+
+-- 创建扩展
+CREATE EXTENSION pg_stat_statements;
+
+-- 查看平均执行时间最长的查询
+SELECT
+  query,
+  calls,
+  total_exec_time / 1000 as total_seconds,
+  mean_exec_time / 1000 as avg_seconds,
+  stddev_exec_time / 1000 as stddev_seconds
+FROM pg_stat_statements
+ORDER BY mean_exec_time DESC
+LIMIT 10;
+
+-- 查看总消耗时间最长的查询
+SELECT
+  query,
+  calls,
+  total_exec_time / 1000 as total_seconds
+FROM pg_stat_statements
+ORDER BY total_exec_time DESC
+LIMIT 10;
+```
+
+### 缓存命中率
+
+```sql
+-- 查看缓冲区命中率
+SELECT
+  sum(heap_blks_read) as heap_read,
+  sum(heap_blks_hit) as heap_hit,
+  sum(heap_blks_hit) / (sum(heap_blks_hit) + sum(heap_blks_read)) AS cache_hit_ratio
+FROM pg_statio_user_tables;
+```
+
+缓存命中率应该 > 99%。如果低于 99%，说明 shared_buffers 太小，或者查询了太多数据。
+
+### 表和索引大小
+
+```sql
+-- 查看最大的表
+SELECT
+  schemaname,
+  tablename,
+  pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) AS total_size,
+  pg_total_relation_size(schemaname||'.'||tablename) AS size_bytes
+FROM pg_tables
+ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC
+LIMIT 10;
+
+-- 查看索引使用情况
+SELECT
+  schemaname,
+  tablename,
+  indexname,
+  idx_scan,
+  idx_tup_read,
+  idx_tup_fetch
+FROM pg_stat_user_indexes
+ORDER BY idx_scan ASC
+LIMIT 10;
+```
+
+如果 idx_scan = 0，说明索引从没用过，可以删除。
+
+### 锁等待
+
+```sql
+-- 查看锁等待
+SELECT
+  pid,
+  usename,
+  pg_blocking_pids(pid) as blocked_by,
+  query as blocked_query,
+  now() - query_start as duration
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+
+-- 查看锁详情
+SELECT
+  l.locktype,
+  l.relation::regclass,
+  l.mode,
+  l.granted,
+  a.usename,
+  a.query,
+  a.query_start
+FROM pg_locks l
+JOIN pg_stat_activity a ON l.pid = a.pid
+WHERE NOT l.granted;
+```
+
+## 配置调优
+
+PostgreSQL 默认配置很保守，适合最小资源。生产环境要调优。
+
+### 内存配置
+
+```bash
+# postgresql.conf
+
+# 共享缓冲区（数据的缓存）
+# 建议：系统内存的 25%
+shared_buffers = 4GB
+
+# 有效缓存（系统内存 + 操作系统缓存）
+# 建议：系统内存的 50-75%
+effective_cache_size = 12GB
+
+# 每个查询操作的内存（排序、哈希表等）
+# 建议：系统内存 / max_connections / 3
+work_mem = 64MB
+
+# 维护操作内存（VACUUM、CREATE INDEX）
+# 建议：系统内存的 5-10%
+maintenance_work_mem = 2GB
+```
+
+### WAL 配置
+
+```bash
+# WAL 缓冲区
+wal_buffers = 64MB
+
+# 检查点间隔（太频繁影响性能，太宽松崩溃恢复慢）
+checkpoint_completion_target = 0.9
+max_wal_size = 4GB
+min_wal_size = 1GB
+
+# WAL 级别（minimal 最快但不能复制，replica 支持复制）
+wal_level = replica
+```
+
+### 并发配置
+
+```bash
+# 最大连接数（太多会耗内存）
+max_connections = 200
+
+# 工作进程（并行查询）
+max_worker_processes = 8
+max_parallel_workers_per_gather = 4
+max_parallel_workers = 8
+```
+
+### 查询优化配置
+
+```bash
+# 随机页面成本（SSD 用 1.1，HDD 用 4.0）
+random_page_cost = 1.1
+
+# IO 并发度（SSD 可以设高一点）
+effective_io_concurrency = 200
+
+# 统计信息精度（越大越准，但 ANALYZE 越慢）
+default_statistics_target = 100
+```
+
+## 连接池：PgBouncer
+
+PostgreSQL 的每个连接都占用一个进程（fork 模式），内存开销大。连接池可以复用连接，减少开销。
+
+### 安装 PgBouncer
+
+```bash
+# Debian/Ubuntu
+apt-get install pgbouncer
+
+# CentOS/RHEL
+yum install pgbouncer
+
+# macOS
+brew install pgbouncer
+```
+
+### 配置 PgBouncer
+
+```ini
+# pgbouncer.ini
+
+[databases]
+myshop = host=localhost port=5432 dbname=myshop
+
+[pgbouncer]
+listen_addr = 0.0.0.0
+listen_port = 6432
+auth_type = md5
+auth_file = /etc/pgbouncer/userlist.txt
+
+# 连接池模式
+# session：一个事务一个连接（默认）
+# transaction：一个事务多个语句用一个连接
+# statement：每个语句一个连接
+pool_mode = transaction
+
+# 最大客户端连接（应用到 PgBouncer）
+max_client_conn = 1000
+
+# 每个数据库的最大连接（PgBouncer 到 PostgreSQL）
+default_pool_size = 25
+```
+
+### 用户配置
+
+```bash
+# userlist.txt
+"postgres" "md5密码"
+"app_user" "md5密码"
+```
+
+启动 PgBouncer：
+
+```bash
+pgbouncer -d /etc/pgbouncer/pgbouncer.ini
+
+# 查看状态
+psql -h localhost -p 6432 -U postgres -d pgbouncer -c "SHOW STATS;"
+```
+
+应用连接 PgBouncer（端口 6432），而不是直接连 PostgreSQL。
+
+## 主从复制：流复制
+
+主从复制可以实现读写分离，提高并发能力。
+
+### 配置主库
+
+```bash
+# postgresql.conf（主库）
+
+wal_level = replica
+max_wal_senders = 5
+wal_keep_size = 1GB
+
+# pg_hba.conf（主库）
+# 允许复制连接
+host replication repl_user 192.168.1.0/24 md5
+```
+
+创建复制用户：
+
+```sql
+CREATE USER repl_user WITH REPLICATION ENCRYPTED PASSWORD 'password';
+```
+
+### 配置从库
+
+```bash
+# 停止从库
+pg_ctl stop
+
+# 清空数据目录
+rm -rf /var/lib/postgresql/data/*
+
+# 从主库克隆数据
+pg_basebackup -h master_host -U repl_user -D /var/lib/postgresql/data/ -P -R
+
+# -R 自动创建 standby.signal 和连接配置
+
+# 启动从库
+pg_ctl start
+```
+
+从库会自动连接主库，持续同步 WAL 日志。
+
+### 监控复制延迟
+
+```sql
+-- 主库查看
+SELECT
+  client_addr,
+  state,
+  sync_state,
+  replay_lag,
+  write_lag
+FROM pg_stat_replication;
+
+-- 从库查看
+SELECT
+  now() - pg_last_xact_replay_timestamp() AS replication_lag;
+```
+
+## 高可用：Patroni
+
+流复制只能手动切换主从，Patroni 可以自动故障转移。
+
+### Patroni 架构
+
+```
+App → PgBouncer → Patroni (Leader)  ──→ PostgreSQL (主)
+                   │
+                   ├─ Patroni (Replica) → PostgreSQL (从)
+                   │
+                   ├─ Patroni (Replica) → PostgreSQL (从)
+                   │
+                   └─ etcd (存储配置和选举)
+```
+
+### 安装 Patroni
+
+```bash
+pip install patroni[etcd]
+
+# 创建配置文件
+cat > /etc/patroni/patroni.yml <<EOF
+scope: postgres-cluster
+name: pg-node1
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: 192.168.1.10:8008
+
+etcd3:
+  hosts:
+    - 192.168.1.20:2379
+    - 192.168.1.21:2379
+    - 192.168.1.22:2379
+
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 1048576
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+
+      parameters:
+        max_connections: 200
+        shared_buffers: 4GB
+        effective_cache_size: 12GB
+        work_mem: 64MB
+        maintenance_work_mem: 2GB
+        min_wal_size: 1GB
+        max_wal_size: 4GB
+        wal_level: replica
+        hot_standby: on
+        max_wal_senders: 5
+        max_replication_slots: 5
+
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: 192.168.1.10:5432
+  data_dir: /var/lib/postgresql/data
+  bin_dir: /usr/lib/postgresql/16/bin
+  authentication:
+    replication:
+      username: repl_user
+      password: password
+    superuser:
+      username: postgres
+      password: password
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false
+EOF
+
+# 启动 Patroni
+patroni /etc/patroni/patroni.yml
+```
+
+### 应用连接
+
+应用连接 Patroni 的 REST API 获取当前主库：
+
+```bash
+curl http://192.168.1.10:8008/master
+```
+
+或者用 HAProxy：
+
+```bash
+# haproxy.cfg
+listen postgres_master
+  bind *:5000
+  mode tcp
+  option httpchk
+  http-check expect status 200
+  default-server inter 3s fall 3 rise 2 on-marked-down shutdown-sessions
+  server pg-node1 192.168.1.10:5432 maxconn 100 check port 8008
+  server pg-node2 192.168.1.11:5432 maxconn 100 check port 8008
+  server pg-node3 192.168.1.12:5432 maxconn 100 check port 8008
+```
+
+应用连 HAProxy 的 5000 端口，自动路由到主库。
+
+## 分库分表
+
+什么时候需要分库分表？单表数据量超过 1000 万，或者单库连接数不够。
+
+### 水平分片
+
+```sql
+-- 按 user_id 分片
+-- shard_0：user_id 尾数 0-3
+-- shard_1：user_id 尾数 4-7
+-- shard_2：user_id 尾数 8-9，a-f
+
+CREATE TABLE orders_shard_0 (
+  CHECK (substring(user_id from length(user_id)) IN ('0','1','2','3'))
+) INHERITS (orders);
+
+CREATE TABLE orders_shard_1 (
+  CHECK (substring(user_id from length(user_id)) IN ('4','5','6','7'))
+) INHERITS (orders);
+
+CREATE TABLE orders_shard_2 (
+  CHECK (substring(user_id from length(user_id)) IN ('8','9','a','b','c','d','e','f'))
+) INHERITS (orders);
+```
+
+### 应用层路由
+
+```typescript
+// 计算分片
+function getShard(userId: string): number {
+  const lastChar = userId[userId.length - 1];
+  const charCode = lastChar.charCodeAt(0);
+  if (charCode >= 48 && charCode <= 57) {
+    // 0-9
+    const digit = parseInt(lastChar);
+    if (digit <= 3) return 0;
+    if (digit <= 7) return 1;
+    return 2;
+  } else {
+    // a-f
+    return 2;
+  }
+}
+
+// 查询路由
+const shard = getShard("usr_8x9k2m");
+const shardConfig = shards[shard];
+await query(`SELECT * FROM orders WHERE user_id = $1`, ["usr_8x9k2m"], {
+  host: shardConfig.host,
+  database: shardConfig.database,
+});
+```
+
+分库分表的 trade-off：查询复杂（跨分片查询很难），事务难保证，运维成本高。能不分就不分，优先优化索引和配置。
+
+## 常见问题
+
+### CPU 100%
+
+```sql
+-- 查看正在运行的查询
+SELECT
+  pid,
+  now() - query_start as duration,
+  state,
+  query
+FROM pg_stat_activity
+WHERE state != 'idle'
+ORDER BY duration DESC;
+
+-- 如果有查询跑太久，可以杀掉
+SELECT pg_cancel_backend(pid);  -- 礼貌终止
+SELECT pg_terminate_backend(pid);  -- 强制终止
+```
+
+### 磁盘满
+
+```sql
+-- 查看数据库大小
+SELECT
+  datname,
+  pg_size_pretty(pg_database_size(datname)) as size
+FROM pg_database
+ORDER BY pg_database_size(datname) DESC;
+
+-- 查看表大小
+SELECT
+  schemaname,
+  tablename,
+  pg_size_pretty(pg_total_relation_size(schemaname||'.'||tablename)) as size
+FROM pg_tables
+ORDER BY pg_total_relation_size(schemaname||'.'||tablename) DESC
+LIMIT 20;
+
+-- 清理空间
+VACUUM FULL orders;  -- 锁表，重建表
+VACUUM orders;  -- 在线清理，不释放空间
+```
+
+### 慢查询突然变慢
+
+可能是统计信息过时：
+
+```sql
+-- 更新统计信息
+ANALYZE orders;
+
+-- 或者重新收集
+VACUUM ANALYZE orders;
+```
+
+## 系列回顾
+
+这是 PostgreSQL 渐进式学习系列的最后一篇，我们来回顾一下整个学习路径：
+
+### 基础篇：建立直觉
+
+01 - 数据库核心概念：我们讲了为什么要用数据库，ACID 是什么，CAP 定理如何影响架构选择。重点理解数据库不是简单的存储，而是要保证一致性、并发、可靠性。
+
+02 - SQL 语言基础：学习了 SQL 的声明式特性，SELECT 语句的执行顺序，JOIN 和聚合函数。关键是记住 SQL 的执行顺序和编程语言不一样，FROM 先执行，SELECT 最后执行。
+
+03 - PostgreSQL 快速入门：安装配置，psql 命令，基本 CRUD 操作。PostgreSQL 比 MySQL 功能更强大，JSONB、数组、枚举类型都很实用。
+
+### 设计篇：数据建模
+
+04 - 表设计与数据类型：金额用 DECIMAL，电话用 VARCHAR，枚举用 ENUM 还是字符串。数据类型选择错了，后期改很痛苦。
+
+05 - 关系设计：外键、一对一、一对多、多对多，级联操作怎么配。关系设计是数据库建模的核心。
+
+06 - 范式理论与反范式：前三范式保证数据不冗余，但有时候要故意反范式优化性能。设计要看场景，不是越规范越好。
+
+### 性能篇：索引与优化
+
+07 - 索引原理与类型：B-Tree 索引为什么快，复合索引的最左前缀，部分索引和表达式索引。索引不是越多越好，有写入代价。
+
+08 - SQL 查询优化：避免 SELECT \*，用 EXISTS 代替 IN，批量操作，游标分页。优化技巧很多，关键是先看执行计划。
+
+09 - 执行计划分析：Seq Scan vs Index Scan，Nested Loop vs Hash Join，cost 是估算、actual time 才是真实的。诊断性能问题的终极武器。
+
+### 生产篇：运维与高可用
+
+10 - 备份与恢复：pg_dump 逻辑备份、pg_basebackup 物理备份、PITR 时间点恢复。备份不验证等于没备份，要定期演练。
+
+11 - 监控与调优：连接数、慢查询、缓存命中率、锁等待，这些指标要天天看。配置调优、连接池、主从复制、高可用，逐步搭建生产级架构。
+
+## 学习路径总结
+
+整个系列围绕一个电商订单系统展开，从用户表、商品表、订单表的设计，到索引优化、查询优化，最后到备份监控。这样一条主线走下来，你不再是"写过 SQL"，而是真正理解了数据库的原理和实践。
+
+数据库是个深不见底的领域，这个系列是入门和进阶。要成为专家，还需要：
+
+- 深入学习 PostgreSQL 内部机制（MVCC、WAL、缓冲区管理）
+- 研究分布式数据库（CockroachDB、TiDB）
+- 关注新特性（PostgreSQL 每年一个大版本）
+- 实践真实项目（电商、社交、金融）
+
+但记住，技术是为了解决问题。不要为了优化而优化，不要为了分布式而分布式。合适的场景用合适的方案，简单的东西往往更可靠。
+
+希望你在这个系列学到的不仅是知识，还有思考方式。数据库设计要看业务需求，性能优化要先测量后优化，架构演进要逐步迭代。这些经验在任何技术领域都适用。
+
+祝你在数据库的道路上越走越远！

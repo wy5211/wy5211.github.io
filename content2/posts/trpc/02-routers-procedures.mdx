@@ -1,0 +1,477 @@
+---
+title: "02 核心概念：Routers 和 Procedures"
+date: "2026-03-23"
+summary: "深入理解 tRPC 的核心概念，掌握 Router 的组织方式和 Procedure 的使用技巧，学会构建结构清晰、类型安全的 API。"
+tags: ["tRPC", "Router", "Procedure", "API设计", "TypeScript"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 2
+---
+
+上一篇文章我们介绍了 tRPC 如何解决类型定义重复的问题。今天我们深入了解一下 tRPC 的两个核心概念：Router 和 Procedure。
+
+在实际开发中，你很快就会发现，仅仅有一个简单的类型推断是不够的。随着项目规模增长，你需要更好地组织 API，处理不同类型的操作。这时候 Router 和 Procedure 的作用就体现出来了。
+
+## 为什么需要 Router
+
+想象一下，如果我们的协作任务管理平台有几十个接口，全都平铺在一个文件里，会是什么样子？
+
+```typescript
+export const appRouter = t.router({
+  // 项目相关
+  getProjects: t.procedure.query(...),
+  getProjectById: t.procedure.query(...),
+  createProject: t.procedure.mutation(...),
+  updateProject: t.procedure.mutation(...),
+  deleteProject: t.procedure.mutation(...),
+
+  // 任务相关
+  getTasks: t.procedure.query(...),
+  getTaskById: t.procedure.query(...),
+  createTask: t.procedure.mutation(...),
+  updateTask: t.procedure.mutation(...),
+  deleteTask: t.procedure.mutation(...),
+
+  // 用户相关
+  getUsers: t.procedure.query(...),
+  getUserById: t.procedure.query(...),
+  // ... 还有很多接口
+});
+```
+
+这样的代码有几个问题：
+
+1. 难以找到特定的接口
+2. 无法清晰地看出接口之间的逻辑关系
+3. 多人协作时容易冲突
+4. 代码审查时很难理解整体结构
+
+Router 就是为了解决这些问题而设计的。它允许我们把相关的接口分组，形成一个清晰的层次结构。
+
+## Router 的组织方式
+
+Router 可以嵌套，类似于文件系统的目录结构。我们来看看如何组织协作任务管理平台的 API。
+
+```typescript
+import { initTRPC } from "@trpc/server";
+import { z } from "zod";
+
+const t = initTRPC.create();
+
+// 项目相关的 Router
+export const projectsRouter = t.router({
+  // 获取项目列表
+  list: t.procedure.query(async () => {
+    return await db.project.findMany();
+  }),
+
+  // 根据 ID 获取项目
+  byId: t.procedure
+    .input(z.object({ id: z.string() }))
+    .query(async ({ input }) => {
+      return await db.project.findUnique({
+        where: { id: input.id },
+      });
+    }),
+
+  // 创建项目
+  create: t.procedure
+    .input(
+      z.object({
+        name: z.string().min(1),
+        description: z.string().optional(),
+      })
+    )
+    .mutation(async ({ input }) => {
+      return await db.project.create({
+        data: input,
+      });
+    }),
+});
+
+// 任务相关的 Router
+export const tasksRouter = t.router({
+  list: t.procedure
+    .input(z.object({ projectId: z.string() }).optional())
+    .query(async ({ input }) => {
+      return await db.task.findMany({
+        where: input?.projectId ? { projectId: input.projectId } : undefined,
+      });
+    }),
+
+  byId: t.procedure
+    .input(z.object({ id: z.string() }))
+    .query(async ({ input }) => {
+      return await db.task.findUnique({
+        where: { id: input.id },
+      });
+    }),
+});
+
+// 主 Router，整合所有子 Router
+export const appRouter = t.router({
+  projects: projectsRouter,
+  tasks: tasksRouter,
+
+  // 也可以直接在主 Router 上定义 Procedure
+  health: t.procedure.query(() => {
+    return { status: "ok", timestamp: new Date().toISOString() };
+  }),
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+这样的组织方式有几个好处：
+
+1. **清晰的层次结构**：一眼就能看出有哪些功能模块
+2. **易于维护**：每个 Router 可以独立文件管理
+3. **便于协作**：不同人可以负责不同的 Router
+4. **类型安全**：嵌套结构也能完整保留类型信息
+
+## Procedure 的类型选择
+
+Router 解决了组织问题，Procedure 解决的是操作类型的问题。在实际开发中，我们需要区分"读取数据"和"修改数据"，这两种操作的行为和安全性要求完全不同。
+
+tRPC 提供了三种 Procedure：
+
+### Query：读取数据
+
+Query 用于读取数据，它应该是幂等的（多次调用结果相同）且无副作用的：
+
+```typescript
+// 获取项目列表
+const getProjects = t.procedure.query(async () => {
+  return await db.project.findMany();
+});
+
+// 根据 ID 查询项目
+const getProjectById = t.procedure
+  .input(z.object({ id: z.string() }))
+  .query(async ({ input }) => {
+    return await db.project.findUnique({
+      where: { id: input.id },
+    });
+  });
+```
+
+Query 的特点是：
+
+- 不修改数据
+- 可以安全地重试
+- 可以被缓存
+- 对应 HTTP 的 GET 请求
+
+### Mutation：修改数据
+
+Mutation 用于修改数据，它会改变系统状态：
+
+```typescript
+// 创建项目
+const createProject = t.procedure
+  .input(
+    z.object({
+      name: z.string().min(1),
+      description: z.string().optional(),
+    })
+  )
+  .mutation(async ({ input }) => {
+    return await db.project.create({
+      data: input,
+    });
+  });
+
+// 更新项目
+const updateProject = t.procedure
+  .input(
+    z.object({
+      id: z.string(),
+      name: z.string().optional(),
+      description: z.string().optional(),
+    })
+  )
+  .mutation(async ({ input }) => {
+    const { id, ...data } = input;
+    return await db.project.update({
+      where: { id },
+      data,
+    });
+  });
+```
+
+Mutation 的特点是：
+
+- 会修改数据
+- 不应该被随意重试
+- 不应该被缓存
+- 对应 HTTP 的 POST/PUT/DELETE 请求
+
+区分 Query 和 Mutation 有几个好处：
+
+1. **语义清晰**：看到名字就知道操作类型
+2. **安全控制**：可以对 Mutation 施加更严格的权限检查
+3. **缓存策略**：Query 可以安全缓存，Mutation 不能
+4. **客户端优化**：React Query 等库会根据类型采用不同的策略
+
+## 输入验证
+
+在实际应用中，输入验证是必不可少的。tRPC 使用 Zod 进行类型安全的输入验证：
+
+```typescript
+import { z } from "zod";
+
+// 定义验证 Schema
+const createProjectSchema = z.object({
+  name: z.string().min(1, "项目名称不能为空").max(100, "项目名称最多100字"),
+  description: z.string().max(500, "描述最多500字").optional(),
+  status: z.enum(["待开始", "进行中", "已完成"]).default("待开始"),
+});
+
+// 使用 Schema
+const createProject = t.procedure
+  .input(createProjectSchema)
+  .mutation(async ({ input }) => {
+    // input 已经是类型安全的
+    // TypeScript 知道 input 的类型是：
+    // { name: string; description?: string; status: string }
+
+    // 如果验证失败，tRPC 会自动返回错误
+    return await db.project.create({
+      data: input,
+    });
+  });
+```
+
+这段代码有几个亮点：
+
+1. **类型推断**：TypeScript 自动推断出 input 的类型
+2. **运行时验证**：Zod 在运行时验证数据
+3. **错误提示**：验证失败时返回友好的错误消息
+4. **默认值**：可以指定字段的默认值
+
+## 嵌套路由的实际应用
+
+在协作任务管理平台中，我们可以设计一个更复杂的嵌套结构：
+
+```typescript
+export const appRouter = t.router({
+  // 项目管理
+  projects: t.router({
+    list: t.procedure.query(...),
+    byId: t.procedure.query(...),
+    create: t.procedure.mutation(...),
+
+    // 项目成员管理
+    members: t.router({
+      list: t.procedure.query(...),
+      add: t.procedure.mutation(...),
+      remove: t.procedure.mutation(...),
+    }),
+  }),
+
+  // 任务管理
+  tasks: t.router({
+    list: t.procedure.query(...),
+    byId: t.procedure.query(...),
+    create: t.procedure.mutation(...),
+
+    // 任务评论
+    comments: t.router({
+      list: t.procedure.query(...),
+      add: t.procedure.mutation(...),
+    }),
+  }),
+
+  // 用户管理
+  users: t.router({
+    me: t.procedure.query(...),
+    byId: t.procedure.query(...),
+  }),
+});
+```
+
+客户端调用时，路径会反映这个嵌套结构：
+
+```typescript
+// 获取项目列表
+const projects = await client.projects.list.query();
+
+// 添加项目成员
+await client.projects.members.add.mutate({
+  projectId: "123",
+  userId: "456",
+});
+
+// 获取任务评论
+const comments = await client.tasks.comments.list.query({
+  taskId: "789",
+});
+```
+
+这种嵌套结构让 API 的组织更加清晰，也更符合人类的思维习惯。
+
+## Router 的合并策略
+
+当项目规模变大时，我们可能需要合并多个 Router。tRPC 提供了几种合并方式：
+
+```typescript
+// 方式1：在定义时合并
+export const appRouter = t.router({
+  projects: projectsRouter,
+  tasks: tasksRouter,
+  users: usersRouter,
+});
+
+// 方式2：使用 mergeRouters（适合大型项目）
+export const appRouter = t.mergeRouters(
+  projectsRouter,
+  tasksRouter,
+  usersRouter
+);
+
+// 方式3：先分组再合并
+export const contentRouter = t.mergeRouters(projectsRouter, tasksRouter);
+export const appRouter = t.router({
+  content: contentRouter,
+  users: usersRouter,
+});
+```
+
+选择哪种方式取决于项目规模和团队偏好。对于中小型项目，方式1就足够了。对于大型项目，方式2和方式3可以更好地组织代码。
+
+## 实战：构建任务管理 API
+
+让我们用协作任务管理平台的例子，把学到的知识串联起来：
+
+```typescript
+import { initTRPC } from "@trpc/server";
+import { z } from "zod";
+
+const t = initTRPC.create();
+
+// 任务 Router
+export const tasksRouter = t.router({
+  // 获取任务列表
+  list: t.procedure
+    .input(
+      z
+        .object({
+          projectId: z.string().optional(),
+          status: z.enum(["待开始", "进行中", "已完成"]).optional(),
+        })
+        .optional()
+    )
+    .query(async ({ input }) => {
+      const tasks = await db.task.findMany({
+        where: {
+          ...(input?.projectId && { projectId: input.projectId }),
+          ...(input?.status && { status: input.status }),
+        },
+        orderBy: { createdAt: "desc" },
+      });
+      return tasks;
+    }),
+
+  // 创建任务
+  create: t.procedure
+    .input(
+      z.object({
+        title: z.string().min(1),
+        description: z.string().optional(),
+        projectId: z.string(),
+        assigneeId: z.string().optional(),
+      })
+    )
+    .mutation(async ({ input }) => {
+      return await db.task.create({
+        data: {
+          ...input,
+          status: "待开始",
+          createdAt: new Date(),
+        },
+      });
+    }),
+
+  // 更新任务状态
+  updateStatus: t.procedure
+    .input(
+      z.object({
+        id: z.string(),
+        status: z.enum(["待开始", "进行中", "已完成"]),
+      })
+    )
+    .mutation(async ({ input }) => {
+      const { id, status } = input;
+      return await db.task.update({
+        where: { id },
+        data: {
+          status,
+          updatedAt: new Date(),
+        },
+      });
+    }),
+});
+
+// 项目 Router
+export const projectsRouter = t.router({
+  list: t.procedure.query(async () => {
+    return await db.project.findMany();
+  }),
+
+  create: t.procedure
+    .input(
+      z.object({
+        name: z.string().min(1),
+        description: z.string().optional(),
+      })
+    )
+    .mutation(async ({ input }) => {
+      return await db.project.create({
+        data: input,
+      });
+    }),
+
+  // 嵌套：任务管理
+  tasks: tasksRouter,
+});
+
+// 主 Router
+export const appRouter = t.router({
+  projects: projectsRouter,
+  tasks: tasksRouter,
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+这段代码展示了 Router 和 Procedure 的实际应用：
+
+1. 使用嵌套 Router 组织代码
+2. 使用 Query 和 Mutation 区分操作类型
+3. 使用 Zod 进行输入验证
+4. 使用可选参数实现灵活的查询
+
+## Trade-off 分析
+
+Router 和 Procedure 的设计体现了几个权衡：
+
+**结构化 vs 简洁性**：
+
+- 嵌套 Router 带来了清晰的结构，但也增加了路径长度
+- 对于只有几个接口的小项目，嵌套可能过度设计
+- 我的建议：项目有 10+ 个接口时，考虑嵌套组织
+
+**Query vs Mutation 的区分**：
+
+- 严格的区分让语义更清晰，但也增加了一些认知负担
+- 某些边界情况可能难以判断（比如"读取最后一条消息并标记为已读"）
+- 我的建议：遵循原则，但在实际应用中保持灵活
+
+**输入验证的严格程度**：
+
+- 严格的验证让代码更安全，但也增加了代码量
+- 对于内部工具，可能不需要太严格的验证
+- 我的建议：对外接口严格验证，内部接口适度验证
+
+Router 和 Procedure 是 tRPC 的基础，掌握了它们，你就能构建出结构清晰、类型安全的 API。下一步，我们将深入了解 tRPC 的类型系统，看看类型是如何从后端"穿越"到前端的。

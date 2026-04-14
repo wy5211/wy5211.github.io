@@ -1,0 +1,626 @@
+---
+title: "08 统一错误处理与响应格式"
+date: "2026-03-30"
+summary: "用拦截器和异常过滤器实现统一的 { code, message, data } 响应格式，让 API 返回不再五花八门"
+tags: ["NestJS", "拦截器", "异常过滤器", "响应格式", "AOP"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式学习"
+seriesOrder: 8
+---
+
+## 前端同学的崩溃时刻
+
+我们的博客平台 API 现在有 20 多个接口了。前端同学对接了一周，在群里发了一条消息：
+
+> "你们 API 的返回格式能不能统一一下？有的返回 `{ data }`，有的返回 `{ success, data }`，有的返回 `{ message }`，出错的时候有的是 `{ error }` 有的是 `{ statusCode, message }`，数据库挂了直接返回一个 HTML 页面。我写了一堆 if-else 判断格式，感觉在写适配器。"
+
+打开代码一看，确实混乱：
+
+```typescript
+// Controller A：返回裸数据
+@Get('posts')
+findAll() {
+  return this.postsService.findAll();  // → { id, title, ... }
+}
+
+// Controller B：自己包了一层
+@Post('posts')
+create() {
+  return { success: true, data: this.postsService.create(...) };
+}
+
+// Controller C：返回 message
+@Delete('posts/:id')
+remove() {
+  return { message: '删除成功' };
+}
+
+// Service 层：抛出 HttpException
+throw new NotFoundException('文章不存在');       // → { statusCode: 404, message: "..." }
+throw new BadRequestException('参数错误');        // → { statusCode: 400, message: [...], error: "Bad Request" }
+
+// 数据库挂了：NestJS 默认返回 500，格式完全不可控
+```
+
+每个开发者按照自己的习惯返回格式，时间一长就乱套了。
+
+上一篇我们加了验证管道，验证失败时抛出的错误格式也是 NestJS 默认的。是时候统一这一切了。
+
+## 要统一的两个东西
+
+API 的响应需要统一两个维度：
+
+1. **成功响应的格式**：所有接口返回 `{ code, message, data }`
+2. **错误响应的格式**：所有异常返回 `{ code, message, detail, timestamp, path }`
+
+先说成功响应。我们希望不管哪个 Controller 返回什么，最终给前端的都是这个格式：
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "id": "usr_a1x9k2m",
+    "name": "zhang_wei",
+    "email": "zhang_wei@example.com"
+  }
+}
+```
+
+分页接口特殊一点，`data` 里包含列表和分页信息：
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": {
+    "items": [...],
+    "meta": { "total": 42, "page": 1, "limit": 10, "totalPages": 5 }
+  }
+}
+```
+
+再说错误响应。无论什么类型的错误，格式都要统一：
+
+```json
+{
+  "code": 40001,
+  "message": "邮箱格式不正确",
+  "detail": {},
+  "timestamp": "2026-03-30T10:30:00.000Z",
+  "path": "/auth/register"
+}
+```
+
+`code` 是业务错误码，不是 HTTP 状态码。HTTP 状态码用来做协议层面的分类，业务错误码用来让前端精确定位错误类型。
+
+为什么需要业务错误码？因为 HTTP 状态码太粗了。`400 Bad Request` 可以是"邮箱格式不对"，也可以是"密码太短"，还可以是"缺少必填字段"。前端拿到 400 不知道该做什么——是该提示用户改邮箱还是改密码？
+
+有了业务错误码，前端可以精确处理：
+
+```typescript
+// 前端 axios 拦截器
+if (response.data.code === 40004) {
+  // 邮箱已注册，跳转到登录页
+  router.push("/login?email=" + form.email);
+} else if (response.data.code === 40002) {
+  // 密码错误，聚焦密码输入框
+  focusPasswordInput();
+}
+```
+
+## 拦截器：统一成功响应
+
+NestJS 的拦截器（Interceptor）可以拦截 Controller 的返回值，在响应发出去之前做加工。这正好适合包装成功响应。
+
+```typescript
+// src/common/interceptors/transform.interceptor.ts
+import {
+  Injectable,
+  NestInterceptor,
+  ExecutionContext,
+  CallHandler,
+} from "@nestjs/common";
+import { Observable } from "rxjs";
+import { map } from "rxjs/operators";
+
+@Injectable()
+export class TransformInterceptor<T> implements NestInterceptor<T, any> {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    return next.handle().pipe(
+      map((data) => ({
+        code: 200,
+        message: "success",
+        data,
+      }))
+    );
+  }
+}
+```
+
+代码很简洁，核心就一个 `map` 操作符：把 Controller 返回的任何数据包成 `{ code, message, data }` 的格式。
+
+Controller 不需要做任何改动。zhang_wei 的文章列表接口原本返回一个数组，现在自动变成：
+
+```json
+{
+  "code": 200,
+  "message": "success",
+  "data": [
+    {
+      "id": "post_x1y2z3",
+      "title": "从 Express 迁移到 NestJS 的踩坑记录",
+      "views": 3842,
+      "author": { "name": "zhang_wei" }
+    }
+  ]
+}
+```
+
+在 `main.ts` 里全局注册：
+
+```typescript
+import { TransformInterceptor } from "./common/interceptors/transform.interceptor";
+
+app.useGlobalInterceptors(new TransformInterceptor());
+```
+
+一行代码，所有接口的成功响应格式就统一了。
+
+但有一个细节：如果 Controller 直接设置了 `@HttpCode(204)`（比如删除接口返回 204 No Content），TransformInterceptor 仍然会包装一层 `{ code: 200, message: 'success', data: null }`。如果你希望 204 响应不包装，需要在拦截器里做个判断：
+
+```typescript
+intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+  return next.handle().pipe(
+    map((data) => {
+      const response = context.switchToHttp().getResponse();
+      // 204 No Content 不包装
+      if (response.statusCode === 204) {
+        return null;
+      }
+      return { code: 200, message: 'success', data };
+    }),
+  );
+}
+```
+
+不过实际项目中，即使删除接口返回 `{ code: 200, message: 'success', data: null }` 也没什么问题。统一格式带来的便利远大于 204 语义的损失。
+
+## 日志拦截器
+
+既然拦截器能包装每个响应，那自然也能记录每个请求。加一个日志拦截器，打印请求的方法、路径、耗时和状态码：
+
+```typescript
+// src/common/interceptors/logging.interceptor.ts
+import {
+  Injectable,
+  NestInterceptor,
+  ExecutionContext,
+  CallHandler,
+  Logger,
+} from "@nestjs/common";
+import { Observable } from "rxjs";
+import { tap } from "rxjs/operators";
+
+@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  private readonly logger = new Logger("HTTP");
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const request = context.switchToHttp().getRequest();
+    const { method, url, ip } = request;
+    const now = Date.now();
+
+    return next.handle().pipe(
+      tap({
+        next: () => {
+          const response = context.switchToHttp().getResponse();
+          const delay = Date.now() - now;
+          this.logger.log(
+            `${method} ${url} ${response.statusCode} - ${delay}ms - ${ip}`
+          );
+        },
+        error: () => {
+          const delay = Date.now() - now;
+          this.logger.error(`${method} ${url} - ${delay}ms - ${ip}`);
+        },
+      })
+    );
+  }
+}
+```
+
+`tap` 操作符的特点是"旁观"——它不会修改响应数据，只是执行副作用（打印日志）。用 `next` 和 `error` 分别处理成功和失败的情况。
+
+日志输出长这样：
+
+```
+[HTTP] GET /posts 200 - 45ms - 127.0.0.1
+[HTTP] POST /auth/register 201 - 234ms - 127.0.0.1
+[HTTP] GET /posts/not-found 404 - 12ms - 127.0.0.1
+[HTTP] POST /auth/register 500 - 1023ms - 127.0.0.1
+```
+
+哪个接口慢了一目了然。响应时间超过 1 秒的接口，大概率需要优化。
+
+## 异常过滤器：统一错误响应
+
+拦截器只处理成功的情况。验证失败、业务错误、数据库异常这些情况走的是异常过滤器（Exception Filter）。
+
+NestJS 有内置的 `HttpExceptionFilter`，默认返回格式是 `{ statusCode, message, error }`。但这个格式太粗糙了——验证失败时 `message` 是一个数组，业务异常时 `message` 是一个字符串，不可预测的格式对前端不友好。
+
+我们需要一个全局异常过滤器，把所有类型的异常统一成 `{ code, message, detail, timestamp, path }` 的格式。
+
+先设计业务错误码：
+
+```typescript
+// src/common/constants/error-codes.ts
+export const ErrorCodes = {
+  // 认证相关 40xxx
+  UNAUTHORIZED: { code: 40001, message: "未登录或登录已过期" },
+  INVALID_CREDENTIALS: { code: 40002, message: "邮箱或密码错误" },
+  TOKEN_EXPIRED: { code: 40003, message: "Token 已过期" },
+  EMAIL_ALREADY_EXISTS: { code: 40004, message: "该邮箱已被注册" },
+
+  // 参数验证 41xxx
+  VALIDATION_FAILED: { code: 41001, message: "请求参数验证失败" },
+  INVALID_PARAM: { code: 41002, message: "参数格式不正确" },
+
+  // 资源相关 42xxx
+  NOT_FOUND: { code: 42001, message: "请求的资源不存在" },
+  ALREADY_EXISTS: { code: 42002, message: "资源已存在" },
+  FORBIDDEN: { code: 42003, message: "没有操作权限" },
+
+  // 系统相关 50xxx
+  INTERNAL_ERROR: { code: 50001, message: "服务器内部错误" },
+  DATABASE_ERROR: { code: 50002, message: "数据库操作失败" },
+};
+```
+
+错误码分段设计：4 开头是客户端错误，5 开头是服务端错误。每一类再细分，前端拿到错误码就能精确处理。
+
+然后写自定义的业务异常类：
+
+```typescript
+// src/common/exceptions/business.exception.ts
+import { HttpException, HttpStatus } from "@nestjs/common";
+
+export class BusinessException extends HttpException {
+  private readonly errorCode: number;
+  private readonly errorMessage: string;
+
+  constructor(
+    errorCode: number,
+    errorMessage: string,
+    httpStatus: HttpStatus = HttpStatus.BAD_REQUEST,
+    detail?: any
+  ) {
+    super(
+      {
+        code: errorCode,
+        message: errorMessage,
+        detail: detail || {},
+      },
+      httpStatus
+    );
+    this.errorCode = errorCode;
+    this.errorMessage = errorMessage;
+  }
+
+  getErrorCode(): number {
+    return this.errorCode;
+  }
+}
+```
+
+使用起来很直观：
+
+```typescript
+// 在 Service 层抛出业务异常
+import { BusinessException } from "../../common/exceptions/business.exception";
+import { ErrorCodes } from "../../common/constants/error-codes";
+
+// 用户不存在
+throw new BusinessException(
+  ErrorCodes.NOT_FOUND.code,
+  "用户不存在",
+  HttpStatus.NOT_FOUND
+);
+
+// 邮箱已被注册
+throw new BusinessException(
+  ErrorCodes.EMAIL_ALREADY_EXISTS.code,
+  `该邮箱 ${email} 已被注册`,
+  HttpStatus.CONFLICT
+);
+```
+
+## 全局异常过滤器
+
+有了业务异常类，还需要一个全局过滤器来兜底，把所有类型的异常统一格式化输出：
+
+```typescript
+// src/common/filters/all-exceptions.filter.ts
+import {
+  ExceptionFilter,
+  Catch,
+  ArgumentsHost,
+  HttpException,
+  HttpStatus,
+  Logger,
+} from "@nestjs/common";
+import { Request, Response } from "express";
+
+@Catch()
+export class AllExceptionsFilter implements ExceptionFilter {
+  private readonly logger = new Logger("ExceptionFilter");
+
+  catch(exception: unknown, host: ArgumentsHost) {
+    const ctx = host.switchToHttp();
+    const response = ctx.getResponse<Response>();
+    const request = ctx.getRequest<Request>();
+
+    let status = HttpStatus.INTERNAL_SERVER_ERROR;
+    let code = 50001;
+    let message = "服务器内部错误";
+    let detail: any = {};
+
+    if (exception instanceof HttpException) {
+      status = exception.getStatus();
+      const exceptionResponse = exception.getResponse();
+
+      if (typeof exceptionResponse === "object" && exceptionResponse !== null) {
+        const resp = exceptionResponse as any;
+
+        // BusinessException 已经带了 code
+        if (resp.code) {
+          code = resp.code;
+          message = resp.message;
+          detail = resp.detail || {};
+        } else if (Array.isArray(resp.message)) {
+          // ValidationPipe 的验证错误，message 是数组
+          code = 41001;
+          message = "请求参数验证失败";
+          detail = resp.message.map((msg: string) => msg);
+        } else {
+          message = resp.message || exception.message;
+        }
+      } else {
+        message = exceptionResponse as string;
+      }
+    } else if (exception instanceof Error) {
+      // 非HttpException 的 Error，记录完整堆栈
+      this.logger.error(`[${request.method}] ${request.url}`, exception.stack);
+    }
+
+    // 非 HttpException 时也记录日志
+    if (!(exception instanceof HttpException)) {
+      this.logger.error(
+        `[${request.method}] ${request.url} - Unhandled exception`,
+        exception instanceof Error ? exception.stack : String(exception)
+      );
+    }
+
+    response.status(status).json({
+      code,
+      message,
+      detail,
+      timestamp: new Date().toISOString(),
+      path: request.url,
+    });
+  }
+}
+```
+
+逐段分析这个过滤器在处理什么：
+
+**HttpException（包括 BusinessException）**。这是我们最常见的情况。ValidationPipe 抛出的 `BadRequestException` 也是 HttpException。过滤器检查响应体里有没有 `code` 字段——BusinessException 会带，普通 HttpException 不带。
+
+**验证错误（message 是数组）**。ValidationPipe 验证失败时，`message` 是一个字符串数组，比如 `["email must be an email", "password must be longer than or equal to 8 characters"]`。我们把它们放到 `detail` 字段里，让前端知道具体哪些字段有问题。
+
+**非 HttpException 的异常**。比如数据库连接失败、Redis 挂了、代码里的 `TypeError`。这些异常我们不希望暴露内部细节给前端，所以返回通用的 "服务器内部错误"，但在服务端日志里记录完整的堆栈信息。
+
+在 `main.ts` 里注册：
+
+```typescript
+import { AllExceptionsFilter } from "./common/filters/all-exceptions.filter";
+
+app.useGlobalFilters(new AllExceptionsFilter());
+```
+
+## 实际效果对比
+
+**之前**，不同错误返回不同格式：
+
+```json
+// 验证失败
+{ "statusCode": 400, "message": ["email must be an email"], "error": "Bad Request" }
+
+// 资源不存在
+{ "statusCode": 404, "message": "文章不存在", "error": "Not Found" }
+
+// 数据库挂了
+<!DOCTYPE html><html><head>...Internal Server Error...</html>
+```
+
+**现在**，所有错误统一格式：
+
+```json
+// 验证失败
+{
+  "code": 41001,
+  "message": "请求参数验证失败",
+  "detail": ["email must be an email", "password must be longer than or equal to 8 characters"],
+  "timestamp": "2026-03-30T10:30:00.000Z",
+  "path": "/auth/register"
+}
+
+// 资源不存在
+{
+  "code": 42001,
+  "message": "用户不存在",
+  "detail": {},
+  "timestamp": "2026-03-30T10:31:00.000Z",
+  "path": "/users/usr_not_exist"
+}
+
+// 数据库挂了
+{
+  "code": 50001,
+  "message": "服务器内部错误",
+  "detail": {},
+  "timestamp": "2026-03-30T10:32:00.000Z",
+  "path": "/posts"
+}
+```
+
+前端只需要写一个统一的响应拦截器，根据 `code` 做路由（toast 提示、跳转登录页等），不用再关心每个接口返回什么格式。
+
+## 用 APP_FILTER 注册过滤器
+
+`main.ts` 里用 `useGlobalFilters` 注册全局过滤器有一个局限：过滤器类无法使用依赖注入。如果异常过滤器需要注入 Service（比如日志服务），就要用 `APP_FILTER` token 在模块里注册：
+
+```typescript
+// src/common/filters/all-exceptions.filter.ts（带依赖注入版本）
+import { Injectable } from "@nestjs/common";
+
+@Injectable()
+export class AllExceptionsFilter implements ExceptionFilter {
+  constructor(private logger: LoggerService) {
+    /* ... */
+  }
+}
+```
+
+```typescript
+// src/app.module.ts
+import { Module } from "@nestjs/common";
+import { APP_FILTER } from "@nestjs/core";
+import { AllExceptionsFilter } from "./common/filters/all-exceptions.filter";
+
+@Module({
+  providers: [
+    {
+      provide: APP_FILTER,
+      useClass: AllExceptionsFilter,
+    },
+  ],
+})
+export class AppModule {}
+```
+
+两种方式选一种就行。如果过滤器不需要注入其他 Service，`main.ts` 里直接注册更简单。需要依赖注入时，用 `APP_FILTER`。
+
+## 拦截器的 RxJS 基础
+
+如果你对 RxJS 不太熟悉，拦截器里的代码可能看着有点绕。快速解释一下核心概念。
+
+NestJS 的拦截器方法返回一个 `Observable`，这是 RxJS 的核心类型。你可以把它理解成一个"异步数据流"——数据从 Controller 流出来，经过一系列操作符的处理，最终变成响应。
+
+两个最常用的操作符：
+
+**`map`**：转换数据。和 JavaScript 数组的 `map` 类似，但操作的是流中的数据：
+
+```typescript
+next.handle().pipe(map((data) => ({ code: 200, message: "success", data })));
+// Controller 返回 { id: 1 }，map 把它变成 { code: 200, message: 'success', data: { id: 1 } }
+```
+
+**`tap`**：执行副作用，不修改数据。类似于 `console.log`，"看一眼"数据但不改变它：
+
+```typescript
+next.handle().pipe(
+  tap((data) => {
+    console.log("响应数据:", data);
+    // data 不会被修改，原样传给下一步
+  })
+);
+```
+
+拦截器里只需要这两个操作符就够了。如果你需要做缓存（拦截请求，有缓存就直接返回），还需要 `catchError` 和 `of`——但那是后面 Redis 缓存篇的内容。
+
+## 拦截器 vs 中间件 vs Guard
+
+这三个概念容易混淆，快速区分一下：
+
+- **中间件（Middleware）**：在请求到达路由之前执行，适合做 CORS、日志、限流等与具体路由无关的事情。不能访问路由信息。
+- **守卫（Guard）**：决定请求能不能继续往下走，适合做认证和授权。返回 `true` 放行，返回 `false` 拒绝。
+- **拦截器（Interceptor）**：在请求处理前后添加额外逻辑，适合做响应包装、日志记录、缓存、性能监控。既能读请求也能改响应。
+
+中间件是 Express 层面的概念，NestJS 继承了它。Guard 和 Interceptor 是 NestJS 自己的抽象，和依赖注入系统集成得更好。能用 Guard 或 Interceptor 解决的问题，不要用中间件。
+
+## NestJS 的请求处理完整链路
+
+到现在，拦截器、管道、守卫、异常过滤器都出场了。用一个请求的完整生命周期来梳理它们的执行顺序：
+
+```
+1. 请求进入
+     ↓
+2. Guard（守卫）
+   → 检查身份和权限。不通过 → 抛异常 → ExceptionFilter
+     ↓
+3. Interceptor 前半段
+   → LoggingInterceptor 记录请求开始时间
+     ↓
+4. Pipe（管道）
+   → ValidationPipe 验证参数。不通过 → 抛异常 → ExceptionFilter
+   → ParseIntPipe 转换参数类型
+     ↓
+5. Controller
+   → 调用 Service 处理业务逻辑
+     ↓
+6. Service
+   → 数据库操作、业务规则
+   → 出错 → 抛 BusinessException → ExceptionFilter
+     ↓
+7. Interceptor 后半段
+   → TransformInterceptor 包装响应格式 { code, message, data }
+     ↓
+8. 响应返回给客户端
+```
+
+如果任何一步抛出异常，控制流直接跳到 ExceptionFilter，不再经过后续的 Interceptor 后半段。这就是为什么异常过滤器能兜住所有错误。
+
+理解这个链路很重要。当你发现"拦截器的包装没生效"时，大概率是某个环节抛了异常，直接走了 ExceptionFilter，没到 TransformInterceptor。
+
+## 一些实际取舍
+
+### 错误信息要不要翻译
+
+目前我们的验证错误信息是英文的（class-validator 默认行为）。可以在 DTO 的每个装饰器上写 `message`，但字段多了很繁琐。另一种做法是在全局异常过滤器里做翻译映射，或者用 i18n 库。对于中文为主的博客平台，建议直接在装饰器上写中文 message：
+
+```typescript
+@IsEmail({}, { message: '请输入有效的邮箱地址' })
+email: string;
+```
+
+简单直接，维护成本低。
+
+### detail 字段要不要暴露给前端
+
+验证错误的 `detail` 里包含具体的字段错误信息，前端需要这些信息来在表单旁边显示提示。但系统错误（数据库挂了）的 detail 最好不暴露，避免泄露内部实现细节。所以在异常过滤器里，非 HttpException 的 detail 设为空对象 `{}`。
+
+### HTTP 状态码要不要隐藏
+
+有些团队选择所有接口都返回 HTTP 200，用业务错误码区分成功和失败。好处是前端不用处理非 200 状态码，坏处是失去了 HTTP 协议层面的语义。我的建议是：保留 HTTP 状态码，同时提供业务错误码。两者各司其职，前端可以两层数据都用。
+
+## 小结
+
+这一篇做了三件事：
+
+1. **TransformInterceptor** 包装所有成功响应为 `{ code, message, data }` 格式
+2. **BusinessException + 错误码设计** 让业务异常携带结构化信息
+3. **AllExceptionsFilter** 兜底所有异常，统一错误响应格式
+
+加上上一篇的 ValidationPipe，现在博客平台的 API 请求链路是：
+
+- 参数不合法 → Pipe 拦截 → ExceptionFilter 返回验证错误
+- 业务逻辑出错 → Service 抛 BusinessException → ExceptionFilter 返回业务错误
+- 系统异常 → ExceptionFilter 返回通用错误，日志记录堆栈
+- 一切正常 → TransformInterceptor 包装成功响应
+
+前端同学终于不用写适配器了。
+
+API 的基本可用性已经具备：数据验证有了，错误处理统一了，响应格式一致了。但有一个根本问题还没解决——任何人都能调用所有接口。下一篇加上 JWT 认证，让博客平台知道"谁在请求"。

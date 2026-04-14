@@ -1,0 +1,246 @@
+---
+title: "09. 协变、逆变与方差注解：理解类型系统的方向性"
+date: "2026-04-12"
+summary: "为什么 number[] 不能赋值给 (string | number)[]？为什么回调函数的参数类型是反过来的？理解了协变和逆变，这些看似矛盾的类型错误就解释得通了。"
+tags: ["TypeScript"]
+category: "typescript"
+cover: ""
+draft: false
+series: "TypeScript 类型系统进阶"
+seriesOrder: 9
+---
+
+你写了一个事件监听器，期望接收一个处理 `User` 的回调：
+
+```typescript
+function onUserCreated(handler: (user: User) => void) {
+  // ...
+}
+
+// 传一个处理 Admin 的回调——Admin 继承自 User
+onUserCreated((admin: Admin) => void);
+```
+
+这看起来合理——Admin 是 User 的子类型，处理 Admin 的函数应该能替代处理 User 的函数。但 TypeScript 可能会报错。
+
+为什么？因为函数参数的**方向是反的**。Admin 是 User 的子类型（Admin 可以当 User 用），但 `(admin: Admin) => void` 和 `(user: User) => void` 的兼容关系是**逆变**的——子类型的函数参数要求的是**更宽泛**的类型，不是更具体的类型。
+
+这篇文章帮你理清这个反直觉的规则，以及 TypeScript 5.x 引入的方差注解怎么让你显式控制这个行为。
+
+## 从赋值兼容开始
+
+先回顾最基本的类型兼容规则：
+
+```typescript
+class User {
+  userId: string;
+}
+
+class Admin extends User {
+  permissions: string[];
+}
+
+const admin: Admin = new Admin();
+const user: User = admin; // 正确：Admin 可以赋值给 User
+```
+
+子类型可以赋值给父类型——Admin 是 User 的子类型，所以 `Admin` 的值可以赋给 `User` 类型的变量。这叫**协变**（covariance）：类型关系和赋值方向一致。Admin → User 的子类型关系，和 admin → user 的赋值方向一致。
+
+数组的协变更直观：
+
+```typescript
+const admins: Admin[] = [new Admin()];
+const users: User[] = admins; // 正确：Admin[] 可以赋值给 User[]
+```
+
+`Admin[]` 可以赋值给 `User[]`，因为 Admin 是 User 的子类型。数组是协变的。
+
+到目前为止一切都很自然。问题出在函数类型上。
+
+## 函数参数是逆变的
+
+看这个例子：
+
+```typescript
+type UserHandler = (user: User) => void;
+type AdminHandler = (admin: Admin) => void;
+
+const handleAdmin: AdminHandler = (admin) => {
+  console.log(admin.permissions); // 使用了 Admin 特有的属性
+};
+
+const handleUser: UserHandler = handleAdmin;
+// 在严格模式下，这会报错！
+```
+
+直觉上你可能觉得这没问题——AdminHandler 能处理 Admin，Admin 是 User 的子类型，那 AdminHandler 应该能当 UserHandler 用。
+
+但 TypeScript 在严格模式（`--strictFunctionTypes`）下不允许。原因在于**安全性**。
+
+假设 TypeScript 允许这个赋值：
+
+```typescript
+const handleUser: UserHandler = handleAdmin;
+
+// 调用 handleUser 时，传入的是 User，不一定是 Admin
+handleUser({ userId: "usr_a1x9k2m" });
+// 但 handleAdmin 的实现里访问了 admin.permissions
+// 如果传入的 User 没有 permissions 属性——运行时崩溃
+```
+
+看到了吗？`handleAdmin` 的实现假设它收到的是 `Admin`（它访问了 `admin.permissions`），但如果被当作 `UserHandler` 使用，调用方可能传入一个普通的 `User`，没有 `permissions` 属性。这就是类型安全漏洞。
+
+所以 TypeScript 的规则是：**函数参数是逆变的**。`(user: User) => void` 可以赋值给 `(admin: Admin) => void`，反过来不行。
+
+```typescript
+// 正确：处理 User 的函数，可以处理 Admin（因为 Admin 是 User）
+const handleUser: UserHandler = (user) => {
+  console.log(user.userId); // 只用了 User 的属性，Admin 也有
+};
+
+const handleAdmin: AdminHandler = handleUser;
+// 正确：能处理所有 User 的函数，当然能处理 Admin
+```
+
+逆变的意思是：类型关系的方向和赋值方向**相反**。Admin 是 User 的子类型，但 `(user: User) => void` 是 `(admin: Admin) => void` 的子类型。方向反了。
+
+## 函数返回值是协变的
+
+和参数相反，函数的返回值是协变的——方向一致：
+
+```typescript
+type GetUserFn = () => User;
+type GetAdminFn = () => Admin;
+
+const getAdmin: GetAdminFn = () => new Admin();
+const getUser: GetUserFn = getAdmin;
+// 正确：返回 Admin 的函数可以赋值给返回 User 的函数
+```
+
+这很好理解——调用方期望得到一个 User，你给它一个 Admin（Admin 包含 User 的所有属性），完全没问题。
+
+总结一下：
+
+- **函数参数**：逆变（方向相反）
+- **函数返回值**：协变（方向一致）
+- **数组元素**：协变（方向一致）
+
+## 实际开发中什么时候会遇到
+
+协变逆变不是理论游戏，在实际开发中经常遇到。
+
+### 事件监听器
+
+```typescript
+class EventEmitter<Events extends Record<string, any>> {
+  on<K extends keyof Events>(
+    event: K,
+    handler: (data: Events[K]) => void
+  ): void {
+    /* ... */
+  }
+}
+
+type Events = {
+  "user:created": User;
+  "admin:created": Admin;
+};
+
+const emitter = new EventEmitter<Events>();
+
+// 正确：handler 期望 User，传入 Admin 没问题（Admin 是 User 的子类型）
+emitter.on("user:created", (user) => {
+  console.log(user.userId);
+});
+
+// 正确：handler 期望 Admin，传入 User 可能有问题
+// 但 TypeScript 允许，因为事件系统由 emitter 控制——
+// 它只会在 'admin:created' 事件中传入 Admin
+emitter.on("admin:created", (admin) => {
+  console.log(admin.permissions);
+});
+```
+
+### 数组的协变风险
+
+```typescript
+const numbers: number[] = [1, 2, 3];
+const mixed: (string | number)[] = numbers;
+// TS 严格模式下会报错！
+
+// 为什么不允许？
+// 如果允许，你可以这样做：
+mixed.push("hello"); // 混入了一个字符串
+// 但 numbers 引用的是同一个数组，现在 numbers[3] 是 "hello"
+// 后面代码如果对 numbers 做数字操作——运行时出错
+```
+
+TypeScript 的 `--strictFunctionTypes` 默认开启后，数组不再是完全协变的。`number[]` 不能赋值给 `(string | number)[]`，因为这个赋值会导致类型安全漏洞。
+
+## 方差注解：显式控制（TS 5.x）
+
+TypeScript 5.x 引入了方差注解（`in` 和 `out`），让你在类型定义中显式声明参数的方差。这主要用在泛型接口和类型别名中。
+
+```typescript
+// out = 协变（只读，只用于返回值）
+interface ReadonlyBox<out T> {
+  readonly value: T;
+  get(): T;
+}
+
+// in = 逆变（只写，只用于参数）
+interface WriteonlyBox<in T> {
+  set(value: T): void;
+}
+
+// in out = 不变（既读又写）
+interface Box<in out T> {
+  get(): T;
+  set(value: T): void;
+}
+```
+
+`out` 表示这个类型参数只出现在"输出"位置（返回值、readonly 属性），所以是协变的。`in` 表示只出现在"输入"位置（函数参数），所以是逆变的。`in out` 表示既出现在输入也出现在输出位置，所以是不变的（既不是协变也不是逆变）。
+
+### 实际用途
+
+方差注解在库开发中特别有用。它能帮助 TypeScript 更好地推断类型，也能让类型定义的意图更清晰：
+
+```typescript
+// 一个只读的数据提供者——明确标注 out
+interface DataProvider<out T> {
+  getData(): Promise<T>;
+  subscribe(callback: (data: T) => void): () => void;
+}
+
+// 一个只写的日志记录器——明确标注 in
+interface Logger<in T> {
+  log(entry: T): void;
+  setLevel(level: number): void;
+}
+
+// 标注 out 后，DataProvider<User> 可以赋值给 DataProvider<Admin>
+// 因为 Admin 是 User 的子类型，返回 Admin 的地方可以用 User
+// 标注 in 后，Logger<Admin> 可以赋值给 Logger<User>
+// 因为 Admin 是 User 的子类型，接受 Admin 的地方可以接受 User
+```
+
+不加方差注解，TypeScript 会自己推断方差。但显式标注有两个好处：一是让代码意图更清晰（读类型定义的人一眼就知道这个类型是只读的还是只写的），二是避免 TypeScript 推断出你不想要的方差行为。
+
+## 什么时候需要关心协变逆变
+
+**需要关心的场景**：
+
+- 写库的时候——设计泛型接口和函数签名
+- 遇到"类型看着兼容但编译器报错"的时候——大概率是逆变问题
+- 处理回调函数、事件监听器、策略模式的时候——这些场景大量涉及函数类型的赋值
+
+**不需要关心的场景**：
+
+- 日常业务代码中大部分类型操作不会涉及协变逆变
+- 如果你不用严格的函数类型检查（关闭 `--strictFunctionTypes`），大部分问题不会出现
+- 简单的 class 继承和赋值，直觉就是对的，不需要想协变逆变
+
+一个实用的建议：**当你遇到"类型明明兼容但编译器报错"的时候，先检查是不是函数参数的逆变问题**。如果是，把函数参数的类型放宽（从子类型改为父类型）通常就能解决。
+
+协变逆变听起来吓人，但核心规则就一条：**函数参数方向相反，其他方向一致**。记住这一条，90% 的场景都能解释通。

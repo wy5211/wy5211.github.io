@@ -1,0 +1,523 @@
+---
+title: "01. Next.js 快速入门：为什么不用 Create React App 了"
+date: "2026-03-23"
+summary: "从 SPA 的痛点出发，理解 Next.js 的核心价值。搭建第一个 Next.js 项目，体验 App Router、内置 TypeScript 和自动代码分割带来的开发体验提升。"
+tags: ["Next.js", "React", "App Router", "全栈开发", "TypeScript"]
+category: "nextjs"
+cover: ""
+draft: false
+series: "Next.js 渐进式全栈开发"
+seriesOrder: 1
+---
+
+去年我用 Vite + React Router 给自己搭了一个技术博客，写了几十篇文章，部署到 Vercel 上，看起来一切正常。直到有一天我打开 Google Search Console，发现收录量几乎为零 -- 因为搜索引擎爬虫拿到的是一个空白的 HTML 壳子，所有内容都靠 JavaScript 在客户端渲染，爬虫根本看不到。
+
+更让我焦虑的是 Lighthouse 的分数。首屏内容绘制（LCP）要 3.2 秒，移动端更差。用户在弱网环境下打开我的博客，先看到一个空白页面，然后进度条转了两三秒，内容才刷出来。这种体验，放在 2026 年确实说不过去。
+
+这不是我一个人的问题。只要是 React SPA，就会遇到这三件事：首屏白屏、SEO 差、JS bundle 越来越大。这些问题的根源不在于你的代码写得不好，而在于 SPA 的架构本身 -- 浏览器必须先下载完 JavaScript，执行完渲染逻辑，用户才能看到内容。
+
+Next.js 要做的，就是给你一个选择：**在服务端就把 HTML 渲染好，浏览器拿到的就是有内容的页面**。
+
+## SPA 到底慢在哪
+
+让我们用一个真实的场景来对比。假设你的博客首页要展示 20 篇文章列表，每篇文章有标题、摘要、发布日期和标签。
+
+用 Vite + React 搭的 SPA，用户访问时的流程是这样的：
+
+```
+1. 浏览器请求你的域名
+2. 服务器返回 index.html（只有一个 <div id="root"></div>）
+3. 浏览器开始下载 app.xxx.js（假设打包后 180KB，gzip 后约 60KB）
+4. 浏览器加载 React、React Router、你的组件代码
+5. React 执行，挂载组件，触发 useEffect 中的 fetch 请求
+6. 等待 API 返回文章数据
+7. React 重新渲染，用户终于看到文章列表
+```
+
+在 4G 网络下，这个过程大约需要 2.5 到 4 秒。而且这还是正常情况 -- 如果用户的网络不稳定，JS bundle 下载失败，页面就彻底白屏了。
+
+换成 Next.js 之后，同一个页面的流程变成了：
+
+```
+1. 浏览器请求你的域名
+2. 服务器在服务端执行 React 组件，获取文章数据，渲染出完整 HTML
+3. 浏览器收到已经包含文章内容的 HTML（用户在 200-500ms 内就能看到内容）
+4. 浏览器在后台下载 JavaScript（用于交互增强，即 Hydration）
+```
+
+关键区别在于：用户不需要等 JavaScript 下载完就能看到内容。搜索引擎爬虫拿到的 HTML 里直接就有文章标题和摘要，不需要执行任何 JS。
+
+## Next.js 不只是一个框架，是多了一种渲染选择
+
+很多人把 Next.js 理解成"React 的升级版"，这其实不太准确。Next.js 的核心价值不是帮你写 React 更方便，而是让你在**同一个项目里选择不同的渲染策略**。
+
+### 三种渲染模式，各管各的事
+
+**SSR（Server-Side Rendering，服务端渲染）** -- 每次用户请求，服务器都重新跑一遍 React 组件，拿到最新数据，返回完整的 HTML。
+
+适合的场景：数据经常变化、需要实时性的页面。比如博客后台的文章管理列表，每次打开都应该显示最新的数据。
+
+```typescript
+// src/app/admin/posts/page.tsx
+// 默认就是 SSR -- 每次请求都在服务端执行
+async function AdminPostsPage() {
+  // 直接在组件里查数据库，不需要写 API 再 fetch
+  const posts = await db.post.findMany({
+    orderBy: { updatedAt: "desc" },
+    take: 50,
+  });
+
+  return (
+    <table>
+      <thead>
+        <tr>
+          <th>标题</th>
+          <th>状态</th>
+          <th>最后更新</th>
+        </tr>
+      </thead>
+      <tbody>
+        {posts.map((post) => (
+          <tr key={post.id}>
+            <td>{post.title}</td>
+            <td>{post.status}</td>
+            <td>{post.updatedAt.toLocaleDateString("zh-CN")}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+export default AdminPostsPage;
+```
+
+注意这里没有 `useEffect`、没有 `useState`、没有 `fetch`。组件本身就是一个 `async` 函数，直接访问数据库，渲染完 HTML 后返回给浏览器。
+
+**SSG（Static Site Generation，静态站点生成）** -- 构建项目的时候就生成好 HTML 文件，部署到 CDN 上，用户请求直接返回静态文件，速度极快。
+
+适合的场景：内容不经常变化的页面。比如博客文章详情页，发布之后很少修改。
+
+```typescript
+// src/app/blog/[slug]/page.tsx
+// revalidate 设为 false 或一个很大的数字，页面在构建时生成
+export const revalidate = false;
+
+async function BlogPostPage({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
+  // 这个查询只在构建时执行一次，之后直接返回缓存的 HTML
+  const post = await db.post.findUnique({ where: { slug } });
+
+  if (!post) {
+    return <div>文章不存在</div>;
+  }
+
+  return (
+    <article>
+      <h1>{post.title}</h1>
+      <time>{post.publishedAt.toLocaleDateString("zh-CN")}</time>
+      {/* 渲染 Markdown 内容 */}
+      <div dangerouslySetInnerHTML={{ __html: post.contentHtml }} />
+    </article>
+  );
+}
+
+export default BlogPostPage;
+```
+
+**CSR（Client-Side Rendering，客户端渲染）** -- 和传统 SPA 一样，HTML 是空的，靠 JavaScript 在浏览器端渲染内容。Next.js 里通过标记 `"use client"` 来使用。
+
+适合的场景：高度交互的页面，比如后台管理的数据表格（带排序、筛选、分页），或者实时聊天界面。这类页面的内容取决于用户的操作，服务端提前渲染意义不大。
+
+```typescript
+// src/app/admin/analytics/page.tsx
+"use client"; // 标记为客户端组件
+
+import { useState, useEffect } from "react";
+
+function AnalyticsDashboard() {
+  const [dateRange, setDateRange] = useState("7d");
+  const [stats, setStats] = useState(null);
+
+  // 用户切换时间范围后重新请求数据
+  useEffect(() => {
+    fetch(`/api/analytics?range=${dateRange}`)
+      .then((res) => res.json())
+      .then(setStats);
+  }, [dateRange]);
+
+  return (
+    <div>
+      <select value={dateRange} onChange={(e) => setDateRange(e.target.value)}>
+        <option value="7d">最近 7 天</option>
+        <option value="30d">最近 30 天</option>
+        <option value="90d">最近 90 天</option>
+      </select>
+      {/* 渲染图表 */}
+    </div>
+  );
+}
+
+export default AnalyticsDashboard;
+```
+
+这三种模式不是互斥的。一个 Next.js 项目里可以同时用 SSR（首页文章列表）、SSG（文章详情页）和 CSR（后台数据面板），根据每个页面的特点选择最合适的策略。这就是 Next.js 和纯 SPA 最大的区别 -- SPA 只能用 CSR，而 Next.js 让你自由选择。
+
+## 动手：把博客从 Vite 迁移到 Next.js
+
+光说概念不直观，我们来做一个真实的迁移。假设你的博客目前是用 Vite + React Router 搭的，项目结构大概长这样：
+
+```
+my-blog/
+├── src/
+│   ├── App.tsx              # 路由配置
+│   ├── pages/
+│   │   ├── Home.tsx         # 首页
+│   │   ├── BlogList.tsx     # 文章列表
+│   │   └── BlogPost.tsx     # 文章详情
+│   └── components/
+│       ├── Navbar.tsx
+│       └── Footer.tsx
+├── public/
+└── package.json
+```
+
+我们要把它迁移到 Next.js，体验一下整个流程。
+
+### 创建 Next.js 项目
+
+```bash
+# 用 pnpm 创建（推荐，速度快）
+pnpm create next-app@latest my-nextjs-blog --ts --tailwind --app --src-dir
+```
+
+这里有几个选项值得解释：
+
+- `--ts`：启用 TypeScript。Next.js 原生支持 TypeScript，不需要自己配置 ts-loader 或 Babel 插件，开箱即用。
+- `--tailwind`：启用 Tailwind CSS。Next.js 的模板和 Tailwind 配合得很好，class 的自动补全和 purge 都不需要额外配置。
+- `--app`：使用 App Router（基于 React Server Components 的路由系统），而不是旧的 Pages Router。
+- `--src-dir`：把代码放在 `src/` 目录下，保持项目根目录的整洁。
+
+创建完成后，项目结构变成了：
+
+```
+my-nextjs-blog/
+├── src/
+│   └── app/
+│       ├── layout.tsx      # 根布局（相当于之前的 App.tsx + Navbar + Footer）
+│       ├── page.tsx        # 首页（对应 / 路由）
+│       ├── globals.css     # 全局样式
+│       └── favicon.ico
+├── public/                 # 静态资源（和之前一样）
+├── next.config.ts          # Next.js 配置文件
+├── tailwind.config.ts      # Tailwind 配置
+├── tsconfig.json           # TypeScript 配置
+└── package.json
+```
+
+注意 `src/app/` 目录 -- 这是 App Router 的核心约定。**文件夹结构就是路由结构**，不需要像 React Router 那样写 `Route` 组件和 `path` 配置。
+
+### 迁移首页：从 useEffect 到 async 组件
+
+在 Vite 版本里，首页的文章列表是这样获取的：
+
+```typescript
+// Vite 版本：src/pages/Home.tsx
+function Home() {
+  const [posts, setPosts] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    // 组件挂载后发起请求，用户先看到 loading 状态
+    fetch("/api/posts")
+      .then((res) => res.json())
+      .then((data) => {
+        setPosts(data);
+        setLoading(false);
+      });
+  }, []);
+
+  if (loading) return <div>加载中...</div>;
+
+  return (
+    <div>
+      {posts.map((post) => (
+        <article key={post.id}>
+          <h2>{post.title}</h2>
+          <p>{post.excerpt}</p>
+          <time>{post.date}</time>
+        </article>
+      ))}
+    </div>
+  );
+}
+```
+
+这个组件在客户端运行：先渲染一个 loading 状态，然后 fetch 数据，拿到数据后再重新渲染。用户看到的是一个从空白到内容的跳变过程。
+
+迁移到 Next.js 后，同样的功能变成这样：
+
+```typescript
+// Next.js 版本：src/app/page.tsx
+// 默认就是 Server Component，不需要任何标记
+async function HomePage() {
+  // 直接在组件中查询数据库，不需要写 API
+  const posts = await db.post.findMany({
+    orderBy: { publishedAt: "desc" },
+    select: {
+      slug: true,
+      title: true,
+      excerpt: true,
+      publishedAt: true,
+      tags: true,
+    },
+    take: 20,
+  });
+
+  return (
+    <main className="max-w-4xl mx-auto px-4 py-12">
+      <section className="mb-16">
+        <h1 className="text-4xl font-bold tracking-tight mb-4">
+          技术笔记
+        </h1>
+        <p className="text-lg text-gray-600">
+          记录前端开发和软件工程中的思考与实践
+        </p>
+      </section>
+
+      <section>
+        <h2 className="text-2xl font-semibold mb-8">最新文章</h2>
+        <div className="space-y-8">
+          {posts.map((post) => (
+            <article key={post.slug} className="group">
+              <a href={`/blog/${post.slug}`} className="block">
+                <h3 className="text-xl font-medium group-hover:text-blue-600 transition-colors">
+                  {post.title}
+                </h3>
+                <p className="mt-2 text-gray-600 line-clamp-2">
+                  {post.excerpt}
+                </p>
+                <div className="mt-3 flex items-center gap-3 text-sm text-gray-500">
+                  <time>{post.publishedAt.toLocaleDateString("zh-CN")}</time>
+                  <div className="flex gap-2">
+                    {post.tags.map((tag) => (
+                      <span
+                        key={tag}
+                        className="px-2 py-0.5 bg-gray-100 rounded text-xs"
+                      >
+                        {tag}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              </a>
+            </article>
+          ))}
+        </div>
+      </section>
+    </main>
+  );
+}
+
+export default HomePage;
+```
+
+对比一下两个版本的区别：
+
+1. 没有 `useState` 和 `useEffect` -- 因为数据在服务端就拿到了，组件只需要负责渲染。
+2. 没有 loading 状态 -- 用户拿到的 HTML 里已经有内容了，不存在"先空白后填充"的过程。
+3. 没有写 API -- 直接查数据库，少了一层网络调用的开销。
+4. 搜索引擎能直接抓到文章标题和摘要 -- 因为它们已经在 HTML 里了。
+
+### 根布局：替代 App.tsx 的角色
+
+在 Vite 版本里，导航栏和页脚通常写在 `App.tsx` 里，作为所有页面的公共外壳。Next.js 用 `layout.tsx` 做这件事，但它有一个重要的区别：**布局在路由切换时不会重新渲染**。
+
+```typescript
+// src/app/layout.tsx
+import type { Metadata } from "next";
+import Link from "next/link";
+
+// Metadata 用于生成 <title>、<meta> 等标签，对 SEO 至关重要
+export const metadata: Metadata = {
+  title: {
+    default: "技术笔记 | 个人博客",
+    template: "%s | 技术笔记",
+  },
+  description: "记录前端开发和软件工程中的思考与实践",
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="zh-CN">
+      <body className="min-h-screen bg-white text-gray-900 antialiased">
+        {/* 导航栏 -- 所有页面共享，切换路由时不会重新挂载 */}
+        <nav className="border-b border-gray-200">
+          <div className="max-w-4xl mx-auto px-4 h-16 flex items-center">
+            <Link href="/" className="font-semibold text-lg">
+              技术笔记
+            </Link>
+            <div className="ml-8 flex gap-6 text-sm">
+              <Link
+                href="/blog"
+                className="text-gray-600 hover:text-gray-900 transition-colors"
+              >
+                文章
+              </Link>
+              <Link
+                href="/about"
+                className="text-gray-600 hover:text-gray-900 transition-colors"
+              >
+                关于
+              </Link>
+            </div>
+          </div>
+        </nav>
+
+        {/* 页面内容 -- 每个路由的 page.tsx 会渲染在这里 */}
+        {children}
+
+        {/* 页脚 */}
+        <footer className="border-t border-gray-200 mt-20">
+          <div className="max-w-4xl mx-auto px-4 py-8 text-sm text-gray-500">
+            <p>&copy; {new Date().getFullYear()} 技术笔记. 使用 Next.js 构建.</p>
+          </div>
+        </footer>
+      </body>
+    </html>
+  );
+}
+```
+
+几个要点：
+
+- `metadata` 导出会被 Next.js 自动提取，生成 `<head>` 中的标签。不需要手动写 `<title>` 或 `<meta name="description">`。
+- 使用 `next/link` 的 `Link` 组件替代 `<a>` 标签。它会在客户端做路由切换（不会触发整页刷新），同时保持 SEO 友好。
+- `children` 是当前路由对应的页面组件。当用户从 `/` 导航到 `/blog` 时，只有 `children` 部分会变化，导航栏和页脚保持不动。
+
+### 加载状态：loading.tsx 的魔法
+
+你可能注意到，首页的 `async` 组件在获取数据时虽然没有白屏，但如果数据库查询很慢，用户也会感觉卡顿。Next.js 提供了 `loading.tsx` 来处理这种情况。
+
+```typescript
+// src/app/blog/loading.tsx
+// 当 /blog 页面的数据还在加载时，自动展示这个组件
+export default function BlogLoading() {
+  return (
+    <main className="max-w-4xl mx-auto px-4 py-12">
+      <h2 className="text-2xl font-semibold mb-8">最新文章</h2>
+      <div className="space-y-8">
+        {/* 骨架屏 -- 给用户一个"内容即将出现"的预期 */}
+        {Array.from({ length: 6 }).map((_, i) => (
+          <div key={i} className="animate-pulse">
+            <div className="h-6 bg-gray-200 rounded w-3/4 mb-2" />
+            <div className="h-4 bg-gray-200 rounded w-full mb-1" />
+            <div className="h-4 bg-gray-200 rounded w-2/3" />
+          </div>
+        ))}
+      </div>
+    </main>
+  );
+}
+```
+
+`loading.tsx` 放在路由目录下，Next.js 会在数据加载期间自动展示它。它配合 React Suspense 工作，你不需要手动管理 loading 状态。而且它是 **Instant Loading States** -- 当用户从其他页面导航过来时，loading 界面会立刻显示（因为已经预加载了），不会有一帧的空白。
+
+### 错误处理：error.tsx
+
+当页面渲染出错时，`error.tsx` 会接管。这里有一个重要的约定：**error.tsx 必须是客户端组件**，因为它需要处理用户交互（比如点击"重试"按钮）。
+
+```typescript
+// src/app/blog/error.tsx
+"use client"; // 错误边界必须是客户端组件
+
+export default function BlogError({
+  error,
+  reset,
+}: {
+  error: Error & { digest?: string };
+  reset: () => void;
+}) {
+  return (
+    <main className="max-w-4xl mx-auto px-4 py-12 text-center">
+      <h2 className="text-xl font-semibold mb-2">
+        加载文章时出了点问题
+      </h2>
+      <p className="text-gray-600 mb-6">
+        {error.message || "请稍后再试，或者刷新页面重试。"}
+      </p>
+      <button
+        onClick={reset}
+        className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+      >
+        重试
+      </button>
+    </main>
+  );
+}
+```
+
+`reset` 函数会重新触发该路由的数据获取和渲染。注意错误边界只会捕获渲染阶段的错误，不会捕获事件处理器或 useEffect 中的错误。
+
+## 目录约定速览
+
+到这里你应该已经感受到了 App Router 的核心思路：**用文件名来定义特殊行为**。不需要配置文件或装饰器，把文件放在正确的位置，Next.js 就知道该怎么处理。
+
+```
+src/app/
+├── layout.tsx       # 根布局，包裹所有页面
+├── page.tsx         # 首页，对应 /
+├── loading.tsx      # 全局加载状态（当子路由正在加载时显示）
+├── error.tsx        # 全局错误处理
+├── not-found.tsx    # 404 页面
+├── globals.css      # 全局样式
+│
+├── blog/
+│   ├── page.tsx     # /blog 文章列表
+│   ├── layout.tsx   # 博客专用布局（可以加侧边栏等）
+│   ├── loading.tsx  # /blog 的加载状态
+│   ├── error.tsx    # /blog 的错误处理
+│   └── [slug]/
+│       └── page.tsx # /blog/hello-world 动态路由
+│
+└── about/
+    └── page.tsx     # /about 关于页面
+```
+
+每个 `page.tsx` 都导出一个组件作为该路由的页面内容。`layout.tsx` 定义该目录下所有页面的公共外壳。`loading.tsx` 和 `error.tsx` 则是 Next.js 内置的 UI 状态管理。这套约定的好处是，你不需要在一个巨大的配置文件里维护所有路由 -- 路由的组织方式和文件系统的组织方式天然一致。
+
+## 开发体验：不只是渲染方式的改变
+
+从 Vite 迁移到 Next.js，除了渲染模式的改变，开发体验上也有几个明显的提升。
+
+**热更新（HMR）更快更准**。Vite 的 HMR 已经很快了，但 Next.js 的 Fast Refresh 做得更好 -- 编辑一个组件时，只有那个组件会更新，状态不会丢失。你在写表单时改了样式，输入框里的内容还在。
+
+**自动代码分割**。在 Vite 项目里，如果你引入了一个 50KB 的日期处理库但只用了一个函数，整个库都会打包进主 bundle。Next.js 默认按路由做代码分割，每个页面只加载自己需要的代码。引入 `dayjs` 的页面只会加载 `dayjs`，其他页面不受影响。你也不需要手动配置 `React.lazy` 或 `dynamic import`。
+
+**内置 TypeScript 支持**。不需要 `vite-tsconfig-paths` 或 `@types/react` 之类的配置。`create-next-app` 生成项目时就把 TypeScript 环境配好了，包括路径别名 `@/`（指向 `src/`），直接用就行。
+
+**内置图片优化**。Next.js 的 `Image` 组件会自动做图片懒加载、格式转换（WebP/AVIF）、响应式尺寸适配。在 Vite 里这些需要自己装插件配置。
+
+## 什么时候不该用 Next.js
+
+说了这么多好处，也得聊聊不适合的场景。
+
+**纯后台管理系统**。如果你的应用只有登录后的内部页面，没有 SEO 需求，用户群体固定（比如公司内部系统），那 Next.js 的 SSR/SSG 能力基本用不上。这种场景下 Vite + React Router 就够了，反而更轻量。
+
+**移动端优先的应用**。如果你的产品核心是 React Native 或者 Capacitor 打包的 App，Web 端只是个管理后台，没必要引入 Next.js 的复杂度。
+
+**团队完全没有服务端经验**。Next.js 虽然降低了全栈开发的门槛，但 Server Components、数据获取、缓存策略这些概念本身就需要理解。如果你的团队全是纯前端背景，且短期内没有后端需求，先从 SPA 起步可能更实际。
+
+简单来说，Next.js 解决的核心问题是**内容在服务端渲染带来的 SEO 和性能收益**。如果你的项目不需要这些，用 Next.js 就是增加了不必要的复杂度。反过来，如果你的项目有公开页面（博客、文档、电商、营销落地页），Next.js 几乎总是比纯 SPA 更好的选择。
+
+## 值不值得迁移
+
+回到开头的问题 -- 我那个技术博客到底该不该从 Vite 迁移到 Next.js？
+
+如果你也遇到了类似的困扰（SEO 收录差、首屏白屏、Lighthouse 分数低），迁移到 Next.js 是一个合理的决定。但迁移不是零成本的：你需要重新组织路由结构、把 `useEffect` 里的数据获取改成 async 组件、处理 Server Components 和 Client Components 的边界。对于已有大量页面的项目，这个迁移可能是几周的工作量。
+
+好消息是，Next.js 的 App Router 学习曲线不算陡。如果你已经熟悉 React，花一个周末读完本系列的前三篇，就能掌握核心概念。接下来的文章我们会逐步深入：下一篇会详细讲解 App Router 的路由系统 -- 动态路由、路由组、并行路由这些更强大的组织方式，帮你把复杂的页面结构管理得井井有条。

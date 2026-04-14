@@ -1,0 +1,289 @@
+---
+title: "08. 装饰器与元数据：运行时的类型信息"
+date: "2026-04-12"
+summary: "TypeScript 的类型编译后就没了。但 API 客户端需要在运行时知道字段类型来做序列化。装饰器和 reflect-metadata 能桥接编译期类型和运行时行为。"
+tags: ["TypeScript"]
+category: "typescript"
+cover: ""
+draft: false
+series: "TypeScript 类型系统进阶"
+seriesOrder: 8
+---
+
+前面七篇文章，我们一直在做"编译期"的事情——用条件类型、模板字面量、映射类型在类型层面做变换。这些类型信息有一个根本的限制：**编译后全部消失**。
+
+这通常不是问题。类型检查是编译期的保障，运行时你不需要它们。但有一个场景绕不过去：你的 API 客户端需要在运行时把对象序列化成 JSON 发给后端。后端要求日期字段传 ISO 字符串、金额字段传分（而不是元）、枚举字段传数字而不是字符串。这些序列化规则，编译期的类型系统帮不了你。
+
+你需要一种机制：在编译期标注"这个字段是日期，序列化时转成 ISO 字符串"，然后在运行时读取这些标注并执行转换。装饰器和元数据就是做这件事的。
+
+## 类型擦除：问题的根源
+
+先搞清楚"类型擦除"到底是什么。
+
+```typescript
+class UserDTO {
+  userId: string;
+  createdAt: Date;
+  balance: number;
+}
+```
+
+编译成 JavaScript 后：
+
+```javascript
+class UserDTO {}
+```
+
+所有类型信息都没了。`userId` 是 string、`createdAt` 是 Date、`balance` 是 number——这些信息在运行时完全不存在。你拿不到一个类的属性列表，更拿不到每个属性的类型。
+
+这是 TypeScript 的设计哲学：类型是编译期的注解，不应该影响运行时行为。好处是编译产物干净、没有运行时开销。坏处是，当你确实需要在运行时知道类型信息时，得另想办法。
+
+装饰器就是那个"另想办法"。
+
+## 装饰器基础
+
+装饰器是一种特殊的函数，可以在类、方法、属性、参数的定义时"附加"额外的行为。TypeScript 5.0 引入了新的装饰器语法（TC39 Stage 3 标准），和旧版装饰器（experimental）有一些区别。本文使用新版语法。
+
+### 类装饰器
+
+类装饰器接收类构造函数，可以修改或替换类：
+
+```typescript
+function sealed(target: Function) {
+  Object.seal(target);
+  Object.seal(target.prototype);
+}
+
+@sealed
+class UserDTO {
+  userId: string;
+  createdAt: Date;
+}
+```
+
+`@sealed` 看起来像注解，实际上是一个函数调用——`sealed(UserDTO)` 在类定义时执行。
+
+### 属性装饰器（TS 5.0 新语法）
+
+新版属性装饰器接收两个参数：类的原型（或静态成员的类本身）和属性名。它返回一个函数，这个函数可以在属性被赋值时拦截和修改值。
+
+```typescript
+function serializable(format: "iso" | "cents") {
+  // 装饰器工厂：接收参数，返回装饰器
+  return function (target: any, context: ClassFieldDecoratorContext) {
+    return function (initialValue: any) {
+      // 这个函数在属性初始化时执行
+      // 可以修改初始值
+      if (format === "iso" && initialValue instanceof Date) {
+        return initialValue.toISOString();
+      }
+      if (format === "cents") {
+        return Math.round(initialValue * 100);
+      }
+      return initialValue;
+    };
+  };
+}
+```
+
+注意：新版装饰器（TS 5.0+）的属性装饰器**返回一个函数**，这个函数在属性初始化时被调用。旧版装饰器的属性装饰器**不返回值**，而是通过 `Object.defineProperty` 修改属性描述符。
+
+### 方法装饰器
+
+方法装饰器可以拦截方法的调用：
+
+```typescript
+function log(target: any, context: ClassMethodDecoratorContext) {
+  const name = String(context.name);
+  return function (...args: any[]) {
+    console.log(`Calling ${name} with`, args);
+    const result = target.apply(this, args);
+    console.log(`${name} returned`, result);
+    return result;
+  };
+}
+
+class UserService {
+  @log
+  findById(id: string) {
+    return { userId: id, username: "zhang_wei" };
+  }
+}
+```
+
+## reflect-metadata：存储和读取元数据
+
+光有装饰器还不够。装饰器能在运行时执行代码，但你还需要一个地方**存储元数据**——"这个字段需要序列化为 ISO 格式"、"这个字段是必填的"。
+
+`reflect-metadata` 库提供了这个能力。它给对象附加键值对形式的元数据，可以按"元数据键"读取。
+
+```bash
+npm install reflect-metadata
+```
+
+```typescript
+import "reflect-metadata";
+
+// 定义元数据键
+const SERIALIZATION_KEY = Symbol("serialization");
+
+// 在装饰器中存储元数据
+function serializeAs(format: "iso" | "cents" | "number") {
+  return function (_target: any, context: ClassFieldDecoratorContext) {
+    // 在这个属性上存储元数据
+    Reflect.defineMetadata(SERIALIZATION_KEY, { format }, context, 0);
+  };
+}
+
+// 在运行时读取元数据
+class UserDTO {
+  @serializeAs("iso")
+  createdAt: Date = new Date();
+
+  @serializeAs("cents")
+  balance: number = 0;
+
+  @serializeAs("number")
+  age: number = 25;
+}
+
+// 读取 createdAt 的序列化规则
+const meta = Reflect.getMetadata(
+  SERIALIZATION_KEY,
+  UserDTO.prototype,
+  "createdAt"
+);
+// { format: 'iso' }
+```
+
+有了这个机制，你可以实现一个通用的序列化函数：遍历对象的所有属性，读取每个属性的序列化规则，按规则转换值。
+
+## 实战：API 客户端的序列化层
+
+把装饰器和 reflect-metadata 组合起来，为 API 客户端实现一个声明式的序列化层。
+
+```typescript
+import "reflect-metadata";
+
+const SERIALIZATION_KEY = Symbol("serialization");
+
+interface SerializationRule {
+  format: "iso" | "cents" | "enum";
+  enumMap?: Record<string, number>;
+}
+
+// 装饰器：声明字段的序列化规则
+function serializeAs(rule: SerializationRule) {
+  return function (_target: any, context: ClassFieldDecoratorContext) {
+    Reflect.defineMetadata(SERIALIZATION_KEY, rule, context, 0);
+  };
+}
+
+// 通用序列化函数：根据元数据自动转换
+function serialize<T>(dto: T): Record<string, any> {
+  const result: Record<string, any> = {};
+
+  for (const key of Object.keys(dto)) {
+    const value = (dto as any)[key];
+    const rule = Reflect.getMetadata(
+      SERIALIZATION_KEY,
+      dto.constructor.prototype,
+      key
+    ) as SerializationRule | undefined;
+
+    if (rule) {
+      switch (rule.format) {
+        case "iso":
+          result[key] = value instanceof Date ? value.toISOString() : value;
+          break;
+        case "cents":
+          result[key] = Math.round(value * 100);
+          break;
+        case "enum":
+          result[key] = rule.enumMap?.[value] ?? value;
+          break;
+      }
+    } else {
+      result[key] = value;
+    }
+  }
+
+  return result;
+}
+```
+
+使用的时候：
+
+```typescript
+class CreateUserDTO {
+  username: string;
+  email: string;
+
+  @serializeAs({ format: "cents" })
+  balance: number = 0;
+
+  @serializeAs({ format: "iso" })
+  trialEndsAt: Date = new Date();
+
+  @serializeAs({ format: "enum", enumMap: { free: 0, pro: 1, enterprise: 2 } })
+  plan: string = "free";
+}
+
+const dto = new CreateUserDTO();
+dto.username = "zhang_wei";
+dto.email = "zw@example.com";
+dto.balance = 29.99;
+dto.trialEndsAt = new Date("2026-06-01");
+dto.plan = "pro";
+
+const payload = serialize(dto);
+// {
+//   username: 'zhang_wei',
+//   email: 'zw@example.com',
+//   balance: 2999,              // 元 → 分
+//   trialEndsAt: '2026-06-01T...', // Date → ISO 字符串
+//   plan: 1                     // 字符串枚举 → 数字
+// }
+```
+
+这个方案的好处是：序列化规则声明在字段上，一目了然。新增字段时只需要加装饰器，不需要修改序列化函数。字段的类型信息和序列化规则在同一个地方维护，不容易遗漏。
+
+## 装饰器 vs 其他方案
+
+装饰器不是实现运行时类型信息的唯一方案。Zod、class-validator 等库用"Schema 定义"的方式实现了类似的功能。
+
+```typescript
+// Zod 方案：用 Schema 定义验证规则
+const UserSchema = z.object({
+  username: z.string().min(1),
+  email: z.string().email(),
+  balance: z.number().transform((v) => Math.round(v * 100)),
+});
+
+// 类型从 Schema 自动推断
+type UserDTO = z.infer<typeof UserSchema>;
+```
+
+Zod 的优势在于：Schema 本身就是验证器，既能做类型推断又能做运行时验证，不需要装饰器和 reflect-metadata。劣势在于：Schema 和类定义是分离的，你需要维护两份定义（除非用 zod-class-validator 这类桥接库）。
+
+装饰器方案的优势在于：规则直接标注在字段上，和代码结构一致。劣势在于：需要额外的 reflect-metadata 依赖，TS 5.0 新装饰器语法还比较新，生态支持不如 Zod 成熟。
+
+一个实用的选择策略：**如果项目已经在用 class-based 的风格（NestJS、TypeORM），装饰器方案更自然。如果项目是函数式风格，Zod 更合适**。
+
+## 什么时候需要装饰器和元数据
+
+不是所有项目都需要。如果你的 API 客户端只是简单地 `JSON.stringify` 发送请求，后端能处理各种类型——那不需要序列化层，也不需要装饰器。
+
+需要装饰器和元数据的场景：
+
+- 后端有特殊的序列化要求（日期格式、金额单位、枚举映射）
+- 需要在运行时读取"字段级别的配置"（验证规则、序列化规则、权限标记）
+- 使用了 class-based 的框架（NestJS、TypeORM），装饰器是框架的标准模式
+
+不需要的场景：
+
+- 前后端类型完全一致，直接 JSON.stringify 就行
+- 项目是函数式风格，不使用 class
+- 序列化逻辑很简单，几行代码就能搞定
+
+装饰器和元数据是一把重型武器。用对了能让代码很优雅，用错了会引入不必要的复杂度。在决定用之前，先问自己：我真的需要在运行时知道类型信息吗？

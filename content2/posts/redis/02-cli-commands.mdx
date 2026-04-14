@@ -1,0 +1,513 @@
+---
+title: "02. Redis 命令行操作：键管理与数据查询"
+date: "2026-03-23"
+summary: "深入掌握 redis-cli 的使用方法，学习键操作、过期时间管理，以及如何安全地查询和管理 Redis 数据。"
+tags: ["Redis", "命令行", "CLI"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 2
+---
+
+## 为什么要掌握命令行操作
+
+上一篇文章我们学会了基本的 SET/GET 操作，但在实际工作中，你需要的不止这些。比如：怎么查看 Redis 里存了哪些键？怎么按模式搜索键？键什么时候会过期？怎么批量删除键？
+
+这些问题都需要用到 Redis 的命令行工具 redis-cli。虽然你平时可能用图形化工具（比如 Redis Insight）更方便，但命令行工具在某些场景下是不可替代的：服务器上没有图形界面、需要自动化脚本、性能排查时需要实时监控。
+
+更重要的是，理解命令行操作会让你对 Redis 的工作机制有更深的认识。
+
+## 连接 Redis
+
+先回顾一下怎么连接 Redis：
+
+```bash
+# 连接本地 Redis
+redis-cli
+
+# 连接远程 Redis
+redis-cli -h 192.168.1.100 -p 6379
+
+# 连接带密码的 Redis
+redis-cli -a your_password
+
+# 连接后测试
+redis-cli ping
+# 返回 PONG
+```
+
+连接成功后，你会看到提示符 `127.0.0.1:6379>`，后面就可以输入命令了。
+
+## 键操作基础
+
+### 查看所有键
+
+最基本的需求是查看 Redis 里有哪些键：
+
+```bash
+# 查看所有键（谨慎使用，会阻塞）
+KEYS *
+
+# 查看匹配的键
+KEYS livestream:*
+
+# 查看以 room 开头的键
+KEYS livestream:room:*
+```
+
+但是要注意，`KEYS` 命令会遍历所有键，如果键很多（比如几百万个），会阻塞 Redis，导致其他请求等待。生产环境千万不要用 `KEYS *`。
+
+那应该用什么？答案是 `SCAN`。
+
+### 安全地遍历键
+
+`SCAN` 命令不会一次性返回所有键，而是分批返回：
+
+```bash
+# SCAN cursor MATCH pattern COUNT count
+SCAN 0 MATCH livestream:* COUNT 100
+
+# 返回：
+# 1) "5"      # 下一个游标
+# 2) 1) "livestream:room:abc123"
+#    2) "livestream:room:def456"
+```
+
+当游标返回 "0" 时，表示遍历完成。
+
+```bash
+# 继续遍历
+SCAN 5 MATCH livestream:* COUNT 100
+```
+
+这个过程就像翻书，一次翻几页，而不是一次性把整本书看完。
+
+### 检查键是否存在
+
+```bash
+# 检查键是否存在
+EXISTS livestream:room:abc123
+# 返回 (integer) 1 表示存在，0 表示不存在
+
+# 检查多个键
+EXISTS key1 key2 key3
+# 返回存在的键的数量
+```
+
+### 查看键的类型
+
+```bash
+# 查看键的类型
+TYPE livestream:room:abc123
+# 返回 string, hash, list, set, zset 等
+
+# 为什么需要知道类型？
+# 因为不同类型的操作命令不同
+```
+
+### 删除键
+
+```bash
+# 删除单个键
+DEL livestream:room:abc123
+
+# 删除多个键
+DEL key1 key2 key3
+
+# 返回删除的键的数量
+```
+
+### 重命名键
+
+```bash
+# 重命名键
+RENAME old_key new_key
+
+# 仅当新键不存在时重命名
+RENAMENX old_key new_key
+```
+
+## 过期时间管理
+
+### 为什么需要过期时间
+
+Redis 是内存数据库，内存是有限的。如果不设置过期时间，无用数据会一直占用内存，最终导致内存溢出。
+
+另一个问题是数据一致性。如果你用 Redis 缓存数据库的数据，当数据库更新后，Redis 的缓存就过期了。如果缓存不过期，用户就会读到旧数据。
+
+### 设置过期时间
+
+```bash
+# 设置键值时指定过期时间（秒）
+SETEX livestream:room:abc123 3600 "room_data"
+
+# 或者用 SET 命令的扩展语法
+SET livestream:room:abc123 "room_data" EX 3600
+
+# 对已存在的键设置过期时间
+EXPIRE livestream:room:abc123 3600
+
+# 在指定时间戳过期
+EXPIREAT livestream:room:abc123 1672534800
+```
+
+### 查看过期时间
+
+```bash
+# 查看剩余过期时间（秒）
+TTL livestream:room:abc123
+# 返回：
+# 正数：剩余秒数
+# -1：永不过期
+# -2：键不存在
+
+# 查看剩余过期时间（毫秒）
+PTTL livestream:room:abc123
+```
+
+### 取消过期时间
+
+```bash
+# 让键永不过期
+PERSIST livestream:room:abc123
+```
+
+## 实际案例：直播间数据管理
+
+让我们用直播平台的场景来练习这些命令。
+
+### 清理过期 Session
+
+```bash
+# 查看过期时间小于 60 秒的 Session
+# 这个操作需要用脚本或程序实现
+```
+
+在 Node.js 中：
+
+```typescript
+async function cleanExpiringSessions() {
+  const cursor = "0";
+  const expiringSoon = [];
+
+  do {
+    const [nextCursor, keys] = await redis.scan(
+      cursor,
+      "MATCH",
+      "session:*",
+      "COUNT",
+      100
+    );
+
+    for (const key of keys) {
+      const ttl = await redis.ttl(key);
+      if (ttl > 0 && ttl < 60) {
+        expiringSoon.push(key);
+      }
+    }
+
+    cursor = nextCursor;
+  } while (cursor !== "0");
+
+  console.log("即将过期的 Session:", expiringSoon);
+  return expiringSoon;
+}
+```
+
+### 批量删除直播间缓存
+
+```bash
+# 危险操作：用 KEYS + DEL
+redis-cli KEYS "livestream:room:*" | xargs redis-cli DEL
+
+# 安全操作：用 SCAN + DEL（需要脚本）
+```
+
+Node.js 实现：
+
+```typescript
+async function deleteRoomPattern(pattern: string) {
+  let cursor = "0";
+  let deleted = 0;
+
+  do {
+    const [nextCursor, keys] = await redis.scan(
+      cursor,
+      "MATCH",
+      pattern,
+      "COUNT",
+      100
+    );
+
+    if (keys.length > 0) {
+      deleted += await redis.del(...keys);
+    }
+
+    cursor = nextCursor;
+  } while (cursor !== "0");
+
+  console.log(`删除了 ${deleted} 个键`);
+  return deleted;
+}
+
+// 使用
+await deleteRoomPattern("livestream:room:*");
+```
+
+### 监控直播间数据量
+
+```bash
+# 查看当前数据库的键数量
+DBSIZE
+
+# 查看匹配模式的键数量（不精确，因为 SCAN 是基于游标的）
+SCAN 0 MATCH "livestream:*" COUNT 1000
+```
+
+## 服务器信息查询
+
+### INFO 命令
+
+`INFO` 命令可以查看 Redis 服务器的各种信息：
+
+```bash
+# 查看所有信息
+INFO
+
+# 查看特定部分
+INFO server    # 服务器信息
+INFO memory    # 内存信息
+INFO stats     # 统计信息
+INFO persistence # 持久化信息
+```
+
+常用信息：
+
+```bash
+# 查看内存使用
+redis-cli INFO memory | grep used_memory_human
+# used_memory_human:256.00M
+
+# 查看连接的客户端数
+redis-cli INFO clients | grep connected_clients
+# connected_clients:10
+
+# 查看每秒执行命令数
+redis-cli INFO stats | grep instantaneous_ops_per_sec
+# instantaneous_ops_per_sec:120
+```
+
+### 实时监控
+
+```bash
+# 实时显示 Redis 状态
+redis-cli --stat
+
+# 输出类似：
+# ------- data ------ --------------------- load -------------------- - child -
+# keys       mem      clients blocked requests            connections
+# 100000     256.00M  2       0       120 ( ops/s)          1000
+```
+
+### 慢查询
+
+```bash
+# 获取慢查询（最近 10 条）
+SLOWLOG GET 10
+
+# 获取慢查询数量
+SLOWLOG LEN
+
+# 清空慢查询日志
+SLOWLOG RESET
+```
+
+慢查询会记录执行时间超过 `slowlog-log-slower-than`（默认 10 毫秒）的命令。
+
+## 常用管理命令
+
+### 清空数据库
+
+```bash
+# 清空当前数据库
+FLUSHDB
+
+# 清空所有数据库
+FLUSHALL
+
+# 异步清空（不阻塞）
+FLUSHDB ASYNC
+FLUSHALL ASYNC
+```
+
+这些命令要非常小心，生产环境慎用。建议先 `BGSAVE` 备份。
+
+### 选择数据库
+
+Redis 默认有 16 个数据库（编号 0-15）：
+
+```bash
+# 切换到数据库 1
+SELECT 1
+
+# 查看当前数据库的键数量
+DBSIZE
+
+# 切换回数据库 0
+SELECT 0
+```
+
+但要注意，不同数据库之间的数据是隔离的，不能跨库操作。
+
+### 监控命令执行
+
+```bash
+# 实时监控所有执行的命令
+MONITOR
+
+# 输出：
+# 1672531200.123456 [0 127.0.0.1:50001] "GET" "livestream:room:abc123"
+# 1672531201.234567 [0 127.0.0.1:50001] "SET" "livestream:room:abc123" "new_value"
+```
+
+这个命令对调试很有用，但不要在生产环境长时间使用，因为它会影响性能。
+
+## 直播平台实战案例
+
+### 案例 1：查找无效的直播间
+
+假设你的直播平台有一些测试数据，键名不规范。你想找出这些键：
+
+```typescript
+async function findInvalidKeys() {
+  let cursor = "0";
+  const invalidKeys = [];
+
+  do {
+    const [nextCursor, keys] = await redis.scan(
+      cursor,
+      "MATCH",
+      "livestream:*",
+      "COUNT",
+      100
+    );
+
+    for (const key of keys) {
+      // 检查键名格式
+      // 正确格式：livestream:room:xxx 或 livestream:user:xxx
+      if (!key.match(/^livestream:(room|user):[a-z0-9]+$/)) {
+        invalidKeys.push(key);
+      }
+    }
+
+    cursor = nextCursor;
+  } while (cursor !== "0");
+
+  console.log("无效的键:", invalidKeys);
+  return invalidKeys;
+}
+```
+
+### 案例 2：统计直播间数据分布
+
+```typescript
+async function analyzeRoomData() {
+  const stats = {
+    rooms: 0,
+    users: 0,
+    sessions: 0,
+    other: 0,
+  };
+
+  let cursor = "0";
+
+  do {
+    const [nextCursor, keys] = await redis.scan(
+      cursor,
+      "MATCH",
+      "livestream:*",
+      "COUNT",
+      100
+    );
+
+    for (const key of keys) {
+      if (key.startsWith("livestream:room:")) {
+        stats.rooms++;
+      } else if (key.startsWith("livestream:user:")) {
+        stats.users++;
+      } else if (key.startsWith("session:")) {
+        stats.sessions++;
+      } else {
+        stats.other++;
+      }
+    }
+
+    cursor = nextCursor;
+  } while (cursor !== "0");
+
+  console.log("数据分布:", stats);
+  return stats;
+}
+```
+
+### 案例 3：批量设置过期时间
+
+```typescript
+async function setExpireForPattern(pattern: string, seconds: number) {
+  let cursor = "0";
+  let updated = 0;
+
+  do {
+    const [nextCursor, keys] = await redis.scan(
+      cursor,
+      "MATCH",
+      pattern,
+      "COUNT",
+      100
+    );
+
+    if (keys.length > 0) {
+      for (const key of keys) {
+        const ttl = await redis.ttl(key);
+        if (ttl === -1) {
+          // 只对永不过期的键设置过期时间
+          await redis.expire(key, seconds);
+          updated++;
+        }
+      }
+    }
+
+    cursor = nextCursor;
+  } while (cursor !== "0");
+
+  console.log(`更新了 ${updated} 个键的过期时间`);
+  return updated;
+}
+
+// 给所有测试数据设置 1 小时过期时间
+await setExpireForPattern("test:*", 3600);
+```
+
+## Trade-off：为什么 SCAN 比 KEYS 慢
+
+你可能会想，既然 SCAN 这么麻烦，为什么不直接用 KEYS？
+
+原因很简单：KEYS 是 O(N) 时间复杂度，N 是键的总数。当键很多时，KEYS 会阻塞 Redis，导致所有请求等待。而 SCAN 是分批返回，每次只处理一小部分，不会阻塞。
+
+但 SCAN 也有代价：它可能返回重复的键，因为在遍历过程中键可能被修改或删除。所以客户端需要去重。
+
+另外，SCAN 不能保证在遍历过程中新增的键一定会被返回。所以如果你需要精确的遍历结果，SCAN 不是最佳选择。
+
+这就是典型的 Trade-off：用一致性换取性能。在大多数场景下，这个取舍是值得的。
+
+## 小结
+
+今天我们学了 Redis 的键操作和命令行工具，重点是 SCAN 命令的安全使用。记住几个原则：
+
+1. 生产环境永远不要用 KEYS，用 SCAN
+2. 所有缓存数据都要设置过期时间
+3. 用 INFO 命令监控 Redis 状态
+4. 批量操作用 pipeline 或事务，不要循环调用
+
+下一篇文章我们会深入 Redis 的数据结构，看看每种结构适合什么场景。记住，Redis 的威力不在于它有多快，而在于它有合适的数据结构解决你的问题。

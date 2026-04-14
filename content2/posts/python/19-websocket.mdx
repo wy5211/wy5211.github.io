@@ -1,0 +1,331 @@
+---
+title: "19 WebSocket"
+date: "2026-03-30"
+summary: "Python WebSocket 和 Spring 的有什么不同？用 FastAPI WebSocket 实现 CMS 的评论实时推送，对比 Spring WebSocket + STOMP 方案。"
+tags: ["Python", "FastAPI", "WebSocket", "实时通信"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 实战"
+seriesOrder: 19
+---
+
+# WebSocket
+
+CMS 的文章详情页需要实时显示新评论。用户 A 发了评论，正在看同一篇文章的用户 B 和 C 应该立刻看到，不用刷新页面。
+
+HTTP 的请求-响应模式做不到这一点。WebSocket 通过一次 HTTP 握手建立持久连接，之后双方可以随时互发消息。
+
+## FastAPI WebSocket：裸协议
+
+FastAPI 内置了 WebSocket 支持，用法很直接：
+
+```python
+from fastapi import FastAPI, WebSocket
+
+app = FastAPI()
+
+@app.websocket("/ws/posts/{post_id}/comments")
+async def post_comments(ws: WebSocket, post_id: int):
+    await ws.accept()
+    while True:
+        data = await ws.receive_text()
+        # 收到客户端消息，广播给同文章的其他连接
+```
+
+这里有一个关键区别：FastAPI 的 WebSocket 是**裸协议**——你直接收发文本或字节，消息格式自己定义。没有内置的订阅机制、没有消息路由、没有房间概念。
+
+Spring Boot 的方案完全不同：
+
+```java
+// Spring Boot 使用 STOMP over WebSocket
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry config) {
+        // 启用简单的内存消息代理，目的地前缀为 /topic
+        config.enableSimpleBroker("/topic");
+        // 客户端发送消息的目的地前缀
+        config.setApplicationDestinationPrefixes("/app");
+    }
+
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        // WebSocket 握手端点
+        registry.addEndpoint("/ws")
+                .setAllowedOriginPatterns("*");
+    }
+}
+
+// 发送消息到 /topic/posts/{postId}/comments
+@MessageMapping("/posts/{postId}/comments")
+public void handleComment(CommentMessage msg) {
+    messagingTemplate.convertAndSend(
+        "/topic/posts/" + msg.getPostId() + "/comments",
+        msg
+    );
+}
+```
+
+Spring Boot 把 WebSocket 抽象成了 STOMP 消息代理。客户端通过 `stomp.js` 订阅 `/topic/posts/123/comments`，服务端用 `@MessageMapping` 声明消息处理方法。这是发布-订阅模型。
+
+FastAPI 没有这层抽象。你需要自己管理连接、自己实现广播、自己定义消息格式。这意味着更多代码，但也意味着更灵活、更透明。
+
+| 维度      | Spring Boot WebSocket + STOMP | FastAPI WebSocket         |
+| --------- | ----------------------------- | ------------------------- |
+| 抽象层级  | 高（消息代理 + 订阅/发布）    | 低（裸 WebSocket 协议）   |
+| 订阅机制  | 内置（`/topic/xxx`）          | 需要手动实现              |
+| 消息格式  | STOMP 帧协议                  | 自定义 JSON（或任意格式） |
+| 房间/频道 | 内置（destination 前缀）      | 需要手动实现              |
+| 客户端库  | stomp.js + SockJS             | 原生 WebSocket API        |
+| 认证      | Spring Security 集成          | 查询参数传 Token          |
+
+## 连接管理器
+
+因为 FastAPI 没有内置的房间机制，CMS 需要自己管理"哪些 WebSocket 连接在关注哪篇文章"：
+
+```python
+import asyncio
+import json
+from datetime import datetime
+from typing import Dict, Set
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+app = FastAPI()
+
+
+class ConnectionManager:
+    """管理所有活跃的 WebSocket 连接，按文章分组"""
+
+    def __init__(self):
+        # post_id -> Set[WebSocket]
+        self.rooms: Dict[int, Set[WebSocket]] = {}
+
+    async def connect(self, ws: WebSocket, post_id: int):
+        await ws.accept()
+        if post_id not in self.rooms:
+            self.rooms[post_id] = set()
+        self.rooms[post_id].add(ws)
+
+    def disconnect(self, ws: WebSocket, post_id: int):
+        if post_id in self.rooms:
+            self.rooms[post_id].discard(ws)
+            if not self.rooms[post_id]:
+                del self.rooms[post_id]
+
+    async def broadcast(self, post_id: int, message: dict):
+        """向关注同一篇文章的所有连接广播"""
+        if post_id not in self.rooms:
+            return
+        dead = []
+        for ws in self.rooms[post_id]:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+        for ws in dead:
+            self.rooms[post_id].discard(ws)
+
+    def get_online_count(self, post_id: int) -> int:
+        return len(self.rooms.get(post_id, set()))
+
+
+manager = ConnectionManager()
+```
+
+在 Spring Boot 中，同样的功能由 STOMP 消息代理自动处理。你不需要手动管理连接集合——`/topic/posts/123/comments` 这个 destination 本身就是"房间"，消息代理负责路由。
+
+## CMS 评论实时推送
+
+把连接管理器和评论业务串起来：
+
+```python
+from fastapi import WebSocket, WebSocketDisconnect, Query, APIRouter
+import uuid
+
+router = APIRouter()
+
+
+@router.websocket("/ws/posts/{post_id}/comments")
+async def comment_stream(ws: WebSocket, post_id: int, token: str = Query(None)):
+    """文章评论实时推送"""
+
+    # 1. 认证（通过查询参数传 JWT）
+    user_id = verify_token(token)  # 假设这个函数验证 JWT 并返回 user_id
+    if user_id is None:
+        await ws.close(code=4001, reason="未认证")
+        return
+
+    # 2. 建立连接
+    await manager.connect(ws, post_id)
+
+    # 3. 发送当前在线人数
+    await ws.send_json({
+        "type": "welcome",
+        "online_count": manager.get_online_count(post_id),
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+
+    # 4. 消息循环
+    try:
+        while True:
+            raw = await ws.receive_text()
+            try:
+                msg = json.loads(raw)
+            except json.JSONDecodeError:
+                await ws.send_json({"type": "error", "detail": "无效的 JSON"})
+                continue
+
+            if msg.get("type") == "ping":
+                await ws.send_json({"type": "pong"})
+            # 其他消息类型在这里处理
+
+    except WebSocketDisconnect:
+        manager.disconnect(ws, post_id)
+```
+
+当有新评论创建时，在 HTTP 路由里调用 `manager.broadcast`：
+
+```python
+from fastapi import BackgroundTasks
+
+@router.post("/api/posts/{post_id}/comments")
+async def create_comment(
+    post_id: int,
+    content: str,
+    background_tasks: BackgroundTasks,
+    current_user: dict = Depends(get_current_user),
+):
+    # 1. 保存评论到数据库
+    comment = await save_comment(post_id, current_user["id"], content)
+
+    # 2. 广播给所有正在看这篇文章的用户
+    await manager.broadcast(post_id, {
+        "type": "new_comment",
+        "comment": {
+            "id": comment.id,
+            "author": current_user["username"],
+            "content": content,
+            "created_at": comment.created_at.isoformat(),
+        },
+        "online_count": manager.get_online_count(post_id),
+    })
+
+    return {"comment_id": comment.id}
+```
+
+对应的 Spring Boot 实现更简洁，因为 STOMP 帮你处理了广播：
+
+```java
+@MessageMapping("/posts/{postId}/comments")
+public void handleComment(
+    @DestinationVariable Long postId,
+    CommentMessage msg,
+    Principal principal
+) {
+    Comment comment = commentService.save(postId, principal.getName(), msg.getContent());
+
+    // 直接发送到 destination，STOMP 代理负责广播给所有订阅者
+    messagingTemplate.convertAndSend(
+        "/topic/posts/" + postId + "/comments",
+        Map.of(
+            "type", "new_comment",
+            "comment", Map.of(
+                "id", comment.getId(),
+                "author", comment.getAuthor(),
+                "content", comment.getContent()
+            )
+        )
+    );
+}
+```
+
+## 水平扩展问题
+
+单机 WebSocket 有一个硬伤：连接状态保存在内存中，多实例部署时，用户 A 连接到实例 1，用户 B 连接到实例 2，实例 1 的广播到达不了实例 2 的连接。
+
+Spring Boot 有多种解决方案：用 RabbitMQ 或 ActiveMQ 作为 STOMP 代理替代内置的 SimpleBroker，消息代理负责跨实例路由。
+
+FastAPI 的做法类似——用 Redis Pub/Sub 做跨实例消息转发：
+
+```python
+import redis.asyncio as redis
+
+redis_client = redis.Redis("redis://localhost:6379")
+pubsub = redis_client.pubsub()
+
+
+async def broadcast_with_redis(post_id: int, message: dict):
+    """跨实例广播：发布到 Redis，所有实例订阅后转发给本地连接"""
+    await redis_client.publish(
+        f"ws:post:{post_id}",
+        json.dumps(message),
+    )
+
+
+# 启动时订阅 Redis 频道
+async def start_pubsub_listener():
+    await pubsub.psubscribe("ws:post:*")
+    async for message in pubsub.listen():
+        if message["type"] == "pmessage":
+            channel = message["channel"]  # ws:post:123
+            post_id = int(channel.split(":")[-1])
+            data = json.loads(message["data"])
+            await manager.broadcast(post_id, data)
+```
+
+## 心跳检测
+
+WebSocket 连接可能因为网络问题"假死"——TCP 层面没断开，但实际上已经无法通信。需要心跳检测来发现这种情况：
+
+```python
+import asyncio
+
+async def heartbeat_loop(ws: WebSocket, interval: int = 30):
+    """定期发送 ping，检测连接是否存活"""
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            await ws.send_json({"type": "ping"})
+    except Exception:
+        pass  # 连接已断开，退出心跳循环
+
+
+# 在 WebSocket 路由中使用
+async def comment_stream(ws: WebSocket, post_id: int, ...):
+    await manager.connect(ws, post_id)
+    heartbeat = asyncio.create_task(heartbeat_loop(ws))
+
+    try:
+        while True:
+            raw = await ws.receive_text()
+            msg = json.loads(raw)
+            if msg.get("type") == "pong":
+                pass  # 心跳响应
+    except WebSocketDisconnect:
+        pass
+    finally:
+        heartbeat.cancel()
+        manager.disconnect(ws, post_id)
+```
+
+Spring Boot 的 STOMP 有内置的心跳机制，通过 `configureClientInboundChannel` 配置即可，不需要手动写。
+
+## 对比总结
+
+| 维度     | Spring Boot + STOMP                  | FastAPI WebSocket                  |
+| -------- | ------------------------------------ | ---------------------------------- |
+| 开发效率 | 高，STOMP 封装了连接管理、广播、订阅 | 低，需要手动实现 ConnectionManager |
+| 灵活性   | 受限于 STOMP 协议规范                | 完全自定义消息格式和逻辑           |
+| 心跳     | 内置，配置即可                       | 手动实现 ping/pong 循环            |
+| 水平扩展 | RabbitMQ/ActiveMQ 替代 SimpleBroker  | Redis Pub/Sub 手动转发             |
+| 客户端   | 需要 stomp.js                        | 原生 WebSocket API，更轻量         |
+| 适合场景 | 复杂的消息路由（聊天室、通知中心）   | 简单的实时推送（评论、状态更新）   |
+
+## 回顾与预告
+
+[上一篇](/posts/python/18-file-upload)的封面图片上传是 HTTP 请求-响应模式，本篇的 WebSocket 打破了这种限制。FastAPI 的 WebSocket 更底层，代码量更多，但你完全掌控消息的收发逻辑。Spring Boot 的 STOMP 方案更适合复杂的消息路由场景。
+
+下一篇讲 Redis 缓存，给 CMS 的文章列表加上缓存层，同时对比 Spring `@Cacheable` 的注解式缓存和 Python 的手动缓存模式。

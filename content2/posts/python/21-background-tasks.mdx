@@ -1,0 +1,326 @@
+---
+title: "21 后台任务"
+date: "2026-03-30"
+summary: "Celery 和 Spring @Async 有什么区别？从轻量的 BackgroundTasks 到重量级的 Celery，对比两种后台任务方案在 CMS 中的应用。"
+tags: ["Python", "Celery", "后台任务", "FastAPI"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 实战"
+seriesOrder: 21
+---
+
+# 后台任务
+
+CMS 的文章发布流程里有个问题：点击"发布"后，除了保存到数据库，还要做几件事——清除相关缓存、通知订阅者、更新搜索引擎索引、推送社交平台。这些操作有的需要几秒，有的可能失败重试。如果全部放在 HTTP 请求里同步执行，用户要等很久，超时还会导致前端报错。
+
+解决方案：把耗时操作丢到后台异步执行，HTTP 请求立即返回"发布成功"。
+
+## Spring Boot 的方式：@Async
+
+Spring Boot 用 `@Async` 注解标记异步方法，Spring 自动用线程池执行：
+
+```java
+@Service
+public class NotificationService {
+
+    // 在独立线程中执行，不阻塞调用方
+    @Async
+    public void notifySubscribers(Long postId, String title) {
+        List<User> subscribers = subscriptionRepository.findByPost(postId);
+        for (User user : subscribers) {
+            emailService.send(user.getEmail(), "新文章", title);
+        }
+    }
+
+    @Async
+    public void refreshSearchIndex(Long postId) {
+        // 调用 Elasticsearch API 更新索引
+    }
+}
+```
+
+Controller 里直接调用，Spring 会在后台线程执行：
+
+```java
+@PostMapping("/api/posts/{id}/publish")
+public ResponseEntity<?> publish(@PathVariable Long id) {
+    postService.publish(id);
+    notificationService.notifySubscribers(id, post.getTitle());
+    notificationService.refreshSearchIndex(id);
+    return ResponseEntity.ok(Map.of("status", "published"));
+}
+```
+
+简单直接。`@Async` 背后是 Spring 的 `TaskExecutor` 线程池，默认单线程，生产环境需要配置：
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+    @Bean
+    public TaskExecutor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(5);
+        executor.setMaxPoolSize(20);
+        executor.setQueueCapacity(100);
+        executor.setThreadNamePrefix("async-");
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+## FastAPI 的轻量方案：BackgroundTasks
+
+FastAPI 内置了 `BackgroundTasks`，用法比 `@Async` 更简单：
+
+```python
+from fastapi import FastAPI, BackgroundTasks
+
+app = FastAPI()
+
+
+def notify_subscribers(post_id: int, title: str):
+    """通知订阅者（后台执行）"""
+    import time
+    time.sleep(3)  # 模拟耗时操作
+    print(f"已通知订阅者: {title}")
+
+
+@app.post("/api/posts/{post_id}/publish")
+async def publish_post(
+    post_id: int,
+    background_tasks: BackgroundTasks,
+):
+    # 1. 同步操作：更新数据库状态
+    await db_update_post_status(post_id, "published")
+
+    # 2. 后台操作：添加到任务队列
+    background_tasks.add_task(notify_subscribers, post_id, "新文章标题")
+
+    # 3. 立即返回
+    return {"status": "published"}
+```
+
+`BackgroundTasks` 的工作方式：请求处理完毕后（响应已发送给客户端），FastAPI 在**同一个进程**中依次执行添加的后台任务。它不是真正的"队列"——没有持久化，进程崩溃任务就丢了。
+
+| 维度     | Spring Boot @Async       | FastAPI BackgroundTasks |
+| -------- | ------------------------ | ----------------------- |
+| 执行方式 | 线程池（独立线程）       | 请求结束后在同进程执行  |
+| 持久化   | 无（内存中的任务队列）   | 无                      |
+| 任务重试 | 需要手动实现             | 需要手动实现            |
+| 定时任务 | `@Scheduled`             | 不支持                  |
+| 分布式   | 否（单 JVM）             | 否（单进程）            |
+| 适用场景 | 邮件、缓存刷新、日志记录 | 同左                    |
+
+两者在"轻量"这个维度上几乎等价。但 CMS 的需求有时不止于此。
+
+## 需要重量级方案的场景
+
+考虑这些需求：
+
+- 发邮件失败后自动重试，间隔递增（1 分钟、2 分钟、4 分钟）
+- 生成月度数据报表，可能执行 10 分钟，需要进度查询
+- 每天凌晨 3 点清理过期会话、刷新热门文章排行
+- 多个 Worker 实例并行处理任务
+
+`@Async` 和 `BackgroundTasks` 都做不到。这就是 Celery 出场的时候。
+
+## Celery：Python 的分布式任务队列
+
+Celery 的架构需要三个角色：
+
+```
+┌──────────┐    ┌──────────────┐    ┌──────────────┐
+│  FastAPI  │───>│   Broker     │───>│  Celery      │
+│  (生产者) │    │  (消息队列)   │    │  Worker      │
+└──────────┘    │  Redis       │    │  (消费者)     │
+                └──────────────┘    └──────┬───────┘
+                                           │
+                                    ┌──────▼───────┐
+                                    │   Backend    │
+                                    │  (结果存储)   │
+                                    └──────────────┘
+```
+
+Broker 是消息中间件（Redis 或 RabbitMQ），Backend 存储任务执行结果。
+
+```python
+from celery import Celery
+
+# 创建 Celery 实例
+celery_app = Celery(
+    "cms_worker",
+    broker="redis://localhost:6379/1",
+    backend="redis://localhost:6379/2",
+)
+
+celery_app.conf.update(
+    task_serializer="json",
+    timezone="Asia/Shanghai",
+    task_track_started=True,
+    task_acks_late=True,  # 任务执行完才确认，Worker 崩溃不丢任务
+)
+
+
+# ========== 定义任务 ==========
+
+@celery_app.task(
+    name="tasks.notify_subscribers",
+    bind=True,          # 允许访问 task 实例
+    max_retries=3,      # 最多重试 3 次
+    retry_backoff=60,   # 重试间隔：60s, 120s, 240s
+)
+def notify_subscribers(self, post_id: int, title: str):
+    """通知订阅者（Celery 任务）"""
+    try:
+        subscribers = get_subscribers(post_id)
+        for user in subscribers:
+            send_email(user.email, "新文章发布", title)
+    except Exception as exc:
+        raise self.retry(exc=exc)
+
+
+@celery_app.task(name="tasks.generate_report")
+def generate_monthly_report(self, year: int, month: int):
+    """生成月度报表（耗时任务）"""
+    # 更新任务进度
+    self.update_state(
+        state="PROGRESS",
+        meta={"current": 50, "total": 100, "status": "正在生成报表..."},
+    )
+    # ... 执行报表生成 ...
+    return {"file": "report_202603.pdf"}
+```
+
+FastAPI 中提交任务：
+
+```python
+@app.post("/api/posts/{post_id}/publish")
+async def publish_post(post_id: int):
+    # 同步操作
+    post = await db_publish_post(post_id)
+
+    # 提交到 Celery（立即返回 task_id）
+    task = notify_subscribers.delay(post_id, post.title)
+
+    return {
+        "status": "published",
+        "task_id": task.id,  # 客户端可以用这个 ID 查询任务状态
+    }
+
+
+@app.get("/api/tasks/{task_id}/status")
+async def get_task_status(task_id: str):
+    """查询任务执行状态"""
+    from celery.result import AsyncResult
+    result = AsyncResult(task_id, app=celery_app)
+    return {
+        "task_id": task_id,
+        "status": result.status,  # PENDING / STARTED / PROGRESS / SUCCESS / FAILURE
+        "result": result.result if result.ready() else None,
+    }
+```
+
+## 定时任务：Celery Beat
+
+Spring Boot 用 `@Scheduled` 做定时任务，Celery 用 Beat：
+
+```python
+from celery.schedules import crontab
+
+celery_app.conf.beat_schedule = {
+    "cleanup-expired-sessions": {
+        "task": "tasks.cleanup_sessions",
+        "schedule": crontab(hour=3, minute=0),  # 每天凌晨 3 点
+    },
+    "refresh-hot-posts": {
+        "task": "tasks.refresh_hot_posts",
+        "schedule": crontab(minute=0),  # 每小时
+    },
+    "refresh-cache": {
+        "task": "tasks.refresh_cache",
+        "schedule": 300.0,  # 每 5 分钟
+    },
+}
+
+@celery_app.task(name="tasks.cleanup_sessions")
+def cleanup_sessions():
+    """清理过期会话"""
+    expired = db.query(RefreshToken).filter(
+        RefreshToken.expires_at < datetime.utcnow()
+    ).delete()
+    return {"deleted": expired}
+```
+
+对应的 Spring Boot：
+
+```java
+@Scheduled(cron = "0 0 3 * * ?")
+public void cleanupSessions() {
+    refreshTokenRepository.deleteByExpiresAtBefore(LocalDateTime.now());
+}
+```
+
+`@Scheduled` 更简洁，但只能单实例运行。Celery Beat 可以配合多个 Worker 分布式执行。
+
+## 三种方案对比
+
+| 维度       | FastAPI BackgroundTasks | Celery             | Spring Boot @Async |
+| ---------- | ----------------------- | ------------------ | ------------------ |
+| 复杂度     | 极低                    | 高（需要 Broker）  | 低                 |
+| 持久化     | 无                      | Broker 持久化      | 无                 |
+| 任务重试   | 不支持                  | 内置（指数退避）   | 需手动实现         |
+| 定时任务   | 不支持                  | Celery Beat        | @Scheduled         |
+| 进度查询   | 不支持                  | task_id + state    | 需手动实现         |
+| 分布式     | 不支持                  | 多 Worker          | 不支持             |
+| 消息中间件 | 不需要                  | Redis / RabbitMQ   | 不需要             |
+| 启动方式   | 无需额外进程            | Worker + Beat 进程 | 无需额外进程       |
+
+## CMS 中的选择策略
+
+不是所有任务都需要 Celery。一个实用的策略：
+
+```python
+from fastapi import BackgroundTasks
+
+@app.post("/api/posts/{post_id}/publish")
+async def publish_post(
+    post_id: int,
+    background_tasks: BackgroundTasks,
+):
+    # 同步：更新数据库
+    post = await db_publish_post(post_id)
+
+    # 轻量后台任务：用 BackgroundTasks
+    background_tasks.add_task(invalidate_cache, post_id)
+    background_tasks.add_task(refresh_post_search_index, post_id)
+
+    # 重量级任务：用 Celery
+    notify_subscribers.delay(post_id, post.title)
+    generate_social_share_image.delay(post_id, post.cover_url)
+
+    return {"status": "published"}
+```
+
+缓存清除和搜索索引更新很快、不需要重试，用 `BackgroundTasks`。发邮件和生成分享图片可能失败、需要重试，用 Celery。两者可以在同一个请求中共存。
+
+## 对比总结
+
+| 维度       | Spring Boot                 | Python                       |
+| ---------- | --------------------------- | ---------------------------- |
+| 轻量异步   | `@Async`（线程池）          | `BackgroundTasks`（同进程）  |
+| 重量级方案 | 需要引入消息队列 + 手动集成 | Celery（生态成熟，开箱即用） |
+| 定时任务   | `@Scheduled`（内置）        | Celery Beat（需要单独进程）  |
+| 任务重试   | 手动实现或 Spring Retry     | Celery 内置 `retry_backoff`  |
+| 分布式     | 需要消息队列 + 自定义方案   | Celery 天然支持              |
+
+Spring Boot 的 `@Async` 覆盖了大部分简单场景，但在需要持久化、重试、分布式时，Java 生态没有一个和 Celery 对等的"标准方案"——你需要自己选消息队列（RabbitMQ/Kafka）、自己写消费者、自己管理任务状态。Celery 把这些全打包了，这是 Python 生态在后台任务领域的优势。
+
+## 回顾与预告
+
+[上一篇](/posts/python/20-redis-caching)的 Redis 缓存解决了读性能问题，本篇的后台任务解决了写操作中的耗时问题。`BackgroundTasks` 和 `@Async` 是同一量级的轻量方案，Celery 则是 Python 独有的重量级选择。
+
+下一篇是系列收官：Docker 部署。把 CMS 的所有组件（FastAPI、Celery Worker、PostgreSQL、Redis、Nginx）用 Docker Compose 编排起来，同时对比 Python、Java、Node.js 三种技术栈的镜像大小和部署差异。

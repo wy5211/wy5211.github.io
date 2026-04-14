@@ -1,0 +1,449 @@
+---
+title: "02. Mapper XML 详解：MyBatis 的灵魂"
+date: "2026-04-12"
+summary: "Mapper XML 是 MyBatis 的核心。resultMap 怎么配、参数怎么传、主键怎么回填——掌握这些，才能驾驭 MyBatis。"
+tags: ["MyBatis", "Java", "XML", "Mapper"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 实战指南"
+seriesOrder: 2
+---
+
+上一篇搭好了 BookHive 项目，完成了用户的注册和查询。但你可能注意到了一个问题：Mapper XML 里的查询语句 `SELECT id, username, email, password_hash, age, created_at, updated_at` 要把所有列名都列出来。如果表有 20 个字段呢？每次查询都要写一遍？
+
+MyBatis 的 Mapper XML 不只是"把 SQL 放在 XML 里"这么简单。它有一套完整的映射机制，能处理列名和属性名不匹配、复杂类型转换、嵌套对象等场景。这篇把 Mapper XML 的核心配置讲透。
+
+## resultMap：精确控制映射关系
+
+上一篇的例子中，我们在配置里开了 `map-underscore-to-camel-case: true`，所以 `created_at` 自动映射到 `createdAt`。这能覆盖大部分场景。但有些情况自动映射处理不了。
+
+### 什么时候需要 resultMap
+
+**列名和属性名完全不同**。比如数据库里叫 `pwd_hash`，Java 里叫 `passwordHash`，驼峰转换规则匹配不上。
+
+**需要类型转换**。数据库存的是 `TINYINT`（0 或 1），Java 里想映射成 `Boolean`。
+
+**需要嵌套映射**。查询结果包含关联对象，需要把多列映射到一个嵌套的对象里。
+
+**需要选择性地映射列**。不想映射所有列，只映射部分。
+
+### 基本 resultMap
+
+以 BookHive 的书籍表为例：
+
+```sql
+CREATE TABLE books (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    title VARCHAR(200) NOT NULL,
+    isbn VARCHAR(20) UNIQUE,
+    price DECIMAL(10, 2) NOT NULL,
+    stock INT NOT NULL DEFAULT 0,
+    publisher_id BIGINT,
+    published_date DATE,
+    description TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+```
+
+```java
+public class Book {
+    private Long id;
+    private String title;
+    private String isbn;
+    private BigDecimal price;
+    private Integer stock;
+    private Long publisherId;
+    private LocalDate publishedDate;
+    private String description;
+    private LocalDateTime createdAt;
+    private LocalDateTime updatedAt;
+    // getter/setter
+}
+```
+
+不开驼峰转换的情况下，需要手写 resultMap：
+
+```xml
+<resultMap id="BookResultMap" type="Book">
+    <id column="id" property="id"/>
+    <result column="title" property="title"/>
+    <result column="isbn" property="isbn"/>
+    <result column="price" property="price"/>
+    <result column="stock" property="stock"/>
+    <result column="publisher_id" property="publisherId"/>
+    <result column="published_date" property="publishedDate"/>
+    <result column="description" property="description"/>
+    <result column="created_at" property="createdAt"/>
+    <result column="updated_at" property="updatedAt"/>
+</resultMap>
+
+<select id="findById" resultMap="BookResultMap">
+    SELECT * FROM books WHERE id = #{id}
+</select>
+```
+
+`<id>` 标识主键列，MyBatis 用它来判断对象的唯一性（在缓存和关联映射中有用）。`<result>` 映射普通列。
+
+开了 `map-underscore-to-camel-case: true` 之后，大部分列都能自动映射。resultMap 只需要在自动映射处理不了的时候才用。
+
+### 简化版：只写需要特殊处理的列
+
+如果大部分列能自动映射，只有个别列需要特殊处理，用 `autoMapping` 属性：
+
+```xml
+<!-- autoMapping=true 让 MyBatis 先自动映射，再处理手动配置的列 -->
+<resultMap id="BookResultMap" type="Book" autoMapping="true">
+    <id column="id" property="id"/>
+    <!-- 只有 description 需要特殊处理 -->
+    <result column="description" property="description"
+            jdbcType="VARCHAR"/>
+</resultMap>
+```
+
+实际开发中，如果全局开了驼峰转换，简单的查询直接用 `resultType="Book"` 就行。resultMap 留给复杂的关联查询（下一篇讲）。
+
+## 参数传递
+
+Mapper 方法的参数怎么传到 XML 里的 `#{}` 占位符？MyBatis 支持多种方式。
+
+### 单参数
+
+最简单的情况，方法只有一个参数：
+
+```java
+Book findById(Long id);
+```
+
+```xml
+<select id="findById" resultType="Book">
+    SELECT * FROM books WHERE id = #{id}
+</select>
+```
+
+`#{id}` 中的 `id` 是参数名。如果方法参数没有 `@Param` 注解，MyBatis 在编译时可能无法获取参数名（取决于编译器配置）。这时候有两种处理方式：
+
+1. 编译时加上 `-parameters` 参数（Maven 默认开启）
+2. 用 `@Param` 注解显式指定
+
+### 多参数
+
+方法有多个参数时，必须用 `@Param` 注解：
+
+```java
+List<Book> findByTitleAndPrice(
+    @Param("title") String title,
+    @Param("minPrice") BigDecimal minPrice,
+    @Param("maxPrice") BigDecimal maxPrice
+);
+```
+
+```xml
+<select id="findByTitleAndPrice" resultType="Book">
+    SELECT * FROM books
+    WHERE title LIKE CONCAT('%', #{title}, '%')
+    AND price BETWEEN #{minPrice} AND #{maxPrice}
+    ORDER BY price ASC
+</select>
+```
+
+不加 `@Param`，MyBatis 不知道 `#{title}` 对应哪个参数。编译报错或运行时绑定异常。
+
+### POJO 传参
+
+参数太多时，用一个 DTO 类打包：
+
+```java
+public class BookQueryDTO {
+    private String title;
+    private BigDecimal minPrice;
+    private BigDecimal maxPrice;
+    private String sortBy;
+    private Integer pageNum;
+    private Integer pageSize;
+    // getter/setter
+}
+```
+
+```java
+List<Book> search(BookQueryDTO query);
+```
+
+```xml
+<select id="search" resultType="Book">
+    SELECT * FROM books
+    WHERE title LIKE CONCAT('%', #{title}, '%')
+    AND price BETWEEN #{minPrice} AND #{maxPrice}
+    ORDER BY ${sortBy}
+    LIMIT #{pageSize} OFFSET #{(pageNum - 1) * pageSize}
+</select>
+```
+
+注意 `#{sortBy}` 应该改成 `${sortBy}`——因为 `ORDER BY` 的列名不能作为 `PreparedStatement` 的参数。但 `${sortBy}` 有 SQL 注入风险，所以在 Java 代码中校验 `sortBy` 只能是预定义的几个值。
+
+### Map 传参
+
+如果参数不固定，可以用 `Map<String, Object>`：
+
+```java
+List<Book> searchByMap(Map<String, Object> params);
+```
+
+```xml
+<select id="searchByMap" resultType="Book">
+    SELECT * FROM books
+    <where>
+        <if test="title != null">
+            AND title LIKE CONCAT('%', #{title}, '%')
+        </if>
+        <if test="minPrice != null">
+            AND price >= #{minPrice}
+        </if>
+    </where>
+</select>
+```
+
+Map 传参灵活但类型不安全——拼错 key 名编译不会报错，只有运行时才出问题。实际项目中更推荐 POJO 传参。
+
+## CRUD 标签完整用法
+
+### insert：插入与主键回填
+
+```xml
+<insert id="insert" useGeneratedKeys="true" keyProperty="id">
+    INSERT INTO books (title, isbn, price, stock, publisher_id, published_date, description)
+    VALUES (#{title}, #{isbn}, #{price}, #{stock}, #{publisherId}, #{publishedDate}, #{description})
+</insert>
+```
+
+`useGeneratedKeys="true"` 让 MySQL 自动生成主键，`keyProperty="id"` 把生成的主键值回填到 `book` 对象的 `id` 属性。插入之后 `book.getId()` 就有值了。
+
+如果不支持 `useGeneratedKeys`（比如某些老版本的数据库），可以用 `<selectKey>`：
+
+```xml
+<insert id="insert">
+    INSERT INTO books (title, isbn, price, stock)
+    VALUES (#{title}, #{isbn}, #{price}, #{stock})
+    <selectKey keyProperty="id" resultType="long" order="AFTER">
+        SELECT LAST_INSERT_ID()
+    </selectKey>
+</insert>
+```
+
+### update：选择性更新
+
+更新操作有一个常见需求：只更新非 null 的字段。用户修改资料时，可能只改了邮箱，其他字段不变。如果用固定的 UPDATE 语句，会把没传的字段覆盖为 null。
+
+```xml
+<update id="updateSelective">
+    UPDATE books
+    <set>
+        <if test="title != null">title = #{title},</if>
+        <if test="isbn != null">isbn = #{isbn},</if>
+        <if test="price != null">price = #{price},</if>
+        <if test="stock != null">stock = #{stock},</if>
+        <if test="publisherId != null">publisher_id = #{publisherId},</if>
+        <if test="publishedDate != null">published_date = #{publishedDate},</if>
+        <if test="description != null">description = #{description},</if>
+    </set>
+    WHERE id = #{id}
+</update>
+```
+
+`<set>` 标签会自动处理末尾多余的逗号。如果 `title` 和 `isbn` 不为 null，生成的 SQL 是 `UPDATE books SET title = ?, isbn = ? WHERE id = ?`，不会出现 `title = ?, isbn = ?, WHERE id = ?` 这种语法错误。
+
+### delete：删除
+
+```xml
+<delete id="deleteById">
+    DELETE FROM books WHERE id = #{id}
+</delete>
+```
+
+删除没什么特别的。需要注意的是，实际项目中很少物理删除（`DELETE FROM`），更多是逻辑删除——加一个 `deleted` 字段，更新为 1 表示已删除。MyBatis-Plus 内置了逻辑删除支持（第 7 篇会讲）。
+
+### select：查询的几种写法
+
+查单个对象：
+
+```xml
+<select id="findById" resultType="Book">
+    SELECT * FROM books WHERE id = #{id}
+</select>
+```
+
+查列表：
+
+```xml
+<select id="findAll" resultType="Book">
+    SELECT * FROM books ORDER BY created_at DESC
+</select>
+```
+
+查某个字段（返回基本类型）：
+
+```xml
+<select id="countByPublisher" resultType="int">
+    SELECT COUNT(*) FROM books WHERE publisher_id = #{publisherId}
+</select>
+```
+
+查 Map（列名作为 key）：
+
+```xml
+<select id="findAsMap" resultType="map">
+    SELECT id, title, price FROM books WHERE id = #{id}
+</select>
+<!-- 返回 {id=1, title="xxx", price=29.99} -->
+```
+
+## 类型处理器：处理特殊类型
+
+默认情况下，MyBatis 能处理 Java 基本类型和 String、BigDecimal、LocalDateTime 等常用类型到数据库类型的转换。但有些类型需要自定义类型处理器。
+
+### 典型场景：枚举映射
+
+数据库通常用 `VARCHAR` 或 `TINYINT` 存储枚举值，Java 里用 `enum`。MyBatis 默认把枚举映射为它的 `name()`（字符串），但有时候数据库里存的是 code。
+
+比如书籍状态：
+
+```java
+public enum BookStatus {
+    AVAILABLE(1, "在售"),
+    OUT_OF_STOCK(2, "缺货"),
+    OFF_SHELF(3, "下架");
+
+    private final int code;
+    private final String description;
+
+    BookStatus(int code, String description) {
+        this.code = code;
+        this.description = description;
+    }
+
+    public int getCode() { return code; }
+}
+```
+
+数据库里 `status` 字段存的是 `1`、`2`、`3`（TINYINT）。需要自定义类型处理器：
+
+```java
+public class BookStatusHandler extends BaseTypeHandler<BookStatus> {
+
+    @Override
+    public void setNonNullParameter(PreparedStatement ps, int i,
+            BookStatus parameter, JdbcType jdbcType) throws SQLException {
+        ps.setInt(i, parameter.getCode());
+    }
+
+    @Override
+    public BookStatus getNullableResult(ResultSet rs, String columnName)
+            throws SQLException {
+        int code = rs.getInt(columnName);
+        return codeFromDb(code);
+    }
+
+    @Override
+    public BookStatus getNullableResult(ResultSet rs, int columnIndex)
+            throws SQLException {
+        int code = rs.getInt(columnIndex);
+        return codeFromDb(code);
+    }
+
+    @Override
+    public BookStatus getNullableResult(CallableStatement cs, int columnIndex)
+            throws SQLException {
+        int code = cs.getInt(columnIndex);
+        return codeFromDb(code);
+    }
+
+    private BookStatus codeFromDb(int code) {
+        for (BookStatus status : BookStatus.values()) {
+            if (status.getCode() == code) return status;
+        }
+        return null;
+    }
+}
+```
+
+注册类型处理器有两种方式。全局注册（所有用到 BookStatus 的地方都生效）：
+
+```yaml
+# application.yml
+mybatis:
+  type-handlers-package: com.bookhive.handler
+```
+
+或者局部注册（只在特定的 resultMap 中使用）：
+
+```xml
+<resultMap id="BookResultMap" type="Book" autoMapping="true">
+    <id column="id" property="id"/>
+    <result column="status" property="status"
+            typeHandler="com.bookhive.handler.BookStatusHandler"/>
+</resultMap>
+```
+
+另一个常见场景是 JSON 字段。数据库里某个字段存的是 JSON 字符串（`JSON` 或 `TEXT` 类型），Java 里想映射成一个对象。MyBatis 有一个开源的类型处理器 `mybatis-typehandlers-jsr310` 可以处理，也可以自己实现——核心逻辑就是序列化和反序列化。
+
+## Mapper XML 的组织方式
+
+随着项目变大，Mapper XML 文件也会变多。怎么组织？
+
+**按模块分目录**。每个模块一个包，XML 放在对应的 resources 目录下：
+
+```
+src/main/resources/mapper/
+├── user/
+│   └── UserMapper.xml
+├── book/
+│   └── BookMapper.xml
+├── order/
+│   └── OrderMapper.xml
+└── ...
+```
+
+对应修改配置：
+
+```yaml
+mybatis:
+  mapper-locations: classpath:mapper/**/*.xml
+```
+
+**XML 和接口同名同包**。`UserMapper.java` 在 `com.bookhive.mapper` 包下，`UserMapper.xml` 在 `resources/mapper/user/` 下。保持命名一致，找文件的时候一目了然。
+
+**SQL 片段复用**。多个查询都用同样的列列表，用 `<sql>` 提取：
+
+```xml
+<sql id="bookColumns">
+    id, title, isbn, price, stock, publisher_id,
+    published_date, description, status, created_at, updated_at
+</sql>
+
+<select id="findById" resultType="Book">
+    SELECT <include refid="bookColumns"/>
+    FROM books WHERE id = #{id}
+</select>
+
+<select id="findByPublisher" resultType="Book">
+    SELECT <include refid="bookColumns"/>
+    FROM books WHERE publisher_id = #{publisherId}
+</select>
+```
+
+改了表结构只需要改一处 `<sql>` 定义，不用逐个查询去改。
+
+## select \* 的问题
+
+你可能注意到上面的例子中，有的用 `SELECT *`，有的用 `SELECT id, title, ...`。实际开发中，**生产代码不应该用 `SELECT *`**。
+
+原因不是性能（MySQL 在 InnoDB 引擎下 `SELECT *` 和列全列出来性能差异不大），而是可维护性：
+
+- `SELECT *` 返回的列顺序取决于表的物理结构，如果有人 `ALTER TABLE` 加了列，列顺序可能变
+- 不需要的列（比如 `TEXT` 类型的大字段）也会被传输，浪费网络带宽
+- resultMap 的映射可能因为多出列而出问题（虽然不会报错，但可能有意外的数据）
+
+建议：查询时只选需要的列。如果所有列都要，用 `<sql>` 片段列出所有列名，而不是 `SELECT *`。
+
+掌握了 resultMap、参数传递、CRUD 标签和类型处理器，你已经能处理大部分单表操作了。下一篇开始讲 MyBatis 最强大的特性——动态 SQL。

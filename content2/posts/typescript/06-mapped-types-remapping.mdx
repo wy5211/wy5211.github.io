@@ -1,0 +1,470 @@
+---
+title: "06. 映射类型与 Key Remapping：批量变换对象类型"
+date: "2026-04-12"
+summary: "通过映射类型的 Key Remapping 机制，批量转换对象类型的属性名，解决前后端命名风格不一致的痛点，并掌握条件过滤、Getter/Setter 生成等高级变换技巧。"
+tags: ["TypeScript"]
+category: "typescript"
+cover: ""
+draft: false
+series: "TypeScript 类型系统进阶"
+seriesOrder: 6
+---
+
+## 一个真实的问题
+
+假设你正在开发一个用户管理模块，后端 API 返回的数据长这样：
+
+```typescript
+// 后端返回的原始数据
+const apiResponse = {
+  user_id: 10086,
+  user_name: "张三",
+  created_at: "2026-04-01T08:00:00Z",
+  is_active: true,
+  avatar_url: "https://example.com/avatar.jpg",
+};
+```
+
+而你的前端代码里，所有的字段都用 camelCase：
+
+```typescript
+// 前端期望的类型
+interface User {
+  userId: number;
+  userName: string;
+  createdAt: string;
+  isActive: boolean;
+  avatarUrl: string;
+}
+```
+
+每次拿到 API 数据，你都得手动写一个转换函数，把 `user_id` 改成 `userId`，`created_at` 改成 `createdAt`。字段少还好，一旦接口有几十个字段，光是写转换代码就够让人崩溃的。
+
+在上一篇文章中，我们实现了 `Partial`、`Pick`、`Omit` 这些基础工具类型，它们能帮我们筛选和修改属性的可选性。但如果我们要**批量重命名属性**，这些工具类型就不够用了。
+
+今天的主角——映射类型的 Key Remapping（键重映射），就是专门用来解决这类问题的。它让我们能在遍历对象属性的同时，按照规则生成新的属性名。
+
+## 回顾：映射类型的基础
+
+在进入 Key Remapping 之前，先快速回顾一下映射类型的基本形态。映射类型的核心语法是遍历 `keyof T`，然后对每个属性做变换：
+
+```typescript
+// 最基础的映射类型：原样复制
+type Copy<T> = {
+  [K in keyof T]: T[K];
+};
+```
+
+这里 `[K in keyof T]` 做的事情很简单——取出 `T` 的所有属性名，然后逐个复制。上一篇文章里我们实现的 `Partial`、`Readonly` 都是这个语法的延伸，加上了 `?` 和 `readonly` 修饰符。
+
+但这个语法有一个限制：属性名只能原样保留，不能改。`Partial<User>` 的属性还是 `id`、`name`，不会变成 `optionalId`、`optionalName`。
+
+Key Remapping 打破了这个限制。
+
+## Key Remapping：用 `as` 重命名属性
+
+TypeScript 4.1 引入了 `as` 子句，允许我们在映射属性时改变属性名。语法长这样：
+
+```typescript
+type MappedWithNewKeys<T> = {
+  //        用 as 指定新键名
+  [K in keyof T as NewKeyName]: T[K];
+};
+```
+
+`as` 后面的表达式决定了新的属性名。如果某个属性映射出的新键名是 `never`，这个属性就会被直接过滤掉——这个特性后面会反复用到。
+
+### 最简单的例子：给所有属性加前缀
+
+假设我们要给一个配置对象的每个属性加上 `config_` 前缀：
+
+```typescript
+type AddPrefix<T, Prefix extends string> = {
+  [K in keyof T as `${Prefix}_${string & K}`]: T[K];
+};
+
+interface AppConfig {
+  apiUrl: string;
+  timeout: number;
+  debug: boolean;
+}
+
+type PrefixedConfig = AddPrefix<AppConfig, "app">;
+// 结果：{
+//   app_apiUrl: string;
+//   app_timeout: number;
+//   app_debug: boolean;
+// }
+```
+
+这里 `as` 后面用到了模板字面量类型（第 02 篇文章讲过的内容），把 `Prefix` 和原始键名 `K` 拼在一起。`string & K` 的作用是确保 `K` 被当作字符串处理——因为 `keyof T` 返回的类型中可能包含 `symbol`，而模板字面量只接受字符串。
+
+## 核心场景：snake_case 到 camelCase 的批量转换
+
+回到开头的问题。我们需要一个工具类型，能自动把 `user_id` 转成 `userId`，`created_at` 转成 `createdAt`。
+
+这个转换的核心逻辑是：遇到下划线 `_` 时，把 `_` 后面的第一个字母大写，去掉 `_` 本身。比如 `user_name` -> `userName`，`is_active` -> `isActive`。
+
+### 第一步：实现单次转换
+
+先处理最常见的情况——只有一个下划线的属性名：
+
+```typescript
+// 匹配 "xxx_yyy" 模式，拆分成前后两段
+type SnakeToCamelCase<S extends string> =
+  S extends `${infer Before}_${infer After}`
+    ? `${Before}${Capitalize<After>}`
+    : S;
+```
+
+这个条件类型的逻辑很直接：如果字符串 `S` 能匹配 `xxx_yyy` 的模式，就把 `Before` 和首字母大写后的 `After` 拼在一起。比如 `user_name` 匹配后，`Before` 是 `user`，`After` 是 `name`，最终结果是 `userName`。
+
+### 第二步：处理多个下划线
+
+像 `avatar_url` 这样的名字没问题，但如果遇到 `first_name_last` 这种包含两个下划线的呢？单次匹配只能处理第一个 `_`，后面的就不管了。
+
+解决思路是递归——每次处理一个下划线，然后对剩余部分继续处理：
+
+```typescript
+type SnakeToCamelCase<S extends string> =
+  S extends `${infer Before}_${infer After}`
+    ? `${Before}${Capitalize<SnakeToCamelCase<After>>}`
+    : S;
+```
+
+唯一的改动在 `Capitalize` 里面：把 `After` 替换为 `SnakeToCamelCase<After>`，这样 `first_name_last` 会先变成 `first_Name_last`，再递归处理 `Name_last` 变成 `NameLast`，最终得到 `firstNameLast`。
+
+### 第三步：应用到整个对象类型
+
+有了单键转换逻辑，接下来把它包装进映射类型：
+
+```typescript
+type CamelCaseKeys<T> = {
+  [K in keyof T as K extends string ? SnakeToCamelCase<K> : K]: T[K];
+};
+```
+
+这个类型做了两件事：遍历 `T` 的所有属性，对每个属性名判断它是不是字符串——如果是，就做 snake_case 转换；如果不是（比如 `symbol`），就保持原样。
+
+来实际测试一下效果：
+
+```typescript
+interface ApiUser {
+  user_id: number;
+  user_name: string;
+  created_at: string;
+  is_active: boolean;
+  avatar_url: string;
+}
+
+type FrontendUser = CamelCaseKeys<ApiUser>;
+// 结果：{
+//   userId: number;
+//   userName: string;
+//   createdAt: string;
+//   isActive: boolean;
+//   avatarUrl: string;
+// }
+```
+
+这比手写转换函数舒服太多了。定义好类型后，TypeScript 会在编译期自动完成所有属性名的转换，零运行时开销。
+
+## 条件过滤：用 `as never` 移除属性
+
+前面提到，`as` 后面如果计算出 `never`，这个属性就不会出现在结果类型中。这个特性可以用来做属性过滤。
+
+### 过滤掉特定类型的属性
+
+假设我们有一个混合了不同类型值的对象，想只保留字符串属性：
+
+```typescript
+type StringOnly<T> = {
+  [K in keyof T as T[K] extends string ? K : never]: T[K];
+};
+
+interface MixedData {
+  name: string; // 保留
+  age: number; // 过滤掉
+  email: string; // 保留
+  active: boolean; // 过滤掉
+}
+
+type OnlyStrings = StringOnly<MixedData>;
+// 结果：{
+//   name: string;
+//   email: string;
+// }
+```
+
+逻辑很清晰：在遍历每个属性时，检查值的类型 `T[K]` 是否为 `string`。如果是，保留原键名 `K`；如果不是，用 `never` 标记，TypeScript 会自动忽略它。
+
+### 过滤掉以特定前缀开头的属性
+
+在 API 响应中，有些字段是内部使用的（比如以 `_` 开头的），前端不需要：
+
+```typescript
+type RemoveInternal<T> = {
+  [K in keyof T as K extends `_${string}` ? never : K]: T[K];
+};
+
+interface RawApiResponse {
+  _trace_id: string; // 内部字段，过滤掉
+  _request_id: string; // 内部字段，过滤掉
+  user_id: number; // 保留
+  user_name: string; // 保留
+}
+
+type CleanResponse = RemoveInternal<RawApiResponse>;
+// 结果：{
+//   user_id: number;
+//   user_name: string;
+// }
+```
+
+`K extends `_${string}``检查属性名是否以`_`开头。匹配到的赋值为`never`，不匹配的保留原键名。一行类型定义，替代了手动 `Omit` 一堆字段。
+
+## 提取可选属性：分离必填和可选
+
+有时候我们需要把一个类型拆成两部分：必填字段和可选字段。这在表单场景中很常见——初始化时只需要必填字段，更新时才用到可选字段。
+
+```typescript
+// 提取所有可选属性
+type OptionalKeys<T> = {
+  [K in keyof T]-?: {} extends Pick<T, K> ? K : never;
+}[keyof T];
+
+// 提取所有必填属性
+type RequiredKeys<T> = {
+  [K in keyof T]-?: {} extends Pick<T, K> ? never : K;
+}[keyof T];
+
+// 根据键集合构造子类型
+type PickByKeys<T, K extends keyof T> = Pick<T, K>;
+```
+
+核心技巧是 `{} extends Pick<T, K>`——如果 `{}`（空对象）能赋值给 `Pick<T, K>`，说明这个属性是可选的。这是因为可选属性允许不传，而 `{}` 就是不传任何属性。
+
+实际使用：
+
+```typescript
+interface UserProfile {
+  userId: number; // 必填
+  nickName: string; // 必填
+  avatar?: string; // 可选
+  bio?: string; // 可选
+  email?: string; // 可选
+}
+
+type OptionalProps = OptionalKeys<UserProfile>;
+// "avatar" | "bio" | "email"
+
+type RequiredProps = RequiredKeys<UserProfile>;
+// "userId" | "nickName"
+
+type RequiredOnly = PickByKeys<UserProfile, RequiredProps>;
+// { userId: number; nickName: string }
+
+type OptionalOnly = PickByKeys<UserProfile, OptionalProps>;
+// { avatar?: string; bio?: string; email?: string }
+```
+
+创建用户时只需要 `RequiredOnly`，更新用户资料时用 `OptionalOnly`，类型边界清清楚楚。
+
+## 生成 Getter / Setter 类型
+
+映射类型不仅能改属性名，还能改属性值的类型。一个经典场景是给对象的每个属性生成对应的 getter 函数。
+
+### 生成只读 Getter
+
+```typescript
+type Getters<T> = {
+  // 对每个属性 K，生成 get + 首字母大写K 的函数
+  [K in keyof T as K extends string
+    ? `get${Capitalize<K>}`
+    : never]: () => T[K];
+};
+```
+
+看一个具体例子：
+
+```typescript
+interface Product {
+  name: string;
+  price: number;
+  stock: number;
+}
+
+type ProductGetters = Getters<Product>;
+// 结果：{
+//   getName: () => string;
+//   getPrice: () => number;
+//   getStock: () => number;
+// }
+```
+
+每个 getter 的返回类型都精确对应原始属性的值类型，不会出现 `any` 或手动标注不准确的情况。
+
+### 同时生成 Getter 和 Setter
+
+```typescript
+type Accessors<T> = {
+  // 生成 getter
+  [K in keyof T as K extends string
+    ? `get${Capitalize<K>}`
+    : never]: () => T[K];
+} & {
+  // 生成 setter
+  [K in keyof T as K extends string ? `set${Capitalize<K>}` : never]: (
+    value: T[K]
+  ) => void;
+};
+
+type ProductAccessors = Accessors<Product>;
+// 结果：{
+//   getName: () => string;
+//   getPrice: () => number;
+//   getStock: () => number;
+//   setPrice: (value: number) => void;
+//   setStock: (value: number) => void;
+//   setName: (value: string) => void;
+// }
+```
+
+通过交叉类型 `&` 把 getter 和 setter 合并到一个类型中。每个 setter 的参数类型同样由映射自动推导，保证类型安全。
+
+## 完整实战：API 响应类型转换流水线
+
+现在把前面学到的技巧组合起来，搭建一个完整的 API 响应转换流水线。我们模拟一个真实的用户管理接口场景。
+
+### 第一步：定义后端返回的原始类型
+
+```typescript
+// 后端实际返回的数据结构
+interface ApiUserResponse {
+  user_id: number;
+  user_name: string;
+  user_email: string;
+  created_at: string;
+  updated_at: string;
+  is_active: boolean;
+  avatar_url: string | null;
+  _internal_score: number; // 内部字段，前端不需要
+  _debug_info: string; // 调试字段，前端不需要
+}
+```
+
+### 第二步：构建转换管道
+
+```typescript
+// 1. 过滤掉以 _ 开头的内部字段
+type RemoveInternal<T> = {
+  [K in keyof T as K extends `_${string}` ? never : K]: T[K];
+};
+
+// 2. snake_case 属性名转 camelCase
+type SnakeToCamel<S extends string> = S extends `${infer Before}_${infer After}`
+  ? `${Before}${Capitalize<SnakeToCamel<After>>}`
+  : S;
+
+type CamelCaseKeys<T> = {
+  [K in keyof T as K extends string ? SnakeToCamel<K> : K]: T[K];
+};
+
+// 3. 将 null 字段转为可选
+type NullToOptional<T> = {
+  [K in keyof T]: null extends T[K] ? Exclude<T[K], null> | undefined : T[K];
+};
+
+// 组合管道：从后到前依次应用
+type TransformApiResponse<T> = NullToOptional<CamelCaseKeys<RemoveInternal<T>>>;
+```
+
+### 第三步：应用并验证
+
+```typescript
+type FrontendUser = TransformApiResponse<ApiUserResponse>;
+// 结果：{
+//   userId: number;
+//   userName: string;
+//   userEmail: string;
+//   createdAt: string;
+//   updatedAt: string;
+//   isActive: boolean;
+//   avatarUrl: string | undefined;   // null 变成了 undefined（可选）
+// }
+```
+
+三个步骤一次完成：内部字段被过滤掉，属性名从 snake_case 转成了 camelCase，`null` 类型变成了 `undefined`（更符合前端的使用习惯）。
+
+### 第四步：编写运行时转换函数
+
+类型转换只在编译期生效，运行时我们还需要一个对应的转换函数。好消息是，类型已经帮我们把"需要做什么"定义清楚了：
+
+```typescript
+function snakeToCamel(str: string): string {
+  return str.replace(/_([a-z])/g, (_, letter) => letter.toUpperCase());
+}
+
+function transformApiResponse<T extends Record<string, any>>(
+  data: T
+): Record<string, any> {
+  const result: Record<string, any> = {};
+
+  for (const key of Object.keys(data)) {
+    // 跳过内部字段
+    if (key.startsWith("_")) continue;
+
+    const camelKey = snakeToCamel(key);
+    let value = data[key];
+
+    // null 转 undefined
+    if (value === null) {
+      value = undefined;
+    }
+
+    result[camelKey] = value;
+  }
+
+  return result;
+}
+
+// 使用时通过类型断言确保安全
+const rawData: ApiUserResponse = await fetchUser();
+const user = transformApiResponse(rawData) as FrontendUser;
+```
+
+类型定义和运行时逻辑保持同步，这是类型安全最大的价值——当你修改类型定义时，TypeScript 会提示你同步更新转换函数。
+
+## 权衡：什么时候该用映射类型
+
+映射类型很强大，但它不是万能的。在实际项目中需要考虑几个方面。
+
+### 适合使用映射类型的场景
+
+当你的项目中存在大量结构相似的对象需要批量变换时，映射类型能显著减少重复代码。最典型的例子就是 API 响应转换——几十个接口如果每个都手写类型，维护成本很高。统一用 `CamelCaseKeys` 处理，后端改了字段名，前端类型自动跟着变。
+
+生成 Getter/Setter、过滤属性、提取特定类型的属性，这些操作用映射类型写起来很自然，可读性也高。
+
+### 需要谨慎的场景
+
+如果你的映射类型嵌套了太多层递归（比如深度 snake_case 转换涉及多层嵌套对象），TypeScript 的类型检查器可能会变慢。第 10 篇文章我们会专门讨论类型性能问题。
+
+另外，过度使用映射类型会让代码变得难以调试。当类型推断出错时，一个嵌套了四五层模板字面量和条件类型的工具类型，它的报错信息可能长达几十行。建议对复杂的映射类型加上中间类型别名，分步定义，这样既能提高可读性，也方便定位问题。
+
+### 一个实用的判断标准
+
+问自己一个问题：**这个映射类型是不是在项目中至少会被 3 个以上的类型复用？** 如果答案是肯定的，那值得提取成公共工具类型。如果只用一次，直接手写目标类型反而更清晰。
+
+## 小结
+
+Key Remapping 让映射类型从"能遍历属性"进化到了"能同时变换属性名"。结合模板字面量类型和条件类型，我们能实现 snake_case 到 camelCase 的转换、属性过滤、Getter/Setter 生成等各种批量变换操作。
+
+在我们的 HTTP API 客户端项目中，这些技巧会直接用在 API 响应类型的自动转换上，让前后端的类型对接变得几乎零成本。
+
+下一篇，我们会进入函数类型的世界——函数重载。当一个函数需要根据不同参数返回不同类型时，重载是 TypeScript 提供的最优雅的解决方案。
+
+---
+
+> **系列导航：**
+> 上一篇：[05. 工具类型实现原理](/posts/typescript/05-utility-types-implementation)
+> 下一篇：[07. 函数重载](/posts/typescript/07-function-overloading)

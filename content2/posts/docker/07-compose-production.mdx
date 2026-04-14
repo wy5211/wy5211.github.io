@@ -1,0 +1,401 @@
+---
+title: "07 Compose 进阶：走向生产环境"
+date: "2025-03-30"
+summary: "给 Compose 配置加上 Redis 缓存层、健康检查、资源限制、日志管理，打造一个生产级的多服务架构。"
+tags: ["Docker", "Docker Compose", "生产环境", "Redis"]
+category: "docker"
+cover: ""
+draft: false
+series: "Docker 从入门到实战"
+seriesOrder: 7
+---
+
+上一篇我们用 Compose 搭建了订单 API 的基本架构（API + PostgreSQL），开发环境够用了。但生产环境有几个必须考虑的问题：
+
+1. 热点商品查询很慢——每次请求都打数据库，数据库扛不住。
+2. 没有健康检查——服务挂了你不知道，负载均衡也不知道该把流量发到哪。
+3. 没有资源限制——一个服务内存泄漏可能拖垮整台机器。
+4. 日志没有管理——容器日志无限增长，磁盘迟早被撑满。
+
+这篇我们逐个解决这些问题，把 Compose 配置推向生产级。
+
+## 加入 Redis 缓存层
+
+订单 API 有个接口是查询商品详情，这是个高频操作。iPhone 15 Pro 的详情不会一秒钟变一次，完全可以缓存。
+
+加入 Redis 服务：
+
+```yaml
+# docker-compose.yml
+services:
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgres://postgres:order_secret_2025@db:5432/postgres
+      - REDIS_URL=redis://cache:6379
+    depends_on:
+      db:
+        condition: service_healthy
+      cache:
+        condition: service_healthy
+
+  db:
+    image: postgres:16-alpine
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_PASSWORD=order_secret_2025
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  cache:
+    image: redis:7-alpine
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:
+  redisdata:
+```
+
+注意几点：
+
+- `cache` 服务的镜像用的是 `redis:7-alpine`，只有 30MB 左右。
+- Redis 也加了 Volume，缓存数据在容器重启后不会丢失。
+- API 的环境变量加了 `REDIS_URL`，指向 `cache:6379`（`cache` 是 Redis 服务的名字）。
+- `depends_on` 用了 `condition: service_healthy`，确保 Redis 和 PostgreSQL 都就绪了才启动 API。
+
+API 代码里的缓存逻辑大致是这样的（伪代码）：
+
+```javascript
+// 查询商品详情——先查缓存
+async function getProductDetail(sku) {
+  const cached = await redis.get(`product:${sku}`);
+  if (cached) return JSON.parse(cached);
+
+  const product = await db.query("SELECT * FROM products WHERE sku = $1", [
+    sku,
+  ]);
+  await redis.setex(`product:${sku}`, 300, JSON.stringify(product)); // 缓存 5 分钟
+  return product;
+}
+```
+
+## 健康检查
+
+健康检查是告诉 Docker（和监控系统）"这个服务是不是还活着"。上一篇我们已经在 PostgreSQL 和 Redis 上配了健康检查，现在给 API 也加上：
+
+```yaml
+services:
+  api:
+    build: .
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+```
+
+四个参数的含义：
+
+- `interval: 30s`：每 30 秒检查一次。
+- `timeout: 5s`：单次检查超过 5 秒视为失败。
+- `retries: 3`：连续失败 3 次才标记为 unhealthy。
+- `start_period: 10s`：容器启动后 10 秒内不计入失败次数（给服务启动时间）。
+
+这里有个细节：你的 API 镜像里需要有 `curl` 命令。如果用的是 Alpine 基础镜像，默认没有 curl。两种解决办法：
+
+```dockerfile
+# 方案一：在 Dockerfile 里装 curl
+RUN apk add --no-cache curl
+
+# 方案二：用 wget（Alpine 自带）
+# healthcheck 里改成：test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+```
+
+方案二更轻量（不增加镜像体积），但方案一更直观。
+
+健康检查不仅能用在 `depends_on` 里，还能让 Nginx 反向代理知道哪个后端是健康的：
+
+```yaml
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    depends_on:
+      api:
+        condition: service_healthy
+```
+
+如果 API 的健康检查失败，Nginx（或者后续的负载均衡器）就不会把流量转发给它。
+
+## 资源限制
+
+生产环境中，必须给每个服务设置资源上限。否则一个内存泄漏的 API 可能吃掉所有内存，导致 PostgreSQL 也被 OOM Killer 杀掉。
+
+```yaml
+services:
+  api:
+    build: .
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5" # 最多用 0.5 个 CPU 核心
+          memory: 512M # 最多用 512MB 内存
+        reservations:
+          cpus: "0.1" # 保证至少有 0.1 个 CPU
+          memory: 128M # 保证至少有 128MB 内存
+
+  db:
+    image: postgres:16-alpine
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 256M
+
+  cache:
+    image: redis:7-alpine
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+        reservations:
+          memory: 64M
+```
+
+`limits` 是硬限制，超过就会触发 OOM。`reservations` 是软限制，告诉 Docker "这个服务至少需要这么多资源"，调度时会参考但不强制。
+
+怎么确定该给多少？没有万能的公式，但可以参考以下方式：
+
+- 在开发环境跑一段时间，用 `docker stats` 观察各服务的实际使用量。
+- limits 设为实际使用量的 1.5-2 倍，留出突发流量的余量。
+- reservations 设为正常使用量，确保服务有足够的资源运行。
+
+## 日志管理
+
+容器日志默认存在 `/var/lib/docker/containers/` 目录下，以 JSON 文件的形式。如果不做配置，日志文件会无限增长。
+
+限制日志大小：
+
+```yaml
+services:
+  api:
+    build: .
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m" # 单个日志文件最大 10MB
+        max-file: "3" # 最多保留 3 个文件
+```
+
+这样每个服务的日志最多占 30MB（10MB x 3），超出后会自动轮转删除旧日志。
+
+对日志量的估算：一个普通的 API 服务，每天产生 100MB-500MB 日志是很常见的。如果没有轮转，一个月后日志可能占用 10GB+ 磁盘空间。
+
+查看日志时，可以按时间过滤：
+
+```bash
+# 查看最近 1 小时的日志
+docker compose logs --since 1h api
+
+# 查看某个时间段的日志
+docker compose logs --since "2025-03-15T14:00:00" --until "2025-03-15T15:00:00" api
+```
+
+## 多环境配置
+
+开发和生产的配置往往不同：开发环境挂载源代码、使用 debug 模式，生产环境不用。Compose 支持多文件合并来实现这种需求。
+
+`docker-compose.yml`（基础配置，所有环境共用）：
+
+```yaml
+services:
+  api:
+    build: .
+    environment:
+      - DATABASE_URL=postgres://postgres:${POSTGRES_PASSWORD}@db:5432/postgres
+      - REDIS_URL=redis://cache:6379
+
+  db:
+    image: postgres:16-alpine
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    environment:
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+
+  cache:
+    image: redis:7-alpine
+    volumes:
+      - redisdata:/data
+
+volumes:
+  pgdata:
+  redisdata:
+```
+
+`docker-compose.override.yml`（开发环境覆盖，会自动合并）：
+
+```yaml
+services:
+  api:
+    volumes:
+      - .:/app
+      - /app/node_modules
+    command: npm run dev
+    environment:
+      - NODE_ENV=development
+```
+
+`docker-compose.prod.yml`（生产环境覆盖，手动指定）：
+
+```yaml
+services:
+  api:
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  db:
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  cache:
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+```
+
+使用方式：
+
+```bash
+# 开发环境（自动合并 docker-compose.yml + docker-compose.override.yml）
+docker compose up -d
+
+# 生产环境（手动指定额外文件）
+docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+```
+
+Compose 合并文件的规则是：后面的文件覆盖前面的同名配置，非同名的配置会合并。这样你可以把公共配置放在基础文件里，环境差异放在各自的覆盖文件里。
+
+## 服务扩展与负载均衡
+
+如果订单 API 的流量增长，一个实例扛不住了，你可以用 `--scale` 启动多个实例：
+
+```bash
+docker compose up -d --scale api=3
+```
+
+这会启动 3 个 API 容器。但如果你只映射了一个端口 `3000:3000`，三个容器会争抢同一个宿主机端口，启动失败。
+
+解决办法：不映射端口，让 Nginx 做负载均衡。
+
+```yaml
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - api
+
+  api:
+    build: .
+    # 注意：不映射 ports，由 Nginx 负载均衡
+    deploy:
+      replicas: 3
+
+  db:
+    # ...
+```
+
+Nginx 配置里用 `upstream` 指向多个 API 实例：
+
+```nginx
+upstream api_backend {
+    server api_1:3000;
+    server api_2:3000;
+    server api_3:3000;
+}
+
+server {
+    listen 80;
+    location / {
+        proxy_pass http://api_backend;
+    }
+}
+```
+
+不过 Compose 的 scale 有个局限： replicas 数量是写死在配置文件里的，不能根据负载自动调整。如果需要自动扩缩容，就要考虑 Kubernetes 了（最后一篇会讲）。
+
+## 重启策略
+
+```yaml
+services:
+  api:
+    restart: unless-stopped
+```
+
+四个可选值：
+
+| 策略             | 行为                                   | 适用场景           |
+| ---------------- | -------------------------------------- | ------------------ |
+| `no`             | 不自动重启（默认）                     | 一次性任务         |
+| `on-failure`     | 非正常退出时重启                       | 批处理任务         |
+| `always`         | 总是重启，包括手动 stop 后 daemon 重启 | 必须一直运行的服务 |
+| `unless-stopped` | 和 always 类似，但手动 stop 后不再重启 | 生产环境推荐       |
+
+`unless-stopped` 是生产环境最常用的选择。`docker compose stop` 停掉的服务不会自动重启，但如果是异常退出（比如 OOM），会自动拉起。
+
+## 回顾
+
+这篇我们把 Compose 配置从开发级推向了生产级：
+
+- **Redis 缓存**：加入缓存层，减轻数据库压力。
+- **健康检查**：让 Docker 和监控系统知道服务是否正常。
+- **资源限制**：防止单个服务吃掉所有资源。
+- **日志轮转**：防止日志撑满磁盘。
+- **多环境配置**：用多文件合并分离开发和生产配置。
+- **服务扩展**：`--scale` 和 Nginx 负载均衡。
+- **重启策略**：`unless-stopped` 保证服务异常退出后自动恢复。
+
+配置完善了，但看看 `docker images`，你的 API 镜像可能有 400-500MB——对于一个 Node.js 项目来说太大了。下一篇专门讲镜像优化。

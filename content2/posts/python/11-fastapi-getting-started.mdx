@@ -1,0 +1,290 @@
+---
+title: "11 FastAPI 入门"
+date: "2026-03-30"
+summary: "FastAPI 和 Spring Boot 有多像？搭建 FastAPI 项目，定义第一个 API，感受 Python Web 框架和 Spring Boot 的相似与不同。"
+tags: ["Python", "FastAPI", "Web框架", "API"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 实战"
+seriesOrder: 11
+---
+
+用 Spring Boot 写过一个 REST API 的人，第一次接触 FastAPI 会有一种奇妙的既视感。`@app.get("/posts/{id}")` 对应 `@GetMapping("/posts/{id}")`，Pydantic model 对应 DTO，`Depends` 对应 `@Autowired`——概念几乎是一一对应的，只是语法从 Java 注解换成了 Python 装饰器。
+
+从这一篇开始，我们会用 FastAPI 重做 Spring Boot 系列里的 CMS 项目。同一个领域模型（User、Post、Tag、Comment），用 Python 重新实现一遍。通过这个贯穿案例，你能直观地看到两套技术栈在同样的业务场景下各自的选择和取舍。
+
+## 搭建项目
+
+```bash
+mkdir cms-api && cd cms-api
+uv init
+uv add fastapi uvicorn[standard] pydantic-settings
+```
+
+三行命令搞定。对比 Spring Boot 的 `spring init` 加 pom.xml 依赖配置，FastAPI 的起步成本明显更低。这和两个框架的定位有关：Spring Boot 是"全家桶"，自动配置帮你搞定一切；FastAPI 是"积木"，你按需拼装。
+
+一个最小的 FastAPI 应用：
+
+```python
+# main.py
+from fastapi import FastAPI
+
+app = FastAPI(title="CMS API", version="1.0.0")
+
+
+@app.get("/")
+async def root():
+    return {"message": "CMS API is running"}
+```
+
+启动：
+
+```bash
+uvicorn main:app --reload
+```
+
+`uvicorn main:app` 的含义是"从 main.py 导入 app 对象，用 uvicorn ASGI 服务器运行它"。`--reload` 在开发模式下自动重载代码变更。生产环境用 `--workers 4` 开启多进程。
+
+在 Spring Boot 系列第 1 篇里，我们花了大量篇幅解释 `@SpringBootApplication`、内嵌 Tomcat、自动配置。FastAPI 没有这些——它只做路由分发和请求处理，Web 服务器交给 uvicorn，数据库交给 SQLAlchemy，配置交给 pydantic-settings。这种"只做一件事"的设计是 Python 生态的典型风格。
+
+## 路由定义：装饰器 vs 注解
+
+FastAPI 用 Python 装饰器定义路由，Spring Boot 用 Java 注解。两者的思路完全一致——声明式的"路径 + 处理器"绑定：
+
+```java
+// Spring Boot
+@RestController
+@RequestMapping("/api/posts")
+public class PostController {
+
+    @GetMapping("/{id}")
+    public Post getPost(@PathVariable Long id) {
+        return postService.findById(id);
+    }
+}
+```
+
+```python
+# FastAPI
+from fastapi import FastAPI, APIRouter
+
+router = APIRouter(prefix="/api/posts", tags=["文章"])
+
+
+@router.get("/{post_id}")
+async def get_post(post_id: int):
+    return post_service.find_by_id(post_id)
+```
+
+对照关系：
+
+| 概念     | Spring Boot                                | FastAPI                                    |
+| -------- | ------------------------------------------ | ------------------------------------------ |
+| 定义路由 | `@GetMapping("/posts/{id}")`               | `@router.get("/posts/{post_id}")`          |
+| 路径前缀 | `@RequestMapping("/api/posts")`            | `APIRouter(prefix="/api/posts")`           |
+| 路径参数 | `@PathVariable Long id`                    | `post_id: int`（函数参数）                 |
+| 查询参数 | `@RequestParam(defaultValue="1") int page` | `page: int = 1`（带默认值的函数参数）      |
+| 请求体   | `@RequestBody CreatePostRequest req`       | `req: CreatePostRequest`（Pydantic model） |
+| 响应格式 | `ResponseEntity<Post>`                     | `response_model=PostResponse`              |
+
+有一个细节值得注意：FastAPI 通过函数签名自动区分参数类型。出现在路径中的是路径参数，带默认值且不在路径中的是查询参数，类型为 Pydantic model 的是请求体。不需要额外的注解（除非需要约束）。
+
+```python
+@router.get("/posts/{post_id}")
+async def get_post(
+    post_id: int,           # 路径参数（在路径字符串中声明）
+    draft: bool = False,    # 查询参数（带默认值）
+    db: Session = Depends(get_db),  # 依赖注入
+):
+    ...
+```
+
+Spring Boot 需要显式的 `@PathVariable`、`@RequestParam`、`@RequestBody` 注解来标记，而 FastAPI 靠参数位置和类型推断。前者更明确，后者更简洁。这是两个框架在"显式 vs 隐式"这个光谱上的典型差异。
+
+## Pydantic Model vs DTO
+
+Pydantic 是 FastAPI 的数据验证层，地位等同于 Spring Boot 里的 Bean Validation + DTO。在 Spring Boot 系列第 2 篇中，我们用 Java record 定义了 `CreatePostRequest`，上面加了 `@NotBlank`、`@Size` 等校验注解。Pydantic 的做法类似，但用 Python 的类型注解：
+
+```python
+# schemas/post.py
+from datetime import datetime
+from pydantic import BaseModel, Field
+
+
+class PostCreate(BaseModel):
+    """创建文章的请求模型"""
+    title: str = Field(..., min_length=1, max_length=200)
+    slug: str = Field(..., min_length=1, max_length=200, pattern=r"^[a-z0-9-]+$")
+    content: str = Field(..., min_length=1)
+    status: str = Field(default="draft", pattern=r"^(draft|published|archived)$")
+
+
+class PostResponse(BaseModel):
+    """文章的响应模型"""
+    id: int
+    title: str
+    slug: str
+    content: str
+    status: str
+    author_id: int
+    view_count: int
+    created_at: datetime
+    published_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+```
+
+`Field(...)` 中的 `...` 表示必填字段，等价于 Spring Boot 的 `@NotBlank`。`min_length`、`max_length`、`pattern` 直接对应 Java 的 `@Size`、`@Pattern`。
+
+`model_config = {"from_attributes": True}` 是 Pydantic v2 的写法，允许从 SQLAlchemy ORM 对象直接构造 Pydantic 模型，替代旧版的 `orm_mode = True`。
+
+关键区别在于 Pydantic 模型是纯 Python 类，没有注解解析的开销。Spring Boot 的 Bean Validation 需要在运行时通过反射读取注解，而 Pydantic 在类定义时就生成了校验逻辑。这也是 FastAPI 性能高的原因之一。
+
+## 自动文档：Swagger UI 开箱即用
+
+启动服务后，访问 `http://localhost:8000/docs`，你会看到一个完整的 Swagger UI 界面。不需要额外安装任何依赖，不需要写配置文件。
+
+在 Spring Boot 里实现同样的效果，需要引入 `springdoc-openapi` 依赖，然后通过 `@Operation`、`@Schema` 等注解手动描述 API。FastAPI 从路由签名、Pydantic 模型、函数文档字符串中自动提取信息生成 OpenAPI 文档。
+
+- Swagger UI：`http://localhost:8000/docs`
+- ReDoc：`http://localhost:8000/redoc`
+- OpenAPI JSON：`http://localhost:8000/openapi.json`
+
+这不是 FastAPI 独有的功能，但它是默认开启且零配置的。对于快速迭代的 CMS 项目，自动文档能显著减少前后端联调的沟通成本。
+
+## CMS：第一个文章 API
+
+把上面的知识组装起来，为 CMS 写一个最简单的文章列表接口：
+
+```python
+# main.py
+from contextlib import asynccontextmanager
+from datetime import datetime
+from fastapi import FastAPI, Query
+from pydantic import BaseModel, Field
+
+# 模拟数据（下一篇替换为 SQLAlchemy）
+posts_db: list[dict] = [
+    {
+        "id": 1,
+        "title": "FastAPI 入门指南",
+        "slug": "fastapi-getting-started",
+        "content": "这是一篇关于 FastAPI 的入门文章...",
+        "status": "published",
+        "author_id": 1,
+        "view_count": 128,
+        "created_at": "2026-03-28T10:00:00",
+        "published_at": "2026-03-28T10:00:00",
+    },
+    {
+        "id": 2,
+        "title": "SQLAlchemy 2.0 新特性",
+        "slug": "sqlalchemy-2-new-features",
+        "content": "SQLAlchemy 2.0 带来了...",
+        "status": "draft",
+        "author_id": 1,
+        "view_count": 0,
+        "created_at": "2026-03-29T14:30:00",
+        "published_at": None,
+    },
+]
+
+
+# Pydantic 模型
+class PostResponse(BaseModel):
+    id: int
+    title: str
+    slug: str
+    content: str
+    status: str
+    author_id: int
+    view_count: int
+    created_at: datetime
+    published_at: datetime | None = None
+
+    model_config = {"from_attributes": True}
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    print("CMS API starting...")
+    yield
+    print("CMS API shutting down...")
+
+
+app = FastAPI(title="CMS API", version="1.0.0", lifespan=lifespan)
+
+
+@app.get("/api/posts", response_model=list[PostResponse])
+async def list_posts(
+    status: str | None = Query(None, pattern=r"^(draft|published|archived)$"),
+    page: int = Query(1, ge=1),
+    size: int = Query(10, ge=1, le=100),
+):
+    """获取文章列表，支持按状态过滤和分页"""
+    result = posts_db
+    if status:
+        result = [p for p in result if p["status"] == status]
+    start = (page - 1) * size
+    return result[start : start + size]
+
+
+@app.get("/api/posts/{post_id}", response_model=PostResponse)
+async def get_post(post_id: int):
+    """获取单篇文章"""
+    for post in posts_db:
+        if post["id"] == post_id:
+            return post
+    from fastapi import HTTPException
+    raise HTTPException(status_code=404, detail="Post not found")
+```
+
+这个例子里有几个值得留意的点：
+
+**`response_model=list[PostResponse]`** 告诉 FastAPI 用 `PostResponse` 来序列化响应。任何不在 `PostResponse` 中声明的字段都会被自动过滤掉。这和 Spring Boot 的 `@ResponseBody` 不同——Spring Boot 默认返回对象的所有字段，你需要用 `@JsonIgnore` 来排除字段。FastAPI 的方式更安全：响应模型就是 API 契约，多余的字段不可能泄漏。
+
+**`Query(None, pattern=...)`** 在查询参数上添加约束。如果客户端传入 `status=invalid`，FastAPI 直接返回 422 错误。Spring Boot 的 `@RequestParam` 本身不支持正则校验，你需要在 Service 层或自定义 Validator 里处理。
+
+## 项目结构对比
+
+两个框架在项目组织上的哲学差异，从目录结构就能看出来：
+
+```
+# Spring Boot（约定重于配置）
+src/main/java/com/example/cms/
+├── controller/          # @RestController
+├── service/             # @Service
+├── repository/          # @Repository / JpaRepository
+├── entity/              # @Entity
+├── dto/                 # record CreatePostRequest
+├── config/              # @Configuration
+└── CmsApplication.java  # @SpringBootApplication
+
+# FastAPI（自由组合）
+cms-api/
+├── app/
+│   ├── main.py          # FastAPI 实例 + 路由注册
+│   ├── config.py        # pydantic-settings
+│   ├── database.py      # SQLAlchemy engine + session
+│   ├── models/          # SQLAlchemy ORM 模型
+│   ├── schemas/         # Pydantic 模型
+│   ├── services/        # 业务逻辑
+│   └── routers/         # APIRouter
+└── pyproject.toml
+```
+
+Spring Boot 的分层是框架强制的——`@ComponentScan` 自动扫描，包名错了类就注册不上。FastAPI 的分层是约定——你需要在 `main.py` 里手动 `include_router`，目录结构只是组织习惯，框架不关心。
+
+这种差异的 trade-off 很直接：Spring Boot 的强制约束在大型团队里能防止混乱，但也增加了新人的学习成本；FastAPI 的自由度适合小团队快速开发，但在 10 人以上团队里需要靠代码规范来维持一致性。
+
+## 回顾
+
+这篇文章搭建了 FastAPI 项目，写了 CMS 的第一个文章 API，核心收获：
+
+- FastAPI 和 Spring Boot 在概念上高度对齐：路由定义、参数绑定、数据验证、依赖注入、自动文档
+- 关键差异在于"显式 vs 隐式"：Spring Boot 靠注解显式标记一切，FastAPI 靠函数签名和类型推断隐式处理
+- Pydantic model 同时承担了 DTO 和 Bean Validation 两个角色，代码更紧凑
+- FastAPI 的自动文档零配置开箱即用，Spring Boot 需要引入 springdoc 并手动添加注解
+
+当前的数据还存在内存列表里，重启就没了。下一篇引入 SQLAlchemy 2.0，给 CMS 加上真正的数据库持久化，你会看到 SQLAlchemy 和 Spring Data JPA 在 ORM 风格和会话管理上的差异。

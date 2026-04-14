@@ -1,0 +1,957 @@
+---
+title: "07 Nuxt 集成：Vue 生态的 tRPC 实践"
+date: "2026-03-23"
+summary: "掌握 Nuxt 3 与 tRPC 的深度集成，学会 Vue Composition API 中使用 tRPC，对比 Next.js 和 Nuxt 的集成差异。"
+tags: ["tRPC", "Nuxt", "Vue", "Composition API", "SSR"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 7
+---
+
+在上一篇文章中，我们学习了如何在 Next.js 中集成 tRPC。现在让我们看看 Vue 生态中如何做同样的事情。
+
+Nuxt 3 是 Vue 生态中最流行的全栈框架，它和 Next.js 有很多相似之处，但在实现细节上也有一些差异。如果你习惯了 Vue 的模板语法和 Composition API，那么 Nuxt + tRPC 会让你感到非常亲切。
+
+## Next.js vs Nuxt：快速对比
+
+在深入代码之前，让我们先看看两个框架的主要区别：
+
+| 特性       | Next.js (React)   | Nuxt (Vue)              |
+| ---------- | ----------------- | ----------------------- |
+| 服务端组件 | Server Components | useAsyncData            |
+| 组件风格   | JSX/TSX           | Template + Script       |
+| 状态管理   | React Query       | useAsyncData + useState |
+| 自动导入   | 需要配置          | 原生支持                |
+| 类型安全   | 完整              | 完整                    |
+
+虽然实现方式不同，但两者都能提供相同的类型安全保证。
+
+## 项目初始化
+
+创建 Nuxt 项目：
+
+```bash
+npx nuxi@latest init task-manager-nuxt
+cd task-manager-nuxt
+npm install
+```
+
+安装 tRPC 和相关依赖：
+
+```bash
+npm install @trpc/server @trpc/client
+npm install @trpc-nuxt/nuxt
+npm install zod superjson
+npm install prisma @prisma/client
+```
+
+## 配置 Nuxt
+
+更新 `nuxt.config.ts`：
+
+```typescript
+// nuxt.config.ts
+
+export default defineNuxtConfig({
+  modules: ["@trpc-nuxt/nuxt"],
+
+  runtimeConfig: {
+    databaseUrl: process.env.DATABASE_URL,
+  },
+
+  typescript: {
+    strict: true,
+  },
+});
+```
+
+## 创建 tRPC 服务端
+
+在 Nuxt 中，tRPC 的服务端配置和 Next.js 很相似，但文件位置不同。
+
+### 创建 Context
+
+```typescript
+// server/trpc/context.ts
+
+import { CreateNuxtContextOptions } from "@trpc-nuxt/nuxt";
+import { prisma } from "@/lib/prisma";
+
+interface User {
+  id: string;
+  name: string;
+  email: string;
+  avatar: string | null;
+  role: "ADMIN" | "MEMBER" | "GUEST";
+}
+
+export interface Context {
+  user: User | null;
+  prisma: typeof prisma;
+}
+
+export async function createContext({
+  event,
+}: CreateNuxtContextOptions): Promise<Context> {
+  // 从请求中获取用户信息
+  const userId = getHeader(event, "x-user-id") as string | undefined;
+
+  let user: User | null = null;
+
+  if (userId) {
+    user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        avatar: true,
+        role: true,
+      },
+    });
+  }
+
+  return {
+    user,
+    prisma,
+  };
+}
+```
+
+### 初始化 tRPC
+
+```typescript
+// server/trpc/index.ts
+
+import { initTRPC, TRPCError } from "@trpc/server";
+import { ZodError } from "zod";
+import type { Context } from "./context";
+
+const t = initTRPC.context<Context>().create({
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError:
+          error.code === "BAD_REQUEST" && error.cause instanceof ZodError
+            ? error.cause.flatten()
+            : null,
+      },
+    };
+  },
+});
+
+// 认证中间件
+const isAuthed = t.middleware(({ ctx, next }) => {
+  if (!ctx.user) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "需要登录",
+    });
+  }
+  return next({
+    ctx: {
+      ...ctx,
+      user: ctx.user,
+    },
+  });
+});
+
+export const router = t.router;
+export const publicProcedure = t.procedure;
+export const protectedProcedure = t.procedure.use(isAuthed);
+```
+
+### 创建 Router
+
+```typescript
+// server/trpc/routers/tasks.ts
+
+import { z } from "zod";
+import { TRPCError } from "@trpc/server";
+import { router, protectedProcedure } from "../index";
+import type { Context } from "../context";
+
+export const tasksRouter = router({
+  // 获取任务列表
+  list: protectedProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        status: z
+          .enum(["TODO", "IN_PROGRESS", "REVIEW", "DONE", "CANCELLED"])
+          .optional(),
+        page: z.number().default(1),
+        limit: z.number().min(1).max(100).default(20),
+      })
+    )
+    .query(async ({ input, ctx }) => {
+      const { projectId, status, page, limit } = input;
+      const skip = (page - 1) * limit;
+
+      // 验证权限
+      const membership = await ctx.prisma.projectMember.findUnique({
+        where: {
+          projectId_userId: {
+            projectId,
+            userId: ctx.user.id,
+          },
+        },
+      });
+
+      if (!membership) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "你不是该项目的成员",
+        });
+      }
+
+      const [tasks, total] = await Promise.all([
+        ctx.prisma.task.findMany({
+          where: {
+            projectId,
+            ...(status && { status }),
+          },
+          skip,
+          take: limit,
+          orderBy: [{ priority: "desc" }, { createdAt: "desc" }],
+          include: {
+            creator: {
+              select: {
+                id: true,
+                name: true,
+                avatar: true,
+              },
+            },
+            assignee: {
+              select: {
+                id: true,
+                name: true,
+                avatar: true,
+              },
+            },
+            _count: {
+              select: {
+                comments: true,
+              },
+            },
+          },
+        }),
+        ctx.prisma.task.count({
+          where: {
+            projectId,
+            ...(status && { status }),
+          },
+        }),
+      ]);
+
+      return {
+        tasks,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      };
+    }),
+
+  // 创建任务
+  create: protectedProcedure
+    .input(
+      z.object({
+        title: z.string().min(1).max(200),
+        description: z.string().optional(),
+        projectId: z.string(),
+        assigneeId: z.string().optional(),
+        priority: z.enum(["LOW", "MEDIUM", "HIGH", "URGENT"]).default("MEDIUM"),
+        dueDate: z.date().optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const membership = await ctx.prisma.projectMember.findUnique({
+        where: {
+          projectId_userId: {
+            projectId: input.projectId,
+            userId: ctx.user.id,
+          },
+        },
+      });
+
+      if (!membership) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "你不是该项目的成员",
+        });
+      }
+
+      const task = await ctx.prisma.task.create({
+        data: {
+          ...input,
+          creatorId: ctx.user.id,
+        },
+        include: {
+          creator: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+          assignee: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+        },
+      });
+
+      return task;
+    }),
+
+  // 更新任务状态
+  updateStatus: protectedProcedure
+    .input(
+      z.object({
+        taskId: z.string(),
+        status: z.enum(["TODO", "IN_PROGRESS", "REVIEW", "DONE", "CANCELLED"]),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const task = await ctx.prisma.task.findUnique({
+        where: { id: input.taskId },
+      });
+
+      if (!task) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "任务不存在",
+        });
+      }
+
+      const membership = await ctx.prisma.projectMember.findUnique({
+        where: {
+          projectId_userId: {
+            projectId: task.projectId,
+            userId: ctx.user.id,
+          },
+        },
+      });
+
+      if (!membership) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "你不是该项目的成员",
+        });
+      }
+
+      const updated = await ctx.prisma.task.update({
+        where: { id: input.taskId },
+        data: { status: input.status },
+        include: {
+          creator: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+          assignee: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+        },
+      });
+
+      return updated;
+    }),
+});
+```
+
+### 合并 Router
+
+```typescript
+// server/trpc/routers/index.ts
+
+import { router } from "../index";
+import { tasksRouter } from "./tasks";
+import { projectsRouter } from "./projects";
+import { usersRouter } from "./users";
+
+export const appRouter = router({
+  tasks: tasksRouter,
+  projects: projectsRouter,
+  users: usersRouter,
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+### 创建 API 路由处理器
+
+```typescript
+// server/api/trpc/[...].ts
+
+import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
+import { appRouter } from "~/server/trpc/routers";
+import { createContext } from "~/server/trpc/context";
+
+export default defineEventHandler((event) => {
+  return fetchRequestHandler({
+    endpoint: "/api/trpc",
+    req: event.node.req,
+    res: event.node.res,
+    router: appRouter,
+    createContext: () => createContext(event),
+  });
+});
+```
+
+## 在 Vue 组件中使用 tRPC
+
+### 服务端渲染页面
+
+在 Nuxt 中，默认情况下页面组件是服务端渲染的。我们可以使用 `useAsyncData` 来获取数据：
+
+```vue
+<!-- app/pages/projects/[id].vue -->
+
+<script setup lang="ts">
+const route = useRoute();
+const projectId = route.params.id as string;
+
+// 服务端获取数据
+const { data, pending, error } = await useAsyncData(`tasks-${projectId}`, () =>
+  $trpc.tasks.list.query({
+    projectId,
+    page: 1,
+    limit: 100,
+  })
+);
+
+if (error.value) {
+  throw createError({
+    statusCode: error.value?.statusCode || 500,
+    statusMessage: "加载失败",
+  });
+}
+
+// SEO 元数据
+useHead({
+  title: "项目任务",
+});
+</script>
+
+<template>
+  <div class="container mx-auto px-4 py-8">
+    <div v-if="pending" class="text-center py-8">加载中...</div>
+
+    <div v-else>
+      <h1 class="text-3xl font-bold mb-6">项目任务</h1>
+
+      <!-- 任务列表 -->
+      <div class="grid gap-4">
+        <div
+          v-for="task in data?.tasks"
+          :key="task.id"
+          class="border rounded-lg p-4"
+        >
+          <h3 class="font-semibold text-lg">{{ task.title }}</h3>
+          <p v-if="task.description" class="text-gray-600 mt-2">
+            {{ task.description }}
+          </p>
+          <div class="flex gap-4 mt-4 text-sm text-gray-500">
+            <span v-if="task.assignee"> 负责人：{{ task.assignee.name }} </span>
+            <span>优先级：{{ task.priority }}</span>
+            <span>状态：{{ task.status }}</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+```
+
+### 客户端交互组件
+
+对于需要交互的功能，我们可以使用客户端组件：
+
+```vue
+<!-- app/components/TaskBoard.vue -->
+
+<script setup lang="ts">
+import { ref } from "vue";
+
+interface Props {
+  projectId: string;
+}
+
+const props = defineProps<Props>();
+
+const filter = ref<string | undefined>(undefined);
+
+// 获取任务列表
+const { data, pending, refresh } = await useAsyncData(
+  `tasks-${props.projectId}-${filter.value || "all"}`,
+  () =>
+    $trpc.tasks.list.query({
+      projectId: props.projectId,
+      status: filter.value as any,
+      page: 1,
+      limit: 100,
+    })
+);
+
+// 创建任务
+const createTask = $trpc.tasks.create.useMutation({
+  onSuccess: () => {
+    refresh();
+  },
+});
+
+// 更新任务状态
+const updateStatus = $trpc.tasks.updateStatus.useMutation({
+  onSuccess: () => {
+    refresh();
+  },
+});
+
+// 过滤器
+const filters = [
+  { label: "全部", value: undefined },
+  { label: "待办", value: "TODO" },
+  { label: "进行中", value: "IN_PROGRESS" },
+  { label: "已完成", value: "DONE" },
+];
+</script>
+
+<template>
+  <div>
+    <!-- 过滤器 -->
+    <div class="flex gap-2 mb-6">
+      <button
+        v-for="f in filters"
+        :key="f.label"
+        @click="filter = f.value"
+        :class="
+          filter === f.value
+            ? 'px-4 py-2 bg-blue-600 text-white rounded'
+            : 'px-4 py-2 border rounded'
+        "
+      >
+        {{ f.label }}
+      </button>
+    </div>
+
+    <!-- 加载状态 -->
+    <div v-if="pending" class="text-center py-8">加载中...</div>
+
+    <!-- 任务列表 -->
+    <div v-else class="grid gap-4">
+      <div
+        v-for="task in data?.tasks"
+        :key="task.id"
+        class="border rounded-lg p-4"
+      >
+        <div class="flex justify-between items-start">
+          <div>
+            <h3 class="font-semibold text-lg">{{ task.title }}</h3>
+            <p v-if="task.description" class="text-gray-600 mt-2">
+              {{ task.description }}
+            </p>
+            <div class="flex gap-4 mt-4 text-sm text-gray-500">
+              <span v-if="task.assignee">
+                负责人：{{ task.assignee.name }}
+              </span>
+              <span>优先级：{{ task.priority }}</span>
+            </div>
+          </div>
+          <select
+            :value="task.status"
+            @change="
+              updateStatus.mutate({
+                taskId: task.id,
+                status: ($event.target as HTMLSelectElement).value as any,
+              })
+            "
+            class="border rounded px-3 py-2"
+            :disabled="updateStatus.pending.value"
+          >
+            <option value="TODO">待办</option>
+            <option value="IN_PROGRESS">进行中</option>
+            <option value="REVIEW">审核中</option>
+            <option value="DONE">已完成</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+```
+
+### 创建任务表单
+
+```vue
+<!-- app/components/CreateTaskModal.vue -->
+
+<script setup lang="ts">
+import { ref } from "vue";
+
+interface Props {
+  projectId: string;
+}
+
+const props = defineProps<Props>();
+const emit = defineEmits(["close"]);
+
+const title = ref("");
+const description = ref("");
+const assigneeId = ref<string | undefined>(undefined);
+const priority = ref<"LOW" | "MEDIUM" | "HIGH" | "URGENT">("MEDIUM");
+
+const createTask = $trpc.tasks.create.useMutation({
+  onSuccess: () => {
+    emit("close");
+    title.value = "";
+    description.value = "";
+    assigneeId.value = undefined;
+    priority.value = "MEDIUM";
+  },
+});
+
+const handleSubmit = () => {
+  if (!title.value.trim()) {
+    alert("请输入任务标题");
+    return;
+  }
+
+  createTask.mutate({
+    title: title.value,
+    description: description.value || undefined,
+    projectId: props.projectId,
+    assigneeId: assigneeId.value,
+    priority: priority.value,
+  });
+};
+</script>
+
+<template>
+  <div class="fixed inset-0 bg-black/50 flex items-center justify-center">
+    <div class="bg-white rounded-lg p-6 max-w-2xl w-full mx-4">
+      <h2 class="text-2xl font-bold mb-4">创建任务</h2>
+
+      <form @submit.prevent="handleSubmit" class="space-y-4">
+        <div>
+          <label class="block mb-2 font-semibold">标题</label>
+          <input
+            v-model="title"
+            type="text"
+            required
+            class="w-full px-4 py-2 border rounded-lg"
+            placeholder="输入任务标题..."
+          />
+        </div>
+
+        <div>
+          <label class="block mb-2 font-semibold">描述</label>
+          <textarea
+            v-model="description"
+            rows="4"
+            class="w-full px-4 py-2 border rounded-lg"
+            placeholder="输入任务描述..."
+          />
+        </div>
+
+        <div>
+          <label class="block mb-2 font-semibold">优先级</label>
+          <select v-model="priority" class="w-full px-4 py-2 border rounded-lg">
+            <option value="LOW">低</option>
+            <option value="MEDIUM">中</option>
+            <option value="HIGH">高</option>
+            <option value="URGENT">紧急</option>
+          </select>
+        </div>
+
+        <div class="flex justify-end gap-3">
+          <button
+            type="button"
+            @click="emit('close')"
+            class="px-4 py-2 border rounded-lg"
+          >
+            取消
+          </button>
+          <button
+            type="submit"
+            :disabled="createTask.pending.value"
+            class="px-6 py-2 bg-blue-600 text-white rounded-lg disabled:opacity-50"
+          >
+            {{ createTask.pending.value ? "创建中..." : "创建" }}
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+</template>
+```
+
+## Composables 代码复用
+
+Nuxt 的 Composables 是一个很好的代码复用机制：
+
+```typescript
+// app/composables/useTasks.ts
+
+export const useTasks = (
+  projectId: string,
+  filter?: Ref<string | undefined>
+) => {
+  const { data, pending, error, refresh } = useAsyncData(
+    computed(() => `tasks-${projectId}-${filter?.value || "all"}`),
+    () =>
+      $trpc.tasks.list.query({
+        projectId,
+        status: filter?.value as any,
+        page: 1,
+        limit: 100,
+      })
+  );
+
+  const createTask = $trpc.tasks.create.useMutation({
+    onSuccess: () => {
+      refresh();
+    },
+  });
+
+  const updateStatus = $trpc.tasks.updateStatus.useMutation({
+    onSuccess: () => {
+      refresh();
+    },
+  });
+
+  return {
+    tasks: computed(() => data.value?.tasks || []),
+    pending,
+    error,
+    refresh,
+    createTask,
+    updateStatus,
+  };
+};
+```
+
+使用这个 composable：
+
+```vue
+<script setup lang="ts">
+const props = defineProps<{ projectId: string }>();
+const filter = ref<string | undefined>(undefined);
+
+const { tasks, pending, createTask, updateStatus } = useTasks(
+  props.projectId,
+  filter
+);
+</script>
+```
+
+## 性能优化
+
+### 1. 数据缓存
+
+```typescript
+const { data } = await useAsyncData(
+  "tasks",
+  () =>
+    $trpc.tasks.list.query({
+      projectId,
+      page: 1,
+      limit: 20,
+    }),
+  {
+    // 5分钟内不会重新获取
+    getCachedData: (key) => useNuxtData(key).data,
+  }
+);
+```
+
+### 2. 预取数据
+
+```vue
+<script setup lang="ts">
+// 预取用户信息
+const { data: user } = await useAsyncData("user", () => $trpc.users.me.query());
+
+// 预取项目统计
+const { data: stats } = await useAsyncData("stats", () =>
+  $trpc.stats.overview.query()
+);
+</script>
+```
+
+### 3. 懒加载组件
+
+```vue
+<script setup lang="ts">
+// 仅在客户端加载的组件
+const TaskBoard = defineAsyncComponent(
+  () => import("~/components/TaskBoard.vue")
+);
+</script>
+
+<template>
+  <div>
+    <h1>项目任务</h1>
+    <!-- 懒加载任务看板 -->
+    <ClientOnly>
+      <TaskBoard />
+      <template #fallback>
+        <div>加载中...</div>
+      </template>
+    </ClientOnly>
+  </div>
+</template>
+```
+
+## 与 Next.js 的实际差异
+
+虽然两者都能提供相同的类型安全，但在实际使用中有一些差异：
+
+### API 调用方式
+
+**Next.js:**
+
+```typescript
+// 服务端组件
+import { serverClient } from '@/lib/trpc/server';
+
+export default async function Page() {
+  const tasks = await serverClient.tasks.list.query();
+  return <TaskList tasks={tasks} />;
+}
+
+// 客户端组件
+'use client';
+import { trpc } from '@/lib/trpc/client';
+
+export function TaskList() {
+  const { data } = trpc.tasks.list.useQuery();
+  return <div>{/* ... */}</div>;
+}
+```
+
+**Nuxt:**
+
+```typescript
+// 服务端（默认）
+const { data } = await useAsyncData(() => $trpc.tasks.list.query());
+
+// 客户端（需要 <ClientOnly>）
+const { data } = useAsyncData("tasks", () => $trpc.tasks.list.query());
+```
+
+### 组件定义风格
+
+**Next.js (React JSX):**
+
+```tsx
+"use client";
+import { trpc } from "@/lib/trpc/client";
+
+export function TaskList() {
+  const { data, isLoading } = trpc.tasks.list.useQuery();
+  if (isLoading) return <div>Loading...</div>;
+  return (
+    <div>
+      {data?.tasks.map((task) => (
+        <div key={task.id}>
+          <h3>{task.title}</h3>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+**Nuxt (Vue Template):**
+
+```vue
+<script setup lang="ts">
+const { data, pending } = await useAsyncData(() => $trpc.tasks.list.query());
+</script>
+
+<template>
+  <div>
+    <div v-if="pending">Loading...</div>
+    <div v-else>
+      <div v-for="task in data?.tasks" :key="task.id">
+        <h3>{{ task.title }}</h3>
+      </div>
+    </div>
+  </div>
+</template>
+```
+
+### 状态管理
+
+**Next.js (React Query):**
+
+```typescript
+const utils = trpc.useContext();
+
+const createTask = trpc.tasks.create.useMutation({
+  onSuccess: () => {
+    utils.tasks.list.invalidate();
+  },
+});
+```
+
+**Nuxt (useAsyncData):**
+
+```typescript
+const { data, refresh } = await useAsyncData("tasks", () =>
+  $trpc.tasks.list.query()
+);
+
+const createTask = $trpc.tasks.create.useMutation({
+  onSuccess: () => {
+    refresh();
+  },
+});
+```
+
+## 权衡与取舍
+
+Nuxt + tRPC 的组合在 Vue 生态中非常强大，但也有一些需要考虑的地方：
+
+**优势：**
+
+- 端到端的类型安全，与 Next.js 相同
+- Vue 的模板语法更直观，学习曲线较平缓
+- Composition API 的代码组织非常清晰
+- 自动导入功能减少了很多样板代码
+
+**劣势：**
+
+- Vue 生态相对 React 较小
+- 某些高级库的集成可能不如 React 丰富
+- 服务端渲染的实现方式与 Next.js 不同，需要适应
+
+**适用场景：**
+
+- 团队更熟悉 Vue
+- 喜欢模板语法而不是 JSX
+- 需要快速开发原型
+
+## 下一步
+
+现在我们已经了解了如何在 React（Next.js）和 Vue（Nuxt）生态中使用 tRPC。但这两个框架都是面向 Web 应用的，如果你需要构建企业级的后端服务，或者需要与其他系统集成，那么 NestJS 可能是更好的选择。
+
+在下一篇文章中，我们将学习如何在 NestJS 中集成 tRPC，利用其强大的模块系统和依赖注入机制。
+
+---

@@ -1,0 +1,368 @@
+---
+title: "12 异步任务与定时任务"
+date: "2026-03-30"
+summary: "setImmediate 和 @Async 有什么区别？从 CMS 的异步通知和定时清理出发，理解 Spring 的异步任务和定时任务机制。"
+tags: ["Spring Boot", "异步", "定时任务", "@Async"]
+category: "springboot"
+cover: ""
+draft: false
+series: "Spring Boot 实战"
+seriesOrder: 12
+---
+
+CMS 的文章发布接口有个问题：发布一篇文章后，系统需要做一系列后续操作——通知订阅者、更新搜索索引、清理相关缓存、记录发布日志。如果这些操作同步执行，用户点"发布"后要等 3-5 秒才能看到响应。
+
+在 Node.js 里这不算什么问题。事件循环天然就是异步的——你发个邮件用 `Promise` 或 `async/await` 包一下，HTTP 请求的回调继续处理，邮件在后台慢慢发。`setImmediate`、`process.nextTick`、`queueMicrotask`，Node.js 给你提供了多个层级的异步调度能力。
+
+但 Java 不同。Java 的 web 服务器（Tomcat）用线程池处理请求——一个请求占一个线程，方法调用默认是同步的。如果你在 Controller 里调用 `emailService.send()`，当前线程会一直阻塞直到邮件发完。要让方法"异步执行"，你需要显式告诉 Spring：这个方法应该在另一个线程里跑。这就是 `@Async` 存在的原因。
+
+## @Async：把方法扔到另一个线程
+
+先看最基本的使用方式：
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+}
+```
+
+`@EnableAsync` 是总开关，没有它 `@Async` 注解不会生效。然后在需要异步执行的方法上加注解：
+
+```java
+@Service
+public class NotificationService {
+
+    @Async
+    public void sendPublishNotification(Long postId, String authorName) {
+        // 模拟发送邮件，耗时 3 秒
+        try {
+            Thread.sleep(3000);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        // 发送邮件、推送通知等...
+    }
+}
+```
+
+Controller 调用这个方法时，Spring 会把 `sendPublishNotification` 的执行交给另一个线程，当前线程立刻返回，HTTP 响应在几十毫秒内返回给用户。
+
+```java
+@RestController
+@RequestMapping("/api/posts")
+public class PostController {
+
+    private final PostService postService;
+    private final NotificationService notificationService;
+
+    public PostController(PostService postService, NotificationService notificationService) {
+        this.postService = postService;
+        this.notificationService = notificationService;
+    }
+
+    @PostMapping("/{id}/publish")
+    public Result<Post> publishPost(@PathVariable Long id) {
+        Post post = postService.publishPost(id);
+        // 异步通知，不阻塞响应
+        notificationService.sendPublishNotification(post.getId(), post.getAuthor().getUsername());
+        return Result.success(post);
+    }
+}
+```
+
+这里有一个关键的坑：**`@Async` 基于代理实现，同一个类内部的方法调用不会走代理。** 如果你在一个 Service 的方法 A 里调用同类的 `@Async` 方法 B，方法 B 仍然是同步执行的。解决方法是把异步方法抽到另一个 Bean 中，或者注入自身的代理。
+
+## ThreadPoolTaskExecutor：线程池配置
+
+默认情况下，`@Async` 使用 Spring 的 `SimpleAsyncTaskExecutor`——它每次调用都创建一个新线程，不复用。在生产环境中这会导致线程数爆炸。你需要配置一个合理的线程池：
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig {
+
+    @Bean("cmsTaskExecutor")
+    public Executor taskExecutor() {
+        ThreadPoolTaskExecutor executor = new ThreadPoolTaskExecutor();
+        executor.setCorePoolSize(4);           // 核心线程数
+        executor.setMaxPoolSize(8);            // 最大线程数
+        executor.setQueueCapacity(100);        // 等待队列容量
+        executor.setThreadNamePrefix("cms-async-");
+        executor.setRejectedExecutionHandler(new ThreadPoolExecutor.CallerRunsPolicy());
+        executor.setWaitForTasksToCompleteOnShutdown(true);   // 优雅关闭
+        executor.setAwaitTerminationSeconds(30);              // 等待未完成任务完成
+        executor.initialize();
+        return executor;
+    }
+}
+```
+
+逐行拆解这些参数：
+
+- **`corePoolSize(4)`** —— 常驻线程数。即使空闲也不销毁。设置为 CPU 核心数通常是合理的起点
+- **`maxPoolSize(8)`** —— 当核心线程都在忙且队列已满时，会创建新线程直到达到这个上限
+- **`queueCapacity(100)`** —— 等待队列。当核心线程都忙时，新任务先排队。队列满后才创建新线程
+- **`CallerRunsPolicy`** —— 拒绝策略。当线程池和队列都满了，新来的任务由调用线程（Tomcat 线程）自己执行。这相当于"降级为同步"，虽然慢了但不会丢任务
+- **`waitForTasksToCompleteOnShutdown(true)`** —— 应用关闭时等待正在执行的任务完成，而不是暴力中断
+
+指定线程池：
+
+```java
+@Async("cmsTaskExecutor")
+public void sendPublishNotification(Long postId, String authorName) {
+    // 使用指定的线程池执行
+}
+```
+
+## 异步方法的返回值
+
+`@Async` 方法可以返回 `void`（"发完就不管"），也可以返回 `CompletableFuture`（"需要知道结果"）：
+
+```java
+@Service
+public class SearchService {
+
+    @Async("cmsTaskExecutor")
+    public CompletableFuture<Void> rebuildSearchIndex() {
+        // 耗时的索引重建
+        List<Post> allPosts = postRepository.findAll();
+        searchClient.bulkIndex(allPosts);
+        return CompletableFuture.completedFuture(null);
+    }
+}
+```
+
+Controller 里可以组合多个异步任务：
+
+```java
+@PostMapping("/{id}/publish")
+public Result<Post> publishPost(@PathVariable Long id) {
+    Post post = postService.publishPost(id);
+
+    // 多个异步任务并行执行
+    CompletableFuture.allOf(
+        notificationService.sendPublishNotification(post.getId()),
+        searchService.updateIndex(post)
+    ).orTimeout(5, TimeUnit.SECONDS); // 设置超时
+
+    return Result.success(post);
+}
+```
+
+`CompletableFuture.allOf()` 等待所有任务完成，`orTimeout` 设置超时上限。这和 Node.js 的 `Promise.all()` + `setTimeout` 逻辑等价，但 Java 的线程池模型让你对并发度有更精确的控制。
+
+## 异步异常处理
+
+异步方法里抛出的异常不会传播到调用方——因为它们在不同的线程里执行。如果不处理，异常会被吞掉。Spring 提供了 `AsyncUncaughtExceptionHandler`：
+
+```java
+@Configuration
+@EnableAsync
+public class AsyncConfig implements AsyncConfigurer {
+
+    @Override
+    public Executor getAsyncExecutor() {
+        // 返回上面配置的线程池
+        return taskExecutor();
+    }
+
+    @Override
+    public AsyncUncaughtExceptionHandler getAsyncUncaughtExceptionHandler() {
+        return (ex, method, params) -> {
+            // 记录异常日志
+            log.error("异步任务执行失败 - 方法: {}, 参数: {}", method.getName(), params, ex);
+            // 可以在这里触发告警、重试等
+        };
+    }
+}
+```
+
+如果异步方法返回 `CompletableFuture`，异常不会走 `AsyncUncaughtExceptionHandler`——它会包含在 `CompletableFuture` 中，调用方需要用 `.exceptionally()` 处理：
+
+```java
+notificationService.sendPublishNotification(post.getId())
+    .exceptionally(ex -> {
+        log.error("通知发送失败", ex);
+        return null; // 降级处理
+    });
+```
+
+这和 Node.js 的 `Promise.catch()` 语义完全一致。
+
+## @Scheduled：定时任务
+
+CMS 有一些需要定时执行的任务：每天凌晨清理超过 30 天的草稿、每小时更新热门文章缓存、每 5 分钟检查长时间未支付订单的状态。这些任务不需要用户触发，系统自动按计划执行。
+
+```java
+@Configuration
+@EnableScheduling
+public class SchedulingConfig {
+}
+```
+
+```java
+@Component
+@Slf4j
+public class CmsScheduledTasks {
+
+    private final PostRepository postRepository;
+    private final HotPostCacheService hotPostCacheService;
+
+    public CmsScheduledTasks(PostRepository postRepository,
+                              HotPostCacheService hotPostCacheService) {
+        this.postRepository = postRepository;
+        this.hotPostCacheService = hotPostCacheService;
+    }
+
+    // 每天凌晨 2 点清理 30 天前的草稿
+    @Scheduled(cron = "0 0 2 * * ?")
+    public void cleanOldDrafts() {
+        LocalDateTime threshold = LocalDateTime.now().minusDays(30);
+        List<Post> oldDrafts = postRepository.findByStatusAndCreatedAtBefore(
+            PostStatus.DRAFT, threshold);
+
+        if (!oldDrafts.isEmpty()) {
+            postRepository.deleteAll(oldDrafts);
+            log.info("清理了 {} 篇过期草稿", oldDrafts.size());
+        }
+    }
+
+    // 每小时刷新热门文章缓存
+    @Scheduled(fixedRate = 3600000)
+    public void refreshHotPostsCache() {
+        hotPostCacheService.evictHotPosts();
+        hotPostCacheService.getHotPosts();
+        log.info("热门文章缓存已刷新");
+    }
+
+    // 应用启动后延迟 30 秒执行一次
+    @Scheduled(initialDelay = 30000, fixedDelay = 300000)
+    public void healthCheck() {
+        // 每 5 分钟检查一次系统健康状态
+    }
+}
+```
+
+三种调度方式的选择：
+
+- **`fixedRate`** —— 固定频率。不管上次任务有没有执行完，到时间就触发下一次。适合执行时间短且周期固定的任务（比如缓存刷新）
+- **`fixedDelay`** —— 固定延迟。上次任务执行完成后，等待指定时间再执行下一次。适合执行时间不确定的任务（比如数据库清理）
+- **`cron`** —— Cron 表达式。最灵活，适合"每天凌晨 2 点"这种时间规则
+
+Cron 表达式的格式：`秒 分 时 日 月 周`
+
+```
+0 0 2 * * ?       每天凌晨 2 点
+0 0/30 * * * ?    每 30 分钟
+0 0 8-18 * * 1-5  工作日 8 点到 18 点，每小时整点
+0 0 0 1 * ?       每月 1 号凌晨
+```
+
+`@Scheduled` 默认使用单线程执行。如果多个定时任务中有耗时操作，会互相阻塞。生产环境中建议配置独立的调度线程池：
+
+```java
+@Bean
+public TaskScheduler taskScheduler() {
+    ThreadPoolTaskScheduler scheduler = new ThreadPoolTaskScheduler();
+    scheduler.setPoolSize(4);
+    scheduler.setThreadNamePrefix("cms-schedule-");
+    return scheduler;
+}
+```
+
+## Node.js 事件循环 vs Java 线程池
+
+这是理解两个技术栈异步模型差异的核心。
+
+Node.js 的事件循环是单线程的。所有的异步 I/O（网络请求、文件读写、定时器）都被注册到事件队列中，事件循环线程不断从队列中取出任务执行。你不需要手动管理线程——运行时帮你做了。但代价是 CPU 密集型任务会阻塞整个事件循环。
+
+```js
+// Node.js 的异步——事件循环自动调度
+app.post("/api/posts/:id/publish", async (req, res) => {
+  const post = await postService.publish(req.params.id);
+
+  // 这些都是非阻塞的，事件循环自动调度
+  emailService.sendNotification(post.id); // I/O 操作，不阻塞
+  searchService.updateIndex(post); // I/O 操作，不阻塞
+
+  res.json({ data: post }); // 立即响应
+});
+```
+
+Java 的 `@Async` 是多线程的。每个异步方法在一个独立的线程中执行，由线程池管理。你显式控制线程数量、队列大小、拒绝策略。这给了你更精细的并发控制，但代价是需要理解线程池的工作原理。
+
+```
+Node.js:                          Java:
+单线程事件循环                     多线程 + 线程池
+  │                                 │
+  ▼                                 ▼
+事件队列                           ThreadPoolTaskExecutor
+  │                                 │
+  ├─ Timer (setTimeout)            ├─ Core Pool (4 线程)
+  ├─ I/O Callbacks                 ├─ Max Pool (8 线程)
+  ├─ Idle, Prepare                 └─ Queue (100 容量)
+  ├─ Poll (check I/O)
+  ├─ setImmediate
+  └─ Close callbacks
+```
+
+对于定时任务，Node.js 用 `setInterval` / `setTimeout` / node-cron：
+
+```js
+const cron = require("node-cron");
+
+// 每天凌晨 2 点清理草稿
+cron.schedule("0 2 * * *", async () => {
+  const threshold = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  await Post.destroy({
+    where: { status: "DRAFT", createdAt: { [Op.lt]: threshold } },
+  });
+});
+```
+
+功能等价，但有一个重要区别：**Node.js 的定时任务运行在事件循环线程中，如果任务阻塞了，整个服务都会受影响。** Java 的定时任务运行在独立的线程池中，即使任务阻塞了，Tomcat 的请求处理线程不受影响。
+
+## 完整对比
+
+| 维度           | Node.js                           | Spring Boot                                 |
+| -------------- | --------------------------------- | ------------------------------------------- |
+| 异步模型       | 单线程事件循环                    | 多线程 + 线程池                             |
+| 异步声明       | `async/await`（语言级）           | `@Async`（框架级，需要显式声明）            |
+| 并发控制       | 不需要手动管理                    | 需要配置线程池参数                          |
+| CPU 密集型任务 | 阻塞事件循环，需要 Worker Threads | 线程池天然支持                              |
+| 定时任务       | `setInterval` / node-cron         | `@Scheduled` + Cron 表达式                  |
+| 异常传播       | `Promise.catch()`                 | `AsyncUncaughtExceptionHandler`             |
+| 优雅关闭       | `process.on('SIGTERM')` 手动处理  | `waitForTasksToCompleteOnShutdown` 内置支持 |
+| 上下文传递     | 闭包自动捕获                      | `SecurityContext` 需要手动传递到子线程      |
+
+## Trade-off 分析
+
+**Spring 线程池模型的收益：**
+
+- CPU 密集型任务不会阻塞请求处理。`@Async` 的异步方法在线程池中执行，Tomcat 线程立即释放去处理下一个请求。这在 CMS 的搜索索引重建、邮件批量发送等耗时操作中效果显著
+- 精确的并发控制。你可以限制最多 8 个线程同时执行异步任务，超过的排队等待。Node.js 没有这种控制——所有任务都在一个线程里排队
+- `@Scheduled` 提供了结构化的定时任务管理。注解声明、Cron 表达式、线程池隔离，比 Node.js 里散落各处的 `setInterval` 更容易维护
+- 优雅关闭有内置支持。应用停机时等待异步任务完成，避免任务执行到一半被中断
+
+**代价：**
+
+- 需要理解线程池。`corePoolSize`、`maxPoolSize`、`queueCapacity`、拒绝策略——这些参数配错了会导致任务丢失或线程耗尽。Node.js 没有这些概念，门槛更低
+- `@Async` 的代理限制。同类内部调用不生效、`SecurityContext` 不自动传递——这些坑在 Node.js 里不存在（因为 Node.js 本来就是单线程的）
+- 线程上下文切换有开销。每个线程有独立的栈空间（默认 1MB），100 个线程就是 100MB 内存。Node.js 的单线程模型在 I/O 密集型场景下更轻量
+- 调试更困难。异步任务在另一个线程里执行，异常堆栈和请求日志的关联不如 Node.js 的 async/await 直观
+
+如果你问"setImmediate 和 @Async 有什么区别"，最核心的差异是：setImmediate 是事件循环层面的调度，天然就是异步的，不需要你做任何事情；@Async 是框架层面的多线程调度，你需要显式启用、配置线程池、处理上下文传递。Node.js 把异步做成了默认行为，Java 把异步做成了需要主动选择的行为。
+
+## 回顾与预告
+
+到这篇为止，CMS 的异步和定时任务能力已经到位：
+
+- `@Async` 把同步方法变成异步执行，让 HTTP 请求不用等待耗时操作
+- `ThreadPoolTaskExecutor` 提供了线程池的精细控制——核心线程、最大线程、队列、拒绝策略
+- `@Scheduled` 实现了定时任务调度，支持 Cron 表达式
+- 异步异常需要显式处理——`AsyncUncaughtExceptionHandler` 或 `CompletableFuture.exceptionally()`
+
+但有些场景比异步任务更复杂——比如 CMS 的评论系统，用户提交评论后，所有正在看这篇文章的人应该立刻看到新评论。这需要服务端主动向客户端推送数据，HTTP 的请求-响应模型做不到这一点。
+
+下一篇讲 WebSocket 实时通信——用 STOMP 协议实现 CMS 的评论实时推送，对比 Spring WebSocket 和 Node.js Socket.io 两种方案。

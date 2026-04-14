@@ -1,0 +1,262 @@
+---
+title: "04 数据持久化：容器里的数据去哪了"
+date: "2025-03-30"
+summary: "容器删了数据就没了？通过 Volume 和 Bind Mount 两种方式解决容器数据持久化问题，理解容器文件系统的真相。"
+tags: ["Docker", "Volume", "数据持久化", "存储"]
+category: "docker"
+cover: ""
+draft: false
+series: "Docker 从入门到实战"
+seriesOrder: 4
+---
+
+上一篇我们把订单 API 打包成了 Docker 镜像，也用 Docker 跑起了 PostgreSQL。现在让我们模拟一个真实的灾难场景。
+
+先启动 PostgreSQL，创建订单表，插入一条数据：
+
+```bash
+docker run -d --name order-db \
+  -e POSTGRES_PASSWORD=order_secret_2025 \
+  -p 5432:5432 \
+  postgres:16
+```
+
+```bash
+# 插入一条测试订单
+docker exec -it order-db psql -U postgres -d postgres -c \
+  "CREATE TABLE orders (id SERIAL PRIMARY KEY, user_id VARCHAR(20), total_amount DECIMAL(10,2)); \
+   INSERT INTO orders (user_id, total_amount) VALUES ('usr_a1x9k2m', 8999.00);"
+```
+
+一切正常，数据在里面。现在模拟一次"重新部署"——删掉容器，重新启动：
+
+```bash
+docker rm -f order-db
+
+docker run -d --name order-db \
+  -e POSTGRES_PASSWORD=order_secret_2025 \
+  -p 5432:5432 \
+  postgres:16
+```
+
+再查一下数据：
+
+```bash
+docker exec -it order-db psql -U postgres -d postgres -c "SELECT * FROM orders;"
+# ERROR:  relation "orders" does not exist
+```
+
+表没了，数据也没了。数据库回到了一个全新的状态。
+
+这在开发时无所谓（反正只是测试数据），但在生产环境中，订单数据是核心资产——删了容器等于删了所有用户的订单。
+
+## 容器文件系统的真相
+
+要理解为什么会这样，需要知道容器文件系统的结构。
+
+上一篇提到，镜像是分层的、只读的。当容器启动时，Docker 在镜像的只读层之上加了一个**可写层（Container Layer）**。容器内所有的文件修改（写入新文件、修改已有文件、删除文件）都发生在这个可写层里。
+
+PostgreSQL 把数据存在 `/var/lib/postgresql/data` 目录下。这些数据写在容器的可写层里。当你 `docker rm` 删除容器时，可写层也被一起删除了——所以数据就没了。
+
+这和虚拟机不一样。虚拟机有自己的虚拟磁盘，你删掉虚拟机实例但磁盘还在，数据还在。容器的设计更轻量，代价就是数据需要你自己管理。
+
+## 三种数据存储方式
+
+Docker 提供了三种在容器外存储数据的方式。
+
+**第一种：容器层（临时存储）**。默认方式，数据写在容器的可写层里。容器删除数据就丢失。只适合不需要持久化的数据（比如缓存、临时文件）。
+
+**第二种：Bind Mount（绑定挂载）**。把宿主机上的一个目录直接挂载到容器里。容器里读写这个目录，实际上是在读写宿主机的文件系统。
+
+```bash
+docker run -d --name order-db \
+  -e POSTGRES_PASSWORD=order_secret_2025 \
+  -p 5432:5432 \
+  -v /home/user/pgdata:/var/lib/postgresql/data \
+  postgres:16
+```
+
+`-v /home/user/pgdata:/var/lib/postgresql/data` 的含义：把宿主机的 `/home/user/pgdata` 目录挂载到容器内的 `/var/lib/postgresql/data`。PostgreSQL 往 `/var/lib/postgresql/data` 写数据，实际写到了宿主机的 `/home/user/pgdata` 里。容器删了，宿主机上的文件还在。
+
+**第三种：Volume（数据卷）**。由 Docker 管理的存储，数据存在 Docker 自己管理的目录下（通常是 `/var/lib/docker/volumes/`），你不需要关心具体路径。
+
+```bash
+docker run -d --name order-db \
+  -e POSTGRES_PASSWORD=order_secret_2025 \
+  -p 5432:5432 \
+  -v order-pgdata:/var/lib/postgresql/data \
+  postgres:16
+```
+
+`-v order-pgdata:/var/lib/postgresql/data` 的含义：创建（或使用已有的）名为 `order-pgdata` 的 Volume，挂载到容器内的 `/var/lib/postgresql/data`。
+
+两种方式的区别在于谁管理存储位置：Bind Mount 你自己指定路径，Volume 由 Docker 管理。
+
+## Volume vs Bind Mount
+
+那什么时候用 Volume，什么时候用 Bind Mount？
+
+**Volume 更适合生产环境**。原因有几个：
+
+1. Docker 统一管理，不依赖宿主机的目录结构。你的 Compose 配置可以在任何机器上跑，不需要提前创建特定目录。
+2. 支持多个容器同时挂载同一个 Volume。
+3. Docker 提供了 Volume 的管理命令（创建、查看、删除、备份）。
+4. 在 macOS 上，Volume 的 I/O 性能比 Bind Mount 好很多（因为 macOS 的 Docker 运行在一个 Linux 虚拟机里，Bind Mount 需要经过 macOS ↔ 虚拟机的文件系统桥接，性能较差）。
+
+**Bind Mount 更适合开发环境**。原因也简单：
+
+1. 你可以直接在宿主机上编辑挂载的文件，容器内立即生效。比如把源代码目录挂载进去，改了代码不需要重新构建镜像。
+2. 路径明确，你知道数据具体在哪，方便用宿主机的工具直接处理。
+
+简单来说：**开发时用 Bind Mount 挂源代码，生产环境用 Volume 管理数据**。
+
+## Volume 的基本操作
+
+```bash
+# 创建一个 Volume
+docker volume create order-pgdata
+
+# 查看所有 Volume
+docker volume ls
+
+# 查看 Volume 的详细信息（包括实际存储路径）
+docker volume inspect order-pgdata
+# 输出：
+# [
+#     {
+#         "CreatedAt": "2025-03-15T08:30:00Z",
+#         "Driver": "local",
+#         "Mountpoint": "/var/lib/docker/volumes/order-pgdata/_data",
+#         "Name": "order-pgdata",
+#         "Scope": "local"
+#     }
+# ]
+
+# 删除 Volume（注意：会删除里面的所有数据）
+docker volume rm order-pgdata
+
+# 删除所有未被任何容器使用的 Volume
+docker volume prune
+```
+
+注意 `docker volume rm` 不会删除正在被容器使用的 Volume。先 `docker rm` 停止并删除容器，再删除 Volume。
+
+## 验证 Volume 持久化
+
+用 Volume 重新跑一次之前的场景：
+
+```bash
+# 创建 Volume
+docker volume create order-pgdata
+
+# 启动 PostgreSQL，挂载 Volume
+docker run -d --name order-db \
+  -e POSTGRES_PASSWORD=order_secret_2025 \
+  -p 5432:5432 \
+  -v order-pgdata:/var/lib/postgresql/data \
+  postgres:16
+
+# 插入数据
+docker exec -it order-db psql -U postgres -d postgres -c \
+  "CREATE TABLE orders (id SERIAL PRIMARY KEY, user_id VARCHAR(20), total_amount DECIMAL(10,2)); \
+   INSERT INTO orders (user_id, total_amount) VALUES ('usr_a1x9k2m', 8999.00);"
+
+# 删除容器
+docker rm -f order-db
+
+# 重新启动，挂载同一个 Volume
+docker run -d --name order-db \
+  -e POSTGRES_PASSWORD=order_secret_2025 \
+  -p 5432:5432 \
+  -v order-pgdata:/var/lib/postgresql/data \
+  postgres:16
+
+# 查看数据——还在！
+docker exec -it order-db psql -U postgres -d postgres -c "SELECT * FROM orders;"
+#  id | user_id    | total_amount
+# ----+------------+--------------
+#   1 | usr_a1x9k2m |     8999.00
+# (1 row)
+```
+
+数据还在。因为数据存放在 Volume `order-pgdata` 里，容器删除不影响 Volume。
+
+## 匿名 Volume 的陷阱
+
+如果你在 `docker run` 时没有给 Volume 起名字，Docker 会创建一个匿名 Volume：
+
+```bash
+# 注意这里没有冒号前面的名字
+docker run -d --name order-db \
+  -v /var/lib/postgresql/data \
+  postgres:16
+```
+
+Docker 会创建一个类似 `a3b2c1d4e5f6...` 的随机名称。你可以在 `docker volume ls` 里看到它，但你很难分辨哪个 Volume 属于哪个容器。
+
+**不要用匿名 Volume 管理重要数据。** 你无法通过名字引用它，清理时容易误删或者遗漏。始终给 Volume 起一个有意义的名字。
+
+## 备份与恢复
+
+Volume 里的数据很重要，定期备份是必要的。备份的思路很简单：启动一个临时容器，把 Volume 挂载进去，把数据打包导出到宿主机。
+
+```bash
+# 备份：把 Volume 数据导出为 tar 文件
+docker run --rm \
+  -v order-pgdata:/source:ro \
+  -v $(pwd):/backup \
+  alpine tar czf /backup/order-pgdata-backup-20250315.tar.gz -C /source .
+
+# 恢复：把 tar 文件导入到 Volume
+docker run --rm \
+  -v order-pgdata:/target \
+  -v $(pwd):/backup \
+  alpine tar xzf /backup/order-pgdata-backup-20250315.tar.gz -C /target
+```
+
+`--rm` 表示容器运行完就自动删除。这里用 `alpine` 镜像是因为它小（只有 5MB），我们只需要它里面的 `tar` 命令。
+
+对于 PostgreSQL，更优雅的方式是用 `pg_dump`：
+
+```bash
+# 备份 PostgreSQL 数据库
+docker exec order-db pg_dump -U postgres postgres > backup.sql
+
+# 恢复
+docker exec -i order-db psql -U postgres postgres < backup.sql
+```
+
+这种方式备份的是 SQL 语句，可读性好，恢复时也更灵活。
+
+## Volume 的实际存储位置
+
+如果你好奇 Volume 的数据到底存在哪：
+
+**Linux 上**，存在 `/var/lib/docker/volumes/` 目录下。每个 Volume 一个子目录：
+
+```
+/var/lib/docker/volumes/
+├── order-pgdata/
+│   └── _data/          # 实际数据在这里
+│       ├── base/
+│       ├── global/
+│       └── pg_wal/
+└── another-volume/
+    └── _data/
+```
+
+**macOS 上**，Docker Desktop 运行在一个 Linux 虚拟机里，Volume 数据存在虚拟机的磁盘映像中（通常在 `~/Library/Containers/com.docker.docker/Data/vms/` 下）。你不能直接在 macOS 文件系统里访问 Volume 的内容，需要通过 `docker run` 的方式来操作。
+
+这也是为什么在 macOS 上 Volume 的 I/O 性能比 Bind Mount 好的原因——Volume 的读写完全发生在 Linux 虚拟机内部，不经过 macOS 文件系统。
+
+## 回顾
+
+这篇我们解决了容器数据持久化的问题。核心结论：
+
+- **容器可写层是临时的**，容器删除数据就丢失。需要持久化的数据必须存到容器外部。
+- **Volume 由 Docker 管理**，适合生产环境——统一管理、跨平台、性能好。
+- **Bind Mount 挂载宿主机目录**，适合开发环境——方便直接编辑文件、实时生效。
+- **不要用匿名 Volume 管理重要数据**，始终起有意义的名字。
+- **定期备份**，用 `pg_dump` 或 `tar` 导出数据。
+
+现在数据不会丢了。但还有一个问题：订单 API 容器和 PostgreSQL 容器是两个独立的容器，API 怎么连上数据库？下一篇来解决容器间的通信问题。

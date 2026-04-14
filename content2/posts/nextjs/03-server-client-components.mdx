@@ -1,0 +1,706 @@
+---
+title: "03. Server Components 与 Client Components"
+date: "2026-03-23"
+summary: "搞清楚 Next.js 中每个组件该在服务端还是客户端运行。这不是二选一，而是一道架构题——选对了，JS bundle 能砍掉一半。"
+tags:
+  [
+    "Next.js",
+    "React Server Components",
+    "Client Components",
+    "性能优化",
+    "TypeScript",
+  ]
+category: "nextjs"
+cover: ""
+draft: false
+series: "Next.js 渐进式全栈开发"
+seriesOrder: 3
+---
+
+## 一个商品列表页的困境
+
+假设你在做一个电商网站。商品列表页的结构很典型：顶部导航栏、中间轮播 Banner、下方商品网格、右侧购物车入口。用户打开页面后，浏览器要先下载一堆 JS（可能 200KB+），然后执行 JS 去发请求拿商品数据，等数据回来再渲染到页面上。整个过程，用户盯着一个转圈圈看了一两秒。
+
+你可能会想：这些商品数据明明在服务端就有，为什么非得绕一圈到客户端再拿一次？轮播图的内容一周才换一次，每次都让客户端重新获取，不是浪费吗？导航栏在所有页面都一样，为什么每个路由都要重新加载它的代码？
+
+这就是 React Server Components（RSC）要解决的问题。上一篇我们用文件系统搭好了路由和布局结构，这篇来搞清楚路由里每个组件到底在哪跑——服务端还是客户端。选对了，你的 JS bundle 能砍掉一半，首屏时间直接减半。
+
+## RSC 到底解决了什么
+
+先回顾一下传统 React SPA 的工作方式。你用 Vite 或 Create React App 搭的项目，所有组件都是"客户端组件"——它们的代码会被打包成 JS 文件发给浏览器，由浏览器的 JS 引擎执行和渲染。这意味着：
+
+- 每个组件的代码都要下载到客户端，即使它只是一个纯展示的静态组件
+- 组件需要数据时，必须通过 API 请求去服务端拿
+- 页面首屏要等 JS 下载完、执行完、数据请求完，用户才能看到内容
+
+RSC 的思路是：既然有些组件根本不需要在客户端运行，那就别把它们发给客户端。服务端直接把组件渲染成 HTML，客户端收到的就是最终结果。
+
+具体来说，Server Components 有两个核心能力：
+
+1. **直接访问后端资源**：可以在组件里直接读数据库、读文件系统、调内部 API，不需要绕一圈
+2. **零客户端 JS 开销**：Server Component 的代码不会打包进客户端 bundle，浏览器完全不知道它们的存在
+
+用一张图来对比两种方式的区别：
+
+```
+传统 SPA 渲染一个商品列表页：
+  浏览器下载 JS (200KB+) → 执行 JS → 发起 API 请求 → 等待响应 → 渲染 HTML
+  用户等待时间：下载 JS + 执行 + 网络请求
+
+RSC 方式渲染同一个页面：
+  服务端查数据库 → 渲染 HTML → 发送给浏览器 → 直接展示
+  浏览器只需下载交互组件的 JS (可能只有 20KB)
+```
+
+## 默认就是 Server Component
+
+在 Next.js App Router 里，`app/` 目录下的所有组件默认都是 Server Component。你不需要加任何标记。
+
+```tsx
+// app/shop/page.tsx
+// 注意：这个文件没有 "use client"，所以它是 Server Component
+
+import { db } from "@/lib/db";
+import { ProductGrid } from "@/components/ProductGrid";
+import { BannerCarousel } from "@/components/BannerCarousel";
+import { CartButton } from "@/components/CartButton";
+
+// Server Component 可以直接用 async/await
+async function ShopPage() {
+  // 直接在组件里查数据库，不需要写 API
+  const products = await db.product.findMany({
+    where: { status: "ACTIVE" },
+    include: { category: true },
+    orderBy: { createdAt: "desc" },
+    take: 24,
+  });
+
+  return (
+    <main>
+      <BannerCarousel />
+      <ProductGrid products={products} />
+      <CartButton />
+    </main>
+  );
+}
+
+export default ShopPage;
+```
+
+上面的代码里，`ShopPage` 是 Server Component。它在服务端执行，查数据库拿到商品数据，然后把整个页面渲染成 HTML 发给浏览器。客户端根本不需要知道 `db.product.findMany` 的存在，也不需要知道这个组件的代码长什么样。
+
+Server Component 还能做这些客户端做不到的事：
+
+- 用 `async/await` 直接获取数据（上面已经演示了）
+- 用 `cookies()` 和 `headers()` 访问请求信息
+- 读取服务端的文件系统、环境变量
+- 调用只有服务端才能访问的内部 API
+
+## "use client" 的真正含义
+
+当你在组件文件顶部写 `"use client"` 时，它做了什么？很多人以为它的意思是"这个组件只在客户端运行"。但实际上，它的意思是**"从这里开始，划定一条客户端边界"**。
+
+这是一个关键区别。`"use client"` 标记的不是单个组件，而是一棵子树。一旦你在某个组件上加了 `"use client"`，它导入的所有组件也都会被打包进客户端 bundle——即使那些组件本身没有加 `"use client"`。
+
+```tsx
+// components/CartButton.tsx
+"use client";
+
+// CartButton 是 Client Component
+// 它导入了 Icon 和 Badge，这两个也会被打包进客户端
+import { Icon } from "./Icon";
+import { Badge } from "./Badge";
+import { useState } from "react";
+
+export function CartButton() {
+  // useState 只能在 Client Component 里用
+  const [count, setCount] = useState(0);
+
+  // onClick 事件处理器也要求 Client Component
+  const handleClick = () => {
+    setCount((prev) => prev + 1);
+  };
+
+  return (
+    <button onClick={handleClick} className="relative">
+      <Icon name="shopping-cart" />
+      {count > 0 && <Badge count={count} />}
+    </button>
+  );
+}
+```
+
+```tsx
+// components/Icon.tsx
+// 注意：这个文件没有 "use client"
+// 但因为被 CartButton（Client Component）导入了，
+// 所以它也会被打包进客户端 bundle
+
+export function Icon({ name }: { name: string }) {
+  // 这里的代码会运行在客户端
+  return (
+    <svg aria-hidden="true">
+      <use href={`#icon-${name}`} />
+    </svg>
+  );
+}
+```
+
+所以 `"use client"` 更准确的理解是：**客户端边界声明**。它告诉打包工具"从这里往下，所有代码都要发到客户端"。
+
+## 什么时候必须用 Client Component
+
+判断一个组件是不是需要标记 `"use client"`，问自己三个问题就行：
+
+**1. 用了 React Hooks 吗？**
+
+`useState`、`useEffect`、`useReducer`、`useRef` 这些 Hooks 只能在客户端运行。如果你的组件用到了任何一个，就必须加 `"use client"`。
+
+```tsx
+// components/SearchBar.tsx
+"use client";
+
+import { useState } from "react";
+
+export function SearchBar() {
+  const [query, setQuery] = useState("");
+  // 搜索框需要追踪输入状态，所以必须是 Client Component
+
+  return (
+    <input
+      type="search"
+      value={query}
+      onChange={(e) => setQuery(e.target.value)}
+      placeholder="搜索商品..."
+    />
+  );
+}
+```
+
+**2. 有浏览器事件处理器吗？**
+
+`onClick`、`onChange`、`onSubmit`、`onKeyDown`……这些事件处理函数只能注册在客户端。如果组件绑定了任何事件，就必须加 `"use client"`。
+
+**3. 用了浏览器 API 吗？**
+
+`window`、`document`、`localStorage`、`IntersectionObserver`、`ResizeObserver`……这些只在浏览器环境里存在。Server Component 运行在 Node.js 里，访问不到这些东西。
+
+```tsx
+// components/StickyHeader.tsx
+"use client";
+
+import { useEffect, useState } from "react";
+
+export function StickyHeader() {
+  const [isScrolled, setIsScrolled] = useState(false);
+
+  useEffect(() => {
+    // 监听滚动事件，浏览器 API
+    const handleScroll = () => {
+      setIsScrolled(window.scrollY > 64);
+    };
+
+    window.addEventListener("scroll", handleScroll);
+    return () => window.removeEventListener("scroll", handleScroll);
+  }, []);
+
+  return (
+    <header
+      className={
+        isScrolled ? "fixed top-0 z-50 bg-white shadow-md" : "relative bg-white"
+      }
+    >
+      {/* 导航内容 */}
+    </header>
+  );
+}
+```
+
+如果以上三个问题的答案都是"没有"，那这个组件大概率应该是 Server Component。
+
+## 什么时候不需要 "use client"
+
+有些场景容易被误判，实际上并不需要 `"use client"`。
+
+**用 `<Link>` 导航不需要**。Next.js 的 `Link` 组件本身会处理客户端路由跳转，它内部做了客户端边界处理，你在外层使用时不需要加 `"use client"`。
+
+```tsx
+// components/Navigation.tsx
+// Server Component，没有 "use client"
+
+import Link from "next/link";
+
+export function Navigation() {
+  // Link 组件可以在 Server Component 里正常使用
+  return (
+    <nav>
+      <Link href="/shop">商城</Link>
+      <Link href="/orders">我的订单</Link>
+      <Link href="/profile">个人中心</Link>
+    </nav>
+  );
+}
+```
+
+**纯展示数据不需要**。如果组件只是接收 props 并渲染 UI，没有任何交互逻辑，它就应该留在服务端。
+
+```tsx
+// components/ProductCard.tsx
+// Server Component，没有 "use client"
+
+type Product = {
+  id: string;
+  name: string;
+  price: number;
+  imageUrl: string;
+  category: { name: string };
+};
+
+export function ProductCard({ product }: { product: Product }) {
+  // 纯展示，不需要客户端 JS
+  return (
+    <article className="group rounded-lg border p-4">
+      <img
+        src={product.imageUrl}
+        alt={product.name}
+        className="aspect-square w-full rounded-md object-cover"
+      />
+      <h3 className="mt-2 font-medium">{product.name}</h3>
+      <span className="text-sm text-gray-500">{product.category.name}</span>
+      <p className="mt-1 text-lg font-bold">¥{product.price.toFixed(2)}</p>
+    </article>
+  );
+}
+```
+
+**用 `<form>` 配合 Server Actions 不需要**。如果你的表单只是用 `action` 属性指向一个 Server Action，没有自定义 `onSubmit` 处理器，那整个表单可以是 Server Component。（我们下一篇详细讲 Server Actions。）
+
+## 组合模式：Server 嵌套 Client
+
+现在来看最重要的规则：**Server Component 可以嵌套 Client Component，但 Client Component 不能嵌套 Server Component**。
+
+为什么？因为 Server Component 运行在服务端，它的代码不会发送到客户端。如果 Client Component 试图 `import` 一个 Server Component，客户端根本找不到那个模块。
+
+但这并不意味着 Client Component 里不能有服务端渲染的内容。有一个巧妙的解决方案：**通过 `children` prop 传递**。
+
+```tsx
+// components/TabPanel.tsx
+"use client";
+
+import { useState } from "react";
+
+// 这是一个 Client Component，负责处理标签切换的交互逻辑
+export function TabPanel({ children }: { children: React.ReactNode }) {
+  const [activeTab, setActiveTab] = useState("description");
+
+  return (
+    <div>
+      <div className="flex gap-2 border-b">
+        <button
+          onClick={() => setActiveTab("description")}
+          className={
+            activeTab === "description"
+              ? "border-b-2 border-blue-500 pb-2"
+              : "pb-2"
+          }
+        >
+          商品详情
+        </button>
+        <button
+          onClick={() => setActiveTab("specifications")}
+          className={
+            activeTab === "specifications"
+              ? "border-b-2 border-blue-500 pb-2"
+              : "pb-2"
+          }
+        >
+          规格参数
+        </button>
+      </div>
+
+      {/* children 可以是任何内容，包括 Server Component 渲染的结果 */}
+      <div className="mt-4">
+        {activeTab === "description" && children}
+        {activeTab === "specifications" && <div>规格参数内容...</div>}
+      </div>
+    </div>
+  );
+}
+```
+
+```tsx
+// app/shop/[id]/page.tsx
+// Server Component
+
+import { db } from "@/lib/db";
+import { TabPanel } from "@/components/TabPanel";
+
+// 这个组件是 Server Component，负责获取商品数据并渲染详情
+async function ProductDescription({ productId }: { productId: string }) {
+  const product = await db.product.findUnique({
+    where: { id: productId },
+    select: {
+      description: true,
+      richContent: true,
+    },
+  });
+
+  if (!product) return <p>商品不存在</p>;
+
+  return (
+    <div className="prose">
+      <p>{product.description}</p>
+      {/* 渲染富文本内容 */}
+      <div dangerouslySetInnerHTML={{ __html: product.richContent }} />
+    </div>
+  );
+}
+
+export default async function ProductDetailPage({
+  params,
+}: {
+  params: { id: string };
+}) {
+  return (
+    <article>
+      <h1>商品详情</h1>
+      {/* Server Component 通过 children 传给 Client Component */}
+      {/* 这是最核心的组合模式 */}
+      <TabPanel>
+        <ProductDescription productId={params.id} />
+      </TabPanel>
+    </article>
+  );
+}
+```
+
+这里的模式很关键：`TabPanel` 是 Client Component，负责切换逻辑。`ProductDescription` 是 Server Component，负责获取和渲染商品详情。它们通过 `children` 组合在一起。服务端渲染时，`ProductDescription` 先执行完，把渲染好的 HTML 作为 `children` 传给 `TabPanel`。客户端收到的是已经渲染好的 HTML，`TabPanel` 只负责切换显示。
+
+## 数据传递的序列化限制
+
+从 Server Component 向 Client Component 传递 props 时，有一个重要限制：**数据必须是可序列化的**。
+
+这意味着你可以传递字符串、数字、布尔值、数组、普通对象。但不能传递函数、类实例、Symbol、undefined（直接作为 prop）等。
+
+```tsx
+// Server Component 向 Client Component 传数据的正确方式
+// app/shop/page.tsx（Server Component）
+
+import { db } from "@/lib/db";
+import { AddToCartButton } from "@/components/AddToCartButton";
+
+async function ShopPage() {
+  const products = await db.product.findMany({
+    take: 12,
+    select: {
+      id: true,
+      name: true,
+      price: true,
+      // 注意：不能 select 出 Date 类型的字段直接传给 Client Component
+      // 需要转换成字符串
+    },
+  });
+
+  return (
+    <div>
+      {products.map((product) => (
+        <AddToCartButton
+          key={product.id}
+          productId={product.id} // 字符串，可序列化
+          productName={product.name} // 字符串，可序列化
+          price={product.price} // 数字，可序列化
+        />
+      ))}
+    </div>
+  );
+}
+```
+
+```tsx
+// components/AddToCartButton.tsx（Client Component）
+"use client";
+
+// 接收的 props 都是可序列化的普通类型
+type AddToCartButtonProps = {
+  productId: string;
+  productName: string;
+  price: number;
+};
+
+export function AddToCartButton({
+  productId,
+  productName,
+  price,
+}: AddToCartButtonProps) {
+  // 注意：不能从 props 接收函数
+  // 比如不能写成 onAddToCart: () => void —— 函数不可序列化
+
+  const handleAdd = () => {
+    // 在 Client Component 内部定义交互逻辑
+    console.log(`添加 ${productName} 到购物车，价格 ¥${price}`);
+    // 调用 API 或 Server Action 来实际添加
+  };
+
+  return (
+    <button
+      onClick={handleAdd}
+      className="rounded-md bg-blue-600 px-4 py-2 text-white"
+    >
+      加入购物车 · ¥{price.toFixed(2)}
+    </button>
+  );
+}
+```
+
+一个容易踩的坑是 Date 对象。数据库返回的 `createdAt` 是 Date 类型，直接传给 Client Component 会报错。你需要手动转换成 ISO 字符串。
+
+## 电商首页组件拆分实战
+
+把前面的知识点串起来，用一个电商首页来演示如何做组件拆分。假设这个首页包含以下模块：
+
+- 顶部导航栏（需要用户登录状态，有下拉菜单交互）
+- 轮播 Banner（静态数据，运营后台配置）
+- 商品分类导航（从数据库读取，纯展示）
+- 商品推荐列表（从数据库读取，有"加入购物车"按钮）
+- 页脚（纯静态内容）
+
+```tsx
+// app/page.tsx（Server Component —— 整个页面的入口）
+// 这个文件没有 "use client"，所以它是 Server Component
+
+import { db } from "@/lib/db";
+import { BannerCarousel } from "@/components/BannerCarousel";
+import { CategoryNav } from "@/components/CategoryNav";
+import { ProductGrid } from "@/components/ProductGrid";
+import { StickyHeader } from "@/components/StickyHeader";
+import { Footer } from "@/components/Footer";
+
+export default async function HomePage() {
+  // 并行获取所有数据，减少等待时间
+  const [banners, categories, products] = await Promise.all([
+    // Banner 数据：运营后台配置，缓存 5 分钟
+    db.banner.findMany({
+      where: { isActive: true },
+      orderBy: { sort: "asc" },
+    }),
+    // 分类数据：变化不频繁
+    db.category.findMany({
+      where: { parentId: null },
+      orderBy: { name: "asc" },
+    }),
+    // 推荐商品：实时数据
+    db.product.findMany({
+      where: { isRecommended: true, status: "ACTIVE" },
+      include: { category: true },
+      take: 20,
+    }),
+  ]);
+
+  return (
+    <>
+      {/* 导航栏有交互逻辑，标记为 Client Component */}
+      <StickyHeader />
+      <main>
+        {/* Banner 数据在服务端获取，组件是纯展示，不需要客户端 JS */}
+        <BannerCarousel banners={banners} />
+        {/* 分类导航也是纯展示 */}
+        <CategoryNav categories={categories} />
+        {/* 商品网格：外层 Server Component 传数据，内层有 Client Component 处理交互 */}
+        <ProductGrid products={products} />
+      </main>
+      {/* 页脚是纯静态内容 */}
+      <Footer />
+    </>
+  );
+}
+```
+
+```tsx
+// components/ProductGrid.tsx（Server Component）
+// 注意：没有 "use client"
+
+import { AddToCartButton } from "./AddToCartButton";
+
+type Product = {
+  id: string;
+  name: string;
+  price: number;
+  imageUrl: string;
+  category: { name: string };
+};
+
+export function ProductGrid({ products }: { products: Product[] }) {
+  return (
+    <section className="mx-auto max-w-7xl px-4 py-8">
+      <h2 className="mb-6 text-2xl font-bold">为你推荐</h2>
+      <div className="grid grid-cols-2 gap-4 md:grid-cols-3 lg:grid-cols-4">
+        {products.map((product) => (
+          <div key={product.id} className="space-y-2">
+            {/* ProductCard 是纯展示的 Server Component */}
+            <div className="rounded-lg border p-3">
+              <img
+                src={product.imageUrl}
+                alt={product.name}
+                className="aspect-square w-full rounded-md object-cover"
+              />
+              <h3 className="mt-2 text-sm font-medium">{product.name}</h3>
+              <span className="text-xs text-gray-500">
+                {product.category.name}
+              </span>
+              <p className="text-base font-bold">¥{product.price.toFixed(2)}</p>
+            </div>
+            {/* AddToCartButton 是 Client Component，因为需要 onClick 交互 */}
+            <AddToCartButton
+              productId={product.id}
+              productName={product.name}
+              price={product.price}
+            />
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+```
+
+仔细看这个架构：`ProductGrid` 是 Server Component，`AddToCartButton` 是 Client Component。Server Component 里嵌套 Client Component，这完全没问题。关键是把交互逻辑（加入购物车的按钮）隔离到最小的 Client Component 里，让整个商品列表的渲染、数据获取都在服务端完成。
+
+## 常见误区
+
+**误区一：把 `"use client"` 加在 layout.tsx 上**
+
+这是一个比较严重的错误。`layout.tsx` 是所有子页面的共享布局，如果加上了 `"use client"`，那整个应用的所有组件都会变成客户端组件，Server Components 的优势全部丧失。
+
+```tsx
+// ❌ 错误做法：layout.tsx 加 "use client"
+"use client";
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html>
+      <body>{children}</body>
+    </html>
+  );
+}
+// 这会让整个应用的所有子组件都变成客户端组件
+
+// ✅ 正确做法：需要交互的部分提取成独立组件
+// layout.tsx（Server Component）
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html>
+      <body>
+        <Header /> {/* 如果 Header 需要交互，在 Header 内部加 "use client" */}
+        {children}
+      </body>
+    </html>
+  );
+}
+```
+
+**误区二：组件需要 props 就加 `"use client"`**
+
+有些同学觉得"这个组件接收了 props，可能需要客户端处理"，就顺手加了 `"use client"`。实际上，Server Component 完全可以接收 props，只是传递的数据必须可序列化。
+
+**误区三：以为 `"use client"` 的组件完全不经过服务端**
+
+加了 `"use client"` 的组件仍然会在服务端做首次渲染（预渲染），生成初始 HTML。只是它的代码也会被发送到客户端，后续的交互（状态更新、事件处理）在客户端执行。所以 `"use client"` 的组件并不等于"纯客户端渲染"。
+
+**误区四：在 Server Component 里直接导入 Client Component 的内部模块**
+
+如果你有一个 Client Component 文件里定义了多个组件和工具函数，不要在 Server Component 里单独导入其中的非客户端组件。因为 `"use client"` 标记的是整个文件，导入文件中的任何导出都会被视为客户端边界的一部分。
+
+```tsx
+// ❌ 错误做法：试图在 Server Component 中导入 Client 文件里的"纯展示"组件
+// components/CartButton.tsx
+"use client";
+export function CartButton() {
+  /* ... */
+}
+export function CartIcon() {
+  /* ... */
+}
+
+// app/page.tsx
+import { CartIcon } from "@/components/CartButton"; // ❌ 这也会被当作 Client Component
+
+// ✅ 正确做法：把不需要客户端的组件拆到独立文件
+// components/icons/CartIcon.tsx（没有 "use client"，是 Server Component）
+export function CartIcon() {
+  /* ... */
+}
+
+// components/CartButton.tsx（有 "use client"，是 Client Component）
+("use client");
+export function CartButton() {
+  /* ... */
+}
+```
+
+## Server Components 的真实收益
+
+说了这么多理论，来点实际数据。下面是一个中等规模电商首页（约 15 个组件）的 bundle 对比：
+
+```
+全部标记为 Client Component（传统 SPA 方式）：
+  客户端 JS bundle：约 380KB（gzip 后约 120KB）
+  首屏内容渲染时间（FCP）：约 1.8s（3G 网络）
+  可交互时间（TTI）：约 3.2s
+
+合理拆分 Server / Client Components：
+  客户端 JS bundle：约 85KB（gzip 后约 28KB）
+  首屏内容渲染时间（FCP）：约 0.6s（3G 网络）
+  可交互时间（TTI）：约 1.4s
+```
+
+bundle 减少了大约 78%。减少的那部分去哪了？它们压根没有被发送到客户端——商品列表的渲染逻辑、数据库查询代码、Markdown 解析库、SEO 相关的组件……这些都在服务端执行完就丢弃了，浏览器根本不需要知道它们的存在。
+
+首屏速度的提升来自两个方面：一是客户端 JS 少了，下载和执行都快了；二是 Server Component 直接输出 HTML，浏览器拿到就能渲染，不需要等 JS 执行完。
+
+## Trade-off 分析
+
+Server Components 不是银弹，在享受它带来的好处的同时，也要清楚它的代价：
+
+**Server Components 的优势：**
+
+- 客户端 JS 大幅减少，页面加载更快
+- 可以直接访问数据库和后端资源，不需要额外的 API 层
+- 对 SEO 友好，服务端直接输出完整 HTML
+- 组件代码不会暴露给客户端，有一定的代码保护作用
+
+**Server Components 的代价：**
+
+- 服务端计算压力增加，每个请求都要在服务端渲染
+- 不能使用浏览器 API 和 React Hooks，交互能力受限
+- 组件间传递数据有序列化限制，函数、Date 对象等需要额外处理
+- 增加了架构复杂度，团队需要理解客户端边界在哪里
+- 调试体验不同：Server Component 的 console.log 输出在服务端终端，不在浏览器 DevTools
+
+**实际项目中的取舍建议：**
+
+- 如果是纯展示页面（博客、文档、营销落地页），尽量全部用 Server Components，JS bundle 可以做到极小
+- 如果是重度交互的应用（在线编辑器、看板工具），Client Component 的比例会更高，这是正常的
+- 大多数实际项目介于两者之间，关键是在组件拆分时有意识地做选择，而不是无脑加 `"use client"`
+
+## 小结
+
+这篇文章的核心就一句话：**默认用 Server Component，只在需要交互时才加 `"use client"`**。
+
+具体来说：
+
+- Next.js App Router 里，所有组件默认是 Server Component，它们在服务端渲染，代码不发送到客户端
+- `"use client"` 声明的是客户端边界，从它开始往下的所有代码都会打包进客户端
+- 需要用 Hooks、浏览器事件、浏览器 API 的组件才需要标记 `"use client"`
+- Server Component 可以嵌套 Client Component，反过来不行；通过 `children` prop 可以间接实现
+- 传给 Client Component 的数据必须是可序列化的
+- 永远不要在 `layout.tsx` 上加 `"use client"`
+
+到目前为止，我们的组件已经能正确地在服务端和客户端各司其职了。但还有一个问题没解决：如果用户在页面上填写了一个表单（比如创建一个新任务），提交后怎么把数据存到数据库？传统方式要写 API Route + 前端 fetch + loading 状态 + 错误处理，代码散落在好几个文件里。下一篇我们来看 Next.js 的 Server Actions 怎么用一种更简洁的方式搞定"数据修改"这件事。

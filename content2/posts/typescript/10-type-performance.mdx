@@ -1,0 +1,258 @@
+---
+title: "10. 类型性能优化与综合实战"
+date: "2026-04-12"
+summary: "复杂类型工具写好了，但编译时间从 10 秒涨到 2 分钟。递归条件类型、深度映射、大型联合类型——哪些是性能杀手？怎么优化？综合回顾整个系列的知识体系。"
+tags: ["TypeScript"]
+category: "typescript"
+cover: ""
+draft: false
+series: "TypeScript 类型系统进阶"
+seriesOrder: 10
+---
+
+前面九篇文章，我们用条件类型、模板字面量、泛型、品牌类型、映射类型、函数重载、装饰器、协变逆变，一步步构建了一个类型安全的 HTTP API 客户端。类型系统很强，但有一个经常被忽略的问题：**性能**。
+
+复杂类型不是免费的。每次 TypeScript 检查类型，都要实例化泛型、展开联合类型、执行条件类型判断。当你的类型定义变得复杂——递归条件类型嵌套了 5 层、映射类型遍历了 100 个属性、联合类型有 50 个成员——编译器开始变慢。项目小的时候不明显，项目大了就能感受到：保存文件后要等好几秒才能看到类型检查结果，IDE 开始卡顿。
+
+这篇文章做两件事：聊聊类型性能优化的实用技巧，然后综合回顾整个系列。
+
+## 什么操作最慢
+
+TypeScript 编译器的性能瓶颈集中在几个操作上。
+
+**条件类型的实例化**。每次使用条件类型，编译器都要判断 `T extends U`。如果 T 是一个大型联合类型（比如 50 个成员），编译器要把每个成员都判断一遍。嵌套的条件类型更是指数级增长。
+
+**递归类型的展开**。递归条件类型（如 `DeepUnwrap<T>`）的展开深度取决于数据结构。嵌套 3 层没问题，嵌套 10 层就开始变慢。
+
+**大型联合类型的分配**。创建和操作大型联合类型（几十个成员）的开销很大。特别是用映射类型展开联合类型时——每个成员都要被处理一遍。
+
+**泛型实例化缓存未命中**。TypeScript 会缓存泛型的实例化结果。但如果你的泛型参数每次都不一样（比如传入的是不同的字面量类型），缓存命中率低，每次都要重新计算。
+
+## 诊断类型性能
+
+先知道慢在哪，才能针对性优化。TypeScript 提供了诊断工具：
+
+```bash
+# 基本诊断
+tsc --extendedDiagnostics
+
+# 输出示例：
+# Files:            127
+# Lines:            18,432
+# Identifiers:      45,891
+# Symbols:          32,156
+# Types:            12,847
+# Instantiations:   89,234   <-- 泛型实例化次数
+# Memory used:      256 MB
+# I/O read time:    0.02s
+# Parse time:       0.15s
+# Program check time: 3.42s  <-- 类型检查时间
+# Emit time:        0.08s
+# Total time:       3.67s
+```
+
+关注两个数字：**Instantiations**（泛型实例化次数）和 **Program check time**（类型检查时间）。如果实例化次数异常高，说明有泛型被反复实例化。
+
+## 避免过度复杂的条件类型
+
+最常见的性能问题是条件类型嵌套太深。
+
+```typescript
+// 性能差：3 层嵌套的条件类型
+type BadNested<T> =
+  T extends string
+    ? T extends `${string}:${infer A}` extends string ? never : infer A : never  // 这甚至语法有问题
+    : T extends number ? T : never;
+```
+
+这种代码读起来痛苦，编译器处理起来也慢。简化策略：**把复杂的条件类型拆成多个简单的类型别名**。
+
+```typescript
+// 性能好：拆分成多个步骤
+type ExtractModule<T> = T extends `${infer Module}:${string}` ? Module : never;
+type IsComplexString<T> = T extends `${string}:${string}` ? false : true;
+type ProcessString<T> = IsComplexString<T> extends true ? T : ExtractModule<T>;
+
+type Process<T> = T extends string
+  ? ProcessString<T>
+  : T extends number
+    ? T
+    : never;
+```
+
+每个类型别名做一件事，TypeScript 可以缓存中间结果。而且代码可读性也好了很多。
+
+## 用类型别名缓存
+
+TypeScript 对相同的类型实例化有缓存。利用这个特性，把常用的中间类型提取成类型别名：
+
+```typescript
+// 每次 UseApiRequest 都会重新计算 Routes[Path]
+type UseApiRequest<Path extends keyof Routes> = {
+  data: Routes[Path];
+  loading: boolean;
+  error: Error | null;
+};
+
+// 如果 Routes[Path] 的计算很复杂（比如经过了多层映射类型变换），
+// 提取中间类型让 TypeScript 缓存
+type RouteResponse<Path extends keyof Routes> = Routes[Path];
+type UseApiRequest<Path extends keyof Routes> = {
+  data: RouteResponse<Path>;
+  loading: boolean;
+  error: Error | null;
+};
+```
+
+差别很小，但在大型项目中，这些微优化累积起来效果明显。
+
+## 递归类型的深度控制
+
+递归条件类型有深度限制。TypeScript 通常在 45-100 层递归后报错："Type instantiation is excessively deep and possibly infinite"。
+
+如果你的递归类型可能处理很深的数据结构，加一个深度计数器：
+
+```typescript
+type DeepReadonly<T, Depth extends number = 5> = Depth extends 0
+  ? T // 达到最大深度，停止递归
+  : T extends Function
+    ? T
+    : T extends object
+      ? { readonly [K in keyof T]: DeepReadonly<T[K], DepthCounter<Depth>> }
+      : T;
+
+type DepthCounter<D extends number> = [-1, -2, -3, -4, -5][D] extends never
+  ? never
+  : _DepthMinusOne<D>;
+
+// 内部实现
+type _DepthMinusOne<D extends number> = D extends 5
+  ? 4
+  : D extends 4
+    ? 3
+    : D extends 3
+      ? 2
+      : D extends 2
+        ? 1
+        : 0;
+```
+
+这样即使数据嵌套了 100 层，类型系统也只递归 5 层就停止，不会报错。第 6 层及以下保持原样。在实际项目中，嵌套超过 5 层的数据结构很少见，这个限制基本够用。
+
+## Isolated Declarations（TS 5.5）
+
+如果你在写库（npm 包），有一个和性能相关的新特性值得关注：`--isolatedDeclarations`。
+
+传统的 `.d.ts` 生成需要跨文件分析——TypeScript 要理解一个文件的类型推导结果，才能生成它的声明文件。这意味着改一个文件可能导致很多不相关的声明文件重新生成。
+
+`--isolatedDeclarations` 要求每个文件能独立生成声明文件，不依赖其他文件的类型信息。好处是：增量构建更快、并行生成声明文件、更好地配合打包工具（tsup、unbuild 等）。
+
+代价是：你需要给导出的函数和变量显式标注返回类型，不能让 TypeScript 推断。
+
+```typescript
+// --isolatedDeclarations 模式下，必须显式标注返回类型
+export function createUserId(id: string): UserId {
+  if (!id.startsWith("usr_")) throw new Error("Invalid UserId");
+  return id as UserId;
+}
+
+// 这样不行——返回类型需要推断，跨文件分析才知道
+export function createUserId(id: string) {
+  if (!id.startsWith("usr_")) throw new Error("Invalid UserId");
+  return id as UserId; // TypeScript 不知道返回的是 UserId
+}
+```
+
+如果你在写库，建议尝试开启 `--isolatedDeclarations`。虽然多了一些类型标注的工作，但构建速度的提升在大项目中很明显。
+
+## erasableSyntaxOnly（TS 5.8）
+
+另一个和运行时性能相关的编译选项。Node.js 22+ 支持 `--experimental-strip-types`，可以在运行时直接执行 TypeScript 文件——不需要先编译成 JavaScript。
+
+但 Node.js 只能"擦除"类型注解，不能处理需要转换的语法（enum、namespace、parameter properties 等）。`--erasableSyntaxOnly` 确保你的代码只使用可擦除的语法，让 Node.js 能直接运行。
+
+```json
+// tsconfig.json
+{
+  "compilerOptions": {
+    "erasableSyntaxOnly": true,
+    "verbatimModuleSyntax": true
+  }
+}
+```
+
+这不会直接提升 TypeScript 的类型检查速度，但它能简化你的构建流程——不需要 tsc 编译，不需要 esbuild 或 swc 转换，直接用 Node.js 运行。在开发环境中，这能省掉一个构建步骤。
+
+## 综合实战：回顾 API 客户端的类型设计
+
+九篇文章下来，我们为 API 客户端构建了这些类型能力：
+
+**基础层**：
+
+- 条件类型和 infer——提取 Promise 内部类型、从函数签名中捕获类型
+- 模板字面量类型——从 URL 路径中提取参数、事件名和参数类型关联
+- 泛型——const 类型参数保留字面量、satisfies 验证不丢失精度
+
+**精确性层**：
+
+- 品牌类型——UserId 和 OrderId 不再混淆
+- 工具类型——DeepPartial、DeepOmit 等批量类型变换
+- 映射类型——snake_case 到 camelCase 的自动转换
+
+**API 设计层**：
+
+- 函数重载——不同路由参数对应不同返回类型
+- 装饰器和元数据——运行时序列化规则
+- 协变逆变和方差注解——回调函数的类型安全
+
+把这些组合起来，一个类型安全的 API 客户端大致是这样的：
+
+```typescript
+// 1. 路由表定义——参数和响应类型自动关联
+const routes = {
+  'GET /users': { response: User[] },
+  'GET /users/:id': { params: { userId: string }; response: User },
+  'POST /users': { body: CreateUserDTO; response: User },
+} as const satisfies Record<string, any>;
+
+// 2. 路径参数自动提取
+type Params<Path extends string> = Record<ExtractParams<Path>, string>;
+
+// 3. 类型安全的请求函数（利用函数重载）
+function client<Path extends keyof typeof routes>(
+  method: 'GET',
+  path: Path,
+  params?: Params<Path>
+): Promise<(typeof routes)[Path]['response']>;
+
+// 4. 使用——全程类型安全
+const users = await client('GET', 'GET /users');
+const user = await client('GET', 'GET /users/:id', { userId: 'usr_a1x9k2m' });
+//          userId 拼写错误？编译报错。参数类型不对？编译报错。
+```
+
+每一步都有编译器帮你检查。路由名拼错了、参数名拼错了、参数类型不对、响应类型用错了——全部在编译期发现，不会等到运行时。
+
+## 系列回顾
+
+```
+基础篇（01-03）
+  01 条件类型与 infer —— 类型系统的 if-else
+  02 模板字面量类型 —— 字符串级别的类型推导
+  03 泛型高级应用 —— satisfies、const 类型参数、递归泛型
+
+核心篇（04-06）
+  04 品牌类型与类型守卫 —— 防止 string 混淆
+  05 工具类型实现原理 —— 从零实现内置工具类型
+  06 映射类型与 Key Remapping —— 批量变换对象类型
+
+进阶篇（07-09）
+  07 函数重载与签名设计 —— 灵活的 API 设计
+  08 装饰器与元数据 —— 编译期到运行时的桥梁
+  09 协变逆变与方差注解 —— 理解类型兼容性
+
+实战篇（10）
+  10 类型性能优化 —— 让复杂类型保持高效
+```
+
+类型系统是 TypeScript 最强大的部分，也是最容易被滥用的部分。能用 `interface` 和简单的泛型解决的问题，不要用条件类型和映射类型。类型工具的目的是**让代码更安全、更好用**，不是为了炫技。如果一个类型定义你自己都看不懂，那它大概率也不应该存在。

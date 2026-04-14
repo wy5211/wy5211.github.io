@@ -1,0 +1,642 @@
+---
+title: "17 API 文档：用 Swagger 让接口自己说话"
+date: "2026-03-30"
+summary: "前端问你注册接口传什么参数，你翻了半天代码才回答。用 Swagger 自动生成文档，改了代码文档自动更新"
+tags: ["NestJS", "Swagger", "API文档", "OpenAPI", "前后端协作"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式学习"
+seriesOrder: 17
+---
+
+## 一个协作中的痛点
+
+你的博客平台已经有 20 多个接口了。认证 4 个（注册、登录、刷新 token、退出）、文章 CRUD 6 个、评论 4 个、文件上传 2 个、标签管理 3 个、WebSocket 相关的还有几个。
+
+前端同学新接手项目，问你的第一个问题是："注册接口需要传什么参数？密码有什么格式要求？返回的字段有哪些？"
+
+你打开 `src/users/dto/register.dto.ts` 给他看 class-validator 装饰器。他又问："那登录接口呢？"你再打开 `login.dto.ts`。他接着问："发文章的接口呢？token 放哪里？"
+
+翻了七八个文件之后，他说："你能不能给一份完整的文档？"
+
+你花了一个下午整理了一份 Markdown 文档。一周后你改了注册接口，加了 `avatar` 字段，忘了更新文档。前端按旧文档对接，联调时发现字段对不上，又浪费了半天。
+
+这就是没有自动化文档的代价。这篇来解决这件事。
+
+---
+
+## OpenAPI 和 Swagger 的关系
+
+先理清两个概念，很多人会混淆。
+
+**OpenAPI** 是一个规范（Specification），它定义了一种用 JSON/YAML 描述 REST API 的标准格式。描述的内容包括：有哪些接口、每个接口的路径和方法、需要什么参数、返回什么结构、认证方式是什么。目前最新的版本是 OpenAPI 3.1。
+
+**Swagger** 是一组工具，帮助实现 OpenAPI 规范。`swagger-ui` 是一个可视化的交互界面，可以在浏览器里查看文档并直接调试接口。
+
+关系很简单：OpenAPI 是"格式标准"，Swagger 是"实现工具"。就像 HTML 是标准，Chrome 是实现。
+
+`@nestjs/swagger` 这个包做的事情：扫描你的 NestJS 代码（Controller、DTO、Entity），自动生成符合 OpenAPI 规范的 JSON 文档，然后用 `swagger-ui` 渲染出来。
+
+这个方案的核心理念是：文档和代码是同一份东西。不存在"代码改了文档忘更新"的问题，因为文档就是从代码生成的。你只需要在代码里用装饰器把元数据写好，Swagger 负责渲染。
+
+---
+
+## 基础配置：5 分钟搞定
+
+安装依赖：
+
+```bash
+pnpm add @nestjs/swagger
+```
+
+在 `main.ts` 里配置：
+
+```typescript
+// src/main.ts
+import { NestFactory } from "@nestjs/core";
+import { SwaggerModule, DocumentBuilder } from "@nestjs/swagger";
+import { AppModule } from "./app.module";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
+
+  // 只在非生产环境启用 Swagger
+  if (process.env.NODE_ENV !== "production") {
+    const config = new DocumentBuilder()
+      .setTitle("技术博客平台 API")
+      .setDescription("基于 NestJS 的博客系统后端接口文档")
+      .setVersion("1.0")
+      .addBearerAuth(
+        { type: "http", scheme: "bearer", bearerFormat: "JWT" },
+        "access-token"
+      )
+      .addTag("认证", "用户注册、登录、Token 管理")
+      .addTag("文章", "文章的增删改查")
+      .addTag("评论", "文章评论")
+      .addTag("标签", "标签管理")
+      .addTag("文件", "文件上传")
+      .build();
+
+    const document = SwaggerModule.createDocument(app, config);
+    SwaggerModule.setup("api-docs", app, document);
+  }
+
+  await app.listen(3000);
+}
+bootstrap();
+```
+
+启动应用后，访问 `http://localhost:3000/api-docs` 就能看到 Swagger UI 了。
+
+`DocumentBuilder` 上的 `addTag` 用于给接口分组，后面在 Controller 上用 `@ApiTags` 对应。`addBearerAuth` 配置了 JWT 认证方式，这样在 Swagger UI 里可以输入 token 来调试需要认证的接口。`setDescription` 支持 Markdown 格式，你可以把变更日志、使用说明写进去。
+
+`SwaggerModule.setup('api-docs', app, document)` 的第一个参数是 Swagger UI 的挂载路径。你可以改成 `docs`、`api` 或者任何你喜欢的路径。
+
+如果你想生成 JSON/YAML 文件（给其他工具用，比如前端自动生成 TypeScript 类型）：
+
+```typescript
+// 导出 OpenAPI JSON 文件
+import { writeFileSync } from "fs";
+const document = SwaggerModule.createDocument(app, config);
+writeFileSync("./swagger-spec.json", JSON.stringify(document, null, 2));
+```
+
+前端团队拿到这个 JSON 文件后，可以用 `openapi-typescript` 自动生成接口类型定义：
+
+```bash
+npx openapi-typescript swagger-spec.json -o src/types/api.d.ts
+```
+
+这是 Swagger 生态的一个大优势：文档不只是给人看的，还能被工具消费，自动生成代码。
+
+---
+
+## DTO 文档化：让参数说明自动生成
+
+Swagger 能自动生成文档的前提是：你的 DTO 里加了 `@ApiProperty` 装饰器。
+
+拿博客平台的注册接口为例：
+
+```typescript
+// src/users/dto/register.dto.ts
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+import {
+  IsEmail,
+  IsNotEmpty,
+  IsString,
+  MinLength,
+  MaxLength,
+  Matches,
+  IsOptional,
+} from "class-validator";
+
+export class RegisterDto {
+  @ApiProperty({
+    description: "用户邮箱，作为登录凭证",
+    example: "zhang_wei@example.com",
+    format: "email",
+  })
+  @IsEmail({}, { message: "邮箱格式不正确" })
+  @IsNotEmpty()
+  email: string;
+
+  @ApiProperty({
+    description: "用户名，2-50 个字符",
+    example: "zhang_wei",
+    minLength: 2,
+    maxLength: 50,
+  })
+  @IsString()
+  @IsNotEmpty()
+  @MinLength(2)
+  @MaxLength(50)
+  name: string;
+
+  @ApiProperty({
+    description: "密码，至少 8 位，需包含大小写字母和数字",
+    example: "Password123!",
+    minLength: 8,
+  })
+  @IsString()
+  @IsNotEmpty()
+  @MinLength(8)
+  @Matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/, {
+    message: "密码必须包含大小写字母和数字",
+  })
+  password: string;
+
+  @ApiPropertyOptional({
+    description: "用户头像 URL",
+    example: "https://cdn.example.com/avatars/default.png",
+  })
+  @IsOptional()
+  @IsString()
+  avatar?: string;
+}
+```
+
+`@ApiProperty` 的几个常用参数：
+
+- `description`：字段说明，会显示在 Swagger UI 里
+- `example`：示例值，前端可以直接看到应该传什么格式
+- `format`：数据格式提示（`email`、`url`、`date-time` 等）
+- `minLength` / `maxLength` / `minimum` / `maximum`：约束提示
+- `enum`：枚举值列表
+- `type`：覆盖自动推断的类型
+- `required`：是否必填（默认从 DTO 属性是否可选推断）
+- `default`：默认值
+- `deprecated`：标记字段为已废弃
+
+有一个容易忽略的：如果 DTO 有 `@IsOptional()` 的字段，记得用 `@ApiPropertyOptional` 而不是 `@ApiProperty`，否则 Swagger 会把它标记为必填。
+
+对于不应该出现在文档里的字段（比如 `password` 不应该在响应里出现），用 `@ApiHideProperty`：
+
+```typescript
+export class UserResponseDto {
+  @ApiProperty({ example: "usr_a1x9k2m" })
+  id: string;
+
+  @ApiProperty({ example: "zhang_wei@example.com" })
+  email: string;
+
+  @ApiProperty({ example: "zhang_wei" })
+  name: string;
+
+  @ApiProperty({ example: "USER", enum: ["USER", "ADMIN"] })
+  role: string;
+
+  @ApiHideProperty() // 文档里不显示密码字段
+  password: string;
+
+  @ApiHideProperty() // 内部字段不暴露
+  deletedAt: Date | null;
+}
+```
+
+注意：`@ApiHideProperty` 只是让字段不在 Swagger 文档里显示，不会影响实际的数据返回。如果你不想返回某个字段，应该在 Service 层用 `select` 或者单独定义响应 DTO。
+
+---
+
+## 文章相关的 DTO：处理枚举和嵌套
+
+博客平台的发布文章接口更复杂一些，涉及枚举和数组：
+
+```typescript
+// src/posts/dto/create-post.dto.ts
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+import {
+  IsString,
+  IsNotEmpty,
+  IsOptional,
+  IsEnum,
+  IsArray,
+} from "class-validator";
+
+export enum PostStatus {
+  DRAFT = "DRAFT",
+  PUBLISHED = "PUBLISHED",
+  ARCHIVED = "ARCHIVED",
+}
+
+export class CreatePostDto {
+  @ApiProperty({
+    description: "文章标题",
+    example: "从 Express 迁移到 NestJS 的踩坑记录",
+    minLength: 1,
+    maxLength: 200,
+  })
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(200)
+  title: string;
+
+  @ApiProperty({
+    description: "文章内容，支持 Markdown",
+    example: "## 前言\n最近团队决定新项目用 NestJS...",
+  })
+  @IsString()
+  @IsNotEmpty()
+  content: string;
+
+  @ApiPropertyOptional({
+    description: "文章摘要，不填则自动截取内容前 200 字",
+    example: "最近团队决定新项目用 NestJS，记录迁移过程中的经验",
+    maxLength: 500,
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(500)
+  summary?: string;
+
+  @ApiPropertyOptional({
+    description: "文章状态",
+    enum: PostStatus,
+    default: PostStatus.DRAFT,
+  })
+  @IsOptional()
+  @IsEnum(PostStatus)
+  status?: PostStatus;
+
+  @ApiPropertyOptional({
+    description: "标签列表",
+    example: ["Node.js", "NestJS", "后端架构"],
+    type: [String],
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  tags?: string[];
+}
+```
+
+`enum: PostStatus` 会在 Swagger UI 里生成一个下拉选择框，前端一眼就能看到有哪些可选值。`type: [String]` 告诉 Swagger 这是一个字符串数组。
+
+对于评论相关的 DTO，涉及嵌套结构：
+
+```typescript
+// src/comments/dto/create-comment.dto.ts
+import { ApiProperty } from "@nestjs/swagger";
+import { IsString, IsNotEmpty, MinLength, MaxLength } from "class-validator";
+
+export class CreateCommentDto {
+  @ApiProperty({
+    description: "评论内容",
+    example: "同意作者说的 DI 部分，我们项目也遇到了循环依赖问题",
+    minLength: 1,
+    maxLength: 2000,
+  })
+  @IsString()
+  @IsNotEmpty()
+  @MinLength(1)
+  @MaxLength(2000)
+  content: string;
+}
+```
+
+查询参数的文档化不通过 DTO，而是通过 Controller 上的 `@ApiQuery` 装饰器——这个后面 Controller 部分会讲到。
+
+---
+
+## Controller 文档化：接口说明和响应定义
+
+Controller 层用 `@ApiTags` 分组，用 `@ApiOperation` 写接口说明，用 `@ApiResponse` 定义响应格式：
+
+```typescript
+// src/posts/posts.controller.ts
+import {
+  Controller,
+  Get,
+  Post,
+  Patch,
+  Delete,
+  Param,
+  Query,
+  Body,
+  UseGuards,
+  HttpCode,
+  HttpStatus,
+} from "@nestjs/common";
+import {
+  ApiTags,
+  ApiOperation,
+  ApiResponse,
+  ApiBearerAuth,
+  ApiParam,
+  ApiQuery,
+} from "@nestjs/swagger";
+import { PostsService } from "./posts.service";
+import { CreatePostDto } from "./dto/create-post.dto";
+import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
+import { CurrentUser } from "../auth/decorators/current-user.decorator";
+
+@ApiTags("文章")
+@ApiBearerAuth("access-token")
+@Controller("posts")
+@UseGuards(JwtAuthGuard)
+export class PostsController {
+  constructor(private postsService: PostsService) {}
+
+  @Post()
+  @ApiOperation({
+    summary: "发布文章",
+    description: "创建一篇新文章，可以是草稿或直接发布",
+  })
+  @ApiResponse({ status: 201, description: "创建成功" })
+  @ApiResponse({ status: 400, description: "参数验证失败" })
+  @ApiResponse({ status: 401, description: "未认证" })
+  create(@CurrentUser("userId") userId: string, @Body() dto: CreatePostDto) {
+    return this.postsService.create(userId, dto);
+  }
+
+  @Get()
+  @ApiOperation({ summary: "获取文章列表" })
+  @ApiQuery({ name: "page", required: false, example: 1, description: "页码" })
+  @ApiQuery({
+    name: "pageSize",
+    required: false,
+    example: 10,
+    description: "每页数量",
+  })
+  @ApiQuery({
+    name: "tag",
+    required: false,
+    example: "NestJS",
+    description: "按标签筛选",
+  })
+  @ApiQuery({
+    name: "author",
+    required: false,
+    example: "zhang_wei",
+    description: "按作者筛选",
+  })
+  @ApiResponse({ status: 200, description: "查询成功" })
+  findAll(@Query() query: any) {
+    return this.postsService.findAll(query);
+  }
+
+  @Get(":id")
+  @ApiOperation({ summary: "获取文章详情" })
+  @ApiParam({ name: "id", description: "文章 ID", example: "post_x1k2m3n" })
+  @ApiResponse({ status: 200, description: "查询成功" })
+  @ApiResponse({ status: 404, description: "文章不存在" })
+  findOne(@Param("id") id: string) {
+    return this.postsService.findOne(id);
+  }
+
+  @Patch(":id")
+  @ApiOperation({ summary: "更新文章", description: "只能更新自己发布的文章" })
+  @ApiParam({ name: "id", description: "文章 ID" })
+  @ApiResponse({ status: 200, description: "更新成功" })
+  @ApiResponse({ status: 403, description: "无权编辑此文章" })
+  @ApiResponse({ status: 404, description: "文章不存在" })
+  update(
+    @CurrentUser("userId") userId: string,
+    @Param("id") id: string,
+    @Body() dto: Partial<CreatePostDto>
+  ) {
+    return this.postsService.update(userId, id, dto);
+  }
+
+  @Delete(":id")
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({
+    summary: "删除文章",
+    description: "软删除，只能删除自己的文章",
+  })
+  @ApiParam({ name: "id", description: "文章 ID" })
+  @ApiResponse({ status: 204, description: "删除成功" })
+  @ApiResponse({ status: 403, description: "无权删除此文章" })
+  remove(@CurrentUser("userId") userId: string, @Param("id") id: string) {
+    return this.postsService.remove(userId, id);
+  }
+}
+```
+
+`@ApiBearerAuth('access-token')` 放在 Controller 类级别，表示这个 Controller 下所有接口都需要认证。前面 `DocumentBuilder` 里的 `addBearerAuth` 配置了 name 为 `'access-token'`，两边要对应。
+
+`@ApiQuery` 用于文档化查询参数。不写的话，Swagger UI 也能显示接口，但前端不知道有哪些可选的查询参数和它们的格式。
+
+`@ApiOperation` 的 `summary` 是简短标题（显示在接口列表里），`description` 是详细说明（展开后看到）。两者都支持 Markdown 格式。
+
+对于公开接口（不需要认证的），有两种处理方式。最简单的做法是把 `@ApiBearerAuth` 从 Controller 级别移到具体方法上，只给需要认证的方法加。另一种方式是保留 Controller 级别的认证，在公开方法上加 `@ApiExcludeEndpoint()` 然后单独定义，但这样维护成本高。
+
+推荐的方式是：把需要认证的方法集中在一个 Controller，公开方法放在另一个 Controller 或用 `@Public()` 装饰器标记。对于 Swagger 来说，关键是文档里不要让公开接口显示锁图标。
+
+---
+
+## 认证配置：在 Swagger UI 里调试认证接口
+
+在 Swagger UI 的右上角有一个 "Authorize" 按钮，点击后可以输入 Bearer token。配置好之后，所有需要认证的接口都会自动在请求头里带上这个 token。
+
+前端同学的使用流程：先调 `POST /auth/login` 拿到 token，复制 token，点 Authorize 按钮粘贴进去，之后调其他接口就自动带上认证了。
+
+但登录接口本身不需要认证（否则鸡生蛋问题），需要在 Controller 里标记：
+
+```typescript
+@ApiTags("认证")
+@Controller("auth")
+export class AuthController {
+  @Post("register")
+  @Public()
+  @ApiOperation({ summary: "用户注册" })
+  @ApiResponse({
+    status: 201,
+    description: "注册成功，返回用户信息和 token",
+  })
+  @ApiResponse({ status: 409, description: "邮箱已被注册" })
+  register(@Body() dto: RegisterDto) {
+    return this.authService.register(dto);
+  }
+
+  @Post("login")
+  @Public()
+  @ApiOperation({ summary: "用户登录" })
+  @ApiResponse({
+    status: 200,
+    description: "登录成功，返回 access token 和 refresh token",
+  })
+  @ApiResponse({ status: 401, description: "邮箱或密码错误" })
+  login(@Body() dto: LoginDto) {
+    return this.authService.login(dto);
+  }
+
+  @Post("refresh")
+  @Public()
+  @ApiOperation({ summary: "刷新 Token" })
+  @ApiResponse({ status: 200, description: "刷新成功，返回新的 token" })
+  @ApiResponse({ status: 401, description: "Refresh Token 无效或已过期" })
+  refresh(@Body("refreshToken") refreshToken: string) {
+    return this.authService.refreshTokens(refreshToken);
+  }
+
+  @Post("logout")
+  @ApiOperation({ summary: "退出登录" })
+  @ApiResponse({ status: 200, description: "退出成功" })
+  logout(@Body("refreshToken") refreshToken: string) {
+    return this.authService.logout(refreshToken);
+  }
+}
+```
+
+注意认证 Controller 的 `@ApiTags('认证')` 和 `DocumentBuilder` 里的 `addTag('认证', '用户注册、登录、Token 管理')` 对应。这样 Swagger UI 里认证相关的接口会自动归到"认证"分组下。
+
+一个实用技巧：你可以在 `DocumentBuilder` 里配置全局的认证方案，然后在不同 Controller 上按需引用。如果你的系统有管理员 token 和普通用户 token 两套认证，可以定义两个 `addBearerAuth`，分别用不同的 name。
+
+---
+
+## 文档和代码同步：自动的才是可靠的
+
+手动维护文档最大的问题就是不同步。Swagger 解决这个问题的方式是：文档直接从代码生成，改了代码重新启动应用，文档就更新了。
+
+但这不意味着"加了 Swagger 就不用管文档了"。有几个容易出问题的地方：
+
+**DTO 和 Entity 混用**。你直接把 Prisma Entity 返回给前端，Entity 上没有 Swagger 装饰器，文档里就看不到这些字段。正确做法是 Service 层用 `select` 控制返回字段，或者定义专门的响应 DTO 并加上 `@ApiProperty`。
+
+**只写成功响应**。Controller 的 `@ApiResponse` 只写了 200/201，没写 400、401、403、404。前端不知道错误时返回什么格式。虽然错误格式由全局异常过滤器统一处理，但在文档里标注一下对前端更友好。
+
+**认证标记冲突**。`@Public` 标记的公开接口在 Controller 级别加了 `@ApiBearerAuth`，会导致 Swagger UI 对这些接口也显示锁图标，让前端困惑。解决方案是把 `@ApiBearerAuth` 从 Controller 级别移到具体方法上，或者拆分 Controller。
+
+**DTO 改了忘了改文档装饰器**。你在 DTO 里加了一个新字段 `nickname`，加了 `@IsString()` 验证，但忘了加 `@ApiProperty`。这个字段在 Swagger 文档里不可见，前端不知道有这个参数。建议在 code review 时检查 DTO 的新字段是否加了 Swagger 装饰器。
+
+---
+
+## Swagger 的局限性
+
+Swagger 不是银弹。它有几个明显的局限：
+
+**只能描述 REST API**。WebSocket 接口、事件驱动的消息、Server-Sent Events 这些，Swagger 描述不了。博客平台里有实时评论推送（第 15 篇实现的 WebSocket），这部分需要单独文档。Socket.io 有自己的文档方式，或者用简单的 Markdown 说明事件和 payload 格式。
+
+**复杂的权限逻辑不好表达**。比如"作者只能编辑自己的文章"这个规则，Swagger UI 里看不出哪个接口有这个限制，只能靠 `@ApiOperation` 的 `description` 写文字描述。这不是 Swagger 的问题，是 OpenAPI 规范本身的表达能力有限。
+
+**嵌套太深的 DTO 会生成冗长文档**。如果你的响应是一个三层嵌套的对象（文章 → 评论 → 用户），Swagger UI 渲染出来的 Schema 会很长。解决办法是在 `@ApiResponse` 里用 `type` 指向扁平化的 DTO，而不是直接用 Entity。
+
+**生产环境不应该暴露 Swagger**。这不只是"接口文档泄露"的问题——Swagger UI 本身是一个 Web 页面，攻击者可以通过它探测你所有的接口路径、参数结构和认证方式。所以配置里加了 `NODE_ENV !== 'production'` 的判断。如果你需要在生产环境提供文档，可以考虑把 Swagger UI 部署在一个独立的内部子域名上，用 VPN 或 IP 白名单保护。
+
+---
+
+## 统一错误响应的文档化
+
+第 08 篇我们实现了全局异常过滤器，统一了错误响应格式。Swagger 也能描述这些错误格式。定义一个通用的错误响应 DTO：
+
+```typescript
+// src/common/dto/error-response.dto.ts
+import { ApiProperty } from "@nestjs/swagger";
+
+export class ErrorResponseDto {
+  @ApiProperty({ example: 400, description: "HTTP 状态码" })
+  statusCode: number;
+
+  @ApiProperty({ example: "VALIDATION_ERROR", description: "业务错误码" })
+  code: string;
+
+  @ApiProperty({ example: "邮箱格式不正确", description: "错误信息" })
+  message: string;
+
+  @ApiProperty({
+    example: { email: ["邮箱格式不正确"] },
+    description: "详细的验证错误信息",
+    required: false,
+  })
+  errors?: Record<string, string[]>;
+}
+```
+
+在 Controller 里用 `type` 引用它，而不是只写 `description`：
+
+```typescript
+import { ErrorResponseDto } from '../common/dto/error-response.dto';
+
+@Post('register')
+@Public()
+@ApiOperation({ summary: '用户注册' })
+@ApiResponse({ status: 201, description: '注册成功', type: UserResponseDto })
+@ApiResponse({ status: 400, description: '参数验证失败', type: ErrorResponseDto })
+@ApiResponse({ status: 409, description: '邮箱已被注册', type: ErrorResponseDto })
+register(@Body() dto: RegisterDto) {
+  return this.authService.register(dto);
+}
+```
+
+这样 Swagger UI 里每个错误响应都有一个可展开的 Schema，前端能看到具体的字段结构，而不只是一段文字描述。
+
+如果你有多个接口返回同样的错误格式，可以定义一个共享的装饰器避免重复：
+
+```typescript
+// src/common/decorators/api-error-responses.ts
+import { applyDecorators } from '@nestjs/common';
+import { ApiResponse } from '@nestjs/swagger';
+import { ErrorResponseDto } from '../dto/error-response.dto';
+
+export function ApiCommonErrors() {
+  return applyDecorators(
+    ApiResponse({ status: 401, description: '未认证', type: ErrorResponseDto }),
+    ApiResponse({ status: 500, description: '服务器内部错误', type: ErrorResponseDto }),
+  );
+}
+
+// 使用
+@Get(':id')
+@ApiCommonErrors()
+@ApiResponse({ status: 200, description: '查询成功' })
+@ApiResponse({ status: 404, description: '文章不存在', type: ErrorResponseDto })
+findOne(@Param('id') id: string) { ... }
+```
+
+---
+
+## 和前端协作的实用技巧
+
+Swagger 不只是文档工具，还是前后端协作的桥梁。几个实用的协作技巧：
+
+**用 example 值统一数据约定**。`@ApiProperty` 的 `example` 不只是展示用，它告诉前端"这个字段传什么格式的数据"。比如日期字段统一用 ISO 格式 `2026-03-30T10:00:00.000Z`，ID 统一用 `usr_a1x9k2m` 这种前缀格式。前端看到 example 就知道该用什么格式，不用猜。
+
+**分页接口的响应格式要明确**。文章列表接口返回的不是简单的数组，而是一个包含 `data`、`total`、`page`、`pageSize` 的对象。用 DTO 描述这个结构：
+
+```typescript
+export class PaginatedResponseDto<T> {
+  @ApiProperty({ example: 1 })
+  page: number;
+
+  @ApiProperty({ example: 10 })
+  pageSize: number;
+
+  @ApiProperty({ example: 42 })
+  total: number;
+
+  @ApiProperty({ example: 5 })
+  totalPages: number;
+
+  data: T[];
+}
+```
+
+**导出 OpenAPI JSON 给前端自动生成代码**。前面提到了用 `openapi-typescript` 生成 TypeScript 类型。更进一步，前端可以用 `openapi-client-axios` 直接从 Swagger spec 生成类型安全的 API 客户端。后端改了接口，前端重新跑一下生成命令就能拿到最新的类型定义。
+
+---
+
+## 小结
+
+`@nestjs/swagger` 通过扫描 Controller 和 DTO 自动生成 OpenAPI 文档。`@ApiProperty` 描述请求参数，`@ApiOperation` 描述接口用途，`@ApiResponse` 描述响应格式。`@ApiBearerAuth` 配置 JWT 认证，让前端能在 Swagger UI 里直接调试认证接口。文档从代码生成，改了代码文档自动更新，但 DTO 和响应类型要维护好，否则文档内容不完整。生产环境关闭 Swagger，避免暴露接口信息。
+
+文档齐全了，最后一步：把博客平台容器化部署。下一篇写 Docker。

@@ -1,0 +1,670 @@
+---
+title: "11. 数据传输优化与性能调优"
+date: "2026-03-23"
+summary: "深入理解 tRPC 元数据系统，通过字段选择、延迟加载、缓存策略减少数据传输量，为协作任务管理平台实现性能优化，构建高效的 tRPC 应用。"
+tags: ["tRPC", "性能优化", "元数据", "缓存", "负载优化"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 11
+---
+
+上篇文章我们实现了实时订阅功能，当任务更新时，所有在线用户会立即收到通知。但有个问题：每次推送的数据包含完整任务对象，包括标题、描述、创建时间等所有字段。如果用户只需要知道"任务从 TODO 变成了 IN PROGRESS"，推送整个对象就是浪费带宽。
+
+随着应用规模增长，数据传输和性能优化变得至关重要。一个任务对象可能包含 20 个字段，但列表页只需要显示 5 个字段。详情页需要显示所有字段，但不包括关联的用户完整信息（只需要名字和头像）。tRPC 提供了强大的元数据系统，让我们可以精确控制数据传输。
+
+## 为什么需要元数据优化
+
+在协作任务管理平台中，不同场景需要不同的数据：
+
+- 列表页：需要任务 ID、标题、状态、优先级（5 个字段）
+- 详情页：需要所有字段，包括描述、创建时间、关联用户（20 个字段）
+- 通知推送：只需要任务 ID 和状态变化（2 个字段）
+
+如果每次都传输完整对象，会导致：
+
+- 网络传输慢（尤其移动网络）
+- 前端渲染慢（需要处理不必要的数据）
+- 服务器负载高（查询更多数据库字段）
+- 流量费用高（尤其云服务按流量计费）
+
+元数据优化让客户端可以精确指定需要哪些字段，服务端只返回请求的数据。
+
+## 字段选择
+
+最直接的优化是让客户端指定需要哪些字段。tRPC 配合 Prisma 可以轻松实现。
+
+```typescript
+// src/trpc/routers/tasks.router.ts
+
+import { z } from "zod";
+import { t, protectedProcedure } from "../index";
+
+export const tasksRouter = t.router({
+  // 根据 ID 获取任务，支持字段选择
+  byId: protectedProcedure
+    .input(
+      z.object({
+        taskId: z.string(),
+        // 客户端指定需要的字段
+        fields: z
+          .array(
+            z.enum([
+              "id",
+              "title",
+              "description",
+              "status",
+              "priority",
+              "createdAt",
+              "updatedAt",
+              "project",
+              "assignee",
+            ])
+          )
+          .optional(),
+      })
+    )
+    .query(async ({ input, ctx }) => {
+      // 根据 fields 构建 Prisma 的 select 对象
+      const select: any = {};
+
+      // 如果没有指定 fields，返回所有字段（默认行为）
+      if (!input.fields || input.fields.length === 0) {
+        return await prisma.task.findUnique({
+          where: { id: input.taskId },
+          include: {
+            project: true,
+            assignee: true,
+          },
+        });
+      }
+
+      // 根据请求的字段构建 select
+      input.fields.forEach((field) => {
+        if (field === "project") {
+          select.project = {
+            select: {
+              id: true,
+              name: true,
+            },
+          };
+        } else if (field === "assignee") {
+          select.assignee = {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          };
+        } else {
+          select[field] = true;
+        }
+      });
+
+      const task = await prisma.task.findUnique({
+        where: { id: input.taskId },
+        select,
+      });
+
+      if (!task) {
+        throw new t.TRPCError({
+          code: "NOT_FOUND",
+          message: "任务不存在",
+        });
+      }
+
+      return task;
+    }),
+});
+```
+
+客户端可以精确指定需要的字段：
+
+```typescript
+// 列表页：只需要基本信息
+const { data: task } = trpc.tasks.byId.useQuery({
+  taskId: "123",
+  fields: ["id", "title", "status", "priority"],
+});
+
+// 详情页：需要完整信息
+const { data: fullTask } = trpc.tasks.byId.useQuery({
+  taskId: "123",
+  fields: [
+    "id",
+    "title",
+    "description",
+    "status",
+    "priority",
+    "project",
+    "assignee",
+  ],
+});
+
+// 通知：只需要 ID 和状态
+const { data: minimalTask } = trpc.tasks.byId.useQuery({
+  taskId: "123",
+  fields: ["id", "status"],
+});
+```
+
+这样可以减少 50-80% 的数据传输量，尤其对移动端用户有明显改善。
+
+## 嵌套对象优化
+
+关联数据是另一个优化重点。任务关联了项目和用户，如果每次都返回完整的项目信息和用户信息（包括邮箱、角色等），会浪费大量带宽。
+
+```typescript
+// src/trpc/routers/tasks.router.ts
+
+export const tasksRouter = t.router({
+  // 获取任务列表，支持嵌套对象控制
+  list: protectedProcedure
+    .input(
+      z.object({
+        projectId: z.string().optional(),
+        include: z.object({
+          project: z.boolean().optional(), // 是否包含项目信息
+          assignee: z.boolean().optional(), // 是否包含负责人信息
+          comments: z.boolean().optional(), // 是否包含评论
+          commentsCount: z.boolean().optional(), // 是否包含评论数量
+        }),
+      })
+    )
+    .query(async ({ input, ctx }) => {
+      const include: any = {};
+
+      // 根据请求构建 include 对象
+      if (input.include.project) {
+        include.project = {
+          select: {
+            id: true,
+            name: true,
+            // 不包含 description、members 等字段
+          },
+        };
+      }
+
+      if (input.include.assignee) {
+        include.assignee = {
+          select: {
+            id: true,
+            name: true,
+            avatar: true,
+            // 不包含 email、role 等敏感字段
+          },
+        };
+      }
+
+      if (input.include.comments) {
+        include.comments = {
+          select: {
+            id: true,
+            content: true,
+            createdAt: true,
+            author: {
+              select: {
+                id: true,
+                name: true,
+                avatar: true,
+              },
+            },
+          },
+          orderBy: { createdAt: "desc" },
+          take: 5, // 只返回最近 5 条评论
+        };
+      }
+
+      if (input.include.commentsCount) {
+        include._count = {
+          select: { comments: true },
+        };
+      }
+
+      const tasks = await prisma.task.findMany({
+        where: {
+          ...(input.projectId && { projectId: input.projectId }),
+        },
+        include,
+        orderBy: { createdAt: "desc" },
+      });
+
+      return tasks;
+    }),
+});
+```
+
+客户端可以根据需要决定是否加载关联数据：
+
+```typescript
+// 任务列表页：只需要任务本身
+const { data: tasks } = trpc.tasks.list.useQuery({
+  include: {
+    project: true,
+    assignee: true,
+    comments: false,
+    commentsCount: true,
+  },
+});
+
+// 任务详情页：需要完整信息
+const { data: detailTasks } = trpc.tasks.list.useQuery({
+  include: {
+    project: true,
+    assignee: true,
+    comments: true,
+    commentsCount: true,
+  },
+});
+```
+
+## 延迟加载
+
+更激进的优化是延迟加载。初始加载只返回核心数据，当用户需要时再加载额外数据。
+
+```typescript
+// src/trpc/routers/tasks.router.ts
+
+export const tasksRouter = t.router({
+  // 获取任务详情（核心数据）
+  detail: protectedProcedure
+    .input(z.object({ taskId: z.string() }))
+    .query(async ({ input, ctx }) => {
+      return await prisma.task.findUnique({
+        where: { id: input.taskId },
+        select: {
+          id: true,
+          title: true,
+          description: true,
+          status: true,
+          priority: true,
+          createdAt: true,
+          updatedAt: true,
+          // 不包含 project、assignee、comments
+        },
+      });
+    }),
+
+  // 延迟加载：获取项目信息
+  project: protectedProcedure
+    .input(z.object({ taskId: z.string() }))
+    .query(async ({ input, ctx }) => {
+      const task = await prisma.task.findUnique({
+        where: { id: input.taskId },
+        select: { projectId: true },
+      });
+
+      if (!task) {
+        throw new t.TRPCError({
+          code: "NOT_FOUND",
+          message: "任务不存在",
+        });
+      }
+
+      return await prisma.project.findUnique({
+        where: { id: task.projectId },
+      });
+    }),
+
+  // 延迟加载：获取评论
+  comments: protectedProcedure
+    .input(
+      z.object({
+        taskId: z.string(),
+        limit: z.number().default(20),
+      })
+    )
+    .query(async ({ input, ctx }) => {
+      return await prisma.comment.findMany({
+        where: { taskId: input.taskId },
+        include: {
+          author: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+        },
+        orderBy: { createdAt: "desc" },
+        take: input.limit,
+      });
+    }),
+});
+```
+
+客户端可以根据用户交互按需加载：
+
+```typescript
+// 初始加载：只获取任务核心数据
+const { data: task } = trpc.tasks.detail.useQuery({ taskId: "123" });
+
+// 延迟加载：用户点击"查看项目"时才加载
+const [showProject, setShowProject] = useState(false);
+const { data: project } = trpc.tasks.project.useQuery(
+  { taskId: "123" },
+  {
+    enabled: showProject, // 只在需要时才请求
+  }
+);
+
+// 延迟加载：用户滚动到底部时才加载评论
+const [showComments, setShowComments] = useState(false);
+const { data: comments } = trpc.tasks.comments.useQuery(
+  { taskId: "123", limit: 20 },
+  {
+    enabled: showComments,
+  }
+);
+```
+
+## 缓存策略
+
+缓存是减少服务器负载和网络请求的关键。tRPC 配合 React Query 提供了强大的缓存能力。
+
+### 客户端缓存
+
+```typescript
+// src/lib/trpc/client.ts
+
+import { createTRPCReact } from "@trpc/react-query";
+import type { AppRouter } from "@/server/trpc";
+
+export const trpc = createTRPCReact<AppRouter>();
+```
+
+客户端可以设置缓存时间，避免重复请求：
+
+```typescript
+// 5 分钟内不重新获取数据
+const { data } = trpc.tasks.list.useQuery(
+  { projectId: "123" },
+  {
+    staleTime: 1000 * 60 * 5, // 5 分钟内认为数据是新鲜的
+    cacheTime: 1000 * 60 * 10, // 缓存保留 10 分钟
+  }
+);
+```
+
+React Query 还支持预取数据，在用户需要之前提前加载：
+
+```typescript
+// 预取下一页数据
+const queryClient = useQueryClient();
+
+const prefetchNextPage = async () => {
+  await queryClient.prefetchQuery(
+    ["tasks", "list", { page: 2 }],
+    () => trpc.tasks.list.query({ projectId: "123", page: 2 })
+  );
+};
+
+// 用户鼠标悬停在"下一页"按钮时预取
+<button onMouseEnter={prefetchNextPage}>
+  下一页
+</button>
+```
+
+### 服务端缓存
+
+服务端缓存可以减少数据库查询，提升响应速度。使用 Redis 或内存缓存：
+
+```typescript
+// src/lib/cache.ts
+
+import { LRUCache } from "lru-cache";
+
+// 内存缓存（适合单服务器）
+const memoryCache = new LRUCache<string, any>({
+  max: 500, // 最多缓存 500 个结果
+  ttl: 1000 * 60 * 5, // 5 分钟过期
+});
+
+// Redis 缓存（适合多服务器）
+import Redis from "ioredis";
+const redis = new Redis({
+  host: process.env.REDIS_HOST,
+  port: 6379,
+});
+
+// 通用缓存函数
+export async function getCached<T>(
+  key: string,
+  fetcher: () => Promise<T>,
+  ttl: number = 300
+): Promise<T> {
+  // 尝试从缓存获取
+  const cached = memoryCache.get(key);
+  if (cached) {
+    return cached;
+  }
+
+  // 缓存未命中，获取数据
+  const data = await fetcher();
+
+  // 写入缓存
+  memoryCache.set(key, data);
+
+  return data;
+}
+```
+
+在 tRPC Procedure 中使用缓存：
+
+```typescript
+// src/trpc/routers/tasks.router.ts
+
+import { getCached } from "@/lib/cache";
+
+export const tasksRouter = t.router({
+  // 获取项目统计（带缓存）
+  projectStats: protectedProcedure
+    .input(z.object({ projectId: z.string() }))
+    .query(async ({ input, ctx }) => {
+      return getCached(
+        `stats:${input.projectId}`,
+        async () => {
+          const [totalTasks, completedTasks, inProgressTasks] =
+            await Promise.all([
+              prisma.task.count({ where: { projectId: input.projectId } }),
+              prisma.task.count({
+                where: { projectId: input.projectId, status: "DONE" },
+              }),
+              prisma.task.count({
+                where: { projectId: input.projectId, status: "IN_PROGRESS" },
+              }),
+            ]);
+
+          return {
+            total: totalTasks,
+            completed: completedTasks,
+            inProgress: inProgressTasks,
+          };
+        },
+        300 // 缓存 5 分钟
+      );
+    }),
+});
+```
+
+## 分页优化
+
+无限滚动是常见的分页方式，但如果实现不当会导致性能问题。
+
+```typescript
+// src/trpc/routers/tasks.router.ts
+
+export const tasksRouter = t.router({
+  // 无限滚动（基于游标）
+  infinite: protectedProcedure
+    .input(
+      z.object({
+        limit: z.number().min(1).max(50).default(20),
+        cursor: z.string().optional(), // 游标：上一页最后一条记录的 ID
+      })
+    )
+    .query(async ({ input, ctx }) => {
+      const { limit, cursor } = input;
+
+      // 查询时多取一条，用于判断是否有下一页
+      const tasks = await prisma.task.findMany({
+        take: limit + 1,
+        ...(cursor && {
+          cursor: { id: cursor },
+          skip: 1, // 跳过游标本身
+        }),
+        orderBy: { createdAt: "desc" },
+      });
+
+      let nextCursor: string | undefined = undefined;
+
+      // 如果返回了超过 limit 条数据，说明还有下一页
+      if (tasks.length > limit) {
+        const nextItem = tasks.pop(); // 移除多取的那一条
+        nextCursor = nextItem!.id; // 下一页的游标
+      }
+
+      return {
+        items: tasks,
+        nextCursor,
+      };
+    }),
+});
+```
+
+客户端使用 `useInfiniteQuery` 实现无限滚动：
+
+```typescript
+import { trpc } from "@/lib/trpc/client";
+
+export function TaskList() {
+  const {
+    data,
+    fetchNextPage,
+    hasNextPage,
+    isFetchingNextPage,
+  } = trpc.tasks.infinite.useInfiniteQuery(
+    { limit: 20 },
+    {
+      getNextPageParam: (lastPage) => lastPage.nextCursor,
+    }
+  );
+
+  return (
+    <div>
+      {data?.pages.map((page) => (
+        <div key={page.nextCursor || "last"}>
+          {page.items.map((task) => (
+            <div key={task.id}>{task.title}</div>
+          ))}
+        </div>
+      ))}
+
+      {hasNextPage && (
+        <button
+          onClick={() => fetchNextPage()}
+          disabled={isFetchingNextPage}
+        >
+          {isFetchingNextPage ? "加载中..." : "加载更多"}
+        </button>
+      )}
+    </div>
+  );
+}
+```
+
+## 性能监控
+
+优化需要数据支撑。添加性能监控，找出慢查询和瓶颈：
+
+```typescript
+// src/trpc/middleware/performance.ts
+
+import { t } from "../index";
+
+export const performanceMiddleware = t.middleware(
+  async ({ next, type, path }) => {
+    const start = Date.now();
+
+    const result = await next();
+
+    const duration = Date.now() - start;
+
+    // 记录慢查询
+    if (duration > 1000) {
+      console.warn(`[Slow Query] ${path} took ${duration}ms`);
+    }
+
+    // 发送到监控服务（如 Sentry、DataDog）
+    if (typeof window !== "undefined" && window.gtag) {
+      window.gtag("event", "timing_complete", {
+        name: path,
+        value: duration,
+      });
+    }
+
+    return result;
+  }
+);
+```
+
+在 tRPC 实例中使用：
+
+```typescript
+export const appRouter = t.router({
+  tasks: t.router({
+    list: t.procedure.use(performanceMiddleware).query(async ({ ctx }) => {
+      // ...
+    }),
+  }),
+});
+```
+
+## Trade-off 分析
+
+性能优化不是银弹，需要权衡。
+
+优势：
+
+- 减少网络传输，提升响应速度
+- 降低服务器负载，减少成本
+- 改善用户体验，尤其移动端
+- 延长设备电池寿命
+
+劣势：
+
+- 增加代码复杂度
+- 缓存一致性难保证
+- 过度优化会损害可读性
+- 调试和测试更困难
+
+适用场景：
+
+- 数据量大（单个对象超过 10KB）
+- 用户量大（并发请求多）
+- 移动端用户多（网络慢）
+- 成本敏感（云服务按流量计费）
+
+不适用场景：
+
+- 数据量小（单个对象小于 1KB）
+- 用户量小（并发请求少）
+- 内部工具（网络环境好）
+- MVP 阶段（快速迭代优先）
+
+对于协作任务管理平台，元数据优化是必要的。随着任务和用户数量增长，数据传输会线性增加，不及时优化会影响用户体验。但要避免过早优化，先保证功能正确，再根据实际性能数据优化热点路径。
+
+## 总结
+
+本文介绍了 tRPC 的元数据系统和性能优化策略。我们通过字段选择、嵌套对象控制、延迟加载、缓存策略，大幅减少了数据传输量，提升了应用性能。
+
+关键点：
+
+- 字段选择让客户端精确指定需要的数据
+- 嵌套对象优化减少关联数据的传输
+- 延迟加载按需获取数据，提升初始加载速度
+- 缓存策略减少重复请求和数据库查询
+- 分页优化避免一次性加载大量数据
+- 性能监控帮助找到优化目标
+
+优化是个持续的过程，需要根据实际数据不断调整。下一篇文章，我们将学习如何在 Monorepo 中组织 tRPC 项目，实现代码复用和独立部署。

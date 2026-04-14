@@ -1,0 +1,663 @@
+---
+title: "03. 动态 SQL：应对复杂查询的利器"
+date: "2026-04-12"
+summary: "搜索条件不固定——用户可能按书名搜、按作者搜、按价格范围搜，也可能组合搜索。MyBatis 的动态 SQL 怎么优雅地处理这些场景？"
+tags: ["MyBatis", "Java", "动态SQL", "Mapper XML"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 实战指南"
+seriesOrder: 3
+---
+
+上一篇讲了 Mapper XML 的核心配置：resultMap、参数传递、CRUD 标签。但那些查询的 SQL 都是固定的——查什么条件、返回哪些列，在 XML 里就写死了。
+
+回到 BookHive 项目。书店的搜索页面长这样：一个输入框输入书名，一个下拉选择分类，两个输入框填价格区间，还有出版日期的起止范围。用户可以只填书名搜索，也可以书名加价格区间组合搜索，甚至什么条件都不填直接看全部。五六个条件，排列组合下来有几十种情况。
+
+如果你用 JDBC 写过这种多条件搜索，一定经历过这种痛苦：在 Java 代码里用一堆 `if-else` 拼 SQL 字符串。
+
+```java
+// 你可能写过的 JDBC 拼接代码
+StringBuilder sql = new StringBuilder("SELECT * FROM books WHERE 1=1");
+List<Object> params = new ArrayList<>();
+
+if (title != null && !title.isEmpty()) {
+    sql.append(" AND title LIKE ?");
+    params.add("%" + title + "%");
+}
+if (minPrice != null) {
+    sql.append(" AND price >= ?");
+    params.add(minPrice);
+}
+if (maxPrice != null) {
+    sql.append(" AND price <= ?");
+    params.add(maxPrice);
+}
+// ... 更多条件
+
+// 手动设置 PreparedStatement 参数
+PreparedStatement ps = conn.prepareStatement(sql.toString());
+for (int i = 0; i < params.size(); i++) {
+    ps.setObject(i + 1, params.get(i));
+}
+```
+
+代码又长又丑，条件一多就容易出错。漏了一个空格、多了一个 `AND`，整个 SQL 就废了。MyBatis 的动态 SQL 就是来解决这个问题的——它让你在 XML 里用标签来描述"什么条件下拼什么 SQL"，框架替你处理拼接细节。
+
+## if 标签：条件判断的基础
+
+`<if>` 是动态 SQL 最基本的标签。它接收一个 `test` 表达式，条件为 true 时才把标签里的内容拼进 SQL。
+
+以 BookHive 的书籍搜索为例，先定义一个查询 DTO：
+
+```java
+public class BookQueryDTO {
+    private String title;          // 书名关键字
+    private String author;         // 作者名
+    private BigDecimal minPrice;   // 最低价格
+    private BigDecimal maxPrice;   // 最高价格
+    private Long categoryId;       // 分类 ID
+    private LocalDate publishedAfter;  // 出版日期下限
+    private LocalDate publishedBefore; // 出版日期上限
+    // getter/setter 省略
+}
+```
+
+Mapper 接口：
+
+```java
+List<Book> searchBooks(BookQueryDTO query);
+```
+
+用 `<if>` 标签写动态查询：
+
+```xml
+<select id="searchBooks" resultType="Book">
+    SELECT id, title, isbn, price, stock, publisher_id,
+           published_date, description, created_at
+    FROM books
+    WHERE 1 = 1
+    <if test="title != null and title != ''">
+        AND title LIKE CONCAT('%', #{title}, '%')
+    </if>
+    <if test="author != null and author != ''">
+        AND author_name = #{author}
+    </if>
+    <if test="minPrice != null">
+        AND price &gt;= #{minPrice}
+    </if>
+    <if test="maxPrice != null">
+        AND price &lt;= #{maxPrice}
+    </if>
+    <if test="categoryId != null">
+        AND category_id = #{categoryId}
+    </if>
+</select>
+```
+
+几个关键点。`test` 表达式用的是 OGNL（Object-Graph Navigation Language），语法和 Java 表达式很像。`title != null and title != ''` 是最常见的写法——不仅判断不为 null，还要判断不是空字符串。对于数值类型（`minPrice`、`categoryId`），只判断 `!= null` 就够了。
+
+XML 里的比较运算符需要转义：`<` 写成 `&lt;`，`>` 写成 `&gt;`，`<=` 写成 `&lt;=`，`>=` 写成 `&gt;=`。或者用 `<![CDATA[]]>` 包裹整段 SQL，就不用转义了，但可读性会差一些。
+
+注意 `WHERE 1 = 1` 这个写法。因为每个 `<if>` 标签里的条件都以 `AND` 开头，如果没有 `WHERE 1 = 1`，当所有条件都不满足时，生成的 SQL 就是 `SELECT ... FROM books WHERE`，后面没有条件，语法错误。`WHERE 1 = 1` 保证 SQL 始终合法。但这种方式不够优雅——`WHERE 1 = 1` 会让索引优化器多判断一个恒真条件。MyBatis 提供了更好的方案。
+
+## where 标签：智能处理 AND/OR 前缀
+
+`<where>` 标签是 `<if>` 的最佳搭档。它做两件事：当内部有条件成立时，自动插入 `WHERE` 关键字；自动去掉第一个条件前面多余的 `AND` 或 `OR`。
+
+把上面的查询改用 `<where>`：
+
+```xml
+<select id="searchBooks" resultType="Book">
+    SELECT id, title, isbn, price, stock, publisher_id,
+           published_date, description, created_at
+    FROM books
+    <where>
+        <if test="title != null and title != ''">
+            AND title LIKE CONCAT('%', #{title}, '%')
+        </if>
+        <if test="author != null and author != ''">
+            AND author_name = #{author}
+        </if>
+        <if test="minPrice != null">
+            AND price &gt;= #{minPrice}
+        </if>
+        <if test="maxPrice != null">
+            AND price &lt;= #{maxPrice}
+        </if>
+        <if test="categoryId != null">
+            AND category_id = #{categoryId}
+        </if>
+        <if test="publishedAfter != null">
+            AND published_date &gt;= #{publishedAfter}
+        </if>
+        <if test="publishedBefore != null">
+            AND published_date &lt;= #{publishedBefore}
+        </if>
+    </where>
+    ORDER BY created_at DESC
+</select>
+```
+
+和之前 `WHERE 1 = 1` 的写法对比，区别在于不需要那个 hack 了。当用户只传了 `title = "Java"` 时，`<where>` 生成的 SQL 是：
+
+```sql
+SELECT ... FROM books WHERE title LIKE CONCAT('%', 'Java', '%') ORDER BY created_at DESC
+```
+
+`<where>` 检测到第一个条件 `AND title LIKE ...` 前面有 `AND`，自动去掉了。如果用户什么条件都没传，所有 `<if>` 都不成立，`<where>` 也不会插入 `WHERE` 关键字，生成的 SQL 就是 `SELECT ... FROM books ORDER BY created_at DESC`，完全合法。
+
+一个容易犯的错误是忘记在 `<if>` 里面写 `AND`。如果写成这样：
+
+```xml
+<!-- 错误写法：漏了 AND -->
+<where>
+    <if test="title != null and title != ''">
+        title LIKE CONCAT('%', #{title}, '%')
+    </if>
+    <if test="minPrice != null">
+        AND price &gt;= #{minPrice}
+    </if>
+</where>
+```
+
+当 `title` 和 `minPrice` 都有值时，生成的 SQL 是 `WHERE title LIKE ... AND price >= ...`，没问题。但如果只有 `minPrice`，生成的 SQL 是 `WHERE AND price >= ...`，语法错误。`<where>` 只会去掉**第一个**条件前面的 `AND/OR`，第二个及以后不会动。所以保险起见，每个 `<if>` 里的条件都加 `AND` 前缀，让 `<where>` 统一处理。
+
+## set 标签：动态更新字段
+
+和 `<where>` 处理查询条件类似，`<set>` 用来处理 UPDATE 语句中动态字段的问题。
+
+BookHive 后台有个书籍编辑功能。编辑时，管理员可能只改了价格，也可能同时改了书名和描述。你不想把没改的字段也 UPDATE 一遍——有些字段可能是 null，覆盖上去数据就丢了。
+
+```xml
+<update id="updateBookSelective">
+    UPDATE books
+    <set>
+        <if test="title != null and title != ''">
+            title = #{title},
+        </if>
+        <if test="isbn != null and isbn != ''">
+            isbn = #{isbn},
+        </if>
+        <if test="price != null">
+            price = #{price},
+        </if>
+        <if test="stock != null">
+            stock = #{stock},
+        </if>
+        <if test="publisherId != null">
+            publisher_id = #{publisherId},
+        </if>
+        <if test="publishedDate != null">
+            published_date = #{publishedDate},
+        </if>
+        <if test="description != null">
+            description = #{description},
+        </if>
+    </set>
+    WHERE id = #{id}
+</update>
+```
+
+`<set>` 的作用和 `<where>` 类似：自动插入 `SET` 关键字，自动去掉最后一个条件后面多余的逗号。
+
+假设只更新了价格和库存，`<set>` 生成的 SQL 是：
+
+```sql
+UPDATE books SET price = ?, stock = ? WHERE id = ?
+```
+
+注意每个 `<if>` 里的赋值语句后面都带了逗号。如果只更新 `title`，没有 `<set>` 的话会生成 `UPDATE books SET title = ?, WHERE id = ?`，逗号在 `WHERE` 前面，语法错误。`<set>` 会自动去掉末尾多余的逗号。
+
+## trim 标签：where 和 set 的底层实现
+
+`<where>` 和 `<set>` 本质上是 `<trim>` 的语法糖。`<trim>` 是一个更通用的标签，可以自定义前缀和后缀的处理规则。
+
+`<where>` 等价于这样的 `<trim>`：
+
+```xml
+<!-- where 标签的底层实现 -->
+<trim prefix="WHERE" prefixOverrides="AND | OR">
+    <if test="title != null and title != ''">
+        AND title LIKE CONCAT('%', #{title}, '%')
+    </if>
+    <if test="minPrice != null">
+        AND price &gt;= #{minPrice}
+    </if>
+</trim>
+```
+
+`prefix="WHERE"` 表示在内容前面加 `WHERE`，`prefixOverrides="AND | OR"` 表示去掉内容开头的 `AND` 或 `OR`（注意 `AND` 和 `|` 之间有空格，`OR` 后面也有空格）。
+
+`<set>` 等价于：
+
+```xml
+<!-- set 标签的底层实现 -->
+<trim prefix="SET" suffixOverrides=",">
+    <if test="title != null and title != ''">
+        title = #{title},
+    </if>
+    <if test="price != null">
+        price = #{price},
+    </if>
+</trim>
+```
+
+`suffixOverrides=","` 去掉内容末尾多余的逗号。
+
+什么时候需要直接用 `<trim>`？当 `<where>` 和 `<set>` 满足不了你的需求时。比如你想在 UPDATE 语句里同时支持动态字段和动态条件：
+
+```xml
+<!-- 复杂场景：动态 SET + 动态 WHERE -->
+<update id="updateBookIfMatches">
+    UPDATE books
+    <trim prefix="SET" suffixOverrides=",">
+        <if test="newTitle != null">
+            title = #{newTitle},
+        </if>
+        <if test="newPrice != null">
+            price = #{newPrice},
+        </if>
+    </trim>
+    <trim prefix="WHERE" prefixOverrides="AND">
+        <if test="id != null">
+            AND id = #{id}
+        </if>
+        <if test="oldPrice != null">
+            AND price = #{oldPrice}
+        </if>
+    </trim>
+</update>
+```
+
+这种场景用 `<set>` 和 `<where>` 嵌套也能实现，但 `<trim>` 写起来更清晰——每个标签的职责一目了然。
+
+实际开发中，绝大多数情况用 `<where>` 和 `<set>` 就够了。知道 `<trim>` 的存在，在遇到特殊情况时有这个工具可用。
+
+## choose/when/otherwise：互斥条件选择
+
+`<choose>` 类似 Java 的 `switch-case`。它从多个条件中选择第一个匹配的执行，匹配到就不再看后面的条件。如果都不匹配，执行 `<otherwise>`。
+
+BookHive 的搜索结果需要支持动态排序。用户可以选择按价格、出版日期或销量排序。不同的排序字段对应不同的 `ORDER BY` 子句，而且只能选一个。
+
+```xml
+<select id="searchBooks" resultType="Book">
+    SELECT id, title, isbn, price, stock, publisher_id,
+           published_date, description, created_at
+    FROM books
+    <where>
+        <if test="title != null and title != ''">
+            AND title LIKE CONCAT('%', #{title}, '%')
+        </if>
+        <if test="categoryId != null">
+            AND category_id = #{categoryId}
+        </if>
+        <if test="minPrice != null">
+            AND price &gt;= #{minPrice}
+        </if>
+        <if test="maxPrice != null">
+            AND price &lt;= #{maxPrice}
+        </if>
+    </where>
+    <choose>
+        <when test="sortBy != null and sortBy == 'price_asc'">
+            ORDER BY price ASC
+        </when>
+        <when test="sortBy != null and sortBy == 'price_desc'">
+            ORDER BY price DESC
+        </when>
+        <when test="sortBy != null and sortBy == 'published_date'">
+            ORDER BY published_date DESC
+        </when>
+        <when test="sortBy != null and sortBy == 'sales'">
+            ORDER BY sales_count DESC
+        </when>
+        <otherwise>
+            ORDER BY created_at DESC
+        </otherwise>
+    </choose>
+</select>
+```
+
+`<choose>` 和 `<if>` 的区别在于：`<if>` 是独立判断，每个条件都可能成立；`<choose>` 是互斥的，只要有一个 `<when>` 成立就跳过后面所有的。
+
+这里还有一个安全考虑。排序字段不能直接用 `#{}` 占位符，因为 `ORDER BY` 的列名是 SQL 结构的一部分，不是参数值。如果直接让用户输入排序字段拼进 SQL，就有 SQL 注入风险。所以这里用白名单方式——在 `<choose>` 里列举所有合法的排序方式，不合法的值会走到 `<otherwise>`，用默认排序。
+
+注意 `sortBy == 'price_asc'` 中的字符串比较用的是 `==` 而不是 `.equals()`。在 OGNL 表达式里，`==` 对于字符串比较的是值而不是引用，所以这里用 `==` 是正确的。
+
+## foreach：批量操作的核心
+
+`<foreach>` 用来遍历集合，生成重复的 SQL 片段。最常见的两个场景：`IN` 查询和批量插入。
+
+### IN 查询
+
+BookHive 后台有个功能：管理员选中多本书，批量上架或下架。前端传过来的是一组书籍 ID，需要用 `WHERE id IN (?, ?, ?)` 查询。
+
+```java
+List<Book> findByIds(@Param("ids") List<Long> ids);
+```
+
+```xml
+<select id="findByIds" resultType="Book">
+    SELECT id, title, isbn, price, stock, publisher_id,
+           published_date, description, created_at
+    FROM books
+    WHERE id IN
+    <foreach collection="ids" item="bookId" open="(" close=")" separator=",">
+        #{bookId}
+    </foreach>
+</select>
+```
+
+如果 `ids` 是 `[1, 3, 5, 7]`，生成的 SQL 是：
+
+```sql
+SELECT ... FROM books WHERE id IN (1, 3, 5, 7)
+```
+
+`<foreach>` 的属性含义：
+
+- `collection`：要遍历的集合名，对应 `@Param("ids")` 的值
+- `item`：当前遍历到的元素名，在 `#{}` 里用 `bookId` 引用
+- `open`：整个遍历结果的前缀，这里是 `(`
+- `close`：整个遍历结果的后缀，这里是 `)`
+- `separator`：每个元素之间的分隔符，这里是 `,`
+
+如果传入的是数组而不是 List，`collection` 属性写 `array`：
+
+```xml
+<foreach collection="array" item="bookId" open="(" close=")" separator=",">
+    #{bookId}
+</foreach>
+```
+
+### 批量插入
+
+用户下单时，一个订单可能包含多本书。需要往订单项表里批量插入多条记录。
+
+```java
+void batchInsertOrderItems(@Param("items") List<OrderItem> items);
+```
+
+```xml
+<insert id="batchInsertOrderItems">
+    INSERT INTO order_items
+        (order_id, book_id, quantity, unit_price)
+    VALUES
+    <foreach collection="items" item="item" separator=",">
+        (#{item.orderId}, #{item.bookId}, #{item.quantity}, #{item.unitPrice})
+    </foreach>
+</insert>
+```
+
+假设 `items` 列表有 3 条记录，生成的 SQL 是：
+
+```sql
+INSERT INTO order_items (order_id, book_id, quantity, unit_price)
+VALUES (1001, 1, 2, 59.99), (1001, 3, 1, 39.99), (1001, 5, 1, 29.99)
+```
+
+一条 INSERT 语句插入多行，比循环调用单条 INSERT 效率高很多。MySQL 的批量插入在 InnoDB 引擎下，单条语句比多次单条 INSERT 快 5-10 倍。
+
+### 批量更新
+
+运营活动需要批量调整一批书籍的价格。`<foreach>` 也可以用在 UPDATE 中，但要注意 MySQL 的语法限制。
+
+```xml
+<update id="batchUpdatePrice">
+    UPDATE books
+    SET price = CASE id
+        <foreach collection="priceMap" index="bookId" item="newPrice">
+            WHEN #{bookId} THEN #{newPrice}
+        </foreach>
+        ELSE price
+    END
+    WHERE id IN
+    <foreach collection="priceMap" index="bookId" item="newPrice" open="(" close=")" separator=",">
+        #{bookId}
+    </foreach>
+</update>
+```
+
+这里传入的是一个 Map（`bookId -> newPrice`），用 `index` 获取 key，`item` 获取 value。生成的 SQL 使用 `CASE WHEN` 语法：
+
+```sql
+UPDATE books
+SET price = CASE id
+    WHEN 1 THEN 59.99
+    WHEN 2 THEN 45.00
+    WHEN 3 THEN 32.50
+    ELSE price
+END
+WHERE id IN (1, 2, 3)
+```
+
+`CASE WHEN` 的方式在一条语句里更新多行不同值，避免了多次数据库交互。
+
+关于 `<foreach>` 的一个注意事项：如果集合为空（`null` 或空集合），`<foreach>` 不会生成任何内容。对于 `IN` 查询来说，会生成 `WHERE id IN` 后面什么都没有，SQL 语法错误。所以在 Java 代码中应该先做非空判断：
+
+```java
+// Service 层做参数校验
+if (ids == null || ids.isEmpty()) {
+    return Collections.emptyList();
+}
+return bookMapper.findByIds(ids);
+```
+
+## sql 和 include：SQL 片段复用
+
+上一篇简单提到过 `<sql>` 和 `<include>`。在动态 SQL 场景下，它们的价值更大。
+
+BookHive 的书籍查询不止一个地方用。搜索页用、管理后台用、推荐模块也用。这些查询的列列表是一样的，搜索条件也是类似的。用 `<sql>` 提取公共部分：
+
+```xml
+<!-- 定义可复用的列列表 -->
+<sql id="bookBaseColumns">
+    id, title, isbn, price, stock, publisher_id,
+    published_date, description, created_at
+</sql>
+
+<!-- 定义可复用的搜索条件片段 -->
+<sql id="bookSearchConditions">
+    <if test="title != null and title != ''">
+        AND title LIKE CONCAT('%', #{title}, '%')
+    </if>
+    <if test="author != null and author != ''">
+        AND author_name = #{author}
+    </if>
+    <if test="minPrice != null">
+        AND price &gt;= #{minPrice}
+    </if>
+    <if test="maxPrice != null">
+        AND price &lt;= #{maxPrice}
+    </if>
+    <if test="categoryId != null">
+        AND category_id = #{categoryId}
+    </if>
+    <if test="publishedAfter != null">
+        AND published_date &gt;= #{publishedAfter}
+    </if>
+    <if test="publishedBefore != null">
+        AND published_date &lt;= #{publishedBefore}
+    </if>
+</sql>
+```
+
+然后在具体的查询中引用：
+
+```xml
+<select id="searchBooks" resultType="Book">
+    SELECT <include refid="bookBaseColumns"/>
+    FROM books
+    <where>
+        <include refid="bookSearchConditions"/>
+    </where>
+    ORDER BY created_at DESC
+</select>
+
+<select id="searchBooksWithPagination" resultType="Book">
+    SELECT <include refid="bookBaseColumns"/>
+    FROM books
+    <where>
+        <include refid="bookSearchConditions"/>
+    </where>
+    ORDER BY created_at DESC
+    LIMIT #{pageSize} OFFSET #{offset}
+</select>
+```
+
+`<include>` 还可以配合 `<property>` 传递参数，让 SQL 片段更灵活：
+
+```xml
+<!-- 带参数的 SQL 片段 -->
+<sql id="bookColumnsWithAlias">
+    b.id, b.title, b.isbn, b.price, b.stock,
+    b.publisher_id, b.published_date, b.description, b.created_at
+</sql>
+
+<!-- 使用时可以通过 property 传参 -->
+<include refid="bookColumnsWithAlias">
+    <property name="alias" value="b"/>
+</include>
+```
+
+提取 SQL 片段的原则是：超过两个查询共用的部分才提取。如果只有一处用，提取出来反而增加了理解成本——你得跳到 `<sql>` 定义的地方才能看到完整内容。
+
+## bind：在 OGNL 中创建变量
+
+`<bind>` 标签用来在 OGNL 上下文中创建一个变量，后续的 `<if>` 和 `#{}` 中可以直接引用。
+
+一个典型的使用场景是模糊搜索的模式拼接。在 BookHive 的搜索功能中，用户输入的关键字需要用 `LIKE '%keyword%'` 的方式匹配。之前我们用的是 `CONCAT('%', #{title}, '%')`，但不同数据库的字符串拼接方式不同。Oracle 用 `||`，PostgreSQL 用 `CONCAT` 或 `||`。用 `<bind>` 可以统一处理：
+
+```xml
+<select id="searchBooks" resultType="Book">
+    <!-- bind 在 OGNL 上下文中创建一个名为 titlePattern 的变量 -->
+    <bind name="titlePattern" value="'%' + title + '%'"/>
+    SELECT id, title, isbn, price, stock, publisher_id,
+           published_date, description, created_at
+    FROM books
+    <where>
+        <if test="title != null and title != ''">
+            AND title LIKE #{titlePattern}
+        </if>
+        <if test="minPrice != null">
+            AND price &gt;= #{minPrice}
+        </if>
+        <if test="maxPrice != null">
+            AND price &lt;= #{maxPrice}
+        </if>
+    </where>
+    ORDER BY created_at DESC
+</select>
+```
+
+`<bind name="titlePattern" value="'%' + title + '%'"/>` 创建了一个变量 `titlePattern`，值是 `'%' + title + '%'`（注意 `value` 属性中的字符串用单引号）。之后在 SQL 中用 `#{titlePattern}` 引用。
+
+这里有一个容易踩的坑：`value` 属性中的表达式是 OGNL 表达式，不是 SQL 表达式。`'%' + title + '%'` 中的 `+` 是字符串拼接（OGNL 的行为），`title` 是从参数对象中取出的属性值。如果 `title` 是 `"Java"`，`titlePattern` 的值就是 `"%Java%"`。
+
+另一个使用 `<bind>` 的场景是简化复杂的条件判断。比如价格区间查询，你想判断"是否有价格条件"：
+
+```xml
+<bind name="hasPriceCondition"
+      value="minPrice != null or maxPrice != null"/>
+
+<if test="hasPriceCondition">
+    AND (
+        <if test="minPrice != null">price &gt;= #{minPrice}</if>
+        <if test="minPrice != null and maxPrice != null">AND </if>
+        <if test="maxPrice != null">price &lt;= #{maxPrice}</if>
+    )
+</if>
+```
+
+`<bind>` 把一个复合条件提取成一个布尔变量，让后续的 `<if>` 更清晰。不过这种用法要适度——如果条件本身就很简单，用 `<bind>` 反而多了一层间接。
+
+## 把所有标签组合起来：完整的搜索功能
+
+回到 BookHive 的核心需求。把前面讲的所有标签组合起来，写一个完整的多条件搜索：
+
+```xml
+<!-- BookMapper.xml -->
+<sql id="bookBaseColumns">
+    id, title, isbn, price, stock, publisher_id,
+    published_date, description, created_at
+</sql>
+
+<sql id="bookSearchConditions">
+    <if test="query.title != null and query.title != ''">
+        <bind name="titlePattern" value="'%' + query.title + '%'"/>
+        AND title LIKE #{titlePattern}
+    </if>
+    <if test="query.author != null and query.author != ''">
+        AND author_name = #{query.author}
+    </if>
+    <if test="query.minPrice != null">
+        AND price &gt;= #{query.minPrice}
+    </if>
+    <if test="query.maxPrice != null">
+        AND price &lt;= #{query.maxPrice}
+    </if>
+    <if test="query.categoryId != null">
+        AND category_id = #{query.categoryId}
+    </if>
+    <if test="query.publishedAfter != null">
+        AND published_date &gt;= #{query.publishedAfter}
+    </if>
+    <if test="query.publishedBefore != null">
+        AND published_date &lt;= #{query.publishedBefore}
+    </if>
+</sql>
+
+<select id="searchBooks" resultType="Book">
+    SELECT <include refid="bookBaseColumns"/>
+    FROM books
+    <where>
+        <include refid="bookSearchConditions"/>
+    </where>
+    <choose>
+        <when test="query.sortBy == 'price_asc'">
+            ORDER BY price ASC
+        </when>
+        <when test="query.sortBy == 'price_desc'">
+            ORDER BY price DESC
+        </when>
+        <when test="query.sortBy == 'published_date'">
+            ORDER BY published_date DESC
+        </when>
+        <otherwise>
+            ORDER BY created_at DESC
+        </otherwise>
+    </choose>
+    LIMIT #{pageSize} OFFSET #{offset}
+</select>
+```
+
+这个搜索接口覆盖了 BookHive 的主要搜索场景：用户可以按任意条件组合搜索，结果按指定方式排序，支持分页。XML 结构清晰——`<sql>` 复用列列表和条件片段，`<where>` 处理动态 WHERE 子句，`<choose>` 处理互斥的排序选项，`<bind>` 处理模糊搜索的模式拼接。
+
+## 动态 SQL 的使用原则
+
+动态 SQL 虽然强大，但写不好也会变成维护的噩梦。几条实际开发中的经验。
+
+**能用固定 SQL 就不要用动态 SQL**。如果一个查询的条件是确定的，直接写固定 SQL，可读性和性能都更好。动态 SQL 是给条件不确定的场景准备的。
+
+**注意 OGNL 表达式中的类型**。`test="categoryId != null"` 对于 Long 类型没问题，但如果参数是从前端 JSON 反序列化来的，可能是 `0` 而不是 `null`。这时候要额外判断 `categoryId != null and categoryId > 0`。
+
+**避免在动态 SQL 中做业务判断**。`<if>` 的条件应该是"这个参数有没有传"，而不是"这个用户的角色是不是管理员"。业务逻辑放在 Service 层，Mapper 层只关心 SQL 的拼接。
+
+**SQL 片段不要嵌套太深**。`<include>` 引用 `<sql>`，`<sql>` 里面再 `<include>` 另一个 `<sql>`，两三层还行，多了就很难追踪最终生成的 SQL 是什么样的。MyBatis 有个 `mybatis.configuration.log-impl` 配置，开启后可以看到实际执行的 SQL 和参数，调试动态 SQL 时非常有用。
+
+**留意空集合的情况**。`<foreach>` 遍历空集合不会报错，但会生成不合法的 SQL（比如 `WHERE id IN` 后面没有内容）。在 Java 层做好参数校验，避免把空集合传进来。
+
+**动态 SQL 加上单元测试**。因为动态 SQL 的分支很多，手动测试很难覆盖所有组合。用 MyBatis 的 `SqlSession` 直接调用 Mapper 方法，断言不同的参数组合生成正确的 SQL 或返回正确的结果。Mock 数据库可以用 H2 内存数据库。
+
+## 什么时候用动态 SQL，什么时候不用
+
+动态 SQL 解决的核心问题是：查询条件不固定、需要根据参数动态拼接 SQL。如果你的查询条件是确定的——比如根据 ID 查用户、根据固定字段查列表——直接写固定 SQL，简单直接。
+
+但当你遇到这些场景时，动态 SQL 是最合适的工具：多条件组合搜索（搜索页、筛选页）、批量操作（批量插入、批量更新）、根据不同条件选择不同的排序方式、选择性更新（只更新非 null 字段）。
+
+如果你发现动态 SQL 写得太复杂了——`<if>` 嵌套了好几层，`<choose>` 里面又套 `<where>`，生成的 SQL 难以理解——那可能是查询设计本身有问题。考虑把复杂的查询拆成多个简单的查询，在 Java 层组合结果，或者用数据库视图来简化 SQL。
+
+MyBatis 的动态 SQL 不是让你把所有逻辑都塞进 XML 里。它是一个工具，用来处理 SQL 层面的动态性。业务逻辑还是在 Java 代码里，SQL 的动态拼接交给 MyBatis。职责分清了，代码就好维护。
+
+下一篇讲关联映射——书籍和作者的关系、订单和订单项的关系，MyBatis 怎么处理一对多、多对多这些复杂的数据关联。

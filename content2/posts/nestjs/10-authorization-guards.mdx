@@ -1,0 +1,709 @@
+---
+title: "10 认证做完了，但谁能干什么？NestJS 授权守卫实战"
+date: "2026-03-30"
+summary: "认证解决你是谁，授权解决你能干什么。用 NestJS Guard + Reflector 实现角色控制，让作者只能改自己的文章。"
+tags: ["NestJS", "Guard", "RBAC", "Reflector", "权限控制"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式学习"
+seriesOrder: 10
+---
+
+## 一个真实的问题
+
+上一篇我们搞定了 JWT 认证。用户 zhang_wei（ID: `usr_a1x9k2m`）拿着 token 请求 `POST /posts`，系统知道他是谁了。但紧接着问题来了：
+
+- 普通用户 li_ming 能发文章，能编辑自己的文章，但不能删别人的文章
+- 管理员 wang_jun 能删任何人的文章，还能管理用户
+- 未登录的用户只能读文章
+
+这是两个完全不同的概念：**认证**（Authentication）确认身份，**授权**（Authorization）确认权限。上一个 token 证明了 zhang_wei 是 zhang_wei，但没有说 zhang_wei 能做什么。
+
+如果你把这两个混在一起，很快就会写出一堆散落在各处的 `if (user.role === 'admin')`。今天我们把授权逻辑抽出来，做成可复用的 Guard。
+
+## 认证和授权到底区别在哪
+
+用一个比喻：你去银行办业务。进门时保安看你的身份证确认你是张三——这是认证。然后你走到柜台说要取 5 万块，柜员看你的账户权限够不够——这是授权。
+
+在 HTTP 请求的层面：
+
+```
+认证阶段：从 Authorization: Bearer xxx 中解析出 { userId: 'usr_a1x9k2m', role: 'AUTHOR' }
+授权阶段：判断 role: 'AUTHOR' 能不能访问 POST /posts
+```
+
+两个阶段缺一不可。没有认证，授权不知道在判断谁；没有授权，认证了也没意义——任何登录用户都能做任何事。
+
+NestJS 里，认证和授权分别由不同的 Guard 处理。`JwtAuthGuard` 负责验证 token 有效性并解析用户信息，`RolesGuard` 负责判断用户角色是否匹配路由要求。它们可以串联使用，也可以单独使用。
+
+## 先设计权限模型
+
+在写代码之前，先想清楚博客平台的角色划分。不要上来就搞 ABAC、PBAC 那套——对于一个技术博客，三角色足够了：
+
+| 角色   | 能做什么                             | 不能做什么           |
+| ------ | ------------------------------------ | -------------------- |
+| reader | 读文章、评论                         | 发文章、删文章       |
+| author | 发文章、编辑自己的文章、删自己的文章 | 删别人的文章、管用户 |
+| admin  | 所有操作                             | （无）               |
+
+对应到 Prisma schema：
+
+```prisma
+enum Role {
+  READER
+  AUTHOR
+  ADMIN
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String
+  name      String
+  role      Role     @default(READER)
+  // ...
+}
+```
+
+注册时默认角色是 `READER`。用户想发文章时，需要先申请升级为 `AUTHOR`（或者由管理员手动升级）。这个"申请升级"的流程不在本篇讨论范围内，但你应该知道这是一个常见的业务需求。
+
+这里有个设计取舍：为什么不用更细粒度的权限（permission），比如 `create:post`、`delete:any-post`？因为博客场景下，角色和权限的映射关系很简单，用 permission 反而增加复杂度。等我们聊到 RBAC 的局限性时再展开。
+
+## 第一步：角色 Guard + Reflector
+
+NestJS 的 Guard 是请求管道中的一个拦截点，它返回 `true` 或 `false`。关键在于：Guard 怎么知道某个路由需要什么角色？答案是 **Reflector**——它能在运行时读取挂在路由上的元数据。
+
+整个机制分三步：
+
+1. 用 `SetMetadata` 创建装饰器，把角色要求"贴"到路由上
+2. Guard 通过 `Reflector` 读取这个元数据
+3. Guard 把读取到的角色要求和当前用户的角色做比较
+
+先定义装饰器：
+
+```typescript
+// src/common/decorators/roles.decorator.ts
+import { SetMetadata } from "@nestjs/common";
+
+export const ROLES_KEY = "roles";
+export const Roles = (...roles: string[]) => SetMetadata(ROLES_KEY, roles);
+```
+
+`SetMetadata` 做的事情很简单：往路由 handler 上挂一个键值对 `roles: ['AUTHOR', 'ADMIN']`。NestJS 内部维护了一个 metadata map，以 handler 引用和 class 引用作为 key。当你调用 `this.reflector.getAllAndOverride(ROLES_KEY, [handler, class])` 时，NestJS 会先查方法级的 metadata，再查类级的 metadata，方法级优先。
+
+再写 Guard：
+
+```typescript
+// src/common/guards/roles.guard.ts
+import { Injectable, CanActivate, ExecutionContext } from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
+import { ROLES_KEY } from "../decorators/roles.decorator";
+
+@Injectable()
+export class RolesGuard implements CanActivate {
+  constructor(private reflector: Reflector) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    // 从 handler 和 class 两个级别读取 @Roles() 设置的角色
+    const requiredRoles = this.reflector.getAllAndOverride<string[]>(
+      ROLES_KEY,
+      [context.getHandler(), context.getClass()]
+    );
+
+    // 没有标记 @Roles，说明不限制角色，放行
+    if (!requiredRoles) {
+      return true;
+    }
+
+    const { user } = context.switchToHttp().getRequest();
+    if (!user) {
+      return false;
+    }
+
+    return requiredRoles.includes(user.role);
+  }
+}
+```
+
+注意这里返回 `false` 而不是抛异常。当 Guard 返回 `false` 时，NestJS 会自动抛出 `ForbiddenException`（HTTP 403）。如果你想自定义错误信息，可以在返回 `false` 之前抛出自定义异常。
+
+使用起来非常直观：
+
+```typescript
+@Controller('posts')
+@UseGuards(JwtAuthGuard, RolesGuard)
+export class PostsController {
+  // 所有人都能读（公开接口）
+  @Get()
+  findAll() { ... }
+
+  // AUTHOR 和 ADMIN 能发文章
+  @Post()
+  @Roles('AUTHOR', 'ADMIN')
+  create(@CurrentUser('userId') userId: string, @Body() dto: CreatePostDto) { ... }
+
+  // 只有 ADMIN 能删文章
+  @Delete(':id')
+  @Roles('ADMIN')
+  remove(@Param('id') id: string) { ... }
+}
+```
+
+`JwtAuthGuard` 先确认身份，`RolesGuard` 再确认权限。Guard 的执行顺序和装饰器声明顺序一致——先声明的先执行。如果 JWT 验证失败，请求根本走不到 RolesGuard。
+
+有一个细节值得注意：`@Roles('AUTHOR', 'ADMIN')` 是"或"关系——用户的角色是 AUTHOR 或 ADMIN 都能通过。如果你需要"与"关系（同时拥有多个角色），需要修改 Guard 的判断逻辑。但大多数场景下，"或"关系就够了。
+
+## 第二步：资源级别权限——作者只能改自己的文章
+
+角色 Guard 解决了"谁有权限访问这个接口"的问题。但 `PUT /posts/:id` 更复杂：author 能改自己的文章，admin 能改所有人的文章，reader 谁的都不能改。
+
+这种"谁能操作哪个具体资源"的逻辑，角色 Guard 处理不了——它只知道接口级别的角色要求，不知道请求里的 `:id` 指向的资源归谁。
+
+这种逻辑应该放在哪里？有两个选择：
+
+1. **放在 Guard 里**：Guard 注入 PrismaService，查数据库判断资源归属
+2. **放在 Service 层**：Controller 把当前用户 ID 传给 Service，Service 内部判断
+
+我倾向于方案 2。原因很简单：Guard 的职责是"能不能进这个方法"，而"能不能操作这条数据"是业务逻辑。把它放在 Service 层，测试更简单，职责更清晰。
+
+方案 1 不是不行，但有一个问题：Guard 里做数据库查询会让 Guard 变重。Guard 应该尽量轻量——检查 metadata、比较字符串，这些操作几乎零开销。一旦引入数据库查询，每个请求都多了一次 IO，在高并发场景下会成为瓶颈。
+
+```typescript
+// src/posts/posts.service.ts
+import {
+  Injectable,
+  NotFoundException,
+  ForbiddenException,
+} from "@nestjs/common";
+import { PrismaService } from "../database/prisma.service";
+
+@Injectable()
+export class PostsService {
+  constructor(private prisma: PrismaService) {}
+
+  async update(
+    id: string,
+    userId: string,
+    userRole: string,
+    dto: UpdatePostDto
+  ) {
+    const post = await this.prisma.post.findUnique({ where: { id } });
+
+    if (!post) {
+      throw new NotFoundException("文章不存在");
+    }
+
+    // admin 可以改任何文章，author 只能改自己的
+    if (userRole !== "ADMIN" && post.authorId !== userId) {
+      throw new ForbiddenException("你只能编辑自己的文章");
+    }
+
+    return this.prisma.post.update({
+      where: { id },
+      data: { title: dto.title, content: dto.content, updatedAt: new Date() },
+    });
+  }
+
+  async remove(id: string, userId: string, userRole: string) {
+    const post = await this.prisma.post.findUnique({ where: { id } });
+
+    if (!post) {
+      throw new NotFoundException("文章不存在");
+    }
+
+    if (userRole !== "ADMIN" && post.authorId !== userId) {
+      throw new ForbiddenException("你只能删除自己的文章");
+    }
+
+    return this.prisma.post.delete({ where: { id } });
+  }
+}
+```
+
+Controller 端用 `@CurrentUser()` 把 role 和 userId 都取出来传给 Service：
+
+```typescript
+@Put(':id')
+@Roles('AUTHOR', 'ADMIN')
+update(
+  @Param('id') id: string,
+  @CurrentUser('userId') userId: string,
+  @CurrentUser('role') role: string,
+  @Body() dto: UpdatePostDto,
+) {
+  return this.postsService.update(id, userId, role, dto);
+}
+```
+
+zhang_wei 发了一个 `PUT /posts/post_abc123` 的请求，JWT 里解析出 `userId: 'usr_a1x9k2m', role: 'AUTHOR'`。Service 查到 `post_abc123` 的 `authorId` 是 `usr_x9y8z7`，不等于 `usr_a1x9k2m`，而且 role 不是 ADMIN——直接 403。
+
+如果是 wang_jun（ADMIN）发同样的请求，`userRole === 'ADMIN'` 为 true，直接通过。不需要查文章归属——admin 拥有所有权限。
+
+## 第三步：全局 Guard + @Public() 豁免
+
+目前每个 Controller 都要手动加 `@UseGuards(JwtAuthGuard, RolesGuard)`。大部分接口都需要认证，只有少数是公开的。与其在每个 Controller 上重复声明，不如把 Guard 注册为全局的，然后用 `@Public()` 装饰器豁免特定的路由。
+
+`@Public()` 的实现和 `@Roles()` 一样，通过 `SetMetadata` 挂元数据：
+
+```typescript
+// src/common/decorators/public.decorator.ts
+import { SetMetadata } from "@nestjs/common";
+
+export const IS_PUBLIC_KEY = "isPublic";
+export const Public = () => SetMetadata(IS_PUBLIC_KEY, true);
+```
+
+`JwtAuthGuard` 里检查这个标记：
+
+```typescript
+// src/common/guards/jwt-auth.guard.ts
+import { Injectable, CanActivate, ExecutionContext } from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
+import { IS_PUBLIC_KEY } from "../decorators/public.decorator";
+import { ConfigService } from "@nestjs/config";
+import * as jwt from "jsonwebtoken";
+import { TokenExpiredError, JsonWebTokenError } from "jsonwebtoken";
+
+@Injectable()
+export class JwtAuthGuard implements CanActivate {
+  constructor(
+    private reflector: Reflector,
+    private configService: ConfigService
+  ) {}
+
+  canActivate(context: ExecutionContext): boolean {
+    // @Public() 标记的路由跳过认证
+    const isPublic = this.reflector.getAllAndOverride<boolean>(IS_PUBLIC_KEY, [
+      context.getHandler(),
+      context.getClass(),
+    ]);
+
+    if (isPublic) return true;
+
+    const request = context.switchToHttp().getRequest();
+    const authHeader = request.headers.authorization;
+
+    if (!authHeader?.startsWith("Bearer ")) {
+      return false;
+    }
+
+    try {
+      const token = authHeader.slice(7);
+      const secret = this.configService.get("JWT_SECRET");
+      const payload = jwt.verify(token, secret);
+
+      // 把用户信息挂到 request 上，后续 Guard 和 Controller 都能用
+      request.user = payload;
+      return true;
+    } catch (err) {
+      if (
+        err instanceof TokenExpiredError ||
+        err instanceof JsonWebTokenError
+      ) {
+        return false;
+      }
+      throw err;
+    }
+  }
+}
+```
+
+然后在 `AppModule` 里注册为全局 Guard：
+
+```typescript
+// src/app.module.ts
+import { Module } from "@nestjs/common";
+import { APP_GUARD } from "@nestjs/core";
+import { JwtAuthGuard } from "./common/guards/jwt-auth.guard";
+import { RolesGuard } from "./common/guards/roles.guard";
+
+@Module({
+  providers: [
+    { provide: APP_GUARD, useClass: JwtAuthGuard },
+    { provide: APP_GUARD, useClass: RolesGuard },
+  ],
+})
+export class AppModule {}
+```
+
+注册顺序有讲究：`JwtAuthGuard` 在前，`RolesGuard` 在后。NestJS 按 provider 注册顺序执行全局 Guard。先验证身份，再验证权限。如果反过来，RolesGuard 先执行，`request.user` 还是 undefined，权限判断肯定失败。
+
+现在 Controller 干净多了：
+
+```typescript
+@Controller("posts")
+export class PostsController {
+  constructor(private postsService: PostsService) {}
+
+  // 公开接口，不需要认证
+  @Get()
+  @Public()
+  findAll(@Query() query: PaginationDto) {
+    return this.postsService.findAll(query);
+  }
+
+  @Get(":slug")
+  @Public()
+  findBySlug(@Param("slug") slug: string) {
+    return this.postsService.findBySlug(slug);
+  }
+
+  // 需要 AUTHOR 或 ADMIN 角色
+  @Post()
+  @Roles("AUTHOR", "ADMIN")
+  create(
+    @CurrentUser("userId") userId: string,
+    @CurrentUser("role") role: string,
+    @Body() dto: CreatePostDto
+  ) {
+    return this.postsService.create(userId, role, dto);
+  }
+}
+```
+
+没有 `@Public()` 的路由默认需要 JWT 认证。没有 `@Roles()` 的路由默认不限制角色（只要登录就行）。两个装饰器各管各的，互不干扰。
+
+## Guard 链的执行顺序
+
+当多个全局 Guard 同时存在时，NestJS 按注册顺序依次执行。如果一个 Guard 返回 `false`，后续的 Guard 不会再执行。
+
+在我们的配置中：
+
+```
+请求进来
+  ↓
+JwtAuthGuard：检查 @Public()，检查 JWT
+  ↓ 通过
+RolesGuard：检查 @Roles()，检查角色
+  ↓ 通过
+Controller 方法执行
+```
+
+如果 `JwtAuthGuard` 返回 `false`（token 无效或缺失），NestJS 直接返回 401，`RolesGuard` 根本不会执行。这就是为什么注册顺序很重要。
+
+如果你在某个 Controller 方法上手动加 `@UseGuards(SomeOtherGuard)`，这个局部 Guard 会插在全局 Guard 链之前执行。但通常不需要这样做——全局 Guard 已经覆盖了所有场景。
+
+## RBAC 的局限性
+
+三角色方案在博客场景下运行良好，但你可能很快就会遇到它的边界：
+
+**问题 1：角色膨胀。** 如果产品要求增加"审核员"角色——能审核文章但不能发布，RBAC 就需要新增角色。再增加"专栏作者"——能发文章但需要审核，又多一个角色。最终你可能有一堆角色，每个角色是一组权限的硬编码组合。
+
+```typescript
+// 角色越来越多，维护成本上升
+enum Role {
+  READER,
+  AUTHOR,
+  MODERATOR,
+  COLUMN_AUTHOR,
+  GUEST_AUTHOR,
+  // ...
+}
+```
+
+**问题 2：权限组合爆炸。** 如果 author A 被临时赋予管理某个专栏的权限，你需要在角色和用户之间加一层映射。这时候权限不再和角色绑定，而是直接绑定到用户——RBAC 模型就开始变形了。
+
+**问题 3：动态权限。** 后台管理员想通过界面给某个用户勾选权限，而不是改代码。这时权限得存数据库，每次请求都查库——虽然可以加缓存，但复杂度明显上去了。
+
+```typescript
+// 权限存数据库时的查询逻辑
+async getUserPermissions(userId: string): Promise<string[]> {
+  const user = await this.prisma.user.findUnique({
+    where: { id: userId },
+    include: {
+      role: { include: { permissions: true } },
+      permissions: true,  // 用户独立的权限
+    },
+  });
+
+  const rolePermissions = user.role.permissions.map(p => p.name);
+  const userPermissions = user.permissions.map(p => p.name);
+  return [...new Set([...rolePermissions, ...userPermissions])];
+}
+```
+
+什么时候该考虑从 RBAC 迁移到更灵活的方案？一个简单判断：如果你发现自己在一个角色里加 `if` 来处理特殊情况，就该升级了。
+
+对于当前阶段，三角色 + Service 层资源判断足够覆盖博客平台的所有场景。过度设计比设计不足更有害。
+
+## 看看完整的 Controller 长什么样
+
+把所有内容串起来，PostsController 的最终形态：
+
+```typescript
+// src/posts/posts.controller.ts
+import {
+  Controller,
+  Get,
+  Post,
+  Put,
+  Delete,
+  Param,
+  Query,
+  Body,
+} from "@nestjs/common";
+import { PostsService } from "./posts.service";
+import { Roles } from "../common/decorators/roles.decorator";
+import { Public } from "../common/decorators/public.decorator";
+import { CurrentUser } from "../common/decorators/current-user.decorator";
+import { CreatePostDto } from "./dto/create-post.dto";
+import { UpdatePostDto } from "./dto/update-post.dto";
+import { PaginationDto } from "../common/dto/pagination.dto";
+
+@Controller("posts")
+export class PostsController {
+  constructor(private postsService: PostsService) {}
+
+  @Get()
+  @Public()
+  async findAll(@Query() query: PaginationDto) {
+    return this.postsService.findAll(query);
+  }
+
+  @Get(":slug")
+  @Public()
+  async findBySlug(@Param("slug") slug: string) {
+    return this.postsService.findBySlug(slug);
+  }
+
+  @Post()
+  @Roles("AUTHOR", "ADMIN")
+  async create(
+    @CurrentUser("userId") userId: string,
+    @CurrentUser("role") role: string,
+    @Body() dto: CreatePostDto
+  ) {
+    return this.postsService.create(userId, role, dto);
+  }
+
+  @Put(":id")
+  @Roles("AUTHOR", "ADMIN")
+  async update(
+    @Param("id") id: string,
+    @CurrentUser("userId") userId: string,
+    @CurrentUser("role") role: string,
+    @Body() dto: UpdatePostDto
+  ) {
+    return this.postsService.update(id, userId, role, dto);
+  }
+
+  @Delete(":id")
+  @Roles("AUTHOR", "ADMIN")
+  async remove(
+    @Param("id") id: string,
+    @CurrentUser("userId") userId: string,
+    @CurrentUser("role") role: string
+  ) {
+    return this.postsService.remove(id, userId, role);
+  }
+
+  @Post(":id/publish")
+  @Roles("AUTHOR", "ADMIN")
+  async publish(
+    @Param("id") id: string,
+    @CurrentUser("userId") userId: string,
+    @CurrentUser("role") role: string
+  ) {
+    return this.postsService.publish(id, userId, role);
+  }
+}
+```
+
+每个方法上最多两个装饰器：`@Roles()` 限制角色，`@Public()` 豁免认证。没有冗余的 `@UseGuards()`，没有散落的 `if (role === ...)`。权限逻辑要么在 Guard 层（接口级），要么在 Service 层（资源级），职责清晰。
+
+## 装饰器组合：减少重复
+
+当某个方法需要认证但不需要角色限制时，什么都不用加——全局 Guard 已经处理了。但如果某个方法既需要特定角色，又需要某些额外权限（比如只有文章作者才能发布），可以写一个组合装饰器：
+
+```typescript
+// src/common/decorators/require-role.decorator.ts
+import { applyDecorators } from "@nestjs/common";
+import { Roles } from "./roles.decorator";
+
+export function RequireRole(...roles: string[]) {
+  return applyDecorators(Roles(...roles));
+}
+```
+
+现在看起来多此一举，但当你需要同时加多个装饰器时，`applyDecorators` 能把一组装饰器合并成一个，保持调用方的代码整洁：
+
+```typescript
+// 将来如果需要同时检查角色和其他条件
+export function RequireOwnerOrAdmin() {
+  return applyDecorators(
+    Roles("AUTHOR", "ADMIN")
+    // 将来可以加更多装饰器
+  );
+}
+```
+
+## 测试 Guard
+
+测试 Guard 不需要启动整个应用，也不需要数据库。Guard 只依赖 Reflector 和 request 对象，这两个都可以 mock：
+
+```typescript
+// roles.guard.spec.ts
+import { RolesGuard } from "./roles.guard";
+import { Reflector } from "@nestjs/core";
+import { ExecutionContext } from "@nestjs/common";
+
+describe("RolesGuard", () => {
+  let guard: RolesGuard;
+  let reflector: Reflector;
+
+  beforeEach(() => {
+    reflector = new Reflector();
+    guard = new RolesGuard(reflector);
+  });
+
+  it("没有 @Roles() 时放行", () => {
+    jest.spyOn(reflector, "getAllAndOverride").mockReturnValue(undefined);
+    const context = createMockContext({ user: { role: "READER" } });
+    expect(guard.canActivate(context)).toBe(true);
+  });
+
+  it("角色匹配时放行", () => {
+    jest
+      .spyOn(reflector, "getAllAndOverride")
+      .mockReturnValue(["AUTHOR", "ADMIN"]);
+    const context = createMockContext({ user: { role: "AUTHOR" } });
+    expect(guard.canActivate(context)).toBe(true);
+  });
+
+  it("角色不匹配时拒绝", () => {
+    jest.spyOn(reflector, "getAllAndOverride").mockReturnValue(["ADMIN"]);
+    const context = createMockContext({ user: { role: "AUTHOR" } });
+    expect(guard.canActivate(context)).toBe(false);
+  });
+});
+
+function createMockContext(request: any): ExecutionContext {
+  return {
+    switchToHttp: () => ({ getRequest: () => request }),
+    getHandler: () => ({}),
+    getClass: () => ({}),
+  } as unknown as ExecutionContext;
+}
+```
+
+测试 Service 层的资源权限也一样——mock PrismaService，返回预设的数据，验证 403 和正常通过的两种情况。
+
+## 401 vs 403：该返回哪个状态码
+
+很多项目把 401 和 403 搞混。两者的含义完全不同：
+
+- **401 Unauthorized**：没认证，系统不知道你是谁。比如没带 token、token 过期、token 无效。
+- **403 Forbidden**：已认证，但你没有权限做这件事。比如 reader 试图删除别人的文章。
+
+在我们的架构中：
+
+```
+JwtAuthGuard 返回 false → NestJS 抛 401（没登录 / token 无效）
+RolesGuard 返回 false → NestJS 抛 403（角色不匹配）
+Service 层抛 ForbiddenException → 403（资源不属于你）
+```
+
+如果你发现接口返回了 401 但用户明明带了 token，检查 JWT Guard 是否正确解析了 payload 并挂到了 `request.user` 上。如果返回了 403 但用户确实有权限，检查 `@Roles()` 装饰器的角色列表是否包含了用户的角色。
+
+## 排查权限问题的思路
+
+权限 bug 是最让人头疼的——请求返回 403，你不知道是哪个环节拦的。一个实用的排查方法：在 Guard 里加日志。
+
+```typescript
+canActivate(context: ExecutionContext): boolean {
+  const requiredRoles = this.reflector.getAllAndOverride<string[]>(ROLES_KEY, [
+    context.getHandler(),
+    context.getClass(),
+  ]);
+
+  const { user, url, method } = context.switchToHttp().getRequest();
+
+  this.logger.debug(
+    `[RolesGuard] ${method} ${url} | required: ${JSON.stringify(requiredRoles)} | actual: ${user?.role}`,
+  );
+
+  // ...
+}
+```
+
+请求进来时，日志会告诉你这个路由期望什么角色，用户实际是什么角色。一眼就能看出问题在哪。
+
+如果日志显示 `required: undefined`，说明路由上没加 `@Roles()` 装饰器。如果 `actual: undefined`，说明 `JwtAuthGuard` 没有正确设置 `request.user`。如果两个都有值但不匹配，那就是角色配置的问题。
+
+## 角色升级的常见场景
+
+zhang_wei 刚注册时是 READER。他想发文章，需要升级为 AUTHOR。这个升级逻辑通常有两种实现方式：
+
+**方式 1：管理员手动升级**
+
+管理员在后台把 zhang_wei 的 role 从 READER 改为 AUTHOR。简单直接，适合用户量不大的场景。
+
+```typescript
+// src/admin/admin.service.ts
+async updateUserRole(userId: string, newRole: string) {
+  return this.prisma.user.update({
+    where: { id: userId },
+    data: { role: newRole },
+  });
+}
+```
+
+**方式 2：用户申请 + 管理员审批**
+
+zhang_wei 点击"申请成为作者"，系统创建一条审批记录。管理员审核通过后，role 变更为 AUTHOR。
+
+```typescript
+// src/users/users.service.ts
+async requestAuthorRole(userId: string) {
+  // 检查是否已有待审批的申请
+  const existing = await this.prisma.roleUpgradeRequest.findFirst({
+    where: { userId, status: 'PENDING' },
+  });
+  if (existing) {
+    throw new BadRequestException('你已有待审批的申请');
+  }
+
+  return this.prisma.roleUpgradeRequest.create({
+    data: { userId, fromRole: 'READER', toRole: 'AUTHOR', status: 'PENDING' },
+  });
+}
+
+async approveRoleUpgrade(requestId: string) {
+  const request = await this.prisma.roleUpgradeRequest.findUnique({
+    where: { id: requestId },
+  });
+  if (!request || request.status !== 'PENDING') {
+    throw new BadRequestException('申请不存在或已处理');
+  }
+
+  await this.prisma.$transaction([
+    this.prisma.user.update({
+      where: { id: request.userId },
+      data: { role: request.toRole },
+    }),
+    this.prisma.roleUpgradeRequest.update({
+      where: { id: requestId },
+      data: { status: 'APPROVED', reviewedAt: new Date() },
+    }),
+  ]);
+}
+```
+
+两种方式的共同点：角色变更后，用户当前的 JWT token 里还是旧 role。用户需要重新登录才能获取新角色。如果这个延迟不可接受，可以在 role 变更时让用户的 refresh token 失效，强制重新登录。
+
+## Trade-off 小结
+
+**全局 Guard vs 局部 Guard**：全局注册省去了每个 Controller 的重复声明，但增加了一点心智负担——新来的开发者需要知道默认行为是"全部需要认证"。在 `AppModule` 里加一行注释就能解决。
+
+**角色 Guard vs 权限 Guard**：角色粒度粗但简单，权限粒度细但复杂。博客场景用角色就够了。如果将来需要"作者 A 能管理专栏 X 但不能管理专栏 Y"，再引入权限模型。
+
+**资源权限放 Guard vs Service**：放 Guard 可以在请求进入方法前就拦截，但 Guard 里注入数据库 Service 不够优雅；放 Service 职责更清晰，测试更容易。我选 Service。
+
+**`@CurrentUser('role')` vs 每次查库**：JWT payload 里带 role，避免每次请求都查用户表。代价是修改用户角色后，旧 token 里还是旧 role——需要用户重新登录或提供刷新 token 的机制。对于博客平台，这个取舍完全可以接受。
+
+**`getAllAndOverride` vs `getAllAndMerge`**：`getAllAndOverride` 取第一个非 undefined 的值（handler 优先于 class），`getAllAndMerge` 把 handler 和 class 的值合并成数组。对于角色，我们用 Override——方法级设置会覆盖类级设置，这符合直觉。
+
+---
+
+权限控制搞定了。zhang_wei 以 author 身份登录后可以发文章、改自己的文章，但不能删别人的。接下来一个自然的需求是：发文章时想上传一张封面图，用户个人资料页也想换头像。下一篇我们处理文件上传。

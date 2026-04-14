@@ -1,0 +1,373 @@
+---
+title: "07 类型注解与 Pydantic"
+date: "2026-03-30"
+summary: "Python 的类型注解和 Java 的泛型有什么区别？从 Type Hint 到 Pydantic BaseModel，理解 Python 的类型系统如何在灵活性和安全性之间平衡。"
+tags: ["Python", "类型注解", "Pydantic", "数据验证"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 实战"
+seriesOrder: 7
+---
+
+你在 Java 里写了一个方法 `List<String> getArticles()`，编译器就能确保返回的是字符串列表。你把这个方法传给另一个方法 `void publish(List<Article> articles)`，类型不匹配，编译直接报错——错误在代码运行之前就被捕获了。Python 里你写 `def get_articles() -> list[str]`，看起来差不多，但 Python 解释器完全忽略这些注解——你返回一个 `list[int]`，它照样运行不报错。
+
+那 Python 的类型注解有什么用？答案是：给工具用的。mypy 做静态检查，IDE 做智能提示，Pydantic 做运行时验证——类型注解本身不执行，但围绕它的工具生态让 Python 获得了接近 Java 的类型安全，同时保留了动态语言的灵活性。这篇我们从 Java 泛型和 Bean Validation 的角度，理解 Python 的类型系统和 Pydantic 数据验证。
+
+## Java vs Python 类型系统对比
+
+| 维度       | Java                                         | Python                               |
+| ---------- | -------------------------------------------- | ------------------------------------ | -------------------------- |
+| 类型检查   | 编译时强制（编译器）                         | 运行时忽略，mypy 静态检查（可选）    |
+| 泛型       | `List<String>` 编译时擦除，但有编译保障      | `list[str]` 仅注解，运行时不检查     |
+| 类型注解   | 声明时必须，不写就报错                       | 可选，不写也不报错                   |
+| 空安全     | 编译期 `@Nullable` 注解（Checker Framework） | `str                                 | None`，mypy 可检查但非强制 |
+| 数据验证   | Bean Validation（`@NotNull`、`@Size`）       | Pydantic BaseModel（运行时强制验证） |
+| 枚举       | `enum` 编译期检查                            | `enum` 或 `Literal`（运行时检查）    |
+| 结构化类型 | 无（靠 class 定义）                          | TypedDict、Protocol（结构化子类型）  |
+
+最核心的区别是第一行：Java 的类型系统是**编译器强制执行**的，Python 的是**可选的、工具辅助的**。Java 的类型错误通不过编译，Python 的类型错误在运行时才会暴露（而且可能不会暴露，因为 Python 根本不检查类型注解）。
+
+这不是缺陷，而是设计取舍。Python 选择把类型系统变成"渐进式"的——你可以不写类型注解，快速写脚本；也可以写满类型注解，让 mypy 帮你查错。两种模式可以共存于同一个项目中。
+
+## Type Hint 基础：Java 泛型的 Python 版本
+
+Python 3.9 之后，类型注解的语法已经非常简洁。不需要 import，直接用内置类型：
+
+```python
+# 基本类型注解
+name: str = "Alice"
+age: int = 30
+score: float = 95.5
+is_active: bool = True
+
+# 容器类型 — Python 3.9+ 直接用小写
+tags: list[str] = ["python", "fastapi"]
+counts: dict[str, int] = {"a": 1, "b": 2}
+unique_ids: set[int] = {1, 2, 3}
+
+# 可选类型 — 相当于 Java 的 @Nullable String
+nickname: str | None = None
+
+# 联合类型 — 相当于 Java 的 Object（但更精确）
+status: str | int = "active"
+
+# 函数注解
+def get_articles(page: int, size: int = 20) -> list[str]:
+    return ["article1", "article2"]
+```
+
+对比 Java 的等价写法：
+
+```java
+// Java — 泛型在声明时必须指定
+List<String> tags = List.of("python", "fastapi");
+Map<String, Integer> counts = Map.of("a", 1, "b", 2);
+
+// Java — 可选类型需要包装类或注解
+@Nullable String nickname = null;  // Checker Framework
+
+// Java — 联合类型不原生支持，通常用 Object
+Object status = "active";  // 丢失类型信息
+```
+
+Python 的 `str | None` 语法比 Java 的 `@Nullable String` 更自然——它是语言语法的一部分，不是注解。Python 3.10 引入了 `|` 运算符，之前要用 `Optional[str]` 或 `Union[str, None]`。现在直接写 `str | None`，和 Java 14 的 `record` 一样，是"更简洁的语法糖"。
+
+### 函数类型的注解
+
+```python
+from collections.abc import Callable, Sequence
+
+# Callable[[参数类型...], 返回类型] — 相当于 Java 的 Function<T, R>
+def transform(
+    items: Sequence[int],
+    callback: Callable[[int], str],
+) -> list[str]:
+    return [callback(item) for item in items]
+
+# 返回多个值 — Python 独有，Java 没有
+def divide(a: float, b: float) -> tuple[float, float]:
+    return a / b, a % b
+```
+
+Java 没有多返回值，通常用 `record` 或数组包装。Python 的 `tuple[float, float]` 让多返回值也有类型信息。
+
+## 泛型：TypeVar vs Java 的 `<T>`
+
+Java 的泛型用 `<T>` 声明类型参数，Python 用 `TypeVar`：
+
+```python
+from typing import TypeVar, Generic
+
+T = TypeVar("T")  # 声明类型变量，相当于 Java 的 <T>
+
+class Repository(Generic[T]):  # 相当于 Java 的 class Repository<T>
+    def __init__(self) -> None:
+        self._items: list[T] = []
+
+    def save(self, item: T) -> None:
+        self._items.append(item)
+
+    def find_all(self) -> list[T]:
+        return list(self._items)
+
+
+# 使用
+article_repo: Repository[Article] = Repository()
+article_repo.save(Article(title="Python 入门"))
+```
+
+对比 Java：
+
+```java
+// Java
+public class Repository<T> {
+    private List<T> items = new ArrayList<>();
+
+    public void save(T item) {
+        items.add(item);
+    }
+
+    public List<T> findAll() {
+        return new ArrayList<>(items);
+    }
+}
+
+// 使用
+Repository<Article> articleRepo = new Repository<>();
+articleRepo.save(new Article("Python 入门"));
+```
+
+语法几乎一样，但行为不同：Java 的泛型有编译期检查，`Repository<Article>` 不能 `save(new User(...))`；Python 的 `Repository[Article]` 在运行时不做任何检查，`article_repo.save("not an article")` 照样通过——只有 mypy 会报错。
+
+带约束的泛型也一样：
+
+```python
+# Python — TypeVar 约束
+Number = TypeVar("Number", int, float)  # 只能是 int 或 float
+
+def calculate_average(numbers: list[Number]) -> float:
+    return sum(numbers) / len(numbers)
+```
+
+```java
+// Java — <T extends Number>
+<T extends Number> double calculateAverage(List<T> numbers) {
+    return numbers.stream()
+        .mapToDouble(Number::doubleValue)
+        .average()
+        .orElse(0);
+}
+```
+
+Python 用 `TypeVar("Number", int, float)` 列举允许的类型，Java 用 `<T extends Number>` 指定上界。Java 的写法更灵活（任何 `Number` 的子类都行），Python 的写法更精确（只能是 `int` 或 `float`，不接受 `Decimal`）。
+
+## Pydantic：运行时数据验证
+
+Type Hint 是给 mypy 和 IDE 看的，运行时不生效。但很多时候你需要在运行时验证数据——比如从 HTTP 请求中接收 JSON，你得确保 `age` 是整数而不是字符串，`email` 格式正确。Java 用 Bean Validation（`@NotNull`、`@Size`、`@Email`）做这件事，Python 用 Pydantic。
+
+Pydantic 的核心是 `BaseModel`——你用 Type Hint 声明字段类型，Pydantic 在运行时自动验证和转换：
+
+```python
+from pydantic import BaseModel, Field
+from datetime import datetime
+
+
+class ArticleCreate(BaseModel):
+    """创建文章的请求模型 — 相当于 Java 的 DTO + Bean Validation"""
+    title: str = Field(
+        min_length=5,
+        max_length=200,
+        description="文章标题",
+    )
+    content: str = Field(min_length=10)
+    tags: list[str] = Field(default_factory=list, max_length=10)
+    status: str = Field(default="draft", pattern=r"^(draft|published|archived)$")
+    published_at: datetime | None = None
+
+
+# 验证通过 — 自动转换类型
+article = ArticleCreate(
+    title="Python 工程化",
+    content="从零搭建一个规范的 Python 项目...",
+    tags=["python", "engineering"],
+    status="draft",
+)
+
+# 验证失败 — 抛出 ValidationError
+try:
+    ArticleCreate(
+        title="Hi",           # 太短，min_length=5
+        content="Too short",  # 太短，min_length=10
+    )
+except Exception as e:
+    print(e)
+    # 2 validation errors for ArticleCreate
+    # title
+    #   String should have at least 5 characters [type=string_too_short]
+    # content
+    #   String should have at least 10 characters [type=string_too_short]
+```
+
+对比 Java 的 Bean Validation：
+
+```java
+// Java — DTO + Bean Validation 注解
+public class ArticleCreateRequest {
+    @NotBlank
+    @Size(min = 5, max = 200)
+    private String title;
+
+    @NotBlank
+    @Size(min = 10)
+    private String content;
+
+    @NotEmpty
+    @Size(max = 10)
+    private List<@NotBlank String> tags;
+
+    @Pattern(regexp = "^(draft|published|archived)$")
+    private String status = "draft";
+}
+```
+
+两者功能等价，但 Pydantic 的验证信息更详细——它告诉你每个字段的具体错误，Java 的 Bean Validation 只返回错误码（`Size`、`Pattern`），你需要自己映射成人类可读的消息。而且 Pydantic 还会自动做类型转换：传入 `"25"` 能自动转成 `int(25)`，Java 的 Bean Validation 不会做这种转换。
+
+### 自定义验证器
+
+Java 的 Bean Validation 支持自定义注解（`@interface`），Pydantic 支持自定义验证方法：
+
+```python
+from pydantic import BaseModel, field_validator, model_validator
+
+
+class ArticleCreate(BaseModel):
+    title: str = Field(min_length=5, max_length=200)
+    content: str = Field(min_length=10)
+    status: str = "draft"
+
+    @field_validator("title")
+    @classmethod
+    def title_must_not_contain_url(cls, v: str) -> str:
+        """单个字段的自定义验证"""
+        if "http" in v.lower():
+            raise ValueError("标题不能包含 URL")
+        return v.strip()
+
+    @model_validator(mode="after")
+    def check_publish_requirement(self) -> "ArticleCreate":
+        """跨字段验证 — 相当于 Java 的 class-level validator"""
+        if self.status == "published" and len(self.content) < 100:
+            raise ValueError("发布状态的文章内容至少需要 100 字符")
+        return self
+```
+
+Java 的 class-level 验证需要写一个自定义注解 + 验证器类，代码量是 Pydantic 的 3-5 倍。Pydantic 用 `@model_validator` 装饰器一行搞定，这是 Python 装饰器的优势在数据验证领域的体现。
+
+### 嵌套模型和序列化
+
+Pydantic 模型可以嵌套，自动序列化/反序列化 JSON——这是 FastAPI 的基础：
+
+```python
+class Author(BaseModel):
+    id: int
+    name: str
+    avatar: str | None = None
+
+
+class ArticleResponse(BaseModel):
+    id: int
+    title: str
+    content: str
+    author: Author
+    tags: list[str]
+    created_at: datetime
+
+    # 允许从 ORM 对象创建 — 相当于 Java 的 MapStruct
+    model_config = {"from_attributes": True}
+
+
+# 构造嵌套数据
+article = ArticleResponse(
+    id=1,
+    title="Python 入门",
+    content="...",
+    author=Author(id=1, name="Alice"),
+    tags=["python", "tutorial"],
+    created_at=datetime.now(),
+)
+
+# 序列化为字典或 JSON
+article.model_dump()          # dict
+article.model_dump_json()     # JSON 字符串
+article.model_json_schema()   # JSON Schema
+```
+
+Java 里实现同样的事情需要：DTO 类 + Jackson 注解（`@JsonProperty`）+ MapStruct 做对象映射，三个不同的框架协同工作。Pydantic 一个类全包了。
+
+## Pydantic vs Bean Validation：关键差异
+
+| 维度        | Bean Validation                     | Pydantic                                       |
+| ----------- | ----------------------------------- | ---------------------------------------------- |
+| 验证时机    | 框架触发（Spring MVC 在参数绑定时） | 模型实例化时自动验证                           |
+| 类型转换    | 不转换，只验证                      | 自动转换（`"25"` -> `25`）                     |
+| 错误信息    | 错误码 + message 模板，需要手动映射 | 详细的错误信息，包含字段名和原因               |
+| 嵌套验证    | `@Valid` 注解逐层标注               | 自动递归验证嵌套模型                           |
+| 序列化      | Jackson（另一个框架）               | 内置 `model_dump()` / `model_dump_json()`      |
+| JSON Schema | 不支持                              | 内置 `model_json_schema()`                     |
+| 自定义验证  | 自定义注解 + 验证器类（代码量大）   | `@field_validator` / `@model_validator` 装饰器 |
+| ORM 映射    | MapStruct / 手动映射                | `from_attributes=True` 直接从 ORM 创建         |
+| 性能        | 反射开销                            | v2 用 Rust 实现核心，极快                      |
+
+Pydantic v2 的核心用 Rust 重写，验证速度比 v1 快 5-50 倍，比 Bean Validation + Jackson 快一个数量级。这不是因为 Java 慢，而是因为 Bean Validation 依赖反射，而 Pydantic v2 在 Rust 层直接处理数据。
+
+## mypy：可选的静态类型检查
+
+mypy 是 Python 的静态类型检查器，相当于 Java 编译器的类型检查部分（但不包含编译）。它读取你的类型注解，在不运行代码的情况下找出类型错误：
+
+```bash
+# 安装
+uv add --dev mypy
+
+# 检查
+uv run mypy src/
+
+# 严格模式（推荐新项目使用）
+uv run mypy --strict src/
+```
+
+```python
+# mypy 能发现的错误
+def get_article_title(article_id: int) -> str:
+    articles = {1: "Python 入门"}
+    return articles[article_id]  # KeyError at runtime, mypy 报不了这个
+
+def process(items: list[int]) -> int:
+    return items[0]  # OK
+
+# mypy 报错：list[str] 不能赋值给 list[int]
+result: list[int] = ["hello", "world"]
+
+# mypy 报错：None 不能赋值给 str
+name: str = None
+
+# mypy 报错：返回值类型不匹配
+def get_count() -> int:
+    return "hello"
+```
+
+mypy 能发现的问题和 Java 编译器的类型检查类似，但不完全一样。Java 编译器检查的是"类型是否匹配"，mypy 检查的是"注解是否自洽"。`dict[key]` 可能抛 `KeyError`，mypy 不报——这不是类型问题，是逻辑问题，需要运行时测试覆盖。
+
+## Trade-off：Python 类型系统的灵活性代价
+
+Python 的"渐进式类型"是它的核心优势：你可以在一个文件里写满类型注解（严格模式），在另一个文件里一个注解都不写（脚本模式），mypy 照样能检查前者、忽略后者。Java 没有这种自由度——你要么写类型（而且必须写），要么不用 Java。
+
+但这种灵活性有代价。Java 团队的类型覆盖率是 100%（不写编译不过），Python 团队需要靠纪律和工具来维持类型覆盖率。如果项目中途引入 mypy，你会发现自己要补大量的类型注解——这和 Java 项目引入 Checker Framework 的 `@Nullable` 注解一样痛苦，但 Java 至少有编译器的强制力。
+
+Pydantic 填补了 Type Hint "运行时不生效"的空白——Type Hint 给 mypy 和 IDE 用，Pydantic 给运行时用。但 Pydantic 只验证模型实例化时的数据，不会检查函数参数的类型。如果你同时需要静态检查和运行时验证，就要两套系统并行：mypy 检查类型注解，Pydantic 验证数据输入。Java 只需要一套——编译器既检查类型又确保代码能编译通过。
+
+## 下一步
+
+上一篇我们搭好了项目工程化体系——`pyproject.toml` 管配置，ruff 管风格，uv 管依赖。这篇我们学了 Python 的类型系统：Type Hint 给代码加上了类型信息，但不运行时检查；mypy 在编辑时帮你找类型错误；Pydantic 在运行时做数据验证，填补了 Type Hint 的空白。Pydantic 的 BaseModel + Bean Validation 的对比，是理解 Python 和 Java 数据验证差异的关键——Python 用一个类同时解决验证、序列化、ORM 映射三个问题，Java 需要三个框架（Bean Validation + Jackson + MapStruct）协同。
+
+代码能编译通过不代表不会出错。下一篇我们来看 Python 的错误处理——Java 有 checked exception 强制你处理异常，Python 没有。Python 的异常处理怎么设计？自定义异常体系怎么建？异常链怎么用？下一篇解答。

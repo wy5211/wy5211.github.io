@@ -1,0 +1,327 @@
+---
+title: "20 Redis 缓存"
+date: "2026-03-30"
+summary: "Python Redis 客户端和 Spring Cache 有什么不同？用 redis-py 给 CMS 加上文章列表缓存，对比 Spring @Cacheable 的注解式缓存。"
+tags: ["Python", "Redis", "缓存", "FastAPI"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 实战"
+seriesOrder: 20
+---
+
+# Redis 缓存
+
+CMS 的首页加载文章列表，每次请求都查数据库。100 个并发用户同时访问，就是 100 次相同的 SQL 查询。数据库的连接池和查询能力是有上限的，在高并发场景下会成为瓶颈。
+
+缓存的目的很简单：把查询结果存到 Redis，下次请求直接从 Redis 读，跳过数据库。文章列表可能几秒钟才更新一次，但每秒会被读几百次——典型的读多写少场景。
+
+## Spring Boot 的方式：注解式缓存
+
+在讲 Python 之前，先看 Spring Boot 怎么做。Spring Cache 抽象了一套注解，开发者不需要直接操作 Redis：
+
+```java
+@Service
+public class PostService {
+
+    // 第一次调用查数据库，结果自动写入 Redis
+    // 后续调用直接读 Redis，不执行方法体
+    @Cacheable(value = "posts", key = "#page + ':' + #size")
+    public Page<Post> listPosts(int page, int size) {
+        return postRepository.findAll(PageRequest.of(page, size));
+    }
+
+    // 更新数据库后，自动删除 Redis 中的旧缓存
+    @CacheEvict(value = "posts", allEntries = true)
+    public Post updatePost(Long id, PostUpdateDTO dto) {
+        // ...
+    }
+
+    // 同时删除多个缓存
+    @Caching(evict = {
+        @CacheEvict(value = "posts", allEntries = true),
+        @CacheEvict(value = "post", key = "#id")
+    })
+    public void deletePost(Long id) {
+        // ...
+    }
+}
+```
+
+三个注解解决大部分场景：`@Cacheable` 读缓存、`@CacheEvict` 删缓存、`@CachePut` 更新缓存。开发者不直接接触 Redis 客户端，Spring Cache 根据配置自动选择 Redis 作为缓存实现。
+
+这是 Java 生态"约定优于配置"哲学的典型体现——用注解声明意图，框架负责执行。
+
+## Python 的方式：手动缓存
+
+Python 没有类似 Spring Cache 的注解式缓存框架。你直接用 `redis-py` 操作 Redis，手动控制缓存的读、写、删除。
+
+```python
+import redis.asyncio as redis
+import json
+
+# 创建 Redis 客户端
+redis_client = redis.from_url("redis://localhost:6379/0", decode_responses=True)
+
+
+async def get_posts_list(page: int, size: int, tag: str = None) -> dict:
+    """获取文章列表（手动缓存）"""
+
+    # 1. 生成缓存 key
+    cache_key = f"posts:page={page}:size={size}:tag={tag or 'all'}"
+
+    # 2. 尝试从缓存读取
+    cached = await redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    # 3. 缓存未命中，查数据库
+    posts = await query_posts_from_db(page, size, tag)
+    result = {
+        "posts": [p.to_dict() for p in posts],
+        "total": await count_posts(tag),
+        "page": page,
+        "size": size,
+    }
+
+    # 4. 写入缓存（TTL 60 秒，列表数据更新较频繁）
+    await redis_client.setex(cache_key, 60, json.dumps(result))
+
+    return result
+```
+
+同样的逻辑在 Spring Boot 中只需要一个 `@Cacheable` 注解。Python 的写法更繁琐，但每一步都是显式的——你知道缓存 key 是什么格式、TTL 是多少秒、什么条件下读缓存、什么条件下写缓存。
+
+## 手动缓存 vs 注解缓存
+
+两种方式的 trade-off 很明确：
+
+| 维度     | Spring Boot @Cacheable              | Python 手动缓存                               |
+| -------- | ----------------------------------- | --------------------------------------------- |
+| 代码量   | 极少（一个注解）                    | 较多（读、写、删都要手写）                    |
+| 灵活性   | 受限于注解参数                      | 完全可控（key 格式、TTL、条件逻辑）           |
+| 可观测性 | 需要额外配置才能看到 cache hit/miss | 每一步都显式，容易加日志                      |
+| 缓存策略 | Cache-Aside（固定）                 | 可以自由选择（Read-Through、Write-Behind 等） |
+| 学习成本 | 学注解参数                          | 学 Redis 数据结构和命令                       |
+| 调试     | 缓存逻辑隐藏在框架内部              | 代码即文档，逻辑一目了然                      |
+
+Spring Boot 的注解方式在标准场景下效率很高，但一旦你需要非标准的缓存策略（比如缓存穿透保护、多级缓存、条件缓存），就要绕过注解直接操作 Redis——此时和 Python 的手动方式没有本质区别。
+
+## 缓存装饰器：Python 的折中方案
+
+虽然 Python 没有 Spring Cache 那样的注解框架，但可以用装饰器实现类似效果：
+
+```python
+import functools
+import hashlib
+import json
+
+def cached(prefix: str, ttl: int = 300):
+    """缓存装饰器——Python 版的 @Cacheable"""
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            # 根据函数名和参数生成缓存 key
+            key_data = {
+                "func": func.__name__,
+                "args": str(args),
+                "kwargs": str(sorted(kwargs.items())),
+            }
+            key_hash = hashlib.md5(
+                json.dumps(key_data, sort_keys=True).encode()
+            ).hexdigest()[:12]
+            cache_key = f"{prefix}:{key_hash}"
+
+            # 读缓存
+            cached = await redis_client.get(cache_key)
+            if cached:
+                return json.loads(cached)
+
+            # 执行函数
+            result = await func(*args, **kwargs)
+
+            # 写缓存
+            if result is not None:
+                await redis_client.setex(cache_key, ttl, json.dumps(result))
+
+            return result
+        return wrapper
+    return decorator
+
+
+# 使用
+@cached(prefix="post_detail", ttl=300)
+async def get_post_detail(post_id: int) -> dict:
+    return await query_post_from_db(post_id)
+
+@cached(prefix="user_info", ttl=600)
+async def get_user_info(user_id: int) -> dict:
+    return await query_user_from_db(user_id)
+```
+
+这和 `@Cacheable(value = "post_detail", key = "#postId")` 的效果类似，但装饰器是 Python 代码，你可以直接阅读和修改它的实现。Spring Boot 的注解背后是 Spring Cache 的整套机制，要自定义行为需要实现 `CacheResolver` 或 `KeyGenerator` 接口——这对不熟悉 Spring 内部机制的开发者来说门槛更高。
+
+## CMS 文章列表缓存：完整方案
+
+```python
+from contextlib import asynccontextmanager
+from fastapi import FastAPI
+
+app = FastAPI()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 启动时连接 Redis
+    await redis_client.ping()
+    yield
+    # 关闭时断开
+    await redis_client.close()
+
+
+# ========== 文章详情缓存 ==========
+
+async def get_post(post_id: int) -> dict | None:
+    cache_key = f"post:{post_id}"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    post = await query_post_from_db(post_id)
+    if post:
+        await redis_client.setex(cache_key, 300, json.dumps(post))
+    return post
+
+
+# ========== 文章列表缓存 ==========
+
+async def list_posts(page: int, size: int) -> dict:
+    cache_key = f"posts:page={page}:size={size}"
+    cached = await redis_client.get(cache_key)
+    if cached:
+        return json.loads(cached)
+
+    result = await query_posts_from_db(page, size)
+    await redis_client.setex(cache_key, 60, json.dumps(result))
+    return result
+
+
+# ========== 缓存失效 ==========
+
+async def invalidate_post_cache(post_id: int):
+    """文章变更时清除相关缓存"""
+    await redis_client.delete(f"post:{post_id}")
+    # 列表缓存用模糊匹配清除
+    async for key in redis_client.scan_iter("posts:page=*"):
+        await redis_client.delete(key)
+
+
+# ========== 写入时失效 ==========
+
+@app.put("/api/posts/{post_id}")
+async def update_post(post_id: int, ...):
+    # 1. 更新数据库
+    await db_update_post(post_id, ...)
+    # 2. 删除缓存（先更新 DB 再删缓存）
+    await invalidate_post_cache(post_id)
+    return {"status": "updated"}
+```
+
+Spring Boot 对应的实现：
+
+```java
+@CacheEvict(value = "post", key = "#postId")
+@CacheEvict(value = "posts", allEntries = true)  // 清除所有列表缓存
+public Post updatePost(Long postId, PostUpdateDTO dto) {
+    // 只需要写业务逻辑，缓存清除由注解处理
+    return postRepository.save(...);
+}
+```
+
+`allEntries = true` 是 Spring Boot 清除列表缓存的简单方式，但它会清除所有分页的缓存，不管是否和当前文章相关。Python 侧可以用 `SCAN` 更精细地控制。两者各有取舍。
+
+## 缓存穿透、击穿、雪崩
+
+这三个问题与框架无关，是缓存策略的通用问题。Python 手动缓存的好处是你可以直接在代码中处理它们：
+
+**缓存穿透**（查询不存在的数据反复打穿到数据库）：
+
+```python
+async def get_post_safe(post_id: int):
+    cache_key = f"post:{post_id}"
+    cached = await redis_client.get(cache_key)
+    if cached == "NULL":
+        return None  # 缓存了空值，直接返回
+    if cached:
+        return json.loads(cached)
+
+    post = await query_post_from_db(post_id)
+    if post is None:
+        # 缓存空值，TTL 短一些
+        await redis_client.setex(cache_key, 60, "NULL")
+    else:
+        await redis_client.setex(cache_key, 300, json.dumps(post))
+    return post
+```
+
+**缓存击穿**（热点 key 过期瞬间大量请求涌向数据库）：
+
+```python
+# 用 Redis SETNX 做互斥锁
+async def get_hot_post(post_id: int):
+    cache_key = f"post:{post_id}"
+    lock_key = f"lock:post:{post_id}"
+
+    cached = await redis_client.get(cache_key)
+    if cached and cached != "NULL":
+        return json.loads(cached)
+
+    # 尝试获取锁
+    acquired = await redis_client.set(lock_key, "1", ex=10, nx=True)
+    if acquired:
+        try:
+            post = await query_post_from_db(post_id)
+            if post:
+                await redis_client.setex(cache_key, 300, json.dumps(post))
+            else:
+                await redis_client.setex(cache_key, 60, "NULL")
+            return post
+        finally:
+            await redis_client.delete(lock_key)
+    else:
+        # 没拿到锁，等一下再试
+        await asyncio.sleep(0.1)
+        return await get_hot_post(post_id)
+```
+
+**缓存雪崩**（大量 key 同时过期）：
+
+```python
+import random
+
+def jitter_ttl(base: int = 300) -> int:
+    """在基础 TTL 上加随机偏移，避免同时过期"""
+    return max(60, base + random.randint(-60, 60))
+
+await redis_client.setex(cache_key, jitter_ttl(300), json.dumps(result))
+```
+
+## 对比总结
+
+| 维度     | Spring Boot @Cacheable   | Python redis-py           |
+| -------- | ------------------------ | ------------------------- |
+| 缓存读写 | 注解声明，框架执行       | 手动 get/set              |
+| 缓存失效 | @CacheEvict              | 手动 delete               |
+| 缓存 key | SpEL 表达式（`#postId`） | 字符串拼接                |
+| TTL      | 全局配置 + 注解参数      | 每个 setex 单独指定       |
+| 灵活策略 | 需要实现接口或绕过注解   | 直接写代码                |
+| 学习曲线 | 低（会注解就行）         | 中（需要理解 Redis 命令） |
+| 调试难度 | 高（框架内部逻辑）       | 低（代码即逻辑）          |
+
+Python 的手动缓存看起来"原始"，但它给你的是完全的掌控力。当你的缓存策略变得复杂（多级缓存、条件缓存、热点保护），手动方式反而比注解方式更容易理解和维护。Spring Boot 的注解在 80% 的场景下更高效，但剩下 20% 的复杂场景可能需要花更多时间去理解框架内部的机制。
+
+## 回顾与预告
+
+[上一篇](/posts/python/19-websocket)的评论实时推送让 CMS 有了实时性，本篇的 Redis 缓存让它有了高并发能力。两篇都是通过引入外部组件（Redis）来解决 Web 框架自身不擅长的问题。
+
+下一篇讲后台任务。有些操作（发邮件、生成报表）不适合在请求中同步执行。Python 有 `BackgroundTasks` 和 Celery 两个方案，Spring Boot 有 `@Async`。它们的取舍和 Redis 缓存类似——框架封装 vs 手动掌控。

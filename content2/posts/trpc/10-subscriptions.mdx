@@ -1,0 +1,644 @@
+---
+title: "10. 实时订阅与协作功能"
+date: "2026-03-23"
+summary: "使用 tRPC Subscriptions 实现实时数据推送，为协作任务管理平台添加任务更新通知、在线用户状态等实时功能，深入理解 Observable 模式和 WebSocket 通信。"
+tags: ["tRPC", "WebSocket", "订阅", "实时通信", "Observable"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 10
+---
+
+上篇文章我们学习了如何将 tRPC 部署到边缘环境。但边缘 Workers 有个限制：不支持 WebSocket 长连接。所以如果要实现实时功能（比如任务更新通知），我们需要回到标准服务器环境。
+
+实时功能是协作应用的核心。当团队成员更新任务状态时，其他成员应该立即看到变化，不需要刷新页面。tRPC 的 Subscription 功能让我们可以用类型安全的方式实现这种实时通信。
+
+## 什么是 Subscription
+
+在 tRPC 中，有三种 Procedure 类型：
+
+- Query：读取数据，客户端发起请求，服务端返回结果（一次性）
+- Mutation：修改数据，客户端发起请求，服务端返回结果（一次性）
+- Subscription：订阅数据变化，服务端主动推送（持续性的）
+
+Subscription 本质上是一个长期运行的查询，服务端可以在数据变化时主动推送更新给客户端。它基于 WebSocket 协议，建立持久的双向连接。
+
+传统的做法是使用轮询（每秒发送一次请求检查更新），但这样浪费带宽且延迟高。WebSocket 建立一次连接后，服务端可以随时推送数据，效率更高。
+
+## Observable 模式
+
+tRPC Subscriptions 基于 Observable 模式。Observable 是一个可以随时间推移产生多个值的对象，类似于 Promise，但 Promise 只能产生一个值，而 Observable 可以产生无限个值。
+
+```typescript
+// Promise：产生一个值后结束
+const promise = new Promise((resolve) => {
+  setTimeout(() => resolve("single value"), 1000);
+});
+
+// Observable：可以产生多个值
+const observable = new Observable((observer) => {
+  let count = 0;
+  const interval = setInterval(() => {
+    observer.next(`value ${count++}`);
+  }, 1000);
+
+  // 清理函数
+  return () => clearInterval(interval);
+});
+```
+
+在 tRPC 中，Subscription 返回一个 Observable，当客户端订阅时，服务端开始推送数据。当客户端取消订阅时，清理函数被调用，释放资源。
+
+## 服务端配置
+
+首先我们需要配置 WebSocket 适配器。这里使用 ws 库，在 Node.js 环境中运行。
+
+```bash
+npm install ws @trpc/server@next
+npm install -D @types/ws
+```
+
+创建 tRPC 实例时，需要添加 WebSocket 适配器。
+
+```typescript
+// src/trpc/index.ts
+
+import { initTRPC } from "@trpc/server";
+import { CreateNextContextOptions } from "@trpc/server/adapters/next";
+import * as trpcNext from "@trpc/server/adapters/next";
+import { WebSocketServer } from "ws";
+import { applyWSSHandler } from "@trpc/server/adapters/ws";
+import { appRouter } from "./router";
+
+export const t = initTRPC.context<Context>().create({
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError:
+          error.code === "BAD_REQUEST" && error.cause instanceof z.ZodError
+            ? error.cause.flatten()
+            : null,
+      },
+    };
+  },
+});
+
+export const appRouter = t.router({
+  // ... 路由定义
+});
+
+export type AppRouter = typeof appRouter;
+
+// 创建 WebSocket 服务器
+export function createWSServer(httpServer: any) {
+  const wss = new WebSocketServer({ server: httpServer });
+
+  applyWSSHandler({
+    wss,
+    router: appRouter,
+    createContext: ({ req, res }) => createContext({ req, res }),
+  });
+
+  return wss;
+}
+```
+
+## 事件发射器
+
+为了在不同客户端之间传递消息，我们需要一个事件发射器。当某个客户端触发事件时，所有订阅该事件的客户端都会收到通知。
+
+```typescript
+// src/lib/event-emitter.ts
+
+import { EventEmitter } from "events";
+
+class TaskEventEmitter extends EventEmitter {
+  constructor() {
+    super();
+    this.setMaxListeners(100); // 增加监听器数量限制
+  }
+}
+
+export const taskEvents = new TaskEventEmitter();
+
+// 事件类型定义
+export interface TaskEvents {
+  "task:created": { taskId: string; projectId: string; userId: string };
+  "task:updated": {
+    taskId: string;
+    projectId: string;
+    userId: string;
+    changes: Record<string, any>;
+  };
+  "task:deleted": { taskId: string; projectId: string; userId: string };
+  "task:status-changed": {
+    taskId: string;
+    projectId: string;
+    status: "TODO" | "IN_PROGRESS" | "DONE";
+    userId: string;
+  };
+}
+```
+
+## 创建 Subscription
+
+现在我们为协作任务管理平台创建实时订阅功能。包括任务创建、更新、删除等事件。
+
+```typescript
+// src/trpc/routers/tasks.router.ts
+
+import { observable } from "@trpc/server/observable";
+import { EventEmitter } from "events";
+import { z } from "zod";
+import { t, protectedProcedure } from "../index";
+import { taskEvents } from "../../lib/event-emitter";
+
+export const tasksRouter = t.router({
+  // 订阅项目中的所有任务更新
+  onProjectUpdate: protectedProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+      })
+    )
+    .subscription(({ input }) => {
+      return observable<{
+        type: "created" | "updated" | "deleted" | "status-changed";
+        data: any;
+      }>((emit) => {
+        const onTaskCreated = (data: TaskEvents["task:created"]) => {
+          // 只推送本项目的事件
+          if (data.projectId === input.projectId) {
+            emit.next({ type: "created", data });
+          }
+        };
+
+        const onTaskUpdated = (data: TaskEvents["task:updated"]) => {
+          if (data.projectId === input.projectId) {
+            emit.next({ type: "updated", data });
+          }
+        };
+
+        const onTaskDeleted = (data: TaskEvents["task:deleted"]) => {
+          if (data.projectId === input.projectId) {
+            emit.next({ type: "deleted", data });
+          }
+        };
+
+        const onStatusChanged = (data: TaskEvents["task:status-changed"]) => {
+          if (data.projectId === input.projectId) {
+            emit.next({ type: "status-changed", data });
+          }
+        };
+
+        // 监听所有事件
+        taskEvents.on("task:created", onTaskCreated);
+        taskEvents.on("task:updated", onTaskUpdated);
+        taskEvents.on("task:deleted", onTaskDeleted);
+        taskEvents.on("task:status-changed", onStatusChanged);
+
+        // 清理函数：取消订阅时调用
+        return () => {
+          taskEvents.off("task:created", onTaskCreated);
+          taskEvents.off("task:updated", onTaskUpdated);
+          taskEvents.off("task:deleted", onTaskDeleted);
+          taskEvents.off("task:status-changed", onStatusChanged);
+        };
+      });
+    }),
+
+  // 订阅特定任务的更新
+  onTaskUpdate: protectedProcedure
+    .input(
+      z.object({
+        taskId: z.string(),
+      })
+    )
+    .subscription(({ input }) => {
+      return observable<TaskEvents["task:updated"]>((emit) => {
+        const onTaskUpdated = (data: TaskEvents["task:updated"]) => {
+          // 只推送此任务的更新
+          if (data.taskId === input.taskId) {
+            emit.next(data);
+          }
+        };
+
+        const onStatusChanged = (data: TaskEvents["task:status-changed"]) => {
+          if (data.taskId === input.taskId) {
+            emit.next(data as any);
+          }
+        };
+
+        taskEvents.on("task:updated", onTaskUpdated);
+        taskEvents.on("task:status-changed", onStatusChanged);
+
+        return () => {
+          taskEvents.off("task:updated", onTaskUpdated);
+          taskEvents.off("task:status-changed", onStatusChanged);
+        };
+      });
+    }),
+
+  // 创建任务（触发事件）
+  create: protectedProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        title: z.string().min(1).max(200),
+        description: z.string().optional(),
+        status: z.enum(["TODO", "IN_PROGRESS", "DONE"]).default("TODO"),
+        priority: z.enum(["LOW", "MEDIUM", "HIGH"]).default("MEDIUM"),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const task = await prisma.task.create({
+        data: {
+          ...input,
+          userId: ctx.user.id,
+        },
+      });
+
+      // 触发事件
+      taskEvents.emit("task:created", {
+        taskId: task.id,
+        projectId: input.projectId,
+        userId: ctx.user.id,
+      });
+
+      return task;
+    }),
+
+  // 更新任务状态（触发事件）
+  updateStatus: protectedProcedure
+    .input(
+      z.object({
+        taskId: z.string(),
+        status: z.enum(["TODO", "IN_PROGRESS", "DONE"]),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const task = await prisma.task.update({
+        where: { id: input.taskId },
+        data: { status: input.status },
+      });
+
+      // 触发事件
+      taskEvents.emit("task:status-changed", {
+        taskId: task.id,
+        projectId: task.projectId,
+        status: input.status,
+        userId: ctx.user.id,
+      });
+
+      return task;
+    }),
+});
+```
+
+这里的关键是：当 Mutation 执行完成后，触发事件发射器，所有订阅该事件的客户端都会收到通知。
+
+## 客户端使用
+
+在 React 客户端中使用 Subscription 非常简单。tRPC 提供了 `useSubscription` Hook。
+
+```typescript
+// src/components/TaskList.tsx
+
+'use client';
+
+import { useState, useEffect } from 'react';
+import { trpc } from '@/lib/trpc/client';
+
+interface TaskListProps {
+  projectId: string;
+}
+
+export function TaskList({ projectId }: TaskListProps) {
+  const [tasks, setTasks] = useState<Task[]>([]);
+
+  // 获取初始任务列表
+  const { data: initialTasks } = trpc.tasks.list.useQuery({
+    projectId,
+  });
+
+  useEffect(() => {
+    if (initialTasks) {
+      setTasks(initialTasks);
+    }
+  }, [initialTasks]);
+
+  // 订阅项目更新
+  trpc.tasks.onProjectUpdate.useSubscription(
+    { projectId },
+    {
+      onData: ({ type, data }) => {
+        switch (type) {
+          case 'created':
+            // 新任务创建时，获取完整数据并添加到列表
+            trpc.tasks.byId.query({ taskId: data.taskId }).then((task) => {
+              setTasks((prev) => [...prev, task]);
+            });
+            break;
+
+          case 'updated':
+            // 任务更新时，更新列表中的数据
+            setTasks((prev) =>
+              prev.map((task) =>
+                task.id === data.taskId
+                  ? { ...task, ...data.changes }
+                  : task
+              )
+            );
+            break;
+
+          case 'deleted':
+            // 任务删除时，从列表中移除
+            setTasks((prev) => prev.filter((task) => task.id !== data.taskId));
+            break;
+
+          case 'status-changed':
+            // 状态变化时，更新任务状态
+            setTasks((prev) =>
+              prev.map((task) =>
+                task.id === data.taskId
+                  ? { ...task, status: data.status }
+                  : task
+              )
+            );
+            break;
+        }
+      },
+      onError: (error) => {
+        console.error('Subscription error:', error);
+      }
+    }
+  );
+
+  return (
+    <div className="space-y-2">
+      {tasks.map((task) => (
+        <div key={task.id} className="p-4 border rounded">
+          <h3>{task.title}</h3>
+          <p>Status: {task.status}</p>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+这样，当任何用户创建、更新或删除任务时，所有在线的用户都会立即看到变化，无需刷新页面。
+
+## 在线用户状态
+
+除了任务更新，我们还可以实现在线用户状态显示。当用户加入项目时，显示在线用户列表。
+
+```typescript
+// src/trpc/routers/online.router.ts
+
+import { observable } from "@trpc/server/observable";
+import { z } from "zod";
+import { t, protectedProcedure } from "../index";
+
+// 存储在线用户
+const onlineUsers = new Map<string, Set<string>>();
+
+export const onlineRouter = t.router({
+  // 订阅项目在线用户
+  onOnlineUsers: protectedProcedure
+    .input(z.object({ projectId: z.string() }))
+    .subscription(({ input, ctx }) => {
+      return observable<{
+        users: Array<{ id: string; name: string }>;
+      }>((emit) => {
+        // 添加当前用户到在线列表
+        if (!onlineUsers.has(input.projectId)) {
+          onlineUsers.set(input.projectId, new Set());
+        }
+        onlineUsers.get(input.projectId)!.add(ctx.user.id);
+
+        // 发送初始在线用户列表
+        const sendOnlineUsers = async () => {
+          const userIds = Array.from(onlineUsers.get(input.projectId) || []);
+          const users = await prisma.user.findMany({
+            where: { id: { in: userIds } },
+            select: { id: true, name: true },
+          });
+          emit.next({ users });
+        };
+
+        sendOnlineUsers();
+
+        // 定期检查并清理离线用户（通过心跳机制）
+        const interval = setInterval(sendOnlineUsers, 30000);
+
+        return () => {
+          // 取消订阅时移除用户
+          onlineUsers.get(input.projectId)?.delete(ctx.user.id);
+          clearInterval(interval);
+        };
+      });
+    }),
+
+  // 心跳（保持在线状态）
+  heartbeat: protectedProcedure
+    .input(z.object({ projectId: z.string() }))
+    .mutation(({ input, ctx }) => {
+      if (!onlineUsers.has(input.projectId)) {
+        onlineUsers.set(input.projectId, new Set());
+      }
+      onlineUsers.get(input.projectId)!.add(ctx.user.id);
+      return { success: true };
+    }),
+});
+```
+
+客户端需要定期发送心跳，保持在线状态。
+
+```typescript
+// src/components/OnlineUsers.tsx
+
+'use client';
+
+import { useEffect } from 'react';
+import { trpc } from '@/lib/trpc/client';
+
+export function OnlineUsers({ projectId }: { projectId: string }) {
+  const { data } = trpc.online.onOnlineUsers.useSubscription({ projectId });
+
+  // 心跳
+  const heartbeat = trpc.online.heartbeat.useMutation();
+
+  useEffect(() => {
+    const interval = setInterval(() => {
+      heartbeat.mutate({ projectId });
+    }, 20000); // 每 20 秒发送一次心跳
+
+    return () => clearInterval(interval);
+  }, [projectId]);
+
+  return (
+    <div className="flex items-center space-x-2">
+      <div className="flex -space-x-2">
+        {data?.users.map((user) => (
+          <div
+            key={user.id}
+            className="w-8 h-8 rounded-full bg-blue-500 flex items-center justify-center text-white text-sm"
+          >
+            {user.name[0]}
+          </div>
+        ))}
+      </div>
+      <span className="text-sm text-gray-500">
+        {data?.users.length} 人在线
+      </span>
+    </div>
+  );
+}
+```
+
+## 性能优化
+
+实时功能需要特别注意性能优化。
+
+首先是节流和防抖。高频事件（如输入框输入）应该节流，避免每秒发送几十次更新。
+
+```typescript
+import { throttle } from "lodash";
+
+// 节流：每秒最多触发一次
+const throttledEmit = throttle((data) => {
+  taskEvents.emit("task:updated", data);
+}, 1000);
+
+// 在高频更新时使用
+for (const item of largeDataset) {
+  throttledEmit(item);
+}
+```
+
+其次是批量发送。如果一秒内有 10 个任务更新，应该批量发送，而不是发送 10 次事件。
+
+```typescript
+const updateBuffer: any[] = [];
+let batchTimeout: NodeJS.Timeout | null = null;
+
+function batchEmit(event: string, data: any) {
+  updateBuffer.push(data);
+
+  if (!batchTimeout) {
+    batchTimeout = setTimeout(() => {
+      taskEvents.emit(event, { updates: updateBuffer.splice(0) });
+      batchTimeout = null;
+    }, 100);
+  }
+}
+```
+
+最后是连接池管理。WebSocket 连接是昂贵的资源，需要限制连接数并清理死连接。
+
+```typescript
+class ConnectionPool {
+  private connections = new Map<string, WebSocket>();
+  private maxConnections = 1000;
+
+  add(id: string, ws: WebSocket) {
+    if (this.connections.size >= this.maxConnections) {
+      throw new Error("Max connections reached");
+    }
+    this.connections.set(id, ws);
+  }
+
+  remove(id: string) {
+    this.connections.delete(id);
+  }
+
+  get size() {
+    return this.connections.size;
+  }
+}
+```
+
+## 错误处理和重连
+
+网络不稳定时，WebSocket 连接可能断开。客户端需要自动重连机制。
+
+```typescript
+// src/lib/trpc/client.ts
+
+import { createTRPCReact } from "@trpc/react-query";
+import type { AppRouter } from "@/server/trpc";
+
+export const trpc = createTRPCReact<AppRouter>({
+  config() {
+    return {
+      links: [
+        httpBatchLink({
+          url: getBaseUrl() + "/trpc",
+        }),
+        // WebSocket 链接，带自动重连
+        wsLink({
+          url: getWsUrl(),
+          retryDelayMs: () => 1000, // 重连延迟
+          onOpen: () => {
+            console.log("WebSocket 连接已建立");
+          },
+          onClose: () => {
+            console.log("WebSocket 连接已关闭，尝试重连...");
+          },
+        }),
+      ],
+    };
+  },
+});
+```
+
+## Trade-off 分析
+
+实时订阅不是银弹，需要权衡。
+
+优势：
+
+- 实时性好，数据变化立即推送
+- 减少不必要的网络请求（相比轮询）
+- 提升协作体验，增强用户参与感
+- 类型安全，前后端共享类型
+
+劣势：
+
+- 服务器资源消耗高（长连接占用内存）
+- 扩展性差（WebSocket 连接难以跨服务器共享）
+- 调试困难（异步事件难以追踪）
+- 离线支持复杂（需要消息队列）
+
+适用场景：
+
+- 多人协作应用（如文档编辑、任务管理）
+- 实时通信应用（如聊天、通知）
+- 实时数据展示（如股票价格、游戏状态）
+- 需要即时反馈的交互
+
+不适用场景：
+
+- 单人应用（没有协作需求）
+- 数据更新频率低（每小时几次）
+- 服务器资源有限
+- 需要离线优先
+
+对于协作任务管理平台，实时订阅是必要的。团队成员需要看到彼此的更新，否则协作效率会大打折扣。但如果团队规模很大（超过 100 人），需要考虑使用 Redis Pub/Sub 或专业的消息队列来处理 WebSocket 连接的跨服务器同步。
+
+## 总结
+
+本文介绍了如何使用 tRPC Subscriptions 实现实时功能。我们为协作任务管理平台添加了任务更新通知和在线用户状态，实现了真正的实时协作。
+
+关键点：
+
+- Subscription 基于 Observable 模式，支持持续的数据推送
+- 事件发射器用于在客户端之间传递消息
+- useSubscription Hook 简化了客户端订阅逻辑
+- 性能优化重点是节流、批量发送和连接池管理
+- 需要根据场景权衡实时功能的利弊
+
+下一篇文章，我们将学习如何优化数据传输和负载，减少不必要的数据传输，提升应用性能。

@@ -1,0 +1,790 @@
+---
+title: "06 Next.js 集成：全栈开发实践"
+date: "2026-03-23"
+summary: "掌握 Next.js App Router 与 tRPC 的深度集成，学会服务端组件（RSC）中调用 tRPC，构建完整的全栈应用。"
+tags: ["tRPC", "Next.js", "App Router", "RSC", "全栈开发"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 6
+---
+
+在上一篇文章中，我们学习了如何将 Prisma 与 tRPC 集成，建立了类型安全的数据库访问层。现在我们有了一个完整的后端 API，接下来需要考虑如何在 Next.js 中使用它。
+
+## 为什么选择 Next.js + tRPC
+
+Next.js 14 的 App Router 引入了 React Server Components（RSC），这改变了我们构建全栈应用的方式。将 tRPC 与 Next.js 结合，可以带来几个关键优势：
+
+首先，你可以在服务端组件中直接调用 tRPC，而不需要额外的 API 层。这意味着数据获取和服务端渲染可以在同一个请求中完成，减少了网络往返次数。
+
+其次，tRPC 的类型安全可以一直延伸到前端组件。当你在服务端组件中调用 `serverClient.tasks.list.query()` 时，返回的数据类型是自动推断的，不需要手动定义接口。
+
+最后，Next.js 的服务端组件可以减少发送到客户端的 JavaScript 体积，提升性能。
+
+让我们继续以协作任务管理平台为例，看看如何在 Next.js 中集成 tRPC。
+
+## 项目初始化
+
+创建一个新的 Next.js 项目：
+
+```bash
+npx create-next-app@latest task-manager
+```
+
+安装必要的依赖：
+
+```bash
+npm install @trpc/server@next @trpc/client@next @trpc/react-query@next @trpc/next@next
+npm install zod superjson
+npm install @tanstack/react-query@latest
+```
+
+## 配置 tRPC 服务端
+
+首先创建 tRPC 的上下文和初始化配置：
+
+```typescript
+// src/lib/trpc/server.ts
+
+import { initTRPC, TRPCError } from "@trpc/server";
+import { CreateNextContextOptions } from "@trpc/server/adapters/next";
+import superjson from "superjson";
+import { prisma } from "@/lib/prisma";
+
+// 定义用户类型
+interface User {
+  id: string;
+  name: string;
+  email: string;
+  avatar: string | null;
+  role: "ADMIN" | "MEMBER" | "GUEST";
+}
+
+// 创建上下文
+export const createContext = async ({ req, res }: CreateNextContextOptions) => {
+  // 从请求中获取用户信息（简化示例）
+  const userId = req.headers["x-user-id"] as string | undefined;
+
+  let user: User | null = null;
+
+  if (userId) {
+    user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id: true,
+        name: true,
+        email: true,
+        avatar: true,
+        role: true,
+      },
+    });
+  }
+
+  return {
+    user,
+    prisma,
+  };
+};
+
+export type Context = Awaited<ReturnType<typeof createContext>>;
+
+// 初始化 tRPC
+const t = initTRPC.context<Context>().create({
+  transformer: superjson,
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError:
+          error.code === "BAD_REQUEST" && error.cause instanceof Error
+            ? { message: error.cause.message }
+            : null,
+      },
+    };
+  },
+});
+
+// 认证中间件
+const isAuthed = t.middleware(({ ctx, next }) => {
+  if (!ctx.user) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "需要登录",
+    });
+  }
+  return next({
+    ctx: {
+      ...ctx,
+      user: ctx.user,
+    },
+  });
+});
+
+export const router = t.router;
+export const publicProcedure = t.procedure;
+export const protectedProcedure = t.procedure.use(isAuthed);
+```
+
+## 创建 Router
+
+创建任务管理相关的 Router：
+
+```typescript
+// src/lib/trpc/routers/tasks.ts
+
+import { z } from "zod";
+import { TRPCError } from "@trpc/server";
+import { protectedProcedure, router } from "../server";
+
+export const tasksRouter = router({
+  // 获取项目任务列表
+  list: protectedProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        status: z
+          .enum(["TODO", "IN_PROGRESS", "REVIEW", "DONE", "CANCELLED"])
+          .optional(),
+        page: z.number().default(1),
+        limit: z.number().min(1).max(100).default(20),
+      })
+    )
+    .query(async ({ input, ctx }) => {
+      const { projectId, status, page, limit } = input;
+      const skip = (page - 1) * limit;
+
+      // 验证权限
+      const membership = await ctx.prisma.projectMember.findUnique({
+        where: {
+          projectId_userId: {
+            projectId,
+            userId: ctx.user.id,
+          },
+        },
+      });
+
+      if (!membership) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "你不是该项目的成员",
+        });
+      }
+
+      const [tasks, total] = await Promise.all([
+        ctx.prisma.task.findMany({
+          where: {
+            projectId,
+            ...(status && { status }),
+          },
+          skip,
+          take: limit,
+          orderBy: [{ priority: "desc" }, { createdAt: "desc" }],
+          include: {
+            creator: {
+              select: {
+                id: true,
+                name: true,
+                avatar: true,
+              },
+            },
+            assignee: {
+              select: {
+                id: true,
+                name: true,
+                avatar: true,
+              },
+            },
+            _count: {
+              select: {
+                comments: true,
+              },
+            },
+          },
+        }),
+        ctx.prisma.task.count({
+          where: {
+            projectId,
+            ...(status && { status }),
+          },
+        }),
+      ]);
+
+      return {
+        tasks,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      };
+    }),
+
+  // 创建任务
+  create: protectedProcedure
+    .input(
+      z.object({
+        title: z.string().min(1).max(200),
+        description: z.string().optional(),
+        projectId: z.string(),
+        assigneeId: z.string().optional(),
+        priority: z.enum(["LOW", "MEDIUM", "HIGH", "URGENT"]).default("MEDIUM"),
+        dueDate: z.date().optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const membership = await ctx.prisma.projectMember.findUnique({
+        where: {
+          projectId_userId: {
+            projectId: input.projectId,
+            userId: ctx.user.id,
+          },
+        },
+      });
+
+      if (!membership) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "你不是该项目的成员",
+        });
+      }
+
+      const task = await ctx.prisma.task.create({
+        data: {
+          ...input,
+          creatorId: ctx.user.id,
+        },
+        include: {
+          creator: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+          assignee: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+        },
+      });
+
+      return task;
+    }),
+
+  // 更新任务状态
+  updateStatus: protectedProcedure
+    .input(
+      z.object({
+        taskId: z.string(),
+        status: z.enum(["TODO", "IN_PROGRESS", "REVIEW", "DONE", "CANCELLED"]),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const task = await ctx.prisma.task.findUnique({
+        where: { id: input.taskId },
+      });
+
+      if (!task) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "任务不存在",
+        });
+      }
+
+      const membership = await ctx.prisma.projectMember.findUnique({
+        where: {
+          projectId_userId: {
+            projectId: task.projectId,
+            userId: ctx.user.id,
+          },
+        },
+      });
+
+      if (!membership) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "你不是该项目的成员",
+        });
+      }
+
+      const updated = await ctx.prisma.task.update({
+        where: { id: input.taskId },
+        data: { status: input.status },
+        include: {
+          creator: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+          assignee: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+        },
+      });
+
+      return updated;
+    }),
+});
+
+export type TasksRouter = typeof tasksRouter;
+```
+
+合并所有 Router：
+
+```typescript
+// src/lib/trpc/router.ts
+
+import { router } from "./server";
+import { tasksRouter } from "./routers/tasks";
+import { projectsRouter } from "./routers/projects";
+import { usersRouter } from "./routers/users";
+
+export const appRouter = router({
+  tasks: tasksRouter,
+  projects: projectsRouter,
+  users: usersRouter,
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+## 创建 API 路由处理器
+
+在 Next.js App Router 中，我们需要创建一个路由处理器来处理 tRPC 请求：
+
+```typescript
+// src/app/api/trpc/[trpc]/route.ts
+
+import { fetchRequestHandler } from "@trpc/server/adapters/next";
+import { appRouter } from "@/lib/trpc/router";
+import { createContext } from "@/lib/trpc/server";
+
+const handler = (req: Request) => {
+  return fetchRequestHandler({
+    endpoint: "/api/trpc",
+    req,
+    router: appRouter,
+    createContext,
+  });
+};
+
+export { handler as GET, handler as POST };
+```
+
+## 配置客户端
+
+创建 tRPC 客户端：
+
+```typescript
+// src/lib/trpc/client.ts
+
+import { createTRPCReact } from "@trpc/react-query";
+import type { AppRouter } from "./router";
+
+export const trpc = createTRPCReact<AppRouter>();
+```
+
+创建 Provider 组件：
+
+```typescript
+// src/components/providers/trpc-provider.tsx
+
+'use client';
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { httpBatchLink, loggerLink } from '@trpc/client';
+import { useState } from 'react';
+import superjson from 'superjson';
+import { trpc } from '@/lib/trpc/client';
+
+export function TRPCProvider({ children }: { children: React.ReactNode }) {
+  const [queryClient] = useState(() => new QueryClient({
+    defaultOptions: {
+      queries: {
+        refetchOnWindowFocus: false,
+        staleTime: 1000 * 60 * 5,
+      },
+    },
+  }));
+
+  const [trpcClient] = useState(() =>
+    trpc.createClient({
+      links: [
+        loggerLink({
+          enabled: (opts) =>
+            process.env.NODE_ENV === 'development' ||
+            (opts.direction === 'down' && opts.result instanceof Error),
+        }),
+        httpBatchLink({
+          transformer: superjson,
+          url: getBaseUrl() + '/api/trpc',
+          headers() {
+            return {
+              'x-user-id': localStorage.getItem('userId') || '',
+            };
+          },
+        }),
+      ],
+    })
+  );
+
+  return (
+    <trpc.Provider client={trpcClient} queryClient={queryClient}>
+      <QueryClientProvider client={queryClient}>
+        {children}
+      </QueryClientProvider>
+    </trpc.Provider>
+  );
+}
+
+function getBaseUrl() {
+  if (typeof window !== 'undefined') {
+    return window.location.origin;
+  }
+  if (process.env.VERCEL_URL) {
+    return `https://${process.env.VERCEL_URL}`;
+  }
+  return `http://localhost:${process.env.PORT ?? 3000}`;
+}
+```
+
+更新根布局以包含 Provider：
+
+```typescript
+// src/app/layout.tsx
+
+import type { Metadata } from 'next';
+import { Inter } from 'next/font/google';
+import './globals.css';
+import { TRPCProvider } from '@/components/providers/trpc-provider';
+
+const inter = Inter({ subsets: ['latin'] });
+
+export const metadata: Metadata = {
+  title: '任务管理平台',
+  description: '基于 tRPC 和 Next.js 的协作任务管理平台',
+};
+
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
+  return (
+    <html lang="zh-CN">
+      <body className={inter.className}>
+        <TRPCProvider>{children}</TRPCProvider>
+      </body>
+    </html>
+  );
+}
+```
+
+## 创建服务端调用器
+
+为了在服务端组件中调用 tRPC，我们需要创建一个服务端调用器：
+
+```typescript
+// src/lib/trpc/server.ts
+
+import { appRouter } from "./router";
+import { createCallerFactory } from "@trpc/server";
+
+export const serverClient = createCallerFactory()(appRouter);
+```
+
+## 在服务端组件中使用 tRPC
+
+现在可以在服务端组件中直接调用 tRPC：
+
+```typescript
+// src/app/projects/[id]/page.tsx
+
+import { notFound } from 'next/navigation';
+import Link from 'next/link';
+import { serverClient } from '@/lib/trpc/server';
+import { TaskBoard } from '@/components/task-board';
+
+interface ProjectPageProps {
+  params: {
+    id: string;
+  };
+}
+
+export default async function ProjectPage({ params }: ProjectPageProps) {
+  // 在服务端直接调用 tRPC
+  const result = await serverClient.tasks.list({
+    projectId: params.id,
+    page: 1,
+    limit: 100,
+  });
+
+  if (!result) {
+    notFound();
+  }
+
+  return (
+    <div className="container mx-auto px-4 py-8">
+      <div className="mb-8">
+        <h1 className="text-3xl font-bold mb-4">项目任务</h1>
+        <div className="flex gap-4">
+          <Link
+            href={`/projects/${params.id}`}
+            className="px-4 py-2 bg-blue-600 text-white rounded-lg"
+          >
+            看板视图
+          </Link>
+          <Link
+            href={`/projects/${params.id}/list`}
+            className="px-4 py-2 border rounded-lg"
+          >
+            列表视图
+          </Link>
+        </div>
+      </div>
+
+      {/* 服务端渲染的任务列表 */}
+      <TaskBoard
+        projectId={params.id}
+        initialTasks={result.tasks}
+      />
+    </div>
+  );
+}
+```
+
+## 在客户端组件中使用 tRPC
+
+对于需要交互的功能，使用客户端组件：
+
+```typescript
+// src/components/task-board.tsx
+
+'use client';
+
+import { trpc } from '@/lib/trpc/client';
+import { useState } from 'react';
+
+interface TaskBoardProps {
+  projectId: string;
+  initialTasks: any[];
+}
+
+export function TaskBoard({ projectId, initialTasks }: TaskBoardProps) {
+  const [filter, setFilter] = useState<string | undefined>();
+
+  // 使用 tRPC 的 React Hook
+  const { data, isLoading } = trpc.tasks.list.useQuery({
+    projectId,
+    status: filter as any,
+    page: 1,
+    limit: 100,
+  }, {
+    initialData: { tasks: initialTasks, pagination: { page: 1, limit: 100, total: initialTasks.length, totalPages: 1 } },
+  });
+
+  const createTask = trpc.tasks.create.useMutation({
+    onSuccess: () => {
+      trpc.tasks.list.invalidate({ projectId, page: 1, limit: 100 });
+    },
+  });
+
+  const updateStatus = trpc.tasks.updateStatus.useMutation({
+    onSuccess: () => {
+      trpc.tasks.list.invalidate({ projectId, page: 1, limit: 100 });
+    },
+  });
+
+  if (isLoading) {
+    return <div>加载中...</div>;
+  }
+
+  return (
+    <div>
+      {/* 过滤器 */}
+      <div className="flex gap-2 mb-6">
+        <button
+          onClick={() => setFilter(undefined)}
+          className={!filter ? 'px-4 py-2 bg-blue-600 text-white rounded' : 'px-4 py-2 border rounded'}
+        >
+          全部
+        </button>
+        <button
+          onClick={() => setFilter('TODO')}
+          className={filter === 'TODO' ? 'px-4 py-2 bg-blue-600 text-white rounded' : 'px-4 py-2 border rounded'}
+        >
+          待办
+        </button>
+        <button
+          onClick={() => setFilter('IN_PROGRESS')}
+          className={filter === 'IN_PROGRESS' ? 'px-4 py-2 bg-blue-600 text-white rounded' : 'px-4 py-2 border rounded'}
+        >
+          进行中
+        </button>
+        <button
+          onClick={() => setFilter('DONE')}
+          className={filter === 'DONE' ? 'px-4 py-2 bg-blue-600 text-white rounded' : 'px-4 py-2 border rounded'}
+        >
+          已完成
+        </button>
+      </div>
+
+      {/* 任务列表 */}
+      <div className="grid gap-4">
+        {data?.tasks.map((task) => (
+          <div key={task.id} className="border rounded-lg p-4">
+            <div className="flex justify-between items-start">
+              <div>
+                <h3 className="font-semibold text-lg">{task.title}</h3>
+                {task.description && (
+                  <p className="text-gray-600 mt-2">{task.description}</p>
+                )}
+                <div className="flex gap-4 mt-4 text-sm text-gray-500">
+                  {task.assignee && (
+                    <span>负责人：{task.assignee.name}</span>
+                  )}
+                  <span>优先级：{task.priority}</span>
+                </div>
+              </div>
+              <select
+                value={task.status}
+                onChange={(e) => updateStatus.mutate({
+                  taskId: task.id,
+                  status: e.target.value as any,
+                })}
+                className="border rounded px-3 py-2"
+              >
+                <option value="TODO">待办</option>
+                <option value="IN_PROGRESS">进行中</option>
+                <option value="REVIEW">审核中</option>
+                <option value="DONE">已完成</option>
+              </select>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+## 性能优化
+
+### 1. 服务端数据预取
+
+在服务端组件中获取数据，避免客户端的额外请求：
+
+```typescript
+export default async function ProjectPage({ params }: ProjectPageProps) {
+  // 服务端获取数据，直接渲染
+  const tasks = await serverClient.tasks.list({
+    projectId: params.id,
+    page: 1,
+    limit: 100,
+  });
+
+  return <TaskBoard initialTasks={tasks.tasks} />;
+}
+```
+
+### 2. 使用 React Query 的缓存
+
+```typescript
+const { data } = trpc.tasks.list.useQuery(
+  {
+    projectId,
+    page: 1,
+    limit: 20,
+  },
+  {
+    staleTime: 1000 * 60 * 5, // 5分钟内不会重新获取
+    cacheTime: 1000 * 60 * 10, // 缓存保留10分钟
+  }
+);
+```
+
+### 3. 增量数据加载
+
+对于无限滚动的场景，可以使用 useInfiniteQuery：
+
+```typescript
+const { data, fetchNextPage, hasNextPage } =
+  trpc.tasks.infinite.useInfiniteQuery(
+    { projectId, limit: 20 },
+    {
+      getNextPageParam: (lastPage) => lastPage.nextCursor,
+    }
+  );
+```
+
+## 错误处理
+
+在客户端组件中处理错误：
+
+```typescript
+'use client';
+
+import { trpc } from '@/lib/trpc/client';
+import { TRPCClientError } from '@trpc/client';
+
+export function TaskList({ projectId }: { projectId: string }) {
+  const { data, error, isLoading } = trpc.tasks.list.useQuery({
+    projectId,
+    page: 1,
+    limit: 20,
+  });
+
+  if (isLoading) {
+    return <div>加载中...</div>;
+  }
+
+  if (error instanceof TRPCClientError) {
+    if (error.code === 'FORBIDDEN') {
+      return <div>你没有权限查看该项目的任务</div>;
+    }
+    return <div>加载失败：{error.message}</div>;
+  }
+
+  return <div>{/* 渲染任务列表 */}</div>;
+}
+```
+
+## 权衡与取舍
+
+Next.js + tRPC 的组合非常适合全栈开发，但也有一些需要考虑的地方：
+
+**优势：**
+
+- 服务端组件可以直接调用 tRPC，减少网络往返
+- 端到端的类型安全，从数据库到前端完全一致
+- 减少客户端 JavaScript 体积
+- 优秀的开发体验，完整的类型提示
+
+**劣势：**
+
+- 需要理解服务端组件和客户端组件的区别
+- 对于简单的应用，可能显得过于复杂
+- 首次学习曲线较陡
+
+**适用场景：**
+
+- 需要服务端渲染的应用
+- 追求类型安全和开发效率
+- 中大型全栈项目
+
+## 下一步
+
+现在我们可以在 Next.js 中使用 tRPC 构建全栈应用了。但 React 并不是唯一的框架选择。在下一篇文章中，我们将学习如何在 Nuxt（Vue 生态）中集成 tRPC，看看两个框架的集成有什么不同。
+
+---

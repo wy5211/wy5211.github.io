@@ -1,0 +1,296 @@
+---
+title: "18 文件上传"
+date: "2026-03-30"
+summary: "Python 处理文件上传和 Spring Boot 有什么不同？用 FastAPI UploadFile 实现 CMS 的图片上传，对比 Spring Boot MultipartFile 的差异。"
+tags: ["Python", "FastAPI", "文件上传"]
+category: "python"
+cover: ""
+draft: false
+series: "Python 实战"
+seriesOrder: 18
+---
+
+# 文件上传
+
+CMS 后台需要一个封面图片上传功能。编辑在后台选了一张 3MB 的 JPEG，点上传，后端要完成：校验文件类型、限制大小、压缩图片、生成缩略图、保存到磁盘并返回可访问的 URL。
+
+在 Spring Boot 中你会用 `MultipartFile`，那 FastAPI 里怎么做？两者的 API 设计思路差异不小。
+
+## UploadFile：FastAPI 的文件接收方式
+
+FastAPI 用 `UploadFile` 接收上传文件。它底层是 `SpooledTemporaryFile`——小文件（默认 2MB 以下）缓存在内存，大文件自动溢写到磁盘临时文件。
+
+```python
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+
+app = FastAPI()
+
+@app.post("/api/posts/{post_id}/cover")
+async def upload_cover(
+    post_id: int,
+    file: UploadFile = File(...),
+):
+    """上传文章封面图片"""
+    content = await file.read()
+    # file.filename  -- 原始文件名
+    # file.content_type  -- MIME 类型
+    return {"filename": file.filename, "size": len(content)}
+```
+
+和 Spring Boot 的对比从这里就开始了：
+
+```java
+// Spring Boot
+@PostMapping("/api/posts/{postId}/cover")
+public ResponseEntity<?> uploadCover(
+    @PathVariable Long postId,
+    @RequestParam("file") MultipartFile file
+) {
+    byte[] content = file.getBytes();
+    String filename = file.getOriginalFilename();
+    String contentType = file.getContentType();
+    // ...
+}
+```
+
+**核心差异**：Spring Boot 的 `MultipartFile` 是同步 API，`file.getBytes()` 直接返回字节数组。FastAPI 的 `UploadFile` 是异步的，`await file.read()` 才能拿到内容。这和两个框架的整体模型一致——Spring Boot 用线程池处理并发，FastAPI 用事件循环。
+
+| 维度     | Spring Boot MultipartFile                  | FastAPI UploadFile                                |
+| -------- | ------------------------------------------ | ------------------------------------------------- |
+| API 风格 | 同步（`getBytes()`、`getInputStream()`）   | 异步（`await file.read()`、`await file.write()`） |
+| 底层实现 | `StandardMultipartHttpServletRequest`      | `SpooledTemporaryFile`                            |
+| 内存管理 | 小文件在内存，大文件写临时文件             | 同左，阈值可配（`max_memory_file_size`）          |
+| 参数注入 | `@RequestParam("file") MultipartFile`      | `file: UploadFile = File(...)`                    |
+| 批量上传 | `MultipartFile[]` 或 `List<MultipartFile>` | `List[UploadFile] = File(...)`                    |
+
+## 文件校验：类型和大小
+
+Spring Boot 可以在 `application.yml` 中全局配置上传限制：
+
+```yaml
+# Spring Boot
+spring:
+  servlet:
+    multipart:
+      max-file-size: 5MB
+      max-request-size: 10MB
+```
+
+FastAPI 没有这种全局配置。你需要在路由里手动校验，或者写一个依赖注入函数复用：
+
+```python
+from pathlib import Path
+from PIL import Image
+import io
+
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+MAX_COVER_SIZE = 5 * 1024 * 1024  # 5MB
+
+def validate_image_file(file: UploadFile, max_size: int) -> bytes:
+    """校验图片文件，返回文件内容"""
+    # 1. 检查 Content-Type
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(400, f"不支持的文件类型: {file.content_type}")
+
+    # 2. 检查扩展名
+    ext = Path(file.filename or "").suffix.lower()
+    if ext not in {".jpg", ".jpeg", ".png", ".gif", ".webp"}:
+        raise HTTPException(400, f"不支持的扩展名: {ext}")
+
+    # 3. 读取内容
+    content = await file.read()
+
+    # 4. 检查大小
+    if len(content) > max_size:
+        raise HTTPException(400, f"文件超出 {max_size // 1024 // 1024}MB 限制")
+
+    # 5. 用 Pillow 验证是否真的是图片（防止伪造 Content-Type）
+    try:
+        Image.open(io.BytesIO(content)).verify()
+    except Exception:
+        raise HTTPException(400, "文件不是有效的图片")
+
+    return content
+```
+
+这一步在 Spring Boot 里通常用 `@Size` 注解 + 自定义 Validator，或者在 Controller 层手动检查。FastAPI 没有注解驱动的校验体系来处理文件上传，所以手动写校验函数是标准做法。
+
+## CMS 封面图片上传：完整实现
+
+把校验、压缩、保存、返回 URL 串起来：
+
+```python
+import uuid
+from datetime import datetime
+from pathlib import Path
+
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.staticfiles import StaticFiles
+from PIL import Image
+import io
+
+app = FastAPI()
+
+UPLOAD_DIR = Path("uploads/covers")
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# 挂载静态文件目录
+app.mount("/static", StaticFiles(directory="uploads"), name="static")
+
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+MAX_COVER_SIZE = 5 * 1024 * 1024
+
+
+@app.post("/api/posts/{post_id}/cover")
+async def upload_cover(post_id: int, file: UploadFile = File(...)):
+    """上传文章封面图片，返回原图和缩略图 URL"""
+
+    # 1. 校验
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        raise HTTPException(400, f"不支持的文件类型: {file.content_type}")
+
+    content = await file.read()
+    if len(content) > MAX_COVER_SIZE:
+        raise HTTPException(400, f"文件超出 5MB 限制")
+
+    # 2. 打开图片
+    try:
+        image = Image.open(io.BytesIO(content))
+        if image.mode in ("RGBA", "P"):
+            image = image.convert("RGB")
+    except Exception:
+        raise HTTPException(400, "图片解析失败")
+
+    # 3. 生成唯一文件名
+    date_prefix = datetime.now().strftime("%Y%m%d")
+    unique_id = uuid.uuid4().hex[:8]
+    filename = f"{date_prefix}_{unique_id}.jpg"
+
+    # 4. 压缩原图（最大宽度 1200px，质量 80）
+    if image.width > 1200:
+        ratio = 1200 / image.width
+        image = image.resize(
+            (1200, int(image.height * ratio)),
+            Image.Resampling.LANCZOS,
+        )
+    original_path = UPLOAD_DIR / filename
+    image.save(original_path, "JPEG", quality=80, optimize=True)
+
+    # 5. 生成缩略图（400x260，居中裁剪）
+    thumb_w, thumb_h = 400, 260
+    target_ratio = thumb_w / thumb_h
+    img_ratio = image.width / image.height
+
+    if img_ratio > target_ratio:
+        new_w = int(image.height * target_ratio)
+        left = (image.width - new_w) // 2
+        thumb = image.crop((left, 0, left + new_w, image.height))
+    else:
+        new_h = int(image.width / target_ratio)
+        top = (image.height - new_h) // 2
+        thumb = image.crop((0, top, image.width, top + new_h))
+
+    thumb = thumb.resize((thumb_w, thumb_h), Image.Resampling.LANCZOS)
+    thumb_filename = f"{date_prefix}_{unique_id}_thumb.jpg"
+    thumb_path = UPLOAD_DIR / thumb_filename
+    thumb.save(thumb_path, "JPEG", quality=75, optimize=True)
+
+    return {
+        "cover_url": f"/static/covers/{filename}",
+        "thumbnail_url": f"/static/covers/{thumb_filename}",
+        "size": len(content),
+        "original_filename": file.filename,
+    }
+```
+
+在 Spring Boot 中对应的实现：
+
+```java
+@PostMapping("/api/posts/{postId}/cover")
+public ResponseEntity<Map<String, String>> uploadCover(
+    @PathVariable Long postId,
+    @RequestParam("file") MultipartFile file
+) throws IOException {
+    // 校验类型
+    String contentType = file.getContentType();
+    if (!List.of("image/jpeg", "image/png").contains(contentType)) {
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "不支持的类型");
+    }
+
+    // 校验大小（也可以用 @Size 注解）
+    if (file.getSize() > 5 * 1024 * 1024) {
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "超出5MB限制");
+    }
+
+    // 图片处理用 Thumbnailator 或 BufferedImage
+    BufferedImage image = ImageIO.read(file.getInputStream());
+    // ... 压缩、缩略图、保存 ...
+
+    return ResponseEntity.ok(Map.of(
+        "coverUrl", "/static/covers/" + filename,
+        "thumbnailUrl", "/static/covers/" + thumbFilename
+    ));
+}
+```
+
+Python 侧的图片处理用 Pillow，一行 `Image.open()` 就能解析；Java 侧通常用 `ImageIO` 或第三方库 Thumbnailator。Pillow 的 API 更直观，但 Java 生态在图片处理方面有更成熟的工具链（如 imgscalr）。
+
+## 静态文件服务
+
+FastAPI 通过 `StaticFiles` 中间件挂载静态目录：
+
+```python
+from fastapi.staticfiles import StaticFiles
+
+# 所有 uploads/ 下的文件都可以通过 /static/ 访问
+app.mount("/static", StaticFiles(directory="uploads"), name="static")
+```
+
+Spring Boot 默认把 `classpath:/static/`、`classpath:/public/` 等目录作为静态资源根，通过 `spring.web.resources.static-locations` 配置。两者的区别在于：Spring Boot 的静态文件默认在 classpath 内（打包进 JAR），而 FastAPI 的 `StaticFiles` 直接映射文件系统目录。对于用户上传的文件，Spring Boot 需要额外配置外部文件路径映射。
+
+## 大文件上传
+
+对于大文件（视频、PDF 等），不能一次性 `await file.read()` 读到内存，需要分块读取：
+
+```python
+CHUNK_SIZE = 1024 * 1024  # 1MB
+
+@app.post("/api/upload/large")
+async def upload_large(file: UploadFile = File(...)):
+    filepath = UPLOAD_DIR / uuid.uuid4().hex
+    total = 0
+    with open(filepath, "wb") as f:
+        while chunk := await file.read(CHUNK_SIZE):
+            total += len(chunk)
+            f.write(chunk)
+    return {"size": total, "path": str(filepath)}
+```
+
+Spring Boot 的 `MultipartFile.getInputStream()` 提供类似能力，用 `InputStream` 逐块读取。两者思路一致，只是异步 vs 同步的区别。
+
+## 安全注意事项
+
+无论用哪个框架，文件上传的安全问题都一样：
+
+- **永远不要用原始文件名**：路径穿越攻击（`../../etc/passwd`）。用 UUID 生成文件名。
+- **双重校验**：Content-Type 可以伪造，用 Pillow（Python）或 `ImageIO`（Java）实际解析验证。
+- **限制大小**：防止磁盘被打满或内存溢出。
+- **上传目录和 Web 根目录分离**：不要把上传目录放在代码目录下。
+
+## 对比总结
+
+| 维度         | Spring Boot                              | FastAPI                            |
+| ------------ | ---------------------------------------- | ---------------------------------- |
+| 接收文件     | `MultipartFile`（同步）                  | `UploadFile`（异步）               |
+| 全局大小限制 | `spring.servlet.multipart.max-file-size` | 手动校验或中间件                   |
+| 类型校验     | 注解 + Validator 或手动                  | 手动校验函数                       |
+| 图片处理     | ImageIO / Thumbnailator / imgscalr       | Pillow                             |
+| 静态文件     | classpath 内置 + 外部路径配置            | `StaticFiles` 挂载文件系统目录     |
+| 大文件读取   | `InputStream` 逐块                       | `await file.read(chunk_size)` 分块 |
+| 依赖注入     | 校验逻辑可抽成自定义 Validator           | 校验逻辑可抽成 Depends 依赖        |
+
+## 回顾与预告
+
+[上一篇](/posts/python/17-middleware-dependency)讲了中间件和依赖注入，文件校验函数用 `Depends` 注入就能在多个路由间复用。本篇的 CMS 封面上传功能已经能跑起来，但它是单机存储——生产环境还需要接入云存储（S3、OSS）。
+
+下一篇讲 WebSocket 实时通信，给 CMS 加上评论实时推送功能，同时对比 Spring WebSocket + STOMP 方案。

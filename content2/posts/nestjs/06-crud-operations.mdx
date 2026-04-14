@@ -1,0 +1,607 @@
+---
+title: "06 CRUD 实战：博客文章管理 API"
+date: "2026-03-30"
+summary: "数据库接好了，但一个像样的 CRUD 比想象中复杂——分页、软删除、关联查询、事务。本文用 TypeORM 实现博客文章的完整 CRUD。"
+tags: ["NestJS", "TypeORM", "CRUD", "Repository", "事务"]
+category: "nestjs"
+cover: ""
+draft: false
+series: "NestJS 渐进式学习"
+seriesOrder: 6
+---
+
+上一篇我们定义了四张表、配好了 TypeORM、跑通了 Migration。数据库是空的（seeding 的数据不算），但 Entity 和 Repository 都就绪了。
+
+现在要做的是把这些拼起来，变成真正可用的 API 接口。听起来简单——不就是增删改查吗？但你很快会发现，一个"像样"的 CRUD 远比 `repository.find()` 复杂。分页怎么做？软删除怎么处理？发布文章时要同时关联标签，这需要事务。查询文章列表时要带上作者信息和标签，关联查询怎么写？
+
+这篇我们一个一个解决。
+
+## Repository：TypeORM 的数据访问层
+
+上一篇在 `ArticlesModule` 里注册了 `TypeOrmModule.forFeature([Article])`，这意味着 NestJS 会为 Article 创建一个 `Repository<Article>` 实例。在 Service 里通过 `@InjectRepository` 注入：
+
+```typescript
+// articles.service.ts
+import { Injectable } from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { Repository, DataSource } from "typeorm";
+import { Article } from "./entities/article.entity";
+
+@Injectable()
+export class ArticlesService {
+  constructor(
+    @InjectRepository(Article)
+    private articleRepo: Repository<Article>,
+    private dataSource: DataSource // 事务用
+  ) {}
+}
+```
+
+`Repository<Article>` 是 TypeORM 的核心 API。它提供了 `find`、`findOne`、`save`、`update`、`delete`、`count` 等方法，基本上你不需要写原生 SQL 就能完成大部分操作。
+
+但有一个前提：Entity 的字段类型和数据库列的映射是正确的。上一篇我们已经用装饰器声明了这些映射，所以可以直接用。
+
+## 创建文章：从草稿到发布
+
+用户写文章通常分两步：先存草稿，再发布。所以创建接口默认 `published: false`，发布是单独的操作。
+
+```typescript
+// articles.service.ts
+async create(authorId: string, dto: CreateArticleDto) {
+  const article = this.articleRepo.create({
+    ...dto,
+    author: { id: authorId } as User,
+    slug: this.generateSlug(dto.title),
+  });
+
+  return this.articleRepo.save(article);
+}
+
+private generateSlug(title: string): string {
+  return title
+    .toLowerCase()
+    .trim()
+    .replace(/\s+/g, '-')
+    .replace(/[^\w\u4e00-\u9fff-]+/g, '') // 保留中文和字母
+    .replace(/-+/g, '-');
+}
+```
+
+`this.articleRepo.create()` 不会立刻写入数据库，它只是创建一个 Entity 实例。`save()` 才真正执行 INSERT。分开两步的好处是，你可以在 `save` 之前做额外的处理。
+
+`generateSlug` 把标题转成 URL 友好的路径，比如「从 Express 迁移到 NestJS 的踩坑记录」变成 `从-express-迁移到-nestjs-的踩坑记录`。正则里保留了中文字符，因为中文标题的 slug 也应该保留中文。
+
+对应的控制器：
+
+```typescript
+// articles.controller.ts
+@Post()
+@HttpCode(HttpStatus.CREATED)
+async create(
+  @Body() dto: CreateArticleDto,
+  // @CurrentUser() 等认证做完再加
+) {
+  // 暂时硬编码 authorId，下一篇认证完成后替换
+  return this.articlesService.create('usr_a1x9k2m', dto);
+}
+```
+
+## 分页列表：findAndCount 的用法
+
+文章列表是最常用的接口，也是最容易写错的。常见的错误是用 `find()` 拿全部数据再在内存里分页——数据量大了直接 OOM。正确做法是让数据库做分页。
+
+TypeORM 的 `findAndCount` 方法一次查询返回数据和总数，用 `skip` 和 `take` 控制分页：
+
+```typescript
+async findPublished(query: ArticleQueryDto) {
+  const { page = 1, limit = 10, keyword, tag } = query;
+  const skip = (page - 1) * limit;
+
+  const where: any = { published: true };
+
+  if (keyword) {
+    where.title = ILike(`%${keyword}%`);
+  }
+
+  if (tag) {
+    where.tags = { slug: tag };
+  }
+
+  const [articles, total] = await this.articleRepo.findAndCount({
+    where,
+    skip,
+    take: limit,
+    order: { publishedAt: 'DESC' },
+    relations: ['author', 'tags'],
+  });
+
+  return {
+    data: articles,
+    meta: {
+      page,
+      limit,
+      total,
+      totalPages: Math.ceil(total / limit),
+    },
+  };
+}
+```
+
+`findAndCount` 内部执行两条 SQL：一条 `SELECT ... LIMIT ... OFFSET ...`，一条 `SELECT COUNT(*)`。它们通过同一个 WHERE 条件保证一致性。
+
+`ILike` 是 PostgreSQL 的不区分大小写匹配（MySQL 用 `Like`）。TypeORM 会根据数据库类型选择正确的操作符。
+
+`relations: ['author', 'tags']` 告诉 TypeORM 做 JOIN 查询，把关联的作者和标签一起查出来。生成的 SQL 大致是：
+
+```sql
+SELECT article.*, author.*, tags.*
+FROM articles article
+LEFT JOIN users author ON article.authorId = author.id
+LEFT JOIN article_tags article_tag ON article.id = article_tag.articleId
+LEFT JOIN tags tag ON article_tag.tagId = tag.id
+WHERE article.published = true
+ORDER BY article.publishedAt DESC
+LIMIT 10 OFFSET 0
+```
+
+### skip/take 的性能问题
+
+`skip` 和 `take` 翻译成 SQL 就是 `OFFSET` 和 `LIMIT`。当 offset 很大时（比如第 10000 页），数据库仍然要扫描前面所有的行再跳过，性能会线性下降。
+
+对于博客平台这种场景，文章量通常在几万到几十万级别，`skip/take` 完全够用。但如果你的数据量到了百万级，可以考虑用"游标分页"（cursor-based pagination）——基于最后一条记录的 ID 或 createdAt 来查询，避免大 offset。这是一个优化话题，后续文章会提到。
+
+## 文章详情：关联查询的几种写法
+
+```typescript
+async findOne(id: string) {
+  const article = await this.articleRepo.findOne({
+    where: { id },
+    relations: ['author', 'tags', 'comments'],
+  });
+
+  if (!article) {
+    throw new NotFoundException(`文章 ${id} 不存在`);
+  }
+
+  // 浏览量 +1
+  await this.articleRepo.increment({ id }, 'views', 1);
+
+  return article;
+}
+```
+
+`findOne` 查单条记录。`relations` 数组里可以传多层——如果 Comment 也有 author 关联，可以写成 `relations: ['author', 'tags', 'comments', 'comments.author']`。
+
+`increment` 是一个便捷方法，直接执行 `UPDATE articles SET views = views + 1 WHERE id = ?`。比先 `findOne` 拿到 views 值再 `+1` 然后 `save` 更安全——不会出现并发更新覆盖的问题。
+
+关于 `relations` 和 `eager`：如果你希望某个关联每次查询都自动加载，可以在 Entity 里设置 `eager: true`：
+
+```typescript
+// 在 Article Entity 里
+@ManyToOne(() => User, { eager: true })
+author: User;
+```
+
+但 `eager` 要谨慎使用。一旦设了 `eager`，所有查 Article 的地方都会 JOIN 用户表，即使你不需要作者信息。对于列表查询，多一个 JOIN 就多一份性能开销。所以更好的做法是按需指定 `relations`，让每次查询只加载需要的数据。
+
+## 软删除：不要真的删数据
+
+用户点"删除"后，文章从列表消失了。但如果你直接 `DELETE FROM articles`，数据就永远没了——用户可能后悔，管理员可能需要恢复。
+
+软删除的方案是加一个 `deletedAt` 字段：删除时不真删，而是设置一个时间戳。查询时过滤掉有 `deletedAt` 的记录。
+
+先在 Article Entity 里加字段：
+
+```typescript
+// article.entity.ts
+import { DeleteDateColumn } from 'typeorm';
+
+@DeleteDateColumn({ type: 'timestamptz', nullable: true })
+deletedAt: Date | null;
+```
+
+`@DeleteDateColumn` 装饰器做了两件事：一是声明列，二是让 TypeORM 的 `softRemove` 和 `recover` 方法可用。
+
+删除时用 `softRemove` 而不是 `remove`：
+
+```typescript
+async softDelete(id: string, authorId: string) {
+  const article = await this.articleRepo.findOne({ where: { id } });
+  if (!article) {
+    throw new NotFoundException(`文章 ${id} 不存在`);
+  }
+  if (article.author.id !== authorId) {
+    throw new ForbiddenException('只能删除自己的文章');
+  }
+
+  await this.articleRepo.softRemove(article);
+  return { message: '文章已删除' };
+}
+```
+
+查询时，TypeORM 会自动过滤掉 `deletedAt IS NOT NULL` 的记录。如果你需要查到已删除的记录（比如管理后台的"回收站"功能），可以用 `withDeleted()`：
+
+```typescript
+// 查全部（包含已删除）
+const allArticles = await this.articleRepo.find({
+  withDeleted: true,
+});
+
+// 只查已删除的
+const deletedArticles = await this.articleRepo
+  .createQueryBuilder("article")
+  .where("article.deletedAt IS NOT NULL")
+  .getMany();
+```
+
+恢复被软删除的文章也很简单：
+
+```typescript
+async restore(id: string) {
+  const article = await this.articleRepo.findOne({
+    where: { id },
+    withDeleted: true,
+  });
+  if (!article) throw new NotFoundException(`文章 ${id} 不存在`);
+  if (!article.deletedAt) {
+    throw new BadRequestException('该文章未被删除');
+  }
+  await this.articleRepo.recover(article);
+  return { message: '文章已恢复' };
+}
+```
+
+`recover` 方法把 `deletedAt` 设回 `null`，文章重新出现在正常查询结果里。
+
+软删除有一个需要注意的点：如果表上有唯一约束（比如 `slug`），软删除的记录仍然占着这个唯一值。如果你想让同一 slug 在删除后可以重新使用，需要在唯一约束里加上 `deletedAt` 条件——PostgreSQL 支持 partial unique index：
+
+```sql
+CREATE UNIQUE INDEX uq_articles_slug ON articles (slug) WHERE "deletedAt" IS NULL;
+```
+
+这个可以通过 Migration 来创建。
+
+## 发布文章 + 关联标签：事务的必要性
+
+"发布文章"不只是把 `published` 设为 `true`。通常还需要同时关联标签。如果标签不存在，要先创建。这些操作要么全部成功，要么全部回滚——这就是事务。
+
+```typescript
+async publish(id: string, tagNames: string[]) {
+  const queryRunner = this.dataSource.createQueryRunner();
+  await queryRunner.connect();
+  await queryRunner.startTransaction();
+
+  try {
+    // 1. 查文章
+    const article = await queryRunner.manager.findOne(Article, {
+      where: { id },
+      relations: ['tags'],
+    });
+
+    if (!article) {
+      throw new NotFoundException(`文章 ${id} 不存在`);
+    }
+
+    // 2. 查找或创建标签
+    const tags: Tag[] = [];
+    for (const name of tagNames) {
+      let tag = await queryRunner.manager.findOne(Tag, {
+        where: { name },
+      });
+      if (!tag) {
+        const slug = name.toLowerCase().replace(/\s+/g, '-');
+        tag = queryRunner.manager.create(Tag, { name, slug });
+        tag = await queryRunner.manager.save(tag);
+      }
+      tags.push(tag);
+    }
+
+    // 3. 更新文章状态和标签
+    article.published = true;
+    article.publishedAt = new Date();
+    article.tags = tags;
+    await queryRunner.manager.save(article);
+
+    await queryRunner.commitTransaction();
+    return article;
+  } catch (err) {
+    await queryRunner.rollbackTransaction();
+    throw err;
+  } finally {
+    await queryRunner.release();
+  }
+}
+```
+
+逐行说几个关键决策：
+
+**为什么用 `queryRunner` 而不是 `this.articleRepo`？** 因为 Repository 默认不在事务里。`queryRunner.manager` 提供的 Repository 方法会在同一个事务中执行，保证原子性。如果中间任何一步失败，`rollbackTransaction()` 会撤销所有变更。
+
+**为什么不在循环里用 `findOrCreate`？** 因为 PostgreSQL 的唯一约束在高并发下可能出问题。用 `queryRunner` 锁住行可以避免，但代码会复杂很多。对于博客平台的发布场景，并发不高，这里用简单的"先查再创建"就够了。
+
+**`finally` 里的 `release()` 为什么必要？** 如果不释放 queryRunner，连接池的连接会被占用不释放，最终导致连接耗尽。这是使用事务时最容易忘记的一步。
+
+TypeORM 还有一个更简洁的事务 API：`this.articleRepo.manager.transaction(async (manager) => { ... })`。它自动处理 connect、commit、rollback、release，代码更短。但如果你的事务逻辑比较复杂，需要精细控制，`queryRunner` 更灵活。
+
+## 编辑文章：部分更新
+
+编辑文章是 PATCH 语义——只传需要修改的字段，不传的保持原值：
+
+```typescript
+async update(id: string, authorId: string, dto: UpdateArticleDto) {
+  const article = await this.articleRepo.findOne({
+    where: { id },
+    relations: ['author'],
+  });
+
+  if (!article) {
+    throw new NotFoundException(`文章 ${id} 不存在`);
+  }
+
+  if (article.author.id !== authorId) {
+    throw new ForbiddenException('只能编辑自己的文章');
+  }
+
+  // 如果标题改了，重新生成 slug
+  if (dto.title && dto.title !== article.title) {
+    dto.slug = this.generateSlug(dto.title);
+  }
+
+  Object.assign(article, dto);
+  return this.articleRepo.save(article);
+}
+```
+
+`Object.assign` 只会覆盖传入的字段。如果 `dto` 里没有 `content`，`article.content` 保持不变。这就是 PATCH 的语义——部分更新。
+
+注意这里有一个安全问题：如果 `dto` 里包含了 `views` 或 `authorId`，用户可以伪造浏览量或把文章转给其他人。下一篇我们会用 DTO 验证（`class-validator`）来限制可更新的字段。现在先知道这个问题。
+
+## DTO 与 Entity 的转换
+
+你可能注意到了，上面的代码直接把 Entity 返回给了控制器。Entity 里包含 `password`（User）这种敏感字段，还有 `deletedAt` 这种内部字段。直接暴露给前端不合适。
+
+通常的做法是在 Service 里做一层转换，或者在 Controller 里做。这里介绍一个实用的方案：Service 返回 Entity，Controller 用一个拦截器自动剥离敏感字段。但拦截器是下一篇（错误处理）的内容，这里先用一个简单的方法。
+
+在 Article Entity 上用 TypeORM 的 `@Exclude` 装饰器（需要安装 `class-transformer`）：
+
+```typescript
+import { Exclude } from "class-transformer";
+
+@Entity("articles")
+export class Article {
+  // ...
+
+  @DeleteDateColumn({ type: "timestamptz", nullable: true })
+  @Exclude()
+  deletedAt: Date | null;
+}
+```
+
+然后在 `main.ts` 里启用 `ClassSerializerInterceptor`，返回数据时会自动排除标记了 `@Exclude` 的字段。不过这个和全局异常过滤器配合起来有些坑，我们留到下一篇统一处理。
+
+目前阶段的策略是：Service 层不关心"返回什么给前端"，它只负责业务逻辑。格式化和字段过滤是控制器层（或拦截器层）的事。这样 Service 的职责保持单一。
+
+## 完整的 ArticlesService
+
+把上面所有方法组装起来：
+
+```typescript
+@Injectable()
+export class ArticlesService {
+  constructor(
+    @InjectRepository(Article)
+    private articleRepo: Repository<Article>,
+    private dataSource: DataSource
+  ) {}
+
+  async create(authorId: string, dto: CreateArticleDto) {
+    const article = this.articleRepo.create({
+      ...dto,
+      author: { id: authorId } as User,
+      slug: this.generateSlug(dto.title),
+    });
+    return this.articleRepo.save(article);
+  }
+
+  async findPublished(query: ArticleQueryDto) {
+    const { page = 1, limit = 10, keyword, tag } = query;
+    const where: any = { published: true };
+
+    if (keyword) {
+      where.title = ILike(`%${keyword}%`);
+    }
+    if (tag) {
+      where.tags = { slug: tag };
+    }
+
+    const [articles, total] = await this.articleRepo.findAndCount({
+      where,
+      skip: (page - 1) * limit,
+      take: limit,
+      order: { publishedAt: "DESC" },
+      relations: ["author", "tags"],
+    });
+
+    return {
+      data: articles,
+      meta: { page, limit, total, totalPages: Math.ceil(total / limit) },
+    };
+  }
+
+  async findOne(id: string) {
+    const article = await this.articleRepo.findOne({
+      where: { id },
+      relations: ["author", "tags"],
+    });
+    if (!article) throw new NotFoundException(`文章 ${id} 不存在`);
+    await this.articleRepo.increment({ id }, "views", 1);
+    return article;
+  }
+
+  async update(id: string, authorId: string, dto: UpdateArticleDto) {
+    const article = await this.articleRepo.findOne({
+      where: { id },
+      relations: ["author"],
+    });
+    if (!article) throw new NotFoundException(`文章 ${id} 不存在`);
+    if (article.author.id !== authorId) {
+      throw new ForbiddenException("只能编辑自己的文章");
+    }
+    if (dto.title && dto.title !== article.title) {
+      dto.slug = this.generateSlug(dto.title);
+    }
+    Object.assign(article, dto);
+    return this.articleRepo.save(article);
+  }
+
+  async softDelete(id: string, authorId: string) {
+    const article = await this.articleRepo.findOne({
+      where: { id },
+      relations: ["author"],
+    });
+    if (!article) throw new NotFoundException(`文章 ${id} 不存在`);
+    if (article.author.id !== authorId) {
+      throw new ForbiddenException("只能删除自己的文章");
+    }
+    await this.articleRepo.softRemove(article);
+    return { message: "文章已删除" };
+  }
+
+  async publish(id: string, tagNames: string[]) {
+    // ... 事务逻辑同上 ...
+  }
+
+  private generateSlug(title: string): string {
+    return title
+      .toLowerCase()
+      .trim()
+      .replace(/\s+/g, "-")
+      .replace(/[^\w\u4e00-\u9fff-]+/g, "")
+      .replace(/-+/g, "-");
+  }
+}
+```
+
+## 用 curl 快速验证
+
+启动应用后，可以用 curl 测试一下。假设你已经跑了 seeding，数据库里有 zhang_wei 的两篇文章：
+
+```bash
+# 查询已发布文章列表
+curl "http://localhost:3000/articles?page=1&limit=10"
+
+# 返回类似：
+# {
+#   "data": [
+#     {
+#       "id": "post_002",
+#       "title": "NestJS 依赖注入到底怎么工作",
+#       "excerpt": "从源码角度理解 NestJS 的 IoC 容器",
+#       "views": 2156,
+#       "author": { "username": "zhang_wei", "nickname": "张威" },
+#       "tags": [{ "name": "NestJS" }, { "name": "后端架构" }]
+#     }
+#   ],
+#   "meta": { "page": 1, "limit": 10, "total": 2, "totalPages": 1 }
+# }
+
+# 查询文章详情（注意 views 会 +1）
+curl http://localhost:3000/articles/post_001
+
+# 按标签筛选
+curl "http://localhost:3000/articles?tag=nestjs"
+
+# 关键词搜索
+curl "http://localhost:3000/articles?keyword=NestJS"
+```
+
+创建新文章：
+
+```bash
+curl -X POST http://localhost:3000/articles \
+  -H "Content-Type: application/json" \
+  -d '{
+    "title": "TypeORM 关联查询避坑指南",
+    "content": "在实际项目中，关联查询是最容易出性能问题的地方...",
+    "excerpt": "总结 TypeORM 关联查询的常见坑和解决方案"
+  }'
+```
+
+删除文章（软删除）：
+
+```bash
+curl -X DELETE http://localhost:3000/articles/<article-id>
+```
+
+再查一次列表，被删除的文章不会出现。但如果用 `withDeleted: true` 查询，它还在数据库里，只是带了一个 `deletedAt` 时间戳。
+
+## Trade-off：几个设计取舍
+
+**findAndCount vs 分两次查：** `findAndCount` 方便，但它内部执行的是两次独立查询（不是在同一个事务里），极端情况下两次查询之间数据可能已经变了（比如刚好有人发了新文章）。对于博客平台，这种不一致完全可以接受。如果需要严格一致，用 `queryRunner` 在事务里分两次查。
+
+**increment vs 先读后写：** `increment` 用 `SET views = views + 1`，并发安全。先 `findOne` 拿到 views 值再 `save({ views: views + 1 })` 在并发时会丢更新——两个请求同时读到 views=100，各自 +1 写回去变成 101，而不是 102。能用 `increment` 就不要手动读后写。
+
+**Repository 方法 vs QueryBuilder：** TypeORM 有两种查询 API——Repository 的 `find/findOne/findAndCount` 和 `QueryBuilder`。Repository 方法更简洁，覆盖 90% 的场景。QueryBuilder 更灵活，适合复杂查询（多表 JOIN、子查询、聚合）。先用 Repository，遇到它搞不定的再用 QueryBuilder。
+
+举一个 QueryBuilder 的例子，展示"什么时候需要它"。假设你要查"最近 7 天浏览量最高的 10 篇文章，只显示标题、浏览量和作者昵称"：
+
+```typescript
+async findTrending() {
+  return this.articleRepo
+    .createQueryBuilder('article')
+    .leftJoin('article.author', 'author')
+    .select([
+      'article.id',
+      'article.title',
+      'article.views',
+      'author.nickname',
+    ])
+    .where('article.published = true')
+    .andWhere('article.publishedAt > :sevenDaysAgo', {
+      sevenDaysAgo: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000),
+    })
+    .orderBy('article.views', 'DESC')
+    .limit(10)
+    .getMany();
+}
+```
+
+`select` 指定只查特定字段，避免 `SELECT *`。这在列表查询时很有用——你不需要文章正文、不需要 createdAt，只需要标题和浏览量。`QueryBuilder` 让这种"精确控制查询"变得自然。
+
+**级联操作 vs 手动管理：** 我们在 `@ManyToOne` 里设了 `onDelete: 'CASCADE'`，删除用户时文章也一起删。这在某些场景下是对的（比如测试数据），但在生产环境，你可能更希望保留已删除用户的文章，只是把作者标记为"已注销"。TypeORM 支持更细粒度的控制——你可以不设 CASCADE，而是在 Service 层手动处理删除逻辑。
+
+## 当前项目状态
+
+三篇核心篇走完，博客平台已经有了基本骨架：
+
+```
+src/
+├── main.ts
+├── app.module.ts
+├── data-source.ts
+├── articles/
+│   ├── articles.module.ts
+│   ├── articles.controller.ts
+│   ├── articles.service.ts
+│   ├── entities/
+│   │   └── article.entity.ts
+│   └── dto/
+│       └── article-query.dto.ts
+├── users/
+│   ├── users.module.ts
+│   ├── users.service.ts
+│   └── entities/
+│       └── user.entity.ts
+├── comments/
+│   └── entities/
+│       └── comment.entity.ts
+├── tags/
+│   └── entities/
+│       └── tag.entity.ts
+└── migrations/
+    └── 1700000000000-init.ts
+```
+
+数据库里有四张表，CRUD 接口能正常工作，分页、关联查询、软删除、事务都有了。但接口是"裸奔"的——任何人可以提交任意数据。下一篇我们加上数据验证，让接口变得健壮。
+
+CRUD 做好了，但有一个明显的问题：所有接口都没有验证。用户可以在创建文章时传一个空标题，可以在更新时把 `views` 设为 999999。下一篇我们用 `class-validator` 和 `ValidationPipe` 在入口就把脏数据拦住。

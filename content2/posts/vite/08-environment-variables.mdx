@@ -1,0 +1,487 @@
+---
+title: "08. 环境变量与多环境配置"
+date: "2026-04-12"
+summary: "dev、staging、production 三个环境有不同的 API 地址和功能开关。Vite 的环境变量机制怎么配才能不出错？"
+tags: ["Vite", "环境变量", "多环境"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战指南"
+seriesOrder: 8
+---
+
+上一篇给 TaskFlow Dashboard 加了 SSR，部署的时候发现一个问题：开发环境的 API 地址是 `http://localhost:3001`，staging 环境是 `https://staging-api.taskflow.dev`，production 是 `https://api.taskflow.dev`。这三个地址得在构建时写死，不能让用户自己填。
+
+另外还有功能开关——新的任务看板视图只在 staging 环境开放给测试团队试用，production 暂时不要。还有 Sentry 的 DSN、Google Analytics 的追踪 ID，每个环境都不一样。
+
+以前用 Webpack 的时候，这些配置散落在 `webpack.common.js`、`webpack.prod.js`、`.env.production` 三个地方，改一个容易漏另一个。迁移到 Vite 之后，想把这些环境变量管理得规范一点。
+
+## Vite 的环境变量机制
+
+Vite 内置了环境变量支持，但它的规则和很多框架不太一样。先搞清楚基础规则，再谈多环境配置。
+
+### 只有 VITE\_ 前缀的变量才暴露给前端
+
+这是最容易踩的坑。Vite 加载 `.env` 文件中的所有变量，但**只有以 `VITE_` 开头的变量才会通过 `import.meta.env` 暴露给前端代码**。
+
+```bash
+# .env 文件
+DATABASE_URL=postgresql://admin:secret@db:5432/taskflow  # 后端用的，前端拿不到
+VITE_API_BASE_URL=https://api.taskflow.dev                 # 前端能拿到
+VITE_SENTRY_DSN=https://xxx@sentry.io/123                  # 前端能拿到
+SECRET_KEY=sk_live_abc123                                  # 前端拿不到
+```
+
+这个设计是有原因的：前端代码是公开的，任何人都能在浏览器里打开 DevTools 看到所有前端变量。所以 Vite 强制你区分"前端变量"和"后端变量"——前者用 `VITE_` 前缀，后者不要放在 `.env` 里（或者至少不要用 `VITE_` 前缀）。
+
+这意味着，如果你的 `.env` 文件里有数据库密码、API Secret 这类敏感信息，即使不小心提交到 Git 仓库，前端代码也读不到它们。当然，更好的做法是不要把敏感信息放在 `.env` 文件里——后面会详细说。
+
+### .env 文件的加载顺序
+
+Vite 会在不同阶段加载不同的 `.env` 文件，加载顺序是：
+
+```
+.env                # 所有环境共享
+.env.local          # 所有环境共享，gitignore 掉（开发者个人配置）
+.env.[mode]         # 特定模式的配置
+.env.[mode].local   # 特定模式的配置，gitignore 掉
+```
+
+"mode" 是什么？Vite 有一个 `--mode` 参数，默认值是 `development`（`vite dev` 命令）和 `production`（`vite build` 命令）。你可以自定义 mode，比如 `vite build --mode staging`。
+
+加载规则是：后面的文件会覆盖前面的。所以优先级从低到高是：
+
+```
+.env < .env.local < .env.[mode] < .env.[mode].local
+```
+
+举个例子，当你在本地运行 `vite dev` 时（mode 是 `development`），Vite 会依次加载：
+
+```
+.env
+.env.local
+.env.development
+.env.development.local
+```
+
+四个文件全部加载，后加载的变量会覆盖先加载的同名变量。
+
+这里有一个细节：`.local` 文件应该加入 `.gitignore`。Vite 官方建议的 `.gitignore` 配置已经包含了 `*.local`，但如果你是手动创建的 `.gitignore`，记得加上。
+
+## 给 TaskFlow 配置多环境
+
+理解了规则，现在来给 TaskFlow Dashboard 配置实际的三个环境。
+
+### 文件结构
+
+```
+taskflow-dashboard/
+  .env                    # 所有环境共享的默认值
+  .env.development        # 开发环境
+  .env.staging            # 预发布环境
+  .env.production         # 生产环境
+  .env.development.local  # 开发者个人的开发配置（gitignore）
+```
+
+`.env` 文件放所有环境共享的默认值，比如应用名称、版本号：
+
+```bash
+# .env
+VITE_APP_NAME=TaskFlow Dashboard
+VITE_APP_VERSION=2.4.0
+VITE_ENABLE_MOCK=false
+```
+
+`.env.development` 放开发环境特有的配置：
+
+```bash
+# .env.development
+VITE_API_BASE_URL=http://localhost:3001
+VITE_ENABLE_DEVTOOLS=true
+VITE_ENABLE_KANBAN=true
+VITE_SENTRY_DSN=
+```
+
+注意 `VITE_SENTRY_DSN=` 是空的——开发环境不需要上报错误到 Sentry。
+
+`.env.staging` 放预发布环境的配置：
+
+```bash
+# .env.staging
+VITE_API_BASE_URL=https://staging-api.taskflow.dev
+VITE_ENABLE_DEVTOOLS=false
+VITE_ENABLE_KANBAN=true
+VITE_SENTRY_DSN=https://abc@sentry.io/staging
+VITE_SENTRY_ENVIRONMENT=staging
+```
+
+`.env.production` 放生产环境的配置：
+
+```bash
+# .env.production
+VITE_API_BASE_URL=https://api.taskflow.dev
+VITE_ENABLE_DEVTOOLS=false
+VITE_ENABLE_KANBAN=false
+VITE_SENTRY_DSN=https://abc@sentry.io/production
+VITE_SENTRY_ENVIRONMENT=production
+```
+
+看 `VITE_ENABLE_KANBAN` 这个变量——staging 是 `true`，production 是 `false`。测试团队在 staging 上试用新功能，确认没问题后再在 production 开启。这就是功能开关的典型用法。
+
+### 构建命令
+
+对应的 `package.json` 脚本：
+
+```json
+{
+  "scripts": {
+    "dev": "vite",
+    "build:staging": "vite build --mode staging",
+    "build:prod": "vite build --mode production",
+    "build": "vite build"
+  }
+}
+```
+
+`vite` 命令默认使用 `development` mode，`vite build` 默认使用 `production` mode。staging 需要显式指定 `--mode staging`。
+
+运行 `npm run build:staging` 时，Vite 加载的文件顺序是：`.env` -> `.env.staging`。运行 `npm run build:prod` 时，加载 `.env` -> `.env.production`。
+
+## TypeScript 类型安全
+
+`import.meta.env` 默认的类型是 `ImportMetaEnv`，里面只有 `MODE`、`BASE_URL`、`PROD`、`DEV`、`SSR` 这几个内置变量。你在 `.env` 里定义的 `VITE_API_BASE_URL` 之类的变量，TypeScript 不认识。
+
+直接写 `import.meta.env.VITE_API_BASE_URL` 不会报错（因为 `ImportMetaEnv` 上有索引签名），但也没有自动补全。变量名拼错了也不会提示。
+
+解决方案是扩展 `ImportMetaEnv` 的类型定义。
+
+### 创建 env.d.ts
+
+在项目根目录创建 `src/env.d.ts`（或者 `env.d.ts`，只要能被 TypeScript 编译器找到就行）：
+
+```typescript
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  // 应用信息
+  readonly VITE_APP_NAME: string;
+  readonly VITE_APP_VERSION: string;
+
+  // API 配置
+  readonly VITE_API_BASE_URL: string;
+  readonly VITE_ENABLE_MOCK: string;
+
+  // 功能开关
+  readonly VITE_ENABLE_DEVTOOLS: string;
+  readonly VITE_ENABLE_KANBAN: string;
+
+  // 监控配置
+  readonly VITE_SENTRY_DSN: string;
+  readonly VITE_SENTRY_ENVIRONMENT: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}
+```
+
+两个关键点：所有变量的类型都是 `string`（因为 `.env` 文件里的值都是字符串），并且全部标记为 `readonly`（你不应该在运行时修改环境变量）。
+
+定义之后，编辑器会给出自动补全，变量名拼错会报红。
+
+### 为什么用 readonly string 而不是更具体的类型
+
+你可能会想：`VITE_ENABLE_KANBAN` 明明是个布尔值，为什么类型是 `string`？
+
+因为 `.env` 文件里的值本质上是文本。`VITE_ENABLE_KANBAN=true` 读出来是字符串 `"true"`，不是布尔值 `true`。如果你在类型里写成 `boolean`，代码运行时会类型不匹配。
+
+使用的时候需要手动转换：
+
+```typescript
+// 正确的用法
+const enableKanban = import.meta.env.VITE_ENABLE_KANBAN === "true";
+
+// 错误的用法——这永远为 true，因为非空字符串都是 truthy
+const enableKanban = import.meta.env.VITE_ENABLE_KANBAN as unknown as boolean;
+```
+
+如果团队经常需要做这种转换，可以封装一个工具函数：
+
+```typescript
+// src/lib/env.ts
+export function envBool(key: keyof ImportMetaEnv): boolean {
+  return import.meta.env[key] === "true";
+}
+
+export function envNum(key: keyof ImportMetaEnv): number {
+  return Number(import.meta.env[key]);
+}
+
+export function envStr(key: keyof ImportMetaEnv): string {
+  return import.meta.env[key] ?? "";
+}
+
+// 使用
+const enableKanban = envBool("VITE_ENABLE_KANBAN");
+const apiBaseUrl = envStr("VITE_API_BASE_URL");
+const pageSize = envNum("VITE_DEFAULT_PAGE_SIZE");
+```
+
+这样做的好处是：如果某个变量名拼错了，TypeScript 在编译阶段就能报错。
+
+## 在代码中使用环境变量
+
+配置好类型定义之后，在组件中使用环境变量就很直观了。
+
+### API 客户端配置
+
+```typescript
+// src/lib/api-client.ts
+import axios from "axios";
+
+export const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL,
+  timeout: 15000,
+});
+
+// 请求拦截器：添加认证 token
+apiClient.interceptors.request.use((config) => {
+  const token = localStorage.getItem("auth_token");
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`;
+  }
+  return config;
+});
+```
+
+`import.meta.env.VITE_API_BASE_URL` 在开发环境会拿到 `http://localhost:3001`，在 staging 构建时会拿到 `https://staging-api.taskflow.dev`。你不需要在任何地方做 if-else 判断。
+
+### 功能开关
+
+```typescript
+// src/components/TaskBoard.tsx
+import { envBool } from '@/lib/env';
+import { KanbanView } from './KanbanView';
+import { ListView } from './ListView';
+
+export function TaskBoard() {
+  const showKanban = envBool('VITE_ENABLE_KANBAN');
+
+  return (
+    <div>
+      <h1>任务看板</h1>
+      {showKanban ? <KanbanView /> : <ListView />}
+    </div>
+  );
+}
+```
+
+功能开关的好处是：你不需要为不同环境维护不同的代码分支。同一个代码库，通过环境变量控制功能可见性。staging 环境开启 `VITE_ENABLE_KANBAN=true` 测试，production 环境设为 `false` 暂时隐藏，验证完成后再改为 `true` 开放给所有用户。
+
+## CI/CD 中的环境变量注入
+
+`.env` 文件适合放在代码仓库里（除了 `.local` 文件）。但如果你的 API 密钥、Sentry DSN 这些信息不想提交到代码仓库呢？
+
+### 方案一：CI/CD 平台注入
+
+大多数 CI/CD 平台（GitHub Actions、GitLab CI、CircleCI）都支持在构建时注入环境变量。你可以在平台的设置界面配置这些变量，构建时通过平台机制传入。
+
+```yaml
+# .github/workflows/build-staging.yml
+name: Build Staging
+on:
+  push:
+    branches: [staging]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        env:
+          VITE_API_BASE_URL: ${{ secrets.STAGING_API_URL }}
+          VITE_SENTRY_DSN: ${{ secrets.STAGING_SENTRY_DSN }}
+          VITE_SENTRY_ENVIRONMENT: staging
+        run: npm run build:staging
+```
+
+这个方案中，敏感信息存在 GitHub Secrets 里，不会出现在代码仓库中。构建时，这些变量作为操作系统环境变量传入，Vite 的 `.env` 加载机制会自动读取操作系统环境变量，优先级高于 `.env` 文件。
+
+Vite 的完整优先级（从低到高）：
+
+```
+.env 文件 < .env.[mode] 文件 < 操作系统环境变量
+```
+
+所以即使 `.env.staging` 里写了 `VITE_SENTRY_DSN=placeholder`，GitHub Actions 注入的值也会覆盖它。
+
+### 方案二：构建时生成 .env 文件
+
+如果你的部署流程比较复杂，可以在构建前动态生成 `.env` 文件：
+
+```yaml
+# .github/workflows/build-production.yml
+- name: Generate .env.production
+  run: |
+    echo "VITE_API_BASE_URL=${{ secrets.PROD_API_URL }}" >> .env.production
+    echo "VITE_SENTRY_DSN=${{ secrets.PROD_SENTRY_DSN }}" >> .env.production
+    echo "VITE_SENTRY_ENVIRONMENT=production" >> .env.production
+    echo "VITE_ENABLE_KANBAN=${{ vars.ENABLE_KANBAN }}" >> .env.production
+
+- name: Build
+  run: npm run build:prod
+```
+
+这种方式的好处是可以在一个步骤里看到完整的 `.env` 内容，方便调试。但要注意不要把敏感信息输出到日志里——GitHub Actions 默认会自动 mask Secrets，但如果用 `echo` 输出，可能还是会泄露。
+
+### 方案三：运行时配置注入
+
+前面两种方案都是在构建时把环境变量写死到产物里。但有时候你需要构建一次、部署到多个环境（比如同一个 Docker 镜像部署到 staging 和 production）。这时候构建时注入就不合适了。
+
+Vite 支持通过 `define` 选项注入全局变量，但更灵活的做法是用运行时配置：
+
+```typescript
+// src/lib/config.ts
+// 这个文件在构建时不会被替换，而是在运行时读取
+export interface AppConfig {
+  apiBaseUrl: string;
+  sentryDsn: string;
+  enableKanban: boolean;
+}
+
+// 尝试从全局变量读取（由部署脚本注入）
+// 如果没有全局变量，回退到构建时的环境变量
+export function getAppConfig(): AppConfig {
+  const runtimeConfig = (window as any).__APP_CONFIG__;
+
+  return {
+    apiBaseUrl: runtimeConfig?.apiBaseUrl ?? import.meta.env.VITE_API_BASE_URL,
+    sentryDsn: runtimeConfig?.sentryDsn ?? import.meta.env.VITE_SENTRY_DSN,
+    enableKanban:
+      runtimeConfig?.enableKanban ??
+      import.meta.env.VITE_ENABLE_KANBAN === "true",
+  };
+}
+```
+
+部署时，通过 Nginx 或 CDN 在 `index.html` 中注入一个全局变量：
+
+```html
+<!-- index.html -->
+<script>
+  window.__APP_CONFIG__ = {
+    apiBaseUrl: "https://api.taskflow.dev",
+    sentryDsn: "https://abc@sentry.io/production",
+    enableKanban: false,
+  };
+</script>
+```
+
+这种方式的好处是：构建产物是环境无关的，同一个 `dist` 目录可以部署到任何环境。缺点是配置暴露在 HTML 中，且需要在部署环节维护注入逻辑。
+
+三种方案各有适用场景。TaskFlow Dashboard 用的 GitHub Actions，敏感信息不多，所以用的是方案一——简单直接。
+
+## 敏感信息的处理原则
+
+回到一个根本问题：`VITE_` 前缀的变量会暴露给前端，所以千万不要把真正的密钥放在 `VITE_` 变量里。
+
+什么算"敏感信息"？一个简单的判断标准：如果这个信息泄露了，攻击者能做什么？
+
+- `VITE_API_BASE_URL`：泄露了攻击者最多知道你的 API 地址。大多数 API 地址本身不是秘密——知道地址不等于能调用。不算敏感。
+- `VITE_SENTRY_DSN`：泄露了攻击者可以向你的 Sentry 项目发送垃圾数据。有影响但不是致命的。通常可以放在 `VITE_` 变量里。
+- `VITE_STRIPE_PUBLIC_KEY`：Stripe 的 Publishable Key 本来就是设计成公开的。可以放在 `VITE_` 变量里。
+- `DATABASE_PASSWORD`：绝对不能放在任何前端可访问的地方。不应该用 `VITE_` 前缀。
+- `JWT_SECRET`：同上。
+- `AWS_SECRET_ACCESS_KEY`：同上。
+
+后端敏感信息的处理原则：不要放在 `.env` 文件里，更不要放在前端代码里。使用 CI/CD 平台的 Secrets 管理功能，或者使用专门的密钥管理服务（AWS Secrets Manager、HashiCorp Vault）。
+
+## SSR 环境的特殊处理
+
+TaskFlow Dashboard 上一篇加了 SSR。SSR 有一个问题：服务端代码运行在 Node.js 中，不需要 `VITE_` 前缀就能访问环境变量。但前端代码仍然需要 `VITE_` 前缀。
+
+这意味着同一个配置项，可能在 `.env` 里需要写两份：
+
+```bash
+# .env.production
+# 前端用的（VITE_ 前缀）
+VITE_API_BASE_URL=https://api.taskflow.dev
+
+# SSR 服务端用的（无前缀）
+SSR_API_BASE_URL=https://internal-api.taskflow.dev
+```
+
+为什么 SSR 要用不同的 API 地址？因为 SSR 运行在你的服务器上，可以访问内网地址，延迟更低。而浏览器端的请求需要走公网。
+
+在 SSR 服务端代码中：
+
+```typescript
+// src/entry-server.ts
+// 服务端代码可以访问所有环境变量（不需要 VITE_ 前缀）
+const internalApiUrl = process.env.SSR_API_BASE_URL;
+```
+
+在前端代码中：
+
+```typescript
+// src/lib/api-client.ts
+// 前端代码只能访问 VITE_ 前缀的变量
+const apiClient = axios.create({
+  baseURL: import.meta.env.VITE_API_BASE_URL,
+});
+```
+
+如果你用了 Vite 8 的 Environment API（实验性），可以更优雅地处理这个问题：
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  environments: {
+    client: {
+      // client 环境只加载 VITE_ 前缀的变量
+      define: {
+        "import.meta.env.VITE_API_BASE_URL": JSON.stringify(
+          process.env.VITE_API_BASE_URL
+        ),
+      },
+    },
+    ssr: {
+      // ssr 环境可以访问所有变量
+    },
+  },
+});
+```
+
+不过 Environment API 还是实验性的，对于大多数项目，用两份变量名的做法就够了。
+
+## 常见问题和踩坑
+
+**问题一：修改了 .env 文件但没生效。**
+
+Vite 只在启动时加载 `.env` 文件。修改了 `.env` 之后，需要重启开发服务器。Vite 的 HMR 不会自动重新加载环境变量。
+
+**问题二：.env.local 文件被提交到了 Git。**
+
+检查 `.gitignore` 里有没有包含 `*.local`。如果没有，赶紧加上。如果已经被提交了，需要从 Git 历史中清除（用 `git filter-branch` 或 `BFG Repo-Cleaner`），然后轮换所有暴露的密钥。
+
+**问题三：VITE\_ 变量在 SSR 服务端拿不到。**
+
+`import.meta.env` 在 Vite 的 SSR 模式下也能用，但只有 `VITE_` 前缀的变量。SSR 服务端如果需要访问其他变量，用 `process.env`。
+
+**问题四：TypeScript 报错 `Cannot find name 'ImportMetaEnv'`。**
+
+确保 `tsconfig.json` 里包含了 `env.d.ts` 文件，或者 `tsconfig.json` 的 `compilerOptions.types` 包含了 `"vite/client"`。
+
+## 权衡
+
+Vite 的环境变量机制有几个值得注意的设计取舍。
+
+强制 `VITE_` 前缀这个规则，初学者经常觉得繁琐——每次新增一个环境变量都要记得加前缀。但这个约束确实能防止把密钥不小心暴露给前端。在安全性和便利性之间，Vite 选了安全性。
+
+`.env` 文件加载顺序的设计——`.env` < `.env.local` < `.env.[mode]` < `.env.[mode].local`——给了你很细的控制粒度。你可以把共享配置放在 `.env`，环境特有配置放在 `.env.[mode]`，个人配置放在 `.local` 文件。但这也意味着排查问题时需要看多个文件才能确定某个变量的最终值。`vite` 命令本身没有提供"打印当前所有环境变量"的功能，需要自己加日志或者用 `console.log(import.meta.env)` 来调试。
+
+SSR 场景下需要维护两套变量名（`VITE_` 前缀给前端，无前缀给服务端），这增加了配置的重复。Vite 8 的 Environment API 试图解决这个问题，但还在实验阶段。目前来说，接受一定的重复是最务实的选择。
+
+下一篇在 production 环境做系统性的性能优化——把 Lighthouse 分数从 65 提到 95+。

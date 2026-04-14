@@ -1,0 +1,304 @@
+---
+title: "03 把应用装进容器：Dockerfile"
+date: "2025-03-30"
+summary: "从最原始的写法到生产级的最佳实践，一步步学会编写 Dockerfile，把电商订单 API 打包成可在任何地方运行的镜像。"
+tags: ["Docker", "Dockerfile", "镜像构建", "Node.js"]
+category: "docker"
+cover: ""
+draft: false
+series: "Docker 从入门到实战"
+seriesOrder: 3
+---
+
+上一篇我们用 Docker 跑了一个现成的 PostgreSQL 镜像。但你自己的应用代码怎么变成镜像？这就是 Dockerfile 的工作——它是一份"配方"，告诉 Docker 怎么把你的代码打包成镜像。
+
+我们的电商订单 API 是一个 Node.js 项目，包含这些文件：
+
+```
+order-api/
+├── package.json
+├── package-lock.json
+├── src/
+│   ├── index.js          # 入口文件
+│   ├── routes/orders.js  # 订单路由
+│   ├── db/pool.js        # 数据库连接池
+│   └── middleware/error.js
+└── tests/
+    └── orders.test.js
+```
+
+目标：写一个 Dockerfile，让这个项目能在任何装了 Docker 的机器上运行。
+
+## 从最笨的办法开始
+
+先不管什么最佳实践，用最直觉的方式写：
+
+```dockerfile
+FROM ubuntu:22.04
+
+RUN apt-get update
+RUN apt-get install -y nodejs npm
+RUN apt-get install -y postgresql-client
+
+WORKDIR /app
+COPY . .
+
+RUN npm install
+
+EXPOSE 3000
+CMD ["node", "src/index.js"]
+```
+
+构建试试：
+
+```bash
+docker build -t order-api:v1 .
+```
+
+等了两分钟，构建完成了。看看这个镜像有多大：
+
+```bash
+docker images order-api
+# REPOSITORY   TAG   IMAGE ID       CREATED          SIZE
+# order-api    v1    abc123def456   10 seconds ago   812MB
+```
+
+812MB。一个只有几百行代码的 Node.js 项目，镜像 812MB。这肯定不对。
+
+问题出在哪？`ubuntu:22.04` 本身就有 77MB，加上 `nodejs` 和 `npm`（Ubuntu 默认仓库里的版本比较旧），再加上 `npm install` 装了一堆依赖，还有 `postgresql-client`——生产环境根本不需要在容器里装 PostgreSQL 客户端。
+
+更重要的是，每一条 `RUN` 指令都会产生一个新的镜像层。五个 `RUN` 就是五层，很多中间产物（apt 缓存、临时文件）留在了层里，白白占空间。
+
+## 换用官方 Node 镜像
+
+改进第一步：不用 Ubuntu，直接用 Node.js 官方镜像。官方镜像已经预装好了 Node.js 和 npm，不用你手动装。
+
+```dockerfile
+FROM node:20
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3000
+CMD ["node", "src/index.js"]
+```
+
+构建后看看大小：
+
+```
+order-api:v2    1.05GB
+```
+
+反而更大了？因为 `node:20` 基于 Debian，自带完整的系统工具链。虽然省去了手动安装 Node.js 的步骤，但基础镜像本身就有 1GB 左右。
+
+换个精简版：
+
+```dockerfile
+FROM node:20-slim
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3000
+CMD ["node", "src/index.js"]
+```
+
+```
+order-api:v3    468MB
+```
+
+好多了。`node:20-slim` 基于 Debian 的精简版，去掉了不必要的系统工具。468MB 也不算小，但比 812MB 强多了。
+
+再进一步，用 Alpine 版本：
+
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY . .
+RUN npm install
+EXPOSE 3000
+CMD ["node", "src/index.js"]
+```
+
+```
+order-api:v4    185MB
+```
+
+从 812MB 到 185MB。选对基础镜像，镜像体积直接缩小了 77%。
+
+## Dockerfile 指令详解
+
+现在来理解我们用到的每条指令。
+
+**`FROM`**：指定基础镜像。这是每条 Dockerfile 的第一行（除了 `ARG`），告诉 Docker "从这个镜像开始构建"。`node:20-alpine` 意味着用 Node.js 20 的 Alpine 版本。
+
+**`WORKDIR`**：设置工作目录。后续的 `COPY`、`RUN`、`CMD` 都会在这个目录下执行。相当于 `cd /app && ...`。如果目录不存在会自动创建。
+
+**`COPY`**：把文件从构建上下文（你执行 `docker build` 的目录）复制到镜像里。`COPY . .` 把当前目录的所有文件复制到镜像的 `/app` 目录。第一个 `.` 是宿主机路径，第二个 `.` 是镜像内路径（相对于 WORKDIR）。
+
+**`RUN`**：在镜像内执行命令。`RUN npm install` 会执行 npm 安装依赖。每条 `RUN` 产生一个新的镜像层。
+
+**`EXPOSE`**：声明容器监听的端口。注意，这只是声明，不会实际映射端口。真正映射端口还是要在 `docker run` 时用 `-p` 参数。`EXPOSE` 的作用是文档性质——告诉使用者"这个容器在 3000 端口提供服务"。
+
+**`CMD`**：容器启动时执行的默认命令。`CMD ["node", "src/index.js"]` 是 exec 形式（JSON 数组），直接执行 `node src/index.js`。CMD 只能有一个，多条 CMD 只有最后一条生效。
+
+## CMD 和 ENTRYPOINT 的区别
+
+这两个指令都定义容器启动时执行的命令，但行为不同。
+
+`CMD` 是默认命令，可以被 `docker run` 的参数覆盖：
+
+```bash
+# Dockerfile 里写的是 CMD ["node", "src/index.js"]
+docker run order-api:v4              # 执行 node src/index.js
+docker run order-api:v4 node -v      # 执行 node -v，覆盖了 CMD
+```
+
+`ENTRYPOINT` 是入口命令，不会被覆盖（除非用 `--entrypoint` 参数）。`docker run` 的参数会追加到 ENTRYPOINT 后面：
+
+```dockerfile
+FROM node:20-alpine
+ENTRYPOINT ["node"]
+```
+
+```bash
+docker run order-api src/index.js     # 执行 node src/index.js
+docker run order-api -v               # 执行 node -v
+```
+
+实际开发中，`CMD` 更常用，大多数场景用 CMD 就够了。ENTRYPOINT 适合做"命令行工具"类的镜像——比如一个代码格式化工具，`ENTRYPOINT` 固定为格式化命令，用户通过参数指定要格式化的文件。
+
+两者可以组合使用：
+
+```dockerfile
+ENTRYPOINT ["node"]
+CMD ["src/index.js"]
+```
+
+这样 `docker run order-api` 执行 `node src/index.js`，`docker run order-api --inspect` 执行 `node --inspect`。
+
+## 缓存友好的写法
+
+现在的 Dockerfile 有一个隐藏的问题。每次你改了一行业务代码，执行 `docker build`：
+
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+COPY . .                # 代码变了，这层缓存失效
+RUN npm install          # 这层也跟着失效，重新安装所有依赖
+```
+
+`COPY . .` 复制了所有文件（包括代码和 `node_modules`），只要任何一个文件有变化，这层就会重建。而 `RUN npm install` 依赖上一层的输出，所以也会重建。结果就是：改了一行代码，要重新安装所有依赖。
+
+解决办法：**先复制依赖文件，安装依赖，再复制代码**。
+
+```dockerfile
+FROM node:20-alpine
+WORKDIR /app
+
+# 先复制依赖文件（很少变化）
+COPY package.json package-lock.json ./
+RUN npm ci
+
+# 再复制应用代码（经常变化）
+COPY . .
+
+EXPOSE 3000
+CMD ["node", "src/index.js"]
+```
+
+`package.json` 和 `package-lock.json` 变化的频率远低于业务代码。这样当你改了 `src/index.js` 时，前两层命中缓存，只有 `COPY . .` 和之后的部分需要重建。构建时间从几十秒缩短到几秒。
+
+这里用了 `npm ci` 而不是 `npm install`。`npm ci` 根据 `package-lock.json` 精确安装，比 `npm install` 更快更可靠，是 CI/CD 环境的推荐做法。
+
+## .dockerignore：别把垃圾打进去
+
+执行 `docker build` 时，Docker 会把当前目录的所有文件作为"构建上下文"发送给 Docker daemon。如果你的项目有 `node_modules`（可能几百 MB）、`.git` 目录、测试文件、文档——这些都会被发送，即使 Dockerfile 里没用到它们。
+
+`.dockerignore` 文件的作用和 `.gitignore` 类似，告诉 Docker 哪些文件不要包含在构建上下文里：
+
+```
+node_modules
+.git
+.env
+.env.local
+npm-debug.log
+coverage
+.DS_Store
+tests
+*.md
+.vscode
+```
+
+加上 `.dockerignore` 之后，构建上下文从几十 MB 缩小到几百 KB，构建速度也有提升。
+
+## 多阶段构建的初体验
+
+上一篇我们提到，构建好的镜像里不应该包含开发依赖（测试框架、代码检查工具等）。但目前的 Dockerfile 把所有依赖都装进去了。
+
+用多阶段构建可以解决这个问题：第一阶段安装所有依赖并构建，第二阶段只复制运行时需要的文件。
+
+```dockerfile
+# 构建阶段
+FROM node:20-alpine AS builder
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+
+# 运行阶段——只复制产物
+FROM node:20-alpine
+WORKDIR /app
+
+# 从构建阶段复制 node_modules（包含运行时依赖）
+COPY --from=builder /app/node_modules ./node_modules
+
+# 复制应用代码
+COPY --from=builder /app/src ./src
+
+EXPOSE 3000
+CMD ["node", "src/index.js"]
+```
+
+这里的关键是 `COPY --from=builder`——它从名为 `builder` 的构建阶段复制文件。最终的镜像只包含运行时依赖和源代码，不包含构建工具和开发依赖。
+
+如果你的项目需要编译步骤（比如 TypeScript 编译、前端打包），多阶段构建的价值更大——编译工具（tsc、webpack 等）只留在构建阶段，不会进入最终镜像。
+
+关于镜像体积优化的更多技巧，我们在第 8 篇会深入展开。
+
+## 构建出错了怎么办
+
+`docker build` 失败时，Docker 会告诉你哪一步出了问题以及错误信息。
+
+```bash
+docker build -t order-api .
+# ...
+# Step 4/6 : RUN npm ci
+# npm ERR! code ELIFECYCLE
+# npm ERR! errno 1
+# npm ERR! order-api@1.0.0 postinstall: `node scripts/build.js`
+# npm ERR! Exit status 1
+```
+
+最常见的几种构建失败原因：
+
+- **`COPY` 找不到文件**：检查文件路径是否正确，注意 Dockerfile 中的路径是相对于构建上下文的，不是宿主机的绝对路径。
+- **`npm ci` 失败**：可能是 `package-lock.json` 和 `package.json` 不一致，或者某个原生模块在 Alpine 上编译失败。
+- **网络问题**：`RUN apt-get` 或 `RUN npm install` 需要下载资源，网络不通就会失败。在国内可以用镜像源加速。
+
+加 `--progress=plain` 可以看到更详细的构建日志：
+
+```bash
+docker build --progress=plain -t order-api .
+```
+
+## 回顾
+
+这篇我们从最原始的 Dockerfile 出发，通过一步步优化，把订单 API 的镜像从 812MB 缩小到了 185MB，同时理解了每条 Dockerfile 指令的作用：
+
+- `FROM`：选对基础镜像（Alpine 比 Debian 小很多）
+- `WORKDIR`：设定工作目录
+- `COPY`：复制文件到镜像，注意先复制 `package.json` 利用缓存
+- `RUN`：执行构建命令，注意合并命令减少层数
+- `CMD`：定义容器启动命令
+- `.dockerignore`：排除不需要的文件
+
+但有一个致命问题我们还没解决：容器删了，数据库里的订单数据也没了。下一篇来解决数据持久化。

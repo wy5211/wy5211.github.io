@@ -1,0 +1,517 @@
+---
+title: "16. 主从复制与哨兵模式：Redis 高可用架构"
+date: "2026-03-23"
+summary: "掌握 Redis 主从复制和哨兵模式，构建高可用的 Redis 集群。"
+tags: ["Redis", "主从复制", "Sentinel"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 16
+---
+
+在上一篇文章中，我们学习了 Redis 的事务、Pipeline 和 Lua 脚本，掌握了如何在单机 Redis 上执行原子操作和批量优化。但现实是残酷的：单台 Redis 服务器总会遇到故障，硬件损坏、网络中断、内存溢出……任何问题都可能导致服务不可用。
+
+想象一下你的直播平台正在运行，几千个用户正在观看直播，突然 Redis 服务器挂了。直播间在线人数统计失效、礼物排行榜丢失、用户 Session 清空……整个平台陷入混乱。这显然是不可接受的。
+
+这时候就需要主从复制和哨兵模式登场了。
+
+## 为什么需要主从复制
+
+主从复制是 Redis 高可用的基础方案。它的核心思想很简单：一主多从，主节点负责写操作，从节点负责读操作。当主节点出现故障时，可以快速切换到从节点。
+
+对于直播平台来说，这意味着什么呢？你可以把直播间状态数据写入主节点，而大量的查询操作（比如用户查看排行榜、浏览在线人数）可以从从节点读取。这样既分担了主节点的压力，又保证了数据安全。
+
+让我们看看主从复制是如何工作的。
+
+## 主从复制的原理
+
+Redis 的主从复制采用异步复制机制。当一个从节点启动时，它会向主节点发送 SYNC 命令，主节点收到后会执行以下步骤：
+
+1. 主节点执行 BGSAVE，在后台生成 RDB 快照文件
+2. 主节点将新收到的写命令缓存到复制缓冲区
+3. RDB 文件生成后，主节点将其发送给从节点
+4. 从节点加载 RDB 文件，将数据恢复到内存
+5. 主节点将复制缓冲区的增量命令发送给从节点
+6. 之后主节点每执行一个写命令，就会同步发送给从节点
+
+这个过程称为"全量同步"或"全量复制"。如果从节点断线重连，Redis 会尝试"部分同步"，只传输断线期间的增量数据。
+
+## 配置主从复制
+
+配置主从复制非常简单。假设你的主节点在 192.168.1.100:6379，你想在另一台服务器上配置一个从节点。
+
+修改从节点的 redis.conf 配置文件：
+
+```bash
+# 指定主节点的 IP 和端口
+replicaof 192.168.1.100 6379
+
+# 如果主节点设置了密码，需要提供认证
+masterauth your_redis_password
+
+# 从节点默认只读
+replica-read-only yes
+
+# 主从断开后，从节点仍然继续响应数据（可能过期）
+replica-serve-stale-data yes
+```
+
+这段配置中，`replicaof` 告诉从节点谁是它的主人。`masterauth` 是密码认证，确保安全性。`replica-read-only` 保证从节点不会被意外写入，避免数据不一致。`replica-serve-stale-data` 是一个容错配置，当从节点与主节点断开连接时，仍然可以提供读取服务（虽然数据可能是过期的）。
+
+如果你不想重启服务器，也可以在运行时动态配置：
+
+```bash
+# 连接到从节点
+redis-cli -h 192.168.1.101 -p 6379
+
+# 执行 replicaof 命令
+127.0.0.1:6379> REPLICAOF 192.168.1.100 6379
+OK
+```
+
+执行后，从节点会立即开始同步数据。你可以通过 INFO 命令查看复制状态：
+
+```bash
+# 在主节点上查看
+127.0.0.1:6379> INFO replication
+# Replication
+role:master
+connected_slaves:2
+slave0:ip=192.168.1.101,port=6379,state=online,offset=123456,lag=0
+slave1:ip=192.168.1.102,port=6379,state=online,offset=123456,lag=1
+
+# 在从节点上查看
+127.0.0.1:6379> INFO replication
+# Replication
+role:slave
+master_host:192.168.1.100
+master_port:6379
+master_link_status:up
+master_link_down_since_mseconds:0
+```
+
+这些信息非常关键。`connected_slaves` 告诉你有多少个从节点连接成功，`lag` 表示复制延迟（单位是秒）。在从节点上，`master_link_status` 显示与主节点的连接状态，`up` 表示正常。
+
+## 主从复制的实际应用
+
+让我们在直播平台中实现一个简单的读写分离方案。使用 ioredis 客户端，我们可以创建一个读写分离的 Redis 客户端管理类：
+
+```typescript
+import Redis from "ioredis";
+
+class ReadWriteRedis {
+  private master: Redis;
+  private slaves: Redis[];
+  private currentSlaveIndex = 0;
+
+  constructor(
+    masterConfig: Redis.RedisOptions,
+    slaveConfigs: Redis.RedisOptions[]
+  ) {
+    // 创建主节点连接
+    this.master = new Redis(masterConfig);
+
+    // 创建多个从节点连接
+    this.slaves = slaveConfigs.map((config) => new Redis(config));
+  }
+
+  // 写操作使用主节点
+  async set(key: string, value: string): Promise<"OK" | null> {
+    return await this.master.set(key, value);
+  }
+
+  async incr(key: string): Promise<number> {
+    return await this.master.incr(key);
+  }
+
+  async hset(key: string, field: string, value: string): Promise<number> {
+    return await this.master.hset(key, field, value);
+  }
+
+  // 读操作使用从节点（轮询负载均衡）
+  private getSlave(): Redis {
+    const slave = this.slaves[this.currentSlaveIndex];
+    this.currentSlaveIndex = (this.currentSlaveIndex + 1) % this.slaves.length;
+    return slave;
+  }
+
+  async get(key: string): Promise<string | null> {
+    const slave = this.getSlave();
+    return await slave.get(key);
+  }
+
+  async hget(key: string, field: string): Promise<string | null> {
+    const slave = this.getSlave();
+    return await slave.hget(key, field);
+  }
+
+  async zrange(key: string, start: number, stop: number): Promise<string[]> {
+    const slave = this.getSlave();
+    return await slave.zrange(key, start, stop);
+  }
+}
+
+// 使用示例
+const redisRW = new ReadWriteRedis(
+  { host: "192.168.1.100", port: 6379, password: "your_password" },
+  [
+    { host: "192.168.1.101", port: 6379, password: "your_password" },
+    { host: "192.168.1.102", port: 6379, password: "your_password" },
+  ]
+);
+
+// 直播间点赞计数（写操作走主节点）
+await redisRW.incr("livestream:room:abc123:likes");
+
+// 查询排行榜（读操作走从节点）
+const topGifters = await redisRW.zrange("livestream:room:abc123:gifts", 0, 9);
+```
+
+这个类封装了读写分离的逻辑。所有的写操作（SET、INCR、HSET）都会发送到主节点，而读操作（GET、HGET、ZRANGE）会轮询发送到不同的从节点。这样做的好处是：主节点的压力被分流到从节点，读操作的性能大幅提升。
+
+在直播平台的场景中，我们可以这样使用：用户送礼物时更新主节点的排行榜，而观众查看排行榜时从从节点读取。由于从节点有多个，读请求会被分散，避免单点瓶颈。
+
+但这里有个问题需要注意：主从复制是异步的，这意味着当你写入主节点后，数据可能还没有立即复制到从节点。如果应用对数据一致性要求很高，可能会读取到旧数据。
+
+## 主从复制的延迟问题
+
+复制延迟是主从架构中需要关注的问题。在网络状况良好时，延迟通常在几毫秒到几十毫秒。但在网络抖动或主节点压力很大时，延迟可能会达到秒级。
+
+Redis 提供了 WAIT 命令来解决这个问题。WAIT 会阻塞当前客户端，直到指定的写操作已经被复制到指定数量的从节点：
+
+```typescript
+// 用户送礼物后，等待至少 1 个从节点确认
+await redisRW.incr("livestream:room:abc123:gifts:user_888");
+await redisRW.master.wait(1, 1000); // 等待 1 个从节点，最多等 1 秒
+
+// 之后从从节点读取，数据一定是新鲜的
+const gifts = await redisRW.get("livestream:room:abc123:gifts:user_888");
+```
+
+WAIT 命令有两个参数：第一个是从节点数量，第二个是超时时间（毫秒）。这里我们等待至少 1 个从节点确认写入，最多等待 1 秒。这样可以保证强一致性，但代价是性能会下降。
+
+在直播平台中，对于关键操作（比如礼物交易），我们可以使用 WAIT 确保数据安全；而对于普通查询（比如浏览历史记录），可以容忍短暂延迟，直接从从节点读取。
+
+## 为什么需要哨兵
+
+主从复制解决了数据备份和读写分离的问题，但还有一个致命缺陷：主节点故障需要人工干预。如果主节点在凌晨 3 点挂了，运维人员睡梦中收到告警，爬起来手动切换从节点……这个过程可能需要十几分钟，对于在线服务来说是无法接受的。
+
+这就是为什么需要哨兵模式。Sentinel 是 Redis 的高可用解决方案，它自动监控主从节点，在主节点故障时自动完成故障转移。
+
+## 哨兵的工作原理
+
+哨兵（Sentinel）是 Redis 提供的独立进程，用于监控和管理 Redis 主从集群。哨兵系统通常由多个哨兵节点组成，它们之间通过 Gossip 协议交换信息。
+
+哨兵的核心功能包括：
+
+1. **监控**：持续检查主节点和从节点是否正常运行
+2. **通知**：当节点出现故障时，通过 API 向管理员或其他程序发送通知
+3. **自动故障转移**：当主节点故障时，将某个从节点升级为主节点
+4. **配置提供者**：客户端可以向哨兵查询当前主节点的地址
+
+哨兵判断节点故障的过程分为两个阶段：
+
+**主观下线（SDOWN）**：单个哨兵认为某个节点下线了。比如哨兵 A 在 5 秒内没有收到主节点的 PONG 响应，它会标记主节点为"主观下线"。
+
+**客观下线（ODOWN）**：足够数量的哨兵都认为某个节点下线了。只有当配置文件中指定的法定数量（quorum）的哨兵都认为主节点下线，才会触发客观下线。
+
+比如你的配置是 `sentinel monitor mymaster 192.168.1.100 6379 2`，这里的 2 就是 quorum。如果有 2 个或更多哨兵认为主节点下线，才会开始故障转移流程。
+
+## 配置哨兵集群
+
+假设我们要为直播平台搭建一个高可用的哨兵集群。推荐的最小配置是 3 个哨兵节点，分布在不同的服务器上，这样可以避免单点故障。
+
+创建哨兵配置文件 sentinel-1.conf：
+
+```bash
+# 哨兵监听端口
+port 26379
+
+# 监控主节点 mymaster，最后一个参数 2 表示至少 2 个哨兵同意才故障转移
+sentinel monitor mymaster 192.168.1.100 6379 2
+
+# 主节点 5 秒无响应则认为主观下线
+sentinel down-after-milliseconds mymaster 5000
+
+# 故障转移时，最多同时有 1 个从节点同步新主节点数据（避免网络压力）
+sentinel parallel-syncs mymaster 1
+
+# 故障转移超时时间 10 秒
+sentinel failover-timeout mymaster 10000
+
+# 主节点密码（如果有）
+sentinel auth-pass mymaster your_redis_password
+
+# 哨兵之间连接的密码（如果哨兵也需要认证）
+# sentinel sentinel-auth-pass mymaster your_sentinel_password
+
+# 故障转移脚本（可选）
+# sentinel notification-script mymaster /var/redis/notify.sh
+# sentinel client-reconfig-script mymaster /var/redis/reconfig.sh
+```
+
+配置文件中的每一行都有明确的含义。`sentinel monitor` 是核心配置，定义了要监控的主节点和故障转移的投票阈值。`down-after-milliseconds` 控制哨兵的敏感度，值越小越容易触发故障转移（但也更容易误判）。`parallel-syncs` 限制同时同步的从节点数量，避免网络拥堵。`failover-timeout` 设置故障转移的超时时间，如果超过这个时间还没完成，会放弃本次转移。
+
+类似地创建 sentinel-2.conf 和 sentinel-3.conf，只需要修改 port（分别为 26380 和 26381），其他配置保持一致。
+
+启动哨兵节点：
+
+```bash
+# 启动哨兵（三种方式等价）
+redis-sentinel /path/to/sentinel-1.conf
+redis-server /path/to/sentinel-1.conf --sentinel
+```
+
+启动后，你可以通过 redis-cli 连接到哨兵查看状态：
+
+```bash
+# 连接到哨兵
+redis-cli -p 26379
+
+# 查看监控的主节点信息
+127.0.0.1:26379> SENTINEL masters
+1) "1) name mymaster"
+   "2) ip 192.168.1.100"
+   "3) port 6379"
+   "4) runid 3d4f8e9c..."
+   ...
+
+# 查看主节点状态
+127.0.0.1:26379> SENTINEL master mymaster
+1) "name mymaster"
+   "2) ip 192.168.1.100"
+   ...
+
+# 查看从节点列表
+127.0.0.1:26379> SENTINEL slaves mymaster
+1) "1) name 192.168.1.101:6379"
+   "2) ip 192.168.1.101"
+   ...
+
+# 查看其他哨兵节点
+127.0.0.1:26379> SENTINEL sentinels mymaster
+```
+
+这些命令让你可以实时监控哨兵集群的状态。SENTINEL masters 显示所有监控的主节点，SENTINEL slaves 显示指定主节点的所有从节点，SENTINEL sentinels 显示监控同一主节点的其他哨兵节点。
+
+## 客户端连接哨兵
+
+使用哨兵后，客户端的连接方式也需要调整。ioredis 提供了哨兵模式的连接方式：
+
+```typescript
+import Redis from "ioredis";
+
+// 通过哨兵连接 Redis
+const redis = new Redis({
+  sentinels: [
+    { host: "192.168.1.100", port: 26379 },
+    { host: "192.168.1.101", port: 26380 },
+    { host: "192.168.1.102", port: 26381 },
+  ],
+  name: "mymaster",
+  sentinelPassword: "your_sentinel_password", // 如果哨兵有密码
+  password: "your_redis_password", // 如果 Redis 有密码
+});
+
+// 正常使用，与单机 Redis 无异
+await redis.set("livestream:room:abc123:viewers", "3421");
+const viewers = await redis.get("livestream:room:abc123:viewers");
+console.log(viewers); // "3421"
+```
+
+这个配置的关键是 `sentinels` 数组和 `name` 参数。ioredis 会连接到所有哨兵节点，向它们查询当前主节点的地址。当主节点发生故障转移时，ioredis 会自动更新连接，应用代码完全无感知。
+
+在直播平台中，这意味着即使主节点半夜挂掉，哨兵会在几秒内自动完成故障转移，用户只会经历短暂的请求失败，之后服务自动恢复，完全不需要人工介入。
+
+## 故障转移演示
+
+让我们模拟一次故障转移，看看哨兵是如何工作的。
+
+首先，正常状态下，你的集群是这样的：
+
+```
+Master: 192.168.1.100:6379
+Slave-1: 192.168.1.101:6379
+Slave-2: 192.168.1.102:6379
+
+Sentinel-1: 192.168.1.100:26379
+Sentinel-2: 192.168.1.101:26380
+Sentinel-3: 192.168.1.102:26381
+```
+
+现在你手动停止主节点：
+
+```bash
+# 连接到主节点并关闭
+redis-cli -h 192.168.1.100 -p 6379
+127.0.0.1:6379> DEBUG sleep 30  # 或直接 KILL 进程
+```
+
+哨兵会检测到主节点下线（主观下线 -> 客观下线），然后开始故障转移：
+
+1. 哨兵集群投票选举领头哨兵
+2. 领头哨兵选择一个从节点升级为主节点（选择复制偏移量最大的）
+3. 让其他从节点复制新主节点
+4. 将旧主节点标记为从节点（如果它恢复了）
+
+整个过程在 10 秒内完成。你可以在哨兵日志中看到详细信息：
+
+```bash
+# +sdown 主观下线
+# +odown 客观下线
+# +elected-leader 选举领头哨兵
+# +failover-state-select-slave 选择新主节点
+# +promoted-slave 升级从节点为主节点
+# +failover-state-reconf-slaves 重新配置其他从节点
+```
+
+你也可以手动触发故障转移（用于维护场景）：
+
+```bash
+redis-cli -p 26379 SENTINEL failover mymaster
+```
+
+这个命令会强制进行故障转移，即使主节点正常运行。这对于主节点维护（比如升级 Redis 版本）非常有用。
+
+## 在直播平台中的实际应用
+
+让我们为直播平台设计一个完整的主从哨兵架构。假设你有 3 台服务器：
+
+**服务器 A**（主节点 + 哨兵）：192.168.1.100
+**服务器 B**（从节点 + 哨兵）：192.168.1.101
+**服务器 C**（从节点 + 哨兵）：192.168.1.102
+
+架构设计如下：
+
+```typescript
+import Redis from "ioredis";
+
+class LiveStreamRedisCluster {
+  private master: Redis;
+  private slaves: Redis[] = [];
+
+  constructor() {
+    // 通过哨兵连接，ioredis 会自动维护主节点连接
+    this.master = new Redis({
+      sentinels: [
+        { host: "192.168.1.100", port: 26379 },
+        { host: "192.168.1.101", port: 26380 },
+        { host: "192.168.1.102", port: 26381 },
+      ],
+      name: "livestream_master",
+      password: "your_redis_password",
+    });
+
+    // 直接连接从节点（读操作）
+    this.slaves = [
+      new Redis({
+        host: "192.168.1.101",
+        port: 6379,
+        password: "your_redis_password",
+      }),
+      new Redis({
+        host: "192.168.1.102",
+        port: 6379,
+        password: "your_redis_password",
+      }),
+    ];
+  }
+
+  // 用户进入直播间（写操作）
+  async joinRoom(roomId: string, userId: string): Promise<void> {
+    const now = Date.now();
+    await this.master.sadd(`livestream:room:${roomId}:viewers`, userId);
+    await this.master.zadd(`livestream:room:${roomId}:active`, now, userId);
+  }
+
+  // 用户送礼（写操作）
+  async sendGift(
+    roomId: string,
+    userId: string,
+    giftId: string,
+    value: number
+  ): Promise<void> {
+    await this.master.zincrby(`livestream:room:${roomId}:gifts`, value, userId);
+    await this.master.incr(`livestream:room:${roomId}:total_gifts`);
+  }
+
+  // 查询在线人数（读操作，走从节点）
+  async getOnlineCount(roomId: string): Promise<number> {
+    const slave = this.getSlave();
+    return await slave.scard(`livestream:room:${roomId}:viewers`);
+  }
+
+  // 查询礼物排行榜（读操作，走从节点）
+  async getGiftLeaderboard(
+    roomId: string,
+    limit: number = 10
+  ): Promise<Array<{ userId: string; score: string }>> {
+    const slave = this.getSlave();
+    const results = await slave.zrevrange(
+      `livestream:room:${roomId}:gifts`,
+      0,
+      limit - 1,
+      "WITHSCORES"
+    );
+
+    const leaderboard = [];
+    for (let i = 0; i < results.length; i += 2) {
+      leaderboard.push({
+        userId: results[i],
+        score: results[i + 1],
+      });
+    }
+    return leaderboard;
+  }
+
+  private getSlave(): Redis {
+    // 简单的轮询负载均衡
+    const index = Math.floor(Math.random() * this.slaves.length);
+    return this.slaves[index];
+  }
+}
+
+// 使用示例
+const liveRedis = new LiveStreamRedisCluster();
+
+// 用户进入直播间
+await liveRedis.joinRoom("abc123", "usr_a1b2c3");
+
+// 用户送礼
+await liveRedis.sendGift("abc123", "usr_a1b2c3", "rocket", 500);
+
+// 查询在线人数（从从节点读取）
+const count = await liveRedis.getOnlineCount("abc123");
+console.log(`当前在线人数：${count}`);
+
+// 查询礼物排行榜（从从节点读取）
+const leaderboard = await liveRedis.getGiftLeaderboard("abc123", 10);
+console.log(leaderboard);
+```
+
+这个类封装了直播平台的核心 Redis 操作。写操作（用户进入房间、送礼）通过哨兵连接到主节点，读操作（查询在线人数、排行榜）直接从从节点读取。
+
+当主节点故障时，哨兵会自动完成故障转移，ioredis 会自动重新连接到新的主节点，你的应用代码完全不需要修改。而从节点的读操作也提供了负载均衡，分散了查询压力。
+
+## 权衡与选择
+
+主从复制 + 哨兵模式是一个强大的高可用方案，但它不是银弹。让我们分析一下它的优缺点。
+
+**优势**：
+
+数据安全是多副本保障的，即使一台服务器彻底损坏，数据也不会丢失。读写分离可以显著提升性能，特别是读多写少的场景（直播平台正好符合）。自动故障转移意味着你可以睡个安稳觉，不用半夜起来手动切换节点。配置相对简单，比 Redis Cluster 容易理解和维护。
+
+**劣势**：
+
+主节点仍然是写瓶颈，所有写操作都要经过它。复制延迟可能导致短暂数据不一致，需要根据业务场景权衡是否使用 WAIT 命令。故障转移期间（通常几秒），写操作会失败，应用需要有重试机制。从节点不能提供写操作，即使在主节点故障期间，从节点也保持只读状态。
+
+那么，什么时候选择主从 + 哨兵，什么时候选择 Redis Cluster 呢？
+
+如果你的数据量能装在单机内存（比如 16GB、32GB），写操作量不是特别大，主从 + 哨兵是首选。它简单、可靠、容易运维。
+
+如果你的数据量超过了单机内存，或者写操作量巨大需要分片，那就需要考虑 Redis Cluster 了。我们会在下一篇文章中详细讨论。
+
+在直播平台场景中，假设你有 1000 个直播间，每个直播间存储 100KB 的数据，总数据量大约 100MB，远小于单机内存。这种情况下，主从 + 哨兵是完美的选择。
+
+现在，你的直播平台已经有了一个高可用的 Redis 架构。即使主节点在午夜挂掉，哨兵会在几秒内完成故障转移，你的用户只会经历短暂的卡顿，然后继续享受直播服务。这就是高可用的价值。

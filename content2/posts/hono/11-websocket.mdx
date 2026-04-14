@@ -1,0 +1,627 @@
+---
+title: "11. WebSocket 实时通信"
+date: "2026-03-20"
+summary: "实现实时双向通信，学习 WebSocket 原理、处理连接管理、广播消息、房间机制，以及构建实时聊天和通知系统。"
+tags: ["Hono", "WebSocket", "Real-time", "Chat", "Broadcasting"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 11
+---
+
+## 前言
+
+在上一篇文章中，我们实现了文件上传功能，用户可以为文章上传封面图和配图。现在博客的基本功能已经很完善了，但还有一个常见的使用场景没有覆盖：实时评论。
+
+你可能在想，为什么不能直接用 HTTP 轮询来实现实时功能？确实可以，每隔几秒钟发送一个请求检查有没有新评论。但这种方式有很多问题：延迟高、服务器负载大、大部分请求都是浪费的（没有新数据）、用户体验也不好。
+
+WebSocket 是为了解决这个问题而设计的。它建立了一个持久的双向连接，服务器可以随时主动向客户端推送消息，不需要客户端不断轮询。这就像打电话和发短信的区别：打电话是双向实时通信，发短信是单向的，需要等待回复。
+
+在本篇文章中，我们将为博客添加实时评论功能，用户发布评论后，其他正在阅读文章的用户能立即看到新评论，无需刷新页面。你将学习到 WebSocket 的工作原理、如何管理连接、如何广播消息、以及如何构建房间机制。
+
+## WebSocket 的工作原理
+
+在深入代码之前，先了解一下 WebSocket 是如何工作的。
+
+WebSocket 连接建立时，客户端发送一个 HTTP 请求，要求升级协议为 WebSocket。服务器同意后，返回 101 状态码，连接就从 HTTP 升级为 WebSocket。之后，客户端和服务器可以随时通过这个连接发送消息，直到连接关闭。
+
+和 HTTP 相比，WebSocket 有几个优势：
+
+- 双向通信：服务器可以主动推送消息，不需要客户端请求
+- 低开销：建立连接后，消息头部很小，不像 HTTP 每次都带完整的头部
+- 实时性强：消息立即传递，没有轮询延迟
+
+不过也有劣势：连接是有状态的，服务器需要维护连接信息；扩展性比 HTTP 差，因为需要保持长连接。
+
+对于实时聊天、通知推送这类场景，WebSocket 是最佳选择。
+
+## 基础 WebSocket 连接
+
+让我们先实现一个简单的 Echo 服务器，理解 WebSocket 的基本用法。
+
+```typescript
+import { Hono } from "hono";
+
+const app = new Hono();
+
+app.get("/ws", async (c) => {
+  // 检查是否是 WebSocket 升级请求
+  if (c.req.header("upgrade") !== "websocket") {
+    return c.text("Expected websocket", 400);
+  }
+
+  return c.streamText(async (stream) => {
+    // 处理 WebSocket 消息
+    stream.onMessage(async (message) => {
+      // Echo 消息回客户端
+      await stream.write(message);
+    });
+
+    // 保持连接
+    await stream.close();
+  });
+});
+
+export default app;
+```
+
+这段代码创建了一个 WebSocket 端点，当客户端连接时，服务器会把收到的每条消息原样返回。这是一个最简单的 WebSocket 实现，帮助我们理解消息是如何流动的。
+
+## 连接管理
+
+在实际应用中，我们需要管理多个 WebSocket 连接，知道哪些用户在线，能够向特定用户发送消息。这需要一个连接管理器。
+
+```typescript
+// src/websocket/connection-manager.ts
+
+interface Client {
+  id: string;
+  userId: string;
+  socket: WebSocket;
+  rooms: Set<string>;
+}
+
+export class ConnectionManager {
+  private clients: Map<string, Client> = new Map();
+  private userClients: Map<string, Set<string>> = new Map();
+
+  // 添加客户端
+  add(client: Client) {
+    this.clients.set(client.id, client);
+
+    if (!this.userClients.has(client.userId)) {
+      this.userClients.set(client.userId, new Set());
+    }
+    this.userClients.get(client.userId)!.add(client.id);
+  }
+
+  // 移除客户端
+  remove(clientId: string) {
+    const client = this.clients.get(clientId);
+    if (!client) return;
+
+    this.clients.delete(clientId);
+
+    const userClients = this.userClients.get(client.userId);
+    if (userClients) {
+      userClients.delete(clientId);
+      if (userClients.size === 0) {
+        this.userClients.delete(client.userId);
+      }
+    }
+  }
+
+  // 获取客户端
+  get(clientId: string): Client | undefined {
+    return this.clients.get(clientId);
+  }
+
+  // 获取用户的所有连接
+  getByUserId(userId: string): Client[] {
+    const clientIds = this.userClients.get(userId);
+    if (!clientIds) return [];
+
+    return Array.from(clientIds)
+      .map((id) => this.clients.get(id))
+      .filter(Boolean) as Client[];
+  }
+
+  // 广播消息给所有客户端
+  broadcast(message: any, excludeClientId?: string) {
+    const data = JSON.stringify(message);
+
+    for (const [id, client] of this.clients) {
+      if (
+        id !== excludeClientId &&
+        client.socket.readyState === WebSocket.OPEN
+      ) {
+        client.socket.send(data);
+      }
+    }
+  }
+
+  // 获取所有客户端
+  getAll(): Client[] {
+    return Array.from(this.clients.values());
+  }
+}
+
+export const connectionManager = new ConnectionManager();
+```
+
+这个连接管理器维护了所有活跃的 WebSocket 连接，可以按用户 ID 查询连接，可以广播消息给所有客户端。这是我们构建实时功能的基础。
+
+## 实时评论系统
+
+现在让我们用连接管理器来实现实时评论功能。
+
+```typescript
+import { Hono } from "hono";
+import { verify } from "hono/jwt";
+import { connectionManager } from "../websocket/connection-manager";
+
+const chat = new Hono();
+
+// WebSocket 连接端点
+chat.get("/ws", async (c) => {
+  if (c.req.header("upgrade") !== "websocket") {
+    return c.text("Expected websocket", 400);
+  }
+
+  // 从查询参数获取 Token
+  const token = c.req.query("token");
+  if (!token) {
+    return c.text("Token required", 401);
+  }
+
+  try {
+    // 验证 Token，获取用户信息
+    const payload = await verify(token, process.env.JWT_SECRET!);
+    const userId = payload.sub as string;
+
+    return c.streamText(async (stream) => {
+      const clientId = crypto.randomUUID();
+
+      // 创建客户端对象
+      const client = {
+        id: clientId,
+        userId,
+        socket: stream as any,
+        rooms: new Set(),
+      };
+
+      // 添加到连接管理器
+      connectionManager.add(client);
+
+      // 发送连接成功消息
+      await stream.write(
+        JSON.stringify({
+          type: "connected",
+          clientId,
+        })
+      );
+
+      // 处理收到的消息
+      stream.onMessage(async (message) => {
+        try {
+          const data = JSON.parse(new TextDecoder().decode(message));
+          await handleCommentMessage(client, data);
+        } catch (error) {
+          console.error("Error handling message:", error);
+        }
+      });
+
+      // 连接关闭时清理
+      stream.onClose(() => {
+        connectionManager.remove(clientId);
+      });
+    });
+  } catch (error) {
+    return c.text("Invalid token", 401);
+  }
+});
+
+// 处理评论消息
+async function handleCommentMessage(client: any, message: any) {
+  switch (message.type) {
+    case "join-post":
+      // 加入文章房间
+      const postId = message.postId;
+      client.rooms.add(postId);
+
+      // 通知房间内其他用户
+      broadcastToRoom(
+        postId,
+        {
+          type: "user-joined",
+          userId: client.userId,
+        },
+        client.id
+      );
+      break;
+
+    case "leave-post":
+      // 离开文章房间
+      client.rooms.delete(message.postId);
+      break;
+
+    case "comment":
+      // 新评论，广播给房间内所有用户
+      const comment = {
+        id: crypto.randomUUID(),
+        postId: message.postId,
+        userId: client.userId,
+        username: message.username,
+        content: message.content,
+        createdAt: new Date().toISOString(),
+      };
+
+      // 保存到数据库
+      await saveComment(comment);
+
+      // 广播给房间内所有用户
+      broadcastToRoom(message.postId, {
+        type: "new-comment",
+        comment,
+      });
+      break;
+  }
+}
+
+// 向房间广播消息
+function broadcastToRoom(
+  roomId: string,
+  message: any,
+  excludeClientId?: string
+) {
+  const data = JSON.stringify(message);
+
+  for (const client of connectionManager.getAll()) {
+    if (client.rooms.has(roomId) && client.id !== excludeClientId) {
+      if (client.socket.readyState === WebSocket.OPEN) {
+        client.socket.send(data);
+      }
+    }
+  }
+}
+
+// 保存评论到数据库
+async function saveComment(comment: any) {
+  // 数据库操作实现
+}
+
+export default chat;
+```
+
+这段代码实现了完整的实时评论功能。用户连接 WebSocket 后，可以加入某个文章的"房间"，之后发送的评论会广播给房间内所有用户。房间机制很重要，它让不同文章的评论互不干扰，用户只会收到自己正在阅读的文章的评论通知。
+
+## 通知推送系统
+
+除了实时评论，我们还可以用 WebSocket 实现通知推送功能。比如当有人点赞或评论了你的文章时，你希望能立即收到通知。
+
+```typescript
+// src/services/notification.service.ts
+
+interface Notification {
+  id: string;
+  userId: string;
+  type: "like" | "comment" | "follow" | "mention";
+  title: string;
+  message: string;
+  data?: any;
+  read: boolean;
+  createdAt: Date;
+}
+
+export class NotificationService {
+  // 推送通知给用户
+  pushToUser(
+    userId: string,
+    notification: Omit<Notification, "id" | "createdAt">
+  ) {
+    const clients = connectionManager.getByUserId(userId);
+
+    if (clients.length === 0) {
+      // 用户不在线，保存到数据库稍后推送
+      this.saveToDatabase(userId, notification);
+      return;
+    }
+
+    // 用户在线，实时推送
+    const fullNotification: Notification = {
+      id: crypto.randomUUID(),
+      ...notification,
+      createdAt: new Date(),
+    };
+
+    for (const client of clients) {
+      if (client.socket.readyState === WebSocket.OPEN) {
+        client.socket.send(
+          JSON.stringify({
+            type: "notification",
+            data: fullNotification,
+          })
+        );
+      }
+    }
+  }
+
+  // 点赞通知
+  notifyLike(postAuthorId: string, likerName: string, postId: string) {
+    this.pushToUser(postAuthorId, {
+      userId: postAuthorId,
+      type: "like",
+      title: "New Like",
+      message: `${likerName} liked your post`,
+      data: { postId },
+      read: false,
+    });
+  }
+
+  // 评论通知
+  notifyComment(
+    postAuthorId: string,
+    commenterName: string,
+    postId: string,
+    comment: string
+  ) {
+    this.pushToUser(postAuthorId, {
+      userId: postAuthorId,
+      type: "comment",
+      title: "New Comment",
+      message: `${commenterName} commented: ${comment.substring(0, 50)}...`,
+      data: { postId },
+      read: false,
+    });
+  }
+
+  // 提及通知
+  notifyMention(userId: string, mentionerName: string, postId: string) {
+    this.pushToUser(userId, {
+      userId,
+      type: "mention",
+      title: "You were mentioned",
+      message: `${mentionerName} mentioned you in a post`,
+      data: { postId },
+      read: false,
+    });
+  }
+
+  private async saveToDatabase(
+    userId: string,
+    notification: Omit<Notification, "id" | "createdAt">
+  ) {
+    // 保存到数据库实现
+    // 用户上线时会从数据库读取并推送
+  }
+}
+
+export const notificationService = new NotificationService();
+```
+
+这个通知服务会先检查用户是否在线。如果在线，直接通过 WebSocket 推送；如果不在线，把通知保存到数据库，等用户上线后再推送。这样用户就不会错过任何通知。
+
+## 心跳和重连
+
+WebSocket 连接可能会因为网络问题断开，我们需要心跳检测和自动重连机制来保证连接的稳定性。
+
+```typescript
+// 服务器端：处理心跳
+stream.onMessage(async (message) => {
+  const data = JSON.parse(new TextDecoder().decode(message));
+
+  switch (data.type) {
+    case "ping":
+      // 收到心跳，回复 pong
+      await stream.write(JSON.stringify({ type: "pong" }));
+      break;
+
+    // 处理其他消息...
+  }
+});
+
+// 客户端：发送心跳
+const ws = new WebSocket("ws://localhost:3000/ws");
+
+// 每 30 秒发送一次心跳
+const heartbeat = setInterval(() => {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "ping" }));
+  } else {
+    clearInterval(heartbeat);
+  }
+}, 30000);
+```
+
+心跳机制很简单：客户端定时发送 ping 消息，服务器收到后回复 pong。如果长时间没有收到 pong，说明连接可能断开了，需要重连。
+
+```typescript
+// 客户端：自动重连
+class ReconnectingWebSocket {
+  private url: string;
+  private ws: WebSocket | null = null;
+  private reconnectDelay: number = 1000;
+  private maxReconnectDelay: number = 30000;
+  private reconnectAttempts: number = 0;
+
+  constructor(url: string) {
+    this.url = url;
+    this.connect();
+  }
+
+  connect() {
+    this.ws = new WebSocket(this.url);
+
+    this.ws.onopen = () => {
+      console.log("Connected");
+      this.reconnectAttempts = 0;
+      this.reconnectDelay = 1000;
+    };
+
+    this.ws.onclose = () => {
+      console.log("Disconnected");
+      this.reconnect();
+    };
+
+    this.ws.onerror = (error) => {
+      console.error("WebSocket error:", error);
+    };
+  }
+
+  reconnect() {
+    this.reconnectAttempts++;
+    console.log(`Reconnecting... (attempt ${this.reconnectAttempts})`);
+
+    setTimeout(() => {
+      this.connect();
+    }, this.reconnectDelay);
+
+    // 指数退避
+    this.reconnectDelay = Math.min(
+      this.reconnectDelay * 2,
+      this.maxReconnectDelay
+    );
+  }
+
+  send(data: any) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify(data));
+    }
+  }
+}
+
+// 使用
+const ws = new ReconnectingWebSocket("ws://localhost:3000/chat/ws?token=xxx");
+```
+
+这个重连类使用了指数退避策略：每次重连的延迟时间加倍，但不超过最大值。这样可以避免在网络问题时频繁重连，加重服务器负担。
+
+## 完整的实时评论路由
+
+让我们把所有功能整合起来：
+
+```typescript
+import { Hono } from "hono";
+import { verify } from "hono/jwt";
+import { connectionManager } from "../websocket/connection-manager";
+
+const chat = new Hono();
+
+chat.get("/ws", async (c) => {
+  if (c.req.header("upgrade") !== "websocket") {
+    return c.text("Expected websocket", 400);
+  }
+
+  const token = c.req.query("token");
+  if (!token) {
+    return c.text("Token required", 401);
+  }
+
+  try {
+    const payload = await verify(token, process.env.JWT_SECRET!);
+    const userId = payload.sub as string;
+
+    return c.streamText(async (stream) => {
+      const clientId = crypto.randomUUID();
+      const client = {
+        id: clientId,
+        userId,
+        socket: stream as any,
+        rooms: new Set(),
+      };
+
+      connectionManager.add(client);
+
+      await stream.write(
+        JSON.stringify({
+          type: "connected",
+          clientId,
+        })
+      );
+
+      stream.onMessage(async (message) => {
+        try {
+          const data = JSON.parse(new TextDecoder().decode(message));
+          await handleMessage(client, data);
+        } catch (error) {
+          console.error("Error:", error);
+        }
+      });
+
+      stream.onClose(() => {
+        connectionManager.remove(clientId);
+      });
+    });
+  } catch (error) {
+    return c.text("Invalid token", 401);
+  }
+});
+
+async function handleMessage(client: any, message: any) {
+  switch (message.type) {
+    case "join-post":
+      client.rooms.add(message.postId);
+      break;
+
+    case "comment":
+      const comment = {
+        id: crypto.randomUUID(),
+        postId: message.postId,
+        userId: client.userId,
+        content: message.content,
+        createdAt: new Date().toISOString(),
+      };
+
+      broadcastToRoom(message.postId, {
+        type: "new-comment",
+        comment,
+      });
+      break;
+
+    case "ping":
+      client.socket.send(JSON.stringify({ type: "pong" }));
+      break;
+  }
+}
+
+function broadcastToRoom(roomId: string, message: any) {
+  for (const client of connectionManager.getAll()) {
+    if (client.rooms.has(roomId)) {
+      if (client.socket.readyState === WebSocket.OPEN) {
+        client.socket.send(JSON.stringify(message));
+      }
+    }
+  }
+}
+
+export default chat;
+```
+
+## Trade-off 分析
+
+WebSocket 虽然强大，但也有一些权衡需要考虑：
+
+**WebSocket vs Server-Sent Events (SSE)**
+
+SSE 是另一种服务器推送技术，它基于 HTTP，只能服务器向客户端推送消息，客户端不能向服务器发送消息。SSE 的优势是实现简单、自动断线重连、基于 HTTP 更容易穿透防火墙。劣势是单向通信、不支持二进制数据。
+
+对于只需要服务器推送的场景（比如通知），SSE 可能更简单。对于需要双向通信的场景（比如聊天），WebSocket 是更好的选择。
+
+**WebSocket vs HTTP 轮询**
+
+HTTP 轮询的优势是实现简单、兼容性好、无状态易扩展。劣势是延迟高、服务器负载大、大部分请求浪费。
+
+对于实时性要求不高的场景，HTTP 轮询可能够用。对于实时性要求高的场景，WebSocket 是必须的。
+
+**连接数限制**
+
+每个 WebSocket 连接都会占用服务器资源，服务器能支持的连接数是有限的。对于大规模应用，需要考虑负载均衡和连接管理。
+
+对于小型应用，单个服务器就能承载所有连接。对于大型应用，可能需要使用消息队列（如 Redis）来在不同服务器之间同步消息。
+
+## 小结
+
+在这篇文章中，我们学习了如何使用 WebSocket 实现实时通信。我们实现了连接管理器、房间机制、实时评论系统、通知推送系统，以及心跳和重连机制。WebSocket 让我们的博客应用具备了实时通信能力，大大提升了用户体验。
+
+不过实时通信也带来了新的挑战：连接管理、状态同步、扩展性问题等。在下一篇文章中，我们将学习如何保护我们的应用，实现速率限制和安全防护，确保实时功能不会被滥用。

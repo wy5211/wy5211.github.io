@@ -1,0 +1,543 @@
+---
+title: "03. Redis 五大数据类型：选择合适的数据结构"
+date: "2026-03-23"
+summary: "深入理解 Redis 五大数据类型的特点、使用场景和底层实现，学会选择合适的数据结构解决问题。"
+tags: ["Redis", "数据类型"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 3
+---
+
+## 为什么需要多种数据类型
+
+上一篇文章我们学习了键的基本操作，但只涉及了 String 类型。你可能会问：Redis 不就是个 key-value 存储吗，为什么需要这么多数据类型？
+
+让我用一个真实的场景来说明。
+
+假设你在做一个直播平台，需要实现这些功能：
+
+- 存储用户信息：包括用户名、邮箱、年龄、城市等字段
+- 实现礼物排行榜：实时显示送礼最多的前 10 名用户
+- 管理弹幕消息：最新消息排在前面，超过 100 条就删除旧的
+- 标签系统：用户可以给直播打标签，需要查询"某个标签下有哪些直播"
+- 在线用户：实时统计在线用户，用户离开时自动移除
+
+如果只能用 String，你需要把所有数据序列化成 JSON 字符串。要获取一个字段，需要读取整个对象，解析 JSON，再取字段。要实现排行榜，需要读取所有数据，在代码里排序。要实现标签系统，需要自己维护索引。
+
+而 Redis 提供了 5 种专门优化的数据结构：String、Hash、List、Set、Sorted Set。每种结构都是为特定场景设计的，可以让你用一行命令完成复杂操作。
+
+这就是 Redis 的核心思想：不是给你一个通用的工具让你自己实现，而是给你一组专门的工具，每个工具都针对特定问题优化。
+
+## 数据类型总览
+
+先快速浏览一下这 5 种类型：
+
+| 数据类型   | 底层实现            | 主要特点                 | 典型场景                   |
+| ---------- | ------------------- | ------------------------ | -------------------------- |
+| String     | SDS                 | 二进制安全，可存任意数据 | 缓存、计数器、分布式锁     |
+| Hash       | 哈希表 + 压缩列表   | 键值对集合，适合对象     | 用户信息、购物车、Session  |
+| List       | 双向链表 + 快速列表 | 有序、可重复             | 消息队列、最新列表、栈     |
+| Set        | 哈希表 + 整数集合   | 无序、唯一、支持集合运算 | 标签、关注系统、共同好友   |
+| Sorted Set | 跳表 + 哈希表       | 有序、唯一、按分数排序   | 排行榜、延时队列、范围查询 |
+
+## String 类型
+
+String 是最基础的类型，可以存储任何形式的字符串，包括二进制数据。最大能存 512MB。
+
+### 适用场景
+
+#### 场景 1：缓存
+
+最常见的用途是缓存数据库数据：
+
+```typescript
+// 缓存用户信息
+async function getUser(userId: string) {
+  const cacheKey = `livestream:user:${userId}`;
+
+  // 先查缓存
+  const cached = await redis.get(cacheKey);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+
+  // 缓存未命中，查询数据库
+  const user = await db.getUser(userId);
+
+  // 写入缓存，1 小时过期
+  await redis.setex(cacheKey, 3600, JSON.stringify(user));
+
+  return user;
+}
+```
+
+这个模式叫 Cache-Aside，是缓存最常用的模式。先查缓存，没有就查数据库，然后写入缓存。
+
+#### 场景 2：计数器
+
+String 可以存储数字，用 INCR 命令实现原子递增：
+
+```typescript
+// 直播间点赞数
+async function likeRoom(roomId: string, userId: string) {
+  const key = `livestream:room:${roomId}:likes`;
+
+  // 原子递增，不需要先读后写
+  const count = await redis.incr(key);
+
+  // 第一次设置时添加过期时间
+  if (count === 1) {
+    await redis.expire(key, 86400); // 24 小时过期
+  }
+
+  console.log(`用户 ${userId} 点赞，当前 ${count} 个赞`);
+  return count;
+}
+```
+
+为什么不用先读后写？因为并发场景下，两个请求可能同时读到相同的值，都加 1，结果少算了 1 次。INCR 是原子操作，Redis 保证它不会被打断。
+
+#### 场景 3：分布式锁
+
+用 SET 的 NX 选项实现分布式锁：
+
+```typescript
+// 获取锁
+async function acquireLock(resourceId: string, ttl = 30) {
+  const lockKey = `lock:${resourceId}`;
+  const lockValue = `usr_${Date.now()}`;
+
+  // NX: 仅当键不存在时设置
+  // EX: 设置过期时间
+  const result = await redis.set(lockKey, lockValue, "NX", "EX", ttl);
+
+  return result === "OK"; // 返回是否成功
+}
+
+// 释放锁
+async function releaseLock(resourceId: string, lockValue: string) {
+  const lockKey = `lock:${resourceId}`;
+
+  // 用 Lua 脚本保证原子性
+  const script = `
+    if redis.call("get", KEYS[1]) == ARGV[1] then
+      return redis.call("del", KEYS[1])
+    else
+      return 0
+    end
+  `;
+
+  await redis.eval(script, 1, lockKey, lockValue);
+}
+```
+
+注意释放锁时要检查锁的值，防止误删别人的锁。用 Lua 脚本保证这两个操作的原子性。
+
+### Trade-off：什么时候用 String
+
+String 的优点是简单、通用。缺点是如果你要存对象，只能序列化成 JSON，获取时需要整体读取，不能只获取部分字段。
+
+如果你需要频繁更新对象的某个字段，或者只需要获取对象的几个字段，考虑用 Hash。
+
+## Hash 类型
+
+Hash 是一个键值对集合，特别适合存储对象。它就像一个嵌套的 Map：外层是 Redis 键，内层是字段和值。
+
+### 适用场景
+
+#### 场景 1：存储用户信息
+
+```typescript
+// 存储用户信息
+async function saveUser(
+  userId: string,
+  userData: {
+    username: string;
+    email: string;
+    age: number;
+    city: string;
+  }
+) {
+  const key = `livestream:user:${userId}`;
+
+  // HSET 可以设置多个字段
+  await redis.hset(key, {
+    username: userData.username,
+    email: userData.email,
+    age: userData.age.toString(),
+    city: userData.city,
+  });
+
+  // 设置过期时间
+  await redis.expire(key, 3600);
+}
+
+// 获取用户信息
+async function getUser(userId: string) {
+  const key = `livestream:user:${userId}`;
+
+  // 获取所有字段
+  const user = await redis.hgetall(key);
+
+  if (Object.keys(user).length === 0) {
+    return null;
+  }
+
+  return {
+    username: user.username,
+    email: user.email,
+    age: parseInt(user.age),
+    city: user.city,
+  };
+}
+
+// 只获取需要的字段
+async function getUserEmail(userId: string) {
+  const email = await redis.hget(`livestream:user:${userId}`, "email");
+  return email;
+}
+```
+
+对比 String 版本：String 需要读取整个 JSON 对象，解析后再取字段。Hash 可以直接获取需要的字段。
+
+#### 场景 2：购物车
+
+```typescript
+// 添加商品到购物车
+async function addToCart(userId: string, productId: string, quantity: number) {
+  const key = `livestream:cart:${userId}`;
+
+  // HINCRBY 原子递增
+  await redis.hincrby(key, `prd_${productId}`, quantity);
+
+  // 设置过期时间
+  await redis.expire(key, 86400 * 7); // 7 天过期
+}
+
+// 查看购物车
+async function getCart(userId: string) {
+  const key = `livestream:cart:${userId}`;
+
+  const cart = await redis.hgetall(key);
+
+  // 转换成数组
+  return Object.entries(cart).map(([productId, quantity]) => ({
+    productId: productId.replace("prd_", ""),
+    quantity: parseInt(quantity),
+  }));
+}
+
+// 更新商品数量
+async function updateQuantity(
+  userId: string,
+  productId: string,
+  delta: number
+) {
+  const key = `livestream:cart:${userId}`;
+
+  const newQuantity = await redis.hincrby(key, `prd_${productId}`, delta);
+
+  // 如果数量为 0，删除该商品
+  if (newQuantity <= 0) {
+    await redis.hdel(key, `prd_${productId}`);
+  }
+
+  return newQuantity;
+}
+```
+
+购物车是 Hash 的经典场景：商品 ID 是字段，数量是值。HINCRBY 可以原子地增减数量。
+
+### Trade-off：Hash vs String
+
+什么时候用 Hash，什么时候用 String(JSON)？
+
+如果对象的字段比较固定，而且经常需要部分更新或部分读取，用 Hash。如果对象总是整体使用，或者字段不固定，用 String(JSON)。
+
+另外要注意，当字段少且值小时，Hash 会用 ziplist 编码，更节省内存。但当字段多或值大时，会转成 hashtable，内存占用会增加。
+
+## List 类型
+
+List 是一个有序的字符串列表，可以在头部或尾部添加元素。它就像一个双向链表。
+
+### 适用场景
+
+#### 场景 1：消息队列
+
+```typescript
+// 生产者：发送消息
+async function sendMessage(queueName: string, message: any) {
+  const key = `livestream:queue:${queueName}`;
+
+  // RPUSH 从右侧（尾部）推入
+  await redis.rpush(key, JSON.stringify(message));
+}
+
+// 消费者：处理消息
+async function consumeMessage(queueName: string) {
+  const key = `livestream:queue:${queueName}`;
+
+  // LPOP 从左侧（头部）弹出
+  const result = await redis.lpop(key);
+
+  if (!result) {
+    return null;
+  }
+
+  return JSON.parse(result);
+}
+
+// 阻塞式消费（如果没有消息会等待）
+async function consumeMessageBlocking(queueName: string, timeout = 5) {
+  const key = `livestream:queue:${queueName}`;
+
+  // BLPOP 会阻塞直到有消息或超时
+  const result = await redis.blpop(key, timeout);
+
+  if (!result) {
+    return null;
+  }
+
+  // result 是一个数组 [key, message]
+  return JSON.parse(result[1]);
+}
+```
+
+这就是经典的 FIFO 队列：生产者从右侧推入，消费者从左侧弹出。
+
+#### 场景 2：最新列表
+
+```typescript
+// 添加最新直播
+async function addLatestRoom(roomId: string) {
+  const key = "livestream:latest:rooms";
+
+  // LPUSH 从左侧（头部）推入
+  await redis.lpush(key, `room_${roomId}`);
+
+  // 只保留最新的 100 个
+  await redis.ltrim(key, 0, 99);
+
+  // 设置过期时间
+  await redis.expire(key, 3600);
+}
+
+// 获取最新直播列表
+async function getLatestRooms(count = 10) {
+  const key = "livestream:latest:rooms";
+
+  // LRANGE 获取指定范围的元素
+  const rooms = await redis.lrange(key, 0, count - 1);
+
+  return rooms;
+}
+```
+
+注意这里的 `LTRIM` 命令，它会截断列表，只保留指定范围的元素。这个技巧常用于实现"最新 N 条"功能。
+
+### Trade-off：List 的局限性
+
+List 虽然可以实现消息队列，但它有一些局限性：
+
+- 没有确认机制，消息被消费后就删除了
+- 没有持久化，Redis 重启后消息会丢失
+- 不支持消息路由、优先级等高级功能
+
+如果你需要可靠的消息队列，考虑用 RabbitMQ 或 Kafka。但如果是简单的异步任务，List 足够了。
+
+## Set 类型
+
+Set 是一个无序的字符串集合，不允许重复元素。它支持集合运算：交集、并集、差集。
+
+### 适用场景
+
+#### 场景 1：标签系统
+
+```typescript
+// 给直播添加标签
+async function addTags(roomId: string, tags: string[]) {
+  const key = `livestream:room:${roomId}:tags`;
+
+  // SADD 添加元素，自动去重
+  await redis.sadd(key, ...tags);
+
+  await redis.expire(key, 86400);
+}
+
+// 获取直播的所有标签
+async function getTags(roomId: string) {
+  const key = `livestream:room:${roomId}:tags`;
+
+  return await redis.smembers(key);
+}
+
+// 查找带某个标签的所有直播
+async function findRoomsByTag(tag: string) {
+  const key = `livestream:tag:${tag}:rooms`;
+
+  return await redis.smembers(key);
+}
+
+// 添加直播时维护索引
+async function addRoomToTagIndex(roomId: string, tag: string) {
+  const key = `livestream:tag:${tag}:rooms`;
+
+  await redis.sadd(key, `room_${roomId}`);
+}
+```
+
+标签系统是 Set 的经典场景：一个直播有多个标签，一个标签对应多个直播。这就是多对多关系。
+
+#### 场景 2：共同关注
+
+```typescript
+// 用户关注主播
+async function followUser(userId: string, targetUserId: string) {
+  const followingKey = `livestream:user:${userId}:following`;
+  const followersKey = `livestream:user:${targetUserId}:followers`;
+
+  // 添加到关注列表
+  await redis.sadd(followingKey, `usr_${targetUserId}`);
+
+  // 添加到粉丝列表
+  await redis.sadd(followersKey, `usr_${userId}`);
+}
+
+// 获取共同关注
+async function getCommonFollowing(userId1: string, userId2: string) {
+  const key1 = `livestream:user:${userId1}:following`;
+  const key2 = `livestream:user:${userId2}:following`;
+
+  // SINTER 计算交集
+  const common = await redis.sinter(key1, key2);
+
+  return common;
+}
+
+// 获取关注了 A 但没关注 B 的用户
+async function getDiffFollowing(userId1: string, userId2: string) {
+  const key1 = `livestream:user:${userId1}:following`;
+  const key2 = `livestream:user:${userId2}:following`;
+
+  // SDIFF 计算差集
+  const diff = await redis.sdiff(key1, key2);
+
+  return diff;
+}
+```
+
+集合运算在社交场景非常有用。想想看，如果要实现"推荐好友"功能，你可以计算"朋友的朋友"减去"已经是朋友的"，再用其他条件过滤。
+
+## Sorted Set 类型
+
+Sorted Set 是一个有序集合，每个元素关联一个分数。它按照分数从小到大排序，分数相同时按字典序排序。
+
+### 适用场景
+
+#### 场景 1：礼物排行榜
+
+```typescript
+// 用户送礼
+async function sendGift(roomId: string, userId: string, giftValue: number) {
+  const key = `livestream:room:${roomId}:gift:leaderboard`;
+
+  // ZINCRBY 原子递增分数
+  await redis.zincrby(key, giftValue, `usr_${userId}`);
+
+  // 设置过期时间
+  await redis.expire(key, 86400 * 7); // 7 天过期
+}
+
+// 获取排行榜 Top 10
+async function getTopGifters(roomId: string, count = 10) {
+  const key = `livestream:room:${roomId}:gift:leaderboard`;
+
+  // ZREVRANGE 按分数从高到低获取
+  const top = await redis.zrevrange(key, 0, count - 1, "WITHSCORES");
+
+  // 返回格式：["user1", "100", "user2", "80"]
+  // 转换成对象数组
+  const result = [];
+  for (let i = 0; i < top.length; i += 2) {
+    result.push({
+      userId: top[i].replace("usr_", ""),
+      score: parseInt(top[i + 1]),
+    });
+  }
+
+  return result;
+}
+
+// 获取用户的排名
+async function getUserRank(roomId: string, userId: string) {
+  const key = `livestream:room:${roomId}:gift:leaderboard`;
+
+  // ZREVRANK 返回排名（从 0 开始）
+  const rank = await redis.zrevrank(key, `usr_${userId}`);
+
+  if (rank === null) {
+    return null;
+  }
+
+  return rank + 1; // 转换成从 1 开始
+}
+```
+
+排行榜是 Sorted Set 最典型的场景。ZINCRBY 原子递增，ZREVRANGE 按分数倒序获取，ZREVRANK 查排名。这些都是 O(log N) 时间复杂度。
+
+#### 场景 2：延时队列
+
+```typescript
+// 添加延时任务（时间戳作为分数）
+async function addDelayTask(taskId: string, executeAt: Date) {
+  const key = "livestream:delay:queue";
+
+  const timestamp = Math.floor(executeAt.getTime() / 1000);
+
+  // 添加到有序集合，分数是执行时间
+  await redis.zadd(key, timestamp, taskId);
+}
+
+// 获取到期的任务
+async function getExpiredTasks() {
+  const key = "livestream:delay:queue";
+
+  const now = Math.floor(Date.now() / 1000);
+
+  // 获取分数 <= now 的所有任务
+  const tasks = await redis.zrangebyscore(key, 0, now);
+
+  return tasks;
+}
+
+// 处理完任务后删除
+async function removeTask(taskId: string) {
+  const key = "livestream:delay:queue";
+
+  await redis.zrem(key, taskId);
+}
+```
+
+用时间戳作为分数，ZRANGEBYSCORE 就可以获取所有到期的任务。这个技巧可以用来实现定时任务、延时重试等功能。
+
+## 如何选择数据类型
+
+最后总结一下选择数据类型的决策流程：
+
+1. 需要存储对象？用 Hash
+2. 需要排序？用 Sorted Set
+3. 需要去重？用 Set
+4. 需要保持顺序？用 List
+5. 都不需要？用 String
+
+但记住，这只是经验法则。具体选择还要考虑数据量、访问模式、性能要求等因素。
+
+## 小结
+
+今天我们学了 Redis 的 5 种核心数据结构。记住，Redis 的威力不在于它有多快，而在于它有合适的数据结构解决你的问题。
+
+不要把它当成一个通用的 key-value 存储，要善用它的数据结构。如果你发现自己用 Redis 时写了很多复杂的业务逻辑，可能说明你选错了数据结构。
+
+下一篇文章我们会深入讨论键的命名规范和设计模式，看看如何设计一个清晰、高效的 Redis 数据结构。

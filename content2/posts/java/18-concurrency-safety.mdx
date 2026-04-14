@@ -1,0 +1,283 @@
+---
+title: "18 同步与并发安全"
+date: "2026-03-30"
+summary: "多线程下计数器怎么不丢数？从 CMS 的评论计数器出发，理解竞态条件、synchronized 和原子类的使用场景。"
+tags: ["Java", "并发安全", "synchronized", "原子类"]
+category: "java"
+cover: ""
+draft: false
+series: "Java 渐进式实战"
+seriesOrder: 18
+---
+
+# 同步与并发安全
+
+上篇我们用多线程为 CMS 批量生成了文章摘要，但遗留了一个关键问题：当多个线程同时修改共享数据时，结果可能出错。这不是小概率事件——在高并发下几乎必然发生。
+
+## 一个会丢数的计数器
+
+假设我们的 CMS 需要统计每篇文章的评论数。用户发评论时计数器 +1，删除评论时 -1。用两个线程模拟这个场景：
+
+```java
+public class BrokenCounter {
+    private int count = 0;
+
+    public void increment() {
+        count++;  // 这一行不是原子操作
+    }
+
+    public int getCount() {
+        return count;
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        BrokenCounter counter = new BrokenCounter();
+
+        // 两个线程各加 10000 次
+        Thread t1 = new Thread(() -> {
+            for (int i = 0; i < 10000; i++) counter.increment();
+        });
+        Thread t2 = new Thread(() -> {
+            for (int i = 0; i < 10000; i++) counter.increment();
+        });
+
+        t1.start();
+        t2.start();
+        t1.join();
+        t2.join();
+
+        System.out.println("预期：20000，实际：" + counter.getCount());
+        // 输出可能是 18734、19102、19847... 每次不同
+    }
+}
+```
+
+运行这段代码，结果几乎永远不是 20000。问题出在 `count++` 这个看似简单的操作上——它实际包含三步：读取、加一、写回。当两个线程交错执行这三步时，数据就会丢失。
+
+## 竞态条件（Race Condition）
+
+竞态条件是指多个线程访问共享数据，且至少一个线程在写，而最终的执行结果取决于线程的调度顺序。
+
+用时间线来理解上面的问题：
+
+```
+线程A: 读取 count=50 → 计算 50+1=51 → 写回 count=51
+线程B:         读取 count=50 → 计算 50+1=51 → 写回 count=51
+```
+
+两个线程各加了一次，但 count 从 50 变成了 51，只加了一。这就是"丢数"。
+
+在 JS 中，主线程是单线程的，`count++` 永远不会被中断——事件循环保证了同一时刻只有一个回调在执行。所以 JS 开发者很少需要面对这类问题。但 Java 的多线程模型意味着你必须主动处理。
+
+## synchronized：互斥锁
+
+最直接的解决方案是让 `count++` 变成互斥操作——同一时刻只允许一个线程执行它。
+
+```java
+public class SafeCounter {
+    private int count = 0;
+
+    // 方式一：同步方法，锁对象是 this
+    public synchronized void increment() {
+        count++;
+    }
+
+    public synchronized int getCount() {
+        return count;
+    }
+}
+```
+
+`synchronized` 加在方法上，相当于 `synchronized(this) { ... }`。进入方法前获取锁，退出后释放。其他线程在锁被持有时会阻塞等待。
+
+也可以缩小同步范围，只锁住关键代码：
+
+```java
+public class PreciseCounter {
+    private int count = 0;
+    private final Object lock = new Object();
+
+    public void increment() {
+        // 只锁住 count++ 这一步，不阻塞其他无关操作
+        synchronized (lock) {
+            count++;
+        }
+    }
+}
+```
+
+锁的范围越小，并发性能越好。如果你的方法里除了 `count++` 还有耗时操作（比如网络请求），不要把它们放进同步块里。
+
+### 静态方法的锁
+
+`synchronized` 加在静态方法上，锁对象是 `Class` 对象，不是实例。这意味着不同实例之间也会互斥：
+
+```java
+public class PostService {
+    // 锁对象是 PostService.class，全局互斥
+    public static synchronized void incrementGlobalViewCount() {
+        // ...
+    }
+}
+```
+
+## volatile：可见性保证
+
+另一个并发问题是**可见性**。Java 的线程可能把共享变量缓存到自己的 CPU 缓存中，导致一个线程修改了变量，另一个线程看不到变化。
+
+```java
+public class VolatileFlag {
+    // 没有 volatile，工作线程可能永远看不到 running = false
+    private volatile boolean running = true;
+
+    public void stop() {
+        running = false;
+    }
+
+    public void work() {
+        while (running) {
+            // 处理任务
+        }
+        System.out.println("线程安全退出");
+    }
+}
+```
+
+`volatile` 做两件事：一是保证修改立即刷新到主内存，二是禁止指令重排序。但它**不保证原子性**——`volatile int count; count++` 仍然会丢数。
+
+**什么时候用 volatile：**
+
+- 状态标志位（`running`、`initialized` 等）
+- 单次写入、多次读取的场景
+- 不需要复合操作的场景
+
+**什么时候用 synchronized：**
+
+- 需要原子性的复合操作（如 `count++`）
+- 需要同时更新多个变量
+
+## AtomicInteger / AtomicLong：无锁原子类
+
+回到评论计数器的问题。`synchronized` 虽然能解决问题，但锁的开销不小。Java 在 `java.util.concurrent.atomic` 包下提供了一组原子类，底层用 CPU 的 CAS（Compare-And-Swap）指令实现，不需要加锁：
+
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+
+public class AtomicCommentCounter {
+    private final AtomicInteger count = new AtomicInteger(0);
+
+    public void increment() {
+        count.incrementAndGet();  // 原子地 +1
+    }
+
+    public void decrement() {
+        count.decrementAndGet();  // 原子地 -1
+    }
+
+    public int getCount() {
+        return count.get();
+    }
+
+    // CAS 的高级用法：只有当前值等于期望值时才更新
+    public boolean compareAndSet(int expect, int update) {
+        return count.compareAndSet(expect, update);
+    }
+}
+```
+
+原子类的适用场景：
+
+- 单个变量的原子操作（计数器、序号生成器）
+- 高并发读写的简单状态
+- 作为累加器（如 `addAndGet(delta)`）
+
+不适用场景：
+
+- 需要同时更新多个变量（还是得用 `synchronized`）
+- 操作之间有依赖关系（先读 A，再根据 A 写 B）
+
+## CMS 实战：多线程评论计数器
+
+把上面的知识整合到 CMS 中。假设我们的博客有热门文章排行榜，需要在后台统计各文章的评论数：
+
+```java
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.*;
+
+public class CommentCounter {
+    // 文章ID -> 评论数，使用 AtomicInteger 保证并发安全
+    private final Map<Long, AtomicInteger> commentCounts = new HashMap<>();
+
+    public void addComment(long postId) {
+        commentCounts
+            .computeIfAbsent(postId, k -> new AtomicInteger(0))
+            .incrementAndGet();
+    }
+
+    public void removeComment(long postId) {
+        AtomicInteger counter = commentCounts.get(postId);
+        if (counter != null) {
+            counter.decrementAndGet();
+        }
+    }
+
+    public int getCount(long postId) {
+        AtomicInteger counter = commentCounts.get(postId);
+        return counter != null ? counter.get() : 0;
+    }
+
+    // 获取评论数最多的前 N 篇文章
+    public List<Map.Entry<Long, Integer>> topPosts(int n) {
+        List<Map.Entry<Long, Integer>> entries = new ArrayList<>();
+        for (Map.Entry<Long, AtomicInteger> entry : commentCounts.entrySet()) {
+            entries.add(Map.entry(entry.getKey(), entry.getValue().get()));
+        }
+        entries.sort((a, b) -> b.getValue().compareTo(a.getValue()));
+        return entries.subList(0, Math.min(n, entries.size()));
+    }
+}
+```
+
+注意这里有一个潜在问题：`commentCounts` 本身是 `HashMap`，在多线程下如果同时调用 `addComment` 和 `topPosts`，`HashMap` 可能会抛出 `ConcurrentModificationException`。如果确实需要多线程读写这个 Map，可以用 `ConcurrentHashMap`，或者用 `synchronized` 包住整个 `topPosts` 方法。
+
+## synchronized vs AtomicInteger vs volatile
+
+这三个机制解决的是不同层面的问题：
+
+| 机制            | 解决的问题                  | 适用场景               | 性能 |
+| --------------- | --------------------------- | ---------------------- | ---- |
+| `volatile`      | 可见性                      | 状态标志、单次写多次读 | 最高 |
+| `AtomicInteger` | 原子性（单变量）            | 计数器、累加器         | 高   |
+| `synchronized`  | 原子性 + 可见性（复合操作） | 多变量联动、复杂逻辑   | 较低 |
+
+选择策略很简单：能用 `volatile` 就不用原子类，能用原子类就不用 `synchronized`。
+
+## JS vs Java 对比
+
+| 维度              | JavaScript                                | Java                                   |
+| ----------------- | ----------------------------------------- | -------------------------------------- |
+| 并发模型          | 单线程 + 事件循环                         | 多线程，共享内存                       |
+| 竞态条件          | 主线程不存在；Worker 线程间不共享内存     | 多线程共享堆内存，竞态条件是常见问题   |
+| 同步机制          | 不需要（主线程）；`postMessage`（Worker） | `synchronized`、`Lock`、原子类         |
+| 原子操作          | `Atomics` API（仅用于 SharedArrayBuffer） | `AtomicInteger`、`AtomicLong` 等原子类 |
+| `volatile` 等价物 | 不存在，JS 没有内存可见性问题             | `volatile` 关键字                      |
+
+JS 的 `Atomics` API 和 Java 的原子类概念相似，但使用场景完全不同。JS 的 `Atomics` 只在 `SharedArrayBuffer`（多个 Worker 共享内存）时才有意义，而 Web 开发中几乎不会用到。Java 的原子类则是日常开发的常客。
+
+## Trade-off
+
+`synchronized` 简单直观但开销大，在高并发场景下可能成为瓶颈。`AtomicInteger` 性能好但只适用于单变量操作。`volatile` 最轻量但只解决可见性。
+
+在实际项目中，选择并发工具的优先级是：
+
+1. **不共享**：能用局部变量就别用共享变量，从根本上避免并发问题
+2. **不可变**：共享不可变对象是安全的（第 4 篇提到的 `String` 就是不可变的）
+3. **原子类**：简单的计数器场景，优先用 `AtomicInteger`
+4. `synchronized`：复杂逻辑或需要多变量联动的场景
+5. `java.util.concurrent` 包：更高级的并发工具（CountDownLatch、CyclicBarrier 等）
+
+并发编程的核心原则是：能用简单的方案就不要用复杂的。锁的范围越小越好，持有锁的时间越短越好。能不加锁就不加锁。
+
+下一篇将进入 Lambda 与函数式接口，看看 Java 8 带来的函数式编程能力，以及它和 JS 箭头函数的本质区别。
+
+---
