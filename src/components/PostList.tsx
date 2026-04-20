@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { PostMeta } from "@/lib/posts";
@@ -16,6 +16,7 @@ export default function PostList({ posts }: PostListProps) {
   const searchParams = useSearchParams();
   const categoryParam = searchParams.get("category");
   const selectedCategory = categoryParam || "";
+  const [mobileExpanded, setMobileExpanded] = useState(false);
 
   // 将英文目录名转换为中文分类名（用于筛选）
   const normalizedCategory =
@@ -103,8 +104,8 @@ export default function PostList({ posts }: PostListProps) {
 
   return (
     <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 pb-12">
-      {/* 分类按钮栏 */}
-      <div className="sticky top-16 z-40 mb-8 glass py-4 rounded-xl border border-gray-200 dark:border-neutral-700">
+      {/* 分类按钮栏 - 桌面端保持不变 */}
+      <div className="hidden md:block sticky top-16 z-40 mb-8 glass py-4 rounded-xl border border-gray-200 dark:border-neutral-700">
         <div className="flex flex-wrap gap-2 justify-center">
           {categories.map((category) => (
             <button
@@ -119,6 +120,60 @@ export default function PostList({ posts }: PostListProps) {
               {category}
             </button>
           ))}
+        </div>
+      </div>
+
+      {/* 分类按钮栏 - 移动端折叠版 */}
+      <div className="md:hidden sticky top-16 z-40 mb-8 glass rounded-xl border border-gray-200 dark:border-neutral-700 overflow-hidden transition-all duration-300">
+        <button
+          onClick={() => setMobileExpanded(!mobileExpanded)}
+          className="w-full flex items-center justify-between px-4 py-3 text-sm font-medium text-gray-700 dark:text-gray-300"
+        >
+          <span>
+            {normalizedCategory || "全部分类"}
+            <span className="ml-2 text-gray-400 dark:text-gray-500 font-normal">
+              · {categories.length} 个分类
+            </span>
+          </span>
+          <svg
+            className={`w-4 h-4 transition-transform duration-300 ${
+              mobileExpanded ? "rotate-180" : ""
+            }`}
+            fill="none"
+            stroke="currentColor"
+            viewBox="0 0 24 24"
+          >
+            <path
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              strokeWidth={2}
+              d="M19 9l-7 7-7-7"
+            />
+          </svg>
+        </button>
+        <div
+          className={`transition-all duration-300 ease-in-out ${
+            mobileExpanded ? "max-h-[60vh] py-3 px-4" : "max-h-0"
+          } overflow-y-auto`}
+        >
+          <div className="flex flex-wrap gap-2">
+            {categories.map((category) => (
+              <button
+                key={category}
+                onClick={() => {
+                  updateCategory(getUrlCategory(category));
+                  setMobileExpanded(false);
+                }}
+                className={`px-4 py-1.5 rounded-lg font-medium text-sm transition-all ${
+                  normalizedCategory === category
+                    ? "bg-gradient-to-r from-blue-500 to-purple-600 text-white shadow-md scale-105"
+                    : "bg-white dark:bg-neutral-800 text-gray-700 dark:text-gray-300 active:bg-gray-200 dark:active:bg-neutral-600"
+                }`}
+              >
+                {category}
+              </button>
+            ))}
+          </div>
         </div>
       </div>
 
