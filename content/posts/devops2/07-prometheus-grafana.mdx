@@ -1,0 +1,344 @@
+---
+title: "07. 可观测性：Prometheus + Grafana 监控与告警"
+date: "2026-04-12"
+summary: "FlowAPI 上线了，但不知道 QPS、错误率、响应时间。出了问题全靠用户反馈。怎么搭建监控系统？"
+tags: ["Prometheus", "Grafana", "监控", "告警", "DevOps"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战指南"
+seriesOrder: 7
+---
+
+FlowAPI 上线一周了。你坐在工位上喝咖啡，手机突然响了——用户在群里说"API 返回 500 了"。你赶紧打开终端，SSH 到服务器，查看容器日志，发现是数据库连接池耗尽了。
+
+从用户反馈到问题定位，花了 15 分钟。这 15 分钟里，所有用户都受到了影响。
+
+如果你有一个监控系统，这个故事会变成：Prometheus 在错误率开始上升的第一分钟就触发了告警，你收到 Slack 通知，打开 Grafana Dashboard 一看——数据库连接数异常，3 分钟内定位问题，5 分钟内扩容连接池。大部分用户甚至没感觉到异常。
+
+## 可观测性三支柱
+
+监控不只是"看仪表盘"。可观测性有三个层面：
+
+**指标（Metrics）**：数值型的时间序列数据。QPS、延迟、CPU 使用率、内存使用量。适合回答"现在怎么样"。
+
+**日志（Logs）**：离散的事件记录。每个请求的日志、错误堆栈、数据库慢查询。适合回答"发生了什么"。
+
+**链路追踪（Traces）**：一个请求经过的所有服务。适合微服务架构中回答"慢在哪里"。
+
+FlowAPI 是单体应用，指标和日志就够了。链路追踪在微服务场景下才需要。
+
+## Prometheus：指标采集
+
+Prometheus 的工作方式是 **pull 模式**——它主动去抓取（scrape）你的应用暴露的指标端点。不是应用主动推数据给 Prometheus，而是 Prometheus 定期来拉。
+
+### 应用暴露指标
+
+FlowAPI 需要暴露一个 `/metrics` 端点，输出 Prometheus 格式的指标。用 `prom-client` 这个 npm 包：
+
+```bash
+npm install prom-client
+```
+
+```typescript
+// src/lib/metrics.ts
+import client from "prom-client";
+
+// 收集 Node.js 默认指标（CPU、内存、事件循环延迟）
+client.collectDefaultMetrics();
+
+// 自定义指标：HTTP 请求总数
+export const httpRequestsTotal = new client.Counter({
+  name: "http_requests_total",
+  help: "Total number of HTTP requests",
+  labelNames: ["method", "route", "status"],
+});
+
+// 自定义指标：HTTP 请求延迟直方图
+export const httpRequestDurationSeconds = new client.Histogram({
+  name: "http_request_duration_seconds",
+  help: "HTTP request duration in seconds",
+  labelNames: ["method", "route", "status"],
+  buckets: [0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+  // 这些 bucket 用于计算百分位数（P50、P95、P99）
+});
+
+// 暴露 /metrics 端点
+export function setupMetrics(app: Express) {
+  app.get("/metrics", async (req, res) => {
+    res.set("Content-Type", client.register.contentType);
+    res.end(await client.register.metrics());
+  });
+}
+```
+
+在 Express 中间件中记录每个请求：
+
+```typescript
+// src/middleware/metrics.ts
+import { httpRequestsTotal, httpRequestDurationSeconds } from "../lib/metrics";
+
+export function metricsMiddleware(
+  req: Request,
+  res: Response,
+  next: NextFunction
+) {
+  const start = Date.now();
+
+  res.on("finish", () => {
+    const duration = (Date.now() - start) / 1000;
+    const route = req.route?.path || req.path;
+    const labels = {
+      method: req.method,
+      route,
+      status: res.statusCode.toString(),
+    };
+
+    httpRequestsTotal.inc(labels);
+    httpRequestDurationSeconds.observe(labels, duration);
+  });
+
+  next();
+}
+```
+
+启动后访问 `http://localhost:3000/metrics`，你会看到类似：
+
+```
+# HELP http_requests_total Total number of HTTP requests
+# TYPE http_requests_total counter
+http_requests_total{method="GET",route="/api/users",status="200"} 142
+http_requests_total{method="POST",route="/api/orders",status="201"} 38
+http_requests_total{method="GET",route="/api/users",status="500"} 2
+
+# HELP http_request_duration_seconds HTTP request duration in seconds
+# TYPE http_request_duration_seconds histogram
+http_request_duration_seconds_bucket{method="GET",route="/api/users",status="200",le="0.01"} 89
+http_request_duration_seconds_bucket{method="GET",route="/api/users",status="200",le="0.05"} 128
+http_request_duration_seconds_bucket{method="GET",route="/api/users",status="200",le="0.1"} 138
+```
+
+### 部署 Prometheus
+
+在 K8s 中部署 Prometheus，最方便的方式是用 kube-prometheus-stack（包含 Prometheus、Grafana、AlertManager）：
+
+```bash
+# 添加 Helm 仓库
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo update
+
+# 安装
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  --namespace monitoring \
+  --create-namespace
+```
+
+安装完成后，需要配置 Prometheus 抓取 FlowAPI 的指标。创建一个 ServiceMonitor：
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: flowapi
+  namespace: production
+  labels:
+    release: monitoring # 匹配 kube-prometheus-stack 的标签
+spec:
+  selector:
+    matchLabels:
+      app: flowapi
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 15s # 每 15 秒抓取一次
+```
+
+Prometheus 会自动发现带 `app: flowapi` 标签的 Service，并抓取 `/metrics` 端点。
+
+## Grafana：可视化
+
+kube-prometheus-stack 自带了 Grafana。暴露它：
+
+```bash
+# 端口转发到本地
+kubectl port-forward -n monitoring svc/monitoring-grafana 3001:80
+
+# 打开浏览器访问 http://localhost:3001
+# 默认用户名 admin，密码 admin
+```
+
+### 核心 Dashboard 面板
+
+FlowAPI 需要关注四个核心指标：
+
+**QPS（每秒请求数）**：
+
+```promql
+sum(rate(http_requests_total[5m])) by (route)
+```
+
+`rate()` 计算每秒增长率，`[5m]` 是时间窗口。5 分钟窗口平滑了瞬时波动。
+
+**延迟分布（P50/P95/P99）**：
+
+```promql
+histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le, route))
+```
+
+`histogram_quantile` 从直方图数据计算百分位数。0.95 = P95，0.99 = P99。
+
+**错误率**：
+
+```promql
+sum(rate(http_requests_total{status=~"5.."}[5m]))
+/
+sum(rate(http_requests_total[5m]))
+```
+
+5xx 响应数除以总请求数。用百分比显示。
+
+**Pod 资源使用**：
+
+```promql
+# CPU 使用率
+sum(rate(container_cpu_usage_seconds_total{namespace="production"}[5m])) by (pod)
+
+# 内存使用
+sum(container_memory_working_set_bytes{namespace="production"}) by (pod)
+```
+
+把这些指标组合成一个 Dashboard，一眼就能看到系统全貌。
+
+### 导入现成 Dashboard
+
+不需要从零设计。Grafana 有官方的 Dashboard 模板：
+
+- **Node Exporter Full**（ID: 1860）：服务器级别的 CPU、内存、磁盘、网络
+- **Kubernetes / Compute Resources / Pod**（ID: 14212）：Pod 级别的资源使用
+- **Node.js Application Dashboard**（ID: 11159）：Node.js 应用的指标
+
+在 Grafana 的 Import 面板中输入 Dashboard ID 就能导入。
+
+## 告警规则
+
+监控的目的是在问题影响用户之前发现它。告警规则定义了"什么时候通知你"。
+
+### Prometheus 告警规则
+
+```yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: flowapi-alerts
+  namespace: production
+spec:
+  groups:
+    - name: flowapi
+      rules:
+        # 错误率超过 5%
+        - alert: HighErrorRate
+          expr: |
+            sum(rate(http_requests_total{status=~"5.."}[5m]))
+            /
+            sum(rate(http_requests_total[5m]))
+            > 0.05
+          for: 2m # 持续 2 分钟才告警（避免瞬时波动）
+          labels:
+            severity: warning
+          annotations:
+            summary: "FlowAPI 错误率超过 5%"
+            description: "当前错误率 {{ $value | humanizePercentage }}"
+
+        # P99 延迟超过 2 秒
+        - alert: HighLatency
+          expr: |
+            histogram_quantile(0.99,
+              sum(rate(http_request_duration_seconds_bucket[5m])) by (le)
+            ) > 2
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "FlowAPI P99 延迟超过 2 秒"
+
+        # Pod 重启次数过多（可能 OOM 或崩溃）
+        - alert: PodRestarts
+          expr: increase(kube_pod_container_status_restarts_total{namespace="production"}[1h]) > 3
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pod {{ $labels.pod }} 在 1 小时内重启了 {{ $value }} 次"
+```
+
+### AlertManager 通知
+
+AlertManager 负责把告警发送到通知渠道。配置 Slack 通知：
+
+```yaml
+# AlertManager 配置
+global:
+  slack_api_url: "https://hooks.slack.com/services/xxx"
+
+route:
+  receiver: "slack-notifications"
+  group_by: ["alertname", "namespace"]
+  group_wait: 30s # 等待 30 秒，收集同组的告警一起发
+  group_interval: 5m # 同组告警的发送间隔
+
+receivers:
+  - name: "slack-notifications"
+    slack_configs:
+      - channel: "#alerts"
+        title: "{{ .GroupLabels.alertname }}"
+        text: "{{ range .Alerts }}{{ .Annotations.summary }}\n{{ end }}"
+```
+
+除了 Slack，也支持邮件、钉钉、PagerDuty 等。
+
+### 告警设计原则
+
+**告警太多等于没有告警**。如果每天收到 50 条告警，你会开始忽略它们。好的告警应该是：
+
+- **可操作的**：收到告警后你知道该做什么。"CPU 使用率高"不如"FlowAPI P99 延迟超过 2 秒"——后者指向了具体的问题。
+- **分级的**：warning 级别上班时间处理，critical 级别随时处理。
+- **有 for 窗口的**：`for: 5m` 意味着持续 5 分钟才告警，避免瞬时波动。
+
+## K8s 集群监控
+
+除了应用指标，还需要监控 K8s 集群本身的健康。
+
+kube-prometheus-stack 自带了：
+
+- **kube-state-metrics**：K8s 对象的状态（Pod 数量、Deployment 副本数、资源请求/限制）
+- **node-exporter**：节点的硬件指标（CPU、内存、磁盘、网络）
+- **Prometheus Adapter**：用 Prometheus 指标驱动 HPA 自动扩缩容
+
+这些不需要额外配置，安装 kube-prometheus-stack 后自动采集。在 Grafana 中导入对应的 Dashboard 就能看到集群级别的指标。
+
+## 监控的成本
+
+Prometheus 的存储成本取决于两个因素：指标数量和保留时间。
+
+**指标数量**。每个指标的时间序列数 = 标签组合数。如果 `http_requests_total` 有 3 个标签（method、route、status），每个标签有 10 个可能的值，时间序列数就是 10^3 = 1000。加上 5 分钟抓取间隔，一天的数据量就不少了。
+
+**保留时间**。默认保留 15 天。可以在 Prometheus 配置中调整：
+
+```yaml
+# values.yaml（Helm 配置）
+prometheus:
+  prometheusSpec:
+    retention: 30d # 保留 30 天
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: 50Gi # 分配 50GB 存储
+```
+
+长期存储（超过 30 天）建议用 Thanos 或 Cortex，把数据存到对象存储（S3）中。
+
+一个实用的原则：**只监控你需要的东西**。不要把所有指标都采集上来——选择对业务和运维有价值的指标，其他的忽略。
+
+从"黑盒"到"可见"，监控是最后一块拼图。下一篇回到基础设施层面——用 Terraform 把手动创建的资源变成代码。

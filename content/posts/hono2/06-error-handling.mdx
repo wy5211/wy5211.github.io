@@ -1,0 +1,418 @@
+---
+title: "06. 错误处理"
+date: "2026-03-20"
+summary: "构建优雅的错误处理机制，学习使用 HTTPException、自定义异常、全局错误处理器，实现统一的错误响应格式。"
+tags: ["Hono", "Error Handling", "Exception", "Best Practices"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 6
+---
+
+## 前言
+
+在上一篇文章中，我们学习了如何使用 Zod 验证请求数据。验证失败时，Zod 会抛出错误，但这些错误如何被捕获并以友好的方式返回给客户端呢？这就需要错误处理机制了。
+
+想象一下，当用户提交了一个无效的表单，服务器返回一个 500 错误，错误信息是 "Internal Server Error"，用户根本不知道哪里出了问题。或者更糟糕的是，在生产环境中，错误堆栈信息直接暴露给用户，可能泄露数据库结构、文件路径等敏感信息。
+
+一个好的错误处理机制应该做到三点：统一性、安全性、友好性。统一性让前端可以标准化处理错误，安全性保护敏感信息不被泄露，友好性让用户知道发生了什么以及如何修复。
+
+Hono 提供了灵活的错误处理机制，包括内置的 HTTPException、全局错误处理器、自定义异常类等。让我们来看看如何构建一个完善的错误处理系统。
+
+## 为什么需要专门的错误处理
+
+先看看没有良好错误处理时会发生什么。
+
+```typescript
+// 没有错误处理的问题
+app.get("/users/:id", async (c) => {
+  const user = await db.query.users.findFirst({
+    where: eq(users.id, c.req.param("id")),
+  });
+
+  return c.json(user);
+  // 如果 user 不存在，返回 null
+  // 客户端不知道是用户不存在还是服务器出错
+});
+
+// 暴露敏感信息的错误处理
+app.get("/users/:id", async (c) => {
+  try {
+    const user = await findUser(c.req.param("id"));
+    return c.json(user);
+  } catch (error) {
+    // 直接返回错误对象，可能暴露数据库结构、文件路径等
+    return c.json({ error: error.message }, 500);
+  }
+});
+```
+
+这两种方式都有问题。第一种没有给出明确的错误信息，第二种可能泄露敏感信息。正确的做法是使用统一的错误处理机制。
+
+## HTTPException 的使用
+
+Hono 提供了 HTTPException 类来处理 HTTP 错误。它的使用很简单。
+
+```typescript
+import { HTTPException } from "hono/http-exception";
+
+app.get("/users/:id", async (c) => {
+  const user = await findUser(c.req.param("id"));
+
+  if (!user) {
+    throw new HTTPException(404, {
+      message: "User not found",
+    });
+  }
+
+  return c.json({ success: true, data: user });
+});
+```
+
+HTTPException 会被 Hono 的错误处理器自动捕获，并返回一个带有相应状态码和错误信息的响应。
+
+你还可以自定义响应体，添加更多有用的信息。
+
+```typescript
+app.get("/users/:id", async (c) => {
+  const user = await findUser(c.req.param("id"));
+
+  if (!user) {
+    throw new HTTPException(404, {
+      res: c.json(
+        {
+          success: false,
+          error: "USER_NOT_FOUND",
+          message: "The requested user does not exist",
+          documentation: "https://api.example.com/docs/errors#user-not-found",
+        },
+        404
+      ),
+    });
+  }
+
+  return c.json({ success: true, data: user });
+});
+```
+
+## 自定义异常类
+
+对于业务逻辑中的特定错误，创建自定义异常类可以让代码更加清晰。
+
+```typescript
+// 基础业务异常
+export class BaseException extends Error {
+  constructor(
+    public code: string,
+    public message: string,
+    public statusCode: number = 500,
+    public details?: any
+  ) {
+    super(message);
+    this.name = this.constructor.name;
+  }
+
+  toResponse() {
+    return {
+      success: false,
+      code: this.code,
+      message: this.message,
+      ...(this.details && { details: this.details }),
+    };
+  }
+}
+
+// 认证异常
+export class AuthenticationException extends BaseException {
+  constructor(message: string = "Authentication failed") {
+    super("AUTHENTICATION_FAILED", message, 401);
+  }
+}
+
+// 资源不存在异常
+export class NotFoundException extends BaseException {
+  constructor(resource: string = "Resource") {
+    super("NOT_FOUND", `${resource} not found`, 404);
+  }
+}
+
+// 验证异常
+export class ValidationException extends BaseException {
+  constructor(errors: any[]) {
+    super("VALIDATION_FAILED", "Validation failed", 422, { errors });
+  }
+}
+```
+
+使用这些自定义异常，代码会变得更加清晰。
+
+```typescript
+app.post("/auth/login", async (c) => {
+  const { email, password } = await c.req.json();
+
+  const user = await findUserByEmail(email);
+
+  if (!user) {
+    throw new AuthenticationException("Invalid credentials");
+  }
+
+  const isValid = await verifyPassword(password, user.password);
+
+  if (!isValid) {
+    throw new AuthenticationException("Invalid credentials");
+  }
+
+  const token = await generateToken(user);
+
+  return c.json({
+    success: true,
+    data: { token, user: sanitizeUser(user) },
+  });
+});
+```
+
+## 全局错误处理器
+
+有了自定义异常，我们需要一个全局错误处理器来统一处理所有错误。
+
+```typescript
+app.onError((err, c) => {
+  const requestId = crypto.randomUUID();
+  const isDevelopment = c.env?.ENV === "development";
+
+  // 记录错误日志
+  console.error({
+    requestId,
+    error: err.message,
+    stack: err.stack,
+    url: c.req.url,
+    method: c.req.method,
+  });
+
+  // 自定义业务异常
+  if (err instanceof BaseException) {
+    const response = {
+      ...err.toResponse(),
+      requestId,
+    };
+
+    if (isDevelopment) {
+      (response as any).stack = err.stack;
+    }
+
+    return c.json(response, err.statusCode);
+  }
+
+  // HTTPException
+  if (err instanceof HTTPException) {
+    return c.json(
+      {
+        success: false,
+        code: "HTTP_ERROR",
+        message: err.message,
+        requestId,
+      },
+      err.status
+    );
+  }
+
+  // Zod 验证错误
+  if (err.name === "ZodError") {
+    return c.json(
+      {
+        success: false,
+        code: "VALIDATION_ERROR",
+        message: "Validation failed",
+        details: err.errors,
+        requestId,
+      },
+      400
+    );
+  }
+
+  // 未知错误
+  return c.json(
+    {
+      success: false,
+      code: "INTERNAL_ERROR",
+      message: isDevelopment ? err.message : "An unexpected error occurred",
+      requestId,
+    },
+    500
+  );
+});
+
+// 404 处理
+app.notFound((c) => {
+  return c.json(
+    {
+      success: false,
+      code: "NOT_FOUND",
+      message: "Route not found",
+      requestId: crypto.randomUUID(),
+    },
+    404
+  );
+});
+```
+
+## 在博客 API 中应用
+
+让我们为博客 API 添加完整的错误处理。
+
+```typescript
+// 异常定义
+export class BaseException extends Error {
+  constructor(
+    public code: string,
+    public message: string,
+    public statusCode: number = 500
+  ) {
+    super(message);
+    this.name = this.constructor.name;
+  }
+
+  toResponse() {
+    return {
+      success: false,
+      code: this.code,
+      message: this.message,
+    };
+  }
+}
+
+export class NotFoundException extends BaseException {
+  constructor(resource: string = "Resource") {
+    super("NOT_FOUND", `${resource} not found`, 404);
+  }
+}
+
+export class AuthenticationException extends BaseException {
+  constructor(message: string = "Authentication required") {
+    super("AUTHENTICATION_FAILED", message, 401);
+  }
+}
+
+export class AuthorizationException extends BaseException {
+  constructor(message: string = "Insufficient permissions") {
+    super("AUTHORIZATION_FAILED", message, 403);
+  }
+}
+
+// 全局错误处理器
+app.onError((err, c) => {
+  const requestId = crypto.randomUUID();
+  const isDevelopment = c.env?.ENV === "development";
+
+  console.error({
+    requestId,
+    error: err.message,
+    url: c.req.url,
+    method: c.req.method,
+  });
+
+  if (err instanceof BaseException) {
+    return c.json(
+      {
+        ...err.toResponse(),
+        requestId,
+      },
+      err.statusCode
+    );
+  }
+
+  if (err instanceof HTTPException) {
+    return c.json(
+      {
+        success: false,
+        code: "HTTP_ERROR",
+        message: err.message,
+        requestId,
+      },
+      err.status
+    );
+  }
+
+  if (err.name === "ZodError") {
+    return c.json(
+      {
+        success: false,
+        code: "VALIDATION_ERROR",
+        message: "Validation failed",
+        details: err.errors,
+        requestId,
+      },
+      400
+    );
+  }
+
+  return c.json(
+    {
+      success: false,
+      code: "INTERNAL_ERROR",
+      message: isDevelopment ? err.message : "Internal server error",
+      requestId,
+    },
+    500
+  );
+});
+
+// 在路由中使用
+app.get("/api/posts/:id", async (c) => {
+  const post = await db.query.posts.findFirst({
+    where: eq(posts.id, c.req.param("id")),
+  });
+
+  if (!post) {
+    throw new NotFoundException("Post");
+  }
+
+  return c.json({ success: true, data: post });
+});
+
+app.delete("/api/posts/:id", authMiddleware, async (c) => {
+  const post = await db.query.posts.findFirst({
+    where: eq(posts.id, c.req.param("id")),
+  });
+
+  if (!post) {
+    throw new NotFoundException("Post");
+  }
+
+  if (post.authorId !== c.get("user").id) {
+    throw new AuthorizationException("You can only delete your own posts");
+  }
+
+  await db.delete(posts).where(eq(posts.id, c.req.param("id")));
+
+  return c.json({
+    success: true,
+    message: "Post deleted successfully",
+  });
+});
+```
+
+## Trade-off 分析
+
+错误处理有多种方式，每种都有其适用场景。
+
+**自定义异常 vs 直接返回错误响应**
+
+自定义异常的优点是代码清晰，可以复用，并且可以在全局处理器中统一处理。缺点是需要额外的代码来定义异常类。
+
+直接返回错误响应的优点是简单直接，不需要额外的类定义。缺点是错误处理逻辑分散在各处，难以维护。
+
+**统一错误响应格式 vs 灵活的响应**
+
+统一的错误响应格式让前端可以标准化处理错误，但可能不够灵活。灵活的响应可以针对不同错误返回不同信息，但前端需要处理多种格式。
+
+建议采用统一的错误响应格式，但在 details 字段中提供灵活的错误详情。
+
+## 总结
+
+错误处理是构建健壮 API 的重要组成部分。通过使用 HTTPException、自定义异常类和全局错误处理器，我们可以构建一个统一、安全、友好的错误处理系统。
+
+在博客 API 中，我们定义了基础的异常类，并在全局错误处理器中统一处理所有错误。这样，无论是文章不存在、权限不足还是验证失败，都能以一致的格式返回给客户端。
+
+在下一篇文章中，我们将学习如何集成数据库，为博客 API 添加数据持久化能力。

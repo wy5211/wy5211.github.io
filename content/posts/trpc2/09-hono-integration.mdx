@@ -1,0 +1,798 @@
+---
+title: "09. Hono + tRPC 边缘计算实战"
+date: "2026-03-23"
+summary: "将 tRPC 部署到 Cloudflare Workers 等边缘平台，利用 Hono 框架构建低延迟、高性能的边缘 API，为协作任务管理平台实现全球分布式架构。"
+tags: ["tRPC", "Hono", "边缘计算", "Cloudflare Workers", "性能优化"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 9
+---
+
+上篇文章我们学习了如何在 NestJS 中构建企业级 tRPC 应用。NestJS 很强大，但部署成本高、启动慢。如果你的协作任务管理平台需要服务全球用户，或者想要极低的延迟和近乎无限的扩展能力，边缘计算是更好的选择。
+
+## 为什么选择边缘计算
+
+传统部署方式中，所有用户的请求都路由到同一个服务器。如果服务器在美国，中国用户访问就要跨越半个地球，延迟至少 200ms。边缘计算将代码部署到全球数百个节点，用户自动连接到最近的数据中心，延迟可以降到 50ms 以下。
+
+对于协作任务管理平台来说，这意味着：当团队成员在不同国家同时编辑同一个任务时，更新几乎是实时的。tRPC 的类型安全在边缘环境下依然完整保留，这是相比 REST API 的巨大优势。
+
+Hono 是一个专为边缘环境设计的轻量级框架，体积只有 13KB，冷启动时间不到 1ms，完美适配 Cloudflare Workers、Vercel Edge Functions、Deno Deploy 等平台。
+
+## 项目初始化
+
+首先创建一个新的 Hono 项目，安装必要的依赖。
+
+```bash
+# 使用 create-hono 脚手架创建项目
+npm create hono@latest task-platform-edge
+
+cd task-platform-edge
+
+# 安装 tRPC 和相关依赖
+npm install @trpc/server zod
+npm install -D wrangler @cloudflare/workers-types
+```
+
+Hono 项目结构很简单。我们需要配置 tRPC、创建路由、设置 Context，然后就能部署到 Cloudflare Workers。
+
+```bash
+# 项目结构
+task-platform-edge/
+├── src/
+│   ├── index.ts          # 应用入口
+│   ├── trpc/
+│   │   ├── index.ts      # tRPC 配置
+│   │   ├── router.ts     # API 路由
+│   │   └── context.ts    # Context 定义
+│   └── middleware/
+│       └── auth.ts       # 认证中间件
+├── wrangler.toml         # Cloudflare 配置
+└── package.json
+```
+
+## 配置 Cloudflare Workers
+
+wrangler.toml 是 Cloudflare Workers 的配置文件。这里我们配置 D1 数据库（Cloudflare 的 SQLite）和 KV 存储。
+
+```toml
+# wrangler.toml
+
+name = "task-platform-edge"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# D1 数据库（SQLite）
+[[d1_databases]]
+binding = "DB"
+database_name = "task-platform-db"
+database_id = "your-database-id"
+
+# KV 存储（缓存）
+[[kv_namespaces]]
+binding = "CACHE"
+id = "your-kv-id"
+
+# 环境变量
+[vars]
+JWT_SECRET = "your-secret-key"
+```
+
+获取数据库 ID 的步骤：
+
+```bash
+# 创建 D1 数据库
+wrangler d1 create task-platform-db
+
+# 创建 KV 命名空间
+wrangler kv:namespace create CACHE
+```
+
+## 创建 tRPC 实例
+
+在边缘环境中创建 tRPC 实例与标准环境几乎一样。主要区别是 Context 的创建方式，因为我们需要访问 Cloudflare 的环境绑定。
+
+```typescript
+// src/trpc/index.ts
+
+import { initTRPC, TRPCError } from "@trpc/server";
+import { Context } from "./context";
+import { z } from "zod";
+
+export const t = initTRPC.context<Context>().create({
+  errorFormatter({ shape, error }) {
+    return {
+      ...shape,
+      data: {
+        ...shape.data,
+        zodError:
+          error.code === "BAD_REQUEST" && error.cause instanceof z.ZodError
+            ? error.cause.flatten()
+            : null,
+      },
+    };
+  },
+});
+
+// 公开 API，不需要认证
+export const publicProcedure = t.procedure;
+
+// 认证中间件
+const isAuthed = t.middleware(({ ctx, next }) => {
+  if (!ctx.user) {
+    throw new TRPCError({
+      code: "UNAUTHORIZED",
+      message: "需要登录",
+    });
+  }
+  return next({
+    ctx: {
+      ...ctx,
+      user: ctx.user,
+    },
+  });
+});
+
+// 受保护的 API，需要登录
+export const protectedProcedure = t.procedure.use(isAuthed);
+```
+
+这个配置和标准 tRPC 应用完全一样。类型安全的优势在边缘环境中依然完整保留。
+
+## 创建 Context
+
+在边缘环境中，Context 需要访问 Cloudflare 的环境绑定（D1 数据库、KV 存储）。
+
+```typescript
+// src/trpc/context.ts
+
+import { Context } from "hono";
+
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+  role: "USER" | "ADMIN";
+}
+
+export type Env = {
+  DB: D1Database;
+  CACHE: KVNamespace;
+  JWT_SECRET: string;
+};
+
+export interface Context {
+  user: User | null;
+  env: Env;
+}
+
+export const createContext = async (
+  c: Context<{ Bindings: Env }>,
+  next: () => Promise<void>
+): Promise<Context> => {
+  // 从请求头获取 Token
+  const authHeader = c.req.header("Authorization");
+  const token = authHeader?.replace("Bearer ", "");
+
+  let user: User | null = null;
+
+  if (token) {
+    // 验证 JWT（需要安装 JWT 库）
+    try {
+      user = await verifyToken(token, c.env.JWT_SECRET);
+    } catch {
+      // Token 无效，user 保持为 null
+    }
+  }
+
+  return {
+    user,
+    env: c.env,
+  };
+};
+```
+
+Context 中包含了当前用户信息和 Cloudflare 环境绑定。在 Procedure 中可以通过 ctx.env 访问数据库和缓存。
+
+## 创建 API 路由
+
+现在我们为协作任务管理平台创建核心 API。包括用户管理、任务 CRUD、项目管理等功能。
+
+```typescript
+// src/trpc/router.ts
+
+import { z } from "zod";
+import { t, publicProcedure, protectedProcedure } from "./index";
+import { Context } from "./context";
+
+export const appRouter = t.router<Context>({
+  // 用户相关路由
+  users: t.router({
+    // 获取当前用户信息
+    me: protectedProcedure.query(({ ctx }) => {
+      return ctx.user;
+    }),
+
+    // 用户注册
+    register: publicProcedure
+      .input(
+        z.object({
+          email: z.string().email(),
+          password: z.string().min(8),
+          name: z.string().min(2),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        // 使用 D1 数据库插入用户
+        const result = await ctx.env.DB.prepare(
+          "INSERT INTO users (email, password, name) VALUES (?, ?, ?)"
+        )
+          .bind(input.email, await hash(input.password), input.name)
+          .run();
+
+        return {
+          id: result.meta.last_row_id,
+          ...input,
+        };
+      }),
+  }),
+
+  // 项目相关路由
+  projects: t.router({
+    // 获取项目列表（支持分页）
+    list: protectedProcedure
+      .input(
+        z.object({
+          page: z.number().default(1),
+          limit: z.number().min(1).max(100).default(20),
+        })
+      )
+      .query(async ({ input, ctx }) => {
+        const { page, limit } = input;
+        const offset = (page - 1) * limit;
+
+        // 从 D1 数据库查询项目
+        const projects = await ctx.env.DB.prepare(
+          `SELECT * FROM projects
+           WHERE user_id = ?
+           ORDER BY created_at DESC
+           LIMIT ? OFFSET ?`
+        )
+          .bind(ctx.user.id, limit, offset)
+          .all();
+
+        // 查询总数
+        const countResult = await ctx.env.DB.prepare(
+          "SELECT COUNT(*) as total FROM projects WHERE user_id = ?"
+        )
+          .bind(ctx.user.id)
+          .first();
+
+        return {
+          projects: projects.results,
+          pagination: {
+            page,
+            limit,
+            total: countResult.total,
+            totalPages: Math.ceil(countResult.total / limit),
+          },
+        };
+      }),
+
+    // 根据 ID 获取项目详情
+    byId: protectedProcedure
+      .input(z.object({ id: z.string() }))
+      .query(async ({ input, ctx }) => {
+        // 先尝试从 KV 缓存获取
+        const cached = await ctx.env.CACHE.get(`project:${input.id}`);
+        if (cached) {
+          return JSON.parse(cached);
+        }
+
+        // 从数据库查询
+        const project = await ctx.env.DB.prepare(
+          "SELECT * FROM projects WHERE id = ? AND user_id = ?"
+        )
+          .bind(input.id, ctx.user.id)
+          .first();
+
+        if (!project) {
+          throw new t.TRPCError({
+            code: "NOT_FOUND",
+            message: "项目不存在",
+          });
+        }
+
+        // 缓存 5 分钟
+        await ctx.env.CACHE.put(
+          `project:${input.id}`,
+          JSON.stringify(project),
+          {
+            expirationTtl: 300,
+          }
+        );
+
+        return project;
+      }),
+
+    // 创建项目
+    create: protectedProcedure
+      .input(
+        z.object({
+          name: z.string().min(1).max(100),
+          description: z.string().optional(),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const result = await ctx.env.DB.prepare(
+          "INSERT INTO projects (name, description, user_id) VALUES (?, ?, ?)"
+        )
+          .bind(input.name, input.description || "", ctx.user.id)
+          .run();
+
+        const project = {
+          id: result.meta.last_row_id.toString(),
+          ...input,
+          user_id: ctx.user.id,
+          created_at: new Date().toISOString(),
+        };
+
+        // 清除列表缓存
+        await ctx.env.CACHE.delete(`projects:${ctx.user.id}`);
+
+        return project;
+      }),
+
+    // 更新项目
+    update: protectedProcedure
+      .input(
+        z.object({
+          id: z.string(),
+          name: z.string().min(1).max(100).optional(),
+          description: z.string().optional(),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const { id, ...data } = input;
+
+        // 检查权限
+        const project = await ctx.env.DB.prepare(
+          "SELECT user_id FROM projects WHERE id = ?"
+        )
+          .bind(id)
+          .first();
+
+        if (!project) {
+          throw new t.TRPCError({
+            code: "NOT_FOUND",
+            message: "项目不存在",
+          });
+        }
+
+        if (project.user_id !== ctx.user.id) {
+          throw new t.TRPCError({
+            code: "FORBIDDEN",
+            message: "只能编辑自己的项目",
+          });
+        }
+
+        // 更新数据
+        const updateFields = [];
+        const values = [];
+
+        if (data.name !== undefined) {
+          updateFields.push("name = ?");
+          values.push(data.name);
+        }
+        if (data.description !== undefined) {
+          updateFields.push("description = ?");
+          values.push(data.description);
+        }
+
+        values.push(id);
+
+        await ctx.env.DB.prepare(
+          `UPDATE projects SET ${updateFields.join(", ")} WHERE id = ?`
+        )
+          .bind(...values)
+          .run();
+
+        // 清除缓存
+        await ctx.env.CACHE.delete(`project:${id}`);
+        await ctx.env.CACHE.delete(`projects:${ctx.user.id}`);
+
+        return { success: true };
+      }),
+  }),
+
+  // 任务相关路由
+  tasks: t.router({
+    // 获取任务列表
+    list: protectedProcedure
+      .input(
+        z.object({
+          projectId: z.string().optional(),
+          status: z.enum(["TODO", "IN_PROGRESS", "DONE"]).optional(),
+          page: z.number().default(1),
+          limit: z.number().min(1).max(100).default(20),
+        })
+      )
+      .query(async ({ input, ctx }) => {
+        const { page, limit, projectId, status } = input;
+        const offset = (page - 1) * limit;
+
+        // 构建查询条件
+        const conditions = ["user_id = ?"];
+        const values = [ctx.user.id];
+
+        if (projectId) {
+          conditions.push("project_id = ?");
+          values.push(projectId);
+        }
+        if (status) {
+          conditions.push("status = ?");
+          values.push(status);
+        }
+
+        const whereClause = conditions.join(" AND ");
+
+        // 查询任务
+        const tasks = await ctx.env.DB.prepare(
+          `SELECT * FROM tasks
+           WHERE ${whereClause}
+           ORDER BY created_at DESC
+           LIMIT ? OFFSET ?`
+        )
+          .bind(...values, limit, offset)
+          .all();
+
+        // 查询总数
+        const countResult = await ctx.env.DB.prepare(
+          `SELECT COUNT(*) as total FROM tasks WHERE ${whereClause}`
+        )
+          .bind(...values)
+          .first();
+
+        return {
+          tasks: tasks.results,
+          pagination: {
+            page,
+            limit,
+            total: countResult.total,
+            totalPages: Math.ceil(countResult.total / limit),
+          },
+        };
+      }),
+
+    // 创建任务
+    create: protectedProcedure
+      .input(
+        z.object({
+          projectId: z.string(),
+          title: z.string().min(1).max(200),
+          description: z.string().optional(),
+          status: z.enum(["TODO", "IN_PROGRESS", "DONE"]).default("TODO"),
+          priority: z.enum(["LOW", "MEDIUM", "HIGH"]).default("MEDIUM"),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        const result = await ctx.env.DB.prepare(
+          `INSERT INTO tasks
+           (project_id, title, description, status, priority, user_id)
+           VALUES (?, ?, ?, ?, ?, ?)`
+        )
+          .bind(
+            input.projectId,
+            input.title,
+            input.description || "",
+            input.status,
+            input.priority,
+            ctx.user.id
+          )
+          .run();
+
+        const task = {
+          id: result.meta.last_row_id.toString(),
+          ...input,
+          user_id: ctx.user.id,
+          created_at: new Date().toISOString(),
+        };
+
+        // 清除缓存
+        await ctx.env.CACHE.delete(`tasks:${ctx.user.id}`);
+        await ctx.env.CACHE.delete(`tasks:${input.projectId}`);
+
+        return task;
+      }),
+
+    // 更新任务状态
+    updateStatus: protectedProcedure
+      .input(
+        z.object({
+          id: z.string(),
+          status: z.enum(["TODO", "IN_PROGRESS", "DONE"]),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        await ctx.env.DB.prepare(
+          "UPDATE tasks SET status = ? WHERE id = ? AND user_id = ?"
+        )
+          .bind(input.status, input.id, ctx.user.id)
+          .run();
+
+        // 清除缓存
+        await ctx.env.CACHE.delete(`task:${input.id}`);
+        await ctx.env.CACHE.delete(`tasks:${ctx.user.id}`);
+
+        return { success: true };
+      }),
+  }),
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+这个 API 设计涵盖了协作任务管理平台的核心功能：项目创建、任务管理、状态更新。所有操作都是类型安全的，前端调用时会有完整的类型提示。
+
+## 创建 Hono 应用
+
+现在将 tRPC 路由集成到 Hono 应用中。
+
+```typescript
+// src/index.ts
+
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { logger } from "hono/logger";
+import { trpcServer } from "@trpc/server/adapters/fetch";
+import { appRouter } from "./trpc/router";
+import { createContext, Context } from "./trpc/context";
+
+type Bindings = {
+  DB: D1Database;
+  CACHE: KVNamespace;
+  JWT_SECRET: string;
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+
+// 中间件
+app.use("*", logger());
+app.use(
+  "*",
+  cors({
+    origin: "*",
+    credentials: true,
+  })
+);
+
+// 健康检查端点
+app.get("/", (c) => {
+  return c.json({
+    name: "协作任务管理平台 API",
+    version: "1.0.0",
+    status: "ok",
+  });
+});
+
+// tRPC 路由
+app.use("/trpc/*", async (c, next) => {
+  const createContextValue = async () => {
+    return createContext(c as any, next as any);
+  };
+
+  return trpcServer({
+    router: appRouter,
+    createContext: createContextValue,
+  })(c);
+});
+
+export default app;
+```
+
+Hono 应用非常简洁。我们添加了 CORS 支持和日志中间件，然后将 tRPC 路由挂载到 /trpc/\* 路径。
+
+## 数据库初始化
+
+在 Cloudflare D1 中创建数据库表。我们需要用户、项目、任务三张表。
+
+```sql
+-- schema.sql
+
+-- 用户表
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  password TEXT NOT NULL,
+  name TEXT NOT NULL,
+  avatar TEXT,
+  role TEXT DEFAULT 'USER',
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 项目表
+CREATE TABLE IF NOT EXISTS projects (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  description TEXT,
+  user_id TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- 任务表
+CREATE TABLE IF NOT EXISTS tasks (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  title TEXT NOT NULL,
+  description TEXT,
+  status TEXT DEFAULT 'TODO',
+  priority TEXT DEFAULT 'MEDIUM',
+  user_id TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+  FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+-- 索引
+CREATE INDEX IF NOT EXISTS idx_projects_user ON projects(user_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_project ON tasks(project_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_user ON tasks(user_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+```
+
+使用 wrangler 执行 SQL：
+
+```bash
+# 执行 SQL 文件
+wrangler d1 execute task-platform-db --file=schema.sql
+
+# 或者执行单条 SQL
+wrangler d1 execute task-platform-db --command="SELECT * FROM users"
+```
+
+## 性能优化
+
+边缘环境有独特的优化策略。KV 缓存是关键，D1 查询需要优化，还要注意冷启动。
+
+首先是缓存策略。频繁访问的数据（如项目详情）应该缓存 5 分钟，减少数据库查询。
+
+```typescript
+// 通用的缓存函数
+async function getCached<T>(
+  kv: KVNamespace,
+  key: string,
+  fetcher: () => Promise<T>,
+  ttl: number = 300
+): Promise<T> {
+  // 尝试从缓存获取
+  const cached = await kv.get(key);
+  if (cached) {
+    return JSON.parse(cached);
+  }
+
+  // 缓存未命中，获取数据
+  const data = await fetcher();
+
+  // 写入缓存
+  await kv.put(key, JSON.stringify(data), {
+    expirationTtl: ttl,
+  });
+
+  return data;
+}
+
+// 使用
+const project = await getCached(
+  ctx.env.CACHE,
+  `project:${id}`,
+  () => fetchProjectFromDB(id),
+  300 // 5 分钟
+);
+```
+
+其次是批量查询优化。避免 N+1 查询问题，使用 IN 语句一次获取多条数据。
+
+```typescript
+// ❌ 避免：N+1 查询
+const tasks = [];
+for (const projectId of projectIds) {
+  const projectTasks = await ctx.env.DB.prepare(
+    "SELECT * FROM tasks WHERE project_id = ?"
+  )
+    .bind(projectId)
+    .all();
+  tasks.push(...projectTasks.results);
+}
+
+// ✅ 推荐：使用 IN 查询
+const allTasks = await ctx.env.DB.prepare(
+  "SELECT * FROM tasks WHERE project_id IN (?, ?, ?)"
+)
+  .bind(...projectIds)
+  .all();
+```
+
+最后是冷启动优化。在模块顶层初始化数据库连接，避免每次请求都创建新连接。
+
+```typescript
+// ✅ 推荐：顶层初始化
+const db = new Database();
+
+// ❌ 避免：请求中初始化
+app.get("/", (c) => {
+  const db = new Database(); // 每次请求都创建新实例
+});
+```
+
+## 部署到 Cloudflare Workers
+
+部署非常简单，只需要一个命令。
+
+```bash
+# 开发模式（本地测试）
+wrangler dev
+
+# 部署到 Cloudflare Workers
+wrangler deploy
+```
+
+部署完成后，你会得到一个 `*.workers.dev` 域名。你也可以绑定自定义域名。
+
+```toml
+# wrangler.toml
+
+routes = [
+  { pattern = "api.yourdomain.com", custom_domain = true }
+]
+```
+
+## Trade-off 分析
+
+边缘计算不是银弹，需要权衡。
+
+优势：
+
+- 全球分布式，延迟极低（50ms 以内）
+- 自动扩展，无需手动扩容
+- 按使用量计费，空闲时成本接近零
+- 零运维，无需管理服务器
+
+劣势：
+
+- D1 数据库功能有限（No SQL 关系查询）
+- 执行时间限制（CPU 时间 30ms，可升级）
+- 不适合 CPU 密集型任务（如视频处理）
+- 本地开发环境与生产环境有差异
+
+适用场景：
+
+- 读多写少的 API
+- 全球用户的应用
+- 需要低延迟的实时协作
+- 预算有限的初创项目
+
+不适用场景：
+
+- 复杂的关系型数据库操作
+- 长时间运行的后台任务
+- 需要完整 PostgreSQL/MySQL 功能
+- 大文件处理
+
+对于协作任务管理平台，边缘计算是个不错的选择。用户遍布全球，实时协作需要低延迟，数据读写模式简单。如果后续需要复杂查询，可以将部分功能迁移到传统服务器，混合架构也是可行的。
+
+## 总结
+
+本文介绍了如何使用 Hono 和 tRPC 构建边缘 API。我们创建了协作任务管理平台的核心功能，部署到 Cloudflare Workers，实现了全球分布式架构。
+
+关键点：
+
+- Hono 是专为边缘设计的轻量级框架
+- tRPC 的类型安全在边缘环境中完整保留
+- D1 数据库和 KV 缓存是边缘存储的核心
+- 性能优化重点是缓存和批量查询
+- 需要根据场景权衡边缘计算的利弊
+
+下一篇文章，我们将学习如何使用 tRPC Subscriptions 实现实时功能，为协作任务管理平台添加任务更新通知。

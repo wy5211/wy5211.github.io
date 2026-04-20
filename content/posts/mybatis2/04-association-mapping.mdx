@@ -1,0 +1,339 @@
+---
+title: "04. 关联映射：一对一、一对多与 N+1 问题"
+date: "2026-04-12"
+summary: "查询书籍时要带出作者信息，查询订单时要带出订单项。MyBatis 怎么处理多表关联？N+1 查询问题怎么解决？"
+tags: ["MyBatis", "Java", "关联映射", "N+1"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 实战指南"
+seriesOrder: 4
+---
+
+前几篇处理的是单表操作——用户的注册查询、书籍的 CRUD。但真实的业务数据很少是孤立的。BookHive 的订单列表需要带出每个订单包含哪些书，书籍详情页需要显示作者是谁。这些场景涉及多表关联，也是 MyBatis 最容易踩坑的地方。
+
+这篇文章用 BookHive 的三个关联场景来讲解：用户和用户详情（一对一）、作者和书籍（多对多）、订单和订单项（一对多）。重点是搞清楚两种映射方式的区别，以及 N+1 查询问题怎么发现、怎么解决。
+
+## 业务场景：为什么需要关联映射
+
+先看 BookHive 的几个真实需求。
+
+用户登录后，首页要显示头像和个性签名——这些信息存在单独的 `user_profiles` 表里，不在 `users` 表里。查用户的时候要同时带出详情。
+
+书籍详情页要展示作者信息——作者是一个独立实体，一本书可能有多个作者，一个作者写了多本书，这是多对多关系，通过 `book_authors` 关联表连接。
+
+订单列表页要展示每个订单包含哪些书、各买了多少本——订单和订单项是一对多关系。
+
+在 JPA 里，你只需要在实体类上加一个 `@OneToOne` 或 `@OneToMany` 注解，框架自动帮你处理。但 MyBatis 没有这种魔法，关联关系需要在 resultMap 里手动配置。这看起来麻烦，好处是你对每一条 SQL 都有完全的控制。
+
+## 数据库表结构
+
+先把这次用到的表结构列出来。前几篇已经建了 `users` 表和 `books` 表，这次新增 5 张关联表。
+
+```sql
+-- 用户详情表（一对一：一个用户对应一份详情）
+CREATE TABLE user_profiles (
+    user_id BIGINT PRIMARY KEY,
+    avatar_url VARCHAR(500),
+    bio TEXT,
+    address VARCHAR(200),
+    phone VARCHAR(20),
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+-- 作者表
+CREATE TABLE authors (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100) NOT NULL,
+    nationality VARCHAR(50),
+    birth_year INT
+);
+
+-- 书籍-作者关联表（多对多：联合主键）
+CREATE TABLE book_authors (
+    book_id BIGINT NOT NULL,
+    author_id BIGINT NOT NULL,
+    PRIMARY KEY (book_id, author_id),
+    FOREIGN KEY (book_id) REFERENCES books(id),
+    FOREIGN KEY (author_id) REFERENCES authors(id)
+);
+
+-- 订单表和订单项表（一对多）
+CREATE TABLE orders (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    order_no VARCHAR(50) NOT NULL UNIQUE,
+    user_id BIGINT NOT NULL,
+    total_amount DECIMAL(10, 2) NOT NULL,
+    status TINYINT NOT NULL DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id)
+);
+
+CREATE TABLE order_items (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    order_id BIGINT NOT NULL,
+    book_id BIGINT NOT NULL,
+    quantity INT NOT NULL,
+    unit_price DECIMAL(10, 2) NOT NULL,
+    FOREIGN KEY (order_id) REFERENCES orders(id),
+    FOREIGN KEY (book_id) REFERENCES books(id)
+);
+```
+
+表结构上有几个值得注意的设计决策。`user_profiles` 没有独立主键，直接用 `user_id` 作为主键，这是一个严格的一对一约束——数据库层面保证一个用户只能有一份详情。`book_authors` 用联合主键实现多对多关系，关联表本身不存业务数据，只是两张实体表之间的桥梁。`order_items` 的 `unit_price` 记录的是下单时的价格，而不是书籍的当前价格，这是电商系统的常见做法——价格变更不应该影响历史订单。
+
+## 一对一映射：association
+
+先处理最简单的情况：查询用户时带出用户详情。
+
+Java 实体类里，User 包含一个 UserProfile 对象，表示一对一关系：
+
+```java
+@Data
+public class User {
+    private Long id;
+    private String username;
+    private String email;
+    private Integer age;
+    private UserProfile profile;  // 一对一：一个用户有一份详情
+}
+
+@Data
+public class UserProfile {
+    private Long userId;
+    private String avatarUrl;
+    private String bio;
+    private String address;
+    private String phone;
+}
+```
+
+实体类用了 Lombok 的 `@Data` 注解自动生成 getter/setter/toString，后面不再重复说明。`profile` 字段的类型是 `UserProfile` 而不是 `List<UserProfile>`，这就是一对一和一对多在 Java 层面的核心区别。
+
+### 嵌套查询：分两次查询
+
+MyBatis 处理一对一关联有两种方式。最直观的是嵌套查询——写两个独立的查询，先查用户，再用用户 ID 查详情。在 resultMap 里用 `association` 标签声明这种关联关系。
+
+`association` 有三个关键属性：`property` 指定 User 对象中关联字段的名字（`profile`），`column` 指定把主查询的哪一列作为参数传给子查询（`id` 列），`select` 指向子查询的全路径（namespace + id）。
+
+```xml
+<resultMap id="UserWithProfileMap" type="User" autoMapping="true">
+    <id column="id" property="id"/>
+    <association property="profile"
+                 column="id"
+                 select="com.bookhive.mapper.UserProfileMapper.selectByUserId"/>
+</resultMap>
+
+<select id="findByIdWithProfile" resultMap="UserWithProfileMap">
+    SELECT id, username, email, age, created_at FROM users WHERE id = #{id}
+</select>
+```
+
+子查询定义在 UserProfileMapper 里，就是一个简单的按 user_id 查询，没什么特别的。调用 `userMapper.findByIdWithProfile(1L)` 时，MyBatis 先执行主查询拿到用户数据，从结果中取出 `id` 的值（也就是 1），再执行子查询查出对应用户的详情，最后把两个结果组装成一个 User 对象。整个过程对调用方透明。
+
+这种方式的优点是**简单直观**——每个查询独立，好理解和调试。而且天然支持延迟加载（后面会讲）。缺点也很明显：**两次数据库查询**。查 1 个用户还好，查 100 个用户就是 101 次 SQL。
+
+### 嵌套结果：一次 JOIN 查出来
+
+另一种方式是用 SQL 的 JOIN 把两张表连起来，一次查询搞定。resultMap 里同样用 `association`，但不再用 `select` 属性指向子查询，而是直接在 `association` 内部定义字段映射，用 `javaType` 声明关联对象的类型。
+
+```xml
+<resultMap id="UserWithProfileJoinMap" type="User" autoMapping="true">
+    <id column="id" property="id"/>
+    <association property="profile" javaType="UserProfile">
+        <result column="avatar_url" property="avatarUrl"/>
+        <result column="bio" property="bio"/>
+        <result column="address" property="address"/>
+        <result column="phone" property="phone"/>
+    </association>
+</resultMap>
+
+<select id="findByIdWithProfileJoin" resultMap="UserWithProfileJoinMap">
+    SELECT u.id, u.username, u.email, u.age, u.created_at,
+           p.avatar_url, p.bio, p.address, p.phone
+    FROM users u
+    LEFT JOIN user_profiles p ON u.id = p.user_id
+    WHERE u.id = #{id}
+</select>
+```
+
+这里用了 `LEFT JOIN`，所以即使用户没有填写详情，用户信息也能查出来（profile 为 null）。如果用 `INNER JOIN`，没有详情的用户就直接被过滤掉了，通常不是我们想要的行为。
+
+**嵌套结果始终只有一次 SQL 查询**，不存在 N+1 问题。缺点是 SQL 会随着关联关系变多而变复杂。两张表都有 `id` 列时必须用别名区分（`u.id` vs `p.user_id`），否则 MyBatis 映射会出错。
+
+### 两种方式怎么选
+
+简单总结一下对比。
+
+| 对比项     | 嵌套查询                   | 嵌套结果             |
+| ---------- | -------------------------- | -------------------- |
+| SQL 次数   | N+1（主查询 + N 次子查询） | 1 次（JOIN）         |
+| SQL 复杂度 | 每个查询简单               | JOIN 语句可能很长    |
+| 延迟加载   | 支持                       | 不支持（已全部查出） |
+| 适用场景   | 关联数据按需加载           | 关联数据总是需要     |
+
+一个实用的判断标准：**如果关联数据几乎每次都要用，用嵌套结果（JOIN）；如果只有部分场景需要，用嵌套查询 + 延迟加载。**
+
+## 一对多映射：collection
+
+一对多比一对一更常见。BookHive 的订单-订单项就是典型的一对多——一个订单包含多个订单项，每个订单项记录了买的是哪本书、买了多少本、当时的单价。
+
+Java 实体中，Order 持有一个 `List<OrderItem>` 类型的字段。注意和一对一的关键区别：association 映射的是单个对象，collection 映射的是一个集合。在 resultMap 里，association 用 `javaType` 声明对象类型，collection 用 `ofType` 声明集合元素类型。
+
+```java
+@Data
+public class Order {
+    private Long id;
+    private String orderNo;
+    private Long userId;
+    private BigDecimal totalAmount;
+    private Integer status;
+    private LocalDateTime createdAt;
+    private List<OrderItem> items;  // 一对多关联
+}
+```
+
+OrderItem 的字段很直观：`orderId` 指向所属订单，`bookId` 指向购买的书籍，`quantity` 是购买数量，`unit_price` 是下单时的单价。
+
+### 嵌套查询方式
+
+collection 的嵌套查询写法和 association 几乎一样。关键区别在于用 `ofType` 而不是 `javaType` 来声明集合元素的类型——因为 `items` 的类型是 `List<OrderItem>`，`javaType` 只能声明 `List`，而 `ofType` 告诉 MyBatis 列表里面装的是 `OrderItem` 对象。
+
+```xml
+<resultMap id="OrderWithItemsMap" type="Order" autoMapping="true">
+    <id column="id" property="id"/>
+    <collection property="items"
+                column="id"
+                ofType="OrderItem"
+                select="com.bookhive.mapper.OrderItemMapper.selectByOrderId"/>
+</resultMap>
+```
+
+和 association 的写法几乎一样，唯一的区别是用了 `ofType="OrderItem"` 而不是 `javaType="OrderItem"`。`ofType` 告诉 MyBatis 这是一个集合，集合里的每个元素是 OrderItem 类型。子查询根据订单 ID 查出该订单的所有订单项，如果查出来为空，`items` 字段就是空列表而不是 null。
+
+### 嵌套结果方式
+
+同样可以用 JOIN 一次查出来。写法和一对一的嵌套结果类似，resultMap 里用 `collection` 代替 `association`，SQL 用 LEFT JOIN。但有一个容易踩的坑：**两张表都有 `id` 列，必须用别名区分**。
+
+SQL 里写 `oi.id AS item_id`，resultMap 里对应写 `<id column="item_id" property="id"/>`。如果不加别名，结果集里有两个 `id` 列，MyBatis 分不清哪个是订单 ID、哪个是订单项 ID，映射就会出错——一个订单的多个订单项可能被合并成一个，或者出现重复数据。
+
+MyBatis 的分组逻辑是这样的：根据外层 `<id column="id">` 的值判断两条记录是否属于同一个订单，如果是，就把内层 collection 的数据追加到 `items` 列表中。所以外层的 `<id>` 标签是正确映射的关键。
+
+### 传递多个参数给嵌套查询
+
+有时候嵌套查询需要多个参数。比如查询订单项时，还要知道当前用户 ID 来做权限校验。`column` 属性支持用大括号语法传递多列值：写 `column="{orderId=id, userId=user_id}"` 就会把主查询结果中 `id` 列的值作为参数 `orderId`、`user_id` 列的值作为参数 `userId`，一起传给嵌套查询。对应的 Mapper 接口方法用 `@Param("orderId")` 和 `@Param("userId")` 接收这两个参数。这个语法在 association 和 collection 中都可以用。
+
+## N+1 问题：关联映射最大的坑
+
+前面提到嵌套查询会导致 N+1 问题，但可能还没引起足够重视。用具体数字算一下这笔账。
+
+### 问题复现：100 个订单 = 101 次 SQL
+
+假设 BookHive 的运营后台需要查询最近 100 个订单，每个订单要显示包含的订单项。如果用嵌套查询方式，MyBatis 会先执行 1 条 SQL 查出 100 个订单，然后对每个订单再执行 1 条 SQL 查订单项，总共 101 次 SQL。
+
+假设一次数据库往返平均 2ms（局域网内的正常水平），101 次就是 202ms。这只是查 100 条数据。如果查 1000 条呢？1002 次 SQL，超过 2 秒。用户能明显感觉到页面卡顿。
+
+更严重的是数据库连接池的压力。假设连接池大小是 20，一个请求占用连接的时间变成原来的 100 倍，并发请求一多，连接池很快被耗尽，其他请求只能排队等待。
+
+### 怎么发现 N+1 问题
+
+最直接的方法是开启 SQL 日志，然后观察控制台输出。在 `application.yml` 里加一行配置就够了：
+
+```yaml
+mybatis:
+  configuration:
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl
+```
+
+调用接口后看控制台，如果看到一个主查询后面跟着大量参数不同的相同 SQL，就是 N+1 了。比如主查询 `SELECT ... FROM orders LIMIT 100` 后面紧跟着 100 个 `SELECT ... FROM order_items WHERE order_id = ?`，每个的参数值不同，这就是典型的 N+1 模式。
+
+生产环境当然不能开全量 SQL 日志（性能开销太大），但开发环境和测试环境一定要开。有些团队用 MyBatis 的拦截器在测试阶段自动检测 N+1，超过阈值就告警，这也是一个思路。
+
+### 解决方案一：嵌套结果（JOIN 查询）
+
+最直接的解决办法是把嵌套查询改成嵌套结果，一次 JOIN 查出来。复用前面定义的 `OrderWithItemsJoinMap`，只需要改 SQL：把原来的单表查询改成 LEFT JOIN 订单项表，加上 LIMIT 和 ORDER BY 就行了。从 101 次 SQL 直接降到 1 次。
+
+这种方式简单高效，但也有代价。JOIN 之后的列数是两张表列数的总和，如果关联了 5 张表，结果集的列数会非常多。而且如果某个订单的订单项特别多（比如一个批发订单有 1000 个订单项），JOIN 后的结果集会膨胀，MySQL 驱动在处理时需要更多内存。
+
+**适用场景**：关联层级不深（2-3 张表），主表数据量可控，关联数据总是需要。
+
+### 解决方案二：延迟加载
+
+不是所有场景都需要关联数据。比如用户列表页只需要展示用户名和邮箱，不需要头像和简介。这时候嵌套查询 + 延迟加载是合理的选择——只有真正访问 `user.getProfile()` 的时候才去查详情表。不访问就不查，0 次额外 SQL。
+
+全局开启延迟加载只需要两个配置项：
+
+```yaml
+mybatis:
+  configuration:
+    lazy-loading-enabled: true
+    aggressive-lazy-loading: false
+```
+
+`lazy-loading-enabled: true` 开启延迟加载，关联对象不会在主查询时立即加载。`aggressive-lazy-loading: false` 关闭激进模式——默认情况下它是 true，意味着访问 Order 的任何一个属性（比如 `getOrderNo()`）都会触发所有延迟加载属性的查询。设为 false 后，只有访问到具体的延迟加载属性（比如 `getItems()`）时才触发对应的查询。
+
+也可以在单个关联上用 `fetchType` 属性覆盖全局配置。`fetchType="lazy"` 延迟加载，`fetchType="eager"` 立即加载。
+
+延迟加载解决了 N+1 的问题吗？严格来说没有——SQL 查询次数没变，只是**把查询推迟到了需要的时候**。如果最终还是要访问所有关联数据，SQL 次数还是 N+1。但它的价值在于：**如果你只需要主表数据，或者只需要部分关联数据，那就只查需要的，避免了浪费**。
+
+### 解决方案三：分步查询 + 手动控制
+
+有时候延迟加载不够灵活。比如 Service 层有一个方法需要订单列表（不要订单项），另一个方法需要订单详情（要订单项）。与其依赖 MyBatis 的延迟加载机制，不如把控制权拿回到自己手里。
+
+思路很简单：定义两个 Mapper 方法，一个只查订单，一个批量查订单项（用 IN 条件），在 Service 层组装。
+
+Mapper 接口里新增一个批量查询方法 `List<OrderItem> findItemsByOrderIds(@Param("orderIds") List<Long> orderIds)`，对应的 XML 用上一篇讲过的 `foreach` 生成 `WHERE order_id IN (?, ?, ...)` 条件。关键点是一次查询把所有需要的订单项全部查出来，而不是逐个订单去查。
+
+Service 层的组装逻辑分三步：先查出订单列表，提取所有订单 ID，用 IN 条件一次性查出所有订单项，然后按 `orderId` 分组（用 `Collectors.groupingBy`），再设置到对应的 Order 对象上。整个过程只有 2 次 SQL——不管查 10 个订单还是 1000 个订单，SQL 次数固定为 2。
+
+这种方式把 N+1 次查询降到了 2 次（1 次查主表 + 1 次查关联表）。代码量多一些，但最灵活，也最不容易出问题——你对每一条 SQL 都有明确的控制。
+
+## 延迟加载的注意事项
+
+延迟加载虽然好用，但有几个坑在实际项目中经常遇到。
+
+### 在 Service 层意外触发额外查询
+
+延迟加载的本质是 MyBatis 创建了一个代理对象。当你访问关联属性时，代理对象拦截这个调用，触发一次额外的数据库查询。问题在于，你可能在不知不觉中触发了它。
+
+一个典型的例子是日志打印。如果你的 Order 实体类用了 Lombok 的 `@Data`（它生成的 `toString()` 会包含所有字段），而在 Service 层打印日志时写了 `log.debug("Processing order: {}", order)`，MyBatis 就会在 `toString()` 执行时触发 `items` 的延迟加载。本来只是想打个日志，结果多执行了 N 次 SQL。
+
+排查的时候特别隐蔽，因为 SQL 日志里看到的是正常的子查询，你可能不会立刻意识到是 `toString()` 触发的。
+
+解决办法：用 `@ToString(exclude = "items")` 把关联属性排除在 `toString()` 输出之外。更好的做法是 Service 层返回 VO/DTO 而不是实体类，避免实体类的 `toString()` 带来意外行为。
+
+### 序列化问题
+
+延迟加载的代理对象不能直接序列化。如果你要把实体对象存到 Redis、或者通过 RPC 传输，代理对象会导致序列化失败，报 `NotSerializableException`。
+
+解决方案是在存入缓存之前，确保关联数据已经加载完毕（提前访问一下关联属性），或者用 DTO 转换后再缓存。总之，不要把 MyBatis 的延迟加载代理对象直接丢进缓存。
+
+### SqlSession 关闭后无法加载
+
+延迟加载依赖 SqlSession。如果在 SqlSession 关闭后才访问关联属性，会抛出 `LazyInitializationException`。在 Spring Boot 中，如果方法不在 `@Transactional` 事务范围内，Mapper 方法执行完毕后 SqlSession 就关闭了。这时候访问延迟加载的属性就会报错。
+
+加上 `@Transactional` 可以延长 SqlSession 的生命周期到方法结束。但如果在 Controller 层、序列化 JSON 时访问关联属性，SqlSession 可能已经关闭。Spring Boot 的 `open-in-view` 配置（默认开启）可以延长 SqlSession 的生命周期到整个 HTTP 请求结束，但这是一种反模式——它掩盖了 N+1 问题，让你以为没问题，实际上数据库已经承受了额外的压力。
+
+建议的做法是：在 Service 层的 `@Transactional` 方法内完成所有数据访问，返回已经组装好的 DTO，而不是把带有延迟加载属性的实体类传到上层。
+
+## 作者与书籍的多对多关联
+
+BookHive 的书籍和作者是多对多关系，通过 `book_authors` 关联表连接。查询书籍详情时需要带出作者列表。
+
+多对多的处理方式和一对多类似，区别在于 SQL 需要 JOIN 三张表。Book 实体持有一个 `List<Author>` 字段，用 `collection` 映射。resultMap 的写法和前面一对多的例子基本一致，SQL 需要 LEFT JOIN 两次——先通过 `book_authors` 关联表连接书籍和作者。同样要注意列名冲突，`authors` 表和 `books` 表都有 `id` 列，需要用 `a.id AS author_id` 做区分。
+
+如果一本书有 3 个作者，JOIN 后会返回 3 行数据。MyBatis 通过外层的 `<id column="id" property="id"/>` 识别出这 3 行属于同一本书（因为 `b.id` 相同），然后把 3 个作者收集到 `authors` 列表里。这个分组逻辑和一对多完全一样——关键在于外层的 `<id>` 标签。关联表 `book_authors` 的列不需要映射到 Java 对象，它只是连接两张表的桥梁。
+
+## 关联映射的选择策略
+
+最后总结一下实际项目中的选择思路，这不是一个非此即彼的选择，而是根据场景灵活搭配。
+
+**优先用嵌套结果（JOIN）**。如果关联数据几乎每次查询都需要，而且关联层级不超过 3 层，用 JOIN 一次查出来。这是最简单、最高效的方式。大部分业务场景用这种方式就够了。BookHive 的订单详情页、书籍详情页，都可以用 JOIN 搞定。
+
+**按需用嵌套查询 + 延迟加载**。如果关联数据只在部分场景需要（比如用户列表页不需要详情，但用户主页需要），用嵌套查询配合延迟加载。但要小心 Service 层的代码不要意外触发延迟加载，实体类的 `toString()` 也要处理好。
+
+**批量场景用分步查询**。如果需要查出大量主表数据及其关联数据（比如导出 1000 个订单的 Excel），不要用嵌套查询也不要依赖延迟加载。用两次查询：先查主表数据，再用 IN 条件批量查关联数据，在 Java 层组装。这样 SQL 次数固定为 2，和数据量无关。
+
+**避免过深的关联嵌套**。如果关联层级超过 3 层（比如订单 -> 订单项 -> 书籍 -> 作者 -> 作者简介），不管是 JOIN 还是嵌套查询都会变得很复杂。这种情况下，考虑拆分成多个查询，在 Service 层组装，或者重新审视数据模型是否合理。现实中很少有需要 3 层以上关联嵌套的场景，如果出现了，通常是数据模型设计的问题。
+
+实际项目中，你可能在同一个 Mapper 里混合使用多种方式——列表查询用 JOIN，详情查询用嵌套查询 + 延迟加载，导出功能用分步批量查询。关键是理解每种方式的特点和代价，根据具体场景做选择，而不是一刀切。下一篇讲注解开发方式，以及注解和 XML 两种方式的搭配使用策略。

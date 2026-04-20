@@ -1,0 +1,238 @@
+---
+title: "01. 条件类型与 infer：TypeScript 的 if-else"
+date: "2026-04-12"
+summary: "条件类型是 TypeScript 类型系统的基础设施。理解了 T extends U ? X : Y 和 infer 关键字，你就能看懂绝大多数工具类型的实现，也能自己写出类型推导逻辑。"
+tags: ["TypeScript"]
+category: "typescript"
+cover: ""
+draft: false
+series: "TypeScript 类型系统进阶"
+seriesOrder: 1
+---
+
+你在写一个通用的 Fetch 封装，想让返回值类型自动跟着传入的泛型走——传 `User` 就返回 `Promise<User>`，传 `string` 就返回 `Promise<string>`。但你发现，当你传 `Promise<User>` 时，它返回的是 `Promise<Promise<User>>`，多包了一层。
+
+这不是 bug，是你的类型定义没处理好嵌套结构。要解决这个问题，你需要 TypeScript 的**条件类型**——类型系统里的 if-else。
+
+## 条件类型的基本语法
+
+条件类型的语法和三元表达式一模一样：
+
+```typescript
+T extends U ? X : Y
+```
+
+"如果 T 能赋值给 U，就返回类型 X，否则返回类型 Y"。
+
+一个最简单的例子：
+
+```typescript
+type IsString<T> = T extends string ? true : false;
+
+type A = IsString<string>; // true
+type B = IsString<number>; // false
+type C = IsString<"hello">; // true — 字面量类型是 string 的子类型
+```
+
+到这里你可能会想：这东西有什么用？`IsString` 这种类型我在实际开发中根本用不到。
+
+确实，单独的条件类型用处不大。它的威力在于和**泛型**、**infer**、**映射类型**组合使用。就像 `if` 语句单独看也很简单，但嵌套起来可以实现任何逻辑。
+
+## 分布式条件类型：联合类型会自动展开
+
+条件类型有一个非常重要的特性——当被检查的类型是**裸类型参数**（没有被 tuple、数组等包裹）时，联合类型会自动分发。
+
+看个例子你就明白了：
+
+```typescript
+type ToArray<T> = T extends any ? T[] : never;
+
+type Result = ToArray<string | number>;
+```
+
+`Result` 不是 `(string | number)[]`，而是 `string[] | number[]`。TypeScript 把 `string | number` 拆开，分别应用 `ToArray`，再把结果合并：
+
+```
+ToArray<string | number>
+= ToArray<string> | ToArray<number>
+= string[] | number[]
+```
+
+这个分发行为在很多场景下很有用，但有时候你**不想要它**。比如你想判断"整个联合类型是否是 string 的子类型"，而不是把联合类型拆开判断。
+
+避免分发的方式很简单——用一个元组包裹：
+
+```typescript
+// 会分发
+type Distributive<T> = T extends string ? true : false;
+type R1 = Distributive<string | number>; // true | false
+
+// 不会分发——用 [] 包裹后，T 不再是裸类型参数
+type NonDistributive<T> = [T] extends [string] ? true : false;
+type R2 = NonDistributive<string | number>; // false
+```
+
+这个区别在实际开发中经常遇到。后面写工具类型时会反复用到"避免分发"这个技巧。
+
+## infer 关键字：捕获类型的一部分
+
+条件类型的真正威力来自 `infer`。它让你在条件类型中"捕获"某个位置的未知类型，然后拿这个捕获到的类型做进一步处理。
+
+### 提取函数返回值类型
+
+假设你想写一个工具类型，传入一个函数类型，返回它的返回值类型：
+
+```typescript
+type MyReturnType<T> = T extends (...args: any[]) => infer R ? R : never;
+
+// 使用
+function fetchUser(id: string) {
+  return { userId: "usr_a1x9k2m", username: "zhang_wei" };
+}
+
+type User = MyReturnType<typeof fetchUser>;
+// { userId: string; username: string }
+```
+
+`infer R` 的意思是：如果 T 是一个函数类型（`(...args: any[]) => ???`），把返回值位置的类型捕获为 R。如果 T 不是函数类型，返回 never。
+
+这个模式太常用了，TypeScript 内置了 `ReturnType<T>` 就是这么实现的。
+
+### 提取 Promise 内部类型
+
+回到开头的问题。你传了 `Promise<User>`，想要的是 `User`，不是 `Promise<User>`：
+
+```typescript
+type UnwrapPromise<T> = T extends Promise<infer U> ? U : T;
+
+type A = UnwrapPromise<User>; // User — 不是 Promise，原样返回
+type B = UnwrapPromise<Promise<User>>; // User — 捕获了 Promise 内部的类型
+type C = UnwrapPromise<Promise<string>>; // string
+```
+
+那如果嵌套了多层呢？`Promise<Promise<Order>>` 应该返回 `Order`。条件类型天然支持递归：
+
+```typescript
+type DeepUnwrap<T> = T extends Promise<infer U> ? DeepUnwrap<U> : T;
+
+type D = DeepUnwrap<Promise<Promise<Order>>>;
+// Order — 递归展开了两次
+```
+
+递归条件类型是 TypeScript 类型系统里最强大的特性之一。它让你能处理任意深度的嵌套结构，就像运行时的递归函数一样。
+
+### 同时提取多个位置的类型
+
+`infer` 不限于一个。你可以在同一个条件类型中捕获多个位置：
+
+```typescript
+type ExtractFunctionParts<T> = T extends (...args: infer A) => infer R
+  ? { args: A; returnType: R }
+  : never;
+
+type Parts = ExtractFunctionParts<(id: string, plan: string) => User>;
+// { args: [id: string, plan: string]; returnType: User }
+```
+
+这在分析函数签名时特别有用——你能同时拿到参数类型和返回值类型。
+
+## NoInfer：阻止不想要的类型推断（TS 5.4）
+
+有时候你不希望 TypeScript 从某个位置推断类型，而是想强制它使用你指定的默认类型。TS 5.4 引入的 `NoInfer` 就是干这个的。
+
+一个典型场景：你写了一个创建 API 路由的函数，希望路由路径是字面量类型而不是宽泛的 string：
+
+```typescript
+function createRoute<Path extends string>(path: Path, handler: () => void) {
+  return { path, handler };
+}
+
+// 你希望 path 的类型是 "/users/:id" 而不是 string
+// 但 TypeScript 可能从 handler 的实现中推断出更宽泛的类型
+```
+
+用 `NoInfer` 锁定类型：
+
+```typescript
+function createRoute<Path extends string>(
+  path: NoInfer<Path>,
+  handler: () => void
+) {
+  return { path, handler };
+}
+
+const route = createRoute("/users/:id", () => {});
+// route.path 的类型是 "/users/:id"，不会被推断成 string
+```
+
+`NoInfer` 告诉编译器："不要从这个位置推断类型，用声明时确定的类型"。这在 API 设计中很实用——它能确保调用方传入的是精确的字面量类型。
+
+## 条件类型在实际开发中的应用
+
+条件类型不是"类型体操"，它在真实项目中有很多实用场景。
+
+### Fetch API 的响应类型提取
+
+你封装了一个 fetch 函数，想根据传入的 URL 返回对应的类型：
+
+```typescript
+type ApiRoutes = {
+  "/users": User[];
+  "/users/:id": User;
+  "/orders": Order[];
+};
+
+type GetResponse<Path extends keyof ApiRoutes> = ApiRoutes[Path];
+
+// 现在你能在调用时自动获得正确的返回类型
+async function apiGet<Path extends keyof ApiRoutes>(
+  path: Path
+): Promise<GetResponse<Path>> {
+  return fetch(path).then((r) => r.json());
+}
+
+const users = await apiGet("/users"); // User[]
+const user = await apiGet("/users/:id"); // User
+```
+
+### 根据条件选择不同的类型
+
+```typescript
+type ApiResponse<T, E = Error> =
+  | { success: true; data: T }
+  | { success: false; error: E };
+
+// 根据操作类型决定返回类型
+type OperationResult<Op extends "create" | "read"> = Op extends "create"
+  ? ApiResponse<User>
+  : ApiResponse<User[]>;
+
+type CreateResult = OperationResult<"create">; // ApiResponse<User>
+type ReadResult = OperationResult<"read">; // ApiResponse<User[]>
+```
+
+## 条件类型 vs 联合类型
+
+什么时候用条件类型，什么时候用联合类型？一个简单的区分：
+
+**联合类型**描述的是"这个值可能是 A 或者 B"。比如 `string | number` 表示"这个值要么是字符串，要么是数字"。
+
+**条件类型**描述的是"如果满足条件 A，就得到类型 B，否则得到类型 C"。比如 `T extends string ? T[] : never` 表示"如果 T 是字符串就得到字符串数组，否则什么都不是"。
+
+联合类型是"声明式"的——你直接列出所有可能。条件类型是"计算式"的——你给一个规则，TypeScript 根据规则算出结果。
+
+当你需要根据类型关系**计算**出一个新类型时，用条件类型。当你只是**列举**可能的类型时，用联合类型。
+
+## 一个需要注意的坑
+
+条件类型的递归不是无限的。TypeScript 有递归深度限制（通常在 45-100 层之间，取决于具体场景）。如果你的递归类型处理的数据超过了这个深度，编译器会报错。
+
+```typescript
+// 如果嵌套了 100 层 Promise，这会报错
+type D = DeepUnwrap<Promise<Promise<Promise<...100层...>>>>;
+// Type instantiation is excessively deep and possibly infinite.
+```
+
+在实际项目中，你很少会遇到这个问题——正常的业务数据不会嵌套 100 层。但如果你在写库，处理用户传入的任意类型，就需要考虑这个边界。
+
+条件类型和 infer 是 TypeScript 类型系统的基石。后面讲模板字面量类型、映射类型、工具类型实现，全部建立在条件类型之上。理解了这篇文章的内容，后面看其他类型技巧会顺畅很多。

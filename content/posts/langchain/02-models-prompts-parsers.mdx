@@ -1,0 +1,375 @@
+---
+title: "02 模型抽象、提示词模板与输出解析"
+date: "2026-04-14"
+summary: "深入 LangChain 的三个核心抽象：统一的模型接口、参数化的提示词模板、类型安全的输出解析器，告别原生 API 调用的面条代码。"
+tags: ["LangChain", "LLM", "Prompt Template", "Output Parser", "Zod"]
+category: "langchain"
+cover: ""
+draft: false
+series: "LangChain.js 实战"
+seriesOrder: 2
+---
+
+上一篇我们对比了原生 API 调用和 LangChain 写法，感受到了框架的价值——模型可替换、输出有类型、步骤可组合。
+
+但这些好处来自哪里？答案藏在 LangChain 的三个核心抽象里：**Model**、**Prompt Template**、**Output Parser**。它们就像乐高积木的基础颗粒——不大，但能组合出任何东西。
+
+这一篇我们深入这三个组件。结束时，你会拥有一个**用户反馈分析器**：输入一段用户反馈，自动提取情感、关键问题、紧急程度和建议操作，输出类型安全的 JSON 对象。
+
+## Model：一个接口，所有模型
+
+不同 LLM 厂商的 API 差异很大。OpenAI 用 `messages` 数组，Anthropic 用 `system` + `messages`，Google 又是另一套。直接对接每个 API，意味着你要维护 N 套调用代码。
+
+LangChain 的 `BaseChatModel` 接口统一了这些差异。你只需要学一套 API。
+
+### 创建模型实例
+
+```typescript
+import { ChatOpenAI } from "@langchain/openai";
+
+const model = new ChatOpenAI({
+  modelName: "gpt-4o-mini", // 模型名
+  temperature: 0, // 输出确定性（0 = 每次相同，1 = 更随机）
+  maxTokens: 1024, // 最大输出 token 数
+});
+```
+
+几个实用参数：
+
+```typescript
+const model = new ChatOpenAI({
+  modelName: "gpt-4o-mini",
+
+  // 1. temperature 控制创造性
+  // 分析、分类任务用 0（确定性输出）
+  // 写作、头脑风暴用 0.7-1.0（更多变化）
+  temperature: 0,
+
+  // 2. maxTokens 控制成本和响应时间
+  // 简单分类 256 足够，长文生成可能需要 4096
+  maxTokens: 256,
+
+  // 3. modelKwargs 传递模型特定参数
+  modelKwargs: {
+    response_format: { type: "json_object" }, // 强制 JSON 输出
+  },
+});
+```
+
+### 换模型只改一行
+
+这是 Model 抽象最直接的好处。假设你想从 OpenAI 切换到 Anthropic：
+
+```typescript
+// 之前
+import { ChatOpenAI } from "@langchain/openai";
+const model = new ChatOpenAI({ modelName: "gpt-4o-mini" });
+
+// 之后 —— 只改这两行，其余代码完全不动
+import { ChatAnthropic } from "@langchain/anthropic";
+const model = new ChatAnthropic({ modelName: "claude-sonnet-4-20250514" });
+```
+
+prompt 定义、输出解析、链式调用——全部照旧。这在实际项目中非常实用：开发阶段用便宜的 gpt-4o-mini 调试，生产环境切换到更强大的模型。
+
+### 调用模型
+
+```typescript
+import { HumanMessage, SystemMessage } from "@langchain/core/messages";
+
+const response = await model.invoke([
+  // system 消息设定角色和行为规范
+  new SystemMessage("你是一个用户反馈分析专家，只输出 JSON。"),
+  // human 消息是用户输入
+  new HumanMessage(
+    "你们的移动端 App 崩溃了！我在提交订单的时候闪退，已经第三次了。订单号 ORD-20250608-3847，赶紧修！"
+  ),
+]);
+
+console.log(response.content);
+// '{"sentiment":"负面","issue":"移动端提交订单时崩溃","urgency":"高"}'
+```
+
+`invoke` 返回一个 `AIMessage` 对象，`.content` 是模型的文本输出。到目前为止看起来和原生调用差不多——但接下来 Prompt Template 会让一切不同。
+
+## Prompt Template：参数化的 Prompt
+
+上一篇的评论分析器里，prompt 是硬编码的字符串。如果产品经理说"加一个评论来源字段"，你就要去改字符串模板。
+
+Prompt Template 把 prompt 从代码中分离出来，变成可复用、可测试的模板。
+
+### 基础模板
+
+```typescript
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+
+// 用 fromMessages 创建对话式模板
+const prompt = ChatPromptTemplate.fromMessages([
+  // system 角色设定
+  [
+    "system",
+    "你是一个用户反馈分析专家。分析用户反馈，提取情感、关键问题和紧急程度。",
+  ],
+  // human 消息模板，{feedback} 是占位符
+  ["human", "请分析以下用户反馈：\n\n{feedback}"],
+]);
+
+// 填充模板 —— 返回格式化的消息数组
+const messages = await prompt.invoke({
+  feedback:
+    "升级到企业版之后团队协作功能确实强了不少，但是导入旧项目的时候一直报错，错误码 IMP-4022。",
+});
+
+console.log(messages);
+// [
+//   SystemMessage { content: "你是一个用户反馈分析专家..." },
+//   HumanMessage { content: "请分析以下用户反馈：\n\n升级到企业版之后..." }
+// ]
+```
+
+`{feedback}` 这种花括号占位符是 Prompt Template 的核心机制。调用 `invoke` 时传入具体值，模板会自动替换。
+
+### 多变量模板
+
+实际场景中，prompt 通常需要多个动态变量：
+
+```typescript
+const prompt = ChatPromptTemplate.fromMessages([
+  [
+    "system",
+    `你是一个用户反馈分析专家。
+当前产品：{productName}
+产品版本：{version}
+分析语言：{language}`,
+  ],
+  ["human", "请分析以下用户反馈：\n\n{feedback}"],
+]);
+
+// 调用时传入所有变量
+const messages = await prompt.invoke({
+  productName: "TaskFlow Pro",
+  version: "3.2.1",
+  language: "中文",
+  feedback: "看板视图的拖拽功能在 Firefox 上有严重延迟",
+});
+```
+
+每个变量都是独立的，改产品名不用动反馈内容，改语言不用动模板结构。
+
+### 少样本模板（Few-shot）
+
+有时候光靠 system 指令不够精确，你需要给 LLM 看几个例子。LangChain 支持在模板中嵌入示例：
+
+```typescript
+import { FewShotChatMessagePromptTemplate } from "@langchain/core/prompts";
+
+// 定义示例
+const examples = [
+  {
+    input: "你们这个新版本好难用啊，找半天找不到设置在哪",
+    output:
+      '{"sentiment":"负面","issue":"新版本UI导航不直观","urgency":"中","suggestedAction":"记录为UI改进建议"}',
+  },
+  {
+    input: "数据导出功能太棒了！CSV 和 Excel 都支持，格式还很规范",
+    output:
+      '{"sentiment":"正面","issue":"无（表扬）","urgency":"低","suggestedAction":"标记为正面反馈，通知产品团队"}',
+  },
+];
+
+// 创建示例格式化模板
+const examplePrompt = ChatPromptTemplate.fromMessages([
+  ["human", "{input}"],
+  ["ai", "{output}"],
+]);
+
+const fewShotPrompt = new FewShotChatMessagePromptTemplate({
+  prefix:
+    "你是一个用户反馈分析专家。请按以下 JSON 格式分析用户反馈：\n" +
+    '{"sentiment":"正面|负面|中性","issue":"关键问题","urgency":"高|中|低","suggestedAction":"建议操作"}\n\n' +
+    "以下是几个分析示例：",
+  suffix: "现在请分析这条反馈：\n{feedback}",
+  examplePrompt,
+  examples,
+  inputVariables: ["feedback"],
+});
+```
+
+Few-shot 的价值在于：LLM 看到具体例子后，输出格式和判断标准会稳定得多。比起在 system prompt 里写"请输出 JSON 格式"，直接给一个示例更有效。
+
+## Output Parser：从字符串到类型安全对象
+
+LLM 的输出是字符串。即使你在 prompt 里要求"输出 JSON"，它也可能返回：
+
+```
+好的，根据分析结果：
+{"sentiment": "负面", "issue": "..."}
+```
+
+带了多余的文字，直接 `JSON.parse` 就炸了。Output Parser 就是来解决这个问题的。
+
+### StructuredOutputParser + Zod
+
+这是最推荐的输出解析方式。用 Zod 定义你想要的数据结构，LangChain 自动生成格式约束并解析输出。
+
+```typescript
+import { StructuredOutputParser } from "langchain/output_parsers";
+import { z } from "zod";
+
+// 用 Zod 定义输出结构 —— 这就是你期望的数据类型
+const parser = StructuredOutputParser.fromZodSchema(
+  z.object({
+    sentiment: z.enum(["正面", "负面", "中性"]).describe("用户反馈的情感倾向"),
+    issue: z.string().describe("反馈中提到的核心问题，一句话概括"),
+    urgency: z
+      .enum(["高", "中", "低"])
+      .describe(
+        "问题的紧急程度。影响核心功能或导致数据丢失为高，体验问题为中，建议为低"
+      ),
+    suggestedAction: z
+      .string()
+      .describe("建议的后续操作，如：记录Bug、通知运维、标记为产品建议等"),
+  })
+);
+```
+
+Zod 的 `.describe()` 不是注释——LangChain 会把描述写进 prompt，让 LLM 更准确地理解每个字段的含义。
+
+### 格式指令自动注入
+
+parser 可以生成格式指令，你把它塞进 prompt：
+
+```typescript
+const formatInstructions = parser.getFormatInstructions();
+
+console.log(formatInstructions);
+// 输出类似：
+// "You must format your output as a JSON value that adheres to the schema...
+// {"sentiment": enum["正面","负面","中性"], "issue": string, ...}"
+```
+
+把这个指令放进模板：
+
+```typescript
+const prompt = ChatPromptTemplate.fromMessages([
+  ["system", "你是一个用户反馈分析专家。\n\n{formatInstructions}"],
+  ["human", "请分析以下用户反馈：\n\n{feedback}"],
+]);
+```
+
+### 组合起来：完整的反馈分析器
+
+把 Model + Prompt Template + Output Parser 三个组件用管道串起来：
+
+```typescript
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StructuredOutputParser } from "langchain/output_parsers";
+import { z } from "zod";
+
+// 1. 定义输出结构
+const parser = StructuredOutputParser.fromZodSchema(
+  z.object({
+    sentiment: z.enum(["正面", "负面", "中性"]),
+    issue: z.string(),
+    urgency: z.enum(["高", "中", "低"]),
+    suggestedAction: z.string(),
+  })
+);
+
+// 2. 创建模型
+const model = new ChatOpenAI({
+  modelName: "gpt-4o-mini",
+  temperature: 0,
+});
+
+// 3. 创建提示词模板
+const prompt = ChatPromptTemplate.fromMessages([
+  ["system", "你是一个用户反馈分析专家。\n\n{formatInstructions}"],
+  ["human", "{feedback}"],
+]);
+
+// 4. 管道串联
+const chain = prompt.pipe(model).pipe(parser);
+
+// 5. 调用
+const result = await chain.invoke({
+  feedback:
+    "移动端在弱网环境下提交订单失败，重试三次后显示'网络超时'，" +
+    "但后台其实已经创建成功了。导致客户重复下单，客服那边已经收到 15 起投诉了。",
+  formatInstructions: parser.getFormatInstructions(),
+});
+
+// result 的类型是 { sentiment: string; issue: string; urgency: string; suggestedAction: string }
+console.log(result);
+// {
+//   sentiment: "负面",
+//   issue: "移动端弱网环境下订单提交状态不一致，前端超时但后端已成功",
+//   urgency: "高",
+//   suggestedAction: "立即提交为P0级Bug，通知移动端和后端团队联合排查，临时方案：增加订单状态查询接口"
+// }
+```
+
+从输入到输出，全程类型安全。如果 LLM 返回的格式不对，`parser` 会抛出明确的错误而不是返回 `undefined`。
+
+### 解析失败怎么办
+
+LLM 的输出毕竟不可控。你可能遇到这些情况：
+
+```typescript
+// 方式 1：用 try-catch 捕获解析错误
+try {
+  const result = await chain.invoke({ feedback, formatInstructions });
+} catch (e) {
+  // 解析失败，回退到纯文本输出
+  console.error("解析失败，原始输出：", e);
+}
+
+// 方式 2：用 OutputFixingParser 自动修复
+import { OutputFixingParser } from "langchain/output_parsers";
+
+const fixingParser = OutputFixingParser.fromLLM(model, parser);
+// 这个 parser 在解析失败时，会把错误信息 + 原始输出再发给 LLM
+// 让 LLM 自己修复格式，自动重试一次
+```
+
+`OutputFixingParser` 的原理很巧妙：它把"你的输出格式不对，正确格式是 X，请修复"这段话和原始输出一起发给 LLM，让 LLM 自己修。代价是多一次 API 调用，但成功率很高。
+
+##踩坑经验
+
+用这三个组件时，有几个常见坑：
+
+**1. Zod describe 不是多余的**
+
+```typescript
+// 差 —— LLM 不知道怎么判断"紧急"
+z.enum(["高", "中", "低"]);
+
+// 好 —— LLM 有了明确的判断标准
+z.enum(["高", "中", "低"]).describe(
+  "影响核心功能为高，体验问题为中，改进建议为低"
+);
+```
+
+`.describe()` 的内容会出现在 prompt 里，直接影响 LLM 的输出质量。花 30 秒写好描述，能省掉很多"AI 瞎分类"的问题。
+
+**2. temperature 不是越低越好**
+
+分类、提取任务用 0 没问题。但如果你发现 LLM 总是给出"安全"的回答（比如所有反馈都是"中性"），可以试试调到 0.1-0.2，给一点变化空间。
+
+**3. JSON 输出的稳定性**
+
+即使加了 `StructuredOutputParser`，偶尔还是会遇到 LLM 输出非法 JSON 的情况（比如字符串里包含未转义的引号）。生产环境一定要加 try-catch，或者用 `OutputFixingParser` 做兜底。
+
+## 三个组件解决了什么
+
+回顾一下：
+
+| 痛点                         | 组件            | 解决方式                      |
+| ---------------------------- | --------------- | ----------------------------- |
+| 换模型要改一堆代码           | Model           | 统一接口，换模型只改一行      |
+| prompt 硬编码，难以维护      | Prompt Template | 参数化模板，变量独立          |
+| LLM 输出是字符串，解析靠正则 | Output Parser   | Zod schema 定义结构，自动解析 |
+| 三个组件怎么串联             | `pipe()`        | 管道语法，像搭积木一样组合    |
+
+下一篇我们深入管道组合——LangChain Expression Language（LCEL）。有了三个基础积木之后，LCEL 教你如何用管道思维组装复杂的 AI 工作流。

@@ -1,0 +1,1317 @@
+---
+title: "14. 实战项目一：协作式代码编辑器"
+date: "2026-03-23"
+summary: "使用 tRPC 构建一个类似 Google Docs 的协作代码编辑器，实现实时协作编辑、多光标同步、用户在线状态等功能。"
+tags: ["tRPC", "实时协作", "WebSocket", "CRDT", "实战项目"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 14
+---
+
+## 前言
+
+在上一篇文章中，我们学习了如何为 tRPC 应用编写全面的测试。测试给了我们重构和添加新功能的信心。今天，我们把这个信心用到实战中，构建一个协作式代码编辑器。
+
+协作编辑是一个经典的实时应用场景。当多个人同时编辑同一个文档时，如何保证所有人的视图一致？如何处理两个人的编辑冲突？这些问题看似简单，实际上相当复杂。早年 Google Docs 推出时就因为解决了这个问题而惊艳全场。
+
+传统做法是使用"最后写入获胜"策略，但这样会导致后编辑的人覆盖掉前面的修改。现代方案是使用 CRDT（Conflict-free Replicated Data Types，无冲突复制数据类型），一种能在不丢失任何编辑的情况下自动解决冲突的数据结构。
+
+对于我们的协作编辑器，核心挑战包括：
+
+**实时同步**：一个人的修改要立即广播给其他人
+
+**冲突解决**：两个人同时编辑同一位置，不能丢失任何修改
+
+**多光标显示**：看到其他人在哪里编辑
+
+**权限控制**：谁能编辑、谁只能查看
+
+**离线支持**：网络断开时本地编辑，恢复后自动同步
+
+今天我们将用 tRPC + WebSocket + CRDT 构建这个编辑器。项目会很大，但别担心，我们会一步步来。
+
+## 为什么需要 CRDT
+
+在深入代码之前，先理解为什么我们需要 CRDT。假设两个人同时编辑同一个文档：
+
+```
+原始文本：Hello World
+```
+
+用户 A 在位置 5 插入 " beautiful"，变成 "Hello beautiful World"。
+
+用户 B 在位置 10 插入 "Cruel"，变成 "Hello Cruel World"。
+
+如果简单按照时间戳合并，后提交的会覆盖先提交的，最终结果是 "Hello Cruel World"，A 的修改丢失了。
+
+CRDT 通过给每个操作分配唯一 ID 和依赖关系，能智能地合并这两个操作。无论操作顺序如何，最终结果都是 "Hello beautiful Cruel World"。
+
+这就是 CRDT 的威力：它让多用户编辑像单用户编辑一样可靠，无需担心数据冲突。
+
+## 项目架构
+
+我们的编辑器采用 Monorepo 架构，因为前后端需要共享大量类型定义。
+
+```
+collab-editor/
+├── apps/
+│   ├── web/                    # Next.js 前端
+│   │   ├── app/
+│   │   │   └── documents/[id]/ # 文档编辑页
+│   │   ├── components/
+│   │   │   ├── editor/         # 编辑器组件
+│   │   │   ├── cursors/        # 光标显示
+│   │   │   └── users/          # 用户列表
+│   │   └── lib/
+│   └── api/                    # NestJS 后端
+│       └── src/
+│           └── modules/
+│               └── documents/  # 文档模块
+├── packages/
+│   ├── trpc/                   # tRPC 定义
+│   ├── database/               # Prisma schema
+│   └── crdt/                   # CRDT 实现
+└── turbo.json
+```
+
+**技术选型理由**：
+
+**Next.js**：服务端渲染提升首屏速度，API Routes 支持 tRPC
+
+**Monaco Editor**：VS Code 的编辑器核心，功能强大
+
+**Yjs**：成熟的 CRDT 实现，支持多种数据类型
+
+**NestJS**：企业级后端框架，模块化设计适合复杂业务
+
+**Redis**：存储在线用户和临时状态，支持 pub/sub
+
+**PostgreSQL**：持久化存储文档和用户数据
+
+## 数据模型设计
+
+### Prisma Schema
+
+文档相关的数据模型需要考虑版本历史、协作权限、实时状态等多个方面。
+
+```prisma
+// packages/database/prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Document {
+  id          String   @id @default(cuid())
+  title       String
+  content     String   @default("")
+  language    String   @default("typescript")
+  version     Int      @default(1)
+  ownerId     String
+  owner       User     @relation(fields: [ownerId], references: [id])
+
+  // 协作者
+  collaborators DocumentCollaborator[]
+  // 版本历史
+  versions     DocumentVersion[]
+  // 实时会话
+  sessions     DocumentSession[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([ownerId])
+}
+
+model DocumentCollaborator {
+  id         String   @id @default(cuid())
+  documentId String
+  document   Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User     @relation(fields: [userId], references: [id])
+
+  role       CollaboratorRole @default(VIEWER)
+  joinedAt   DateTime @default(now())
+  lastSeenAt DateTime @default(now())
+
+  @@unique([documentId, userId])
+  @@index([documentId])
+}
+
+model DocumentVersion {
+  id        String   @id @default(cuid())
+  documentId String
+  document  Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  version   Int
+  content   String
+  createdAt DateTime @default(now())
+  createdBy String
+
+  @@index([documentId, version])
+}
+
+model DocumentSession {
+  id           String   @id @default(cuid())
+  documentId   String
+  document     Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  userId       String
+  user         User     @relation(fields: [userId], references: [id])
+
+  // 实时状态
+  cursorPosition Int?
+  selectionRange String? // JSON string: {from: number, to: number}
+
+  isConnected  Boolean  @default(true)
+  lastHeartbeat DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([documentId, isConnected])
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  avatar    String?
+  password  String
+
+  // 拥有的文档
+  ownedDocuments      Document[]             @relation("DocumentOwner")
+  // 协作的文档
+  collaboratingDocuments DocumentCollaborator[]
+  // 编辑会话
+  sessions            DocumentSession[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+enum CollaboratorRole {
+  OWNER
+  EDITOR
+  VIEWER
+}
+```
+
+这个设计考虑了几个关键点：
+
+**版本历史**：每次保存时创建版本记录，支持回滚
+
+**细粒度权限**：OWNER、EDITOR、VIEWER 三级权限
+
+**实时会话**：跟踪在线用户和光标位置
+
+**软删除保护**：使用 `onDelete: Cascade` 确保文档删除时清理相关数据
+
+## 后端实现
+
+### tRPC Router 定义
+
+文档 Router 包含查询、创建、更新、订阅等操作。重点是 Subscription，它实现了实时数据推送。
+
+```typescript
+// packages/trpc/src/routers/documents.router.ts
+
+import { z } from "zod";
+import { observable } from "@trpc/server/observable";
+import { EventEmitter } from "events";
+import type { Context } from "../context";
+
+// 事件发射器用于实时通知
+const documentEvents = new EventEmitter();
+
+export const documentsRouter = t.router<Context>({
+  // 获取文档详情
+  byId: t.procedure
+    .input(z.object({ id: z.string() }))
+    .query(async ({ input, ctx }) => {
+      const document = await ctx.prisma.document.findUnique({
+        where: { id: input.id },
+        include: {
+          collaborators: {
+            include: {
+              user: {
+                select: {
+                  id: true,
+                  name: true,
+                  email: true,
+                  avatar: true,
+                },
+              },
+            },
+          },
+        },
+      });
+
+      if (!document) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "文档不存在",
+        });
+      }
+
+      // 检查访问权限
+      const hasAccess =
+        document.ownerId === ctx.user?.id ||
+        document.collaborators.some((c) => c.userId === ctx.user?.id);
+
+      if (!hasAccess) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "无权访问此文档",
+        });
+      }
+
+      // 记录用户访问
+      await ctx.prisma.documentCollaborator.updateMany({
+        where: {
+          documentId: input.id,
+          userId: ctx.user.id,
+        },
+        data: {
+          lastSeenAt: new Date(),
+        },
+      });
+
+      return document;
+    }),
+
+  // 创建文档
+  create: t.procedure
+    .input(
+      z.object({
+        title: z.string().min(1).max(200),
+        language: z.string().default("typescript"),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const document = await ctx.prisma.document.create({
+        data: {
+          title: input.title,
+          content: "",
+          language: input.language,
+          ownerId: ctx.user.id,
+        },
+      });
+
+      // 创建初始版本
+      await ctx.prisma.documentVersion.create({
+        data: {
+          documentId: document.id,
+          version: 1,
+          content: "",
+          createdBy: ctx.user.id,
+        },
+      });
+
+      return document;
+    }),
+
+  // 更新文档内容（使用 CRDT）
+  updateContent: t.procedure
+    .input(
+      z.object({
+        documentId: z.string(),
+        update: z.object({
+          type: z.enum(["insert", "delete", "retain"]),
+          position: z.number(),
+          content: z.string().optional(),
+          length: z.number().optional(),
+        }),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      // 检查权限
+      const collaborator = await ctx.prisma.documentCollaborator.findFirst({
+        where: {
+          documentId: input.documentId,
+          userId: ctx.user.id,
+        },
+      });
+
+      if (!collaborator || collaborator.role === "VIEWER") {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "无权编辑此文档",
+        });
+      }
+
+      // 获取当前文档
+      const document = await ctx.prisma.document.findUnique({
+        where: { id: input.documentId },
+        select: { content: true, version: true },
+      });
+
+      if (!document) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "文档不存在",
+        });
+      }
+
+      // 应用 CRDT 更新
+      const ydoc = new Y.Doc();
+      const ytext = ydoc.getText();
+      ytext.insert(0, document.content);
+
+      // 应用操作
+      switch (input.update.type) {
+        case "insert":
+          ytext.insert(input.update.position, input.update.content || "");
+          break;
+        case "delete":
+          ytext.delete(input.update.position, input.update.length || 0);
+          break;
+        case "retain":
+          // 保留指定长度，删除其余
+          const currentLength = ytext.length;
+          if (currentLength > input.update.position) {
+            ytext.delete(input.update.position);
+          }
+          break;
+      }
+
+      const newContent = ytext.toString();
+
+      // 更新数据库
+      const updated = await ctx.prisma.document.update({
+        where: { id: input.documentId },
+        data: {
+          content: newContent,
+          version: { increment: 1 },
+        },
+      });
+
+      // 创建版本记录
+      await ctx.prisma.documentVersion.create({
+        data: {
+          documentId: input.documentId,
+          version: updated.version,
+          content: newContent,
+          createdBy: ctx.user.id,
+        },
+      });
+
+      // 广播更新
+      documentEvents.emit("document:updated", {
+        documentId: input.documentId,
+        content: newContent,
+        update: input.update,
+        userId: ctx.user.id,
+        version: updated.version,
+      });
+
+      return updated;
+    }),
+
+  // 订阅文档更新
+  onDocumentUpdate: t.procedure
+    .input(z.object({ documentId: z.string() }))
+    .subscription(({ input }) => {
+      return observable((emit) => {
+        const onUpdate = (data: any) => {
+          if (data.documentId === input.documentId) {
+            emit.next(data);
+          }
+        };
+
+        documentEvents.on("document:updated", onUpdate);
+
+        return () => {
+          documentEvents.off("document:updated", onUpdate);
+        };
+      });
+    }),
+
+  // 更新光标位置
+  updateCursor: t.procedure
+    .input(
+      z.object({
+        documentId: z.string(),
+        position: z.number(),
+        selection: z
+          .object({
+            from: z.number(),
+            to: z.number(),
+          })
+          .optional(),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      // 更新会话状态
+      await ctx.prisma.documentSession.upsert({
+        where: {
+          id: ctx.user.id, // 假设 userId 作为会话 ID
+        },
+        create: {
+          id: ctx.user.id,
+          documentId: input.documentId,
+          userId: ctx.user.id,
+          cursorPosition: input.position,
+          selectionRange: input.selection
+            ? JSON.stringify(input.selection)
+            : null,
+          lastHeartbeat: new Date(),
+        },
+        update: {
+          cursorPosition: input.position,
+          selectionRange: input.selection
+            ? JSON.stringify(input.selection)
+            : null,
+          lastHeartbeat: new Date(),
+        },
+      });
+
+      // 广播光标移动
+      documentEvents.emit("cursor:moved", {
+        documentId: input.documentId,
+        userId: ctx.user.id,
+        userName: ctx.user.name,
+        position: input.position,
+        selection: input.selection,
+      });
+
+      return { success: true };
+    }),
+
+  // 订阅光标移动
+  onCursorMove: t.procedure
+    .input(z.object({ documentId: z.string() }))
+    .subscription(({ input }) => {
+      return observable((emit) => {
+        const onMove = (data: any) => {
+          if (data.documentId === input.documentId) {
+            emit.next(data);
+          }
+        };
+
+        documentEvents.on("cursor:moved", onMove);
+
+        return () => {
+          documentEvents.off("cursor:moved", onMove);
+        };
+      });
+    }),
+
+  // 获取在线用户
+  onlineUsers: t.procedure
+    .input(z.object({ documentId: z.string() }))
+    .query(async ({ input, ctx }) => {
+      const sessions = await ctx.prisma.documentSession.findMany({
+        where: {
+          documentId: input.documentId,
+          isConnected: true,
+          lastHeartbeat: {
+            gte: new Date(Date.now() - 30000), // 30 秒内有活动
+          },
+        },
+        include: {
+          user: {
+            select: {
+              id: true,
+              name: true,
+              avatar: true,
+            },
+          },
+        },
+      });
+
+      return sessions;
+    }),
+});
+```
+
+这个 Router 实现了协作编辑的核心功能。关键点：
+
+**CRDT 集成**：使用 Yjs 处理文档更新，确保无冲突合并
+
+**实时通知**：通过 EventEmitter 广播更新，订阅者收到通知
+
+**权限检查**：每次操作都验证用户权限
+
+**会话管理**：跟踪用户光标和在线状态
+
+### WebSocket 适配器
+
+tRPC 的 Subscription 需要WebSocket 支持。我们需要配置 WebSocket 服务器。
+
+```typescript
+// packages/trpc/src/server.ts
+
+import { applyWSSHandler } from "@trpc/server/adapters/ws";
+import ws from "ws";
+import http from "http";
+import { Context } from "./context";
+import { appRouter } from "./routers";
+
+export function createWSServer(httpServer: http.Server) {
+  const wss = new ws.Server({ server: httpServer, path: "/trpc" });
+
+  applyWSSHandler({
+    wss,
+    router: appRouter,
+    createContext: ({ req, res }): Context => {
+      // 从 WebSocket 握手请求中提取认证信息
+      const token = req.headers["authorization"]?.split(" ")[1];
+
+      let user = null;
+      if (token) {
+        user = verifyToken(token);
+      }
+
+      return {
+        user,
+        prisma: new PrismaClient(),
+      };
+    },
+  });
+
+  // 心跳检测
+  wss.on("connection", (ws) => {
+    ws.isAlive = true;
+    ws.on("pong", () => {
+      ws.isAlive = true;
+    });
+  });
+
+  // 定期清理断开的连接
+  const interval = setInterval(() => {
+    wss.clients.forEach((ws: any) => {
+      if (ws.isAlive === false) {
+        return ws.terminate();
+      }
+      ws.isAlive = false;
+      ws.ping();
+    });
+  }, 30000);
+
+  wss.on("close", () => {
+    clearInterval(interval);
+  });
+
+  return wss;
+}
+```
+
+这段代码创建了一个 WebSocket 服务器，处理 tRPC 的 Subscription 连接。重要细节：
+
+**认证提取**：从握手请求中提取 token，验证用户身份
+
+**心跳检测**：定期 ping 客户端，清理无响应的连接
+
+**上下文创建**：为每个连接创建独立的 Prisma 客户端
+
+## 前端实现
+
+### Monaco Editor 组件
+
+Monaco Editor 是 VS Code 的核心编辑器，提供了强大的编辑功能和优秀的用户体验。
+
+```typescript
+// apps/web/src/components/editor/MonacoEditor.tsx
+
+"use client";
+
+import { useEffect, useRef, useState } from "react";
+import Editor from "@monaco-editor/react";
+import { trpc } from "@/lib/trpc/client";
+import { useDebounce } from "@/lib/hooks/useDebounce";
+
+interface MonacoEditorProps {
+  documentId: string;
+  initialContent: string;
+  language: string;
+  readOnly?: boolean;
+}
+
+export function MonacoEditor({
+  documentId,
+  initialContent,
+  language,
+  readOnly = false,
+}: MonacoEditorProps) {
+  const [content, setContent] = useState(initialContent);
+  const editorRef = useRef<any>(null);
+
+  // 订阅文档更新
+  trpc.documents.onDocumentUpdate.useSubscription(
+    { documentId },
+    {
+      onData: (update) => {
+        // 当其他人更新文档时，同步更新
+        setContent(update.content);
+
+        // 如果是当前用户自己的更新，不需要处理
+        if (update.userId === currentUserId) {
+          return;
+        }
+
+        // 应用其他人的更新到编辑器
+        const editor = editorRef.current;
+        if (editor) {
+          const model = editor.getModel();
+          if (model) {
+            model.setValue(update.content);
+          }
+        }
+      },
+    }
+  );
+
+  // 更新文档内容
+  const updateMutation = trpc.documents.updateContent.useMutation();
+
+  // 防抖处理：用户停止输入 500ms 后才提交
+  const debouncedUpdate = useDebounce((newContent: string) => {
+    if (newContent === content) return;
+
+    // 计算差异（简化版，实际应该用更精确的 diff 算法）
+    const commonLength = Math.min(content.length, newContent.length);
+    let firstDiff = 0;
+
+    while (
+      firstDiff < commonLength &&
+      content[firstDiff] === newContent[firstDiff]
+    ) {
+      firstDiff++;
+    }
+
+    // 确定操作类型
+    let update;
+    if (newContent.length > content.length) {
+      // 插入
+      update = {
+        type: "insert" as const,
+        position: firstDiff,
+        content: newContent.slice(firstDiff),
+      };
+    } else if (newContent.length < content.length) {
+      // 删除
+      update = {
+        type: "delete" as const,
+        position: firstDiff,
+        length: content.length - newContent.length,
+      };
+    } else {
+      // 替换
+      update = {
+        type: "insert" as const,
+        position: firstDiff,
+        content: newContent.slice(firstDiff),
+      };
+    }
+
+    updateMutation.mutate({
+      documentId,
+      update,
+    });
+  }, 500);
+
+  // 编辑器内容变化处理
+  const handleEditorChange = (value: string | undefined) => {
+    if (!value || value === content) return;
+
+    setContent(value);
+    debouncedUpdate(value);
+  };
+
+  // 光标位置变化处理
+  const handleCursorChange = (e: any) => {
+    const position = e.position?.lineNumber || 0;
+    const selection = e.selection
+      ? {
+          from: e.selection.startLineNumber,
+          to: e.selection.endLineNumber,
+        }
+      : undefined;
+
+    trpc.documents.updateCursor.mutate({
+      documentId,
+      position,
+      selection,
+    });
+  };
+
+  return (
+    <div className="relative h-full">
+      <Editor
+        height="100%"
+        language={language}
+        value={content}
+        onChange={handleEditorChange}
+        onMount={(editor, monaco) => {
+          editorRef.current =;
+
+          // 监听光标变化
+          editor.onDidChangeCursorPosition((e) => {
+            handleCursorChange(e);
+          });
+        }}
+        theme="vs-dark"
+        options={{
+          readOnly,
+          minimap: { enabled: true },
+          fontSize: 14,
+          lineNumbers: "on",
+          scrollBeyondLastLine: false,
+          automaticLayout: true,
+          wordWrap: "on",
+          formatOnPaste: true,
+          formatOnType: true,
+        }}
+      />
+
+      {/* 显示其他用户的光标 */}
+      <RemoteCursors documentId={documentId} editorRef={editorRef} />
+    </div>
+  );
+}
+```
+
+这个组件实现了协作编辑的核心交互：
+
+**实时同步**：订阅文档更新，自动应用其他人的修改
+
+**防抖提交**：避免每个字符都提交，减少网络压力
+
+**光标追踪**：实时上报光标位置，让其他人看到
+
+**Monaco 集成**：利用 VS Code 的强大编辑功能
+
+### 远程光标显示
+
+看到其他人在哪里编辑，是协作编辑的重要体验。
+
+```typescript
+// apps/web/src/components/editor/RemoteCursors.tsx
+
+"use client";
+
+import { useEffect, useState } from "react";
+import { trpc } from "@/lib/trpc/client";
+
+interface RemoteCursorsProps {
+  documentId: string;
+  editorRef: React.MutableRefObject<any>;
+}
+
+interface RemoteCursor {
+  userId: string;
+  userName: string;
+  position: number;
+  selection?: { from: number; to: number };
+  color: string;
+}
+
+export function RemoteCursors({
+  documentId,
+  editorRef,
+}: RemoteCursorsProps) {
+  const [cursors, setCursors] = useState<RemoteCursor[]>([]);
+
+  // 订阅光标移动
+  trpc.documents.onCursorMove.useSubscription(
+    { documentId },
+    {
+      onData: (move) => {
+        // 忽略自己的光标
+        if (move.userId === currentUserId) return;
+
+        setCursors((prev) => {
+          const existing = prev.find((c) => c.userId === move.userId);
+
+          if (existing) {
+            // 更新现有光标
+            return prev.map((c) =>
+              c.userId === move.userId
+                ? { ...c, position: move.position, selection: move.selection }
+                : c
+            );
+          } else {
+            // 添加新光标
+            return [
+              ...prev,
+              {
+                userId: move.userId,
+                userName: move.userName,
+                position: move.position,
+                selection: move.selection,
+                color: getUserColor(move.userId),
+              },
+            ];
+          }
+        });
+      },
+    }
+  );
+
+  // 移除超时的光标（30 秒无活动）
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setCursors((prev) =>
+        prev.filter((c) => {
+          const lastUpdate = cursorLastUpdate.get(c.userId) || 0;
+          return Date.now() - lastUpdate < 30000;
+        })
+      );
+    }, 5000);
+
+    return () => clearInterval(interval);
+  }, []);
+
+  return (
+    <>
+      {cursors.map((cursor) => (
+        <CursorOverlay
+          key={cursor.userId}
+          cursor={cursor}
+          editorRef={editorRef}
+        />
+      ))}
+    </>
+  );
+}
+
+// 为每个用户分配颜色
+function getUserColor(userId: string): string {
+  const colors = [
+    "#FF6B6B",
+    "#4ECDC4",
+    "#45B7D1",
+    "#FFA07A",
+    "#98D8C8",
+    "#F7DC6F",
+    "#FF85A2",
+    "#A8DADC",
+  ];
+
+  let hash = 0;
+  for (let i = 0; i < userId.length; i++) {
+    hash = userId.charCodeAt(i) + ((hash << 5) - hash);
+  }
+
+  return colors[Math.abs(hash) % colors.length];
+}
+
+// 光标覆盖层组件
+function CursorOverlay({
+  cursor,
+  editorRef,
+}: {
+  cursor: RemoteCursor;
+  editorRef: React.MutableRefObject<any>;
+}) {
+  const [position, setPosition] = useState({ top: 0, left: 0 });
+
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!editor) return;
+
+    // 将行号转换为像素坐标
+    const top = editor.getTopForLineNumber(cursor.position);
+    const left = 0;
+
+    setPosition({ top, left });
+  }, [cursor.position, editorRef]);
+
+  return (
+    <div
+      className="absolute pointer-events-none transition-all duration-150"
+      style={{
+        top: position.top,
+        left: position.left,
+        borderLeft: `2px solid ${cursor.color}`,
+        backgroundColor: `${cursor.color}20`,
+        padding: "2px 0",
+        height: "20px",
+      }}
+    >
+      <span
+        className="text-xs px-1 py-0.5 text-white rounded-sm"
+        style={{ backgroundColor: cursor.color }}
+      >
+        {cursor.userName}
+      </span>
+    </div>
+  );
+}
+```
+
+这个组件实现了光标显示的完整逻辑：
+
+**订阅更新**：实时接收其他人的光标移动
+
+**颜色分配**：根据用户 ID 生成固定颜色，保持一致性
+
+**坐标转换**：将行号转换为像素位置，正确显示光标
+
+**超时清理**：移除不活跃的光标，避免显示错误
+
+### 在线用户列表
+
+知道谁在线，是协作应用的基础功能。
+
+```typescript
+// apps/web/src/components/editor/OnlineUsers.tsx
+
+"use client";
+
+import { useEffect, useState } from "react";
+import { trpc } from "@/lib/trpc/client";
+import Image from "next/image";
+
+interface OnlineUsersProps {
+  documentId: string;
+}
+
+export function OnlineUsers({ documentId }: OnlineUsersProps) {
+  const { data: users, refetch } = trpc.documents.onlineUsers.useQuery(
+    { documentId },
+    {
+      refetchInterval: 5000, // 每 5 秒刷新一次
+    }
+  );
+
+  // 订阅文档更新，用户加入时刷新列表
+  trpc.documents.onDocumentUpdate.useSubscription(
+    { documentId },
+    {
+      onData: () => {
+        refetch();
+      },
+    }
+  );
+
+  if (!users || users.length === 0) {
+    return (
+      <div className="text-sm text-gray-500">
+        暂无在线用户
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      {users.map((session) => (
+        <div
+          key={session.userId}
+          className="relative group"
+          title={session.user.name}
+        >
+          <div className="relative">
+            {session.user.avatar ? (
+              <Image
+                src={session.user.avatar}
+                alt={session.user.name}
+                width={32}
+                height={32}
+                className="rounded-full"
+              />
+            ) : (
+              <div className="w-8 h-8 rounded-full bg-gray-300 flex items-center justify-center">
+                {session.user.name[0].toUpperCase()}
+              </div>
+            )}
+
+            {/* 在线指示器 */}
+            <div className="absolute bottom-0 right-0 w-3 h-3 bg-green-500 rounded-full border-2 border-white" />
+          </div>
+
+          {/* Tooltip */}
+          <div className="absolute bottom-full left-1/2 transform -translate-x-1/2 mb-2 px-2 py-1 bg-gray-800 text-white text-xs rounded opacity-0 group-hover:opacity-100 transition-opacity">
+            {session.user.name}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+```
+
+这个组件提供了在线用户的实时视图：
+
+**定期刷新**：每 5 秒查询一次在线用户
+
+**事件驱动**：用户加入或离开时立即更新
+
+**视觉反馈**：头像、在线指示器、悬停提示
+
+### 编辑器主页面
+
+把所有组件组合到一起，形成一个完整的编辑器页面。
+
+```typescript
+// apps/web/src/app/documents/[id]/page.tsx
+
+import { notFound } from "next/navigation";
+import { serverClient } from "@/lib/trpc/server";
+import { MonacoEditor } from "@/components/editor/MonacoEditor";
+import { OnlineUsers } from "@/components/editor/OnlineUsers";
+import { getServerSession } from "next-auth";
+
+export default async function DocumentPage({
+  params,
+}: {
+  params: { id: string };
+}) {
+  const session = await getServerSession();
+
+  if (!session?.user) {
+    return <div>请先登录</div>;
+  }
+
+  // 服务端获取文档信息
+  const document = await serverClient.documents.byId.query({
+    id: params.id,
+  });
+
+  if (!document) {
+    notFound();
+  }
+
+  return (
+    <div className="flex h-screen flex-col">
+      {/* 顶部工具栏 */}
+      <header className="flex items-center justify-between border-b px-4 py-3">
+        <div className="flex items-center gap-4">
+          <h1 className="text-xl font-semibold">{document.title}</h1>
+
+          <span className="text-sm text-gray-500">
+            {document.language}
+          </span>
+        </div>
+
+        <div className="flex items-center gap-4">
+          {/* 在线用户 */}
+          <OnlineUsers documentId={document.id} />
+
+          {/* 分享按钮 */}
+          <button className="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+            分享
+          </button>
+        </div>
+      </header>
+
+      {/* 编辑器区域 */}
+      <main className="flex-1 relative">
+        <MonacoEditor
+          documentId={document.id}
+          initialContent={document.content}
+          language={document.language}
+          readOnly={false}
+        />
+      </main>
+
+      {/* 底部状态栏 */}
+      <footer className="flex items-center justify-between border-t px-4 py-2 text-sm text-gray-600">
+        <div>
+          行 {currentLine}，列 {currentColumn}
+        </div>
+        <div>
+          版本 {document.version} ·
+          上次保存 {formatTime(document.updatedAt)}
+        </div>
+      </footer>
+    </div>
+  );
+}
+```
+
+这个页面整合了所有编辑器功能，提供完整的协作编辑体验。关键设计：
+
+**SSR 优化**：服务端获取文档数据，减少首屏加载时间
+
+**权限验证**：未登录用户无法访问
+
+**状态展示**：工具栏、状态栏提供丰富的上下文信息
+
+## 性能优化
+
+实时协作对性能要求很高，任何延迟都会影响用户体验。这里有几个优化技巧：
+
+### 批量更新
+
+频繁的网络请求会影响性能。我们可以将多个编辑操作批量提交。
+
+```typescript
+// 使用累积器收集更新
+const updateBuffer = useRef<any[]>([]);
+
+const flushBuffer = useCallback(() => {
+  if (updateBuffer.current.length === 0) return;
+
+  trpc.documents.updateContent.mutate({
+    documentId,
+    updates: updateBuffer.current,
+  });
+
+  updateBuffer.current = [];
+}, [documentId]);
+
+// 用户输入时，添加到缓冲区
+const handleEditorChange = (value: string) => {
+  updateBuffer.current.push({
+    type: "insert",
+    position: cursorPosition,
+    content: insertedText,
+  });
+
+  // 100ms 后刷新缓冲区
+  setTimeout(flushBuffer, 100);
+};
+```
+
+### 差异同步
+
+只传输变化的部分，而不是整个文档。
+
+```typescript
+import * as diff from "diff";
+
+const oldContent = "Hello World";
+const newContent = "Hello Beautiful World";
+
+const changes = diff.diffChars(oldContent, newContent);
+
+// 只传输变化的 diff，而不是完整内容
+trpc.documents.updateContent.mutate({
+  documentId,
+  changes,
+});
+```
+
+### WebSocket 压缩
+
+文本数据可以压缩，减少传输大小。
+
+```typescript
+import { compress, decompress } from "lz-string";
+
+// 发送前压缩
+const compressed = compress(newContent);
+
+// 接收后解压
+const decompressed = decompress(compressed);
+```
+
+### 离线支持
+
+网络不稳定时，允许本地编辑，恢复后自动同步。
+
+```typescript
+// 使用 IndexedDB 存储离线编辑
+const offlineStore = {
+  async saveUpdate(documentId: string, update: any) {
+    const key = `doc:${documentId}:pending`;
+    const pending = await this.get(key);
+    pending.push(update);
+    await localStorage.setItem(key, JSON.stringify(pending));
+  },
+
+  async getPendingUpdates(documentId: string) {
+    const key = `doc:${documentId}:pending`;
+    const pending = await this.get(key);
+    return pending || [];
+  },
+
+  async clearPending(documentId: string) {
+    const key = `doc:${documentId}:pending`;
+    await localStorage.removeItem(key);
+  },
+};
+
+// 网络恢复后，同步离线编辑
+window.addEventListener("online", async () => {
+  const pending = await offlineStore.getPendingUpdates(documentId);
+
+  for (const update of pending) {
+    await trpc.documents.updateContent.mutate(update);
+  }
+
+  await offlineStore.clearPending(documentId);
+});
+```
+
+## 部署考虑
+
+部署协作编辑器需要特别注意 WebSocket 支持和负载均衡。
+
+### Vercel 部署
+
+Vercel 默认不支持 WebSocket，需要使用其他服务。
+
+```typescript
+// 使用 Supabase Realtime 作为 WebSocket 后端
+import { RealtimeChannel } from "@supabase/supabase-js";
+
+const channel = supabase
+  .channel(`document:${documentId}`)
+  .on(
+    "postgres_changes",
+    {
+      event: "UPDATE",
+      schema: "public",
+      table: "documents",
+      filter: `id=eq.${documentId}`,
+    },
+    (payload) => {
+      setContent(payload.new.content);
+    }
+  )
+  .subscribe();
+```
+
+### 自托管部署
+
+使用 Nginx 作为反向代理，支持 WebSocket。
+
+```nginx
+# nginx.conf
+location /trpc {
+    proxy_pass http://backend;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 86400;
+}
+```
+
+### 扩展性考虑
+
+当用户量增长时，单一服务器无法承载所有 WebSocket 连接。这时需要：
+
+**Redis Pub/Sub**：跨服务器广播消息
+
+**连接迁移**：用户重连时恢复状态
+
+**负载均衡**：根据服务器负载分配连接
+
+## 总结与权衡
+
+协作编辑器是个有趣但也复杂的项目。我们用了这么多技术，到底值得吗？
+
+**CRDT 的代价**：CRDT 算法复杂，学习曲线陡峭。但它带来的好处是明显的：无需担心冲突，任何编辑都能正确合并。对于实时协作来说，这个收益是值得的。
+
+**WebSocket vs 轮询**：WebSocket 保持长连接，服务器资源消耗大，但实时性好。轮询实现简单，但延迟高。对于协作编辑，实时性至关重要，WebSocket 是更好的选择。
+
+**乐观 vs 悲观同步**：我们采用乐观策略，立即显示用户的修改，后台同步。这给用户更快的反馈，但可能导致短暂的不一致。悲观策略等待服务器确认才显示，一致性好但体验差。根据应用场景权衡。
+
+**单服务器 vs 分布式**：单服务器实现简单，但扩展性差。分布式支持大规模用户，但增加了复杂度。从小做起，按需扩展。
+
+这个项目展示了 tRPC 在复杂场景下的能力。类型安全让我们在实现复杂的协作逻辑时，仍有信心代码是正确的。实时 Subscription 让多用户交互变得简单。这就是 tRPC 的价值所在。
+
+## 下一步
+
+我们已经完成了一个相当复杂的协作编辑器，实时同步、冲突解决、多光标显示都有了。下一个项目是构建一个全栈电商系统，涵盖商品目录、购物车、订单管理、支付集成等更全面的业务场景。
+
+这将是本系列的最后一篇文章，会综合运用前面学到的所有知识，包括 Monorepo 架构、类型安全、测试、实时更新等等。让我们为这个系列画上一个圆满的句号。

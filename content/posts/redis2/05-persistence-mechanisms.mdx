@@ -1,0 +1,393 @@
+---
+title: "05. Redis 持久化机制：RDB 与 AOF"
+date: "2026-03-23"
+summary: "深入理解 Redis 的两种持久化方式 RDB 和 AOF，以及混合持久化机制，选择合适的持久化方案。"
+tags: ["Redis", "持久化", "RDB", "AOF"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 5
+---
+
+## 为什么需要持久化
+
+前几篇文章我们一直在说 Redis 是内存数据库，数据存在内存里。内存的速度快，但有一个致命问题：断电后数据就没了。
+
+你可能会说：我的 Redis 只用来做缓存，数据丢了没关系，大不了重新查数据库。但问题是，如果 Redis 短时间内丢了大量缓存数据，所有请求都会打到数据库，可能导致数据库宕机。这就是"缓存雪崩"。
+
+另一个场景是 Redis 存储的是重要数据，比如用户 Session、购物车、统计数据。这些数据丢了，用户体验会受影响，甚至造成业务损失。
+
+所以，虽然 Redis 是内存数据库，但它提供了持久化机制，可以把内存数据保存到磁盘，重启后恢复。
+
+## 两种持久化方式
+
+Redis 提供了两种持久化方式：
+
+- RDB（Redis Database）：定时生成内存快照，保存到磁盘
+- AOF（Append Only File）：记录每个写命令，重启时重新执行
+
+这两种方式各有优缺点，也可以同时使用。下面我们详细看看。
+
+## RDB 持久化
+
+### 工作原理
+
+RDB 的工作原理很简单：每隔一段时间，Redis 会把当前内存中的数据生成一个快照，保存到磁盘上的 RDB 文件。
+
+具体过程是这样的：
+
+1. Redis 主进程 fork 一个子进程
+2. 子进程把内存数据写入临时文件
+3. 写完后用临时文件替换旧的 RDB 文件
+4. 主进程继续处理命令，不阻塞
+
+注意第 1 步的 fork 操作。fork 是 Linux 系统调用，它会创建一个子进程，复制父进程的内存空间。但 Linux 使用了写时复制（Copy-on-Write）技术， fork 时并不真正复制内存，而是父子进程共享同一块内存。只有当内存被修改时，才会复制。这样 fork 的开销就很小。
+
+### 配置方式
+
+在 redis.conf 中配置 RDB：
+
+```bash
+# RDB 保存规则
+# save <seconds> <changes>
+# 表示在 <seconds> 秒内如果有 <changes> 个 key 变化，则保存
+
+save 900 1     # 900 秒（15 分钟）内至少 1 个 key 变化
+save 300 10    # 300 秒（5 分钟）内至少 10 个 key 变化
+save 60 10000  # 60 秒（1 分钟）内至少 10000 个 key 变化
+
+# 如果不想使用 RDB，可以注释掉所有 save 行，或设置：
+# save ""
+
+# RDB 文件名
+dbfilename dump.rdb
+
+# RDB 文件目录
+dir /var/lib/redis
+
+# 是否压缩 RDB 文件
+rdbcompression yes
+
+# RDB 文件是否校验
+rdbchecksum yes
+```
+
+这三个 save 规则的意思是：
+
+- 如果 15 分钟内有至少 1 个 key 变化，就保存
+- 如果 5 分钟内有至少 10 个 key 变化，就保存
+- 如果 1 分钟内有至少 10000 个 key 变化，就保存
+
+这样设计的好处是：数据变化频繁时保存频率高，变化不频繁时保存频率低，平衡了性能和数据完整性。
+
+### 手动触发 RDB
+
+除了自动触发，你也可以手动触发 RDB：
+
+```bash
+# 同步保存（会阻塞）
+SAVE
+
+# 异步保存（不阻塞，推荐）
+BGSAVE
+
+# 查看最后一次 RDB 保存时间
+LASTSAVE
+```
+
+`BGSAVE` 会 fork 子进程进行保存，主进程继续处理请求。`SAVE` 是同步保存，会阻塞所有请求，生产环境不要用。
+
+### RDB 的优缺点
+
+RDB 的优点：
+
+- 文件紧凑，占用空间小
+- 恢复速度快，直接加载到内存
+- 对性能影响小，fork 子进程进行持久化
+- 适合备份，可以定期复制 RDB 文件到其他服务器
+
+RDB 的缺点：
+
+- 可能丢失数据。如果 Redis 异常终止，会丢失最后一次快照之后的所有数据
+- fork 操作有开销，数据量大时更明显
+- 不适合实时持久化，无法做到秒级保存
+
+### RDB 适用场景
+
+RDB 适合这些场景：
+
+- 数据可以丢失一部分
+- 需要定期备份
+- 数据量大，恢复速度快很重要
+
+典型的场景是缓存：缓存数据丢了可以从数据库重建，所以 RDB 是合适的。
+
+## AOF 持久化
+
+### 工作原理
+
+AOF 的工作原理是：记录每个写命令，追加到 AOF 文件。Redis 重启时，重新执行 AOF 文件中的命令，恢复数据。
+
+具体过程是这样的：
+
+1. Redis 执行写命令
+2. 把命令追加到 AOF 缓冲区
+3. 根据同步策略，把缓冲区内容写入文件
+4. Redis 重启时，读取 AOF 文件，重新执行命令
+
+注意第 3 步的同步策略。Redis 提供了三种策略：
+
+- always：每次写命令都同步到磁盘
+- everysec：每秒同步一次（推荐）
+- no：由操作系统决定何时同步
+
+### 配置方式
+
+在 redis.conf 中配置 AOF：
+
+```bash
+# 启用 AOF
+appendonly yes
+
+# AOF 文件名
+appendfilename "appendonly.aof"
+
+# AOF 同步策略
+appendfsync everysec
+
+# 其他选项：
+# appendfsync always    # 每次写命令都同步（最安全，但最慢）
+# appendfsync everysec  # 每秒同步一次（推荐）
+# appendfsync no        # 由操作系统决定（最快，但可能丢失最多数据）
+
+# AOF 重写配置
+no-appendfsync-on-rewrite no   # 重写时是否不同步
+auto-aof-rewrite-percentage 100 # AOF 文件大小比上次重写增长的百分比
+auto-aof-rewrite-min-size 64mb  # 触发重写的 AOF 文件最小大小
+
+# AOF 加载时是否忽略最后可能损坏的命令
+aof-load-truncated yes
+```
+
+`appendfsync everysec` 是推荐配置，平衡了数据安全性和性能。它表示每秒同步一次，最多丢失 1 秒数据。
+
+### AOF 重写
+
+AOF 文件会随着时间增长，因为每个写命令都会追加。比如你执行 100 次 `INCR count`，AOF 文件就会有 100 条 `INCR count` 命令。
+
+AOF 重写可以压缩文件：读取当前内存数据，生成最少的命令。比如 `count` 的值是 100，重写后就只有一条 `SET count 100` 命令。
+
+```bash
+# 手动触发 AOF 重写（异步）
+BGREWRITEAOF
+
+# 配置自动重写
+auto-aof-rewrite-percentage 100  # 文件大小是上次重写的 2 倍时触发
+auto-aof-rewrite-min-size 64mb   # 文件至少 64MB 才触发重写
+```
+
+重写过程和 RDB 类似，也是 fork 子进程进行，不会阻塞主进程。
+
+### AOF 的优缺点
+
+AOF 的优点：
+
+- 数据完整性高，最多丢失 1 秒数据（everysec 模式）
+- AOF 文件是文本格式，可以查看和修改
+- 容错性好，即使文件末尾损坏，也可以恢复
+
+AOF 的缺点：
+
+- 文件大，通常比 RDB 文件大
+- 恢复慢，需要重新执行所有命令
+- 性能影响，每次写命令都有开销（everysec 模式）
+
+### AOF 适用场景
+
+AOF 适合这些场景：
+
+- 不能接受数据丢失
+- 需要查看命令历史
+- 数据审计
+
+典型的场景是 Session 存储、购物车、统计数据。这些数据丢了用户体验会受影响，所以 AOF 更合适。
+
+## 混合持久化
+
+Redis 4.0+ 引入了混合持久化，结合了 RDB 和 AOF 的优势。
+
+### 工作原理
+
+混合持久化的工作原理：
+
+- AOF 重写时，先生成 RDB 格式的文件
+- 把重写期间的新命令以 AOF 格式追加
+- 最终文件：RDB（开头）+ AOF（增量）
+
+这样既利用了 RDB 的紧凑性和快速恢复，又利用了 AOF 的数据完整性。
+
+### 配置方式
+
+```bash
+# 启用 AOF
+appendonly yes
+
+# 启用混合持久化（Redis 4.0+）
+aof-use-rdb-preamble yes
+```
+
+混合持久化是 Redis 4.0+ 的推荐配置，结合了两种方式的优势。
+
+## 如何选择持久化方案
+
+选择持久化方案要考虑几个因素：
+
+### 1. 数据重要性
+
+如果数据可以丢失，比如纯缓存场景，可以关闭持久化或只用 RDB：
+
+```bash
+# 纯缓存场景
+save ""
+appendonly no
+```
+
+如果数据不能丢失，比如 Session、购物车，用 AOF 或混合持久化：
+
+```bash
+# 数据完整性要求高
+save ""
+appendonly yes
+appendfsync everysec
+aof-use-rdb-preamble yes  # Redis 4.0+
+```
+
+### 2. 性能要求
+
+如果性能是第一优先级，用 RDB：
+
+```bash
+# 性能优先
+save 900 1
+save 300 10
+save 60 10000
+appendonly no
+```
+
+如果数据完整性是第一优先级，用 AOF：
+
+```bash
+# 数据完整性优先
+save ""
+appendonly yes
+appendfsync everysec
+```
+
+### 3. 恢复速度
+
+如果恢复速度快很重要，比如数据量大，用 RDB 或混合持久化：
+
+```bash
+# 恢复速度优先
+appendonly yes
+aof-use-rdb-preamble yes  # 混合持久化
+```
+
+### 推荐配置
+
+对于大多数场景，推荐使用混合持久化：
+
+```bash
+# 推荐配置
+save ""
+appendonly yes
+appendfsync everysec
+aof-use-rdb-preamble yes
+auto-aof-rewrite-percentage 100
+auto-aof-rewrite-min-size 64mb
+```
+
+这个配置平衡了数据完整性、性能和恢复速度。
+
+## 直播平台的持久化策略
+
+让我们用直播平台的场景来设计持久化策略。
+
+### 缓存数据
+
+缓存数据可以丢失，关闭持久化或只用 RDB：
+
+```bash
+# 缓存数据不需要持久化
+# livestream:cache:*
+# 这些数据可以从数据库重建
+```
+
+### Session 数据
+
+Session 数据不能丢失，用 AOF：
+
+```bash
+# Session 数据需要持久化
+# livestream:session:*
+
+# 配置
+appendonly yes
+appendfsync everysec
+aof-use-rdb-preamble yes
+```
+
+### 统计数据
+
+统计数据可以接受少量丢失，用 RDB：
+
+```bash
+# 统计数据
+# livestream:stats:*
+
+# 配置
+save 900 1
+save 300 10
+save 60 10000
+appendonly no
+```
+
+### 排行榜数据
+
+排行榜数据不能完全丢失，但可以接受短时间丢失，用混合持久化：
+
+```bash
+# 排行榜数据
+# livestream:room:abc123:gift:leaderboard
+
+# 配置
+save ""
+appendonly yes
+appendfsync everysec
+aof-use-rdb-preamble yes
+```
+
+## Trade-off：性能 vs 数据完整性
+
+持久化的核心 Trade-off 是性能 vs 数据完整性。
+
+- RDB：性能好，但可能丢失数据
+- AOF：数据完整性好，但性能差
+- 混合持久化：折中方案
+
+选择时要考虑业务需求。如果数据可以丢失，优先 RDB。如果数据不能丢失，优先 AOF。如果不确定，用混合持久化。
+
+但记住，持久化不是银弹。它只能降低数据丢失的风险，不能完全避免。如果要 100% 数据安全，需要配合主从复制、集群等高可用方案。
+
+## 小结
+
+今天我们学了 Redis 的持久化机制。记住几个要点：
+
+1. RDB 是快照，适合备份和可以丢失数据的场景
+2. AOF 是日志，适合不能丢失数据的场景
+3. 混合持久化结合了两者优势，是推荐配置
+4. 选择持久化方案要权衡性能和数据完整性
+5. 持久化不能完全避免数据丢失，高可用需要配合其他方案
+
+下一篇文章我们会深入 String 类型的应用，看看如何用 String 实现计数器、分布式锁和限流功能。

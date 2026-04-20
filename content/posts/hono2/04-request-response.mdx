@@ -1,0 +1,760 @@
+---
+title: "04. 请求与响应处理"
+date: "2026-03-20"
+summary: "深入掌握 Hono 的请求与响应处理机制，学习如何高效读取请求数据、处理各种响应类型、管理 Cookie，以及实现文件下载和流式响应等高级功能。"
+tags: ["Hono", "TypeScript", "Request", "Response", "Cookie"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 4
+---
+
+在上一篇文章中，我们学习了如何使用中间件来增强博客 API 的功能。但构建一个完整的 API，还需要深入理解如何处理 HTTP 请求和响应。
+
+无论是获取用户提交的表单数据、解析 JSON 请求体、设置 Cookie，还是返回各种格式的响应，都需要一个简洁而强大的 API。Hono 提供了一套优雅且直观的请求/响应处理 API，让你能够轻松应对各种场景。
+
+与 Express 不同，Hono 采用了统一的 Context（上下文）对象模式，所有的请求和响应操作都通过 `c` 对象完成，这种设计更加简洁和一致。
+
+让我们继续完善博客 API，学习如何处理各种请求和响应场景。
+
+## Context 对象详解
+
+Hono 的每个路由处理器都会接收一个 `Context` 对象（通常命名为 `c`），它是连接请求和响应的桥梁。
+
+### Context 的核心结构
+
+```typescript
+import { Hono } from "hono";
+
+const app = new Hono();
+
+app.get("/", (c) => {
+  // c 是 Context 对象的实例
+
+  // 请求相关（通过 c.req 访问）
+  const url = c.req.url;
+  const method = c.req.method;
+  const header = c.req.header("User-Agent");
+
+  // 响应相关（直接通过 c 调用）
+  return c.json({ message: "Hello" });
+});
+```
+
+### Context 的主要属性和方法
+
+```typescript
+// 请求相关
+c.req.url;
+c.req.method;
+c.req.header();
+c.req.query();
+c.req.param();
+c.req.json();
+c.req.text();
+c.req.formData();
+
+// 响应相关
+c.json();
+c.text();
+c.html();
+c.xml();
+c.body();
+c.header();
+c.status();
+c.redirect();
+
+// 状态管理
+c.set();
+c.get();
+c.var;
+```
+
+## 读取请求数据
+
+### 1. 读取请求头
+
+获取单个或多个请求头信息。
+
+```typescript
+import { Hono } from "hono";
+
+const app = new Hono();
+
+// 获取单个请求头
+app.get("/", (c) => {
+  const userAgent = c.req.header("User-Agent");
+  const authorization = c.req.header("Authorization");
+
+  return c.json({
+    userAgent,
+    hasAuth: !!authorization,
+  });
+});
+
+// 检查请求头是否存在
+app.use("/api/*", async (c, next) => {
+  const apiKey = c.req.header("X-API-Key");
+
+  if (!apiKey) {
+    return c.json({ error: "API Key required" }, 401);
+  }
+
+  await next();
+});
+```
+
+在博客 API 中，我们可以用请求头来处理认证和内容协商。
+
+```typescript
+// 认证中间件
+app.use("/api/protected/*", async (c, next) => {
+  const authorization = c.req.header("Authorization");
+
+  if (!authorization?.startsWith("Bearer ")) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  const token = authorization.substring(7);
+  const user = await verifyToken(token);
+
+  c.set("user", user);
+
+  await next();
+});
+```
+
+### 2. 读取查询参数
+
+处理 URL 查询字符串（`?key=value&foo=bar`）。
+
+```typescript
+// 获取单个查询参数
+app.get("/posts", (c) => {
+  const page = c.req.query("page");
+  const limit = c.req.query("limit");
+
+  return c.json({
+    page: page || "1",
+    limit: limit || "10",
+  });
+});
+
+// 获取所有查询参数
+app.get("/search", (c) => {
+  const queries = c.req.query();
+  return c.json(queries);
+});
+```
+
+在博客 API 中，我们可以用查询参数来实现分页和筛选。
+
+```typescript
+app.get("/api/posts", (c) => {
+  const page = parseInt(c.req.query("page") || "1");
+  const limit = parseInt(c.req.query("limit") || "10");
+  const keyword = c.req.query("keyword");
+  const published = c.req.query("published");
+
+  // 构建查询条件
+  const conditions = {};
+
+  if (keyword) {
+    conditions.title = { contains: keyword };
+  }
+
+  if (published !== undefined) {
+    conditions.published = published === "true";
+  }
+
+  // 查询数据
+  const posts = await getPosts(conditions, page, limit);
+
+  return c.json({
+    data: posts,
+    meta: { page, limit, total: posts.length },
+  });
+});
+```
+
+### 3. 读取路径参数
+
+获取路由中定义的动态参数。
+
+```typescript
+// 单个路径参数
+app.get("/posts/:id", (c) => {
+  const id = c.req.param("id");
+  return c.json({ postId: id });
+});
+
+// 多个路径参数
+app.get("/users/:userId/posts/:postId", (c) => {
+  const { userId, postId } = c.req.param();
+  return c.json({ userId, postId });
+});
+```
+
+### 4. 解析请求体
+
+处理各种类型的请求体数据。
+
+#### JSON 请求体
+
+```typescript
+// 解析 JSON
+app.post("/posts", async (c) => {
+  const body = await c.req.json();
+  const { title, content } = body;
+
+  return c.json({ message: "Post created", title, content });
+});
+```
+
+在博客 API 中，我们需要验证请求体数据。
+
+```typescript
+app.post("/api/posts", async (c) => {
+  const body = await c.req.json();
+  const { title, content, published } = body;
+
+  // 验证必填字段
+  if (!title || !content) {
+    return c.json(
+      {
+        error: "Title and content are required",
+      },
+      400
+    );
+  }
+
+  // 创建文章
+  const post = await createPost({
+    title,
+    content,
+    published: published || false,
+    authorId: c.get("user").id,
+  });
+
+  return c.json({ data: post }, 201);
+});
+```
+
+#### FormData 请求体
+
+处理表单数据和文件上传。
+
+```typescript
+// 解析表单数据
+app.post("/contact", async (c) => {
+  const body = await c.req.formData();
+
+  const name = body.get("name");
+  const email = body.get("email");
+  const message = body.get("message");
+
+  return c.json({
+    name,
+    email,
+    message,
+  });
+});
+```
+
+在博客 API 中，我们可以用 FormData 来处理文章封面图上传。
+
+```typescript
+app.post("/api/posts/:id/cover", async (c) => {
+  const id = c.req.param("id");
+  const body = await c.req.formData();
+  const file = body.get("cover") as File;
+
+  if (!file) {
+    return c.json({ error: "No file uploaded" }, 400);
+  }
+
+  // 验证文件类型
+  if (!file.type.startsWith("image/")) {
+    return c.json({ error: "Only images allowed" }, 400);
+  }
+
+  // 验证文件大小（5MB）
+  if (file.size > 5 * 1024 * 1024) {
+    return c.json({ error: "File too large" }, 400);
+  }
+
+  // 保存文件
+  const filename = await saveFile(file);
+
+  // 更新文章
+  await updatePost(id, { coverImage: filename });
+
+  return c.json({ data: { coverImage: filename } });
+});
+```
+
+## Cookie 管理
+
+Cookie 是在客户端存储小量数据的重要方式。Hono 提供了便捷的 Cookie 操作工具。
+
+### 基本操作
+
+```typescript
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
+
+// 设置 Cookie
+app.post("/login", (c) => {
+  setCookie(c, "token", "abc123", {
+    httpOnly: true,
+    secure: true,
+    sameSite: "Lax",
+    maxAge: 3600,
+    path: "/",
+  });
+
+  return c.text("Login successful");
+});
+
+// 获取 Cookie
+app.get("/profile", (c) => {
+  const token = getCookie(c, "token");
+
+  if (!token) {
+    return c.json({ error: "Not authenticated" }, 401);
+  }
+
+  return c.json({ token });
+});
+
+// 删除 Cookie
+app.post("/logout", (c) => {
+  deleteCookie(c, "token");
+  return c.text("Logout successful");
+});
+```
+
+在博客 API 中，我们可以用 Cookie 来实现用户认证。
+
+```typescript
+import { sign } from "hono/jwt";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
+
+// 登录
+app.post("/api/auth/login", async (c) => {
+  const { email, password } = await c.req.json();
+
+  // 验证用户
+  const user = await authenticateUser(email, password);
+
+  if (!user) {
+    return c.json({ error: "Invalid credentials" }, 401);
+  }
+
+  // 生成 JWT
+  const token = await sign(
+    { sub: user.id, email: user.email },
+    process.env.JWT_SECRET!
+  );
+
+  // 设置 Cookie
+  setCookie(c, "auth_token", token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "Lax",
+    maxAge: 7 * 24 * 60 * 60,
+    path: "/",
+  });
+
+  return c.json({ message: "Login successful" });
+});
+
+// 受保护的路由
+app.get("/api/me", async (c) => {
+  const token = getCookie(c, "auth_token");
+
+  if (!token) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  // 验证 token
+  try {
+    const payload = await verify(token, process.env.JWT_SECRET!);
+    const user = await findUser(payload.sub);
+
+    return c.json({ data: user });
+  } catch (error) {
+    return c.json({ error: "Invalid token" }, 401);
+  }
+});
+
+// 登出
+app.post("/api/auth/logout", (c) => {
+  deleteCookie(c, "auth_token");
+  return c.json({ message: "Logout successful" });
+});
+```
+
+## 返回响应
+
+### 1. JSON 响应
+
+最常用的响应类型，用于 API。
+
+```typescript
+// 基本 JSON 响应
+app.get("/posts", (c) => {
+  return c.json({ posts: [] });
+});
+
+// 带状态码的 JSON 响应
+app.post("/posts", async (c) => {
+  const post = await createPost();
+
+  return c.json({ message: "Post created", post }, 201);
+});
+```
+
+在博客 API 中，我们需要统一 JSON 响应格式。
+
+```typescript
+// 成功响应
+const success = (data: any, message?: string) => ({
+  success: true,
+  data,
+  message,
+});
+
+// 错误响应
+const error = (message: string) => ({
+  success: false,
+  error: message,
+});
+
+app.get("/api/posts", async (c) => {
+  const posts = await getPosts();
+  return c.json(success(posts));
+});
+
+app.post("/api/posts", async (c) => {
+  try {
+    const post = await createPost(await c.req.json());
+    return c.json(success(post, "Post created"), 201);
+  } catch (err) {
+    return c.json(error("Failed to create post"), 400);
+  }
+});
+```
+
+### 2. 设置响应头
+
+```typescript
+// 设置单个响应头
+app.get("/posts", (c) => {
+  c.header("Cache-Control", "public, max-age=3600");
+  c.header("X-Custom-Header", "custom-value");
+
+  return c.json({ data: [] });
+});
+```
+
+在博客 API 中，我们可以用响应头来控制缓存。
+
+```typescript
+app.get("/api/posts/:id", async (c) => {
+  const post = await getPost(c.req.param("id"));
+
+  // 设置缓存
+  c.header("Cache-Control", "public, max-age=3600");
+  c.header("ETag", post.updatedAt);
+
+  return c.json({ data: post });
+});
+```
+
+### 3. 重定向
+
+```typescript
+// 临时重定向（302）
+app.get("/old-path", (c) => {
+  return c.redirect("/new-path");
+});
+
+// 永久重定向（301）
+app.get("/legacy-page", (c) => {
+  return c.redirect("/new-page", 301);
+});
+```
+
+在博客 API 中，我们可以用重定向来处理 URL 变更。
+
+```typescript
+// 处理旧的文章 URL
+app.get("/blog/:id", async (c) => {
+  const id = c.req.param("id");
+  const post = await getPost(id);
+
+  if (!post) {
+    return c.json({ error: "Post not found" }, 404);
+  }
+
+  // 重定向到新的 URL
+  return c.redirect(`/posts/${post.slug}`, 301);
+});
+```
+
+## 文件下载
+
+### 基本文件下载
+
+```typescript
+import { readFile } from "fs/promises";
+
+// 下载静态文件
+app.get("/download/:filename", async (c) => {
+  const filename = c.req.param("filename");
+  const filepath = `./uploads/${filename}`;
+
+  try {
+    const file = await readFile(filepath);
+
+    return c.body(file, 200, {
+      "Content-Type": "application/octet-stream",
+      "Content-Disposition": `attachment; filename="${filename}"`,
+    });
+  } catch (error) {
+    return c.json({ error: "File not found" }, 404);
+  }
+});
+```
+
+在博客 API 中，我们可以实现文章导出功能。
+
+```typescript
+app.get("/api/posts/:id/export", async (c) => {
+  const post = await getPost(c.req.param("id"));
+
+  if (!post) {
+    return c.json({ error: "Post not found" }, 404);
+  }
+
+  // 生成 Markdown
+  const markdown = `# ${post.title}\n\n${post.content}`;
+
+  c.header("Content-Type", "text/markdown");
+  c.header("Content-Disposition", `attachment; filename="${post.slug}.md"`);
+
+  return c.text(markdown);
+});
+```
+
+## 状态码使用指南
+
+选择正确的 HTTP 状态码是良好的 API 设计实践。
+
+```typescript
+// 成功响应
+app.get("/posts/:id", async (c) => {
+  const post = await getPost(c.req.param("id"));
+
+  if (!post) {
+    return c.json({ error: "Post not found" }, 404);
+  }
+
+  return c.json({ data: post }, 200);
+});
+
+// 创建成功
+app.post("/posts", async (c) => {
+  const post = await createPost(await c.req.json());
+  return c.json({ data: post }, 201);
+});
+
+// 删除成功
+app.delete("/posts/:id", async (c) => {
+  await deletePost(c.req.param("id"));
+  return c.text("", 204);
+});
+```
+
+在博客 API 中，我们需要仔细选择状态码。
+
+```typescript
+// 200 OK - 成功获取资源
+app.get("/api/posts/:id", async (c) => {
+  const post = await getPost(c.req.param("id"));
+  return c.json({ data: post }, 200);
+});
+
+// 201 Created - 成功创建资源
+app.post("/api/posts", async (c) => {
+  const post = await createPost(await c.req.json());
+  return c.json({ data: post }, 201);
+});
+
+// 204 No Content - 成功删除资源
+app.delete("/api/posts/:id", async (c) => {
+  await deletePost(c.req.param("id"));
+  return c.text("", 204);
+});
+
+// 400 Bad Request - 请求参数错误
+app.post("/api/posts", async (c) => {
+  const body = await c.req.json();
+
+  if (!body.title) {
+    return c.json({ error: "Title is required" }, 400);
+  }
+});
+
+// 401 Unauthorized - 未认证
+app.post("/api/posts", authMiddleware, async (c) => {
+  // ...
+});
+
+// 404 Not Found - 资源不存在
+app.get("/api/posts/:id", async (c) => {
+  const post = await getPost(c.req.param("id"));
+
+  if (!post) {
+    return c.json({ error: "Post not found" }, 404);
+  }
+});
+
+// 409 Conflict - 资源冲突
+app.post("/api/users", async (c) => {
+  const { email } = await c.req.json();
+
+  const existing = await findUserByEmail(email);
+  if (existing) {
+    return c.json({ error: "Email already exists" }, 409);
+  }
+});
+```
+
+## 完整示例：博客 API 请求响应处理
+
+```typescript
+import { Hono } from "hono";
+import { getCookie, setCookie, deleteCookie } from "hono/cookie";
+import { sign, verify } from "hono/jwt";
+
+const app = new Hono();
+
+// 统一响应格式
+const success = (data: any, message?: string) => ({
+  success: true,
+  data,
+  message,
+});
+
+const error = (message: string) => ({
+  success: false,
+  error: message,
+});
+
+// 获取文章列表
+app.get("/api/posts", async (c) => {
+  const page = parseInt(c.req.query("page") || "1");
+  const limit = parseInt(c.req.query("limit") || "10");
+  const keyword = c.req.query("keyword");
+
+  const posts = await getPosts({ keyword }, page, limit);
+
+  c.header("Cache-Control", "public, max-age=60");
+  c.header("X-Total-Count", String(posts.total));
+
+  return c.json(success(posts.data));
+});
+
+// 获取文章详情
+app.get("/api/posts/:id", async (c) => {
+  const post = await getPost(c.req.param("id"));
+
+  if (!post) {
+    return c.json(error("Post not found"), 404);
+  }
+
+  c.header("Cache-Control", "public, max-age=3600");
+  c.header("ETag", post.updatedAt);
+
+  return c.json(success(post));
+});
+
+// 创建文章
+app.post("/api/posts", async (c) => {
+  const body = await c.req.json();
+  const { title, content, published } = body;
+
+  if (!title || !content) {
+    return c.json(error("Title and content are required"), 400);
+  }
+
+  const user = c.get("user");
+
+  const post = await createPost({
+    title,
+    content,
+    published: published || false,
+    authorId: user.id,
+  });
+
+  return c.json(success(post, "Post created"), 201);
+});
+
+// 用户登录
+app.post("/api/auth/login", async (c) => {
+  const { email, password } = await c.req.json();
+
+  const user = await authenticateUser(email, password);
+
+  if (!user) {
+    return c.json(error("Invalid credentials"), 401);
+  }
+
+  const token = await sign(
+    { sub: user.id, email: user.email },
+    process.env.JWT_SECRET!
+  );
+
+  setCookie(c, "auth_token", token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === "production",
+    sameSite: "Lax",
+    maxAge: 7 * 24 * 60 * 60,
+    path: "/",
+  });
+
+  return c.json(success({ user }, "Login successful"));
+});
+
+// 导出文章
+app.get("/api/posts/:id/export", async (c) => {
+  const post = await getPost(c.req.param("id"));
+
+  if (!post) {
+    return c.json(error("Post not found"), 404);
+  }
+
+  const markdown = `# ${post.title}\n\n${post.content}\n\n---\n\nPublished: ${post.published ? "Yes" : "No"}`;
+
+  c.header("Content-Type", "text/markdown; charset=utf-8");
+  c.header("Content-Disposition", `attachment; filename="${post.slug}.md"`);
+
+  return c.text(markdown);
+});
+
+export default app;
+```
+
+## 权衡与考虑
+
+Hono 的 Context 对象设计简洁统一，但需要时间熟悉。相比 Express 的 req/res 分离设计，Hono 的 c 对象更加一致，但也意味着需要记住更多的方法。
+
+Cookie 管理很方便，但需要注意安全性。在博客 API 中，我们使用 httpOnly 和 secure 来保护 Cookie，防止 XSS 攻击。但这也意味着前端 JavaScript 无法访问这些 Cookie，需要权衡安全性和便利性。
+
+文件下载功能强大，但大文件下载可能影响性能。在博客 API 中，我们对于文章导出这样的小文件直接返回，但对于大文件应该考虑使用流式传输或云存储。
+
+状态码的选择很重要，但过度使用会增加客户端复杂度。在博客 API 中，我们使用最常见的几个状态码（200、201、204、400、401、404、409），保持简单明了。
+
+在下一篇文章中，我们将深入学习数据验证与 Zod，了解如何使用 Zod 实现强大的数据验证，学习如何定义类型安全的 Schema、验证请求数据、处理复杂验证场景，并提供友好的错误提示。

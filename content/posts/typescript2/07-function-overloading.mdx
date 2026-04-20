@@ -1,0 +1,207 @@
+---
+title: "07. 函数重载与签名设计：设计优雅的 API"
+date: "2026-04-12"
+summary: "一个函数在不同参数下返回不同类型——联合类型做不到，泛型也做不到精确推导。函数重载是 TypeScript 设计灵活 API 的核心工具。"
+tags: ["TypeScript"]
+category: "typescript"
+cover: ""
+draft: false
+series: "TypeScript 类型系统进阶"
+seriesOrder: 7
+---
+
+核心篇的三篇文章里，我们构建了品牌类型、实现了工具类型、用映射类型批量变换了对象类型。但这些类型工具最终都要通过**函数**暴露给使用者。函数签名设计得好不好，直接决定了你的 API 用起来是顺手还是别扭。
+
+有一个很常见的需求：同一个函数，传入不同参数，返回不同类型。比如 API 客户端的 `get` 方法——传 `'/users'` 返回 `User[]`，传 `'/users/:id'` 返回 `User`。联合类型做不到这么精确的推导，泛型也难以表达这种"根据参数值的字面量类型决定返回类型"的逻辑。
+
+函数重载就是为这种场景设计的。
+
+## 一个联合类型搞不定的问题
+
+假设你在设计 API 客户端的 `get` 方法。路由表定义如下：
+
+```typescript
+type Routes = {
+  "/users": User[];
+  "/users/:id": User;
+  "/orders": Order[];
+};
+```
+
+你希望 `get('/users')` 返回 `User[]`，`get('/users/:id')` 返回 `User`。用泛型可以做到吗？
+
+```typescript
+function get<Path extends keyof Routes>(path: Path): Routes[Path] {
+  return fetch(path).then((r) => r.json());
+}
+
+const users = get("/users"); // User[]
+const user = get("/users/:id"); // User
+```
+
+看起来可以。但如果你的 API 还需要支持查询参数呢？有些路由需要参数，有些不需要：
+
+```typescript
+// 无参数的路由
+get("/users"); // User[]
+// 有参数的路由
+get("/users/:id", { id: "usr_a1x9k2m" }); // User
+// 带查询参数的路由
+get("/orders", { status: "pending", limit: 20 }); // Order[]
+```
+
+"有的路由不要参数，有的要路径参数，有的要查询参数"——一个泛型签名很难表达这种差异。这时候函数重载就派上用场了。
+
+## 函数重载：多个签名，一个实现
+
+函数重载的语法是：先声明多个函数签名（只写类型，不写实现），最后写一个实现签名（包含所有参数的可能情况）。
+
+```typescript
+// 重载签名 1：不需要参数的路由
+function get<R>(path: string): Promise<R>;
+// 重载签名 2：需要查询参数的路由
+function get<R, P extends object>(path: string, params: P): Promise<R>;
+// 实现签名：必须兼容所有重载签名
+function get<R, P extends object>(path: string, params?: P): Promise<R> {
+  const url = params ? `${path}?${new URLSearchParams(params as any)}` : path;
+  return fetch(url).then((r) => r.json());
+}
+```
+
+使用的时候，TypeScript 会根据你传入的参数数量和类型，匹配最合适的重载签名：
+
+```typescript
+const users = get("/users"); // 匹配签名 1
+const user = get("/users/:id", { id: "usr_a1x9k2m" }); // 匹配签名 2
+```
+
+## 重载签名的顺序：从具体到一般
+
+重载签名有顺序要求——TypeScript 从上往下匹配，**第一个匹配到的签名生效**。所以你要把最具体的签名放在前面，最宽泛的放在后面。
+
+```typescript
+// 具体的放前面
+function format(value: Date): string;
+function format(value: number): string;
+// 宽泛的放后面
+function format(value: string): string;
+// 实现
+function format(value: any): string {
+  if (value instanceof Date) return value.toISOString();
+  if (typeof value === "number") return value.toFixed(2);
+  return value;
+}
+
+format(new Date()); // 匹配第一个签名
+format(42); // 匹配第二个签名
+format("hello"); // 匹配第三个签名
+```
+
+如果你把 `format(value: string)` 放在第一个，那 `format(new Date())` 可能匹配到 string 签名（因为 Date 的 toString() 返回 string），或者直接报错——取决于 TypeScript 的具体行为。总之，把宽泛的签名放前面会让具体签名失效。
+
+## 联合类型 vs 重载：什么时候用哪个
+
+有时候同一个需求既可以用联合类型实现，也可以用重载实现。怎么选？
+
+```typescript
+// 联合类型版本
+function get(id: string | number): User | Order {
+  if (typeof id === "string") return fetchUser(id);
+  return fetchOrder(id);
+}
+
+// 重载版本
+function get(id: string): User;
+function get(id: number): Order;
+function get(id: string | number): User | Order {
+  if (typeof id === "string") return fetchUser(id);
+  return fetchOrder(id);
+}
+```
+
+区别在于**调用方的类型推导**：
+
+```typescript
+// 联合类型：返回值总是 User | Order
+const result1 = get("usr_a1x9k2m"); // User | Order — 你需要手动收窄
+const result2 = get(12345); // User | Order
+
+// 重载：返回值跟着参数走
+const result3 = get("usr_a1x9k2m"); // User — 精确
+const result4 = get(12345); // Order — 精确
+```
+
+重载版本让调用方不需要手动收窄返回类型。当**不同的输入对应不同的输出类型**时，用重载。当**输出类型和输入无关**时，用联合类型。
+
+## this 类型：链式调用
+
+API 客户端经常需要链式调用：`client.get('/users').query({ limit: 10 }).header({ Auth: '...' })`。要实现类型安全的链式调用，需要 `this` 类型。
+
+```typescript
+class ApiRequest<T> {
+  private url: string;
+  private params: Record<string, string> = {};
+
+  constructor(url: string) {
+    this.url = url;
+  }
+
+  // 关键：返回 this，让链式调用保持类型
+  query(params: Record<string, string>): this {
+    Object.assign(this.params, params);
+    return this;
+  }
+
+  // 最终执行：返回具体的类型 T
+  async execute(): Promise<T> {
+    const qs = new URLSearchParams(this.params);
+    return fetch(`${this.url}?${qs}`).then((r) => r.json());
+  }
+}
+
+// 使用
+const users = await new ApiRequest<User[]>("/users")
+  .query({ status: "active", limit: "20" })
+  .query({ sort: "createdAt" }) // this 类型让连续调用 query 没问题
+  .execute(); // 最终返回 User[]
+```
+
+`this` 类型的好处是：如果子类继承了 `ApiRequest`，链式调用返回的仍然是子类类型，不会丢失子类特有的方法。
+
+## 实现签名的"隐藏"效果
+
+重载有一个容易被忽略的特性：**实现签名对外不可见**。调用方只能看到重载签名，看不到实现签名。
+
+这意味着实现签名可以比所有重载签名都宽泛，TypeScript 不会用实现签名来检查调用方的代码：
+
+```typescript
+function parse(input: string): number;
+function parse(input: string, radix: number): number;
+// 实现签名用了 any，但调用方看不到
+function parse(input: any, radix?: any): number {
+  return parseInt(input, radix);
+}
+
+parse("42"); // 正确：匹配签名 1
+parse("42", 16); // 正确：匹配签名 2
+parse(42); // 错误：没有匹配的重载签名
+// 虽然实现签名接受 any，但调用方看不到实现签名
+```
+
+这个特性在设计库的 API 时很有用——你可以在实现签名里用 `any` 简化代码，但对外暴露的类型仍然是精确的。
+
+## 什么时候该用重载
+
+适合用重载的场景：
+
+- 不同参数对应不同返回类型（`get('/users')` 返回数组，`get('/users/:id')` 返回单个对象）
+- 同一个操作支持多种输入格式（`format(date)`、`format(number)`、`format(string)`）
+- 可选参数导致返回类型变化（`find()` 返回 `T | undefined`，`find(assert)` 返回 `T`）
+
+不适合用重载的场景：
+
+- 只是参数个数不同但返回类型相同——用可选参数就行
+- 参数类型是联合类型但处理逻辑相同——直接用联合类型
+- 超过 5 个重载签名——考虑用泛型或对象参数替代
+
+函数签名是 API 设计的"门面"。用户看到的第一样东西就是函数签名——参数叫什么、返回什么类型、有几个重载。签名设计得好，API 用起来就自然流畅；设计得差，用户得反复看文档才能搞清楚怎么调用。

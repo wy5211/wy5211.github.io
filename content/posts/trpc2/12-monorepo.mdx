@@ -1,0 +1,748 @@
+---
+title: "12. Monorepo 架构与工程化"
+date: "2026-03-23"
+summary: "在 Monorepo 中组织 tRPC 项目，使用 Turborepo 优化构建，实现前后端类型共享、代码复用和独立部署，为协作任务管理平台构建可扩展的大型应用架构。"
+tags: ["tRPC", "Monorepo", "Turborepo", "架构", "工程化"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 12
+---
+
+上篇文章我们学习了性能优化策略。但随着项目规模增长，单一代码库会变得臃肿。协作任务管理平台现在有 Web 前端、管理后台、移动端、API 服务等多个应用，如果每个应用都单独维护，会导致代码重复、类型不一致、部署流程复杂。
+
+Monorepo 是解决这个问题的方案：将所有应用和共享代码放在一个仓库中。这样前后端可以共享 tRPC 类型定义，UI 组件、工具函数可以在不同应用中复用，改动可以原子化提交（相关改动在一个 PR 中）。tRPC 的类型安全在 Monorepo 中发挥得淋漓尽致。
+
+## 为什么选择 Monorepo
+
+传统方式是 Multirepo：每个应用一个仓库。前端仓库有前端代码和类型定义，后端仓库有后端代码和类型定义。当后端 API 变化时，需要手动同步前端的类型定义，容易出错。
+
+Monorepo 的优势：
+
+- **代码共享**：前后端共享 tRPC 类型定义，无需手动同步
+- **原子化提交**：相关改动在一个 PR 中，代码审查更容易
+- **统一构建**：Turborepo 增量构建，只构建改动的包
+- **独立部署**：每个应用可以独立发布，互不影响
+- **类型安全**：跨包的端到端类型检查
+
+劣势是学习曲线陡峭，工具配置复杂。但对于中大型项目，Monorepo 的收益远大于成本。
+
+## 项目结构
+
+标准的 Monorepo 结构分为 apps 和 packages 两层。apps 存放可部署的应用，packages 存放共享代码。
+
+```bash
+task-platform-monorepo/
+├── apps/
+│   ├── web/                    # Next.js Web 前端
+│   ├── admin/                  # 管理后台（React Admin）
+│   ├── api/                    # tRPC API 服务（NestJS）
+│   └── mobile/                 # 移动端（React Native）
+├── packages/
+│   ├── trpc/                   # tRPC 定义（共享）
+│   │   ├── routers/
+│   │   ├── context/
+│   │   └── middleware/
+│   ├── ui/                     # 共享 UI 组件
+│   ├── database/               # 数据库模块（Prisma）
+│   ├── config/                 # 共享配置（ESLint、TypeScript）
+│   └── utils/                  # 工具函数
+├── package.json
+├── pnpm-workspace.yaml         # pnpm 工作空间配置
+├── turbo.json                  # Turborepo 配置
+└── tsconfig.json               # 根 TypeScript 配置
+```
+
+## 初始化项目
+
+使用 Turborepo 初始化 Monorepo：
+
+```bash
+# 创建 Turborepo 项目
+pnpm create turbo@latest task-platform-monorepo
+
+cd task-platform-monorepo
+
+# 安装依赖
+pnpm install
+```
+
+Turborepo 会自动生成基础结构。我们需要调整配置，添加 apps 和 packages 目录。
+
+## 配置 pnpm 工作空间
+
+pnpm-workspace.yaml 定义了工作空间的范围：
+
+```yaml
+# pnpm-workspace.yaml
+
+packages:
+  - "apps/*"
+  - "packages/*"
+```
+
+这样 pnpm 会识别 apps 和 packages 目录下的所有包，支持跨包引用。
+
+## 配置 Turborepo
+
+turbo.json 定义了构建任务和依赖关系：
+
+```json
+{
+  "$schema": "https://turbo.build/schema.json",
+  "globalDependencies": ["**/.env.*local"],
+  "pipeline": {
+    "build": {
+      "dependsOn": ["^build"],
+      "outputs": [".next/**", "!.next/cache/**", "dist/**"]
+    },
+    "dev": {
+      "cache": false,
+      "persistent": true
+    },
+    "lint": {
+      "outputs": []
+    },
+    "typecheck": {
+      "dependsOn": ["^generate"],
+      "outputs": []
+    },
+    "db:generate": {
+      "cache": false,
+      "outputs": ["packages/database/prisma/**"]
+    },
+    "db:push": {
+      "cache": false,
+      "dependsOn": ["db:generate"]
+    }
+  }
+}
+```
+
+关键配置：
+
+- `dependsOn: ["^build"]`：依赖包先构建（如 web 依赖 trpc 和 ui）
+- `outputs`：定义构建产出的缓存目录
+- `persistent: true`：开发模式持久运行（不自动结束）
+
+## 创建 tRPC 共享包
+
+tRPC 共享包包含路由定义、Context、中间件等，前后端都需要引用。
+
+```bash
+# 创建 tRPC 包目录
+mkdir -p packages/trpc/src
+cd packages/trpc
+pnpm init
+```
+
+配置 package.json：
+
+```json
+{
+  "name": "@task-platform/trpc",
+  "version": "0.0.1",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./routers": "./src/routers/index.ts"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@trpc/server": "^11.0.0",
+    "zod": "^3.22.0",
+    "superjson": "^2.2.0"
+  },
+  "devDependencies": {
+    "tsup": "^8.0.0",
+    "typescript": "^5.3.0",
+    "@task-platform/database": "workspace:*",
+    "@task-platform/config": "workspace:*"
+  }
+}
+```
+
+创建 Context：
+
+```typescript
+// packages/trpc/src/context.ts
+
+import { User } from "@task-platform/database";
+
+export interface Context {
+  user: User | null;
+  session: Session | null;
+}
+
+export async function createContext(req: Request): Promise<Context> {
+  // 从请求中获取用户信息
+  const token = req.headers.get("authorization")?.replace("Bearer ", "");
+
+  let user: User | null = null;
+
+  if (token) {
+    // 验证 JWT
+    user = await verifyToken(token);
+  }
+
+  return {
+    user,
+    session: null,
+  };
+}
+```
+
+创建 tRPC 实例：
+
+```typescript
+// packages/trpc/src/index.ts
+
+import { initTRPC } from "@trpc/server";
+import superjson from "superjson";
+import { Context } from "./context";
+
+export const t = initTRPC.context<Context>().create({
+  transformer: superjson,
+});
+
+export const createTRPCRouter = t.router;
+export const publicProcedure = t.procedure;
+
+// 认证中间件
+const isAuthed = t.middleware(({ ctx, next }) => {
+  if (!ctx.user) {
+    throw new t.TRPCError({
+      code: "UNAUTHORIZED",
+      message: "需要登录",
+    });
+  }
+  return next({
+    ctx: {
+      ...ctx,
+      user: ctx.user,
+    },
+  });
+});
+
+export const protectedProcedure = t.procedure.use(isAuthed);
+```
+
+创建路由：
+
+```typescript
+// packages/trpc/src/routers/index.ts
+
+import { z } from "zod";
+import { createTRPCRouter, protectedProcedure } from "../index";
+import { prisma } from "@task-platform/database";
+
+export const appRouter = createTRPCRouter({
+  tasks: createTRPCRouter({
+    list: protectedProcedure
+      .input(
+        z.object({
+          projectId: z.string().optional(),
+          page: z.number().default(1),
+          limit: z.number().default(20),
+        })
+      )
+      .query(async ({ input, ctx }) => {
+        const { page, limit, projectId } = input;
+        const skip = (page - 1) * limit;
+
+        const [tasks, total] = await Promise.all([
+          prisma.task.findMany({
+            where: {
+              ...(projectId && { projectId }),
+              userId: ctx.user.id,
+            },
+            skip,
+            take: limit,
+            orderBy: { createdAt: "desc" },
+          }),
+          prisma.task.count({
+            where: {
+              ...(projectId && { projectId }),
+              userId: ctx.user.id,
+            },
+          }),
+        ]);
+
+        return {
+          tasks,
+          pagination: {
+            page,
+            limit,
+            total,
+            totalPages: Math.ceil(total / limit),
+          },
+        };
+      }),
+
+    create: protectedProcedure
+      .input(
+        z.object({
+          projectId: z.string(),
+          title: z.string().min(1).max(200),
+          description: z.string().optional(),
+          status: z.enum(["TODO", "IN_PROGRESS", "DONE"]).default("TODO"),
+        })
+      )
+      .mutation(async ({ input, ctx }) => {
+        return await prisma.task.create({
+          data: {
+            ...input,
+            userId: ctx.user.id,
+          },
+        });
+      }),
+  }),
+});
+
+export type AppRouter = typeof appRouter;
+```
+
+## 创建数据库包
+
+数据库包包含 Prisma 配置和生成的 Client，所有需要数据库的包都引用它。
+
+```bash
+mkdir -p packages/database/prisma
+cd packages/database
+pnpm init
+```
+
+配置 package.json：
+
+```json
+{
+  "name": "@task-platform/database",
+  "version": "0.0.1",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "generate": "prisma generate",
+    "push": "prisma db push",
+    "studio": "prisma studio"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.0.0"
+  },
+  "devDependencies": {
+    "prisma": "^5.0.0"
+  }
+}
+```
+
+Prisma Schema：
+
+```prisma
+// packages/database/prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  name      String
+  avatar    String?
+  role      Role     @default(USER)
+  tasks     Task[]
+  projects  Project[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Project {
+  id        String   @id @default(cuid())
+  name      String
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  tasks     Task[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model Task {
+  id          String     @id @default(cuid())
+  title       String
+  description String?
+  status      TaskStatus @default(TODO)
+  priority    Priority   @default(MEDIUM)
+  projectId   String
+  project     Project    @relation(fields: [projectId], references: [id])
+  userId      String
+  user        User       @relation(fields: [userId], references: [id])
+  createdAt   DateTime   @default(now())
+  updatedAt   DateTime   @updatedAt
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+
+enum Priority {
+  LOW
+  MEDIUM
+  HIGH
+}
+```
+
+导出 Prisma Client：
+
+```typescript
+// packages/database/src/index.ts
+
+import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+export const prisma = globalForPrisma.prisma || new PrismaClient();
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+
+export * from "@prisma/client";
+```
+
+## 创建 Web 应用
+
+Web 应用使用 Next.js，引用共享的 tRPC 包。
+
+```bash
+# 在 apps 目录下创建 Next.js 应用
+pnpm create next-app@latest apps/web
+```
+
+配置 package.json，引用工作空间包：
+
+```json
+{
+  "name": "@task-platform/web",
+  "dependencies": {
+    "@task-platform/trpc": "workspace:*",
+    "@task-platform/ui": "workspace:*",
+    "@task-platform/database": "workspace:*",
+    "@trpc/client": "^11.0.0",
+    "@trpc/react-query": "^11.0.0",
+    "@tanstack/react-query": "^5.0.0"
+  }
+}
+```
+
+创建 tRPC 客户端：
+
+```typescript
+// apps/web/src/utils/trpc.ts
+
+import { createTRPCReact } from "@trpc/react-query";
+import type { AppRouter } from "@task-platform/trpc";
+
+export const trpc = createTRPCReact<AppRouter>();
+```
+
+创建 tRPC Provider：
+
+```typescript
+// apps/web/src/app/providers/trpc-provider.tsx
+
+'use client';
+
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { httpBatchLink, loggerLink } from '@trpc/client';
+import { trpc } from '@/utils/trpc';
+import { useState } from 'react';
+import superjson from 'superjson';
+
+export function TRPCProvider({ children }: { children: React.ReactNode }) {
+  const [queryClient] = useState(() => new QueryClient());
+  const [trpcClient] = useState(() =>
+    trpc.createClient({
+      links: [
+        loggerLink({
+          enabled: (opts) =>
+            process.env.NODE_ENV === 'development' ||
+            opts.direction === 'down'
+        }),
+        httpBatchLink({
+          url: 'http://localhost:3000/api/trpc',
+          transformer: superjson
+        })
+      ]
+    })
+  );
+
+  return (
+    <trpc.Provider client={trpcClient} queryClient={queryClient}>
+      <QueryClientProvider client={queryClient}>
+        {children}
+      </QueryClientProvider>
+    </trpc.Provider>
+  );
+}
+```
+
+在页面中使用：
+
+```typescript
+// apps/web/src/app/page.tsx
+
+import { trpc } from '@/utils/trpc';
+
+export default function HomePage() {
+  const { data } = trpc.tasks.list.useQuery({
+    page: 1,
+    limit: 10
+  });
+
+  return (
+    <div>
+      <h1>任务列表</h1>
+
+      <div className="grid gap-4">
+        {data?.tasks.map((task) => (
+          <article key={task.id} className="border rounded-lg p-4">
+            <h2>{task.title}</h2>
+            <p>状态: {task.status}</p>
+          </article>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+## 创建 API 应用
+
+API 应用使用 NestJS，同样引用共享的 tRPC 包。
+
+```bash
+# 在 apps 目录下创建 NestJS 应用
+nest new apps/api
+```
+
+配置 tRPC 模块：
+
+```typescript
+// apps/api/src/trpc/trpc.module.ts
+
+import { Module, Global } from "@nestjs/common";
+import { tRPCService } from "./trpc.service";
+import { appRouter } from "@task-platform/trpc/routers";
+
+@Global()
+@Module({
+  providers: [tRPCService],
+  exports: [tRPCService],
+})
+export class tRPCModule {
+  constructor(private readonly trpcService: tRPCService) {}
+
+  createRouter() {
+    return appRouter; // 直接使用共享的 router
+  }
+}
+```
+
+## 构建优化
+
+Turborepo 的核心优势是增量构建。只有改动的包会被重新构建，未改动的包使用缓存。
+
+```bash
+# 构建所有应用（只构建改动的包）
+pnpm turbo build
+
+# 强制重新构建（忽略缓存）
+pnpm turbo build --force
+
+# 查看构建缓存
+pnpm turbo build --dry-run
+```
+
+构建缓存可以配置远程存储，团队成员共享缓存：
+
+```json
+// turbo.json
+
+{
+  "remoteCache": {
+    "url": "https://vercel.com/api/rest/cache/your-team-id"
+  }
+}
+```
+
+## 独立部署
+
+Monorepo 中的每个应用可以独立部署。Web 应用部署到 Vercel，API 应用部署到 Railway，互不影响。
+
+```bash
+# 部署 Web 应用到 Vercel
+cd apps/web
+vercel deploy
+
+# 部署 API 应用到 Railway
+cd apps/api
+railway up
+```
+
+使用 Turborepo 可以一键部署所有应用：
+
+```json
+// package.json
+
+{
+  "scripts": {
+    "deploy": "turbo run build && turbo run deploy"
+  }
+}
+```
+
+## 代码复用
+
+共享 UI 组件是 Monorepo 的另一个优势。创建 UI 包：
+
+```bash
+mkdir -p packages/ui/src/components
+cd packages/ui
+pnpm init
+```
+
+创建共享组件：
+
+```typescript
+// packages/ui/src/components/Button.tsx
+
+import { ButtonHTMLAttributes, forwardRef } from 'react';
+
+export interface ButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
+  variant?: 'primary' | 'secondary' | 'ghost';
+  size?: 'sm' | 'md' | 'lg';
+}
+
+export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
+  ({ variant = 'primary', size = 'md', className = '', ...props }, ref) => {
+  const baseStyles = 'rounded-lg font-medium transition-colors';
+
+  const variants = {
+    primary: 'bg-blue-600 text-white hover:bg-blue-700',
+    secondary: 'bg-gray-200 text-gray-900 hover:bg-gray-300',
+    ghost: 'bg-transparent hover:bg-gray-100'
+  };
+
+  const sizes = {
+    sm: 'px-3 py-1.5 text-sm',
+    md: 'px-4 py-2 text-base',
+    lg: 'px-6 py-3 text-lg'
+  };
+
+  return (
+    <button
+      ref={ref}
+      className={`${baseStyles} ${variants[variant]} ${sizes[size]} ${className}`}
+      {...props}
+    />
+  );
+});
+
+Button.displayName = 'Button';
+```
+
+导出组件：
+
+```typescript
+// packages/ui/src/index.ts
+
+export * from "./components/Button";
+export * from "./components/Input";
+export * from "./components/Card";
+```
+
+在 Web 应用中使用：
+
+```typescript
+// apps/web/src/app/page.tsx
+
+import { Button } from '@task-platform/ui';
+
+export default function HomePage() {
+  return (
+    <Button variant="primary" size="md">
+      创建任务
+    </Button>
+  );
+}
+```
+
+## Trade-off 分析
+
+Monorepo 不是银弹，需要权衡。
+
+优势：
+
+- 代码共享，避免重复
+- 类型安全，前后端类型一致
+- 原子化提交，相关改动在一起
+- 统一构建，增量编译提升速度
+- 独立部署，应用互不影响
+
+劣势：
+
+- 学习曲线陡峭，需要理解 Turborepo、pnpm workspace
+- 工具配置复杂，CI/CD 需要调整
+- 仓库体积大，克隆时间长
+- 权限管理复杂，敏感代码隔离难
+
+适用场景：
+
+- 多应用共享类型和组件
+- 团队规模不大（10-50 人）
+- 需要频繁跨应用改动
+- 重视代码复用和类型安全
+
+不适用场景：
+
+- 单一应用（不需要 Monorepo）
+- 团队规模超大（100+ 人，权限管理复杂）
+- 应用之间完全独立
+- 团队不熟悉 Monorepo 工具
+
+对于协作任务管理平台，Monorepo 是合适的。Web 前端、管理后台、API 服务都需要共享 tRPC 类型定义，UI 组件也可以复用。但随着团队规模增长，可能需要考虑将敏感模块（如支付）拆分到独立仓库。
+
+## 总结
+
+本文介绍了如何在 Monorepo 中组织 tRPC 项目。我们使用 Turborepo 和 pnpm workspace 构建了可扩展的架构，实现了前后端类型共享、代码复用和独立部署。
+
+关键点：
+
+- Monorepo 将应用和共享代码组织在一个仓库中
+- tRPC 共享包让前后端类型保持一致
+- Turborepo 实现增量构建，提升编译速度
+- 独立部署让每个应用可以单独发布
+- 代码复用减少重复工作，提升效率
+
+Monorepo 是大型项目的必经之路，但不要过早引入。先保证项目功能正确，规模增长后再重构为 Monorepo。tRPC 的类型安全在 Monorepo 中发挥得淋漓尽致，这是相比 REST API 的核心优势。
+
+到此为止，我们完成了 tRPC 系列的基础篇、框架篇和部分高级篇。你现在已经掌握了在主流框架中使用 tRPC 的完整技能，可以构建生产级的应用了。

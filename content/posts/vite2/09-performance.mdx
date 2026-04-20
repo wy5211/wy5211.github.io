@@ -1,0 +1,583 @@
+---
+title: "09. 性能深度优化：分析瓶颈与解决策略"
+date: "2026-04-12"
+summary: "迁移到 Vite 后开发体验好了，但生产环境的 Lighthouse 分数还不够。怎么系统性地优化前端性能？"
+tags: ["Vite", "性能优化", "Lighthouse", "Web Vitals"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战指南"
+seriesOrder: 9
+---
+
+上一篇配好了多环境，这一篇在 production 环境做系统性的性能优化。
+
+TaskFlow Dashboard 迁移到 Vite 之后，开发体验确实好了很多——启动从 18 秒降到 0.8 秒，HMR 从 3 秒降到毫秒级。但部署到 production 之后，用 Lighthouse 跑了一下分数：Performance 65，FID 1.2s，LCP 4.8s，CLS 0.15。
+
+产品经理发来一条消息："页面打开有点慢，用户反馈说手机上要转好几秒才能看到内容。"
+
+之前的 Webpack 配置虽然慢，但至少生产构建做了很多优化（代码分割、压缩、CDN 缓存）。迁移到 Vite 之后，`vite build` 的默认配置虽然能工作，但远不是最优的。需要系统地做一次性能优化。
+
+## 先搞清楚慢在哪里
+
+性能优化的第一步不是改代码，而是测量。你不知道瓶颈在哪，优化就是在瞎猜。
+
+### Lighthouse 和 Web Vitals
+
+Lighthouse 是最常用的性能分析工具，Chrome DevTools 内置。它会模拟一个中等性能的手机（Moto G Power），在 4G 网络下访问你的页面，然后给出分数和具体的优化建议。
+
+Web Vitals 是 Google 定义的核心性能指标，反映的是真实用户的体验：
+
+- **LCP（Largest Contentful Paint）**：页面主要内容渲染完成的时间。2.5 秒以内算好。TaskFlow 的 LCP 是 4.8 秒——用户盯着白屏等了将近 5 秒。
+- **FID（First Input Delay）**：用户第一次和页面交互到浏览器响应的延迟。100 毫秒以内算好。TaskFlow 是 1.2 秒——用户点了一个按钮，页面卡了一秒多才反应。
+- **CLS（Cumulative Layout Shift）**：页面视觉稳定性。0.1 以内算好。TaskFlow 是 0.15——页面加载过程中有明显的跳动。
+
+Lighthouse 分数和 Web Vitals 不完全一致。Lighthouse 是实验室数据（模拟环境），Web Vitals 是现场数据（真实用户）。但作为优化的起点，Lighthouse 足够了。
+
+### 用 Rollup Plugin Visualizer 分析产物
+
+Vite 8 用 Rolldown 打包，但仍然支持 Rollup 的 `visualizer` 插件来分析产物体积：
+
+```typescript
+// vite.config.ts
+import { visualizer } from "rollup-plugin-visualizer";
+
+export default defineConfig({
+  plugins: [
+    visualizer({
+      filename: "stats.html",
+      open: true, // 构建完成后自动打开报告
+      gzipSize: true, // 显示 gzip 后的体积
+    }),
+  ],
+});
+```
+
+跑一次 `npm run build`，会生成一个 `stats.html` 文件，用交互式图表展示每个模块的体积。TaskFlow Dashboard 的报告显示：
+
+- `date-fns`：整包 78KB（gzip 28KB）。项目只用了 5 个函数。
+- `@ant-design/icons`：整包 156KB（gzip 42KB）。项目只用了 12 个图标。
+- `react-beautiful-dnd`：85KB（gzip 25KB）。拖拽排序功能，但只有任务看板页面用到。
+- `echarts`：320KB（gzip 95KB）。图表库，只有仪表盘页面用到。
+
+总计 639KB（gzip 190KB），而页面首次加载只需要其中的大约 30%。
+
+这就是问题所在：大依赖没有做代码分割，全部打进了首屏的 bundle 里。
+
+## 首屏加载优化
+
+首屏加载优化是投入产出比最高的优化方向。用户打开页面，越快看到内容，体验越好。
+
+### 代码分割：把不需要的代码拆出去
+
+Vite 默认会做基本的代码分割——`node_modules` 中的依赖会打包成独立的 chunk。但默认的分割粒度太粗，一个大包包含所有依赖。
+
+针对 TaskFlow 的问题，手动配置更细的分割策略：
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
+
+export default defineConfig({
+  plugins: [react()],
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          // 把大型第三方库拆成独立的 chunk
+          if (id.includes("node_modules/echarts")) {
+            return "vendor-echarts";
+          }
+          if (id.includes("node_modules/@ant-design")) {
+            return "vendor-antd";
+          }
+          if (id.includes("node_modules/date-fns")) {
+            return "vendor-datefns";
+          }
+          if (id.includes("node_modules/react-beautiful-dnd")) {
+            return "vendor-dnd";
+          }
+          // React 和 React-DOM 拆成独立 chunk（高缓存命中率）
+          if (
+            id.includes("node_modules/react") ||
+            id.includes("node_modules/react-dom")
+          ) {
+            return "vendor-react";
+          }
+        },
+      },
+    },
+  },
+});
+```
+
+`manualChunks` 函数接收模块 ID，返回 chunk 名称。相同的 chunk 名称会被打包到同一个文件里。这样，echarts、ant-design、date-fns 各自独立成一个 JS 文件，浏览器可以并行下载。
+
+但这样做有一个风险：如果 chunk 太碎，HTTP 请求数会增加。HTTP/2 下并发请求的成本比 HTTP/1.1 低很多，但也不能无限制地拆。通常把每个超过 50KB 的依赖拆成独立 chunk 是合理的。
+
+优化后的效果：首屏 JS 从 639KB 降到 210KB（gzip 从 190KB 降到 62KB）。
+
+### 路由级别的懒加载
+
+代码分割只是把依赖拆成了独立文件，但它们仍然会在首屏加载。真正应该做的是：只在用户访问某个页面时才加载该页面需要的代码。
+
+```typescript
+// src/router.tsx
+import { lazy, Suspense } from 'react';
+import { createBrowserRouter } from 'react-router-dom';
+
+// 使用 lazy 做路由级别的代码分割
+const Dashboard = lazy(() => import('./pages/Dashboard'));
+const TaskBoard = lazy(() => import('./pages/TaskBoard'));
+const Analytics = lazy(() => import('./pages/Analytics'));
+const Settings = lazy(() => import('./pages/Settings'));
+
+export const router = createBrowserRouter([
+  {
+    path: '/',
+    element: <AppLayout />,
+    children: [
+      { index: true, element: <Suspense fallback={<Loading />}><Dashboard /></Suspense> },
+      { path: 'board', element: <Suspense fallback={<Loading />}><TaskBoard /></Suspense> },
+      { path: 'analytics', element: <Suspense fallback={<Loading />}><Analytics /></Suspense> },
+      { path: 'settings', element: <Suspense fallback={<Loading />}><Settings /></Suspense> },
+    ],
+  },
+]);
+```
+
+`lazy` 函数让 React 在路由匹配时才动态 `import` 对应的组件。`Suspense` 提供 loading 状态。这样，用户首次访问只加载 Dashboard 页面（210KB），其他页面的代码按需加载。
+
+进一步优化：当用户在 Dashboard 上时，可以在鼠标 hover 导航链接时预加载目标页面：
+
+```typescript
+// src/components/SidebarLink.tsx
+import { useNavigate } from 'react-router-dom';
+
+export function SidebarLink({ to, children }: { to: string; children: React.ReactNode }) {
+  const navigate = useNavigate();
+
+  return (
+    <a
+      href={to}
+      onClick={(e) => { e.preventDefault(); navigate(to); }}
+      onMouseEnter={() => {
+        // 鼠标悬停时预加载目标页面
+        import(`./pages/${to.charAt(1).toUpperCase() + to.slice(2)}`)
+          .catch(() => {}); // 静默失败，不影响用户体验
+      }}
+    >
+      {children}
+    </a>
+  );
+}
+```
+
+这个技巧叫做 "hover prefetch"。用户把鼠标移到链接上的时间大约 200-300ms，这段时间足够预加载一个页面 chunk。当用户真正点击的时候，页面已经加载好了，感觉是瞬间切换。
+
+### 替换重型依赖
+
+`date-fns` 的 tree shaking 有个问题：虽然理论上可以按需引入，但实际打包后还是包含了整个库（取决于 Vite 的 tree shaking 效果和 `date-fns` 的模块格式）。
+
+TaskFlow 只用了 5 个函数：`format`、`parseISO`、`differenceInDays`、`startOfWeek`、`addDays`。用 `dayjs` 替换（7KB gzip），或者更激进的做法，用原生 `Intl.DateTimeFormat` API 自己实现：
+
+```typescript
+// src/lib/date-utils.ts
+// 用原生 API 实现，零依赖
+export function formatDate(dateStr: string): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date(dateStr));
+}
+
+export function formatRelativeTime(dateStr: string): string {
+  const now = Date.now();
+  const target = new Date(dateStr).getTime();
+  const diffDays = Math.floor((now - target) / (1000 * 60 * 60 * 24));
+
+  if (diffDays === 0) return "今天";
+  if (diffDays === 1) return "昨天";
+  if (diffDays < 7) return `${diffDays} 天前`;
+  if (diffDays < 30) return `${Math.floor(diffDays / 7)} 周前`;
+  return formatDate(dateStr);
+}
+```
+
+这两个函数覆盖了 TaskFlow 90% 的日期格式化需求。去掉了 `date-fns` 依赖，节省了 28KB gzip。
+
+`@ant-design/icons` 的优化思路类似——把 12 个图标的 import 从全量包改成按需引入：
+
+```typescript
+// 之前：从全量包引入（会把整个 @ant-design/icons 打进来）
+import { SettingOutlined, UserOutlined } from "@ant-design/icons";
+
+// 之后：从具体文件引入（只打包用到的图标）
+import SettingOutlined from "@ant-design/icons/lib/icons/SettingOutlined";
+import UserOutlined from "@ant-design/icons/lib/icons/UserOutlined";
+```
+
+这样改动后，`@ant-design/icons` 从 42KB gzip 降到了 8KB。
+
+### 图片和字体优化
+
+Lighthouse 报告里还有一项：图片加载过慢。TaskFlow 的仪表盘有 12 个图表的缩略图，每张 200KB 的 PNG。
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+import { viteImageMin } from "vite-plugin-imagemin";
+
+export default defineConfig({
+  plugins: [
+    viteImageMin({
+      mozjpeg: { quality: 80 }, // JPEG 压缩
+      optipng: { optimizationLevel: 3 }, // PNG 压缩
+      svgo: { plugins: [{ name: "removeViewBox", active: false }] }, // SVG 优化
+      webp: { quality: 80 }, // 同时生成 WebP 格式
+    }),
+  ],
+});
+```
+
+更好的方案是用 `<picture>` 标签做格式降级，用 WebP 作为首选格式，PNG 作为降级方案：
+
+```tsx
+// src/components/ChartThumbnail.tsx
+export function ChartThumbnail({ src, alt }: { src: string; alt: string }) {
+  const webpSrc = src.replace(/\.\w+$/, ".webp");
+
+  return (
+    <picture>
+      <source srcSet={webpSrc} type="image/webp" />
+      <img src={src} alt={alt} loading="lazy" decoding="async" />
+    </picture>
+  );
+}
+```
+
+`loading="lazy"` 让浏览器在图片进入视口时才加载，`decoding="async"` 让图片解码不阻塞主线程。
+
+## 缓存策略
+
+优化了首屏加载还不够。用户第二次访问时，如果所有资源都重新下载，体验还是不好。需要配置合理的缓存策略。
+
+### Content Hash
+
+Vite 默认给构建产物加上 content hash 文件名。比如 `index-abc123.js`。只要文件内容不变，hash 就不变，浏览器可以使用缓存。
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  build: {
+    rollupOptions: {
+      output: {
+        // 自定义 chunk 文件名格式
+        chunkFileNames: "assets/js/[name]-[hash].js",
+        entryFileNames: "assets/js/[name]-[hash].js",
+        assetFileNames: "assets/[ext]/[name]-[hash].[ext]",
+      },
+    },
+  },
+});
+```
+
+这样做的效果是：代码改了，对应的 chunk hash 会变，浏览器会重新下载。没改的 chunk（比如 `vendor-react`）hash 不变，浏览器继续用缓存。
+
+但有一个问题：如果某个被多个页面共享的工具模块改了一行代码，所有引用它的 chunk 的 hash 都会变，导致缓存大面积失效。`manualChunks` 的配置可以缓解这个问题——把变化频率不同的模块分到不同的 chunk 里。
+
+### CDN 和长期缓存
+
+静态资源应该通过 CDN 分发，并设置长期缓存。在 Nginx 配置中：
+
+```nginx
+# 带有 content hash 的资源，缓存一年
+location /assets/ {
+  expires 1y;
+  add_header Cache-Control "public, immutable";
+}
+
+# index.html 不缓存（或设置很短的缓存时间）
+location / {
+  expires -1;
+  add_header Cache-Control "no-cache, no-store, must-revalidate";
+}
+```
+
+`immutable` 告诉浏览器：这个 URL 对应的资源永远不会变（因为 hash 变了 URL 就变了）。浏览器连条件请求（If-Modified-Since）都不需要发。
+
+`index.html` 不能缓存——因为每次部署后 `index.html` 里引用的 JS/CSS 文件名会变。如果不缓存 `index.html`，用户刷新页面就能拿到最新的文件引用。
+
+## 运行时性能优化
+
+加载速度优化好了，但页面加载完之后，操作还卡。这属于运行时性能问题。
+
+### React 渲染优化
+
+TaskFlow 的任务列表有 500+ 条数据，每次状态更新整个列表都重新渲染。用 React DevTools 的 Profiler 可以看到，一次简单的状态更新触发了 200+ 个组件的重渲染。
+
+最有效的优化是使用 `React.memo` 和 `useMemo`/`useCallback`：
+
+```tsx
+// src/components/TaskItem.tsx
+import React from "react";
+
+interface TaskItemProps {
+  id: string;
+  title: string;
+  status: string;
+  onStatusChange: (id: string, status: string) => void;
+}
+
+// React.memo 只有 props 变化时才重新渲染
+export const TaskItem = React.memo(function TaskItem({
+  id,
+  title,
+  status,
+  onStatusChange,
+}: TaskItemProps) {
+  return (
+    <div className="task-item">
+      <span>{title}</span>
+      <select
+        value={status}
+        onChange={(e) => onStatusChange(id, e.target.value)}
+      >
+        <option value="todo">待办</option>
+        <option value="in_progress">进行中</option>
+        <option value="done">已完成</option>
+      </select>
+    </div>
+  );
+});
+```
+
+```tsx
+// src/components/TaskList.tsx
+import { useCallback } from "react";
+import { TaskItem } from "./TaskItem";
+
+export function TaskList({ tasks }: { tasks: Task[] }) {
+  // useCallback 保证函数引用稳定，避免子组件不必要的重渲染
+  const handleStatusChange = useCallback((id: string, status: string) => {
+    updateTaskStatus(id, status);
+  }, []);
+
+  return (
+    <div>
+      {tasks.map((task) => (
+        <TaskItem
+          key={task.id}
+          id={task.id}
+          title={task.title}
+          status={task.status}
+          onStatusChange={handleStatusChange}
+        />
+      ))}
+    </div>
+  );
+}
+```
+
+但要注意：不要过度使用 `React.memo`。如果组件渲染本身就很快（比如一个简单的 div），`memo` 的浅比较开销可能比重新渲染还大。只有对渲染开销大的组件使用 `memo`。
+
+另一个常见的性能问题是列表没有虚拟化。500 条数据全部渲染成 DOM 节点，即使屏幕只能显示 20 条。使用虚拟列表可以只渲染可见区域的元素：
+
+```tsx
+import { useVirtualizer } from "@tanstack/react-virtual";
+
+export function TaskList({ tasks }: { tasks: Task[] }) {
+  const parentRef = React.useRef<HTMLDivElement>(null);
+
+  const virtualizer = useVirtualizer({
+    count: tasks.length,
+    getScrollElement: () => parentRef.current,
+    estimateSize: () => 60, // 每行大约 60px 高
+  });
+
+  return (
+    <div ref={parentRef} style={{ height: "600px", overflow: "auto" }}>
+      <div style={{ height: virtualizer.getTotalSize(), position: "relative" }}>
+        {virtualizer.getVirtualItems().map((item) => (
+          <div
+            key={item.key}
+            style={{
+              position: "absolute",
+              top: item.start,
+              height: item.size,
+            }}
+          >
+            <TaskItem task={tasks[item.index]} />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+```
+
+虚拟列表的效果是：不管数据量是 500 还是 50000，DOM 节点数始终只有 20-30 个。
+
+## Vite 8 特有的优化手段
+
+Vite 8 有一些特有的优化能力值得利用。
+
+### Oxc 压缩
+
+Vite 8 用 Oxc（Rust 编写）做代码压缩，替代了之前的 terser。Oxc 的压缩速度比 terser 快 10-100 倍，产物体积相当甚至更小。
+
+默认配置已经足够好。如果需要进一步压缩，可以调整压缩级别：
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  build: {
+    minify: "oxc", // Vite 8 默认值，显式声明
+    target: "es2020", // 目标浏览器，影响语法降级程度
+  },
+});
+```
+
+`target` 的设置很重要。如果设为 `es2015`，所有 ES2020+ 的语法都会被降级，产物体积会增大。TaskFlow 的用户主要是 Chrome 和 Safari 的最新版本，设为 `es2020` 就够了。
+
+### CSS 代码分割
+
+Vite 默认会把 CSS 提取成独立文件。如果一个异步加载的组件有自己的 CSS，Vite 会把这段 CSS 提取成一个独立的 CSS 文件，在组件加载时才注入。
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  build: {
+    cssCodeSplit: true, // 默认值，按需加载 CSS
+  },
+});
+```
+
+这意味着 Dashboard 页面的 CSS 和 Analytics 页面的 CSS 在不同的文件里。用户访问 Dashboard 时不会加载 Analytics 页面的样式。
+
+### 预构建优化
+
+Vite 会把 `node_modules` 中的依赖预构建成 ESM 格式。默认情况下，所有被引用的依赖都会被预构建。如果你的项目有很多依赖，预构建时间会比较长。
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  optimizeDeps: {
+    // 明确指定需要预构建的依赖（跳过不需要的）
+    include: ["react", "react-dom", "react-router-dom", "axios"],
+    // 排除不需要预构建的依赖（已经是 ESM 格式的）
+    exclude: ["some-esm-only-package"],
+  },
+});
+```
+
+对于 TaskFlow 来说，默认配置就够了。只有当你发现预构建时间过长时，才需要手动调整。
+
+## 性能预算和监控
+
+优化不是一次性的工作。你需要建立机制来防止性能退化。
+
+### 配置性能预算
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks(id) {
+          if (id.includes("node_modules/echarts")) return "vendor-echarts";
+          // ... 其他 chunk 配置
+        },
+      },
+    },
+    // 限制 chunk 大小
+    chunkSizeWarningLimit: 200, // 超过 200KB 发出警告
+  },
+});
+```
+
+`chunkSizeWarningLimit` 会在构建时检查 chunk 体积。如果某个 chunk 超过了 200KB，Vite 会输出警告。你可以在 CI/CD 中把这个警告变成错误，阻止部署：
+
+```bash
+# 在 CI 脚本中
+npm run build 2>&1 | grep -q "chunk size" && echo "BUILD FAILED: chunk too large" && exit 1
+```
+
+### Web Vitals 上报
+
+Lighthouse 只能在实验室里跑，你还需要真实用户的性能数据。用 `web-vitals` 库在浏览器端收集核心指标并上报：
+
+```typescript
+// src/lib/report-web-vitals.ts
+import { onLCP, onFID, onCLS, onINP, onTTFB } from "web-vitals";
+
+function sendToAnalytics(metric: any) {
+  // 发送到你的监控服务（Sentry、DataDog、自建服务）
+  const url = import.meta.env.VITE_API_BASE_URL + "/api/vitals";
+  navigator.sendBeacon(
+    url,
+    JSON.stringify({
+      name: metric.name,
+      value: metric.value,
+      rating: metric.rating, // 'good' | 'needs-improvement' | 'poor'
+      navigationType: metric.navigationType,
+      timestamp: Date.now(),
+    })
+  );
+}
+
+onLCP(sendToAnalytics);
+onFID(sendToAnalytics);
+onCLS(sendToAnalytics);
+onINP(sendToAnalytics);
+onTTFB(sendToAnalytics);
+```
+
+在 `main.tsx` 中调用：
+
+```typescript
+// src/main.tsx
+import { reportWebVitals } from "./lib/report-web-vitals";
+
+reportWebVitals();
+```
+
+收集到的数据可以在监控看板上看到 P75（75 分位）的核心指标。如果某个版本发布后 LCP 的 P75 突然升高，说明这个版本引入了性能退化。
+
+## 优化结果
+
+经过以上优化，TaskFlow Dashboard 的 Lighthouse 分数变化：
+
+| 指标           | 优化前 | 优化后 |
+| -------------- | ------ | ------ |
+| Performance    | 65     | 96     |
+| LCP            | 4.8s   | 1.8s   |
+| FID            | 1.2s   | 50ms   |
+| CLS            | 0.15   | 0.03   |
+| 首屏 JS (gzip) | 190KB  | 62KB   |
+| 总请求数       | 23     | 14     |
+
+主要的提升来自三个方面：路由级代码分割（首屏 JS 从 639KB 降到 210KB）、依赖替换（去掉 date-fns 和 echarts 的全量引入）、虚拟列表（500 条数据的渲染从 200ms 降到 16ms）。
+
+## 权衡
+
+性能优化有一个核心矛盾：**优化程度和代码复杂度的平衡**。
+
+手动配置 `manualChunks` 需要你了解每个依赖的体积和使用场景，而且需要持续维护——每次新增大型依赖都要考虑是否需要单独拆分 chunk。如果项目依赖不多（总 JS < 200KB gzip），Vite 的默认分割策略就够了，不需要手动干预。
+
+路由级懒加载是投入产出比最高的优化，几乎没有缺点。唯一需要注意的是 loading 状态的设计——如果 fallback 太简陋，用户在加载过程中会觉得"闪了一下"。
+
+虚拟列表引入了额外的依赖（`@tanstack/react-virtual`），增加了代码复杂度。如果列表数据不超过 100 条，原生渲染就够了。
+
+`React.memo` 和 `useCallback` 需要仔细使用。滥用会导致代码充满了 `memo` 和 `useCallback`，反而降低可读性。而且浅比较本身也有开销——如果 props 经常变化，`memo` 的比较反而浪费了时间。
+
+Web Vitals 上报需要后端配合搭建监控服务。如果你没有现成的监控基础设施，可以用 Sentry 的 Performance Monitoring（免费额度足够小项目使用）。
+
+性能预算（`chunkSizeWarningLimit`）是个好实践，但不要设得太严格。200KB 的限制对于 echarts 这种图表库来说太紧了——有时候一个依赖就是这么大，拆也拆不开。合理的做法是区分"首屏 chunk"和"异步 chunk"的预算：首屏 chunk 控制在 150KB 以内，异步 chunk 可以放宽到 300KB。
+
+下一篇是系列的收尾：完整的 CI/CD 流水线和生产部署。把前面做的所有优化固化到自动化流程里。

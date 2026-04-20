@@ -1,0 +1,289 @@
+---
+title: "01 为什么需要 LangChain：原生 API 调用的痛点"
+date: "2026-04-14"
+summary: "从直接调用 LLM API 的痛点出发，理解 LangChain 解决了什么问题，什么时候该用它，什么时候不该。"
+tags: ["LangChain", "LLM", "AI 应用开发", "TypeScript"]
+category: "langchain"
+cover: ""
+draft: false
+series: "LangChain.js 实战"
+seriesOrder: 1
+---
+
+你已经会用 `fetch` 调 OpenAI 的 API 了。写一个 prompt，发个请求，拿到 JSON，提取 reply。感觉够用了？
+
+试试这个需求：**做一个产品评论分析工具，输入用户评论，输出情感分类、关键问题、紧急程度。**
+
+你很快写出来了。然后产品经理说：
+
+- "能不能换个模型试试？Anthropic 的 Claude 便宜一些。"
+- "输出能不能固定成 JSON 格式？前端要解析。"
+- "评论太多了，能不能批量处理？"
+- "能不能先翻译成英文再分析，准确率更高。"
+
+你发现，每加一个需求，就要改一大块代码。prompt 变成了面条，模型调用散落在各处，JSON 解析到处是 try-catch。
+
+这就是 LangChain 要解决的问题。
+
+## 原生 API 调用有多痛苦
+
+让我们先用原生代码实现一个简单的"产品评论分类器"，看看痛点在哪。
+
+```typescript
+// 用原生 fetch 调用 OpenAI API
+async function analyzeReview(review: string) {
+  // 痛点 1：prompt 硬编码，换场景就要改代码
+  const prompt = `你是一个产品评论分析专家。请分析以下用户评论，返回情感分类（正面/负面/中性）和关键问题。
+
+用户评论：${review}
+
+请按以下格式返回：
+情感：xxx
+关键问题：xxx`;
+
+  const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
+    },
+    // 痛点 2：参数配置散落各处，难以统一管理
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      messages: [{ role: "user", content: prompt }],
+      temperature: 0,
+    }),
+  });
+
+  const data = await response.json();
+
+  // 痛点 3：输出解析全靠手写正则，脆弱且易碎
+  const text = data.choices[0].message.content;
+  const sentiment = text.match(/情感[：:]\s*(.+)/)?.[1] ?? "未知";
+  const issue = text.match(/关键问题[：:]\s*(.+)/)?.[1] ?? "未知";
+
+  return { sentiment, issue };
+}
+```
+
+看起来还行？但当你需要以下改动时，痛苦才开始：
+
+1. **换模型** — 要改 URL、改参数格式、改鉴权方式（Anthropic 和 OpenAI 的 API 完全不同）
+2. **输出 JSON** — 要改 prompt 加约束，加 try-catch 兜底解析失败的情况
+3. **多步处理** — 先翻译再分析，两个 API 调用怎么串联？错误怎么处理？
+4. **批量处理** — 100 条评论并发还是串行？限流怎么办？
+
+每个改动都不难，但改着改着代码就变成了意大利面条。
+
+## LangChain 解决了什么
+
+LangChain 在 LLM API 之上提供了一层**组合抽象**。你可以把它想象成 AI 应用里的 Express.js——Express 没有替代 Node.js 的 HTTP 模块，但它让你写 API 不再痛苦。
+
+### 核心思路：组件化 + 管道组合
+
+LangChain 把 AI 应用拆成几个独立组件：
+
+| 组件                | 解决的问题                          | 类比                     |
+| ------------------- | ----------------------------------- | ------------------------ | --- |
+| **Model**           | 统一的模型调用接口，换模型只改一行  | 类似 ORM 抽象不同数据库  |
+| **Prompt Template** | 参数化 prompt，告别硬编码           | 类似 SQL 模板引擎        |
+| **Output Parser**   | 把 LLM 的字符串输出解析成结构化数据 | 类似 JSON.parse 但更智能 |
+| **Chain**           | 把多个步骤串联成管道                | 类似 Unix 管道 `         | `   |
+| **Memory**          | 管理对话历史，让 LLM "记住"上下文   | 类似 Session             |
+| **Retriever**       | 从知识库中检索相关文档给 LLM        | 类似搜索引擎             |
+| **Agent**           | 让 LLM 自己决定调什么工具           | 类似路由分发             |
+
+不要被这个列表吓到，你不需要一次性学会所有组件。LangChain 的学习曲线是渐进的——先用 Model + Prompt + Parser 三个组件就能解决 80% 的问题。
+
+## 同样的需求，用 LangChain 写
+
+我们用 LangChain 重写上面的评论分析器，感受一下差异。
+
+先安装依赖：
+
+```bash
+npm install @langchain/core @langchain/openai zod
+```
+
+然后重写：
+
+```typescript
+import { ChatOpenAI } from "@langchain/openai";
+import { ChatPromptTemplate } from "@langchain/core/prompts";
+import { StructuredOutputParser } from "langchain/output_parsers";
+import { z } from "zod";
+
+// 定义输出结构 —— 用 Zod schema 描述你想要的数据
+const reviewParser = StructuredOutputParser.fromZodSchema(
+  z.object({
+    sentiment: z.enum(["正面", "负面", "中性"]).describe("评论的情感分类"),
+    keyIssue: z.string().describe("评论中提到的最关键的问题"),
+    urgency: z.enum(["高", "中", "低"]).describe("问题的紧急程度"),
+  })
+);
+
+// 创建模型 —— 换模型只改这里
+const model = new ChatOpenAI({
+  modelName: "gpt-4o-mini",
+  temperature: 0,
+});
+
+// 参数化 prompt —— 模板和业务数据分离
+const prompt = ChatPromptTemplate.fromMessages([
+  [
+    "system",
+    `你是一个产品评论分析专家。请严格按照以下格式输出：\n{formatInstructions}`,
+  ],
+  ["human", "请分析以下用户评论：\n{review}"],
+]);
+
+// 用管道串联：prompt → model → parser
+const chain = prompt.pipe(model).pipe(reviewParser);
+
+// 调用 —— 输出是类型安全的对象
+const result = await chain.invoke({
+  review:
+    "升级到专业版之后，之前的项目数据全没了！我已经给客户发了邮件说数据迁移完了，现在怎么交代？",
+  formatInstructions: reviewParser.getFormatInstructions(),
+});
+
+console.log(result);
+// { sentiment: "负面", keyIssue: "升级后项目数据丢失", urgency: "高" }
+```
+
+对比原生写法，有几个关键变化：
+
+**1. 模型可替换**
+
+```typescript
+// 换成 Claude，只改这一行
+import { ChatAnthropic } from "@langchain/anthropic";
+const model = new ChatAnthropic({ modelName: "claude-sonnet-4-20250514" });
+```
+
+其余代码（prompt、parser、chain）完全不用动。因为 `ChatOpenAI` 和 `ChatAnthropic` 都实现了同一个接口。
+
+**2. 输出有类型保证**
+
+用 Zod schema 定义了输出结构，`StructuredOutputParser` 会在 prompt 中自动注入格式约束，并把 LLM 的输出解析为符合 schema 的对象。如果解析失败，会抛出明确的错误而不是返回 `undefined`。
+
+**3. 步骤可组合**
+
+`prompt.pipe(model).pipe(parser)` 这种管道语法意味着你可以随时插入新步骤。比如加一个翻译步骤：
+
+```typescript
+const translatePrompt = ChatPromptTemplate.fromTemplate(
+  "将以下文本翻译成英文：\n{text}"
+);
+const translateChain = translatePrompt.pipe(model);
+
+// 组合：先翻译，再分析
+// 这里只是示意管道组合的灵活性，具体语法后续文章会详细讲
+```
+
+## 什么时候用 LangChain（什么时候不用）
+
+LangChain 不是万能的。以下场景适合和不适合使用：
+
+### 适合用
+
+- **需要组合多个 AI 步骤**（如：先提取信息，再分类，最后生成报告）
+- **需要接入知识库**（RAG 场景：文档加载、切分、检索、生成）
+- **需要多轮对话**（带记忆的聊天机器人）
+- **需要让 AI 调用工具**（查数据库、调 API、执行操作）
+- **团队协作**（模板化的 prompt 比散落的字符串更好维护）
+
+### 不适合用
+
+- **简单的单次 API 调用**（问一个问题拿一个回答，原生 fetch 就够了）
+- **对延迟极度敏感**（LangChain 的抽象层有少量开销）
+- **只需要做文本补全**（不需要模板、不需要解析、不需要链）
+
+> 一个简单的判断标准：如果你的 AI 应用只有"用户输入 → 调 API → 返回结果"这一步，不需要 LangChain。但凡有第二步，它就值得考虑。
+
+## 环境搭建
+
+既然决定要学，先把环境搭好。整个过程不超过 3 分钟。
+
+```bash
+# 创建项目
+mkdir langchain-demo && cd langchain-demo
+npm init -y
+
+# 安装核心依赖
+npm install @langchain/core @langchain/openai zod
+npm install -D typescript @types/node tsx
+
+# 初始化 TypeScript
+npx tsc --init
+```
+
+创建 `.env` 文件：
+
+```bash
+OPENAI_API_KEY=sk-your-key-here
+```
+
+创建 `tsconfig.json` 关键配置：
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "esModuleInterop": true,
+    "strict": true
+  }
+}
+```
+
+验证安装是否成功：
+
+```typescript
+// test.ts
+import { ChatOpenAI } from "@langchain/openai";
+import { HumanMessage } from "@langchain/core/messages";
+
+const model = new ChatOpenAI({ modelName: "gpt-4o-mini" });
+
+const response = await model.invoke([
+  new HumanMessage("用一句话解释什么是 LangChain"),
+]);
+
+console.log(response.content);
+```
+
+```bash
+npx tsx test.ts
+```
+
+如果输出了对 LangChain 的解释，说明环境 OK。
+
+## LangChain.js 的包结构
+
+LangChain.js 采用模块化设计，了解包结构有助于你理解后面文章中的 import：
+
+| 包名                   | 作用                                           | 是否必须 |
+| ---------------------- | ---------------------------------------------- | -------- |
+| `@langchain/core`      | 核心抽象接口（Runnable、PromptTemplate 等）    | 是       |
+| `@langchain/openai`    | OpenAI 模型集成                                | 按需     |
+| `@langchain/anthropic` | Anthropic Claude 集成                          | 按需     |
+| `@langchain/community` | 社区贡献的集成（各种向量库、加载器等）         | 按需     |
+| `langchain`            | 旧版统一包（向后兼容，新项目建议用上面的分包） | 可选     |
+
+> 新项目建议直接用 `@langchain/core` + 具体的模型包（如 `@langchain/openai`），不要用旧的 `langchain` 统一包。分包后 tree-shaking 更好，安装更快。
+
+## 这系列会带你学到什么
+
+这个系列围绕一个**SaaS 产品的智能客服助手**展开。你将从零开始，逐步构建一个能：
+
+- 回答产品使用问题（基础对话）
+- 记住用户之前说了什么（多轮对话 + 记忆）
+- 基于产品文档精准回答（RAG 检索增强）
+- 查订单、查套餐、处理退款（工具调用 + Agent）
+- 流式输出、错误处理、成本控制（生产级优化）
+
+的完整 AI 客服系统。
+
+下一篇，我们从 LangChain 的三个核心组件开始——模型抽象、提示词模板、输出解析。它们是后面所有功能的地基。

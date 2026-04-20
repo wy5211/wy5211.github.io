@@ -1,0 +1,356 @@
+---
+title: "07. SSR 支持：环境 API 与 React SSR"
+date: "2026-04-12"
+summary: "产品要求支持 SEO，需要加 SSR。Vite 的 SSR 方案和环境 API 怎么用？"
+tags: ["Vite", "SSR", "Environment API", "React"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战指南"
+seriesOrder: 7
+---
+
+前几篇都是 SPA 模式，这一篇引入 SSR——产品团队要求任务页面能被搜索引擎收录。
+
+事情是这样的。TaskFlow Dashboard 上线一年多了，用户量不错，但产品团队发现一个问题：在 Google 搜索 "TaskFlow 任务管理" 的时候，搜索结果里没有任何 TaskFlow 的页面。原因是 SPA 的内容是通过 JavaScript 动态渲染的，搜索引擎爬虫虽然能执行 JavaScript，但索引效果远不如服务端渲染的 HTML。
+
+产品经理给了一个明确的指标：核心任务页面（任务列表、任务详情）的 Google 收录率要在一个月内从 0 提升到 80%。
+
+这是一个典型的 SSR 需求。不是整个站都需要 SSR——只有那些需要被搜索引擎收录的页面需要。其他管理后台页面（设置、团队成员管理）仍然是 SPA 就够了。
+
+## SSR 不是银弹
+
+在动手之前，先想清楚一个问题：SSR 是不是最佳方案。
+
+SSR 解决的问题是 SEO 和首屏加载速度。但它引入了新的复杂度：
+
+**服务端资源开销**。每个请求都需要在服务端渲染一次 React 组件树，CPU 和内存开销比纯静态文件大得多。TaskFlow Dashboard 的任务详情页面渲染一次大约需要 50ms，如果并发量是 1000 QPS，就需要一台专门的服务器来处理渲染。
+
+**数据获取变复杂**。SPA 模式下，数据获取在浏览器端完成——组件挂载后发请求，拿到数据后渲染。SSR 模式下，数据获取需要在服务端完成——渲染 HTML 之前就要拿到数据，然后注入到 HTML 中。两套数据获取逻辑需要保持同步。
+
+**状态管理变复杂**。如果用 Redux/Zustand 这样的状态管理库，需要确保服务端渲染时的状态和客户端 hydration 时的状态一致。状态不一致会导致 hydration mismatch 警告，甚至渲染错误。
+
+对于 TaskFlow Dashboard 来说，有一个更简单的替代方案：**静态站点生成（SSG）**。任务列表页和任务详情页的内容更新频率不高（几分钟到几小时），可以在构建时预渲染成 HTML 文件。这样既解决了 SEO 问题，又不需要运行时的服务端渲染开销。
+
+但产品团队的需求是"任务状态实时更新"——这意味着内容变化频率可能很高，SSG 不太合适。那就用 SSR。
+
+## Vite 的 SSR 方案
+
+Vite 提供了 SSR 支持的核心能力：在 Node.js 环境中运行 Vite 的模块转换管线，把你的 React/TSX 代码编译成可以在服务端执行的 JavaScript。
+
+注意，Vite 只提供构建层面的 SSR 支持。它不会帮你搭一个完整的 SSR 服务器——你需要自己处理 HTTP 服务、路由匹配、数据获取、hydration 等逻辑。Vite 的定位是"构建工具"，不是"应用框架"。
+
+这和 Next.js 的思路不同。Next.js 把 SSR 当作框架的核心功能，你只需要导出一个 `getServerSideProps` 函数，框架帮你处理剩下的所有事情。Vite 给你的是底层能力——你自己组装。
+
+这个选择有代价也有好处。代价是集成工作量更大。好处是你可以精确控制 SSR 的行为，不需要和框架的设计决策做妥协。
+
+Vite SSR 的基本使用方式是这样的：
+
+```typescript
+// server.ts
+import { createServer } from "http";
+import express from "express";
+
+// 创建 Vite 的 SSR 开发服务器（开发模式）
+// 或者用 vite.build({ ssr: true }) 构建后用 node 运行（生产模式）
+async function createSSRServer() {
+  const app = express();
+
+  // 开发模式：使用 Vite 的中间件
+  const vite = await import("vite");
+  const viteDevServer = await vite.createServer({
+    server: { middlewareMode: true },
+    appType: "custom",
+  });
+
+  app.use(viteDevServer.middlewares);
+
+  // SSR 路由处理
+  app.get("*", async (req, res) => {
+    try {
+      const { render } = await viteDevServer.ssrLoadModule(
+        "/src/entry-server.tsx"
+      );
+      const html = await render(req.url);
+      res.status(200).set({ "Content-Type": "text/html" }).end(html);
+    } catch (e) {
+      viteDevServer.ssrFixStacktrace(e as Error);
+      console.error(e);
+      res.status(500).end(e.message);
+    }
+  });
+
+  createServer(app).listen(3000);
+}
+
+createSSRServer();
+```
+
+这段代码做了三件事：创建一个 Express 服务器，挂载 Vite 的开发中间件，然后对所有请求调用 SSR 渲染函数。
+
+`viteDevServer.ssrLoadModule` 是 Vite SSR 的核心 API——它加载一个模块并在服务端执行，享受 Vite 的即时编译和 HMR 支持。在开发模式下，你修改了 React 组件代码，刷新浏览器就能看到服务端渲染结果的更新，和 SPA 的开发体验一致。
+
+## Environment API：管理多个运行时环境
+
+Vite 8 引入了 Environment API（实验性），让 SSR 配置更灵活。
+
+在 Vite 5 及之前，只有两个隐式环境：`client`（浏览器）和 `ssr`（Node.js 服务端）。所有 SSR 相关的配置都挂在 `ssr` 下面。但现实中的项目可能有更多环境——比如你要把 SSR 渲染部署到 Cloudflare Workers（边缘运行时），那 `ssr` 环境的 Node.js 特定配置就不适用了。
+
+Environment API 让你定义任意数量的命名环境：
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  environments: {
+    // 浏览器环境——默认的客户端
+    client: {
+      build: {
+        outDir: "dist/client",
+        rollupOptions: {
+          input: "./index.html",
+        },
+      },
+    },
+
+    // Node.js SSR 环境
+    ssr: {
+      build: {
+        outDir: "dist/server",
+        ssr: "src/entry-server.tsx",
+      },
+    },
+
+    // 边缘运行时环境（如果需要的话）
+    edge: {
+      build: {
+        outDir: "dist/edge",
+        ssr: "src/entry-edge.tsx",
+      },
+    },
+  },
+});
+```
+
+每个环境有独立的构建配置：输出目录、入口文件、外部化依赖、优化选项。Vite 会分别为每个环境执行构建，生成各自的产物。
+
+对于 TaskFlow Dashboard，目前只需要 `client` 和 `ssr` 两个环境。Environment API 的好处是，如果未来需要部署到边缘运行时，加一个 `edge` 环境就行，不需要重构现有的 SSR 配置。
+
+需要注意，Environment API 目前还是实验性的，API 可能会变化。如果你不需要多环境，用传统的 `ssr` 配置就够了。
+
+## React SSR 实战：从入口文件开始
+
+SSR 的实现需要两个入口文件：一个给浏览器用（客户端 hydration），一个给服务端用（服务端渲染）。
+
+客户端入口和 SPA 基本一样，只是把 `ReactDOM.createRoot` 换成了 `ReactDOM.hydrateRoot`：
+
+```tsx
+// src/entry-client.tsx
+import React from "react";
+import { hydrateRoot } from "react-dom/client";
+import { BrowserRouter } from "react-router-dom";
+import { App } from "./App";
+
+// hydrateRoot 和 createRoot 的区别：
+// hydrateRoot 会复用服务端已经渲染好的 DOM，只绑定事件监听器
+// 如果客户端渲染的结果和服务端不一致，React 会给出 hydration 警告
+hydrateRoot(
+  document.getElementById("root")!,
+  <BrowserRouter>
+    <App />
+  </BrowserRouter>
+);
+```
+
+服务端入口需要处理路由匹配和数据获取：
+
+```tsx
+// src/entry-server.tsx
+import React from "react";
+import { renderToString } from "react-dom/server";
+import { StaticRouter } from "react-router-dom/server";
+import { App } from "./App";
+
+// 这个函数在服务端执行，返回完整的 HTML 字符串
+export async function render(url: string) {
+  const html = renderToString(
+    <StaticRouter location={url}>
+      <App />
+    </StaticRouter>
+  );
+
+  return `
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>TaskFlow Dashboard</title>
+  </head>
+  <body>
+    <div id="root">${html}</div>
+    <script type="module" src="/src/entry-client.tsx"></script>
+  </body>
+</html>`;
+}
+```
+
+这里用了 `StaticRouter` 而不是 `BrowserRouter`。`StaticRouter` 不使用浏览器的 History API，而是根据传入的 `url` prop 来确定当前路由。这是 SSR 的标准做法——服务端不知道浏览器地址栏的 URL，需要你手动传入。
+
+`renderToString` 把 React 组件树渲染成 HTML 字符串。它不执行 `useEffect`——所以任何依赖 DOM 的操作（事件监听、DOM 测量）都不会在服务端执行，只会在客户端 hydration 后执行。
+
+## 数据获取：SSR 的核心难点
+
+服务端渲染的 HTML 如果不包含实际数据，SEO 效果和 SPA 没有区别——搜索引擎看到的还是空白的 div。
+
+TaskFlow Dashboard 的任务详情页需要从 API 获取任务数据。SPA 模式下的逻辑是：
+
+```tsx
+// SPA 模式：组件挂载后获取数据
+function TaskDetail({ taskId }: { taskId: string }) {
+  const [task, setTask] = useState<Task | null>(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    fetch(`/api/tasks/${taskId}`)
+      .then((res) => res.json())
+      .then((data) => {
+        setTask(data);
+        setLoading(false);
+      });
+  }, [taskId]);
+
+  if (loading) return <div>加载中...</div>;
+  return <TaskCard task={task} />;
+}
+```
+
+这个逻辑在 SSR 下不行——`useEffect` 不会在服务端执行，所以渲染出来的 HTML 永远是"加载中..."。
+
+SSR 下需要换一种方式：在渲染之前获取数据，然后通过 props 传给组件。
+
+```tsx
+// 数据获取函数——服务端和客户端共用
+async function fetchTask(taskId: string): Promise<Task> {
+  const res = await fetch(`http://localhost:3001/api/tasks/${taskId}`);
+  return res.json();
+}
+
+// 服务端渲染入口
+export async function render(url: string) {
+  const taskId = extractTaskId(url); // 从 URL 中提取 taskId
+  const taskData = await fetchTask(taskId);
+
+  // 把数据序列化后注入到 HTML 中
+  const html = renderToString(
+    <StaticRouter location={url}>
+      <App initialData={{ taskDetail: taskData }} />
+    </StaticRouter>
+  );
+
+  return `
+<!DOCTYPE html>
+<html>
+  <head>...</head>
+  <body>
+    <div id="root">${html}</div>
+    <!-- 服务端获取的数据，客户端 hydration 时使用 -->
+    <script>window.__INITIAL_DATA__ = ${JSON.stringify(taskData)}</script>
+    <script type="module" src="/src/entry-client.tsx"></script>
+  </body>
+</html>`;
+}
+```
+
+客户端 hydration 时，从 `window.__INITIAL_DATA__` 读取数据，跳过二次请求：
+
+```tsx
+// 客户端入口
+function App({ initialData }: { initialData?: Record<string, any> }) {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <BrowserRouter>
+        <Routes>
+          <Route
+            path="/tasks/:id"
+            element={<TaskDetail initialData={initialData?.taskDetail} />}
+          />
+        </Routes>
+      </BrowserRouter>
+    </QueryClientProvider>
+  );
+}
+```
+
+这种模式叫 "passing data from server"。服务端获取数据后，通过 `window.__INITIAL_DATA__` 传递给客户端。客户端 hydration 时，优先使用已有数据，避免重复请求。
+
+TaskFlow Dashboard 最终选择了 React Router v7 的数据加载器（`loader`）来实现这个模式。React Router v7 提供了 `createStaticRouter` 和 `createStaticHandler`，自动处理服务端的数据获取和客户端的 hydration 同步，比手写 `window.__INITIAL_DATA__` 更可靠。
+
+## Hydration 的问题
+
+SSR 不是"服务端渲染完就结束了"。服务端渲染的 HTML 只是第一步——浏览器加载 JavaScript 后，React 需要在已有的 DOM 上"激活"（hydrate），绑定事件监听器，接管后续的渲染。
+
+这个过程有一个潜在问题：hydration mismatch。
+
+如果服务端渲染的 HTML 和客户端渲染的结果不一致，React 会警告。常见的原因包括：
+
+- 服务端和客户端的数据不同步（服务端获取了新数据，但客户端用的还是旧数据）
+- 使用了 `Math.random()`、`Date.now()` 这类每次调用结果不同的函数
+- 使用了 `window`、`document` 等浏览器专属 API（服务端没有这些对象）
+- CSS 样式影响了组件的渲染结果（服务端没有 CSS 上下文）
+
+TaskFlow Dashboard 在开发 SSR 时遇到的 hydration 问题，90% 是因为某个组件直接使用了 `window.localStorage`。解决方案是封装一个 `useLocalStorage` hook，在服务端返回默认值，在客户端返回实际值：
+
+```tsx
+function useLocalStorage<T>(key: string, defaultValue: T) {
+  const [value, setValue] = useState<T>(() => {
+    // 服务端返回默认值，客户端从 localStorage 读取
+    if (typeof window === "undefined") return defaultValue;
+    try {
+      const stored = localStorage.getItem(key);
+      return stored ? JSON.parse(stored) : defaultValue;
+    } catch {
+      return defaultValue;
+    }
+  });
+
+  useEffect(() => {
+    localStorage.setItem(key, JSON.stringify(value));
+  }, [key, value]);
+
+  return [value, setValue] as const;
+}
+```
+
+## WASM SSR：Vite 8 的新能力
+
+Vite 8 增加了对 WASM 模块在 SSR 环境中的支持。如果你的项目使用了 WebAssembly（比如图像处理、数据压缩），Vite 8 可以在服务端正确加载和执行 WASM 模块。
+
+这对 TaskFlow Dashboard 来说暂时用不上，但如果你的项目需要在服务端做计算密集型操作（比如生成报表、处理用户上传的文件），WASM SSR 是一个有价值的能力。之前在 Vite 5 中，WASM 模块只能在浏览器环境中使用，SSR 下会报错。
+
+## 什么时候值得做 SSR
+
+TaskFlow Dashboard 最终只对两个页面做了 SSR：任务列表页和任务详情页。其他页面（设置、团队管理、个人中心）仍然是 SPA 渲染。
+
+这个决策基于几个考量。
+
+**SSR 的收益**：任务列表页和任务详情页是产品希望被搜索引擎收录的页面。这两个页面的内容相对稳定（不会因为用户操作而频繁变化），数据获取的 API 响应时间在 50ms 以内，SSR 的额外开销可以接受。
+
+**SSR 的成本**：需要维护两套入口文件、处理数据获取的同步问题、处理 hydration mismatch、服务端需要额外的渲染资源。这些成本在所有页面都做 SSR 时会急剧增加。
+
+**SSG 的可能性**：如果某些页面的内容更新频率很低（比如一周才更新一次），可以考虑 SSG——构建时预渲染成 HTML，不需要运行时渲染。Vite 通过 `vite-plugin-ssr`（现在的 `vike`）或 `vite-ssg` 等社区插件支持 SSG。
+
+**ISR 的折中方案**：增量静态再生成（ISR）介于 SSR 和 SSG 之间——页面默认是静态的，但在内容更新时重新生成。这需要配合 CDN 使用，Vite 本身不直接提供 ISR，但可以通过 `vike` 的 `prerender` 功能实现。
+
+最终 TaskFlow Dashboard 的策略是：核心页面 SSR，辅助页面 SPA，未来如果需要可以引入 SSG。
+
+## 案例总结
+
+给 TaskFlow Dashboard 加 SSR，从技术调研到上线用了大约三周。其中一周用在数据获取逻辑的改造上——把 20 多个页面的 `useEffect` 数据获取模式迁移到 React Router 的 `loader` 模式。
+
+Vite 的 SSR 支持在构建层面表现不错——`vite build --ssr` 的构建速度很快（大约 2 秒），产物体积小（约 120 KB），HMR 在 SSR 模式下也能正常工作。Environment API 虽然还是实验性的，但对于只有 `client` 和 `ssr` 两个环境的场景来说，传统的 SSR 配置方式已经足够了。
+
+最大的挑战不是 Vite 本身，而是 SSR 的架构设计——数据获取、hydration、路由匹配这些逻辑和框架强相关。如果你用 Next.js，这些都已经帮你处理好了。用 Vite 的话，你需要自己组装，但换来的自由度是你可以精确控制 SSR 的行为。
+
+对于 TaskFlow Dashboard 这样的项目，SSR 的投入是值得的——Google 收录率从 0 提升到了 85%，核心任务页面的首屏加载时间从 2.1 秒降到了 0.8 秒（LCP 指标）。但如果你的项目不需要 SEO，也没有首屏性能问题，SPA 仍然是更简单、更省力的选择。下一篇我们处理环境变量和多环境配置的问题。

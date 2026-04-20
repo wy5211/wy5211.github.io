@@ -1,0 +1,541 @@
+---
+title: "09. Set 集合运算：社交功能"
+date: "2026-03-23"
+summary: "使用 Redis Set 实现社交网络功能，包括关注系统、标签系统和共同好友查询。"
+tags: ["Redis", "Set", "社交功能"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 9
+---
+
+上一篇我们讲了 List 类型，适合实现有序的消息队列。但有些场景需要"唯一性"和"集合运算"，比如关注系统、标签系统、共同好友。这时候就需要 Set 类型。
+
+Set 是一个无序的唯一集合，自动去重，支持交集、并集、差集等运算。
+
+## 为什么需要 Set
+
+想象一个社交场景：用户可以关注其他用户，查看共同关注、推荐好友。如果用 List 存储，需要自己处理去重和交集运算，很麻烦。
+
+Set 的特点正好匹配这些需求：
+
+1. 自动去重：同一个元素只能存在一次
+2. 集合运算：可以求交集、并集、差集
+3. 高效查找：O(1) 时间复杂度判断元素是否存在
+
+## 关注系统
+
+让我们用 Set 实现一个关注系统：
+
+```typescript
+import Redis from "ioredis";
+
+const redis = new Redis();
+
+class FollowSystem {
+  constructor(private redis: Redis) {}
+
+  // 关注（同时更新关注列表和粉丝列表）
+  async follow(userId: string, targetUserId: string): Promise<void> {
+    const pipeline = this.redis.pipeline();
+
+    // 添加到关注列表
+    pipeline.sadd(`user:${userId}:following`, targetUserId);
+
+    // 添加到对方的粉丝列表
+    pipeline.sadd(`user:${targetUserId}:followers`, userId);
+
+    await pipeline.exec();
+  }
+
+  // 取关（同时删除关注和粉丝记录）
+  async unfollow(userId: string, targetUserId: string): Promise<void> {
+    const pipeline = this.redis.pipeline();
+
+    pipeline.srem(`user:${userId}:following`, targetUserId);
+    pipeline.srem(`user:${targetUserId}:followers`, userId);
+
+    await pipeline.exec();
+  }
+
+  // 获取关注列表
+  async getFollowing(userId: string): Promise<string[]> {
+    return await this.redis.smembers(`user:${userId}:following`);
+  }
+
+  // 获取粉丝列表
+  async getFollowers(userId: string): Promise<string[]> {
+    return await this.redis.smembers(`user:${userId}:followers`);
+  }
+
+  // 检查是否关注
+  async isFollowing(userId: string, targetUserId: string): Promise<boolean> {
+    return (
+      (await this.redis.sismember(`user:${userId}:following`, targetUserId)) ===
+      1
+    );
+  }
+
+  // 获取关注数和粉丝数
+  async getStats(
+    userId: string
+  ): Promise<{ following: number; followers: number }> {
+    const pipeline = this.redis.pipeline();
+    pipeline.scard(`user:${userId}:following`);
+    pipeline.scard(`user:${userId}:followers`);
+
+    const results = await pipeline.exec();
+    return {
+      following: results[0][1] as number,
+      followers: results[1][1] as number,
+    };
+  }
+}
+
+// 使用示例
+const follow = new FollowSystem(redis);
+
+// 用户 usr_a1b2c3 关注 usr_b2d3e4
+await follow.follow("usr_a1b2c3", "usr_b2d3e4");
+
+// 查看关注列表
+const following = await follow.getFollowing("usr_a1b2c3");
+console.log("关注列表:", following);
+
+// 查看粉丝列表
+const followers = await follow.getFollowers("usr_b2d3e4");
+console.log("粉丝列表:", followers);
+
+// 检查是否关注
+const isFollowing = await follow.isFollowing("usr_a1b2c3", "usr_b2d3e4");
+console.log("是否关注:", isFollowing);
+```
+
+这里用了两个 Set 来存储关系：user:ID:following 存储关注的人，user:ID:followers 存储粉丝。关注时需要同时更新两个 Set，用 Pipeline 可以减少网络往返。
+
+## 共同关注
+
+Set 最强大的功能是集合运算。比如想找出两个人的共同关注：
+
+```typescript
+class FollowSystem {
+  // ... 前面的代码 ...
+
+  // 获取共同关注
+  async getCommonFollowing(
+    userId1: string,
+    userId2: string
+  ): Promise<string[]> {
+    // SINTER 返回多个集合的交集
+    return await this.redis.sinter(
+      `user:${userId1}:following`,
+      `user:${userId2}:following`
+    );
+  }
+
+  // 获取共同粉丝
+  async getCommonFollowers(
+    userId1: string,
+    userId2: string
+  ): Promise<string[]> {
+    return await this.redis.sinter(
+      `user:${userId1}:followers`,
+      `user:${userId2}:followers`
+    );
+  }
+
+  // 获取我关注但对方没关注的人（差集）
+  async getIDontFollowTheirFollowings(
+    userId: string,
+    targetUserId: string
+  ): Promise<string[]> {
+    // SDIFF 返回第一个集合有，但其他集合没有的元素
+    return await this.redis.sdiff(
+      `user:${userId}:following`,
+      `user:${targetUserId}:following`
+    );
+  }
+
+  // 获取所有关注（去重）
+  async getAllFollowing(userId1: string, userId2: string): Promise<string[]> {
+    // SUNION 返回所有集合的并集
+    return await this.redis.sunion(
+      `user:${userId1}:following`,
+      `user:${userId2}:following`
+    );
+  }
+}
+
+// 使用示例
+const common = await follow.getCommonFollowing("usr_a1b2c3", "usr_b2d3e4");
+console.log("共同关注:", common);
+```
+
+SINTER（交集）、SUNION（并集）、SDIFF（差集）是 Set 的三个核心运算。它们可以在 Redis 端完成，不需要把数据拉到应用层，性能很高。
+
+## 推荐关注
+
+社交平台常用"二度人脉"推荐：关注的人还关注了谁（排除自己已经关注的）。
+
+```typescript
+class FollowSystem {
+  // ... 前面的代码 ...
+
+  // 推荐关注（关注的人还关注了谁）
+  async getRecommendFollows(
+    userId: string,
+    limit: number = 10
+  ): Promise<string[]> {
+    // 1. 获取我的关注列表
+    const myFollowing = await this.getFollowing(userId);
+    if (myFollowing.length === 0) {
+      return [];
+    }
+
+    // 2. 用临时集合存储推荐
+    const tempKey = `temp:recommend:${userId}`;
+
+    // 3. 获取我关注的每个人关注的列表，合并到临时集合
+    for (const targetId of myFollowing.slice(0, 50)) {
+      // 限制数量，避免太多
+      const theirFollowing = await this.getFollowing(targetId);
+      if (theirFollowing.length > 0) {
+        await this.redis.sunionstore(
+          tempKey,
+          tempKey,
+          `user:${targetId}:following`
+        );
+      }
+    }
+
+    // 4. 移除自己和已经关注的人
+    await this.redis.srem(tempKey, userId, ...myFollowing);
+
+    // 5. 随机获取 N 个推荐
+    const recommends = await this.redis.srandmember(tempKey, limit);
+
+    // 6. 清理临时集合
+    await this.redis.del(tempKey);
+
+    return recommends || [];
+  }
+}
+
+// 使用示例
+const recommends = await follow.getRecommendFollows("usr_a1b2c3", 10);
+console.log("推荐关注:", recommends);
+```
+
+SUNIONSTORE 可以把多个集合的并集存到一个新集合中。这里用它来收集"关注的人还关注了谁"。
+
+## 标签系统
+
+Set 的另一个应用是标签系统。比如直播平台的标签：游戏、音乐、聊天、户外等。
+
+```typescript
+class TagSystem {
+  constructor(private redis: Redis) {}
+
+  // 给直播间添加标签
+  async addTags(roomId: string, tags: string[]): Promise<void> {
+    const pipeline = this.redis.pipeline();
+
+    // 1. 保存直播间的标签
+    pipeline.sadd(`room:${roomId}:tags`, ...tags);
+
+    // 2. 把直播间添加到每个标签下（反向索引）
+    for (const tag of tags) {
+      pipeline.sadd(`tag:${tag}:rooms`, roomId);
+    }
+
+    await pipeline.exec();
+  }
+
+  // 获取直播间的标签
+  async getRoomTags(roomId: string): Promise<string[]> {
+    return await this.redis.smembers(`room:${roomId}:tags`);
+  }
+
+  // 获取标签下的直播间
+  async getTaggedRooms(tag: string): Promise<string[]> {
+    return await this.redis.smembers(`tag:${tag}:rooms`);
+  }
+
+  // 删除直播间的标签
+  async removeTags(roomId: string, tags: string[]): Promise<void> {
+    const pipeline = this.redis.pipeline();
+
+    pipeline.srem(`room:${roomId}:tags`, ...tags);
+
+    for (const tag of tags) {
+      pipeline.srem(`tag:${tag}:rooms`, roomId);
+    }
+
+    await pipeline.exec();
+  }
+
+  // 查找同时拥有多个标签的直播间（交集）
+  async findeyondingsWithAllTags(tags: string[]): Promise<string[]> {
+    const keys = tags.map((tag) => `tag:${tag}:rooms`);
+    return await this.redis.sinter(...keys);
+  }
+
+  // 查找拥有任意标签的直播间（并集）
+  async findRoomsByAnyTags(tags: string[]): Promise<string[]> {
+    const keys = tags.map((tag) => `tag:${tag}:rooms`);
+    return await this.redis.sunion(...keys);
+  }
+
+  // 获取相关标签（共同直播间多的标签）
+  async getRelatedTags(tag: string, limit: number = 10): Promise<string[]> {
+    // 1. 获取该标签的所有直播间
+    const rooms = await this.getTaggedRooms(tag);
+    if (rooms.length === 0) {
+      return [];
+    }
+
+    // 2. 用临时集合存储相关标签
+    const tempKey = `temp:related_tags:${tag}`;
+
+    // 3. 获取这些直播间的所有标签
+    for (const roomId of rooms.slice(0, 100)) {
+      // 限制数量
+      const roomTags = await this.getRoomTags(roomId);
+      if (roomTags.length > 0) {
+        await this.redis.sunionstore(tempKey, tempKey, `room:${roomId}:tags`);
+      }
+    }
+
+    // 4. 移除当前标签
+    await this.redis.srem(tempKey, tag);
+
+    // 5. 随机获取 N 个相关标签
+    const related = await this.redis.srandmember(tempKey, limit);
+
+    // 6. 清理临时集合
+    await this.redis.del(tempKey);
+
+    return related || [];
+  }
+}
+
+// 使用示例
+const tags = new TagSystem(redis);
+
+// 给直播间添加标签
+await tags.addTags("abc123", ["游戏", "王者荣耀", "技术"]);
+
+// 查找"游戏"且"技术"的直播间
+const rooms = await tags.findRoomsByAllTags(["游戏", "技术"]);
+console.log("符合条件的直播间:", rooms);
+
+// 获取"游戏"的相关标签
+const related = await tags.getRelatedTags("游戏", 10);
+console.log("相关标签:", related);
+```
+
+标签系统用了双向索引：room:ID:tags 存储直播间的标签，tag:NAME:rooms 存储标签下的直播间。这样既可以"查询直播间的标签"，也可以"查询标签下的直播间"。
+
+## 点赞系统
+
+Set 的自动去重特性很适合实现点赞功能。用户只能点赞一次，再次点赞不会重复计数。
+
+```typescript
+class LikeSystem {
+  constructor(private redis: Redis) {}
+
+  // 点赞
+  async like(
+    userId: string,
+    targetType: string,
+    targetId: string
+  ): Promise<boolean> {
+    const key = `${targetType}:${targetId}:likes`;
+    const countKey = `${targetType}:${targetId}:likes_count`;
+
+    // 尝试添加到点赞集合（如果已存在会返回 0）
+    const added = await this.redis.sadd(key, userId);
+
+    if (added === 1) {
+      // 首次点赞，增加计数
+      await this.redis.incr(countKey);
+      return true;
+    }
+
+    return false; // 已经点过赞了
+  }
+
+  // 取消点赞
+  async unlike(
+    userId: string,
+    targetType: string,
+    targetId: string
+  ): Promise<boolean> {
+    const key = `${targetType}:${targetId}:likes`;
+    const countKey = `${targetType}:${targetId}:likes_count`;
+
+    // 尝试从点赞集合移除（如果不存在会返回 0）
+    const removed = await this.redis.srem(key, userId);
+
+    if (removed === 1) {
+      // 成功移除，减少计数
+      await this.redis.decr(countKey);
+      return true;
+    }
+
+    return false; // 没有点过赞
+  }
+
+  // 检查是否点赞
+  async hasLiked(
+    userId: string,
+    targetType: string,
+    targetId: string
+  ): Promise<boolean> {
+    const key = `${targetType}:${targetId}:likes`;
+    return (await this.redis.sismember(key, userId)) === 1;
+  }
+
+  // 获取点赞数
+  async getLikeCount(targetType: string, targetId: string): Promise<number> {
+    const countKey = `${targetType}:${targetId}:likes_count`;
+    const count = await this.redis.get(countKey);
+    return parseInt(count || "0");
+  }
+
+  // 获取点赞的用户列表
+  async getLikers(
+    targetType: string,
+    targetId: string,
+    limit: number = 100
+  ): Promise<string[]> {
+    const key = `${targetType}:${targetId}:likes`;
+    // SRANDMEMBER 随机获取，不会删除元素
+    return (await this.redis.srandmember(key, limit)) || [];
+  }
+}
+
+// 使用示例
+const likes = new LikeSystem(redis);
+
+// 用户点赞直播间
+await likes.like("usr_a1b2c3", "room", "abc123");
+
+// 检查是否点赞
+const hasLiked = await likes.hasLiked("usr_a1b2c3", "room", "abc123");
+console.log("是否点赞:", hasLiked);
+
+// 获取点赞数
+const count = await likes.getLikeCount("room", "abc123");
+console.log("点赞数:", count);
+```
+
+这里用了两个键：room:ID:likes 存储点赞用户集合（Set），room:ID:likes_count 存储点赞数（String）。分开存储的原因是：SCARD（获取集合大小）虽然可以获取点赞数，但比直接 GET 慢一些，而且点赞数查询更频繁。
+
+## 抽奖系统
+
+Set 的随机性和去重性可以用来实现抽奖功能：
+
+```typescript
+class LotterySystem {
+  constructor(private redis: Redis) {}
+
+  // 用户参与抽奖
+  async participate(userId: string, lotteryId: string): Promise<boolean> {
+    const key = `lottery:${lotteryId}:participants`;
+
+    // SADD 会自动去重，重复参与会返回 0
+    const added = await this.redis.sadd(key, userId);
+    return added === 1;
+  }
+
+  // 随机抽取中奖者（从集合中移除）
+  async drawWinners(lotteryId: string, count: number = 1): Promise<string[]> {
+    const key = `lottery:${lotteryId}:participants`;
+
+    // SPOP 随机弹出元素（会从集合中删除）
+    return (await this.redis.spop(key, count)) || [];
+  }
+
+  // 查看参与者数量
+  async getParticipantCount(lotteryId: string): Promise<number> {
+    const key = `lottery:${lotteryId}:participants`;
+    return await this.redis.scard(key);
+  }
+
+  // 检查是否参与
+  async hasParticipated(userId: string, lotteryId: string): Promise<boolean> {
+    const key = `lottery:${lotteryId}:participants`;
+    return (await this.redis.sismember(key, userId)) === 1;
+  }
+
+  // 预览中奖者（不从集合中移除）
+  async previewWinners(
+    lotteryId: string,
+    count: number = 1
+  ): Promise<string[]> {
+    const key = `lottery:${lotteryId}:participants`;
+    // SRANDMEMBER 随机获取但不删除
+    return (await this.redis.srandmember(key, count)) || [];
+  }
+}
+
+// 使用示例
+const lottery = new LotterySystem(redis);
+
+// 用户参与抽奖
+const joined = await lottery.participate("usr_a1b2c3", "lottery_001");
+console.log("参与成功:", joined);
+
+// 查看参与人数
+const count = await lottery.getParticipantCount("lottery_001");
+console.log("参与人数:", count);
+
+// 抽取 3 个中奖者
+const winners = await lottery.drawWinners("lottery_001", 3);
+console.log("中奖者:", winners);
+```
+
+SPOP 会随机从集合中弹出元素，而且保证不重复。这正好符合抽奖的需求：每个用户只能中奖一次，抽完就移除。
+
+## Set vs List
+
+什么时候用 Set，什么时候用 List？
+
+| 特性     | Set              | List               |
+| -------- | ---------------- | ------------------ |
+| 唯一性   | 自动去重         | 允许重复           |
+| 顺序     | 无序             | 有序               |
+| 查找     | O(1)             | O(N)               |
+| 集合运算 | 支持（交/并/差） | 不支持             |
+| 适用场景 | 关注、标签、点赞 | 消息队列、最新列表 |
+
+如果需要唯一性，用 Set；如果需要保持顺序，用 List。
+
+## 总结与 Trade-off
+
+Set 类型适合需要唯一性和集合运算的场景。
+
+**Set 的优点：**
+
+- 自动去重，不需要自己处理
+- 支持高效的集合运算（交/并/差）
+- O(1) 时间复杂度判断元素是否存在
+- 可以实现社交关系、标签、点赞等功能
+
+**Set 的缺点：**
+
+- 无序，不能按顺序获取
+- 按索引访问慢（实际上不提供索引访问）
+- 集合运算复杂度 O(N)，N 是最小集合的大小
+
+**适用场景：**
+
+- 关注系统（关注/粉丝/共同关注）
+- 标签系统（标签查询/相关标签）
+- 点赞系统（去重点赞）
+- 抽奖系统（随机抽取）
+- 需要集合运算的场景
+
+下一篇我们会讲 Sorted Set 类型，看看如何实现排行榜、范围查询等需要排序的功能。

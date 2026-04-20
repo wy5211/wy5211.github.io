@@ -1,0 +1,352 @@
+---
+title: "04 文档处理与 Chunking 策略：切对了才搜得准"
+date: "2026-04-14"
+summary: "Chunking 是 RAG 质量的地基——固定长度、递归字符、语义切分、父子文档策略对比，以及表格/代码/列表等真实文档的处理技巧。"
+tags: ["RAG", "Chunking", "文档处理", "语义切分", "文本分割"]
+category: "rag"
+cover: ""
+draft: false
+series: "RAG 深入"
+seriesOrder: 4
+---
+
+上一篇解决了向量存到哪的问题。但在把文档变成向量之前，有一个更早的环节经常被忽视：**怎么切文档**。
+
+很多人的做法是：无脑用 RecursiveCharacterTextSplitter，chunkSize=500，完事。然后发现用户问"支付服务宕机的根因是什么"，检索到的片段里没有"根因"——它被切到了另一个片段里。
+
+Chunking 直接决定了检索质量的上限。Embedding 模型再好、向量数据库再快，如果关键信息被切断了，后面一切都是白费。
+
+## Chunking 为什么这么重要
+
+来看一个真实的例子。知识库中有一篇故障复盘：
+
+```
+# INC-2025-047 支付服务宕机复盘
+
+## 概要
+6月12日 14:23 支付服务开始出现超时，14:30 全面宕机。
+影响范围：所有在线支付渠道。影响时长：47 分钟。
+严重程度：P1。
+
+## 根因分析
+Redis 连接池配置为最大 200 个连接。大促期间并发请求激增，
+连接池在 14:23 耗尽，后续请求排队等待超时，触发级联故障。
+
+## 解决方案
+1. 立即：将连接池上限从 200 调整到 1000
+2. 短期：实施熔断机制，防止级联故障
+3. 长期：引入 Redis Cluster 分散负载
+```
+
+按 chunkSize=300 切分：
+
+```
+片段 1："# INC-2025-047 支付服务宕机复盘\n\n## 概要\n6月12日
+14:23 支付服务开始出现超时，14:30 全面宕机。影响范围：所有在线
+支付渠道。影响时长：47 分钟。严重程度：P1。"
+
+片段 2："## 根因分析\nRedis 连接池配置为最大 200 个连接。大促
+期间并发请求激增，连接池在 14:23 耗尽，后续请求排队等待超时，
+触发级联故障。"
+
+片段 3："## 解决方案\n1. 立即：将连接池上限从 200 调整到 1000
+\n2. 短期：实施熔断机制，防止级联故障\n3. 长期：引入 Redis
+Cluster 分散负载"
+```
+
+用户问"支付服务宕机的根因是什么"——能检索到片段 2，没问题。
+
+但如果按 chunkSize=200 切：
+
+```
+片段 1："# INC-2025-047 支付服务宕机复盘\n\n## 概要\n6月12日
+14:23 支付服务开始出现超时，14:30 全面宕机。"
+
+片段 2："影响范围：所有在线支付渠道。影响时长：47 分钟。
+严重程度：P1。\n\n## 根因分析\nRedis 连接池配置为最大 200 个连接。"
+
+片段 3："大促期间并发请求激增，连接池在 14:23 耗尽，后续请求
+排队等待超时，触发级联故障。"
+```
+
+关键信息"Redis 连接池耗尽"被切到了片段 2 的尾部和片段 3 的前部。如果检索只返回 top 1，大概率只返回片段 2——但片段 2 里连接池还没耗尽呢。
+
+**切分粒度直接决定了检索能否命中完整信息。**
+
+## 四种切分策略对比
+
+### 1. 固定长度切分
+
+最简单的方式，按字符数固定切分。
+
+```
+每 200 个字符切一段，不管内容结构。
+优点：实现简单，片段大小均匀
+缺点：无视语义边界，可能在句子/段落中间切断
+```
+
+几乎没有场景适合单独使用固定长度切分。
+
+### 2. 递归字符切分（RecursiveCharacterTextSplitter）
+
+按优先级尝试不同分隔符：`\n\n` → `\n` → `。` → `.` → 空格 → 字符。优先在自然断点处切割。
+
+```
+chunkSize=500, chunkOverlap=50
+
+优点：尽量保持段落和句子的完整性
+缺点：不理解文档结构（标题、列表、代码块一视同仁）
+适合：大多数通用文档
+```
+
+这是 **默认推荐**的策略。在 LangChain 系列中你已经用过了。
+
+### 3. 按文档结构切分
+
+识别 Markdown 标题层级，按章节切分。每个片段就是一个完整的章节。
+
+```
+# 标题 1 → 片段 A（包含所有内容直到 ## 标题 2）
+## 标题 2 → 片段 B（包含所有内容直到 ### 标题 3）
+
+优点：语义最完整，每个片段是自洽的
+缺点：章节长度不均匀（有的 100 字，有的 5000 字）
+适合：结构化的技术文档
+```
+
+```typescript
+// 按标题切分的逻辑
+function splitByHeadings(markdown: string): Chunk[] {
+  const chunks: Chunk[] = [];
+  const lines = markdown.split("\n");
+  let currentChunk = "";
+  let currentTitle = "";
+
+  for (const line of lines) {
+    // 检测标题行（## 或更深）
+    if (/^#{2,}\s/.test(line)) {
+      // 遇到新标题，保存上一个 chunk
+      if (currentChunk.trim()) {
+        chunks.push({
+          content: currentTitle + "\n" + currentChunk,
+          metadata: { heading: currentTitle },
+        });
+      }
+      currentTitle = line;
+      currentChunk = "";
+    } else {
+      currentChunk += line + "\n";
+    }
+  }
+
+  // 别忘了最后一个
+  if (currentChunk.trim()) {
+    chunks.push({
+      content: currentTitle + "\n" + currentChunk,
+      metadata: { heading: currentTitle },
+    });
+  }
+
+  return chunks;
+}
+```
+
+按标题切分的效果通常最好，但需要处理一个问题：某些章节太长，仍然需要二次切分。
+
+### 4. 语义切分（Semantic Chunking）
+
+用 Embedding 模型判断句子之间的语义连贯性，在语义跳跃处切分。
+
+```
+句子 1："我们评估了 PostgreSQL 和 MongoDB。"  ← 语义相近
+句子 2："PostgreSQL 在关系型查询上优势明显。"   ← 语义相近
+句子 3："Redis 连接池配置建议设为 1000。"     ← 语义跳跃 → 在这里切分！
+
+优点：切分点最自然，每个片段语义高度相关
+缺点：需要多次调用 Embedding API，成本高、速度慢
+适合：对检索质量要求极高的场景
+```
+
+```typescript
+import { OpenAI } from "openai";
+
+const openai = new OpenAI();
+
+async function semanticChunk(text: string, threshold = 0.5) {
+  // 按句子拆分
+  const sentences = text.split(/(?<=[。.！!？?])\s*/);
+
+  // 计算每个句子的 Embedding
+  const embeddings = await openai.embeddings.create({
+    model: "text-embedding-3-small",
+    input: sentences,
+  });
+
+  const vectors = embeddings.data.map((d) => d.embedding);
+
+  // 计算相邻句子的相似度
+  const chunks: string[][] = [[]];
+
+  for (let i = 0; i < vectors.length - 1; i++) {
+    chunks[chunks.length - 1].push(sentences[i]);
+
+    const similarity = cosineSimilarity(vectors[i], vectors[i + 1]);
+
+    // 相似度低于阈值 → 语义跳跃 → 开始新片段
+    if (similarity < threshold) {
+      chunks.push([]);
+    }
+  }
+
+  return chunks.map((c) => c.join(""));
+}
+```
+
+语义切分的成本很高（每个句子一次 Embedding 调用），一般用在离线处理阶段，不适合实时。
+
+## 策略选择指南
+
+| 文档类型     | 推荐策略      | chunkSize | 说明                                   |
+| ------------ | ------------- | --------- | -------------------------------------- |
+| API 文档     | 按标题 + 递归 | 500-800   | 结构清晰，按标题切最自然               |
+| 架构设计文档 | 语义切分      | 动态      | 逻辑复杂，需要语义级切分               |
+| 故障复盘     | 递归字符      | 500       | 有明确章节（概要/根因/方案），递归够用 |
+| 会议纪要     | 按标题 + 递归 | 800-1000  | 主题跳跃大，按议题切                   |
+| 代码 + 注释  | 特殊处理      | 按函数/类 | 代码要按逻辑单元切，不能按字符         |
+| FAQ          | 按问答对      | 自然切分  | 每个问答对就是一个片段                 |
+
+## 父子文档策略
+
+这是一种进阶的 Chunking 技巧：**用小片段检索，返回大片段给 LLM。**
+
+```
+原始文档（1000 字）
+  │
+  ├─ 父文档：完整文档（给 LLM 看的，上下文完整）
+  │
+  ├─ 子文档 1（200 字）：概要部分
+  ├─ 子文档 2（200 字）：根因分析部分
+  └─ 子文档 3（200 字）：解决方案部分
+
+检索流程：
+  1. 用子文档做 Embedding 和检索（粒度细，命中率高）
+  2. 命中子文档后，返回对应的父文档（上下文完整）
+  3. 把父文档交给 LLM 生成回答
+```
+
+为什么这样更好？
+
+- **小片段检索更精准**：用户问"根因是什么"，精确匹配到 200 字的"根因分析"片段
+- **大片段提供完整上下文**：LLM 看到完整的复盘文档，理解"根因"的前因后果
+
+实现时需要维护父子关系：
+
+```typescript
+interface Chunk {
+  id: string;
+  parentId?: string;    // 指向父文档
+  content: string;
+  embedding?: number[];
+  metadata: {
+    source: string;
+    type: "parent" | "child";
+  };
+}
+
+// 检索时
+const childResults = await vectorDB.search(queryVector, topK: 5);
+
+// 找到对应的父文档
+const parentIds = [...new Set(childResults.map((r) => r.metadata.parentId))];
+const parentDocs = await vectorDB.getByIds(parentIds);
+
+// 用父文档生成回答
+const context = parentDocs.map((d) => d.content).join("\n\n---\n\n");
+const answer = await generate(query, context);
+```
+
+## 处理特殊内容
+
+真实文档不只是纯文本。以下是常见的难点：
+
+### 表格
+
+Markdown 表格按字符切分会变成残缺的行列：
+
+```
+切分前：
+| 服务 | CPU | 内存 | 状态 |
+|------|-----|------|------|
+| API  | 45% | 2GB  | 正常 |
+| DB   | 89% | 8GB  | 告警 |
+
+切分后（在第二行断裂）：
+片段 1："| 服务 | CPU | 内存 | 状态 |\n|------|-----|------|------|"
+片段 2："| API  | 45% | 2GB  | 正常 |\n| DB   | 89% | 8GB  | 告警 |"
+→ 片段 2 失去了表头，语义不完整
+```
+
+处理方法：把整个表格作为一个片段，不要在表格中间切分。
+
+### 代码块
+
+代码要按函数/类切分，不要按字符数切：
+
+```typescript
+// 不要在代码块中间切断
+function processOrder(order: Order) {
+  // ← 切在这里就废了
+  const validated = validate(order);
+  const result = charge(validated);
+  return result;
+}
+```
+
+处理方法：检测代码块标记（```），在代码块内部按空行或函数边界切分。
+
+### 嵌套列表
+
+```markdown
+- 部署流程
+  1. 构建镜像
+     - 运行 `npm run build`
+     - 复制产物到镜像
+  2. 推送镜像
+     - tag 为 `registry/app:v1.2`
+     - `docker push`
+```
+
+嵌套列表是一个完整的流程，不应该在中间切断。按缩进层级识别并保持完整。
+
+## 实际工作流
+
+综合以上策略，一个实用的 Chunking 流程：
+
+```
+1. 识别文档类型（Markdown / PDF / 网页）
+      │
+2. 按结构预切分（标题 / 章节边界）
+      │
+3. 对每个章节：
+  ├─ 长度 < chunkSize → 作为一个片段
+  └─ 长度 > chunkSize → 递归字符切分（保留标题作为上下文）
+      │
+4. 处理特殊内容（表格/代码块不切断）
+      │
+5. 添加元数据（来源、章节标题、文档类型）
+      │
+6. （可选）生成父子文档关系
+```
+
+关键原则：**先按结构切，再用长度兜底。** 不要上来就按字符数暴力切。
+
+## 这一篇你学到了什么
+
+- Chunking 直接决定检索质量上限，是最容易被忽视但影响最大的环节
+- **递归字符切分**是通用默认选择，但不是最优选择
+- **按标题切分**适合结构化技术文档，效果通常最好
+- **语义切分**最精确但成本高，适合离线处理
+- **父子文档策略**兼顾检索精准度和上下文完整性
+- 表格、代码、列表需要特殊处理，不能暴力按字符切
+
+下一篇进入高级检索策略——混合检索、重排序、Query 改写，把 RAG 从"能用"升级到"好用"。

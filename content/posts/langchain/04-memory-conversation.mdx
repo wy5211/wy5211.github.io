@@ -1,0 +1,336 @@
+---
+title: "04 记忆机制：让 AI 记住你说过的话"
+date: "2026-04-14"
+summary: "理解 LLM 无状态的先天缺陷，用 LangChain 的 Memory 组件实现多轮对话——缓冲记忆、窗口记忆、摘要记忆，以及生产环境的持久化方案。"
+tags: ["LangChain", "Memory", "多轮对话", "LLM", "TypeScript"]
+category: "langchain"
+cover: ""
+draft: false
+series: "LangChain.js 实战"
+seriesOrder: 4
+---
+
+用户和你的客服助手聊了 5 分钟：
+
+```
+用户：企业版支持多少人同时在线？
+助手：企业版支持最多 500 人同时在线。
+用户：那费用呢？
+助手：您指的是什么费用？
+用户：就是刚才说的企业版的费用啊！
+```
+
+助手完全忘了之前在聊企业版。这不是 Bug，这是 LLM 的先天设计——每次调用 API 都是无状态的，模型不会记住上一轮对话。
+
+上一篇用 LCEL 搭好了链式调用，这一篇在链中加入**记忆组件**，让对话有上下文。
+
+## LLM 为什么没有记忆
+
+每次调用 `model.invoke(messages)` 时，你传入的 `messages` 数组就是模型能看到的全部上下文。如果你只传当前这条消息，模型对之前发生了什么一无所知。
+
+所以"记忆"的本质是：**把之前的对话历史也塞进 messages 数组里**。
+
+```
+第一次调用：
+messages: [
+  { role: "user", content: "企业版支持多少人同时在线？" }
+]
+
+第二次调用（没有记忆）：
+messages: [
+  { role: "user", content: "那费用呢？" }
+]
+
+第二次调用（有记忆）：
+messages: [
+  { role: "user", content: "企业版支持多少人同时在线？" },
+  { role: "assistant", content: "企业版支持最多 500 人同时在线。" },
+  { role: "user", content: "那费用呢？" }  // 现在能理解"那"指的是企业版
+]
+]
+```
+
+就这么简单——把历史消息拼上就行。但手动管理这段历史很麻烦：存哪？怎么截断？对话太长怎么办？LangChain 的 Memory 组件帮你处理这些。
+
+## BufferMemory：完整的对话记忆
+
+最直接的方式：把所有历史对话原样保留。
+
+```typescript
+import { ChatOpenAI } from "@langchain/openai";
+import {
+  ChatPromptTemplate,
+  MessagesPlaceholder,
+} from "@langchain/core/prompts";
+import { BufferMemory } from "langchain/memory";
+import { ConversationChain } from "langchain/chains";
+
+const model = new ChatOpenAI({ modelName: "gpt-4o-mini", temperature: 0.7 });
+
+const memory = new BufferMemory({
+  returnMessages: true, // 返回 Message 对象而非字符串
+  memoryKey: "history", // 在 prompt 中用哪个变量名引用历史
+});
+
+// 创建带记忆的对话链
+// MessagesPlaceholder 会在运行时被 memory 中的历史消息替换
+const prompt = ChatPromptTemplate.fromMessages([
+  [
+    "system",
+    "你是 TaskFlow Pro 的客服助手。请基于对话历史和你的知识回答用户问题。",
+  ],
+  new MessagesPlaceholder("history"),
+  ["human", "{input}"],
+]);
+
+const chain = new ConversationChain({ llm: model, memory, prompt });
+```
+
+注意这里用了 `ConversationChain` 而不是之前用的 `pipe`。因为记忆管理需要特殊的链逻辑——在调用模型之前注入历史、在调用之后保存新对话。`ConversationChain` 封装了这个逻辑。
+
+```typescript
+// 第一轮对话
+const res1 = await chain.call({ input: "企业版支持多少人同时在线？" });
+console.log(res1.response);
+// "TaskFlow Pro 企业版支持最多 500 人同时在线..."
+
+// 第二轮对话 —— memory 自动保留了第一轮的内容
+const res2 = await chain.call({ input: "那费用呢？" });
+console.log(res2.response);
+// "TaskFlow Pro 企业版的费用为 ¥12,800/年（按年付费）或 ¥1,280/月（按月付费）..."
+// 这次它知道"那"指的是企业版
+```
+
+### BufferMemory 的问题
+
+对话 50 轮之后，`messages` 数组可能有几千个 token。每次调用都要把完整历史发给 LLM——token 费用线性增长，最终超过模型的上下文窗口限制。
+
+```
+10 轮对话 ≈ 2,000 tokens → 可以
+50 轮对话 ≈ 10,000 tokens → 还行
+200 轮对话 ≈ 40,000 tokens → 接近 gpt-4o-mini 上限
+500 轮对话 ≈ 100,000 tokens → 爆了
+```
+
+## WindowMemory：只保留最近 N 轮
+
+解决方案：不保留全部历史，只保留最近几轮。
+
+```typescript
+import { BufferWindowMemory } from "langchain/memory";
+
+// k = 4 表示只保留最近 4 轮对话（一轮 = 一次 human + 一次 ai）
+const memory = new BufferWindowMemory({
+  k: 4,
+  returnMessages: true,
+  memoryKey: "history",
+});
+
+const chain = new ConversationChain({ llm: model, memory, prompt });
+
+// 即使对话了 100 轮，发送给 LLM 的历史也只有最近 4 轮
+```
+
+这种方式的代价是：5 轮之前的内容会被遗忘。对于客服场景，通常够用——用户很少在 10 轮之后突然引用第一轮的内容。
+
+### k 怎么选
+
+- **k=2~4**：客服对话、FAQ 场景，用户问题通常是独立的
+- **k=6~10**：需要理解长上下文的场景（如讨论一个复杂的技术方案）
+- **k=20+**：接近全量记忆，适合需要完整上下文的分析场景
+
+## SummaryMemory：自动压缩长对话
+
+如果你既不想丢掉早期对话，又不想让 token 爆炸，SummaryMemory 是一个折中方案——当对话超过一定长度时，让 LLM 把旧对话压缩成一段摘要。
+
+```typescript
+import { ConversationSummaryMemory } from "langchain/memory";
+
+const memory = new ConversationSummaryMemory({
+  llm: model, // 用同一个模型做摘要（或用更便宜的模型）
+  returnMessages: true,
+  memoryKey: "history",
+});
+
+const chain = new ConversationChain({ llm: model, memory, prompt });
+```
+
+它的工作原理：
+
+```
+前 5 轮：完整保留历史
+第 6 轮：LLM 把前 5 轮压缩成摘要
+        "用户询问了企业版功能和费用，客服介绍了企业版支持500人在线，
+         价格¥12,800/年。用户还问了数据迁移的问题。"
+第 7 轮：摘要 + 最近 2 轮对话
+...
+```
+
+摘要随着对话进行不断更新。token 消耗比 BufferMemory 低，但多了一次摘要生成的 API 调用。
+
+### 哪种记忆适合客服场景
+
+| 记忆类型      | 适用场景                          | 不适用场景               |
+| ------------- | --------------------------------- | ------------------------ |
+| BufferMemory  | 短对话（< 20 轮）、需要完整上下文 | 长对话、成本敏感         |
+| WindowMemory  | 客服 FAQ、独立问题为主            | 需要引用很早之前的内容   |
+| SummaryMemory | 长对话、需要保留全局上下文        | 短对话（摘要开销不划算） |
+
+客服助手通常用 **WindowMemory（k=4~6）**，因为：
+
+1. 大多数用户咨询在 10 轮内解决
+2. 即使有长对话，最近几轮的上下文通常足够理解意图
+3. 不需要额外的摘要 API 调用，成本最低
+
+## 用 LCEL 实现带记忆的链
+
+`ConversationChain` 是高层封装。如果你想在 LCEL 管道中加记忆，需要手动管理：
+
+```typescript
+import { ChatMessageHistory } from "langchain/stores/message/in_memory";
+import {
+  RunnablePassthrough,
+  RunnableSequence,
+} from "@langchain/core/runnables";
+
+// 手动管理对话历史
+const history = new ChatMessageHistory();
+
+const prompt = ChatPromptTemplate.fromMessages([
+  ["system", "你是 TaskFlow Pro 的客服助手。基于对话历史回答用户问题。"],
+  new MessagesPlaceholder("history"),
+  ["human", "{input}"],
+]);
+
+// 手动构建带记忆的链
+const chain = RunnableSequence.from([
+  // 第一步：获取历史消息 + 当前输入
+  {
+    input: (input: string) => input,
+    history: async () => history.getMessages(),
+  },
+  // 第二步：填充 prompt
+  prompt,
+  // 第三步：调用模型
+  model,
+]);
+
+// 使用
+async function chat(userInput: string) {
+  const response = await chain.invoke(userInput);
+
+  // 保存到历史
+  await history.addUserMessage(userInput);
+  await history.addAIMessage(response.content.toString());
+
+  return response.content;
+}
+
+// 测试
+console.log(await chat("企业版支持多少人同时在线？"));
+console.log(await chat("那费用呢？")); // 能理解"那"指企业版
+```
+
+手动管理更灵活——你可以在保存之前做过滤、在获取历史时做压缩、或者从数据库加载历史。
+
+## 生产环境：对话历史持久化
+
+内存中的记忆在服务重启后就没了。生产环境需要把对话历史存到数据库或 Redis。
+
+### 简单方案：自己封装
+
+```typescript
+// 用数据库存储对话历史
+interface MessageRecord {
+  sessionId: string;
+  role: "user" | "assistant";
+  content: string;
+  createdAt: Date;
+}
+
+async function getHistoryFromDB(sessionId: string): Promise<MessageRecord[]> {
+  // 从数据库查询最近 N 条消息
+  return db.messages.findMany({
+    where: { sessionId },
+    orderBy: { createdAt: "desc" },
+    take: 20, // 只取最近 20 条
+  });
+}
+
+async function saveMessage(
+  sessionId: string,
+  role: "user" | "assistant",
+  content: string
+) {
+  await db.messages.create({
+    data: { sessionId, role, content, createdAt: new Date() },
+  });
+}
+
+// 在链中使用
+async function chatWithDB(sessionId: string, userInput: string) {
+  // 从数据库加载历史
+  const records = await getHistoryFromDB(sessionId);
+  const history = records
+    .reverse()
+    .map((r) =>
+      r.role === "user" ? new HumanMessage(r.content) : new AIMessage(r.content)
+    );
+
+  // 构建带历史的 prompt
+  const messages = await prompt.invoke({ input: userInput, history });
+  const response = await model.invoke(messages);
+
+  // 保存新消息
+  await saveMessage(sessionId, "user", userInput);
+  await saveMessage(sessionId, "assistant", response.content.toString());
+
+  return response.content;
+}
+```
+
+这种方案的好处是完全可控——你可以随时清理过期对话、限制历史长度、做数据分析。
+
+## 踩坑经验
+
+**1. token 超限是迟早的事**
+
+不管用什么记忆方案，一定要加上 token 计数和截断逻辑：
+
+```typescript
+import { encodingForModel } from "js-tiktoken";
+
+const enc = encodingForModel("gpt-4o-mini");
+
+function trimHistory(messages: Message[], maxTokens: number): Message[] {
+  let totalTokens = 0;
+
+  // 从最新的消息开始往前数
+  for (let i = messages.length - 1; i >= 0; i--) {
+    totalTokens += enc.encode(messages[i].content).length;
+    if (totalTokens > maxTokens) {
+      return messages.slice(i + 1);
+    }
+  }
+  return messages;
+}
+```
+
+**2. system prompt 不要放进历史**
+
+system prompt 是固定的角色设定，它不属于对话历史。把它和历史分开管理，避免重复发送。
+
+**3. 多用户场景注意 sessionId**
+
+每个用户的对话历史是独立的。用 sessionId 区分不同用户、不同会话。一个用户可能有多个会话（比如今天一个、明天又一个）。
+
+## 这一篇你学到了什么
+
+- LLM 是无状态的，"记忆"就是把历史消息拼进 prompt
+- **BufferMemory** 保留完整历史，适合短对话
+- **WindowMemory** 只保留最近 N 轮，适合客服场景
+- **SummaryMemory** 自动摘要压缩，适合长对话
+- 生产环境需要把对话历史持久化到数据库
+- 必须加上 token 计数和截断逻辑，防止超限
+
+下一篇开始进入 RAG（检索增强生成）——让客服助手基于你的产品文档回答问题，而不是只靠模型自身的知识。

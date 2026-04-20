@@ -1,0 +1,434 @@
+---
+title: "16 闭包与迭代器"
+date: "2026-03-30"
+summary: "掌握 Rust 的函数式编程特性，学会使用闭包捕获环境变量和迭代器链式操作"
+tags: ["Rust", "闭包", "迭代器", "函数式编程", "map", "filter"]
+category: "rust"
+draft: false
+series: "Rust 渐进式学习"
+seriesOrder: 17
+---
+
+## 为什么需要闭包和迭代器？
+
+在构建分布式任务处理系统时，我们经常需要处理这样的场景：有一堆任务需要筛选、转换、聚合。如果用传统的命令式编程，代码会变得冗长且难以维护。
+
+假设我们要从任务队列中找出所有高优先级任务，计算它们的预计执行时间，然后按时间排序。用传统方式需要写多个循环和临时变量。而 Rust 的闭包和迭代器提供了函数式编程的能力，让我们能用链式调用的方式优雅地处理这类问题。
+
+更重要的是，Rust 的迭代器是零成本抽象——编译器会将其优化成与手写循环一样高效的机器码。这意味着我们既获得了代码的简洁性，又没有牺牲性能。
+
+## 闭包基础
+
+闭包是匿名函数，可以捕获定义时所在作用域中的变量。在任务处理系统中，闭包非常适合定义临时的过滤规则和转换逻辑。
+
+```rust
+// 闭包的基本语法
+fn main() {
+    let priority_threshold = 5;
+
+    // 闭包捕获了外部的 priority_threshold
+    let is_high_priority = |task: &Task| -> bool {
+        task.priority >= priority_threshold
+    };
+
+    let task = Task {
+        id: 1,
+        priority: 8,
+        name: String::from("data processing")
+    };
+
+    if is_high_priority(&task) {
+        println!("任务 {} 是高优先级", task.name);
+    }
+}
+
+struct Task {
+    id: u32,
+    priority: u32,
+    name: String,
+}
+```
+
+闭包语法分为几个部分：参数用 `|` 包围，可以指定类型（也可以让编译器推断），函数体可以是一个表达式或代码块。返回值类型由编译器自动推断。
+
+## 闭包的三种捕获方式
+
+闭包捕获环境变量的方式取决于如何使用这些变量。Rust 编译器会自动选择最合适的捕获方式。
+
+```rust
+fn main() {
+    // 1. 不可变借用：闭包只读取环境变量
+    let task_count = 10;
+    let count_tasks = |limit: u32| -> bool {
+        task_count > limit  // 只读取，不修改
+    };
+    println!("{}", count_tasks(5));  // true
+    // task_count 仍然可用
+
+    // 2. 可变借用：闭包需要修改环境变量
+    let mut processed_count = 0;
+    let mut process_task = |task_id: u32| {
+        processed_count += 1;  // 修改环境变量
+        println!("处理任务 {}，总数 {}", task_id, processed_count);
+    };
+    process_task(1);  // 处理任务 1，总数 1
+    process_task(2);  // 处理任务 2，总数 2
+
+    // 3. 获取所有权：闭包需要转移变量所有权
+    let task_data = vec![1, 2, 3, 4, 5];
+    let consume_data = move || {
+        let sum: u32 = task_data.iter().sum();
+        sum  // task_data 的所有权已转移到闭包
+    };
+    println!("总和: {}", consume_data());
+    // task_data 不再可用
+}
+```
+
+这三种捕获方式对应三个 trait：`Fn`（不可变借用）、`FnMut`（可变借用）、`FnOnce`（获取所有权）。它们之间有继承关系：`Fn` 包含 `FnMut` 包含 `FnOnce`。
+
+当闭包作为函数参数时，我们可以指定需要的 trait 类型：
+
+```rust
+// 接受 Fn 闭包（只读）
+fn apply_to_tasks<F>(tasks: &[Task], f: F) -> Vec<String>
+where
+    F: Fn(&Task) -> String,
+{
+    tasks.iter().map(|task| f(task)).collect()
+}
+
+// 接受 FnMut 闭包（可修改捕获的变量）
+fn fold_tasks<F>(tasks: &[Task], mut f: F) -> u32
+where
+    F: FnMut(u32, &Task) -> u32,
+{
+    tasks.iter().fold(0, |acc, task| f(acc, task))
+}
+
+struct Task {
+    id: u32,
+    priority: u32,
+    name: String,
+}
+```
+
+## 迭代器入门
+
+迭代器是处理序列的统一接口。在任务处理系统中，我们经常需要对任务列表进行各种操作：筛选、转换、聚合。
+
+```rust
+fn main() {
+    let tasks = vec![
+        Task { id: 1, priority: 3, name: String::from("low priority task") },
+        Task { id: 2, priority: 8, name: String::from("urgent task") },
+        Task { id: 3, priority: 5, name: String::from("normal task") },
+    ];
+
+    // 找出所有高优先级任务（优先级 >= 5）
+    let high_priority: Vec<&Task> = tasks.iter()
+        .filter(|task| task.priority >= 5)
+        .collect();
+
+    println!("高优先级任务数量: {}", high_priority.len());
+
+    // 获取任务名称列表
+    let names: Vec<&str> = tasks.iter()
+        .map(|task| task.name.as_str())
+        .collect();
+
+    println!("任务列表: {:?}", names);
+}
+
+struct Task {
+    id: u32,
+    priority: u32,
+    name: String,
+}
+```
+
+迭代器有三个基本方法：
+
+- `iter()`：产生不可变引用 `&T`
+- `iter_mut()`：产生可变引用 `&mut T`
+- `into_iter()`：产生拥有所有权的值 `T`
+
+## 迭代器适配器链式调用
+
+迭代器的真正威力在于适配器的链式调用。每个适配器都返回一个新的迭代器，可以继续调用其他适配器。
+
+```rust
+fn main() {
+    let tasks = vec![
+        Task { id: 1, priority: 3, estimated_time: 10 },
+        Task { id: 2, priority: 8, estimated_time: 30 },
+        Task { id: 3, priority: 5, estimated_time: 20 },
+        Task { id: 4, priority: 2, estimated_time: 5 },
+    ];
+
+    // 链式操作：筛选高优先级 -> 提取时间 -> 排序 -> 计算总和
+    let total_time: u32 = tasks.iter()
+        .filter(|task| task.priority >= 5)        // 筛选高优先级
+        .map(|task| task.estimated_time)          // 提取时间
+        .collect::<Vec<_>>()                       // 收集到 Vec
+        .iter()
+        .sum();                                    // 求和
+
+    println!("高优先级任务总耗时: {} 分钟", total_time);
+}
+
+struct Task {
+    id: u32,
+    priority: u32,
+    estimated_time: u32,
+}
+```
+
+常用适配器包括：
+
+- `map`：转换每个元素
+- `filter`：过滤元素
+- `take`：取前 N 个
+- `skip`：跳过前 N 个
+- `enumerate`：添加索引
+- `zip`：合并两个迭代器
+- `rev`：反转迭代器
+
+## 消费适配器
+
+消费适配器会消耗迭代器，产生最终结果。常见的有 `collect`、`sum`、`count`、`fold`。
+
+```rust
+fn main() {
+    let tasks = vec![
+        Task { id: 1, priority: 3, estimated_time: 10 },
+        Task { id: 2, priority: 8, estimated_time: 30 },
+        Task { id: 3, priority: 5, estimated_time: 20 },
+    ];
+
+    // sum：求和
+    let total_time: u32 = tasks.iter()
+        .map(|t| t.estimated_time)
+        .sum();
+
+    // count：计数
+    let high_priority_count = tasks.iter()
+        .filter(|t| t.priority >= 5)
+        .count();
+
+    // fold：自定义累积
+    let max_priority = tasks.iter()
+        .fold(0, |max, task| {
+            if task.priority > max {
+                task.priority
+            } else {
+                max
+            }
+        });
+
+    // any/all：条件判断
+    let has_urgent = tasks.iter().any(|t| t.priority >= 8);
+    let all_valid = tasks.iter().all(|t| t.estimated_time > 0);
+
+    println!("总耗时: {}", total_time);
+    println!("高优先级任务数: {}", high_priority_count);
+    println!("最高优先级: {}", max_priority);
+    println!("存在紧急任务: {}", has_urgent);
+    println!("所有任务都有效: {}", all_valid);
+}
+
+struct Task {
+    id: u32,
+    priority: u32,
+    estimated_time: u32,
+}
+```
+
+## 实战：任务队列处理
+
+现在让我们用闭包和迭代器实现一个实际的任务队列处理场景。假设我们有一个任务队列，需要找出所有符合条件的任务，计算总耗时，并生成报告。
+
+```rust
+#[derive(Debug, Clone)]
+struct Task {
+    id: u32,
+    name: String,
+    priority: u32,
+    estimated_time: u32,  // 分钟
+    status: TaskStatus,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum TaskStatus {
+    Pending,
+    InProgress,
+    Completed,
+    Failed,
+}
+
+fn main() {
+    let tasks = vec![
+        Task {
+            id: 1,
+            name: String::from("数据导入"),
+            priority: 8,
+            estimated_time: 45,
+            status: TaskStatus::Pending,
+        },
+        Task {
+            id: 2,
+            name: String::from("生成报表"),
+            priority: 5,
+            estimated_time: 30,
+            status: TaskStatus::Pending,
+        },
+        Task {
+            id: 3,
+            name: String::from("发送通知"),
+            priority: 3,
+            estimated_time: 10,
+            status: TaskStatus::Pending,
+        },
+        Task {
+            id: 4,
+            name: String::from("备份数据库"),
+            priority: 9,
+            estimated_time: 60,
+            status: TaskStatus::Pending,
+        },
+    ];
+
+    // 场景 1：找出所有高优先级待处理任务
+    let urgent_tasks: Vec<&Task> = tasks.iter()
+        .filter(|task| task.priority >= 5 && task.status == TaskStatus::Pending)
+        .collect();
+
+    println!("高优先级待处理任务：");
+    for task in &urgent_tasks {
+        println!("  - {} (优先级: {}, 耗时: {}分钟)",
+            task.name, task.priority, task.estimated_time);
+    }
+
+    // 场景 2：计算总耗时
+    let total_time: u32 = urgent_tasks.iter()
+        .map(|task| task.estimated_time)
+        .sum();
+
+    println!("\n总耗时: {} 分钟 ({} 小时)", total_time, total_time as f64 / 60.0);
+
+    // 场景 3：按优先级排序生成执行计划
+    let mut execution_plan: Vec<_> = tasks.iter()
+        .filter(|task| task.status == TaskStatus::Pending)
+        .collect();
+
+    // 使用闭包定义排序规则
+    execution_plan.sort_by(|a, b| {
+        b.priority.cmp(&a.priority)  // 优先级降序
+    });
+
+    println!("\n执行计划（按优先级）：");
+    for (i, task) in execution_plan.iter().enumerate() {
+        println!("  {}. {} - 优先级 {}", i + 1, task.name, task.priority);
+    }
+
+    // 场景 4：使用 fold 生成任务摘要
+    let summary = tasks.iter().fold(
+        String::from("任务摘要:\n"),
+        |mut acc, task| {
+            let status_str = match task.status {
+                TaskStatus::Pending => "待处理",
+                TaskStatus::InProgress => "进行中",
+                TaskStatus::Completed => "已完成",
+                TaskStatus::Failed => "失败",
+            };
+            acc.push_str(&format!("  - [{}] {} (优先级: {})\n",
+                status_str, task.name, task.priority));
+            acc
+        }
+    );
+
+    println!("\n{}", summary);
+}
+```
+
+这个例子展示了如何组合使用多种迭代器适配器和闭包来处理复杂的数据转换逻辑。代码既简洁又高效。
+
+## 惰性求值
+
+迭代器的一个重要特性是惰性求值——适配器不会立即执行，只有调用消费适配器时才会真正处理数据。
+
+```rust
+fn main() {
+    let tasks = vec![1, 2, 3, 4, 5];
+
+    // 这不会执行任何操作，只是创建了一个迭代器
+    let iter = tasks.iter()
+        .map(|x| {
+            println!("处理 {}", x);
+            x * 2
+        });
+
+    println!("迭代器创建完成");
+
+    // 只有调用 collect 时才会执行
+    let result: Vec<_> = iter.collect();
+    println!("结果: {:?}", result);
+}
+```
+
+惰性求值的好处是可以创建复杂的迭代器链而不产生中间集合，编译器还能进行优化，将整个链式调用融合成一次遍历。
+
+## 闭包的性能
+
+闭包的性能与手写函数完全相同。编译器会对闭包进行内联优化，将其展开为直接代码。不用担心闭包会带来运行时开销。
+
+```rust
+// 闭包版本
+fn sum_with_closure(numbers: &[i32]) -> i32 {
+    numbers.iter().map(|x| x * 2).sum()
+}
+
+// 手写版本（编译后可能完全相同）
+fn sum_manual(numbers: &[i32]) -> i32 {
+    let mut sum = 0;
+    for &x in numbers {
+        sum += x * 2;
+    }
+    sum
+}
+```
+
+## 权衡与考虑
+
+闭包和迭代器虽然强大，但也有需要权衡的地方：
+
+**优势：**
+
+- 代码简洁，表达意图清晰
+- 链式调用避免中间变量
+- 零成本抽象，性能无损失
+- 惰性求值节省资源
+
+**劣势：**
+
+- 学习曲线较陡，需要理解函数式编程概念
+- 调试可能比命令式代码困难
+- 过度使用可能导致代码难以理解
+
+**适用场景：**
+
+- 数据转换和过滤
+- 集合操作
+- 需要保持代码简洁的场景
+
+**不适用场景：**
+
+- 需要提前退出的复杂逻辑
+- 对性能要求极端且需要手动优化的场景
+- 团队成员不熟悉函数式编程时
+
+## 下一步
+
+闭包和迭代器为处理数据序列提供了强大的工具。但有时我们需要更灵活的所有权管理——比如多个地方共享同一份数据，或者在不可变引用下修改内部状态。
+
+下一篇文章将学习**智能指针**——Box、Rc、Arc、RefCell，它们提供了超越普通引用的能力。

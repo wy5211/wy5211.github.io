@@ -1,0 +1,558 @@
+---
+title: "12. 安全与限流"
+date: "2026-03-20"
+summary: "构建安全的 API，学习速率限制、CORS 配置、安全头设置，以及防范 XSS、CSRF、SQL 注入等常见安全威胁。"
+tags: ["Hono", "Security", "Rate Limiting", "CORS", "OWASP"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 12
+---
+
+## 前言
+
+在上一篇文章中，我们实现了 WebSocket 实时通信功能，用户可以实时看到新评论和通知。这个功能很棒，但也引入了新的安全风险。
+
+你可能在想，我的博客 API 又不是银行系统，需要这么严格的安全措施吗？答案是肯定的。即使是简单的博客 API，也可能面临各种攻击：有人可能用脚本不断注册账号、有人可能通过暴力破解尝试登录、有人可能提交恶意代码试图攻击其他用户、有人可能通过大量请求让服务崩溃。
+
+更糟糕的是，一旦你的 API 被攻击，不仅影响你的服务，还可能影响你的用户。如果用户数据泄露，你要承担法律责任。如果服务被攻击导致不可用，你会失去用户信任。
+
+安全不是一次性的事情，而是需要贯穿整个开发过程。在本篇文章中，我们将学习如何保护博客 API，实现速率限制防止滥用，配置 CORS 防止跨域攻击，设置安全头保护浏览器端，以及防范各种常见的 Web 攻击。
+
+## 为什么需要速率限制
+
+速率限制（Rate Limiting）是保护 API 的第一道防线。它限制每个用户在特定时间内的请求次数，防止 API 被滥用。
+
+你可能会问，为什么要限制请求次数？我当然希望用户多用我的 API。但问题是，不是所有请求都是合法用户发起的。攻击者可能用脚本每秒发送上千个请求，试图暴力破解密码、耗尽服务器资源、或者只是恶作剧。
+
+速率限制可以防止：
+
+- DDoS 攻击：大量请求让服务不可用
+- 暴力破解：不断尝试不同的密码
+- API 滥用：某个用户调用过于频繁，影响其他用户
+- 爬虫过度抓取：爬虫抓取过于频繁，影响正常用户
+
+Hono 提供了内置的速率限制中间件，我们可以轻松配置。
+
+## 实现速率限制
+
+让我们为博客 API 添加速率限制。
+
+```typescript
+import { Hono } from "hono";
+import { rateLimiter } from "hono/rate-limiter";
+
+const app = new Hono();
+
+// 全局限速：每个 IP 每 15 分钟最多 100 个请求
+app.use(
+  "*",
+  rateLimiter({
+    windowMs: 15 * 60 * 1000, // 时间窗口：15 分钟
+    max: 100, // 最多请求数
+    standardHeaders: true, // 返回标准的速率限制头
+  })
+);
+
+// API 路由更严格的限速：每分钟最多 20 个请求
+app.use(
+  "/api/*",
+  rateLimiter({
+    windowMs: 60 * 1000, // 1 分钟
+    max: 20,
+    message: "Too many requests, please try again later",
+  })
+);
+
+// 登录接口特别严格：每 15 分钟最多 5 次尝试
+const loginLimiter = rateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  skipFailedRequests: false, // 失败的请求也计数
+});
+
+app.post("/api/auth/login", loginLimiter, async (c) => {
+  // 登录逻辑
+});
+
+export default app;
+```
+
+这段代码配置了三层速率限制：全局限速、API 限速、登录接口限速。登录接口最严格，因为这是暴力破解的主要目标。
+
+## 基于用户的速率限制
+
+有时候我们想对不同的用户设置不同的限制，比如付费用户可以调用更多次数。
+
+```typescript
+// 自定义速率限制器
+const createUserRateLimiter = (maxRequests: number, windowMs: number) => {
+  return async (c: Context, next: Next) => {
+    const user = c.get("user");
+
+    if (!user) {
+      // 未登录用户使用 IP 限制
+      return await next();
+    }
+
+    // 这里可以用 Redis 实现分布式限速
+    const key = `ratelimit:user:${user.id}`;
+    const current = await redis.incr(key);
+
+    if (current === 1) {
+      await redis.expire(key, Math.ceil(windowMs / 1000));
+    }
+
+    if (current > maxRequests) {
+      return c.json(
+        {
+          success: false,
+          message: "Rate limit exceeded",
+        },
+        429
+      );
+    }
+
+    await next();
+  };
+};
+
+// 使用
+app.use(
+  "/api/posts",
+  authMiddleware,
+  createUserRateLimiter(100, 60 * 1000), // 普通用户每分钟 100 次
+  async (c) => {
+    // 文章列表逻辑
+  }
+);
+
+// 付费用户更高限额
+app.use(
+  "/api/premium/posts",
+  authMiddleware,
+  requireRole("premium"),
+  createUserRateLimiter(1000, 60 * 1000), // 付费用户每分钟 1000 次
+  async (c) => {
+    // 高级功能
+  }
+);
+```
+
+## 配置 CORS
+
+CORS（跨源资源共享）是浏览器的重要安全机制，它限制一个域的网页如何访问另一个域的资源。如果不正确配置 CORS，可能导致安全漏洞。
+
+```typescript
+import { cors } from "hono/cors";
+
+// 开发环境：允许所有来源
+if (process.env.NODE_ENV === "development") {
+  app.use(
+    "*",
+    cors({
+      origin: "*",
+      credentials: true,
+    })
+  );
+}
+
+// 生产环境：只允许特定来源
+else {
+  app.use(
+    "*",
+    cors({
+      origin: (origin) => {
+        const allowedOrigins = [
+          "https://yourdomain.com",
+          "https://www.yourdomain.com",
+          "https://app.yourdomain.com",
+        ];
+
+        // 允许列表中的来源
+        if (allowedOrigins.includes(origin)) {
+          return origin;
+        }
+
+        // 允许本地开发（方便调试）
+        if (origin?.startsWith("http://localhost:")) {
+          return origin;
+        }
+
+        // 不允许其他来源
+        return "";
+      },
+      credentials: true, // 允许携带 Cookie
+      maxAge: 86400, // 预检请求缓存 24 小时
+      allowMethods: ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+      allowHeaders: ["Content-Type", "Authorization"],
+      exposeHeaders: ["Content-Length", "Content-Type"],
+    })
+  );
+}
+```
+
+这段代码区分了开发和生产环境。开发环境允许所有来源，方便调试。生产环境只允许白名单中的域名访问，并且可以携带 Cookie（用于认证）。
+
+## 设置安全头
+
+HTTP 安全头告诉浏览器如何保护你的网页，防止各种攻击。Hono 提供了 helmet 中间件，可以一键设置所有推荐的安全头。
+
+```typescript
+import { helmet } from "hono/helmet";
+
+// 应用所有安全头
+app.use("*", helmet());
+
+// 或者自定义配置
+app.use(
+  "*",
+  helmet({
+    contentSecurityPolicy: {
+      defaultSrc: ["'self'"], // 默认只允许同源资源
+      scriptSrc: ["'self'", "'unsafe-inline'", "https://cdn.example.com"], // 允许的脚本来源
+      styleSrc: ["'self'", "'unsafe-inline'"], // 允许的样式来源
+      imgSrc: ["'self'", "data:", "https:"], // 允许的图片来源
+      connectSrc: ["'self'", "https://api.example.com"], // 允许的请求目标
+      frameSrc: ["'none'"], // 禁止被嵌入 iframe
+      objectSrc: ["'none'"], // 禁止插件
+    },
+    hsts: {
+      maxAge: 31536000, // 一年内只能通过 HTTPS 访问
+      includeSubDomains: true,
+      preload: true,
+    },
+    noSniff: true, // 防止浏览器嗅探 MIME 类型
+    referrerPolicy: {
+      policy: "strict-origin-when-cross-origin", // 严格控制 Referer 信息
+    },
+    xssFilter: true, // 启用 XSS 过滤器
+  })
+);
+```
+
+这些安全头的作用是：
+
+- Content-Security-Policy：限制资源加载来源，防止 XSS 攻击
+- Strict-Transport-Security：强制使用 HTTPS，防止中间人攻击
+- X-Content-Type-Options：防止 MIME 类型嗅探
+- X-Frame-Options：防止点击劫持攻击
+- Referrer-Policy：控制 Referer 信息泄露
+- X-XSS-Protection：启用浏览器的 XSS 过滤
+
+## 防范 XSS 攻击
+
+XSS（跨站脚本攻击）是最常见的 Web 攻击之一。攻击者注入恶意脚本，当其他用户浏览时执行，可以窃取 Cookie、Session 等敏感信息。
+
+防范 XSS 需要多层防护：
+
+**1. 输入验证**
+
+```typescript
+import { z } from "zod";
+
+// 严格验证输入
+const commentSchema = z.object({
+  content: z
+    .string()
+    .max(1000, "Comment too long")
+    .transform((val) =>
+      val
+        .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, "") // 移除 script 标签
+        .replace(/on\w+="[^"]*"/gi, "") // 移除事件处理器
+        .trim()
+    ),
+});
+```
+
+**2. 输出编码**
+
+```typescript
+// HTML 转义函数
+const escapeHtml = (unsafe: string): string => {
+  return unsafe
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+};
+
+// 使用
+app.get("/api/posts/:id", async (c) => {
+  const post = await getPost(c.req.param("id"));
+
+  // 如果返回 HTML，必须转义
+  return c.html(`
+    <div>
+      <h1>${escapeHtml(post.title)}</h1>
+      <p>${escapeHtml(post.content)}</p>
+    </div>
+  `);
+});
+```
+
+**3. Content-Security-Policy**
+
+```typescript
+app.use(
+  "*",
+  helmet({
+    contentSecurityPolicy: {
+      defaultSrc: ["'self'"],
+      scriptSrc: ["'self'"], // 禁止内联脚本
+    },
+  })
+);
+```
+
+## 防范 CSRF 攻击
+
+CSRF（跨站请求伪造）欺骗用户在已认证的状态下执行非预期操作。比如用户登录了你的网站，然后访问了恶意网站，恶意网站偷偷向你的网站发送请求。
+
+防范 CSRF 的主要方法是使用 CSRF Token：
+
+```typescript
+import { randomBytes } from "crypto";
+
+// 生成 CSRF Token
+const generateCsrfToken = (): string => {
+  return randomBytes(32).toString("hex");
+};
+
+// CSRF 中间件
+app.use("*", async (c, next) => {
+  const token = generateCsrfToken();
+
+  // 存储到 Session（这里简化处理，实际应该存在 Session 或 Redis）
+  c.set("csrfToken", token);
+
+  // 设置 Cookie
+  setCookie(c, "csrf_token", token, {
+    httpOnly: true,
+    secure: true, // 只通过 HTTPS 传输
+    sameSite: "Strict", // 防止 CSRF
+  });
+
+  await next();
+});
+
+// 验证 CSRF Token
+const validateCsrfToken = (c: Context): boolean => {
+  const headerToken = c.req.header("X-CSRF-Token");
+  const cookieToken = getCookie(c, "csrf_token");
+
+  return headerToken && headerToken === cookieToken;
+};
+
+// 在状态修改操作中验证
+app.post(
+  "/api/posts",
+  authMiddleware,
+  async (c, next) => {
+    if (!validateCsrfToken(c)) {
+      return c.json(
+        {
+          success: false,
+          message: "Invalid CSRF token",
+        },
+        403
+      );
+    }
+    await next();
+  },
+  async (c) => {
+    // 创建文章逻辑
+  }
+);
+
+// 提供前端获取 Token 的接口
+app.get("/api/csrf-token", (c) => {
+  return c.json({
+    token: c.get("csrfToken"),
+  });
+});
+```
+
+前端需要从 `/api/csrf-token` 获取 Token，然后在发送 POST/PUT/DELETE 请求时，把 Token 放在 `X-CSRF-Token` 头中。
+
+## 防范 SQL 注入
+
+SQL 注入是最危险的攻击之一，攻击者可以通过注入恶意 SQL 语句来获取、修改或删除数据库中的数据。
+
+防范 SQL 注入的最佳方法是使用参数化查询。好消息是，如果你使用 Drizzle ORM，它已经帮你做了防护：
+
+```typescript
+import { eq } from "drizzle-orm";
+
+// ❌ 危险：直接拼接 SQL
+const unsafeQuery = `SELECT * FROM users WHERE id = '${userId}'`;
+// 如果 userId 是 "1' OR '1'='1"，会返回所有用户
+
+// ✅ 安全：使用参数化查询
+const user = await db.query.users.findFirst({
+  where: eq(users.id, userId),
+});
+// Drizzle 会自动参数化，防止注入
+
+// ✅ 安全：使用 ORM
+const users = await db.select().from(users).where(eq(users.role, "admin"));
+```
+
+只要你使用 ORM 的方法，不要手动拼接 SQL，就不会有 SQL 注入问题。
+
+## 输入验证
+
+无论做什么，都不要信任用户输入。所有输入都应该经过验证：
+
+```typescript
+import { z } from "zod";
+
+// 定义严格的验证规则
+const createPostSchema = z.object({
+  title: z
+    .string()
+    .min(1, "Title is required")
+    .max(200, "Title too long")
+    .transform((val) => val.trim()),
+
+  content: z
+    .string()
+    .min(1, "Content is required")
+    .max(10000, "Content too long"),
+
+  tags: z.array(z.string()).max(5, "Too many tags").optional(),
+
+  published: z.boolean().optional(),
+});
+
+// 使用
+app.post(
+  "/api/posts",
+  authMiddleware,
+  zValidator("json", createPostSchema),
+  async (c) => {
+    const data = c.req.valid("json"); // 已验证和类型化的数据
+    // 安全使用
+  }
+);
+```
+
+## 请求体大小限制
+
+为了防止大文件攻击，我们应该限制请求体的大小：
+
+```typescript
+app.use("*", async (c, next) => {
+  const contentLength = c.req.header("content-length");
+  const maxSize = 10 * 1024 * 1024; // 10MB
+
+  if (contentLength && parseInt(contentLength) > maxSize) {
+    return c.json(
+      {
+        success: false,
+        message: "Request body too large",
+      },
+      413
+    );
+  }
+
+  await next();
+});
+```
+
+## 完整的安全配置
+
+让我们把所有安全措施整合起来：
+
+```typescript
+import { Hono } from "hono";
+import { cors } from "hono/cors";
+import { helmet } from "hono/helmet";
+import { rateLimiter } from "hono/rate-limiter";
+import { authMiddleware } from "./middleware/auth";
+
+const app = new Hono();
+
+// 1. 安全头
+app.use("*", helmet());
+
+// 2. CORS
+app.use("*", cors({
+  origin: process.env.NODE_ENV === "production"
+    ? "https://yourdomain.com"
+    : "*",
+  credentials: true,
+}));
+
+// 3. 速率限制
+app.use("*", rateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 100,
+}));
+
+// 4. 请求体大小限制
+app.use("*", async (c, next) => {
+  const contentLength = c.req.header("content-length");
+  if (contentLength && parseInt(contentLength) > 10 * 1024 * 1024) {
+    return c.json({ message: "Request too large" }, 413);
+  }
+  await next();
+});
+
+// 5. API 路由
+const api = new Hono();
+
+// 更严格的 API 限速
+api.use("*", rateLimiter({
+  windowMs: 60 * 1000,
+  max: 20,
+}));
+
+// 认证路由
+const auth = new Hono();
+auth.post("/register", ...);
+auth.post("/login", rateLimiter({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+}), ...);
+
+api.route("/auth", auth);
+
+// 受保护的路由
+const protected = new Hono();
+protected.use("*", authMiddleware);
+protected.get("/posts", ...);
+protected.post("/posts", ...);
+
+api.route("/", protected);
+
+app.route("/api", api);
+
+export default app;
+```
+
+## Trade-off 分析
+
+安全措施虽然必要，但也有一些权衡：
+
+**严格的安全 vs 用户体验**
+
+更严格的验证（如强密码要求、复杂的 CSRF Token）会提升安全性，但可能降低用户体验。需要找到平衡点。
+
+**速率限制 vs 正常使用**
+
+速率限制可以防止滥用，但可能影响正常用户的体验。比如某个用户正在批量操作，可能会触发限流。可以考虑针对不同用户设置不同的限制。
+
+**安全头 vs 功能兼容**
+
+某些安全头（如 CSP）可能会影响一些第三方功能的正常使用，比如统计脚本、社交分享按钮等。需要仔细配置，在安全和功能之间找到平衡。
+
+## 小结
+
+在这篇文章中，我们学习了如何保护博客 API 的安全。我们实现了速率限制防止滥用，配置了 CORS 防止跨域攻击，设置了安全头保护浏览器端，以及防范了各种常见的 Web 攻击。
+
+安全是一个持续的过程，没有一劳永逸的解决方案。你需要定期更新依赖、监控安全事件、及时响应新的威胁。通过实施这些安全措施，你的博客 API 会更加安全可靠。
+
+下一篇我们将学习如何通过缓存来提升性能，让我们的应用更快更高效。

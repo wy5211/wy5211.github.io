@@ -1,0 +1,252 @@
+---
+title: "02 Embedding 模型深入：文本如何变成向量"
+date: "2026-04-14"
+summary: "理解 Embedding 的原理——语义相似度如何变成可计算的向量距离，OpenAI 和开源模型怎么选，多语言和长文本有哪些坑。"
+tags: ["RAG", "Embedding", "向量", "语义搜索", "OpenAI"]
+category: "rag"
+cover: ""
+draft: false
+series: "RAG 深入"
+seriesOrder: 2
+---
+
+上一篇讲了 RAG 的整体架构，我们把文档切成片段后，第一步就是 Embedding——把文本变成向量。这一步看似简单（调个 API 就行），但 Embedding 模型的选择直接影响检索质量。换一个模型，同样的查询可能返回完全不同的结果。
+
+这一篇深入 Embedding 的原理和选型，让你知道"为什么这个模型更好"而不只是"大家都用这个"。
+
+## Embedding 的直觉理解
+
+先忘掉数学，用一个类比理解 Embedding。
+
+想象你在一个巨大的"意义空间"里给每段文本找一个坐标。语义相近的文本，坐标离得近；语义无关的文本，坐标离得远。
+
+```
+意义空间（简化到 2D 可视化）：
+
+  ┌─────────────────────────────────────┐
+  │                                     │
+  │    ● 数据库选型                      │
+  │    ● PostgreSQL vs MongoDB          │
+  │                                     │
+  │         ● 代码审查规范               │
+  │                                     │
+  │                   ● CI/CD 配置       │
+  │                   ● GitHub Actions   │
+  │                                     │
+  │    ● 团队建设活动        ● 故障复盘   │
+  │                                     │
+  └─────────────────────────────────────┘
+
+"数据库选型" 和 "PostgreSQL vs MongoDB" 离得很近（都在讨论数据库）
+"数据库选型" 和 "团队建设活动" 离得很远（完全不同的主题）
+```
+
+实际 Embedding 不是 2 维，而是 1536 维或更高。维度越高，能表达的语义细节越多。但原理一样——**语义相近 → 向量距离近**。
+
+## 三种距离度量
+
+"向量距离近"具体怎么算？有三种常用方法：
+
+### 余弦相似度（最常用）
+
+衡量两个向量的方向是否一致，忽略长度。结果在 -1 到 1 之间，1 表示完全相同，0 表示无关。
+
+```typescript
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    dotProduct += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+
+  return dotProduct / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+```
+
+余弦相似度是最常用的度量，因为它对文本长度不敏感。一段 10 个字的描述和一段 100 个字的描述，只要语义相同，余弦相似度就会很高。
+
+### 欧氏距离
+
+两个向量在空间中的直线距离。值越小越相似。
+
+```typescript
+function euclideanDistance(a: number[], b: number[]): number {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    sum += (a[i] - b[i]) ** 2;
+  }
+  return Math.sqrt(sum);
+}
+```
+
+### 点积
+
+两个向量对应位置相乘再求和。值越大越相似。
+
+```typescript
+function dotProduct(a: number[], b: number[]): number {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    sum += a[i] * b[i];
+  }
+  return sum;
+}
+```
+
+### 怎么选
+
+大多数场景用**余弦相似度**就行。它对向量归一化后的效果等同于点积，而且不受到文本长度影响。
+
+只有在向量已经归一化（长度为 1）的情况下，点积和余弦相似度结果才一样。OpenAI 的 Embedding 模型输出的向量已经是归一化的，所以用哪个都行。但如果你用其他模型，最好确认一下。
+
+## OpenAI Embedding 模型对比
+
+OpenAI 目前提供三个 Embedding 模型：
+
+| 模型                   | 维度 | 价格（/1M tokens） | 适合场景                    |
+| ---------------------- | ---- | ------------------ | --------------------------- |
+| text-embedding-3-small | 1536 | $0.02              | 大多数 RAG 场景，性价比最高 |
+| text-embedding-3-large | 3072 | $0.13              | 对检索精度要求更高的场景    |
+| text-embedding-ada-002 | 1536 | $0.10              | 旧版，不推荐新项目使用      |
+
+### 3-small vs 3-large 的实际差异
+
+```typescript
+import { OpenAI } from "openai";
+
+const openai = new OpenAI();
+
+// 用 3-small 嵌入
+const smallResponse = await openai.embeddings.create({
+  model: "text-embedding-3-small",
+  input: "为什么选择 PostgreSQL 而不是 MongoDB",
+});
+// 维度: 1536
+
+// 用 3-large 嵌入
+const largeResponse = await openai.embeddings.create({
+  model: "text-embedding-3-large",
+  input: "为什么选择 PostgreSQL 而不是 MongoDB",
+});
+// 维度: 3072
+```
+
+3-large 的维度是 3-small 的两倍，理论上能捕捉更多语义细节。但实测下来，对于大多数 RAG 场景（技术文档、FAQ），3-small 已经足够好。3-large 的优势主要体现在：
+
+- 细粒度区分（区分"怎么做"和"为什么做"）
+- 跨语言检索（中英混合文档）
+- 短文本匹配（一句话级别的检索）
+
+如果你在犹豫选哪个，先用 3-small 跑起来，等后面评估发现检索精度不够时再考虑升级。
+
+### 可变维度：Matryoshka Embedding
+
+`text-embedding-3-small` 支持一个实用特性——可以指定更低的维度，降低存储成本：
+
+```typescript
+const response = await openai.embeddings.create({
+  model: "text-embedding-3-small",
+  input: "为什么选择 PostgreSQL",
+  dimensions: 512, // 从 1536 压缩到 512
+});
+```
+
+原理是 Matryoshka Representation Learning——模型训练时把最重要的信息编码在前面的维度里。压缩维度会损失一些精度，但存储成本降低到原来的 1/3。
+
+适合的场景：文档量非常大（百万级）时，用低维度降低向量数据库的存储和检索成本。先用 1536 维上线，如果存储成为瓶颈，再降到 512 或 768。
+
+## 开源 Embedding 模型
+
+OpenAI 方便但有持续成本。如果你的文档量大、调用量高，自部署开源模型更经济。
+
+| 模型                    | 维度 | 语言   | 特点                                         |
+| ----------------------- | ---- | ------ | -------------------------------------------- |
+| BGE-M3 (BAAI)           | 1024 | 多语言 | 多功能（稠密+稀疏+多向量），综合能力强       |
+| GTE-large (Alibaba)     | 1024 | 中英文 | 中文效果好，社区活跃                         |
+| E5-large-v2 (Microsoft) | 1024 | 多语言 | 训练质量高，适合技术文档                     |
+| bge-reranker-v2-m3      | -    | 多语言 | 重排序模型（不是 Embedding，但经常搭配使用） |
+
+### 开源 vs OpenAI 的决策
+
+选 OpenAI 当你的文档量小于 10 万条、团队没有 GPU 资源、追求快速上线。
+
+选开源当你的文档量超过 10 万条（Embedding 成本开始显著）、需要离线部署或数据不能外传、有特定语言需求（纯中文场景，BGE/GTE 可能比 OpenAI 好）。
+
+### 自部署示例
+
+用 FastAPI 部署 BGE-M3 模型：
+
+```python
+# server.py — 简化的 Embedding 服务
+from fastapi import FastAPI
+from sentence_transformers import SentenceTransformer
+
+app = FastAPI()
+model = SentenceTransformer("BAAI/bge-m3")
+
+@app.post("/embed")
+async def embed(texts: list[str]):
+    vectors = model.encode(texts, normalize_embeddings=True)
+    return {"embeddings": vectors.tolist()}
+```
+
+然后在 TypeScript 中调用：
+
+```typescript
+async function embedWithLocal(texts: string[]): Promise<number[][]> {
+  const response = await fetch("http://localhost:8000/embed", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(texts),
+  });
+  const data = await response.json();
+  return data.embeddings;
+}
+```
+
+自部署的好处是免费（除了 GPU 服务器成本），而且延迟可控——不用等 OpenAI 的网络往返。
+
+## 踩坑经验
+
+### 长文本截断
+
+每个 Embedding 模型都有 token 上限（OpenAI 是 8191 tokens）。超过上限的部分会被截断。
+
+```
+一篇 5000 字的架构设计文档 → 超过 8191 tokens
+→ 只有前半部分被向量化
+→ 后半部分的信息完全丢失
+```
+
+这就是为什么要把文档切成小片段再向量化。Chunking 策略在后面的文章会深入讲。
+
+### 中英文混合
+
+如果你的文档有中英文混合（比如代码注释、技术文档），注意：
+
+- OpenAI 的模型对中英文混合处理得不错
+- 部分开源模型（如英文为主的 E5）对中文支持较弱
+- 代码片段的 Embedding 效果通常不好——代码的语义和自然语言很不同
+
+对于代码密集的文档，一个实用技巧是把代码和注释分开 Embedding，检索时合并结果。
+
+### 领域术语
+
+通用的 Embedding 模型对专业术语的理解可能不准。比如 "K8s" 和 "Kubernetes" 在某些模型里被视为不同的东西。
+
+缓解方法：在文档中同时使用全称和缩写（"Kubernetes（K8s）"），或者在检索前做术语标准化。
+
+## 这一篇你学到了什么
+
+- Embedding 把文本变成高维向量，语义相近 → 距离近
+- **余弦相似度**是最常用的距离度量，对文本长度不敏感
+- OpenAI **text-embedding-3-small** 是大多数 RAG 场景的最佳起点
+- **可变维度**（Matryoshka）允许在精度和存储成本之间做 trade-off
+- 开源模型（BGE/GTE/E5）适合大规模部署或纯中文场景
+- 踩坑：长文本截断、中英文混合、领域术语
+
+下一篇解决向量存到哪的问题——向量数据库的选型、索引原理和生产优化。

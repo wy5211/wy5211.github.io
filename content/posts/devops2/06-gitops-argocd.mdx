@@ -1,0 +1,425 @@
+---
+title: "06. 声明式部署：GitOps 与 ArgoCD"
+date: "2026-04-12"
+summary: "kubectl apply 是手动的，多人协作时配置容易漂移。GitOps 怎么让 Git 成为集群状态的唯一事实来源？"
+tags: ["GitOps", "ArgoCD", "Kubernetes", "DevOps"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战指南"
+seriesOrder: 6
+---
+
+前两篇把 FlowAPI 的 K8s 配置从"能跑"升级到"能上生产"——资源限制、健康检查、安全加固、网络策略，该加的都加了。每次更新流程是这样的：改 YAML → 提交到 Git → 登录集群 → `kubectl apply -f deployment.yaml`。
+
+看起来挺顺的对吧？但当团队从你一个人变成三个人，问题就来了。
+
+周三下午，同事 A 修了一个 bug，改了 Deployment 的镜像版本，直接在集群上 `kubectl apply` 了——没提交到 Git。周四你发现副本数不够，在集群上 `kubectl scale deployment flowapi --replicas=5`——也没提交到 Git。周五同事 B 从 Git 拉了最新代码做了一次全量 apply，副本数从 5 回到了 3，同事 A 的镜像版本也被覆盖了。线上事故。
+
+这就是配置漂移（configuration drift）——集群的实际状态和 Git 仓库里声明的不一致。每个人都在集群上做"临时修改"，没人记得改了什么，Git 里的 YAML 变成了摆设。
+
+GitOps 就是解决这个问题的。
+
+## GitOps 是什么
+
+核心思想就一句话：**Git 仓库是集群状态的唯一事实来源（single source of truth）**。
+
+你不是通过 `kubectl apply` 来改变集群状态，而是把期望状态提交到 Git，然后有一个自动化的工具负责把 Git 里的配置同步到集群。集群的实际状态永远以 Git 为准——Git 里有什么，集群就有什么；Git 里没有的，集群里也不应该有。
+
+这样做的好处：
+
+**可审计**。每次集群状态的变更都有 Git commit 记录——谁改的、改了什么、什么时候改的。出了问题可以回溯。
+
+**可回滚**。回滚集群状态 = `git revert`。Git 的历史记录就是集群的变更历史。
+
+**防漂移**。如果有人在集群上做了手动修改，自动同步工具会发现实际状态和 Git 不一致，自动修正回来。
+
+**权限分离**。开发者只需要 Git 仓库的写权限，不需要 K8s 集群的操作权限。集群权限集中在 GitOps 工具上。
+
+ArgoCD 是目前最流行的 GitOps 工具之一（另一个是 Flux，后面会对比）。它的工作方式很直观：你在 K8s 集群里装一个 ArgoCD，告诉它"盯着这个 Git 仓库的这个目录"，它就会自动把仓库里的 YAML 同步到集群里。
+
+## 安装 ArgoCD
+
+在 K8s 集群里安装 ArgoCD 非常简单——它本身就是一组 K8s 资源：
+
+```bash
+# 创建 argocd 命名空间
+kubectl create namespace argocd
+
+# 安装 ArgoCD（官方推荐方式）
+kubectl apply -n argocd \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+
+# 等待所有 Pod 就绪
+kubectl get pods -n argocd -w
+```
+
+安装完成后，ArgoCD 会在 `argocd` 命名空间里启动几个组件：
+
+- **argocd-server**：API Server 和 Web UI
+- **argocd-repo-server**：管理 Git 仓库连接
+- **argocd-application-controller**：核心控制器，负责对比 Git 状态和集群状态，执行同步
+
+访问 Web UI：
+
+```bash
+# 用 port-forward 访问（本地测试用）
+kubectl port-forward svc/argocd-server -n argocd 8080:443
+
+# 获取初始管理员密码
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath="{.data.password}" | base64 -d
+```
+
+浏览器打开 `https://localhost:8080`，用 `admin` 和上面拿到的密码登录。生产环境建议通过 Ingress 暴露，配上 HTTPS 和身份认证。
+
+## 仓库结构
+
+在讲 ArgoCD 的核心概念之前，先看看 FlowAPI 的 Git 仓库长什么样。上一篇用 Kustomize 管理多环境配置，目录结构不变：
+
+```
+flowapi-k8s/                    # K8s 配置仓库（和代码仓库分开）
+├── base/
+│   ├── deployment.yaml         # 公共 Deployment
+│   ├── service.yaml            # 公共 Service
+│   ├── configmap.yaml          # 公共 ConfigMap
+│   └── kustomization.yaml
+├── overlays/
+│   ├── dev/
+│   │   └── kustomization.yaml  # dev 差异：1 副本，小资源
+│   ├── staging/
+│   │   └── kustomization.yaml  # staging 差异：2 副本
+│   └── production/
+│       └── kustomization.yaml  # production 差异：3 副本，大资源
+```
+
+ArgoCD 盯着的就是这个仓库。每次你往这个仓库提交变更，ArgoCD 就会自动把新的配置同步到集群。
+
+## Application：连接 Git 和集群
+
+ArgoCD 的核心概念是 **Application**——一个自定义资源（CRD），定义了"Git 仓库里哪个目录的配置，同步到集群的哪个 Namespace"。
+
+先看一个完整的例子：
+
+```yaml
+# argocd-apps/production.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: flowapi-production
+  namespace: argocd # Application 必须在 argocd 命名空间
+spec:
+  # 项目名，默认用 default 就行
+  project: default
+
+  # 源：Git 仓库里的配置
+  source:
+    repoURL: https://github.com/your-org/flowapi-k8s.git
+    targetRevision: main # 分支或 tag
+    path: overlays/production # 仓库里的目录路径
+
+  # 目标：部署到哪个集群、哪个命名空间
+  destination:
+    server: https://kubernetes.default.svc # 当前集群
+    namespace: production
+
+  # 自动同步策略
+  syncPolicy:
+    automated:
+      prune: true # Git 里删了的资源，集群里也自动删除
+      selfHeal: true # 检测到漂移时自动修正
+    syncOptions:
+      - CreateNamespace=true # 如果 Namespace 不存在就自动创建
+```
+
+逐个字段说一下：
+
+`source.repoURL`：Git 仓库地址。ArgoCD 支持 HTTPS 和 SSH，私有仓库需要配置访问凭证。
+
+`source.targetRevision`：Git 分支名、tag 或 commit hash。用 `main` 表示跟踪主分支。也可以用 `v1.2.3` 这样的 tag 来锁定版本。
+
+`source.path`：仓库里的目录。ArgoCD 会读取这个目录下的所有 YAML 文件（包括 Kustomize 的 kustomization.yaml）。
+
+`destination.server`：目标集群的 API Server 地址。`https://kubernetes.default.svc` 是集群内部地址，表示部署到 ArgoCD 所在的同一个集群。ArgoCD 也支持多集群管理——一个 ArgoCD 管理多个集群。
+
+`syncPolicy.automated.prune`：如果 Git 里删掉了某个资源的 YAML，集群里对应的资源也会被自动删除。这个要谨慎开启——确保你真的想删。
+
+`syncPolicy.automated.selfHeal`：如果有人手动改了集群上的配置（比如 `kubectl scale`），ArgoCD 检测到漂移后会自动改回 Git 里声明的状态。这是 GitOps 的核心能力。
+
+把这个 Application 提交到集群：
+
+```bash
+kubectl apply -f argocd-apps/production.yaml
+```
+
+ArgoCD 立刻开始工作：克隆 Git 仓库 → 读取 `overlays/production` 目录下的 Kustomize 配置 → 渲染出完整的 YAML → 和集群当前状态对比 → 把差异同步到集群。
+
+你可以在 Web UI 上看到整个同步过程——哪些资源被创建了、哪些被修改了、哪些已经是最新状态。
+
+## 自动同步和自愈
+
+selfHeal 是 GitOps 最有意思的部分。看一个场景：
+
+你配置了 production 环境 3 个副本。周五晚上有人值班，看到流量突增，直接在集群上执行了 `kubectl scale deployment flowapi --replicas=8 -n production`。流量高峰过了，这个人忘了改回来。
+
+没有 GitOps：周一你发现集群跑了 8 个副本，不知道什么时候改的、谁改的、是不是故意的。
+
+有 GitOps：ArgoCD 检测到集群实际状态（8 副本）和 Git 声明状态（3 副本）不一致，自动把副本数改回 3。而且 ArgoCD UI 上会记录这次漂移事件——什么时候发生的、之前的值是什么、修正后的值是什么。
+
+默认情况下 ArgoCD 每 3 分钟对比一次 Git 和集群的状态。你也可以配置 Webhook——Git 仓库有 push 时立刻触发同步，不用等轮询。
+
+同步状态的几种情况：
+
+- **Synced**：集群状态和 Git 完全一致
+- **OutOfSync**：Git 有更新，集群还没同步（或者集群有漂移）
+- **Degraded**：同步失败了，比如 YAML 格式错误、镜像拉不下来
+
+## 多环境管理
+
+dev、staging、production 三个环境，三个 Application：
+
+```yaml
+# argocd-apps/dev.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: flowapi-dev
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/flowapi-k8s.git
+    targetRevision: main
+    path: overlays/dev # dev 的配置
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: dev
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+```yaml
+# argocd-apps/staging.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: flowapi-staging
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/flowapi-k8s.git
+    targetRevision: main
+    path: overlays/staging # staging 的配置
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: staging
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=true
+```
+
+production 的 Application 前面已经写过了。三个环境的区别就是 `path` 和 `namespace` 不同。
+
+如果你觉得管理三个 Application 太繁琐，ArgoCD 提供了 **App of Apps** 模式——创建一个"根 Application"，它的 source 目录里放着所有子 Application 的 YAML。同步根 Application 时，ArgoCD 自动创建所有子 Application。
+
+还有一种方式是 **ApplicationSet**，用模板批量生成 Application：
+
+```yaml
+# argocd-apps/appset.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: flowapi
+  namespace: argocd
+spec:
+  generators:
+    - list:
+        elements:
+          - env: dev
+            namespace: dev
+            replicas: "1"
+          - env: staging
+            namespace: staging
+            replicas: "2"
+          - env: production
+            namespace: production
+            replicas: "3"
+  template:
+    metadata:
+      name: "flowapi-{{env}}"
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/your-org/flowapi-k8s.git
+        targetRevision: main
+        path: "overlays/{{env}}"
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: "{{namespace}}"
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+```
+
+一个 ApplicationSet 替代了三个 Application。新增环境时，在 `elements` 列表里加一条就行。
+
+## 回滚：Git revert = 集群回滚
+
+在没有 GitOps 的时候，K8s 的回滚是 `kubectl rollout undo`。这个命令好用，但有个问题——它回滚的是 Deployment 的版本，不是整个集群的配置。如果你的 ConfigMap 也改坏了，`rollout undo` 恢复不了。
+
+GitOps 下，回滚就是 Git 操作：
+
+```bash
+# 回滚到上一个版本
+git revert HEAD
+git push
+
+# 回滚到指定 commit
+git revert abc123
+git push
+```
+
+Git push 之后，ArgoCD 检测到仓库变更，自动把集群同步到回滚后的状态——Deployment、Service、ConfigMap，全部恢复。
+
+这比 `kubectl rollout undo` 强的地方在于：回滚的是完整的配置，不只是 Deployment。而且回滚操作有 Git 记录，出了问题还能再"回滚的回滚"。
+
+对于生产环境，一个更安全的做法是给配置打 tag：
+
+```bash
+# 发布 v1.2.0
+git tag -a v1.2.0 -m "release v1.2.0"
+git push origin v1.2.0
+
+# production 的 Application 跟踪 tag 而不是分支
+# targetRevision: v1.2.0
+```
+
+每次发布改一下 `targetRevision` 指向新的 tag。回滚时改回上一个 tag。这样 production 永远不会意外跟踪到 main 分支上的未验证变更。
+
+## 和 CI/CD 流水线的配合
+
+这是一个容易混淆的点：ArgoCD 是 CD 工具，不是 CI 工具。CI（构建、测试）还是 GitHub Actions、GitLab CI 这些工具负责。
+
+整个流程是这样的：
+
+```
+代码仓库                     配置仓库                     K8s 集群
+┌──────────┐  push  ┌──────────┐  push  ┌──────────┐
+│ app code │ ────→  │ CI 流水线 │ ────→  │  ArgoCD  │
+│ (src/)   │        │ (Actions)│        │ (同步)   │
+└──────────┘        └──────────┘        └──────────┘
+                         │
+                    构建 Docker 镜像
+                    推送到 Registry
+                    更新 K8s YAML 中的
+                    镜像 tag
+                    提交到配置仓库
+```
+
+具体来说：
+
+**第 1 步：开发者提交代码**。合并 PR 到 main 分支。
+
+**第 2 步：CI 流水线构建镜像**。GitHub Actions 构建 Docker 镜像，推送到 Registry（比如 `your-registry.com/flowapi:1.2.0`）。
+
+**第 3 步：CI 更新配置仓库**。CI 流水线把新镜像 tag 写入 K8s 配置仓库的 YAML 中，提交并 push。
+
+**第 4 步：ArgoCD 同步到集群**。ArgoCD 检测到配置仓库变更，自动同步到 K8s 集群。
+
+第 3 步是关键——CI 怎么更新配置仓库？一种方式是用 GitHub Actions 的 `peter-evans/create-pull-request` action：
+
+```yaml
+# .github/workflows/deploy.yml（代码仓库）
+name: Build and Update Config
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build and push image
+        run: |
+          docker build -t your-registry.com/flowapi:${{ github.sha }} .
+          docker push your-registry.com/flowapi:${{ github.sha }}
+
+      - name: Update K8s config repo
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.CONFIG_REPO_PAT }}
+          repository: your-org/flowapi-k8s # 配置仓库
+          branch: update-image-${{ github.sha }}
+          commit-message: "Update image to ${{ github.sha }}"
+          body: |
+            Auto-generated by CI pipeline.
+            Image: your-registry.com/flowapi:${{ github.sha }}
+```
+
+这个 action 会自动创建一个 PR，更新 Kustomize 的镜像配置。你可以在配置仓库里加一个 ArgoCD Image Updater，让它自动识别新镜像并更新配置——这就不需要 CI 主动修改配置仓库了。
+
+分工很清晰：
+
+- **CI（GitHub Actions）**：构建镜像、跑测试、推镜像到 Registry
+- **CD（ArgoCD）**：从 Git 读取配置、同步到集群、检测漂移、自愈
+
+CI 不需要 K8s 集群的访问权限，ArgoCD 不需要 Docker Registry 的写权限。各自只做自己的事。
+
+## ArgoCD vs Flux
+
+K8s 生态里有两个主流 GitOps 工具：ArgoCD 和 Flux。功能上都能实现 GitOps，但设计哲学不同。
+
+**ArgoCD**：
+
+- 有 Web UI，可视化查看所有 Application 的同步状态
+- 通过 Application CRD 管理部署，概念直观
+- 支持多集群管理
+- 支持 Kustomize、Helm、Kustomize、Jsonnet 等多种配置管理工具
+- CNCF 孵化项目，社区活跃
+
+**Flux**：
+
+- 没有 Web UI（但可以配合 Grafana 仪表盘查看状态）
+- 更轻量，资源占用更少
+- 通过 GitRepository、Kustomization 等 CRD 管理，更贴近 K8s 原生风格
+- 支持多集群（需要 Flux 实例管理）
+- 同样是 CNCF 项目
+
+怎么选？如果你需要可视化界面来管理多个团队的应用，选 ArgoCD。如果你偏好纯命令行、追求轻量、配置即代码的极简风格，选 Flux。对于 FlowAPI 这个规模，两个都够用。这篇选 ArgoCD 是因为它的 Web UI 对新手更友好，排查问题时直接看界面比翻日志方便。
+
+## Trade-off：GitOps 的得与失
+
+GitOps 把部署流程标准化了——所有变更通过 Git，有记录、可回滚、防漂移。但它不是万能的。
+
+**适合的场景**：
+
+- 多人协作部署 K8s 应用，需要审计和变更追踪
+- 配置变更有审批流程（通过 Git PR review 实现）
+- 多环境（dev/staging/prod）需要统一的部署管理
+- 合规要求高，需要每次变更都有记录
+
+**不适合或者需要额外处理的情况**：
+
+- **紧急修复**。线上出了 P0 故障，你需要立刻改一个 ConfigMap。走 GitOps 流程：提交 PR → 审核 → 合并 → ArgoCD 同步，可能要 5-10 分钟。直接 `kubectl edit` 只要 10 秒。但 selfHeal 会在几分钟后把你的手动修改覆盖掉。解决方案：紧急修复时临时关闭 selfHeal，修完后再走 Git 补提交。
+- **Secret 管理**。Git 仓库不适合存 Secret（即使加密了也不理想）。需要配合 Sealed Secrets 或 external-secrets-operator 使用，增加了一层复杂度。
+- **学习曲线**。团队需要理解 GitOps 的概念，习惯"改 Git 而不是改集群"的工作方式。对于习惯了 `kubectl apply` 的人，这个转变需要时间。
+- **配置仓库的维护**。多了一个仓库要管理，CI 需要跨仓库操作，PR 流程需要设计。
+
+我的建议是：如果你已经在用 K8s，而且团队超过两个人在操作集群，GitOps 是值得投入的。初期不用搞太复杂——一个 Application、自动同步、selfHeal 开起来，就能解决大部分配置漂移的问题。多环境、App of Apps 这些模式，等单环境跑稳了再逐步引入。
+
+下一篇开始讲监控——部署自动化了，但出了问题你怎么知道？Prometheus 和 Grafana 怎么让集群的状态一目了然。

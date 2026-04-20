@@ -1,0 +1,493 @@
+---
+title: "15. Cloudflare Workers 部署"
+date: "2026-03-20"
+summary: "将 Hono 应用部署到 Cloudflare Workers 边缘网络，学习 wrangler 配置、环境变量、KV/D1/R2 使用，以及实现零配置部署。"
+tags:
+  ["Hono", "Cloudflare Workers", "Deployment", "Edge Computing", "Serverless"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 15
+---
+
+## 前言
+
+在上一篇文章中，我们为博客 API 编写了完整的测试套件。测试通过后，下一步就是将应用部署到生产环境，让真实用户能够访问。
+
+为什么选择 Cloudflare Workers？传统部署需要购买服务器、配置环境、处理扩容，而 Workers 让你在全球 300+ 个边缘节点运行代码，无需管理服务器。用户请求会被自动路由到最近的节点，实现毫秒级响应。
+
+Hono 与 Cloudflare Workers 是天生的一对。Hono 的轻量设计和 Web 标准API完美契合 Workers 的边缘环境。在这篇文章中，我会带你把博客 API 部署到 Cloudflare Workers，并学习如何使用 Workers 的三大存储服务：KV、D1 和 R2。
+
+## 理解 Cloudflare Workers
+
+先说说 Workers 的核心优势，这些特性让它与传统云服务有本质区别：
+
+**全球边缘网络**：Cloudflare 在全球有 300+ 个数据中心，你的代码会被复制到每个节点。当用户发起请求时，Cloudflare 会自动将请求路由到最近的节点。这意味着无论用户在纽约、东京还是伦敦，都能获得相似的延迟体验。
+
+**零冷启动**：Workers 使用 V8 Isolates 技术，不同于传统容器的冷启动问题。Isolates 是轻量级的执行环境，启动时间几乎可以忽略不计。这意味着即使你的应用长时间没有请求，再次收到请求时也能立即响应。
+
+**免费额度慷慨**：每天 100,000 次免费请求，对于大多数个人项目和小型应用完全够用。超出后按量付费，价格也比传统云服务低很多。
+
+**自动扩展**：不需要配置负载均衡器或设置自动扩容策略。当流量突然增长时，Workers 会自动处理更多请求，你只需要为实际使用的资源付费。
+
+## 配置 Wrangler
+
+Wrangler 是 Cloudflare 的 CLI 工具，用于开发、测试和部署 Workers 应用。
+
+先安装 Wrangler 并登录：
+
+```bash
+npm install -g wrangler
+wrangler login
+```
+
+登录会打开浏览器，你授权后 Wrangler 会获得访问你账户的权限。
+
+接下来初始化项目。如果你已经在用 Hono，只需要添加 Workers 配置：
+
+```bash
+cd blog-api
+wrangler init
+```
+
+Wrangler 会询问几个问题，选择生成 wrangler.toml 配置文件即可。
+
+## 理解 wrangler.toml 配置
+
+Wrangler 的核心配置文件是 wrangler.toml，让我们一步步构建这个配置文件：
+
+```toml
+name = "blog-api"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+# 账户信息（wrangler deploy 时会自动填充）
+# account_id = "your-account-id"
+```
+
+这是最基础的配置。name 是项目的唯一标识符，main 指定入口文件，compatibility_date 确保 Workers 运行时使用特定日期的 API，避免未来版本更新导致不兼容。
+
+**环境分离**：实际项目中通常需要多个环境：
+
+```toml
+[env.development]
+name = "blog-api-dev"
+
+[env.preview]
+name = "blog-api-preview"
+
+[env.production]
+name = "blog-api-prod"
+routes = [
+  { pattern = "api.yourdomain.com/*", zone_name = "yourdomain.com" }
+]
+```
+
+这样你可以分别部署到开发、预览和生产环境，互不影响。生产环境还可以配置自定义域名。
+
+## 绑定 Workers 服务
+
+Workers 的真正强大之处在于它的绑定服务，让你能够使用 Cloudflare 的各种服务。
+
+先说说我们需要什么：
+
+**KV**：键值存储，适合缓存和配置数据
+**D1**：SQLite 数据库，适合关系型数据存储
+**R2**：对象存储，适合文件存储（如图片、视频）
+
+创建这些资源：
+
+```bash
+# 创建 KV 命名空间
+wrangler kv:namespace create "CACHE"
+# 记录返回的 id，类似 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+# 创建预览环境的 KV（用于本地开发）
+wrangler kv:namespace create "CACHE" --preview
+# 记录返回的 preview_id
+
+# 创建 D1 数据库
+wrangler d1 create "blog-db"
+# 记录返回的 database_id
+
+# 创建 R2 Bucket
+wrangler r2 bucket create "blog-storage"
+```
+
+将这些资源绑定到应用，在 wrangler.toml 中添加：
+
+```toml
+# KV 绑定
+[[kv_namespaces]]
+binding = "CACHE"
+id = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+preview_id = "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy"
+
+# D1 数据库绑定
+[[d1_databases]]
+binding = "DB"
+database_name = "blog-db"
+database_id = "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+
+# R2 存储绑定
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "blog-storage"
+
+# 环境变量
+[vars]
+ENVIRONMENT = "production"
+API_URL = "https://api.example.com"
+```
+
+注意 binding 名称，这些是在代码中引用这些服务的方式。
+
+## 在 Hono 中使用绑定服务
+
+现在需要在 TypeScript 中定义这些绑定的类型，这样在使用时会有类型提示：
+
+```typescript
+// src/index.ts
+import { Hono } from "hono";
+
+type Bindings = {
+  CACHE: KVNamespace;
+  DB: D1Database;
+  STORAGE: R2Bucket;
+  ENVIRONMENT: string;
+  API_URL: string;
+  JWT_SECRET: string;
+};
+
+const app = new Hono<{ Bindings: Bindings }>();
+```
+
+通过泛型传递 Bindings 类型后，在路由中可以通过 c.env 访问这些绑定。
+
+让我们为博客 API 添加一些使用这些服务的路由：
+
+```typescript
+// 健康检查
+app.get("/health", (c) => {
+  return c.json({
+    status: "ok",
+    environment: c.env.ENVIRONMENT,
+    timestamp: Date.now(),
+  });
+});
+
+// 使用 KV 缓存热门文章
+app.get("/posts/:id", async (c) => {
+  const { id } = c.req.param();
+
+  // 先从缓存读取
+  const cached = await c.env.CACHE.get(`post:${id}`, "json");
+  if (cached) {
+    return c.json({ success: true, data: cached, cached: true });
+  }
+
+  // 缓存未命中，从数据库查询
+  const post = await c.env.DB.prepare("SELECT * FROM posts WHERE id = ?")
+    .bind(id)
+    .first();
+
+  if (!post) {
+    return c.json({ success: false, message: "Post not found" }, 404);
+  }
+
+  // 写入缓存，5分钟过期
+  await c.env.CACHE.put(`post:${id}`, JSON.stringify(post), {
+    expirationTtl: 300,
+  });
+
+  return c.json({ success: true, data: post, cached: false });
+});
+
+// 使用 R2 存储上传的图片
+app.post("/upload", async (c) => {
+  const formData = await c.req.formData();
+  const file = formData.get("file") as File;
+
+  if (!file) {
+    return c.json({ success: false, message: "No file provided" }, 400);
+  }
+
+  // 生成唯一文件名
+  const ext = file.name.split(".").pop();
+  const key = `uploads/${crypto.randomUUID()}.${ext}`;
+
+  // 上传到 R2
+  await c.env.STORAGE.put(key, file.stream());
+
+  // 返回访问 URL
+  const url = `https://cdn.yourdomain.com/${key}`;
+  return c.json({ success: true, data: { url } });
+});
+
+export default app;
+```
+
+注意这里我们没有使用复杂的 ORM，而是直接使用 D1 的 SQL API。在边缘环境中，越简单越好。
+
+## 设置敏感信息
+
+有些配置是敏感的，比如 JWT_SECRET，不应该直接写在 wrangler.toml 中（因为可能会提交到 Git）。Wrangler 提供了 secret 命令来安全地管理这些信息：
+
+```bash
+# 设置密钥（会提示输入值）
+wrangler secret put JWT_SECRET
+
+# 查看已设置的密钥列表（不显示值）
+wrangler secret list
+
+# 删除密钥
+wrangler secret delete JWT_SECRET
+```
+
+密钥设置后会被加密存储，部署时才会注入到 Workers 环境中。
+
+## 数据库迁移
+
+D1 支持 SQL 迁移系统，让我们版本化管理数据库结构。
+
+创建迁移文件：
+
+```bash
+wrangler d1 migrations create blog-db init
+```
+
+这会在 migrations 目录创建一个 SQL 文件。编辑这个文件，定义我们的表结构：
+
+```sql
+-- migrations/0001_init.sql
+-- 用户表
+CREATE TABLE IF NOT EXISTS users (
+  id TEXT PRIMARY KEY,
+  email TEXT NOT NULL UNIQUE,
+  username TEXT NOT NULL UNIQUE,
+  password TEXT NOT NULL,
+  name TEXT,
+  bio TEXT,
+  avatar TEXT,
+  role TEXT NOT NULL DEFAULT 'user',
+  created_at TEXT NOT NULL
+);
+
+-- 文章表
+CREATE TABLE IF NOT EXISTS posts (
+  id TEXT PRIMARY KEY,
+  title TEXT NOT NULL,
+  slug TEXT NOT NULL UNIQUE,
+  content TEXT NOT NULL,
+  excerpt TEXT,
+  cover_image TEXT,
+  published INTEGER NOT NULL DEFAULT 0,
+  author_id TEXT NOT NULL REFERENCES users(id),
+  views INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  published_at TEXT
+);
+
+-- 评论表
+CREATE TABLE IF NOT EXISTS comments (
+  id TEXT PRIMARY KEY,
+  content TEXT NOT NULL,
+  post_id TEXT NOT NULL REFERENCES posts(id),
+  author_id TEXT NOT NULL REFERENCES users(id),
+  parent_id TEXT REFERENCES comments(id),
+  created_at TEXT NOT NULL
+);
+
+-- 标签表
+CREATE TABLE IF NOT EXISTS tags (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  slug TEXT NOT NULL UNIQUE
+);
+
+-- 文章标签关联表
+CREATE TABLE IF NOT EXISTS post_tags (
+  post_id TEXT NOT NULL REFERENCES posts(id),
+  tag_id TEXT NOT NULL REFERENCES tags(id),
+  PRIMARY KEY (post_id, tag_id)
+);
+
+-- 创建索引提升查询性能
+CREATE INDEX IF NOT EXISTS idx_posts_published ON posts(published);
+CREATE INDEX IF NOT EXISTS idx_posts_author ON posts(author_id);
+CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id);
+```
+
+应用迁移到本地数据库（用于开发）：
+
+```bash
+wrangler d1 migrations apply blog-db --local
+```
+
+应用迁移到生产数据库：
+
+```bash
+wrangler d1 migrations apply blog-db --remote
+```
+
+## 本地开发
+
+Wrangler 提供了本地开发服务器，模拟 Workers 环境：
+
+```bash
+# 启动开发服务器（使用远程绑定）
+wrangler dev --remote
+
+# 或使用本地模式（需要先应用本地迁移）
+wrangler dev --local
+```
+
+推荐使用 --remote 模式，因为这样可以使用真实的 D1 和 KV 数据库，更接近生产环境。
+
+如果需要在本地使用不同的环境变量，创建 .dev.vars 文件：
+
+```bash
+# .dev.vars（不要提交到 Git）
+JWT_SECRET=dev-secret-key
+DATABASE_URL=file:./dev.db
+```
+
+## 部署到生产环境
+
+一切准备就绪后，部署非常简单：
+
+```bash
+# 部署到生产环境
+wrangler deploy
+
+# 部署到特定环境
+wrangler deploy --env development
+
+# 部署并立即查看实时日志
+wrangler deploy --tail
+```
+
+部署完成后，Wrangler 会显示你的应用 URL。如果你配置了自定义域名，可以通过那个域名访问。
+
+## 监控和日志
+
+部署后需要监控应用状态。Wrangler 提供了几个有用的命令：
+
+```bash
+# 查看实时日志
+wrangler tail
+
+# 过滤特定状态码的日志
+wrangler tail --status-code 500
+
+# 查看特定环境的日志
+wrangler tail --env production
+
+# 打开 Web Analytics
+wrangler analytics
+```
+
+也可以在代码中添加性能日志：
+
+```typescript
+app.use("*", async (c, next) => {
+  const start = Date.now();
+
+  await next();
+
+  const duration = Date.now() - start;
+
+  // 添加响应头
+  c.header("X-Response-Time", `${duration}ms`);
+
+  // 记录慢请求
+  if (duration > 1000) {
+    console.warn(`Slow request: ${c.req.method} ${c.req.path} - ${duration}ms`);
+  }
+});
+```
+
+## 自动化部署
+
+手动部署可以，但自动化更好。使用 GitHub Actions 在 push 到 main 分支时自动部署：
+
+```yaml
+# .github/workflows/deploy.yml
+name: Deploy to Cloudflare Workers
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Deploy to Cloudflare Workers
+        uses: cloudflare/wrangler-action@v2
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+```
+
+这个配置会先运行测试，测试通过后才部署，确保只有代码质量合格时才会更新生产环境。
+
+## 权衡与取舍
+
+使用 Cloudflare Workers 部署 Hono 应用有很多优势，但也需要了解一些权衡：
+
+**优势**：
+
+- 全球边缘部署，用户访问延迟低
+- 零冷启动，响应速度快
+- 自动扩展，无需手动配置
+- 免费额度慷慨，小项目几乎零成本
+
+**限制**：
+
+- 每个请求的 CPU 时间限制（默认 10ms，付费版 50ms）
+- 内存限制（128MB）
+- 不支持所有 Node.js API（只支持 Web 标准 API）
+- D1 数据库有连接数限制
+
+**适合场景**：
+
+- API 服务
+- 内容分发
+- 边缘计算和逻辑处理
+- 需要全球低延迟的应用
+
+**不适合场景**：
+
+- 长时间运行的任务（如视频转码）
+- 需要大量内存的计算
+- 依赖 Node.js 特定 API 的应用
+
+对于博客 API 这类应用，Cloudflare Workers 是理想选择。请求响应快速，数据可以通过 D1 持久化，热门内容通过 KV 缓存，文件上传到 R2，完全满足需求。
+
+## 下一步
+
+现在博客 API 已经成功部署到 Cloudflare Workers，用户可以在全球任何地方快速访问。但 Cloudflare 不是唯一的边缘计算平台，Deno Deploy 是另一个优秀的选择。
+
+下一篇文章会带你将同一个应用部署到 Deno Deploy，对比两个平台的差异，帮你根据项目需求选择最合适的部署方案。

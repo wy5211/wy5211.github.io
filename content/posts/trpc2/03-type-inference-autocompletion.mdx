@@ -1,0 +1,511 @@
+---
+title: "03 类型推断与自动补全"
+date: "2026-03-23"
+summary: "深入理解 tRPC 的类型系统，掌握如何在前端获得完整的类型提示和自动补全，体验真正的端到端类型安全。"
+tags: ["tRPC", "TypeScript", "类型推断", "自动补全", "类型安全"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 3
+---
+
+上一篇文章我们学习了 Router 和 Procedure，知道了如何组织 tRPC 的 API。今天我们深入了解一下 tRPC 最神奇的部分：类型推断。
+
+你可能听说过"端到端类型安全"，但它到底意味着什么？为什么 tRPC 能做到其他工具做不到的事情？
+
+答案就在 TypeScript 的类型推断系统。让我们来看看类型是如何从后端"穿越"到前端的。
+
+## 类型推断的必要性
+
+在实际开发中，你一定遇到过这样的场景：
+
+后端接口返回了 `{ id, name, email }`，但前端代码里写成了 `{ id, username, email }`。直到运行时才发现错误，因为后端没有 `username` 字段。
+
+或者更糟糕的情况：后端改了接口，把 `email` 改成了 `emailAddress`，但前端代码忘了更新。TypeScript 检查不出来，因为前端的类型定义是手动写的，和后端没有真正关联。
+
+这些问题的根源在于：前端的类型定义和后端的实际实现是分离的。它们可能在一开始是一致的，但随着代码演进，很容易出现不一致。
+
+tRPC 的解决方案是：让前端直接使用后端的类型，而不是重新定义。这样就能保证前后端类型的一致性。
+
+## 类型推断的工作原理
+
+tRPC 的类型推断依赖于 TypeScript 的 `typeof` 操作符。我们通过一个简单的例子来看看它的工作原理。
+
+```typescript
+// 后端定义
+export const appRouter = t.router({
+  getProject: t.procedure
+    .input(z.object({ id: z.string() }))
+    .query(({ input }) => {
+      return {
+        id: input.id,
+        name: "网站重构",
+        description: "重构公司官网",
+        status: "进行中",
+      };
+    }),
+});
+
+// 使用 typeof 提取类型
+export type AppRouter = typeof appRouter;
+```
+
+`typeof appRouter` 会提取出整个 Router 的类型信息，包括每个 Procedure 的输入输出类型。这个类型包含了：
+
+1. Router 的嵌套结构
+2. 每个 Procedure 的输入参数类型
+3. 每个 Procedure 的返回值类型
+
+前端只需要导入这个类型，就能获得完整的类型信息。
+
+## 在前端使用类型推断
+
+前端如何使用这个类型？我们来看看实际的代码。
+
+### 创建类型安全的客户端
+
+```typescript
+import { createTRPCProxyClient, httpBatchLink } from "@trpc/client";
+import type { AppRouter } from "./server";
+
+// 创建客户端，传入后端的类型
+const client = createTRPCProxyClient<AppRouter>({
+  links: [
+    httpBatchLink({
+      url: "http://localhost:3000",
+    }),
+  ],
+});
+```
+
+关键在于 `createTRPCProxyClient<AppRouter>` 这一行。`AppRouter` 类型让客户端知道了后端的所有接口信息。
+
+### 调用 API 时的类型推断
+
+```typescript
+async function example() {
+  // 输入参数类型推断
+  const project = await client.projects.get.query({
+    id: "123",
+  });
+  // TypeScript 知道 id 应该是 string 类型
+  // 如果写成 id: 123，会报错
+
+  // 返回值类型推断
+  console.log(project.name);
+  // TypeScript 知道 project 有 name 属性
+
+  console.log(project.status);
+  // TypeScript 知道 project 有 status 属性
+
+  // 错误示例
+  console.log(project.unknownField);
+  //                    ^^^^^^^^^^^^
+  // Property 'unknownField' does not exist on type...
+}
+```
+
+注意这里发生了什么：我们没有在前端定义任何类型，但 TypeScript 知道每个接口需要什么参数、会返回什么数据。
+
+### 自动补全的威力
+
+类型推断带来的最大好处是自动补全。在 IDE 中输入 `client.projects.`，你会看到所有可用的接口：
+
+```typescript
+client.projects.
+  // IDE 自动提示：
+  // - get
+  // - list
+  // - create
+  // - update
+  // - delete
+```
+
+选择一个接口后，IDE 会继续提示需要的参数：
+
+```typescript
+client.projects.get.query({
+  // IDE 提示：id: string
+});
+```
+
+这种自动补全能力大大提升了开发效率，你不需要翻文档就能知道如何调用 API。
+
+## React Hooks 集成
+
+在实际的 React 应用中，我们通常使用 `@trpc/react-query` 提供的 Hooks。这些 Hooks 完整保留了类型推断能力。
+
+### 使用 useQuery
+
+```typescript
+import { trpc } from "./utils/trpc";
+
+function ProjectList() {
+  // 类型推断：data 的类型是 Project[] | undefined
+  const { data, isLoading, error } = trpc.projects.list.useQuery();
+
+  if (isLoading) return <div>加载中...</div>;
+  if (error) return <div>错误：{error.message}</div>;
+
+  return (
+    <ul>
+      {data?.map((project) => (
+        <li key={project.id}>
+          {project.name} - {project.status}
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+注意 `data` 的类型：TypeScript 知道它是 `Project[] | undefined`，所以我们在使用它之前需要检查 `isLoading` 和 `error`。
+
+### 带参数的查询
+
+```typescript
+function ProjectDetail({ projectId }: { projectId: string }) {
+  // 参数类型自动推断
+  const { data } = trpc.projects.byId.useQuery({
+    id: projectId,
+  });
+
+  if (!data) return null;
+
+  // TypeScript 知道 data 的类型是 Project
+  return (
+    <div>
+      <h1>{data.name}</h1>
+      <p>{data.description}</p>
+      <p>状态：{data.status}</p>
+    </div>
+  );
+}
+```
+
+### 使用 useMutation
+
+```typescript
+function CreateProjectForm() {
+  const utils = trpc.useContext();
+
+  // 类型推断：mutate 的参数类型自动推导
+  const createProject = trpc.projects.create.useMutation({
+    onSuccess: () => {
+      // 使缓存失效，触发重新获取
+      utils.projects.list.invalidate();
+    },
+  });
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const form = e.currentTarget;
+
+    // TypeScript 知道需要哪些字段
+    createProject.mutate({
+      name: form.projectName.value,
+      description: form.description.value,
+    });
+  };
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <input name="projectName" />
+      <textarea name="description" />
+      <button type="submit">
+        {createProject.isLoading ? "创建中..." : "创建"}
+      </button>
+    </form>
+  );
+}
+```
+
+注意 `mutate` 的参数：TypeScript 自动推断出需要 `name` 和可选的 `description` 字段。
+
+## 类型推断的层次
+
+tRPC 的类型推断分为三个层次，每一层都提供了不同的类型信息。
+
+### 层次1：Router 结构推断
+
+```typescript
+const appRouter = t.router({
+  projects: t.router({
+    list: t.procedure.query(...),
+    byId: t.procedure.query(...),
+  }),
+  tasks: t.router({
+    list: t.procedure.query(...),
+    create: t.procedure.mutation(...),
+  }),
+});
+```
+
+TypeScript 推断出的类型结构是：
+
+```typescript
+type AppRouter = {
+  projects: {
+    list: Procedure<..., Project[]>;
+    byId: Procedure<{id: string}, Project>;
+  };
+  tasks: {
+    list: Procedure<..., Task[]>;
+    create: Procedure<{...}, Task>;
+  };
+};
+```
+
+这个类型结构保留了 Router 的嵌套关系，前端调用时路径必须匹配这个结构。
+
+### 层次2：输入类型推断
+
+```typescript
+const getProject = t.procedure
+  .input(
+    z.object({
+      id: z.string(),
+      includeMembers: z.boolean().optional(),
+    })
+  )
+  .query(({ input }) => {
+    // input 的类型自动推断为：
+    // { id: string; includeMembers?: boolean }
+  });
+```
+
+前端调用时，TypeScript 会检查参数类型：
+
+```typescript
+await client.projects.get.query({
+  id: "123",
+  includeMembers: true, // 可选
+});
+
+// 错误示例
+await client.projects.get.query({
+  id: 123, // 错误：应该是 string
+});
+```
+
+### 层次3：输出类型推断
+
+```typescript
+const getProject = t.procedure
+  .input(z.object({ id: z.string() }))
+  .query(async ({ input }) => {
+    const project = await db.project.findUnique({
+      where: { id: input.id },
+      include: {
+        members: true,
+        tasks: true,
+      },
+    });
+
+    // TypeScript 推断返回类型为：
+    // (Project & { members: Member[]; tasks: Task[] }) | null
+    return project;
+  });
+```
+
+前端知道返回类型的完整结构：
+
+```typescript
+const project = await client.projects.get.query({ id: "123" });
+
+if (project) {
+  console.log(project.name);
+  console.log(project.members); // Member[]
+  console.log(project.tasks); // Task[]
+}
+```
+
+## 高级类型技巧
+
+在实际开发中，我们可能需要从 tRPC 的类型中提取特定的类型信息。
+
+### 提取特定 API 的类型
+
+```typescript
+import type { inferRouterOutputs, inferRouterInputs } from "@trpc/server";
+import type { AppRouter } from "./server";
+
+// 提取所有输出类型
+type RouterOutputs = inferRouterOutputs<AppRouter>;
+// 等同于：
+// type RouterOutputs = {
+//   projects: {
+//     list: Project[];
+//     byId: Project | null;
+//     create: Project;
+//   };
+//   tasks: { ... };
+// };
+
+// 提取特定 API 的输出类型
+type ProjectListOutput = RouterOutputs["projects"]["list"];
+// 等同于：type ProjectListOutput = Project[];
+
+// 提取特定 API 的输入类型
+type CreateProjectInput = RouterInputs["projects"]["create"];
+// 等同于：
+// type CreateProjectInput = {
+//   name: string;
+//   description?: string;
+// };
+```
+
+这些类型可以在组件中使用，而不需要重新定义：
+
+```typescript
+function ProjectForm() {
+  const [project, setProject] = useState<CreateProjectInput>({
+    name: "",
+    description: "",
+  });
+
+  // ...
+}
+```
+
+### 条件类型推断
+
+有时候一个 API 的返回类型取决于输入参数。tRPC 可以处理这种情况：
+
+```typescript
+const searchContent = t.procedure
+  .input(
+    z.object({
+      query: z.string(),
+      type: z.enum(["projects", "tasks", "users"]),
+    })
+  )
+  .query(async ({ input }) => {
+    switch (input.type) {
+      case "projects":
+        return {
+          type: "projects" as const,
+          results: await db.project.findMany({
+            where: { name: { contains: input.query } },
+          }),
+        };
+
+      case "tasks":
+        return {
+          type: "tasks" as const,
+          results: await db.task.findMany({
+            where: { title: { contains: input.query } },
+          }),
+        };
+
+      case "users":
+        return {
+          type: "users" as const,
+          results: await db.user.findMany({
+            where: { name: { contains: input.query } },
+          }),
+        };
+    }
+  });
+```
+
+前端使用时，TypeScript 会根据返回的 `type` 字段推断 `results` 的类型：
+
+```typescript
+const result = await client.search.query({
+  query: "网站",
+  type: "projects",
+});
+
+if (result.type === "projects") {
+  // TypeScript 知道 result.results 是 Project[]
+  console.log(result.results[0].name);
+}
+```
+
+## 类型推断的局限性
+
+虽然 tRPC 的类型推断很强大，但也有一些局限性需要注意。
+
+### 序列化问题
+
+JSON 序列化会丢失一些类型信息：
+
+```typescript
+const getProject = t.procedure.query(async () => {
+  return {
+    id: "123",
+    name: "网站重构",
+    createdAt: new Date(), // Date 对象
+  };
+});
+
+// 前端接收时，createdAt 变成了 string
+const project = await client.projects.get.query();
+console.log(project.createdAt instanceof Date); // false
+```
+
+这是因为 JSON 无法序列化 Date 对象，它会被转换成字符串。解决方法是使用数据转换器（transformer），我们会在后续文章中介绍。
+
+### 循环引用
+
+如果类型之间存在循环引用，推断可能会失败：
+
+```typescript
+// 可能导致问题
+const appRouter = t.router({
+  projects: t.router({
+    tasks: t.procedure.query(() => {
+      return db.task.findMany();
+    }),
+  }),
+  tasks: t.router({
+    project: t.procedure.query(() => {
+      return db.project.findFirst();
+    }),
+  }),
+});
+```
+
+解决方法是明确指定返回类型：
+
+```typescript
+const appRouter = t.router({
+  projects: t.router({
+    tasks: t.procedure.query<Task[]>(() => {
+      return db.task.findMany();
+    }),
+  }),
+  tasks: t.router({
+    project: t.procedure.query<Project | null>(() => {
+      return db.project.findFirst();
+    }),
+  }),
+});
+```
+
+## Trade-off 分析
+
+类型推断是 tRPC 的核心特性，但使用时也有一些权衡需要考虑。
+
+**类型安全 vs 灵活性**：
+
+- 严格的类型推断让代码更安全，但也限制了某些动态操作
+- 比如无法根据运行时条件动态选择 API 路径
+- 我的建议：在绝大多数场景下，类型安全的价值远大于灵活性的损失
+
+**编译时检查 vs 运行时验证**：
+
+- TypeScript 的类型检查只在编译时有效，运行时需要额外的验证
+- tRPC 使用 Zod 进行运行时验证，弥补了这个不足
+- 我的建议：总是使用 Zod 定义输入验证，不要依赖 any 类型
+
+**类型复杂度 vs 可维护性**：
+
+- 复杂的类型推断可能让类型错误信息难以理解
+- 在大型项目中，类型推断的时间也可能变长
+- 我的建议：合理使用类型注释，帮助 TypeScript 和开发者理解代码
+
+类型推断是 tRPC 最大的价值所在。它让前后端的类型保持一致，减少了大量重复工作，也避免了类型不一致导致的 bug。掌握类型推断的机制和技巧，能让你更高效地使用 tRPC。
+
+下一步，我们将学习 tRPC 的中间件系统，看看如何处理认证、日志等横切关注点。

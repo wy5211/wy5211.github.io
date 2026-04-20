@@ -1,0 +1,396 @@
+---
+title: "09. 执行计划分析：像医生一样诊断数据库性能问题"
+date: "2026-04-12"
+summary: "深入理解 PostgreSQL 执行计划，掌握诊断性能问题的核心技能"
+tags: ["PostgreSQL", "执行计划", "性能诊断", "EXPLAIN"]
+category: "数据库"
+cover: ""
+draft: false
+series: "PostgreSQL 渐进式学习路线"
+seriesOrder: 9
+---
+
+上一篇文章我们学习了 SQL 查询优化的各种技巧，但有个问题：你怎么知道优化有没有效果？为什么加了索引还是慢？为什么两个看起来一样的查询，性能差这么多？
+
+这时候就需要看执行计划。执行计划就像是数据库的体检报告，告诉你它准备怎么执行你的查询，每一步要花多少时间。学会读执行计划，你就能像医生一样诊断性能问题。
+
+## 什么是执行计划
+
+当你写一个 SQL 查询，PostgreSQL 不会直接执行，而是先让查询优化器分析，生成一个执行计划。这个计划包含了：用哪个索引、用什么方式连接表、先扫描哪张表等等。
+
+你可以用 EXPLAIN 命令查看执行计划：
+
+```sql
+-- 只看计划，不执行
+EXPLAIN SELECT * FROM orders WHERE user_id = 'usr_8x9k2m';
+
+-- 看计划并且真的执行，返回实际时间
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 'usr_8x9k2m';
+
+-- 更详细的信息（缓冲区使用情况）
+EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM orders WHERE user_id = 'usr_8x9k2m';
+```
+
+为什么要加 ANALYZE？因为 EXPLAIN 只显示优化器的估算，可能不准确。ANALYZE 会真正执行查询，记录实际时间，这样你才能知道到底哪里慢。
+
+## 扫描方式：数据库怎么找数据
+
+### Seq Scan：顺序扫描
+
+Seq Scan 就是从头到尾扫描整张表，就像翻一本书，从第一页看到最后一页。
+
+```sql
+EXPLAIN ANALYZE SELECT * FROM orders;
+
+-- 输出：
+-- Seq Scan on orders  (cost=0.00..45.23 rows=1523 width=124)
+--   (actual time=0.015..3.456 rows=1523 loops=1)
+```
+
+这里出现了 Seq Scan，说明做了全表扫描。cost=0.00..45.23 是优化器估算的成本（启动成本 0，总成本 45.23），actual time=0.015..3.456 是实际执行时间（毫秒）。
+
+什么时候会出现 Seq Scan？没有索引、数据量很小、或者需要返回大部分数据。比如你的 orders 表就 1000 条记录，全表扫描可能比用索引还快。
+
+### Index Scan：索引扫描
+
+如果有合适的索引，数据库就会用索引扫描，就像看书有目录，直接翻到对应页。
+
+```sql
+-- 先创建索引
+CREATE INDEX idx_orders_user_id ON orders(user_id);
+
+-- 再看执行计划
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 'usr_8x9k2m';
+
+-- 输出：
+-- Index Scan using idx_orders_user_id on orders
+--   (cost=0.42..12.34 rows=23 width=124)
+--   (actual time=0.023..0.156 rows=23 loops=1)
+--   Index Cond: (user_id = 'usr_8x9k2m'::text)
+```
+
+看到 Index Scan，说明用了索引。实际时间从 3 毫秒降到了 0.15 毫秒，快了 20 多倍。
+
+### Index Only Scan：只读索引
+
+如果查询的所有列都在索引里，数据库连表都不用查，只读索引就够了，这叫覆盖索引。
+
+```sql
+-- 创建复合索引
+CREATE INDEX idx_orders_user_status ON orders(user_id, status, total);
+
+-- 查询的列都在索引里
+EXPLAIN ANALYZE
+SELECT user_id, status, total
+FROM orders
+WHERE user_id = 'usr_8x9k2m';
+
+-- 输出：
+-- Index Only Scan using idx_orders_user_status on orders
+--   (cost=0.42..8.76 rows=23 width=36)
+--   (actual time=0.012..0.089 rows=23 loops=1)
+```
+
+Index Only Scan 是最快的扫描方式，因为它避免了访问表数据（叫 heap fetch）。你会在输出里看到 Heap Fetches: 0，说明完全没有查表。
+
+### Bitmap Index Scan：位图扫描
+
+当有多个 OR 条件时，数据库可能用位图扫描。先找到所有符合条件的索引位置，再合并成位图，最后批量读取数据。
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM orders
+WHERE user_id = 'usr_8x9k2m' OR user_id = 'usr_1a2b3c';
+
+-- 输出：
+-- Bitmap Heap Scan on orders
+--   Recheck Cond: ((user_id = 'usr_8x9k2m'::text) OR (user_id = 'usr_1a2b3c'::text))
+--   -> BitmapOr
+--     -> Bitmap Index Scan on idx_orders_user_id
+--         Index Cond: (user_id = 'usr_8x9k2m'::text)
+--     -> Bitmap Index Scan on idx_orders_user_id
+--         Index Cond: (user_id = 'usr_1a2b3c'::text)
+```
+
+## 连接方式：多表查询怎么做
+
+### Nested Loop：嵌套循环
+
+Nested Loop 就像两个 for 循环，外层表每行，内层表全扫描一遍。适合小表或者有索引的情况。
+
+```sql
+EXPLAIN ANALYZE
+SELECT u.email, o.order_number, o.total
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+WHERE u.id = 'usr_8x9k2m';
+
+-- 输出：
+-- Nested Loop
+--   -> Index Scan using users_pkey on users u
+--       Index Cond: (id = 'usr_8x9k2m'::text)
+--   -> Index Scan using idx_orders_user_id on orders o
+--       Index Cond: (user_id = 'usr_8x9k2m'::text)
+```
+
+这个例子很好，因为先通过主键定位到用户，再用索引找订单，两个都是 Index Scan，很快。但如果外层表很大，就会很慢。
+
+### Hash Join：哈希连接
+
+Hash Join 适合大表等值连接。先读小表构建哈希表，再扫描大表匹配。
+
+```sql
+EXPLAIN ANALYZE
+SELECT u.email, COUNT(o.id), SUM(o.total)
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+GROUP BY u.email;
+
+-- 输出：
+-- Hash Join
+--   Hash Cond: (o.user_id = u.id)
+--   -> HashAggregate
+--       Group Key: o.user_id
+--       -> Seq Scan on orders
+--   -> Hash
+--       -> Seq Scan on users
+```
+
+Hash Join 不需要索引，但需要内存构建哈希表。如果 work_mem 设置太小，就会写到磁盘，很慢。
+
+### Merge Join：合并连接
+
+Merge Join 适合两个有序的大表。先排序，再像合并两个有序数组一样遍历。
+
+```sql
+EXPLAIN ANALYZE
+SELECT u.email, o.order_number
+FROM users u
+INNER JOIN orders o ON u.id = o.user_id
+ORDER BY u.id;
+
+-- 输出：
+-- Merge Join
+--   Merge Cond: (u.id = o.user_id)
+--   -> Index Scan using users_pkey on users
+--   -> Sort
+--       Sort Key: o.user_id
+--       -> Seq Scan on orders
+```
+
+Merge Join 在连接列已经有序时很快，否则需要排序开销。
+
+## 实战诊断：找出性能瓶颈
+
+假设你在电商系统里发现这个查询很慢：
+
+```sql
+SELECT
+  u.email,
+  o.order_number,
+  oi.product_id,
+  oi.quantity,
+  oi.unit_price
+FROM orders o
+INNER JOIN users u ON o.user_id = u.id
+INNER JOIN order_items oi ON o.id = oi.order_id
+WHERE o.status = 'pending'
+  AND o.created_at >= '2026-01-01'
+ORDER BY o.created_at DESC
+LIMIT 20;
+```
+
+先看执行计划：
+
+```sql
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT
+  u.email,
+  o.order_number,
+  oi.product_id,
+  oi.quantity,
+  oi.unit_price
+FROM orders o
+INNER JOIN users u ON o.user_id = u.id
+INNER JOIN order_items oi ON o.id = oi.order_id
+WHERE o.status = 'pending'
+  AND o.created_at >= '2026-01-01'
+ORDER BY o.created_at DESC
+LIMIT 20;
+```
+
+假设输出是这样的：
+
+```
+Limit  (cost=12345.67..12345.72 rows=20 width=156)
+  (actual time=1234.567..1234.789 rows=20 loops=1)
+  Buffers: shared hit=2345 read=1567
+  -> Sort  (cost=12345.67..12367.89 rows=5678 width=156)
+      (actual time=1234.567..1234.789 rows=20 loops=1)
+      Sort Key: o.created_at DESC
+      Sort Method: top-N heapsort  Memory: 45kB
+      Buffers: shared hit=2345 read=1567
+      -> Hash Join  (cost=123.45..11234.56 rows=5678 width=156)
+          (actual time=123.456..1123.456 rows=5678 loops=1)
+          Hash Cond: (o.user_id = u.id)
+          Buffers: shared hit=2345 read=1567
+          -> Hash Join  (cost=100.23..10987.65 rows=5678 width=124)
+              (actual time=100.234..1056.789 rows=5678 loops=1)
+              Hash Cond: (oi.order_id = o.id)
+              Buffers: shared hit=2000 read=1500
+              -> Seq Scan on order_items oi
+                  (actual time=10.123..456.789 rows=50000 loops=1)
+                  Buffers: shared hit=1500 read=1200
+              -> Hash
+                  (actual time=50.123..50.123 rows=5678 loops=1)
+                  Buckets: 8192  Batches: 1  Memory Usage: 512kB
+                  Buffers: shared hit=234 read=156
+                  -> Seq Scan on orders o
+                      Filter: ((status = 'pending'::text) AND (created_at >= '2026-01-01'::date))
+                      Rows Removed by Filter: 45000
+                      (actual time=5.123..234.567 rows=5678 loops=1)
+                      Buffers: shared hit=234 read=156
+          -> Hash
+              (actual time=10.123..10.123 rows=1000 loops=1)
+              Buckets: 2048  Batches: 1  Memory Usage: 128kB
+              Buffers: shared hit=45 read=12
+              -> Seq Scan on users u
+                  (actual time=0.234..5.678 rows=1000 loops=1)
+                  Buffers: shared hit=45 read=12
+```
+
+这个执行计划有问题。实际执行花了 1.2 秒，而且 read=1567 说明从磁盘读了很多数据。
+
+问题在哪？看 orders 表：Seq Scan，Filter 状态和创建时间。这意味着没有用索引，全表扫描后过滤。
+
+解决方法：添加索引
+
+```sql
+CREATE INDEX idx_orders_status_created ON orders(status, created_at);
+```
+
+再看执行计划，应该会变成：
+
+```
+-> Index Scan using idx_orders_status_created on orders o
+    Index Cond: ((status = 'pending'::text) AND (created_at >= '2026-01-01'::date))
+```
+
+实际时间可能降到 100 毫秒以内。
+
+## 常见性能问题模式
+
+### 隐式类型转换
+
+你写了 WHERE user_id = 123，但 user_id 是 VARCHAR 类型。数据库会隐式转换，导致索引失效。
+
+```sql
+-- 错误：user_id 是 VARCHAR，但用了数字
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 123;
+
+-- 输出可能显示：
+-- Filter: ((user_id)::integer = 123)
+
+-- 正确：使用字符串
+EXPLAIN ANALYZE SELECT * FROM orders WHERE user_id = 'usr_8x9k2m';
+```
+
+### 函数包裹索引列
+
+```sql
+-- 索引失效
+SELECT * FROM orders WHERE DATE(created_at) = '2026-04-12';
+
+-- 改成范围查询
+SELECT * FROM orders
+WHERE created_at >= '2026-04-12'
+  AND created_at < '2026-04-13';
+```
+
+或者创建表达式索引：
+
+```sql
+CREATE INDEX idx_orders_date ON orders(DATE(created_at));
+```
+
+### 统计信息过时
+
+优化器根据统计信息选择执行计划。如果数据变化很大，统计信息过时，优化器可能选错计划。
+
+```sql
+-- 更新统计信息
+ANALYZE orders;
+
+-- 或者收集更详细的统计信息
+ALTER TABLE orders SET (statistics_target = 1000);
+ANALYZE orders;
+```
+
+### 缓冲区命中率低
+
+看 BUFFERS 信息：
+
+```
+Buffers: shared hit=2345 read=1567
+```
+
+hit 是从内存读，read 是从磁盘读。hit/(hit+read) 是缓存命中率，应该 > 99%。如果 read 很多，说明数据没缓存，可能是 shared_buffers 太小，或者查询了太多数据。
+
+### 锁等待
+
+查询慢不是因为执行计划，而是被其他事务阻塞了。
+
+```sql
+-- 查看锁等待
+SELECT
+  pid,
+  now() - query_start as duration,
+  state,
+  query
+FROM pg_stat_activity
+WHERE cardinality(pg_blocking_pids(pid)) > 0;
+```
+
+## 监控慢查询
+
+定期检查慢查询，找出需要优化的 SQL：
+
+```sql
+-- 启用 pg_stat_statements 扩展
+CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+
+-- 查看平均执行时间最长的查询
+SELECT
+  query,
+  calls,
+  total_exec_time / 1000 as total_seconds,
+  mean_exec_time / 1000 as avg_seconds,
+  stddev_exec_time / 1000 as stddev_seconds
+FROM pg_stat_statements
+ORDER BY mean_exec_time DESC
+LIMIT 10;
+
+-- 查看调用次数最多的查询
+SELECT
+  query,
+  calls,
+  total_exec_time / 1000 as total_seconds
+FROM pg_stat_statements
+ORDER BY calls DESC
+LIMIT 10;
+```
+
+## 小结
+
+执行计划分析是性能优化的核心技能。关键点：
+
+- 用 EXPLAIN ANALYZE 看真实执行时间
+- 优先用 Index Scan，避免 Seq Scan
+- 大表连接用 Hash Join，小表用 Nested Loop
+- 检查 BUFFERS 看缓存命中率
+- 注意隐式类型转换和函数包裹
+- 定期更新统计信息
+
+但执行计划分析也有 trade-off：花时间分析，但收益不确定。有时候简单查询不用过度优化，复杂查询才需要深入分析。另外，优化器也在不断进化，PostgreSQL 每个版本都在改进，不要太迷信自己"知道"的优化规则。
+
+下一篇我们会讲备份与恢复，这是生产环境的最后一道防线。

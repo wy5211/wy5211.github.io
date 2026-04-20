@@ -1,0 +1,319 @@
+---
+title: "06 高级查询与聚合"
+date: "2026-03-23"
+summary: "掌握 MongoDB 聚合管道（Aggregation Pipeline），实现复杂的数据统计、分组和关联查询"
+tags: ["Mongoose", "聚合", "Aggregation", "$lookup"]
+category: "mongoose"
+draft: false
+series: "Mongoose 渐进式学习"
+seriesOrder: 6
+---
+
+上一篇我们讨论了如何设计数据关系，用 populate 可以把关联数据查出来。但实际开发中，经常需要做更复杂的数据统计和分析，比如计算每个标签的文章数、统计作者的浏览量排行、分析文章发布趋势等。
+
+这些需求用普通的 find() 很难实现，或者需要在应用层做大量计算，效率很低。MongoDB 提供的聚合管道（Aggregation Pipeline）就是为了解决这类问题，它让我们在数据库层面完成复杂的数据转换和统计。
+
+## 聚合管道的基本思想
+
+聚合管道的核心思想是把数据处理分解成多个阶段，每个阶段负责特定的操作，数据像流水线一样依次通过各个阶段，最终得到处理结果。
+
+比如要统计每个标签的文章数和平均浏览量，可以这样设计管道：先筛选出已发布的文章，再把标签数组展开（一篇文章有多个标签），然后按标签分组统计，最后按文章数排序输出。
+
+这种方式的好处是所有计算都在数据库完成，只返回最终结果，减少了网络传输和应用层的计算负担。而且 MongoDB 会优化管道的执行顺序，尽可能利用索引提升性能。
+
+## 基础聚合操作
+
+先看几个常用的聚合阶段。$match 用于筛选文档，类似 find() 的条件；$project 用于选择或计算字段；$group 用于分组统计。
+
+```typescript
+import Post from "../models/Post";
+import connectDB from "../config/database";
+
+await connectDB();
+
+// 基础聚合：筛选、计算字段、排序、限制
+const result1 = await Post.aggregate([
+  {
+    $match: {
+      status: "published",
+      views: { $gte: 100 },
+    },
+  },
+  {
+    $project: {
+      title: 1,
+      views: 1,
+      likes: 1,
+      tags: 1,
+      // 计算热度 = 浏览 + 点赞
+      popularity: { $add: ["$views", "$likes"] },
+    },
+  },
+  {
+    $sort: { popularity: -1 },
+  },
+  {
+    $limit: 5,
+  },
+]);
+
+result1.forEach((post: any) => {
+  console.log(
+    `${post.title}: ${post.views} 浏览 + ${post.likes} 点赞 = ${post.popularity} 热度`
+  );
+});
+```
+
+这个聚合先筛选出已发布且浏览量超过 100 的文章，然后计算每篇文章的热度值，最后按热度降序排列取前 5 名。$project 中的计算字段使用 $add 操作符，MongoDB 提供了大量类似的操作符用于字符串、日期、数组等计算。
+
+## 分组统计
+
+$group 是聚合管道中最强大的阶段之一，它能实现类似 SQL GROUP BY 的功能。分组时需要指定 _id 字段作为分组依据，然后用各种累加器（$sum、$avg、$max 等）计算统计值。
+
+```typescript
+// 按标签分组统计
+const result2 = await Post.aggregate([
+  { $match: { status: "published" } },
+  { $unwind: "$tags" }, // 展开标签数组
+  {
+    $group: {
+      _id: "$tags",
+      count: { $sum: 1 }, // 文章数
+      totalViews: { $sum: "$views" }, // 总浏览量
+      avgViews: { $avg: "$views" }, // 平均浏览量
+      maxViews: { $max: "$views" }, // 最高浏览量
+      posts: {
+        $push: {
+          title: "$title",
+          views: "$views",
+          createdAt: "$createdAt",
+        },
+      },
+    },
+  },
+  { $sort: { count: -1 } },
+  { $limit: 10 },
+  {
+    $project: {
+      tag: "$_id",
+      count: 1,
+      totalViews: 1,
+      avgViews: { $round: ["$avgViews", 2] },
+      latestPost: { $last: "$posts.title" },
+    },
+  },
+]);
+
+result2.forEach((stat: any) => {
+  console.log(`${stat.tag}:`);
+  console.log(`  文章数: ${stat.count}`);
+  console.log(`  总浏览: ${stat.totalViews}`);
+  console.log(`  平均浏览: ${stat.avgViews}`);
+  console.log(`  最新文章: ${stat.latestPost}`);
+});
+```
+
+这个聚合首先用 $unwind 把标签数组展开，这样每篇文章的每个标签都会变成一个独立的文档。然后按标签名分组，统计每个标签的文章数、浏览量等信息。注意 $push 操作符可以把分组内的文档聚集成数组，方便后续处理。
+
+## 关联查询
+
+$lookup 可以在聚合管道中实现类似 SQL JOIN 的关联查询。它比 populate 更强大，因为可以在关联时应用过滤条件和字段选择，而且是在数据库层完成关联，性能更好。
+
+```typescript
+// 基础关联：查询文章及其作者信息
+const result3 = await Post.aggregate([
+  { $match: { status: "published" } },
+  {
+    $lookup: {
+      from: "users", // 要关联的集合名（注意是表名，不是 Model 名）
+      localField: "author", // 当前集合的关联字段
+      foreignField: "_id", // 被关联集合的字段
+      as: "authorInfo", // 输出字段名
+    },
+  },
+  { $unwind: "$authorInfo" }, // 展开数组（因为 $lookup 总是返回数组）
+  {
+    $project: {
+      title: 1,
+      "authorInfo.name": 1,
+      "authorInfo.email": 1,
+      "authorInfo.role": 1,
+      views: 1,
+    },
+  },
+]);
+
+result3.forEach((post: any) => {
+  console.log(
+    `${post.title} by ${post.authorInfo.name} (${post.authorInfo.role})`
+  );
+});
+```
+
+$lookup 的基本形式需要指定四个参数：from 是要关联的集合名，localField 是当前文档的关联字段，foreignField 是被关联集合的字段，as 是结果存放的字段名。注意 $lookup 总是返回数组，即使只有一个匹配结果，所以通常需要配合 $unwind 使用。
+
+更复杂的关联可以通过子管道实现：
+
+```typescript
+// 使用子管道进行精细控制
+const result4 = await Post.aggregate([
+  { $match: { status: "published" } },
+  {
+    $lookup: {
+      from: "users",
+      let: { authorId: "$author" }, // 定义变量
+      pipeline: [
+        {
+          $match: {
+            $expr: {
+              $eq: ["$_id", "$$authorId"], // 使用变量（注意双美元符号）
+            },
+          },
+        },
+        {
+          $project: {
+            name: 1,
+            email: 1,
+            role: 1,
+            "profile.bio": 1,
+          },
+        },
+      ],
+      as: "authorInfo",
+    },
+  },
+  { $unwind: "$authorInfo" },
+  {
+    $match: {
+      "authorInfo.role": "author", // 只查询作者角色
+    },
+  },
+  {
+    $project: {
+      title: 1,
+      authorName: "$authorInfo.name",
+      authorBio: "$authorInfo.profile.bio",
+      views: 1,
+    },
+  },
+]);
+
+result4.forEach((post: any) => {
+  console.log(`${post.title} by ${post.authorName}`);
+  console.log(`  ${post.authorBio}`);
+});
+```
+
+这种形式通过 let 和 pipeline 定义更复杂的关联逻辑，可以在关联时应用过滤、字段选择等操作。注意引用变量时要用双美元符号（$$），这和普通的字段引用（$）有区别。
+
+## 多维聚合
+
+$facet 可以在一个聚合中并行执行多个管道，然后返回多个结果集。这非常适合需要同时获取多种统计数据的场景，比如仪表盘的总览数据。
+
+```typescript
+// 仪表盘数据：同时获取多个维度的统计
+const result5 = await Post.aggregate([
+  { $match: { status: "published" } },
+  {
+    $facet: {
+      // 维度 1：热门文章
+      popularPosts: [
+        { $sort: { views: -1 } },
+        { $limit: 5 },
+        { $project: { title: 1, views: 1, _id: 0 } },
+      ],
+      // 维度 2：最新文章
+      latestPosts: [
+        { $sort: { createdAt: -1 } },
+        { $limit: 5 },
+        { $project: { title: 1, createdAt: 1, _id: 0 } },
+      ],
+      // 维度 3：总体统计
+      stats: [
+        {
+          $group: {
+            _id: null,
+            totalPosts: { $sum: 1 },
+            totalViews: { $sum: "$views" },
+            avgViews: { $avg: "$views" },
+          },
+        },
+      ],
+      // 维度 4：标签分布
+      tags: [
+        { $unwind: "$tags" },
+        {
+          $group: {
+            _id: "$tags",
+            count: { $sum: 1 },
+          },
+        },
+        { $sort: { count: -1 } },
+        { $limit: 5 },
+      ],
+    },
+  },
+]);
+
+const dashboard = result5[0];
+
+console.log("热门文章:");
+dashboard.popularPosts.forEach((post: any) => {
+  console.log(`  ${post.title}: ${post.views} 浏览`);
+});
+
+console.log("\n总体统计:");
+const stats = dashboard.stats[0];
+console.log(`  总文章: ${stats.totalPosts}`);
+console.log(`  总浏览: ${stats.totalViews}`);
+console.log(`  平均浏览: ${stats.avgViews.toFixed(2)}`);
+
+console.log("\n标签分布:");
+dashboard.tags.forEach((tag: any) => {
+  console.log(`  ${tag._id}: ${tag.count} 篇`);
+});
+```
+
+$facet 的每个维度都是独立的管道，它们并行执行，最后返回一个包含多个结果集的对象。这比分别执行多个查询要高效得多，因为只需要一次数据库往返。
+
+## 时间序列分析
+
+聚合管道非常适合处理时间序列数据，比如按天、周、月统计文章发布趋势。
+
+```typescript
+// 按日期统计文章发布趋势
+const result6 = await Post.aggregate([
+  { $match: { status: "published" } },
+  {
+    $group: {
+      _id: {
+        // 按日期分组（只取年月日）
+        $dateToString: {
+          format: "%Y-%m-%d",
+          date: "$createdAt",
+        },
+      },
+      posts: { $sum: 1 },
+      views: { $sum: "$views" },
+    },
+  },
+  { $sort: { _id: 1 } }, // 按日期升序
+  { $limit: 30 }, // 最近 30 天
+]);
+
+result6.forEach((day: any) => {
+  console.log(`${day._id}: ${day.posts} 篇文章, ${day.views} 浏览`);
+});
+```
+
+$dateToString 操作符可以把日期格式化为字符串，常用于按时间维度分组。MongoDB 还提供了大量日期操作符，比如 $dateFromString（解析日期字符串）、$dateFromParts（构建日期）、$dateDiff（计算日期差）等。
+
+## 聚合 vs 查询
+
+聚合管道很强大，但不是所有场景都适合用它。普通查询（find()）返回的是 Mongoose Document，保留 Schema 定义的方法、虚拟字段、默认值等功能；而聚合返回的是普通 JavaScript 对象，性能更好但失去了这些特性。
+
+如果只是简单的筛选和排序，用 find() 更合适；如果需要复杂的统计、关联、计算，聚合是更好的选择。另一个考虑因素是代码可读性，聚合管道的代码往往比较长，不如 find() 直观。
+
+性能方面，聚合在数据库层完成所有计算，减少了数据传输，但可能会占用更多数据库资源。实际应用中，建议先用 explain() 分析执行计划，再决定是聚合还是应用层计算。
+
+聚合管道是 MongoDB 最强大的功能之一，掌握它能让你的数据处理能力上一个台阶。但也要记住，简单问题用简单方案，不要为了用聚合而用聚合。

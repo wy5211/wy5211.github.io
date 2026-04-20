@@ -1,0 +1,773 @@
+---
+title: "10. 生产实践与常见陷阱"
+date: "2026-04-12"
+summary: "项目要上线了。多租户、数据权限、SQL 审计——这些生产环境的需求怎么实现？日常开发中有哪些常见坑？"
+tags: ["MyBatis", "拦截器", "多租户", "生产实践"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 实战指南"
+seriesOrder: 10
+---
+
+BookHive 运行了大半年，老板说要做 SaaS 版本——把系统开放给其他书店用，每个书店租用一套系统，数据互相隔离。你一听就知道，这叫"多租户"。
+
+这意味着每一张业务表都要加上 `tenant_id` 字段，每个查询都要带上 `WHERE tenant_id = ?`。改 SQL 的话，几十个 Mapper XML 要一个一个改，而且以后新增的查询也容易忘。你需要一种机制，自动在 SQL 中注入租户条件。
+
+除了多租户，生产环境还有一堆需求等着你：SQL 审计（谁在什么时候执行了什么 SQL）、数据权限（普通员工只能看自己部门的数据）、枚举和 JSON 字段的映射、各种莫名其妙的运行时异常。这篇把这些问题一起理清。
+
+## 自定义拦截器：MyBatis 的万能钥匙
+
+要自动改 SQL，MyBatis 提供了一个强大的机制——拦截器（Interceptor）。你可以把它理解成 SQL 执行管线上的"中间件"，在 SQL 执行前、执行后介入，做你想做的事。
+
+### 拦截器能拦截什么
+
+MyBatis 的 SQL 执行会经过四个关键对象，拦截器可以拦截其中任何一个：
+
+| 拦截目标         | 职责                                   | 典型用途                           |
+| ---------------- | -------------------------------------- | ---------------------------------- |
+| Executor         | 执行器，负责 SQL 的整体执行            | 缓存控制、批量操作                 |
+| StatementHandler | 语句处理器，负责 JDBC Statement 的操作 | SQL 改写（多租户、分页）、参数设置 |
+| ParameterHandler | 参数处理器，负责设置 SQL 参数          | 参数加密、敏感信息脱敏             |
+| ResultSetHandler | 结果集处理器，负责映射查询结果         | 结果后处理、数据权限过滤           |
+
+多租户和数据权限的核心是**改写 SQL**，所以通常拦截 `StatementHandler`。SQL 审计需要记录 SQL 和执行时间，通常拦截 `StatementHandler` 或 `Executor`。
+
+### SQL 审计拦截器
+
+先看一个实用的例子：记录每条 SQL 的执行时间，超过阈值就打日志。
+
+```java
+package com.bookhive.interceptor;
+
+import org.apache.ibatis.executor.statement.StatementHandler;
+import org.apache.ibatis.mapping.BoundSql;
+import org.apache.ibatis.plugin.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.sql.Statement;
+import java.util.Properties;
+
+/**
+ * SQL 审计拦截器
+ * 记录每条 SQL 的执行时间，超过阈值则记录为慢查询
+ */
+@Intercepts({
+    // 拦截 StatementHandler 的 query 方法（所有 SELECT 查询）
+    @Signature(type = StatementHandler.class, method = "query",
+        args = {Statement.class, org.apache.ibatis.session.ResultHandler.class}),
+    // 拦截 StatementHandler 的 update 方法（INSERT、UPDATE、DELETE）
+    @Signature(type = StatementHandler.class, method = "update",
+        args = {Statement.class})
+})
+public class SqlAuditInterceptor implements Interceptor {
+
+    private static final Logger log = LoggerFactory.getLogger(SqlAuditInterceptor.class);
+    // 慢查询阈值：1 秒
+    private static final long SLOW_THRESHOLD_MS = 1000;
+
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        // 获取 StatementHandler，里面有 BoundSql（绑定了参数的 SQL）
+        StatementHandler handler = (StatementHandler) invocation.getTarget();
+        BoundSql boundSql = handler.getBoundSql();
+        String sql = boundSql.getSql();
+
+        long startTime = System.currentTimeMillis();
+        try {
+            // 放行，让 MyBatis 继续执行原始方法
+            return invocation.proceed();
+        } finally {
+            long elapsed = System.currentTimeMillis() - startTime;
+            if (elapsed > SLOW_THRESHOLD_MS) {
+                // 慢查询：用 WARN 级别，方便运维监控
+                log.warn("慢 SQL [{}ms]: {}", elapsed, sql);
+            } else {
+                // 普通查询：用 DEBUG 级别，生产环境不会输出
+                log.debug("SQL [{}ms]: {}", elapsed, sql);
+            }
+        }
+    }
+
+    @Override
+    public Object plugin(Object target) {
+        // 用 JDK 动态代理包装目标对象，使拦截器生效
+        return Plugin.wrap(target, this);
+    }
+
+    @Override
+    public void setProperties(Properties properties) {
+        // 可以通过配置传入参数，比如阈值
+    }
+}
+```
+
+拦截器的实现三步走：实现 `Interceptor` 接口，用 `@Intercepts` 和 `@Signature` 注解指定拦截点，然后在 `intercept` 方法中写你的逻辑。`invocation.proceed()` 是放行——调用原始方法继续执行。你在 `proceed()` 前后加逻辑，就实现了"拦截"。
+
+注册拦截器只需要在 Spring Boot 配置类中声明为 Bean：
+
+```java
+@Configuration
+public class MyBatisConfig {
+
+    @Bean
+    public SqlAuditInterceptor sqlAuditInterceptor() {
+        return new SqlAuditInterceptor();
+    }
+}
+```
+
+这样所有经过 MyBatis 的 SQL 都会被这个拦截器记录。生产环境中，慢查询日志是发现性能问题的第一手数据来源。不过要注意，Java 层面的拦截会增加一点开销，对于 QPS 极高的服务，建议用 MySQL 自带的慢查询日志（`long_query_time` 配置），不走 Java 拦截。
+
+## 多租户实现：BookHive SaaS 化
+
+多租户有几种架构方案。最简单的是"每个租户一个数据库"，隔离性最好，但运维成本高。最常见的是"共享数据库，共享表"，通过 `tenant_id` 字段区分数据。BookHive SaaS 版采用后者。
+
+### 表结构改造
+
+每张业务表加 `tenant_id` 字段：
+
+```sql
+ALTER TABLE books ADD COLUMN tenant_id BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE orders ADD COLUMN tenant_id BIGINT NOT NULL DEFAULT 0;
+ALTER TABLE users ADD COLUMN tenant_id BIGINT NOT NULL DEFAULT 0;
+
+-- 联合索引：原来的索引加上 tenant_id
+CREATE INDEX idx_books_tenant_status ON books(tenant_id, status);
+```
+
+注意：系统配置表（比如字典表、权限表）不需要 `tenant_id`，它们是全局共享的。
+
+### 方案 1：MyBatis-Plus 的多租户插件（推荐）
+
+如果你用了 MyBatis-Plus，它已经内置了多租户支持，配置好之后业务代码完全不用改：
+
+```java
+@Configuration
+public class MyBatisPlusConfig {
+
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+
+        // 多租户拦截器
+        TenantLineInnerInterceptor tenantInterceptor = new TenantLineInnerInterceptor();
+        tenantInterceptor.setTenantLineHandler(new TenantLineHandler() {
+
+            // 获取当前租户 ID（通常从 ThreadLocal 中获取）
+            @Override
+            public Expression getTenantId() {
+                Long tenantId = TenantContext.getTenantId();
+                if (tenantId == null) {
+                    throw new RuntimeException("租户 ID 不能为空");
+                }
+                return new LongValue(tenantId);
+            }
+
+            // 判断哪些表需要忽略租户过滤
+            @Override
+            public boolean ignoreTable(String tableName) {
+                // 系统配置表、字典表等不需要租户隔离
+                return "sys_config".equals(tableName)
+                    || "dict_data".equals(tableName)
+                    || "sys_permission".equals(tableName);
+            }
+        });
+
+        interceptor.addInnerInterceptor(tenantInterceptor);
+        // 分页拦截器放在多租户后面
+        interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.MYSQL));
+
+        return interceptor;
+    }
+}
+```
+
+`TenantContext` 是一个简单的 ThreadLocal 工具类，存取当前请求的租户 ID：
+
+```java
+public class TenantContext {
+    private static final ThreadLocal<Long> TENANT_ID = new ThreadLocal<>();
+
+    public static void setTenantId(Long tenantId) {
+        TENANT_ID.set(tenantId);
+    }
+
+    public static Long getTenantId() {
+        return TENANT_ID.get();
+    }
+
+    public static void clear() {
+        TENANT_ID.remove();
+    }
+}
+```
+
+在请求入口设置租户 ID，请求结束后清除。用 Spring 的 `OncePerRequestFilter` 最合适：
+
+```java
+@Component
+public class TenantFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+            HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        try {
+            // 从请求头或 token 中解析租户 ID
+            Long tenantId = extractTenantId(request);
+            TenantContext.setTenantId(tenantId);
+            chain.doFilter(request, response);
+        } finally {
+            // 请求结束后必须清除，否则线程复用时会串数据
+            TenantContext.clear();
+        }
+    }
+}
+```
+
+配置好之后，所有经过 MyBatis-Plus 的查询都会自动加上 `WHERE tenant_id = ?`。比如你写的是：
+
+```java
+bookMapper.selectList(new LambdaQueryWrapper<Book>().eq(Book::getStatus, 1));
+```
+
+实际执行的 SQL 是：
+
+```sql
+SELECT * FROM books WHERE status = 1 AND tenant_id = 100
+```
+
+插入和更新操作也会自动注入 `tenant_id`，不需要在实体类上手动设置。MyBatis-Plus 的多租户插件会处理 SELECT、INSERT、UPDATE、DELETE 四种语句。
+
+### 方案 2：自定义拦截器
+
+如果你不用 MyBatis-Plus，也可以自己写一个拦截器实现类似的效果。核心思路是拿到原始 SQL，在 WHERE 条件后面拼接 `AND tenant_id = ?`。
+
+```java
+@Intercepts({
+    @Signature(
+        type = StatementHandler.class,
+        method = "prepare",
+        args = {Connection.class, Integer.class}
+    )
+})
+public class TenantInterceptor implements Interceptor {
+
+    // 不需要租户隔离的表
+    private static final Set<String> IGNORE_TABLES = Set.of(
+        "sys_config", "dict_data", "sys_permission"
+    );
+
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        StatementHandler handler = (StatementHandler) invocation.getTarget();
+        BoundSql boundSql = handler.getBoundSql();
+
+        // 通过反射获取 MappedStatement（包含 SQL 的元信息）
+        MetaObject metaObject = SystemMetaObject.forObject(handler);
+        MappedStatement ms = (MappedStatement) metaObject
+            .getValue("delegate.mappedStatement");
+
+        String sql = boundSql.getSql();
+        String tableName = extractTableName(sql);
+
+        if (tableName != null && !IGNORE_TABLES.contains(tableName)) {
+            Long tenantId = TenantContext.getTenantId();
+            if (tenantId != null) {
+                // 改写 SQL，添加 tenant_id 条件
+                String newSql = addTenantCondition(sql, tenantId);
+                // 通过反射修改 BoundSql 中的 SQL
+                metaObject.setValue("delegate.boundSql.sql", newSql);
+            }
+        }
+
+        return invocation.proceed();
+    }
+
+    // ... plugin 和 setProperties 方法同上
+}
+```
+
+自定义拦截器的灵活性更高，但实现复杂度也更高——你要处理各种 SQL 语句类型（SELECT、INSERT、UPDATE、DELETE），还要处理 JOIN、子查询等复杂情况。MyBatis-Plus 的 `TenantLineInnerInterceptor` 已经帮你处理了这些边界情况，所以能用它就用它。
+
+### 多租户的坑
+
+**DDL 操作不要加 tenant_id**。建表、改表语句（`CREATE TABLE`、`ALTER TABLE`）如果被拦截器改写了，会直接报错。MyBatis-Plus 的 `TenantLineInnerInterceptor` 默认不会拦截 DDL 语句，但如果你自己写拦截器，要特别处理。
+
+**批量操作要注意租户 ID 的一致性**。如果你在一条线程中切换租户 ID（比如后台管理员操作），确保在操作完成后清除 ThreadLocal。用 `TenantContext.ignoreTenant()` 临时忽略租户过滤，比手动 set/clear 更安全。
+
+**数据迁移时注意 tenant_id 的填充**。如果从单租户升级到多租户，历史数据的 `tenant_id` 需要正确填充，否则那些数据在多租户模式下就"消失"了。
+
+## 数据权限控制
+
+和多租户类似的思路，数据权限控制也是自动在 SQL 中注入条件。区别在于，数据权限的条件可能更复杂——不是简单的 `tenant_id = ?`，而是基于用户角色和部门层级。
+
+比如 BookHive 的场景：普通店员只能看到自己创建的订单，店长能看到本店所有订单，区域经理能看到区域内所有店的订单。
+
+```java
+/**
+ * 数据权限拦截器
+ * 根据当前用户的角色，自动注入数据过滤条件
+ */
+@Intercepts({
+    @Signature(
+        type = StatementHandler.class,
+        method = "prepare",
+        args = {Connection.class, Integer.class}
+    )
+})
+public class DataPermissionInterceptor implements Interceptor {
+
+    // 需要数据权限控制的表 → 对应的权限字段
+    private static final Map<String, String> PERMISSION_TABLES = Map.of(
+        "orders", "creator_id",
+        "books", "creator_id",
+        "inventory", "department_id"
+    );
+
+    @Override
+    public Object intercept(Invocation invocation) throws Throwable {
+        // 获取当前用户信息（从 Spring Security 上下文中获取）
+        UserInfo currentUser = SecurityContextHolder.getCurrentUser();
+
+        // 管理员跳过数据权限
+        if (currentUser.isAdmin()) {
+            return invocation.proceed();
+        }
+
+        StatementHandler handler = (StatementHandler) invocation.getTarget();
+        BoundSql boundSql = handler.getBoundSql();
+        String sql = boundSql.getSql();
+        String tableName = extractTableName(sql);
+
+        if (tableName != null && PERMISSION_TABLES.containsKey(tableName)) {
+            String permissionField = PERMISSION_TABLES.get(tableName);
+
+            // 根据角色生成过滤条件
+            String condition;
+            if (currentUser.isStoreManager()) {
+                // 店长：本店所有数据
+                condition = permissionField + " IN (SELECT id FROM users WHERE store_id = "
+                    + currentUser.getStoreId() + ")";
+            } else {
+                // 普通员工：只有自己的数据
+                condition = permissionField + " = " + currentUser.getId();
+            }
+
+            String newSql = injectCondition(sql, condition);
+            MetaObject metaObject = SystemMetaObject.forObject(handler);
+            metaObject.setValue("delegate.boundSql.sql", newSql);
+        }
+
+        return invocation.proceed();
+    }
+}
+```
+
+不过说实话，实际项目中数据权限很少用 MyBatis 拦截器实现。原因在于数据权限的规则往往很复杂——有些表按部门过滤，有些按创建人过滤，还有些是混合逻辑。拦截器改写 SQL 的方式在这种复杂场景下容易出错，排查起来也困难。
+
+更稳妥的方案是：在 Service 层根据用户角色拼接不同的查询条件。MyBatis-Plus 的 `LambdaQueryWrapper` 配合自定义的 `DataScope` 注解可以实现这一点。虽然不如拦截器"自动"，但可控性更好，出问题了也容易定位。
+
+## 枚举类型的处理
+
+MyBatis 默认用枚举的 `name()` 值和数据库交互。比如你的 Java 枚举是：
+
+```java
+public enum OrderStatus {
+    PENDING,    // 待处理
+    PAID,       // 已支付
+    SHIPPED,    // 已发货
+    COMPLETED,  // 已完成
+    CANCELLED   // 已取消
+}
+```
+
+数据库中对应的字段存的是字符串：`'PENDING'`、`'PAID'` 等。MyBatis 自动完成 `PENDING`（Java 枚举）和 `'PENDING'`（数据库字符串）的转换。
+
+这种默认行为有个问题：如果数据库里存的是数字（0、1、2、3），或者你将来想把 `PENDING` 改名为 `WAITING`，就会出问题。
+
+### EnumOrdinalTypeHandler：按序号映射（不推荐）
+
+MyBatis 提供了 `EnumOrdinalTypeHandler`，按枚举的声明顺序（从 0 开始）映射到数据库整数。`PENDING` 对应 0，`PAID` 对应 1，以此类推。
+
+为什么不推荐？因为枚举的声明顺序改变就会导致数据错乱。如果你在 `PENDING` 和 `PAID` 之间插入了一个 `CONFIRMED`，原来 `PAID = 1` 的数据就会变成 `CONFIRMED`。这种 bug 非常隐蔽，上线了都不一定能发现。
+
+### 自定义 TypeHandler：按自定义字段映射（推荐）
+
+在第 2 篇讲 TypeHandler 的时候提过，你可以为每个枚举定义一个 TypeHandler，用枚举的某个字段（比如 `code`）来做映射。
+
+```java
+public enum OrderStatus {
+    PENDING(0, "待处理"),
+    PAID(1, "已支付"),
+    SHIPPED(2, "已发货"),
+    COMPLETED(3, "已完成"),
+    CANCELLED(4, "已取消");
+
+    private final int code;
+    private final String desc;
+
+    OrderStatus(int code, String desc) {
+        this.code = code;
+        this.desc = desc;
+    }
+
+    public int getCode() { return code; }
+    public String getDesc() { return desc; }
+}
+```
+
+对应的 TypeHandler：
+
+```java
+public class OrderStatusHandler extends BaseTypeHandler<OrderStatus> {
+
+    @Override
+    public void setNonNullParameter(PreparedStatement ps, int i,
+                                     OrderStatus parameter, JdbcType type) throws SQLException {
+        // Java 枚举 → 数据库整数：存 code 值
+        ps.setInt(i, parameter.getCode());
+    }
+
+    @Override
+    public OrderStatus getNullableResult(ResultSet rs, String columnName)
+            throws SQLException {
+        // 数据库整数 → Java 枚举：根据 code 查找
+        int code = rs.getInt(columnName);
+        return fromCode(code);
+    }
+
+    @Override
+    public OrderStatus getNullableResult(ResultSet rs, int columnIndex)
+            throws SQLException {
+        int code = rs.getInt(columnIndex);
+        return fromCode(code);
+    }
+
+    @Override
+    public OrderStatus getNullableResult(CallableStatement cs, int columnIndex)
+            throws SQLException {
+        int code = cs.getInt(columnIndex);
+        return fromCode(code);
+    }
+
+    // 根据 code 值查找对应的枚举
+    private OrderStatus fromCode(int code) {
+        for (OrderStatus status : OrderStatus.values()) {
+            if (status.getCode() == code) {
+                return status;
+            }
+        }
+        return null;
+    }
+}
+```
+
+在全局配置中注册，或者在 Mapper XML 中指定：
+
+```xml
+<result column="status" property="status"
+        typeHandler="com.bookhive.handler.OrderStatusHandler"/>
+```
+
+### MyBatis-Plus 的 @EnumValue 注解
+
+如果你用 MyBatis-Plus，有更简单的方式——`@EnumValue` 注解：
+
+```java
+public enum OrderStatus {
+    PENDING(0, "待处理"),
+    PAID(1, "已支付"),
+    SHIPPED(2, "已发货"),
+    COMPLETED(3, "已完成"),
+    CANCELLED(4, "已取消");
+
+    @EnumValue  // 标记这个字段作为数据库映射值
+    private final int code;
+    private final String desc;
+
+    // 构造方法和 getter 省略
+}
+```
+
+`@EnumValue` 标注在 `code` 字段上，MyBatis-Plus 会自动用 `code` 的值和数据库交互。不需要额外写 TypeHandler。这是最省事的方式，推荐使用。
+
+## JSON 字段的映射
+
+MySQL 5.7+ 支持 JSON 类型。BookHive 的书籍扩展属性、订单详情等数据结构不固定，适合用 JSON 存储。
+
+比如 BookHive 的书籍有一个 `extra_info` 字段，存储出版社信息、获奖情况等额外属性：
+
+```sql
+ALTER TABLE books ADD COLUMN extra_info JSON
+    COMMENT '书籍扩展信息，JSON 格式';
+```
+
+Java 端对应的类型是一个 `Map` 或自定义类。MyBatis 默认不认识 JSON 类型，需要自定义 TypeHandler。
+
+### JSON TypeHandler 实现
+
+用 Jackson 做 JSON 序列化/反序列化：
+
+```java
+/**
+ * 通用 JSON TypeHandler
+ * 将数据库中的 JSON 字符串和 Java 对象互相转换
+ *
+ * @param <T> 目标 Java 类型
+ */
+public class JsonTypeHandler<T> extends BaseTypeHandler<T> {
+
+    private static final ObjectMapper objectMapper = new ObjectMapper();
+
+    // 目标类型的 Class 对象，用于反序列化
+    private final Class<T> type;
+
+    public JsonTypeHandler(Class<T> type) {
+        this.type = type;
+    }
+
+    @Override
+    public void setNonNullParameter(PreparedStatement ps, int i,
+                                     T parameter, JdbcType jdbcType) throws SQLException {
+        // Java 对象 → JSON 字符串 → 写入数据库
+        ps.setString(i, objectMapper.writeValueAsString(parameter));
+    }
+
+    @Override
+    public T getNullableResult(ResultSet rs, String columnName) throws SQLException {
+        // 从数据库读取 JSON 字符串 → 反序列化为 Java 对象
+        String json = rs.getString(columnName);
+        return parseJson(json);
+    }
+
+    @Override
+    public T getNullableResult(ResultSet rs, int columnIndex) throws SQLException {
+        String json = rs.getString(columnIndex);
+        return parseJson(json);
+    }
+
+    @Override
+    public T getNullableResult(CallableStatement cs, int columnIndex) throws SQLException {
+        String json = cs.getString(columnIndex);
+        return parseJson(json);
+    }
+
+    private T parseJson(String json) {
+        if (json == null || json.isEmpty()) {
+            return null;
+        }
+        return objectMapper.readValue(json, type);
+    }
+}
+```
+
+在 resultMap 中使用：
+
+```xml
+<resultMap id="bookResultMap" type="Book">
+    <id property="id" column="id"/>
+    <result property="title" column="title"/>
+    <!-- extra_info 字段：JSON 字符串 → Map<String, Object> -->
+    <result property="extraInfo" column="extra_info"
+            typeHandler="com.bookhive.handler.JsonTypeHandler"
+            javaType="java.util.Map"/>
+</resultMap>
+```
+
+Java 端的 Book 实体类中，`extraInfo` 就是一个 `Map<String, Object>`。如果 JSON 结构比较固定，也可以映射为自定义的 POJO 类——只要把 `javaType` 改成对应的类就行。
+
+MyBatis-Plus 也提供了内置的 Jackson TypeHandler：`com.baomidou.mybatisplus.extension.handlers.JacksonTypeHandler`，配置方式类似。如果你项目中已经用了 MyBatis-Plus，直接用它就行，不需要自己写。
+
+## 常见错误排查
+
+写 MyBatis 最头疼的不是写 SQL，而是写完之后各种异常。这里把最常见的几种错误和排查思路列出来，都是实际开发中踩过的坑。
+
+### BindingException：Mapper 接口和 XML 对不上
+
+错误信息：
+
+```
+org.apache.ibatis.binding.BindingException:
+Invalid bound statement (not found): com.bookhive.mapper.BookMapper.findById
+```
+
+这个错误出现频率最高。原因是 Mapper 接口中的方法名和 XML 中的 `id` 对不上，或者 XML 没有被扫描到。
+
+排查步骤：
+
+**1. 检查 namespace 是否正确。** XML 的 `namespace` 必须和 Mapper 接口的全限定类名完全一致：
+
+```xml
+<!-- namespace 必须和接口全限定类名一致 -->
+<mapper namespace="com.bookhive.mapper.BookMapper">
+```
+
+**2. 检查方法名和 id 是否一致。** 接口方法是 `findById`，XML 的 `id` 也必须是 `findById`：
+
+```java
+// Mapper 接口
+Book findById(Long id);
+```
+
+```xml
+<!-- id 必须和接口方法名一致 -->
+<select id="findById" resultType="Book">
+    SELECT * FROM books WHERE id = #{id}
+</select>
+```
+
+**3. 检查 XML 文件是否在正确的位置。** Spring Boot 默认扫描 `classpath:mapper/*.xml`。如果你的 XML 放在 `src/main/resources/mapper/` 目录下，确认 `application.yml` 中的 `mapper-locations` 配置正确：
+
+```yaml
+mybatis:
+  mapper-locations: classpath:mapper/**/*.xml
+```
+
+注意 `**`，如果 XML 在子目录中，需要用双星号递归匹配。
+
+**4. 检查 Maven 编译是否包含了 XML。** 如果 XML 放在 `src/main/java` 目录下（和 Mapper 接口放一起），需要在 `pom.xml` 中配置资源过滤，否则编译时 XML 不会被复制到 classpath：
+
+```xml
+<build>
+    <resources>
+        <resource>
+            <directory>src/main/java</directory>
+            <includes>
+                <include>**/*.xml</include>
+            </includes>
+        </resource>
+        <resource>
+            <directory>src/main/resources</directory>
+        </resource>
+    </resources>
+</build>
+```
+
+这个坑特别隐蔽——本地开发没问题，因为 IDE 会自动编译 XML，但打包上线时就找不到了。
+
+### LazyInitializationException：延迟加载的对象在 Session 关闭后被访问
+
+错误信息：
+
+```
+org.apache.ibatis.exceptions.PersistenceException:
+Error lazy loading. Your serializer may be accessing a lazy-loaded
+collection outside of an SqlSession.
+```
+
+当你在 Mapper XML 中配置了关联查询的延迟加载（`fetchType="lazy"`），返回的对象中关联属性是一个代理对象。如果你在 SqlSession 关闭后（通常是一个 `@Transactional` 方法执行完之后）访问这个属性，就会抛异常。
+
+```xml
+<!-- 延迟加载配置 -->
+<association property="author" column="author_id"
+             select="com.bookhive.mapper.AuthorMapper.findById"
+             fetchType="lazy"/>
+```
+
+```java
+@Service
+public class BookService {
+
+    @Transactional  // 事务结束 → SqlSession 关闭
+    public Book getBook(Long id) {
+        Book book = bookMapper.findById(id);
+        return book;
+        // book.getAuthor() 此时还没查数据库，它是代理对象
+    }
+}
+
+@RestController
+public class BookController {
+
+    @GetMapping("/books/{id}")
+    public Book getBook(@PathVariable Long id) {
+        Book book = bookService.getBook(id);
+        // 到这里事务已经结束，SqlSession 已经关闭
+        book.getAuthor().getName();  // 报错！延迟加载触发查询，但 Session 已经关了
+        return book;
+    }
+}
+```
+
+解决方案：
+
+**方案 1：在事务内访问关联数据。** 把 `book.getAuthor()` 的调用放到 `@Transactional` 方法内部。
+
+**方案 2：不用延迟加载，直接在 SQL 中 JOIN 查出来。** 对于确定需要用到的关联数据，用 `fetchType="eager"` 或者嵌套结果映射。
+
+**方案 3：关闭全局延迟加载。** 在 `application.yml` 中：
+
+```yaml
+mybatis:
+  configuration:
+    lazy-loading-enabled: false
+```
+
+大部分场景下，延迟加载带来的复杂度大于它节省的资源。如果不确定是否需要延迟加载，建议先关掉，等真正遇到性能瓶颈再开启。
+
+### There is no getter for property named 'xxx'
+
+错误信息：
+
+```
+org.apache.ibatis.reflection.ReflectionException:
+There is no getter for property named 'title' in 'class java.lang.String'
+```
+
+这个错误通常发生在你传了一个简单类型（String、Integer）作为参数，但在 XML 中用了对象属性的访问方式。
+
+```java
+// Mapper 接口：参数是 String 类型
+List<Book> searchByTitle(String title);
+```
+
+```xml
+<!-- 如果在 <if> 标签中直接用 title，MyBatis 会把参数当成对象去找 getTitle() -->
+<if test="title != null and title != ''">
+    AND title LIKE CONCAT('%', #{title}, '%')
+</if>
+```
+
+这里 `#{title}` 对简单类型参数是没问题的——MyBatis 对于单个简单类型参数，`#{}` 里的名字可以任意取。但在 `<if test="...">` 的 OGNL 表达式中，MyBatis 会把参数当成对象来处理。解决方法是加 `@Param` 注解：
+
+```java
+List<Book> searchByTitle(@Param("title") String title);
+```
+
+加了 `@Param` 之后，MyBatis 会把参数包装成一个 Map，key 就是 `@Param` 的值，`<if test="title != null">` 就能正常工作了。
+
+另一个常见原因是参数类型传错了——比如接口期望一个 `BookQuery` 对象，但调用时传了 `String`：
+
+```java
+// 接口期望 BookQuery 对象
+List<Book> search(BookQuery query);
+
+// 但调用时传了 String
+bookMapper.search("Java");  // 报错：String 没有 getKeyword() 等方法
+```
+
+### Invalid bound statement：Mapper XML 没有被扫描到
+
+和 BindingException 类似，但更底层。通常是因为 Spring Boot 的 `@MapperScan` 配置路径不对。
+
+```java
+// 启动类上的扫描路径要覆盖到 Mapper 接口所在的包
+@MapperScan("com.bookhive.mapper")  // 确保路径正确
+@SpringBootApplication
+public class BookHiveApplication { }
+```
+
+如果 Mapper 接口在 `com.bookhive.mapper` 包下，但 `@MapperScan` 写成了 `com.bookhive.dao`，所有的 Mapper 都不会被注册。
+
+另一个常见原因：多模块项目中，Mapper 接口在一个模块，XML 在另一个模块，编译后的 classpath 中找不到 XML。这种情况下需要确认打包配置是否正确，用 `jar tf` 命令检查打包后的 jar 里是否包含 XML 文件。
+
+## 回顾与思考
+
+这个系列从 JDBC 的痛点出发，搭建了 BookHive 项目，逐步覆盖了 MyBatis 的核心能力。第 1-2 篇理解了 MyBatis 的本质——SQL 和 Java 代码的分离映射。第 3-4 篇掌握了动态 SQL 和关联映射，这两块是 MyBatis 最核心的能力，也是日常开发中最常用的。第 5 篇讨论了注解和 XML 的选择策略，第 6 篇深入了 Spring Boot 的整合和多数据源配置。第 7-8 篇引入 MyBatis-Plus 提升开发效率，同时处理了分页和性能优化。第 9 篇讲了缓存和批量操作，这篇则覆盖了生产环境的高级需求。
+
+如果用一句话概括 MyBatis 的定位：**它让你写 SQL，但不用处理 JDBC 的繁琐细节**。和 JPA 相比，MyBatis 的代价是更多的 SQL 代码和映射维护，换来的是对 SQL 的完全控制。在业务查询复杂、性能要求高、需要 DBA 参与的场景下，这个代价是值得的。反过来，如果你的项目以简单 CRUD 为主，JPA 的自动映射能省下大量代码，MyBatis 反而是累赘。
+
+MyBatis 的学习曲线不算陡，但"会用"和"用好"之间有差距。拦截器机制、TypeHandler 体系、动态 SQL 的灵活组合——这些进阶能力在处理多租户、数据权限、特殊字段映射等生产需求时，能省去大量重复代码。理解了核心概念之后，遇到新问题就不需要到处搜答案，而是能判断该用哪个机制来解。框架会更新，版本会迭代，但这些核心概念不会变。

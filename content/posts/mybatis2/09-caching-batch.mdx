@@ -1,0 +1,498 @@
+---
+title: "09. 缓存策略与批量操作"
+date: "2026-04-12"
+summary: "热门书籍的信息被频繁查询，每次都查数据库太慢。MyBatis 的一级缓存和二级缓存怎么用？批量导入上万条书籍怎么优化？"
+tags: ["MyBatis", "缓存", "批量操作", "性能优化"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 实战指南"
+seriesOrder: 9
+---
+
+BookHive 的《深入理解计算机系统》这本书详情页，每秒被请求几十次。每次请求都查一次数据库，数据库的 QPS 压力很大，响应时间也不稳定。运营那边也有问题——他们要导入 5000 本新书上架，点一下按钮，等了半分钟才完成。
+
+这两个问题看起来不相关，但其实都指向同一个方向：减少和数据库交互的代价。缓存是减少查询次数的手段，批量操作是提高单次写入效率的手段。上一篇讲了分页查询和 SQL 性能优化，这篇从另一个角度来优化性能。
+
+## 一级缓存：SqlSession 级别
+
+MyBatis 有一套自带的缓存机制，默认就是开启的。最基础的是一级缓存，它的作用范围是同一个 SqlSession。
+
+### 工作机制
+
+在同一个 SqlSession 中，如果你用相同的 SQL 和相同的参数执行了两次查询，第二次不会真的去查数据库，而是直接从缓存里拿结果。
+
+```java
+SqlSession session = sqlSessionFactory.openSession();
+BookMapper mapper = session.getMapper(BookMapper.class);
+
+// 第一次查询，走数据库
+Book book1 = mapper.selectById(1L);
+System.out.println("第一次查询，命中数据库");
+
+// 第二次查询，SQL 和参数相同，直接从缓存返回
+Book book2 = mapper.selectById(1L);
+System.out.println("第二次查询，命中一级缓存");
+
+// book1 == book2，是同一个对象引用
+System.out.println(book1 == book2); // true
+
+session.close();
+```
+
+一级缓存的 key 由 SQL 语句、参数、分页信息等组成。只要这些完全一致，就会命中缓存。
+
+### 什么时候缓存会失效
+
+一级缓存的生命周期和 SqlSession 绑定。以下情况会清空缓存：
+
+```java
+SqlSession session = sqlSessionFactory.openSession();
+BookMapper mapper = session.getMapper(BookMapper.class);
+
+// 查询，结果被缓存
+Book book1 = mapper.selectById(1L);
+
+// 执行了更新操作，一级缓存被整体清空
+mapper.updateById(new Book().setId(1L).setTitle("新标题"));
+
+// 这次查询不会命中缓存，因为缓存已经被更新操作清空了
+Book book2 = mapper.selectById(1L);
+
+// 手动清空缓存
+session.clearCache();
+
+// SqlSession 关闭，缓存自然销毁
+session.close();
+```
+
+任何 insert、update、delete 操作都会清空当前 SqlSession 的整个一级缓存。这个设计很直接——你改了数据，之前的缓存就不靠谱了，全部作废重来。
+
+### Spring 环境下的行为
+
+在 Spring 中，你通常不会直接操作 SqlSession，而是通过注入 Mapper 来使用。这时候一级缓存的行为取决于事务。
+
+```java
+@Service
+public class BookService {
+
+    @Autowired
+    private BookMapper bookMapper;
+
+    // 没有事务：每次调用 mapper 方法，Spring 会创建新的 SqlSession
+    // 一级缓存不会生效，因为每次查询都是不同的 SqlSession
+    public Book getBookById(Long id) {
+        return bookMapper.selectById(id);
+    }
+
+    // 有事务：整个方法执行期间共用同一个 SqlSession
+    // 一级缓存生效
+    @Transactional
+    public void checkAndProcess(Long id) {
+        Book book1 = bookMapper.selectById(id);  // 查数据库
+        Book book2 = bookMapper.selectById(id);  // 命中一级缓存
+        // book1 == book2
+    }
+}
+```
+
+没有 `@Transactional` 的时候，Spring 的 `SqlSessionTemplate` 会在每次 Mapper 方法调用结束后关闭 SqlSession，所以一级缓存基本没有用。加了事务之后，同一个事务内的多次相同查询可以复用缓存。
+
+理解这一点很重要：如果你期望一级缓存能帮你减少数据库查询，确保你的方法上有 `@Transactional`。否则一级缓存在 Spring 环境下几乎形同虚设。
+
+## 二级缓存：Mapper 级别
+
+一级缓存的作用范围太小了（同一个 SqlSession），二级缓存的范围更大——它是 Mapper 级别的（也叫 Namespace 级别），可以跨 SqlSession 共享。
+
+### 配置方式
+
+二级缓存需要手动开启。分两步：全局配置和 Mapper 级配置。
+
+```yaml
+# application.yml
+mybatis:
+  configuration:
+    cache-enabled: true # 全局开启二级缓存（默认就是 true）
+```
+
+然后在 Mapper XML 中加 `<cache/>` 标签：
+
+```xml
+<!-- BookMapper.xml -->
+<mapper namespace="com.bookhive.mapper.BookMapper">
+
+    <!-- 加上这行，开启这个 Mapper 的二级缓存 -->
+    <cache/>
+
+    <select id="selectById" resultType="com.bookhive.entity.Book">
+        SELECT * FROM books WHERE id = #{id}
+    </select>
+
+</mapper>
+```
+
+如果你用的是 MyBatis-Plus 的注解方式，可以用 `@CacheNamespace`：
+
+```java
+@CacheNamespace
+public interface BookMapper extends BaseMapper<Book> {
+}
+```
+
+### 数据流向
+
+二级缓存的工作流程是这样的：
+
+```java
+// SqlSession A
+SqlSession sessionA = sqlSessionFactory.openSession();
+BookMapper mapperA = sessionA.getMapper(BookMapper.class);
+
+// 第一次查询，查数据库，结果存入 SqlSession A 的一级缓存
+Book bookA1 = mapperA.selectById(1L);
+
+// 关闭 SqlSession A，一级缓存的数据写入二级缓存
+sessionA.close();
+
+// SqlSession B
+SqlSession sessionB = sqlSessionFactory.openSession();
+BookMapper mapperB = sessionB.getMapper(BookMapper.class);
+
+// 这次查询命中二级缓存，不查数据库
+Book bookB1 = mapperB.selectById(1L);
+
+sessionB.close();
+```
+
+数据流向是：数据库 -> 一级缓存 -> 二级缓存。查询时先找一级缓存，没有就找二级缓存，都没有才查数据库。SqlSession 关闭时，一级缓存的数据会被写入二级缓存。
+
+### 序列化要求
+
+因为二级缓存的数据要跨 SqlSession 共享（可能跨线程），所以实体类必须实现 `Serializable` 接口。
+
+```java
+public class Book implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
+    private Long id;
+    private String title;
+    private String author;
+    private BigDecimal price;
+    // ... 其他字段
+}
+```
+
+如果不实现 `Serializable`，查询时会抛出序列化异常。
+
+### 脏数据问题（重点）
+
+二级缓存听起来很好，但实际项目中用得很少。核心原因是**脏数据风险**。
+
+看这个场景：
+
+```java
+// SqlSession A：查询
+SqlSession sessionA = sqlSessionFactory.openSession();
+BookMapper mapperA = sessionA.getMapper(BookMapper.class);
+Book book = mapperA.selectById(1L);
+// book 的 title 是 "深入理解计算机系统"
+// 此时 book 在 sessionA 的一级缓存中
+
+// SqlSession B：更新
+SqlSession sessionB = sqlSessionFactory.openSession();
+BookMapper mapperB = sessionB.getMapper(BookMapper.class);
+Book updateBook = new Book();
+updateBook.setId(1L);
+updateBook.setTitle("深入理解计算机系统（第三版）");
+mapperB.updateById(updateBook);
+sessionB.commit();
+sessionB.close();
+// 此时 sessionB 的 commit 会清空 BookMapper 的二级缓存
+// 但 sessionA 的一级缓存还在
+
+// SqlSession A：再查同一条
+Book book2 = mapperA.selectById(1L);
+// 注意：这里命中的是 sessionA 的一级缓存，返回的还是旧数据！
+// book2.getTitle() 还是 "深入理解计算机系统"
+
+sessionA.close();
+```
+
+问题出在：SqlSession A 关闭之前，它的一级缓存不会被其他 SqlSession 的更新操作影响。即使在 SqlSession B 中更新了数据并 commit，SqlSession A 中的缓存也不会自动失效。
+
+这还不是最严重的问题。更严重的是二级缓存的**粒度太粗**。
+
+```java
+// 更新了 id=1 的书
+mapper.updateById(new Book().setId(1L).setTitle("新标题"));
+
+// 清空的是整个 BookMapper 的二级缓存
+// id=2, id=3, id=100 的缓存也全部失效了
+// 哪怕它们和这次更新毫无关系
+```
+
+整个 Mapper 的二级缓存是一起清空的，不是按数据行清空。更新一条记录，所有查询缓存全部失效。在数据频繁变化的场景下，缓存几乎永远处于失效状态，等于白开。
+
+### 生产环境的建议
+
+对于 BookHive 这样的项目，二级缓存的适用面很窄。
+
+适合用缓存的场景：读多写少、对数据一致性要求不高的表，比如书籍分类（字典表）、系统配置表。这些表的数据很少变动，即使缓存短暂不一致也不会影响业务。
+
+不适合用缓存的场景：订单表、库存表、用户余额等频繁更新或对一致性要求高的数据。
+
+实际上，生产环境更常见的做法是用 Redis 等外部缓存替代 MyBatis 的二级缓存。Redis 的缓存粒度可以精确到 key，有过期时间控制，可以在数据变更时主动失效特定 key，比 MyBatis 二级缓存灵活得多。
+
+MyBatis 二级缓存不是不能用，但你要清楚它的局限性。如果只是字典表这种几乎不变的表，用它问题不大。其他场景，建议用外部缓存方案。
+
+## 批量插入优化
+
+运营要导入 5000 本新书。如果逐条插入，每条都是一个独立的 INSERT 语句，网络往返 5000 次，数据库执行 5000 次，慢是必然的。
+
+### 逐条插入的问题
+
+```java
+// 逐条插入——最原始的方式
+@Service
+public class BookImportService {
+
+    @Autowired
+    private BookMapper bookMapper;
+
+    // 导入 5000 本书，耗时约 30 秒
+    public void importBooks(List<Book> books) {
+        for (Book book : books) {
+            bookMapper.insert(book);  // 每次都是一次数据库往返
+        }
+    }
+}
+```
+
+每次 `insert` 调用都是：Java 应用发送 SQL -> 数据库解析执行 -> 返回结果。5000 次循环，就是 5000 次网络往返加上 5000 次 SQL 解析。大部分时间浪费在了通信开销上，而不是真正的数据写入。
+
+### 方案 1：多值插入（INSERT INTO ... VALUES）
+
+把多条记录拼成一条 SQL，一次发给数据库：
+
+```xml
+<!-- BookMapper.xml -->
+<insert id="batchInsert">
+    INSERT INTO books (title, author, isbn, price, category_id, status)
+    VALUES
+    <foreach collection="list" item="book" separator=",">
+        (#{book.title}, #{book.author}, #{book.isbn}, #{book.price}, #{book.categoryId}, #{book.status})
+    </foreach>
+</insert>
+```
+
+```java
+// 一次插入 5000 条，耗时约 2 秒
+List<Book> books = parseExcel(file);
+bookMapper.batchInsert(books);
+```
+
+一条 SQL 包含 5000 个 VALUES，数据库只解析一次 SQL，网络只往返一次。速度从 30 秒降到 2 秒。
+
+但这里有个注意点：MySQL 有 `max_allowed_packet` 参数限制，默认通常是 4MB。如果一条 SQL 太大（比如插入的字段很多、每行数据很大），会超出这个限制报错。解决方法有两种：减小每批的数量，或者调大 `max_allowed_packet`。
+
+```yaml
+# application.yml 中配置每批插入的数量
+book:
+  import:
+    batch-size: 500 # 每批 500 条，5000 条分 10 批执行
+```
+
+```java
+public void importBooks(List<Book> books) {
+    int batchSize = 500;
+    for (int i = 0; i < books.size(); i += batchSize) {
+        int end = Math.min(i + batchSize, books.size());
+        List<Book> subList = books.subList(i, end);
+        bookMapper.batchInsert(subList);  // 每批 500 条
+    }
+}
+```
+
+### 方案 2：ExecutorType.BATCH
+
+MyBatis 提供了一种 BASH 执行器，它不会立即执行 SQL，而是把 SQL 语句缓存起来，等 commit 的时候一次性发送给数据库。
+
+```java
+@Service
+public class BookImportService {
+
+    @Autowired
+    private SqlSessionFactory sqlSessionFactory;
+
+    public void importBooks(List<Book> books) {
+        // 打开一个 BATCH 模式的 SqlSession
+        try (SqlSession session = sqlSessionFactory.openSession(ExecutorType.BATCH)) {
+            BookMapper mapper = session.getMapper(BookMapper.class);
+
+            for (Book book : books) {
+                mapper.insert(book);  // SQL 不会立即执行，只是被缓存
+            }
+
+            // commit 时，所有缓存的 SQL 一次性发送到数据库执行
+            session.commit();
+        }
+    }
+}
+```
+
+BATCH 模式的原理：每次调用 `mapper.insert()` 时，MyBatis 只是预编译 SQL 并缓存参数，不执行。等 `session.commit()` 时，JDBC 驱动会把多条 SQL 打包后一次性发给数据库。
+
+和 `INSERT INTO ... VALUES` 多值插入不同，BATCH 模式发送的还是多条独立的 INSERT 语句，只是通过 JDBC 的 batch 机制减少了网络往返次数。性能比逐条插入好很多，但比多值插入略差。
+
+### 性能对比
+
+三种方式导入 5000 条数据（书籍表，字段适中）的测试结果：
+
+| 方式                    | 耗时 | 网络往返次数 | SQL 解析次数 |
+| ----------------------- | ---- | ------------ | ------------ |
+| 逐条插入                | ~30s | 5000         | 5000         |
+| ExecutorType.BATCH      | ~3s  | ~10          | 5000         |
+| 多值 INSERT（每批 500） | ~2s  | 10           | 10           |
+
+多值插入最快，因为它不仅减少了网络往返，还减少了 SQL 解析的次数。BATCH 模式次之，但使用起来更简单，不需要写特殊的 XML。
+
+### Spring 中使用 BATCH 模式
+
+在 Spring 环境中，默认的 `SqlSessionTemplate` 使用的是 SIMPLE 执行器。要使用 BATCH 模式，需要额外配置：
+
+```java
+@Configuration
+public class MyBatisBatchConfig {
+
+    @Bean
+    public SqlSessionTemplate batchSqlSessionTemplate(SqlSessionFactory sqlSessionFactory) {
+        // 创建一个使用 BATCH 执行器的 SqlSessionTemplate
+        return new SqlSessionTemplate(sqlSessionFactory, ExecutorType.BATCH);
+    }
+}
+```
+
+```java
+@Service
+public class BookImportService {
+
+    @Autowired
+    @Qualifier("batchSqlSessionTemplate")
+    private SqlSessionTemplate batchSession;
+
+    public void importBooks(List<Book> books) {
+        BookMapper mapper = batchSession.getMapper(BookMapper.class);
+        for (Book book : books) {
+            mapper.insert(book);
+        }
+        // 注意：batchSession 默认不会自动 commit
+        // 需要手动调用或依赖外部事务
+        batchSession.flushStatements();
+    }
+}
+```
+
+要注意的是，BATCH 模式下 `insert` 方法的返回值（自增 ID）是不准确的，因为 SQL 并没有立即执行。如果业务依赖插入后的自增 ID，BATCH 模式用起来会比较麻烦。
+
+### MyBatis-Plus 的 saveBatch
+
+如果项目用了 MyBatis-Plus，批量插入更简单：
+
+```java
+@Service
+public class BookImportService {
+
+    @Autowired
+    private BookService bookService;
+
+    public void importBooks(List<Book> books) {
+        // 每 500 条提交一次，底层用的是多值 INSERT
+        bookService.saveBatch(books, 500);
+    }
+}
+```
+
+`saveBatch` 的第二个参数是批次大小，默认 1000。它底层会生成类似这样的 SQL：
+
+```sql
+INSERT INTO books (title, author, isbn, price, category_id, status)
+VALUES
+('书名1', '作者1', 'ISBN1', 59.00, 1, 1),
+('书名2', '作者2', 'ISBN2', 45.00, 2, 1),
+...
+('书名500', '作者500', 'ISBN500', 78.00, 5, 1)
+```
+
+对于大多数场景，`saveBatch` 已经足够好用，不需要自己写 XML 或配置 BATCH 模式。
+
+## 批量更新
+
+批量更新比批量插入复杂一些，因为更新的场景更多样。
+
+### CASE WHEN 方式
+
+用一条 SQL 通过 CASE WHEN 更新多条记录：
+
+```xml
+<!-- BookMapper.xml -->
+<update id="batchUpdateStatus">
+    UPDATE books
+    SET status =
+    <foreach collection="list" item="item">
+        <if test="item.status != null">
+            CASE
+                WHEN id = #{item.id} THEN #{item.status}
+            </if>
+        </if>
+    </foreach>
+    WHERE id IN
+    <foreach collection="list" item="item" open="(" separator="," close=")">
+        #{item.id}
+    </foreach>
+</update>
+```
+
+生成的 SQL 类似这样：
+
+```sql
+UPDATE books
+SET status = CASE
+    WHEN id = 1 THEN 1
+    WHEN id = 2 THEN 0
+    WHEN id = 3 THEN 1
+END
+WHERE id IN (1, 2, 3)
+```
+
+一条 SQL 更新了三条记录，网络只往返一次。但如果更新的字段很多，SQL 会变得很长，可能超出 `max_allowed_packet` 限制。
+
+### MyBatis-Plus 的 updateBatchById
+
+```java
+@Service
+public class BookService {
+
+    @Autowired
+    private IBookService bookService;
+
+    public void batchUpdatePrice(List<Book> books) {
+        // 每 500 条提交一次
+        bookService.updateBatchById(books, 500);
+    }
+}
+```
+
+`updateBatchById` 底层用的是 BATCH 模式，不是多值 UPDATE。它会逐条发送 UPDATE 语句，但通过 JDBC 的 batch 机制减少网络往返。性能比逐条更新好很多，但比 CASE WHEN 方式略差。
+
+选择哪种方式取决于场景：如果更新的字段少、数据量可控，CASE WHEN 更高效；如果更新逻辑复杂或字段多，`updateBatchById` 更安全。
+
+## 什么时候用什么
+
+缓存和批量操作是两个不同维度的优化手段，适用场景也不同。
+
+**缓存的适用性**：MyBatis 的一级缓存基本不需要你操心，它默认就开着，在事务内自动生效。二级缓存需要慎重——如果你确实有读多写少的表（字典表、配置表），可以开启，但要确认数据不一致的风险在可接受范围内。对于核心业务数据（订单、库存、用户信息），不要依赖 MyBatis 二级缓存，用 Redis 或者应用层的缓存方案更可靠。
+
+**批量操作的选择**：导入数据、初始化数据这种场景，优先用 MyBatis-Plus 的 `saveBatch`，简单高效。如果数据量特别大（几十万条），考虑分批处理，每批 500-1000 条，避免单条 SQL 过大。批量更新看情况——字段少用 CASE WHEN，字段多用 `updateBatchById`。不管用哪种方式，都要注意数据库的 `max_allowed_packet` 限制。
+
+**不要过度优化**：缓存不是免费的，它引入了数据不一致的风险；批量操作也不是万能的，大批量写入会导致数据库的锁竞争和 IO 压力。先确认有性能问题，再针对性优化，而不是一上来就把所有查询都加缓存、所有写入都改成批量。

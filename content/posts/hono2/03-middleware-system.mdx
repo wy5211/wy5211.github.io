@@ -1,0 +1,536 @@
+---
+title: "03. 中间件机制深入"
+date: "2026-03-20"
+summary: "深入理解 Hono 中间件系统的洋葱模型，掌握内置中间件的使用，学习自定义中间件开发，构建可复用的中间件生态。"
+tags: ["Hono", "Middleware", "洋葱模型", "TypeScript"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 3
+---
+
+在上一篇文章中，我们学习了如何组织博客 API 的路由结构。但一个完整的 API 不仅仅是路由定义，还需要在请求处理的不同阶段执行各种操作：身份验证、日志记录、错误处理、CORS 配置等等。
+
+中间件就是解决这类问题的优雅方案。Hono 的中间件系统采用经典的洋葱模型，让请求和响应流经多层处理，既灵活又强大。
+
+让我们继续完善博客 API，学习如何使用 Hono 的中间件系统来构建更强大的功能。
+
+## 什么是中间件
+
+中间件是一个函数，它在请求到达路由处理器之前和响应返回客户端之前执行。它可以修改请求对象、修改响应对象、结束请求响应循环，或者调用 `next()` 将控制权传递给下一个中间件。
+
+### 中间件的作用
+
+```
+Request → Middleware 1 → Middleware 2 → Route Handler
+         ← Middleware 1 ← Middleware 2 ← Response
+```
+
+每个中间件都可以在请求处理前执行逻辑、调用 `next()` 传递控制、在响应返回后执行逻辑。
+
+## 洋葱模型
+
+Hono 的中间件采用洋葱模型，这是一个非常直观的概念。
+
+### 可视化理解
+
+```
+        ┌─────────────────────────────────────────┐
+        │           Middleware 1                  │
+        │  ┌───────────────────────────────────┐  │
+        │  │       Middleware 2               │  │
+        │  │  ┌─────────────────────────────┐  │  │
+        │  │  │    Middleware 3             │  │  │
+        │  │  │  ┌───────────────────────┐  │  │  │
+        │  │  │  │   Route Handler       │  │  │  │
+        │  │  │  └───────────────────────┘  │  │  │
+        │  │  └─────────────────────────────┘  │  │
+        │  └───────────────────────────────────┘  │
+        └─────────────────────────────────────────┘
+
+执行顺序：
+1. Middleware 1 (前) ↓
+2. Middleware 2 (前) ↓
+3. Middleware 3 (前) ↓
+4. Route Handler
+5. Middleware 3 (后) ↑
+6. Middleware 2 (后) ↑
+7. Middleware 1 (后) ↑
+```
+
+### 代码示例
+
+```typescript
+import { Hono } from "hono";
+
+const app = new Hono();
+
+// 中间件 1
+app.use("*", async (c, next) => {
+  console.log("中间件 1: 请求进入");
+  await next();
+  console.log("中间件 1: 响应返回");
+});
+
+// 中间件 2
+app.use("*", async (c, next) => {
+  console.log("中间件 2: 请求进入");
+  await next();
+  console.log("中间件 2: 响应返回");
+});
+
+// 路由处理器
+app.get("/", (c) => {
+  console.log("路由处理器执行");
+  return c.text("Hello");
+});
+```
+
+访问 `/` 的输出。
+
+```
+中间件 1: 请求进入
+中间件 2: 请求进入
+路由处理器执行
+中间件 2: 响应返回
+中间件 1: 响应返回
+```
+
+在博客 API 中，我们可以用洋葱模型来实现日志记录、认证、错误处理等功能。
+
+## 基础中间件开发
+
+### 中间件函数签名
+
+```typescript
+type Middleware = (
+  c: Context,
+  next: Next
+) => Promise<Response | void> | Response | void;
+```
+
+### 第一个自定义中间件
+
+让我们为博客 API 创建一个请求计时中间件。
+
+```typescript
+import { Hono } from "hono";
+
+// 请求计时中间件
+const timerMiddleware = async (c, next) => {
+  const start = Date.now();
+
+  // 等待下一个中间件/路由处理器执行
+  await next();
+
+  // 计算执行时间
+  const duration = Date.now() - start;
+
+  // 添加响应头
+  c.header("X-Response-Time", `${duration}ms`);
+
+  console.log(`${c.req.method} ${c.req.path} - ${duration}ms`);
+};
+
+const app = new Hono();
+
+// 应用中间件
+app.use("*", timerMiddleware);
+
+app.get("/", (c) => c.text("Hello"));
+```
+
+测试。
+
+```bash
+curl -i http://localhost:3000/
+```
+
+响应。
+
+```
+HTTP/1.1 200 OK
+X-Response-Time: 5ms
+Content-Type: text/plain; charset=UTF-8
+
+Hello
+```
+
+### 中间件修改上下文
+
+中间件可以向 Context 添加数据，这在认证场景中非常有用。
+
+```typescript
+// 认证中间件
+const authMiddleware = async (c, next) => {
+  const token = c.req.header("Authorization");
+
+  if (!token) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+
+  // 验证 token
+  const user = await verifyToken(token);
+
+  // 将用户信息存储到 context
+  c.set("user", user);
+
+  await next();
+};
+
+// 在路由中使用
+app.get("/api/me", authMiddleware, (c) => {
+  const user = c.get("user");
+  return c.json({ user });
+});
+```
+
+## 内置中间件
+
+Hono 提供了丰富的内置中间件，开箱即用。
+
+### 1. Logger - 请求日志
+
+```typescript
+import { logger } from "hono/logger";
+
+app.use("*", logger());
+```
+
+输出。
+
+```
+  --> GET /posts
+  <-- GET /posts 200 3ms
+```
+
+### 2. CORS - 跨域资源共享
+
+```typescript
+import { cors } from "hono/cors";
+
+// 基础配置
+app.use("*", cors());
+
+// 详细配置
+app.use(
+  "*",
+  cors({
+    origin: ["http://localhost:3000", "https://example.com"],
+    credentials: true,
+    maxAge: 86400,
+    allowMethods: ["GET", "POST", "PUT", "DELETE"],
+    allowHeaders: ["Content-Type", "Authorization"],
+  })
+);
+```
+
+在博客 API 中，我们通常会这样配置 CORS。
+
+```typescript
+app.use(
+  "*",
+  cors({
+    origin:
+      process.env.NODE_ENV === "production"
+        ? "https://myblog.com"
+        : ["http://localhost:3000", "http://localhost:5173"],
+    credentials: true,
+  })
+);
+```
+
+### 3. Powered By - 响应头
+
+```typescript
+import { poweredBy } from "hono/powered-by";
+
+app.use("*", poweredBy());
+// 添加 X-Powered-By: Hono
+```
+
+## 常见自定义中间件
+
+### 1. 请求验证中间件
+
+在博客 API 中，我们可以验证 Content-Type。
+
+```typescript
+// 验证 Content-Type
+const requireJson = async (c, next) => {
+  const contentType = c.req.header("Content-Type");
+
+  if (!contentType?.includes("application/json")) {
+    return c.json(
+      {
+        error: "Content-Type must be application/json",
+      },
+      415
+    );
+  }
+
+  await next();
+};
+
+app.post("/api/posts", requireJson, async (c) => {
+  const body = await c.req.json();
+  // ...
+});
+```
+
+### 2. 错误处理中间件
+
+```typescript
+const catchErrors = async (c, next) => {
+  try {
+    await next();
+  } catch (error) {
+    console.error("Error:", error);
+
+    // 处理不同类型的错误
+    if (error instanceof ValidationError) {
+      return c.json(
+        {
+          error: "Validation Error",
+          details: error.messages,
+        },
+        400
+      );
+    }
+
+    if (error instanceof AuthError) {
+      return c.json(
+        {
+          error: "Authentication Failed",
+        },
+        401
+      );
+    }
+
+    // 默认错误
+    return c.json(
+      {
+        error: "Internal Server Error",
+      },
+      500
+    );
+  }
+};
+
+app.use("*", catchErrors);
+```
+
+### 3. Rate Limiter - 限流
+
+对于博客 API，我们需要防止用户过度请求。
+
+```typescript
+// 简单的内存限流
+const rateLimiter = (options: { max: number; windowMs: number }) => {
+  const requests = new Map<string, number[]>();
+
+  return async (c, next) => {
+    const ip =
+      c.req.header("CF-Connecting-IP") ||
+      c.req.header("X-Forwarded-For") ||
+      "unknown";
+    const now = Date.now();
+
+    // 获取该 IP 的请求记录
+    let userRequests = requests.get(ip) || [];
+
+    // 清理过期记录
+    userRequests = userRequests.filter((time) => now - time < options.windowMs);
+
+    // 检查是否超过限制
+    if (userRequests.length >= options.max) {
+      return c.json(
+        {
+          error: "Too many requests",
+        },
+        429
+      );
+    }
+
+    // 记录本次请求
+    userRequests.push(now);
+    requests.set(ip, userRequests);
+
+    await next();
+  };
+};
+
+// 使用：每分钟最多 100 个请求
+app.use("*", rateLimiter({ max: 100, windowMs: 60000 }));
+```
+
+### 4. 安全头中间件
+
+为博客 API 添加安全头。
+
+```typescript
+const securityHeaders = async (c, next) => {
+  await next();
+
+  // 设置安全头
+  c.header("X-Content-Type-Options", "nosniff");
+  c.header("X-Frame-Options", "DENY");
+  c.header("X-XSS-Protection", "1; mode=block");
+  c.header("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  c.header("Referrer-Policy", "strict-origin-when-cross-origin");
+};
+
+app.use("*", securityHeaders);
+```
+
+## 路由级中间件
+
+中间件可以应用到特定路由或路由组。
+
+### 单路由中间件
+
+```typescript
+const authMiddleware = async (c, next) => {
+  const token = c.req.header("Authorization");
+  if (!token) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  await next();
+};
+
+// 只应用到单个路由
+app.post("/api/posts", authMiddleware, (c) => {
+  return c.json({ message: "Create post" });
+});
+
+// 公开路由
+app.get("/api/posts", (c) => {
+  return c.json({ message: "List posts" });
+});
+```
+
+在博客 API 中，我们可以这样保护需要认证的操作。
+
+```typescript
+// 公开路由
+app.get("/api/posts", listPosts);
+app.get("/api/posts/:id", getPost);
+
+// 需要认证的路由
+app.post("/api/posts", authMiddleware, createPost);
+app.put("/api/posts/:id", authMiddleware, updatePost);
+app.delete("/api/posts/:id", authMiddleware, deletePost);
+```
+
+### 路由组中间件
+
+```typescript
+const api = new Hono();
+
+// 应用到整个路由组
+api.use("*", authMiddleware);
+
+api.get("/posts", (c) => c.json([]));
+api.get("/users", (c) => c.json([]));
+```
+
+## 完整示例：博客 API 中间件配置
+
+让我们为博客 API 配置完整的中间件系统。
+
+```typescript
+import { Hono } from "hono";
+import { logger } from "hono/logger";
+import { cors } from "hono/cors";
+import { authMiddleware } from "./middleware/auth";
+import { rateLimiter } from "./middleware/rate-limiter";
+import { securityHeaders } from "./middleware/security";
+
+const app = new Hono();
+
+// 全局中间件
+app.use("*", logger());
+app.use(
+  "*",
+  cors({
+    origin:
+      process.env.NODE_ENV === "production"
+        ? "https://myblog.com"
+        : ["http://localhost:3000"],
+    credentials: true,
+  })
+);
+app.use("*", securityHeaders);
+app.use("*", rateLimiter({ max: 100, windowMs: 60000 }));
+
+// 健康检查（跳过认证）
+app.get("/health", (c) => {
+  return c.json({
+    status: "ok",
+    timestamp: new Date().toISOString(),
+  });
+});
+
+// API 路由
+const api = new Hono();
+
+// 公开路由
+api.get("/posts", listPosts);
+api.get("/posts/:id", getPost);
+api.get("/users", listUsers);
+api.get("/users/:id", getUser);
+
+// 需要认证的路由
+const protectedRoutes = new Hono();
+protectedRoutes.use("*", authMiddleware);
+
+protectedRoutes.post("/posts", createPost);
+protectedRoutes.put("/posts/:id", updatePost);
+protectedRoutes.delete("/posts/:id", deletePost);
+protectedRoutes.post("/posts/:id/comments", createComment);
+
+api.route("/", protectedRoutes);
+
+app.route("/api", api);
+
+// 错误处理
+app.onError((err, c) => {
+  console.error("Error:", err);
+
+  return c.json(
+    {
+      error:
+        process.env.NODE_ENV === "production"
+          ? "Internal Server Error"
+          : err.message,
+    },
+    500
+  );
+});
+
+// 404 处理
+app.notFound((c) => {
+  return c.json(
+    {
+      error: "Route not found",
+      path: c.req.path,
+    },
+    404
+  );
+});
+
+export default app;
+```
+
+## 权衡与考虑
+
+中间件提供了强大的功能，但也增加了复杂性。过多的中间件可能影响性能，每个中间件都会增加请求处理的延迟。在博客 API 中，我们需要在功能性和性能之间找到平衡。
+
+洋葱模型让中间件的执行顺序变得重要。日志中间件应该最先执行，错误处理中间件应该最后执行。认证中间件需要在业务逻辑之前执行。
+
+全局中间件简化了配置，但可能导致不必要的处理。在博客 API 中，我们将认证中间件只应用到需要保护的路由，而不是全局应用，这样可以减少不必要的验证开销。
+
+中间件的错误处理需要特别注意。一个中间件的错误可能影响整个请求链。我们需要仔细设计错误处理逻辑，确保错误能够正确传递和记录。
+
+在下一篇文章中，我们将深入探讨 Hono 的请求与响应处理机制，学习如何高效读取请求数据、处理各种响应类型、管理 Cookie，以及实现文件下载和流式响应等高级功能。

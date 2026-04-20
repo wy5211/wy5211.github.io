@@ -1,0 +1,643 @@
+---
+title: "14. 测试策略"
+date: "2026-03-20"
+summary: "构建可靠的测试体系，学习单元测试、集成测试、API 测试，以及使用 Vitest 和 Hono 的测试工具编写高质量测试。"
+tags: ["Hono", "Testing", "Vitest", "TDD", "Quality Assurance"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 14
+---
+
+## 前言
+
+在上一篇文章中，我们实现了多层缓存策略来提升博客 API 的性能。现在我们的应用既安全又快速，功能也很完善了。但还有一个重要的问题：我们怎么确保代码是正确的？
+
+你可能在想，我手动测试过了，功能都是正常的。但手动测试有几个问题：每次修改代码都要重新测试、很难覆盖所有边界情况、随着功能增加，手动测试的工作量会越来越大。更糟糕的是，你可能在修复一个 bug 时引入了新的 bug，但手动测试可能发现不了。
+
+自动化测试能解决这些问题。测试是一段代码，用来验证另一段代码的行为是否符合预期。测试可以自动运行、快速反馈、覆盖各种情况。有了测试，你在修改代码时会更有信心，因为测试会告诉你是否破坏了原有功能。
+
+在本篇文章中，我们将为博客 API 建立完整的测试体系。你将学习到不同类型的测试、如何用 Vitest 编写测试、如何测试 API、如何 Mock 外部依赖，以及如何衡量测试覆盖率。
+
+## 为什么需要测试
+
+你可能觉得写测试很浪费时间，还不如直接写功能。但测试的价值会在项目逐渐变大时显现出来。
+
+测试的好处包括：
+
+- 及早发现 bug：在开发阶段发现问题比在生产环境发现成本低得多
+- 防止回归：修改代码时，测试会告诉你是否破坏了原有功能
+- 简化重构：有测试的保护，你可以放心地重构代码
+- 活文档：测试代码展示了代码的预期行为，比文档更准确
+- 提升代码质量：为了可测试，你会写出更模块化、低耦合的代码
+
+测试虽然需要时间投入，但长期来看能节省更多时间。想象一下，如果没有测试，每次修改代码你都要手动测试所有功能，这得多累。
+
+## 测试类型
+
+在深入代码之前，先了解一下常见的测试类型，以及它们的区别。
+
+**单元测试**测试单个函数或组件，不依赖外部系统。比如测试一个验证邮箱格式的函数。
+
+```typescript
+test("validateEmail returns true for valid email", () => {
+  expect(validateEmail("test@example.com")).toBe(true);
+});
+```
+
+**集成测试**测试多个组件协作，可能涉及数据库、缓存等。比如测试创建文章的完整流程。
+
+```typescript
+test("POST /posts creates post and returns 201", async () => {
+  const response = await app.request("/posts", {
+    method: "POST",
+    body: JSON.stringify({ title: "Test", content: "Content" }),
+  });
+
+  expect(response.status).toBe(201);
+});
+```
+
+**端到端测试**测试完整的用户流程，通常在真实浏览器中运行。比如测试用户注册、登录、发布文章的完整流程。
+
+```typescript
+test("user can register, login, and create post", async () => {
+  await register("user@example.com", "password");
+  const token = await login("user@example.com", "password");
+  const post = await createPost(token, { title: "Test" });
+  expect(post).toBeDefined();
+});
+```
+
+对于博客 API，我们主要关注单元测试和集成测试。端到端测试更适合前端应用。
+
+## 项目设置
+
+首先安装和配置测试工具。我们选择 Vitest，因为它和 Vite 生态系统无缝集成，速度快，配置简单。
+
+```bash
+# 安装依赖
+npm install -D vitest
+npm install -D @vitest/ui  # 可视化测试界面
+npm install -D @vitest/coverage-v8  # 覆盖率报告
+```
+
+```typescript
+// vitest.config.ts
+import { defineConfig } from "vitest/config";
+
+export default defineConfig({
+  test: {
+    globals: true, // 全局测试 API
+    environment: "node", // Node.js 环境
+    setupFiles: ["./tests/setup.ts"], // 测试设置文件
+    coverage: {
+      provider: "v8",
+      reporter: ["text", "html", "lcov"],
+      exclude: ["node_modules/", "tests/", "**/*.test.ts"],
+    },
+  },
+});
+```
+
+```typescript
+// tests/setup.ts
+import { beforeEach } from "vitest";
+
+// 每个测试前重置数据库
+beforeEach(async () => {
+  await resetTestDatabase();
+});
+
+// 全局 Mock 外部服务
+vi.mock("./lib/email", () => ({
+  sendEmail: vi.fn(),
+}));
+```
+
+在 package.json 中添加测试脚本：
+
+```json
+{
+  "scripts": {
+    "test": "vitest",
+    "test:ui": "vitest --ui",
+    "test:coverage": "vitest --coverage"
+  }
+}
+```
+
+## 单元测试
+
+让我们从简单的单元测试开始。单元测试通常针对工具函数、服务类等不依赖外部系统的代码。
+
+```typescript
+// src/utils/validation.ts
+export const validateEmail = (email: string): boolean => {
+  const regex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return regex.test(email);
+};
+
+export const generateSlug = (text: string): string => {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+};
+
+// tests/utils/validation.test.ts
+import { describe, it, expect } from "vitest";
+import { validateEmail, generateSlug } from "../../src/utils/validation";
+
+describe("validateEmail", () => {
+  it("returns true for valid emails", () => {
+    expect(validateEmail("test@example.com")).toBe(true);
+    expect(validateEmail("user+tag@domain.co.uk")).toBe(true);
+    expect(validateEmail("123@456.789")).toBe(true);
+  });
+
+  it("returns false for invalid emails", () => {
+    expect(validateEmail("invalid")).toBe(false);
+    expect(validateEmail("@example.com")).toBe(false);
+    expect(validateEmail("test@")).toBe(false);
+    expect(validateEmail("test @example.com")).toBe(false);
+  });
+
+  it("returns false for empty string", () => {
+    expect(validateEmail("")).toBe(false);
+  });
+});
+
+describe("generateSlug", () => {
+  it("converts text to slug", () => {
+    expect(generateSlug("Hello World")).toBe("hello-world");
+    expect(generateSlug("Hello   World")).toBe("hello-world");
+    expect(generateSlug("Hello! World?")).toBe("hello-world");
+    expect(generateSlug("Hello-World")).toBe("hello-world");
+  });
+
+  it("handles edge cases", () => {
+    expect(generateSlug("")).toBe("");
+    expect(generateSlug("---")).toBe("");
+    expect(generateSlug("你好世界")).toBe("");
+  });
+
+  it("removes leading and trailing dashes", () => {
+    expect(generateSlug("--Hello World--")).toBe("hello-world");
+  });
+});
+```
+
+这段测试覆盖了各种情况：正常输入、边界情况、异常输入。测试用例的命名很重要，应该清楚描述测试的内容和预期结果。
+
+## API 测试
+
+API 测试是集成测试的一种，测试 HTTP 接口的行为。Hono 提供了 `app.request()` 方法，可以方便地测试 API。
+
+```typescript
+// tests/api/posts.test.ts
+import { describe, it, expect, beforeEach } from "vitest";
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+import * as schema from "../../src/db/schema";
+import { db } from "../../src/db";
+import { eq } from "drizzle-orm";
+
+// 创建测试应用
+const app = new Hono();
+
+const createPostSchema = z.object({
+  title: z.string().min(1).max(200),
+  content: z.string().min(1).max(10000),
+});
+
+app.post("/posts", zValidator("json", createPostSchema), async (c) => {
+  const data = c.req.valid("json");
+  const user = c.get("user") || { id: "test-user" };
+
+  const [post] = await db
+    .insert(schema.posts)
+    .values({
+      id: crypto.randomUUID(),
+      title: data.title,
+      content: data.content,
+      authorId: user.id,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    })
+    .returning();
+
+  return c.json({ success: true, data: post }, 201);
+});
+
+app.get("/posts", async (c) => {
+  const posts = await db.query.posts.findMany();
+  return c.json({ success: true, data: posts });
+});
+
+describe("Posts API", () => {
+  beforeEach(async () => {
+    // 清空测试数据
+    await db.delete(schema.posts);
+  });
+
+  describe("POST /posts", () => {
+    it("creates post with valid data", async () => {
+      const response = await app.request("/posts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: "Test Post",
+          content: "Test Content",
+        }),
+      });
+
+      expect(response.status).toBe(201);
+
+      const json = await response.json();
+      expect(json.success).toBe(true);
+      expect(json.data.title).toBe("Test Post");
+      expect(json.data.content).toBe("Test Content");
+      expect(json.data.id).toBeDefined();
+    });
+
+    it("returns 400 with invalid data", async () => {
+      const response = await app.request("/posts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: "", // 空标题
+          content: "Content",
+        }),
+      });
+
+      expect(response.status).toBe(400);
+
+      const json = await response.json();
+      expect(json.success).toBe(false);
+    });
+
+    it("returns 400 with missing fields", async () => {
+      const response = await app.request("/posts", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: "Test",
+          // 缺少 content
+        }),
+      });
+
+      expect(response.status).toBe(400);
+    });
+  });
+
+  describe("GET /posts", () => {
+    it("returns empty array initially", async () => {
+      const response = await app.request("/posts");
+
+      expect(response.status).toBe(200);
+
+      const json = await response.json();
+      expect(json.success).toBe(true);
+      expect(json.data).toEqual([]);
+    });
+
+    it("returns list of posts", async () => {
+      // 创建测试数据
+      await db.insert(schema.posts).values([
+        {
+          id: "1",
+          title: "Post 1",
+          content: "Content 1",
+          authorId: "user1",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+        {
+          id: "2",
+          title: "Post 2",
+          content: "Content 2",
+          authorId: "user1",
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ]);
+
+      const response = await app.request("/posts");
+      const json = await response.json();
+
+      expect(json.data).toHaveLength(2);
+      expect(json.data[0].title).toBe("Post 1");
+      expect(json.data[1].title).toBe("Post 2");
+    });
+  });
+});
+```
+
+这段测试覆盖了文章创建和获取的各种情况：成功创建、验证失败、字段缺失、空列表、多篇文章等。每个测试都是独立的，`beforeEach` 确保测试之间不互相影响。
+
+## 测试认证
+
+认证是 API 的重要部分，我们需要测试认证中间件是否正常工作。
+
+```typescript
+// tests/api/auth.test.ts
+import { describe, it, expect } from "vitest";
+import { Hono } from "hono";
+import { sign, verify } from "hono/jwt";
+import { authMiddleware } from "../../src/middleware/auth";
+
+const app = new Hono();
+
+// 受保护的路由
+app.get("/api/protected", authMiddleware, (c) => {
+  const user = c.get("user");
+  return c.json({
+    success: true,
+    data: { userId: user.id },
+  });
+});
+
+describe("Auth Middleware", () => {
+  it("allows access with valid token", async () => {
+    const token = await sign(
+      { sub: "user1", role: "user" },
+      process.env.JWT_SECRET!
+    );
+
+    const response = await app.request("/api/protected", {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    expect(response.status).toBe(200);
+
+    const json = await response.json();
+    expect(json.success).toBe(true);
+    expect(json.data.userId).toBe("user1");
+  });
+
+  it("denies access without token", async () => {
+    const response = await app.request("/api/protected");
+
+    expect(response.status).toBe(401);
+
+    const json = await response.json();
+    expect(json.success).toBe(false);
+  });
+
+  it("denies access with invalid token", async () => {
+    const response = await app.request("/api/protected", {
+      headers: {
+        Authorization: "Bearer invalid-token",
+      },
+    });
+
+    expect(response.status).toBe(401);
+  });
+
+  it("denies access with malformed authorization header", async () => {
+    const response = await app.request("/api/protected", {
+      headers: {
+        Authorization: "InvalidFormat token",
+      },
+    });
+
+    expect(response.status).toBe(401);
+  });
+});
+```
+
+## Mock 外部依赖
+
+测试时我们不想依赖真实的数据库或外部 API，这会让测试变慢且不稳定。我们可以用 Mock 来模拟这些依赖。
+
+```typescript
+// Mock 数据库
+vi.mock("../../src/db", () => ({
+  db: {
+    query: {
+      users: {
+        findFirst: vi.fn(),
+      },
+    },
+  },
+}));
+
+import { db } from "../../src/db";
+
+test("returns user from database", async () => {
+  const mockUser = { id: "1", name: "John", email: "john@example.com" };
+
+  // 设置 Mock 返回值
+  vi.mocked(db.query.users.findFirst).mockResolvedValue(mockUser);
+
+  // 调用被测函数
+  const user = await getUserById("1");
+
+  // 验证结果
+  expect(user).toEqual(mockUser);
+
+  // 验证调用
+  expect(db.query.users.findFirst).toHaveBeenCalledWith({
+    where: eq(users.id, "1"),
+  });
+});
+
+// Mock HTTP 请求
+global.fetch = vi.fn();
+
+test("calls external API", async () => {
+  const mockResponse = { data: "test" };
+
+  vi.mocked(fetch).mockResolvedValue({
+    ok: true,
+    json: async () => mockResponse,
+  } as Response);
+
+  const result = await fetchExternalData();
+
+  expect(result).toEqual(mockResponse);
+  expect(fetch).toHaveBeenCalledWith("https://api.example.com/data");
+});
+```
+
+## 测试数据库操作
+
+对于涉及数据库的代码，我们可以使用内存数据库进行测试。
+
+```typescript
+// tests/setup.ts
+import { drizzle } from "drizzle-orm/better-sqlite3";
+import Database from "better-sqlite3";
+import * as schema from "../src/db/schema";
+import { migrate } from "drizzle-orm/better-sqlite3/migrator";
+
+// 创建内存数据库
+const sqlite = new Database(":memory:");
+export const testDb = drizzle(sqlite, { schema });
+
+// 运行迁移
+beforeAll(async () => {
+  await migrate(testDb, { migrationsFolder: "drizzle" });
+});
+
+// 每个测试后清空数据
+afterEach(async () => {
+  const tables = Object.values(schema);
+  for (const table of tables) {
+    await testDb.delete(table);
+  }
+});
+
+// tests/services/user.service.test.ts
+import { describe, it, expect } from "vitest";
+import { UserService } from "../../src/services/user.service";
+import { testDb } from "../setup";
+
+describe("UserService", () => {
+  const userService = new UserService(testDb);
+
+  it("creates user with valid data", async () => {
+    const user = await userService.create({
+      name: "John Doe",
+      email: "john@example.com",
+    });
+
+    expect(user.id).toBeDefined();
+    expect(user.name).toBe("John Doe");
+    expect(user.email).toBe("john@example.com");
+  });
+
+  it("finds user by ID", async () => {
+    const created = await userService.create({
+      name: "Jane Doe",
+      email: "jane@example.com",
+    });
+
+    const found = await userService.findById(created.id);
+
+    expect(found).toEqual(created);
+  });
+
+  it("returns null for non-existent user", async () => {
+    const user = await userService.findById("non-existent");
+
+    expect(user).toBeNull();
+  });
+});
+```
+
+## 测试覆盖率
+
+测试覆盖率衡量测试覆盖了多少代码。Vitest 可以生成覆盖率报告。
+
+```bash
+npm run test:coverage
+```
+
+```typescript
+// vitest.config.ts
+export default defineConfig({
+  test: {
+    coverage: {
+      thresholds: {
+        lines: 80, // 至少 80% 的代码行被测试
+        functions: 80, // 至少 80% 的函数被测试
+        branches: 75, // 至少 75% 的分支被测试
+        statements: 80, // 至少 80% 的语句被测试
+      },
+    },
+  },
+});
+```
+
+如果覆盖率低于阈值，测试会失败。这可以确保团队维持一定的测试质量。
+
+不过要注意，覆盖率不是唯一指标。100% 覆盖率不代表没有 bug，测试质量更重要。
+
+## 测试最佳实践
+
+写测试有一些最佳实践可以遵循：
+
+**1. 测试命名**
+
+```typescript
+// 好的命名：描述了测试的内容和预期
+it("should return user when found by ID", () => {});
+it("should throw error when user not found", () => {});
+it("should create user with generated ID", () => {});
+
+// 不好的命名：不清楚测试什么
+it("test 1", () => {});
+it("works", () => {});
+```
+
+**2. AAA 模式**
+
+```typescript
+test("creates post", async () => {
+  // Arrange（准备）：设置测试数据
+  const postData = { title: "Test", content: "Content" };
+
+  // Act（执行）：调用被测函数
+  const response = await createPost(postData);
+
+  // Assert（断言）：验证结果
+  expect(response.title).toBe("Test");
+  expect(response.id).toBeDefined();
+});
+```
+
+**3. 测试独立性**
+
+```typescript
+// 每个测试应该独立运行，不依赖其他测试
+beforeEach(async () => {
+  // 重置状态
+  await resetDatabase();
+  await resetCache();
+});
+```
+
+**4. 只测试公共接口**
+
+```typescript
+// 好的：测试公共方法
+test("UserService.create creates user", async () => {
+  const user = await userService.create({ name: "John" });
+  expect(user.id).toBeDefined();
+});
+
+// 不好的：测试私有实现细节
+test("UserService._generateId generates UUID", async () => {
+  // 私有方法可能改变，测试会很脆弱
+});
+```
+
+## Trade-off 分析
+
+测试虽然重要，但也有一些权衡：
+
+**测试覆盖 vs 开发速度**
+
+更多测试意味着更多代码编写和维护时间，但也意味着更少的 bug 和更高的代码质量。需要找到平衡点。
+
+**单元测试 vs 集成测试**
+
+单元测试快且稳定，但无法发现集成问题。集成测试更真实但更慢更脆弱。通常推荐多用单元测试，关键流程用集成测试。
+
+**测试复杂度 vs 可维护性**
+
+复杂的测试逻辑本身可能有 bug，难以维护。测试应该简单直接，如果测试太复杂，可能是被测代码设计有问题。
+
+## 小结
+
+在这篇文章中，我们学习了如何为博客 API 建立完整的测试体系。我们学习了不同类型的测试、如何用 Vitest 编写测试、如何测试 API 和认证、如何 Mock 外部依赖，以及如何衡量测试覆盖率。
+
+测试是保证代码质量的重要手段，虽然需要投入时间，但长期来看能节省更多时间。通过建立良好的测试体系，你可以更有信心地修改和重构代码，不用担心破坏现有功能。
+
+至此，Hono 渐进式学习系列的功能篇已经完成。你已经掌握了构建生产级博客 API 所需的核心技能：路由、中间件、验证、错误处理、数据库集成、认证、文件上传、WebSocket、安全、缓存和测试。在下一篇文章中，我们将学习如何将应用部署到 Cloudflare Workers，让它在真实的边缘环境中运行。

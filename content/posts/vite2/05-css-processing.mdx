@@ -1,0 +1,271 @@
+---
+title: "05. CSS 处理：Modules、Tailwind 与 PostCSS"
+date: "2026-04-12"
+summary: "项目里 CSS Modules 和 Tailwind 混用，构建顺序经常冲突。Vite 的 CSS 处理和 Webpack 有什么不同？"
+tags: ["Vite", "CSS Modules", "Tailwind CSS", "PostCSS"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战指南"
+seriesOrder: 5
+---
+
+上一篇优化了 JS 构建，这一篇处理 CSS。
+
+TaskFlow Dashboard 迁移到 Vite 之后，JS 部分运行正常。但 CSS 出了问题——开发环境下样式时有时无，Tailwind 的工具类偶尔不生效，CSS Modules 的类名有时候是原始的 `.container`，有时候又变成了 `_container_1a2b3`。
+
+你打开 Webpack 时期的 CSS 配置回忆了一下：`css-loader` 处理 `@import` 和 `url()`，`style-loader` 把 CSS 注入到页面，`postcss-loader` 跑 autoprefixer，`mini-css-extract-plugin` 在生产环境提取 CSS 文件。四个包，三个 loader，一个 plugin，顺序还不能搞错。
+
+Vite 的 CSS 处理完全不是这个思路。
+
+## Vite 的 CSS 管线：导入即生效
+
+Webpack 里处理 CSS 需要你手动配置一串 loader 链。Vite 不需要——你在 JS/TS 文件里 `import './style.css'`，Vite 自动处理剩下的所有事情。
+
+这个设计叫 "import and apply"。当你导入一个 CSS 文件时，Vite 做了这些事：
+
+**开发模式**：读取 CSS 文件内容，通过 PostCSS 处理（如果配置了的话），然后通过 `<style>` 标签注入到页面。HMR 更新时，直接替换 `<style>` 标签的内容，不需要重新加载页面。
+
+**构建模式**：把所有导入的 CSS 收集起来，打包成一个或多个 CSS 文件，通过 `<link>` 标签引入。
+
+这个管线是 Vite 内置的，不需要任何额外配置。你只需要 `import` 就行。
+
+但 "自动处理" 不意味着 "不需要理解"。当你在项目里同时用 CSS Modules、Tailwind CSS、PostCSS 插件的时候，理解处理顺序和配置方式就变得很重要了。
+
+## CSS Modules：局部作用域的样式
+
+TaskFlow Dashboard 有 40 多个页面组件，每个组件都有自己的样式文件。之前用 Webpack 的时候，通过 `css-loader` 的 `modules` 选项开启 CSS Modules。文件名必须是 `*.module.css`，否则会被当作全局样式处理。
+
+Vite 的处理方式不同。默认情况下，所有 `.module.css`、`.module.scss`、`.module.less` 文件自动作为 CSS Modules 处理。不需要额外配置。
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+
+export default defineConfig({
+  css: {
+    modules: {
+      // 自定义类名生成规则
+      localsConvention: "camelCaseOnly",
+      // 生成的类名格式：[name]_[local]_[hash:5]
+      generateScopedName: "[name]_[local]_[hash:5]",
+    },
+  },
+});
+```
+
+这段配置做了两件事：`localsConvention` 设置为 `camelCaseOnly`，意味着你在 JS 里引用类名时可以用驼峰写法（`style.containerHeader` 而不是 `style['container-header']`）。`generateScopedName` 控制生成的类名格式，方便调试时定位源文件。
+
+在组件中使用 CSS Modules：
+
+```tsx
+// src/components/TaskCard.tsx
+import styles from "./TaskCard.module.css";
+
+export function TaskCard({ title, priority }: TaskCardProps) {
+  return (
+    <div className={styles.card}>
+      <h3 className={styles.title}>{title}</h3>
+      <span
+        className={
+          priority === "high" ? styles.highPriority : styles.normalPriority
+        }
+      >
+        {priority}
+      </span>
+    </div>
+  );
+}
+```
+
+Vite 会把 `styles.card` 编译成类似 `TaskCard_card_a3f2b` 的类名。构建模式下，这个映射关系在构建时确定。开发模式下，HMR 更新样式文件时，类名 hash 可能会变化——这是正常的，不影响功能。
+
+有一个容易踩的坑：CSS Modules 和 Tailwind 混用时，如果 Tailwind 的 `@apply` 指令用在一个 CSS Modules 文件里，`@apply` 引用的工具类不会被处理。原因是 CSS Modules 的处理发生在 PostCSS 之后，而 Tailwind 作为 PostCSS 插件，在这个阶段已经执行完了。解决方案是把 `@apply` 放在非 Modules 的 CSS 文件里，或者直接在 HTML 中使用 Tailwind 的工具类。
+
+## Tailwind CSS 4：和 Vite 的深度集成
+
+TaskFlow Dashboard 用的是 Tailwind CSS 3，配置文件是 `tailwind.config.js`，PostCSS 配置文件是 `postcss.config.js`，两个文件加起来将近 100 行。Tailwind CSS 4 做了很大的架构变化——它不再需要 PostCSS 配置文件，也不需要 `tailwind.config.js`。
+
+Tailwind CSS 4 用 CSS 原生的 `@import` 和 `@theme` 指令来配置，而不是 JavaScript 配置文件。
+
+```css
+/* src/styles/app.css */
+@import "tailwindcss";
+
+/* 自定义主题——直接在 CSS 里声明 */
+@theme {
+  --color-primary: #1a73e8;
+  --color-danger: #dc2626;
+  --font-display: "Inter", sans-serif;
+}
+```
+
+在 Vite 项目里集成 Tailwind CSS 4，只需要安装一个包：
+
+```bash
+npm install -D @tailwindcss/vite
+```
+
+然后在 `vite.config.ts` 里注册插件：
+
+```typescript
+import { defineConfig } from "vite";
+import tailwindcss from "@tailwindcss/vite";
+
+export default defineConfig({
+  plugins: [tailwindcss()],
+});
+```
+
+就这么简单。不需要 `tailwind.config.js`，不需要 `postcss.config.js`，不需要配置 `content` 扫描路径——Tailwind CSS 4 的 Vite 插件会自动检测使用到的类名。
+
+这背后的原因是 Tailwind CSS 4 使用了 lightningcss 作为 CSS 引擎。Vite 8 也内置了 lightningcss 支持（通过 `css.transformer: 'lightningcss'` 配置）。两个工具共享同一个 CSS 解析器，不需要额外的转换步骤。
+
+从 Webpack 迁移过来的感受很明显：之前 100 行的 Tailwind + PostCSS 配置，现在变成了 3 行代码。这不仅仅是行数的减少——配置文件越少，出问题的可能性就越低。
+
+## PostCSS 插件：处理 Tailwind 覆盖不到的场景
+
+Tailwind CSS 4 已经覆盖了大部分 CSS 处理需求，但有些场景还是需要 PostCSS 插件。
+
+TaskFlow Dashboard 有一个需求：组件库的样式需要自动添加浏览器前缀，同时要把 `px` 转换成 `rem`（设计稿是基于 750px 宽度的移动端设计）。这两个功能 Tailwind 不直接提供，需要 PostCSS 插件。
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+import tailwindcss from "@tailwindcss/vite";
+
+export default defineConfig({
+  plugins: [tailwindcss()],
+  css: {
+    postcss: {
+      plugins: [
+        // autoprefixer：自动添加浏览器前缀
+        // 注意：如果你用了 lightningcss，它会自动处理前缀
+        // 这里只在不用 lightningcss 的场景下才需要
+        // require('autoprefixer'),
+        // postcss-pxtorem：把 px 转换成 rem
+        // 配置根元素字体大小为 16px，1rem = 16px
+        // {
+        //   rootValue: 16,
+        //   propList: ['*'],
+        // },
+      ],
+    },
+    // Vite 8 内置 lightningcss 支持
+    transformer: "lightningcss",
+    lightningcss: {
+      // lightningcss 的配置
+      drafts: {
+        nesting: true, // 支持原生 CSS 嵌套
+      },
+    },
+  },
+});
+```
+
+这段配置展示了 Vite 中 PostCSS 的使用方式。有几个要点需要注意。
+
+Vite 8 默认使用 lightningcss 作为 CSS 转换器，它已经内置了 autoprefixer 的功能（基于 browserslist 配置）。所以如果你用了 lightningcss，就不需要再单独配置 autoprefixer 插件了。
+
+PostCSS 插件和 Tailwind CSS 4 的执行顺序是这样的：Vite 先通过 lightningcss 做 CSS 转换（解析、前缀、语法降级），然后 Tailwind 的 Vite 插件处理 Tailwind 相关的指令（`@import "tailwindcss"`、`@theme`、工具类扫描），最后是你配置的 PostCSS 插件。
+
+不过实际上 Tailwind CSS 4 的 Vite 插件在管线中插入的位置更靠前——它会在 lightningcss 之前处理 `@import "tailwindcss"` 指令，展开所有工具类，然后 lightningcss 再对展开后的 CSS 做最终处理。
+
+理解这个顺序很重要。如果你写了一个 PostCSS 插件来修改 CSS 属性值，你需要确认它在管线中的位置是否符合预期。Vite 的 `css.postcss.plugins` 配置的插件会在 lightningcss 之后执行——如果你需要在 lightningcss 之前执行，可以通过 `css.postcss` 的插件顺序来控制。
+
+## CSS 产物优化：构建模式下的考量
+
+开发模式下，CSS 通过 `<style>` 标签注入，没有太多优化空间。构建模式下，Vite 会对 CSS 做几个优化。
+
+**CSS 提取**。Vite 构建时默认把所有 CSS 提取到单独的文件。每个动态 import 的 chunk 如果包含 CSS，也会生成对应的 CSS 文件。这确保了按需加载的组件不会加载不需要的样式。
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  build: {
+    cssCodeSplit: true, // 默认就是 true
+    // CSS 文件命名
+    cssFileName: "assets/[name]-[hash].css",
+  },
+});
+```
+
+`cssCodeSplit` 控制是否按 chunk 拆分 CSS。TaskFlow Dashboard 有 40 多个页面组件，大部分是按需加载的。开启 CSS 拆分后，首页只加载首页需要的样式（大约 15 KB），而不是全部样式（大约 80 KB）。
+
+**CSS 压缩**。Vite 8 使用 lightningcss 做压缩（如果配置了 `css.transformer: 'lightningcss'`）。lightningcss 的压缩效果比 PostCSS 的 `cssnano` 好约 5-10%，而且速度快很多。
+
+**CSS 顺序**。Vite 按照模块导入的顺序来决定 CSS 的注入顺序。如果你在 `main.tsx` 里先导入了 `tailwind.css`，再导入了 `custom.css`，那么 `custom.css` 的规则会覆盖 `tailwind.css` 的同名规则。这个行为和 Webpack 的 `css-loader` 一致，迁移时不需要调整。
+
+## 常见 CSS 构建问题
+
+TaskFlow Dashboard 在迁移过程中遇到了几个 CSS 相关的问题。
+
+**问题一：Tailwind 类名在动态拼接时不生效。**
+
+```tsx
+// 这样写 Tailwind 无法扫描到类名
+const className = `bg-${isHigh ? "red" : "green"}-500`;
+
+// 解决方案：使用完整的类名
+const className = isHigh ? "bg-red-500" : "bg-green-500";
+```
+
+这不是 Vite 的问题，而是 Tailwind CSS 的 JIT 编译器需要扫描完整的类名字符串。在 Webpack 里也会遇到同样的问题。不过因为 Vite 的 HMR 更新更快，你可以更快地发现和修复这个问题。
+
+**问题二：CSS Modules 的全局样式覆盖。**
+
+某些第三方组件库（比如日期选择器）会注入全局样式，覆盖了你 CSS Modules 中定义的样式。解决方案是提高 CSS Modules 的特异性，或者在全局样式文件中用 `!important` 覆盖。
+
+```css
+/* TaskCard.module.css */
+.card {
+  /* 使用层叠层提高优先级 */
+  @layer components {
+    background: white;
+    border: 1px solid #e5e7eb;
+  }
+}
+```
+
+CSS 原生的 `@layer` 指令可以控制样式的优先级。lightningcss 支持 `@layer`，所以这在 Vite 8 中可以直接使用。
+
+**问题三：CSS 文件体积过大。**
+
+迁移后，TaskFlow Dashboard 的 CSS 总体积从 Webpack 时期的 45 KB 增长到了 62 KB。原因是 Tailwind CSS 4 的 `@import "tailwindcss"` 默认引入了所有工具层。可以通过配置 `@source` 指令来限制扫描范围：
+
+```css
+/* src/styles/app.css */
+@import "tailwindcss";
+
+/* 只扫描这些目录中的类名 */
+@source "../src/components";
+@source "../src/pages";
+```
+
+这样 Tailwind 只会扫描你指定的目录，未使用的工具类不会被包含在产物中。
+
+## 案例总结：TaskFlow Dashboard 的 CSS 配置
+
+迁移完成后，TaskFlow Dashboard 的 CSS 配置精简到了这样：
+
+```typescript
+// vite.config.ts
+import { defineConfig } from "vite";
+import tailwindcss from "@tailwindcss/vite";
+
+export default defineConfig({
+  plugins: [tailwindcss()],
+  css: {
+    modules: {
+      localsConvention: "camelCaseOnly",
+    },
+    transformer: "lightningcss",
+  },
+});
+```
+
+对比 Webpack 时期的配置（4 个 loader/plugin、2 个配置文件、近 100 行），Vite 的配置只有 15 行。功能完全一致：CSS Modules、Tailwind CSS、自动前缀、CSS 压缩、代码拆分。
+
+这里有一个取舍。Vite 的 CSS 处理是 "约定优于配置" 的——它预设了一套合理的默认行为。如果你需要非常精细地控制 CSS 的处理流程（比如自定义 PostCSS 插件的执行顺序、特殊的 CSS 模块化方案），Webpack 的 loader 链给了你更多的控制权，代价是配置复杂度。
+
+对于 TaskFlow Dashboard 来说，Vite 的默认行为完全满足需求。下一篇我们处理更复杂的需求——开发一个自定义 Vite 插件，替代之前团队写的 Webpack loader。

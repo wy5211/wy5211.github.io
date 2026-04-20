@@ -1,0 +1,646 @@
+---
+title: "03. 自动化部署：GitHub Actions CI/CD"
+date: "2026-04-12"
+summary: "每次部署都要 SSH 到服务器手动操作。GitHub Actions 怎么实现 push 代码后自动构建、测试、部署？"
+tags: ["CI/CD", "GitHub Actions", "DevOps", "自动化"]
+category: "devops"
+cover: ""
+draft: false
+series: "DevOps 实战指南"
+seriesOrder: 3
+---
+
+FlowAPI 已经通过 `https://flowapi.example.com` 对外服务了。Nginx 做反向代理，Let's Encrypt 证书自动续签，一切看起来很稳。
+
+直到你改了一个 bug，要部署新版本。流程是这样的：
+
+```bash
+# 1. 在本地构建镜像
+docker build -t flowapi:latest .
+
+# 2. 推到镜像仓库
+docker push your-registry.com/flowapi:latest
+
+# 3. SSH 到服务器
+ssh deploy@你的服务器IP
+
+# 4. 在服务器上拉新镜像
+docker pull your-registry.com/flowapi:latest
+
+# 5. 停掉旧容器，启动新容器
+docker stop flowapi && docker rm flowapi
+docker run -d --name flowapi --env-file /home/deploy/flowapi/.env \
+  -p 3000:3000 --restart unless-stopped \
+  your-registry.com/flowapi:latest
+
+# 6. 检查日志，确认没问题
+docker logs -f flowapi
+```
+
+这个过程你自己做还凑合，但团队里其他人也要部署呢？每次有人问"怎么部署"，你都得把上面这段发一遍。而且手动操作哪天忘了第 5 步里的 `--env-file` 参数，数据库连接就挂了。
+
+你需要自动化。具体来说，你需要两件事：
+
+1. **持续集成（CI）**：代码 push 上去之后，自动跑测试、构建镜像。代码有问题，在合并之前就拦住。
+2. **持续部署（CD）**：测试通过之后，自动部署到服务器。不需要任何人 SSH 上去操作。
+
+这就是 CI/CD。不是什么高深的概念，就是把上面那 6 步手动操作变成一条自动执行的流水线。
+
+## GitHub Actions 是什么
+
+GitHub Actions 是 GitHub 内置的 CI/CD 平台。和 Jenkins、GitLab CI 这些相比，它最大的优势是**不需要额外搭建服务**——你的代码在 GitHub 上，流水线配置直接放在仓库里，push 就能跑。
+
+几个核心概念：
+
+- **Workflow**：一条完整的流水线，用 YAML 文件定义，放在仓库的 `.github/workflows/` 目录下
+- **Job**：workflow 中的一个任务，可以并行也可以串行
+- **Step**：job 中的一个步骤，可以是运行命令，也可以调用别人写好的 Action
+- **Runner**：执行 job 的机器。GitHub 提供免费的 Linux/Windows/macOS runner，也可以自建
+- **Action**：可复用的操作单元，GitHub Marketplace 上有大量现成的
+
+画成图大概是这样：
+
+```
+Workflow: deploy.yml
+├── Job: test
+│   ├── Step: 检出代码
+│   ├── Step: 安装依赖
+│   ├── Step: 跑 lint
+│   └── Step: 跑测试
+├── Job: build
+│   ├── Step: 登录镜像仓库
+│   ├── Step: 构建 Docker 镜像
+│   └── Step: 推送镜像
+└── Job: deploy
+    ├── Step: SSH 到服务器
+    └── Step: 拉取新镜像并重启
+```
+
+三个 Job 按顺序执行：test 通过了才 build，build 通过了才 deploy。任何一个失败，后面的不执行。
+
+## 从 CI 开始：测试流水线
+
+先搭 CI 部分。目标是：push 到 main 分支时，自动安装依赖、跑 lint、跑测试。
+
+创建 `.github/workflows/ci.yml`：
+
+```yaml
+name: CI
+
+# 触发条件：push 到 main 分支，或者创建 Pull Request
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    # 使用 Ubuntu 最新版 runner
+    runs-on: ubuntu-latest
+
+    # 这些环境变量在所有 step 中都能用
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://flowapi:testpassword@localhost:5432/flowapi_test
+
+    # Service Container：启动一个 PostgreSQL 实例供测试使用
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: flowapi
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: flowapi_test
+        ports:
+          - 5432:5432
+        # 等待 PostgreSQL 准备好（通过检查端口是否可连接）
+        options: >-
+          --health-cmd="pg_isready -U flowapi"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      # 第一步：检出代码。GitHub 官方提供的 Action，把仓库代码拉到 runner 上
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      # 第二步：设置 Node.js 环境。这里用 20.x
+      - name: Setup Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "20.x"
+          # 开启依赖缓存，下次构建不用重新下载 node_modules
+          cache: "npm"
+
+      # 第三步：安装依赖
+      - name: Install dependencies
+        run: npm ci
+        # npm ci 比 npm install 更适合 CI 环境：
+        # - 严格按照 package-lock.json 安装，不更新 lock 文件
+        # - 如果 lock 文件和 package.json 不一致会报错
+        # - 比 npm install 快，因为跳过了解析步骤
+
+      # 第四步：代码检查
+      - name: Run lint
+        run: npm run lint
+
+      # 第五步：跑测试
+      - name: Run tests
+        run: npm test
+```
+
+这个配置里有一个值得注意的地方：**Service Container**。FlowAPI 需要 PostgreSQL，但 runner 上没有数据库。GitHub Actions 支持 Service Container——在 runner 上临时启动一个 PostgreSQL 容器，测试用完自动销毁。`DATABASE_URL` 环境变量指向的就是这个临时数据库。
+
+另一个细节是 Action 的版本。你看 `actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683` 这行，后面跟的不是 `v4` 这种 tag，而是一串 SHA。这是**最佳实践**——后面会专门讲为什么。
+
+## 加上构建：Docker 镜像流水线
+
+测试通过之后，构建 Docker 镜像并推送到镜像仓库。把这个加到同一个 workflow 里：
+
+```yaml
+build:
+  # 需要 test 通过才执行
+  needs: test
+  runs-on: ubuntu-latest
+
+  # 只有 push 到 main 才构建（PR 不需要）
+  if: github.event_name == 'push'
+
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+    # 设置 Docker Buildx——GitHub 官方的增强构建工具，支持缓存和多平台
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@6524a658d75be2d2da9e13f381a2f915914cfaa6 # v3.7.1
+
+    # 登录 Docker Hub（或你的私有镜像仓库）
+    - name: Log in to Docker Hub
+      uses: docker/login-action@74a5d142397b4f367a81961eba4e8cd7edddf772 # v3.3.0
+      with:
+        # 这两个值存在 GitHub Secrets 里，不硬编码
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+
+    # 构建并推送镜像
+    - name: Build and push Docker image
+      uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+      with:
+        context: .
+        push: true
+        # 用 Git commit SHA 作为 tag，而不是 latest
+        # 这样每次部署对应一个确定的镜像版本，方便回滚
+        tags: |
+          your-registry.com/flowapi:latest
+          your-registry.com/flowapi:${{ github.sha }}
+        # 使用 GitHub Actions 缓存加速构建
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+```
+
+几个设计决策值得说一说。
+
+镜像 tag 用了两个：`latest` 和 `github.sha`。`latest` 方便引用，`github.sha`（commit 的哈希值）保证每个版本有唯一标识。出了问题要回滚，直接部署上一个 commit 的镜像就行，不用猜 latest 指向的是哪个版本。
+
+缓存用了 `type=gha`——GitHub Actions Cache。Docker 构建最耗时的部分是下载基础镜像和安装依赖，这两步在层缓存命中时可以直接跳过。GitHub 提供每个仓库 10GB 的免费缓存空间，对大多数项目够用了。
+
+## CD：自动部署到服务器
+
+CI 通过了，镜像也推上去了。最后一步：SSH 到服务器，拉新镜像，重启容器。
+
+```yaml
+deploy:
+  needs: build
+  runs-on: ubuntu-latest
+  if: github.event_name == 'push'
+
+  steps:
+    - name: Checkout code
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+    # 通过 SSH 连接到服务器执行部署命令
+    - name: Deploy to server
+      uses: appleboy/ssh-action@2713531c2e928655077c02196c3d265e1e2f3791 # v1.1.0
+      with:
+        host: ${{ secrets.SERVER_HOST }}
+        username: ${{ secrets.SERVER_USER }}
+        key: ${{ secrets.SSH_PRIVATE_KEY }}
+        # 禁用严格主机密钥检查（因为 runner 每次都是新环境）
+        # 生产环境建议用 known_hosts 做验证
+        script: |
+          # 进入应用目录
+          cd /home/deploy/flowapi
+
+          # 拉取最新镜像
+          docker pull your-registry.com/flowapi:latest
+
+          # 停掉并删除旧容器（--rm 在容器存在时防止报错）
+          docker stop flowapi || true
+          docker rm flowapi || true
+
+          # 启动新容器
+          docker run -d \
+            --name flowapi \
+            --restart unless-stopped \
+            -p 3000:3000 \
+            --env-file .env \
+            --network flowapi-network \
+            your-registry.com/flowapi:latest
+
+          # 清理不再使用的旧镜像，释放磁盘空间
+          docker image prune -f
+
+          # 等待几秒后检查容器状态
+          sleep 5
+          docker ps --filter name=flowapi --format "{{.Status}}"
+```
+
+`deploy` 这个 job 做的事情和你之前手动操作一模一样，只不过现在由 GitHub Actions runner 代劳了。`docker stop flowapi || true` 里的 `|| true` 是因为第一次部署时容器还不存在，`docker stop` 会报错。加了 `|| true` 让它忽略这个错误继续执行。
+
+你可能会问：停容器到启动新容器之间，服务是不可用的。这个问题后面讲部署策略时会提到解决方案。
+
+## 密钥管理：GitHub Secrets
+
+回头看一下上面的配置，有几处用到了 `${{ secrets.XXX }}`：
+
+- `DOCKER_USERNAME` / `DOCKER_PASSWORD`：镜像仓库的认证信息
+- `SERVER_HOST` / `SERVER_USER` / `SSH_PRIVATE_KEY`：服务器登录信息
+- 未来可能还有 `DATABASE_URL`、`API_KEY` 之类的
+
+这些值**绝对不能写在 YAML 文件里**。一旦提交到 Git 仓库，就是公开的——即使你后面删掉，历史记录里还能找到。
+
+GitHub Secrets 是 GitHub 提供的加密存储。设置方式：
+
+1. 打开仓库页面，点 **Settings** -> **Secrets and variables** -> **Actions**
+2. 点 **New repository secret**
+3. 输入 Name（比如 `SSH_PRIVATE_KEY`）和 Value（你的 SSH 私钥内容）
+4. 保存
+
+在 workflow 里通过 `${{ secrets.SSH_PRIVATE_KEY }}` 引用。GitHub 在运行时会解密并注入，日志里会自动打码。
+
+SSH 部署需要单独配一对密钥。不要用你自己的个人密钥——生成一个专门给 CI/CD 用的：
+
+```bash
+# 在本地生成部署专用密钥
+ssh-keygen -t ed25519 -f ~/.ssh/deploy-key -C "github-actions-deploy"
+# 会生成两个文件：
+# ~/.ssh/deploy-key（私钥，放到 GitHub Secrets 的 SSH_PRIVATE_KEY）
+# ~/.ssh/deploy-key.pub（公钥，添加到服务器的 authorized_keys）
+```
+
+把公钥添加到服务器的 `deploy` 用户：
+
+```bash
+# 在服务器上执行
+echo "公钥内容" >> /home/deploy/.ssh/authorized_keys
+```
+
+这样 GitHub Actions runner 就能通过 SSH 连接到你的服务器了。如果将来密钥泄露，换一对就行，不影响你个人的密钥。
+
+## 完整的 workflow 文件
+
+把上面三部分拼在一起，就是完整的 CI/CD 流水线：
+
+```yaml
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://flowapi:testpassword@localhost:5432/flowapi_test
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: flowapi
+          POSTGRES_PASSWORD: testpassword
+          POSTGRES_DB: flowapi_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U flowapi"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: "20.x"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run lint
+        run: npm run lint
+
+      - name: Run tests
+        run: npm test
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@6524a658d75be2d2da9e13f381a2f915914cfaa6 # v3.7.1
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@74a5d142397b4f367a81961eba4e2c9edddf772 # v3.3.0
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+        with:
+          context: .
+          push: true
+          tags: |
+            your-registry.com/flowapi:latest
+            your-registry.com/flowapi:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Deploy to server
+        uses: appleboy/ssh-action@2713531c2e928655077c02196c3d265e1e2f3791 # v1.1.0
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /home/deploy/flowapi
+            docker pull your-registry.com/flowapi:latest
+            docker stop flowapi || true
+            docker rm flowapi || true
+            docker run -d \
+              --name flowapi \
+              --restart unless-stopped \
+              -p 3000:3000 \
+              --env-file .env \
+              --network flowapi-network \
+              your-registry.com/flowapi:latest
+            docker image prune -f
+            sleep 5
+            docker ps --filter name=flowapi --format "{{.Status}}"
+```
+
+push 到 main 之后，打开仓库的 **Actions** 页面，就能看到流水线在跑了。三个 job 依次执行，全部通过就是部署成功。
+
+## 部署策略：蓝绿部署
+
+上面的部署方式有个问题：`docker stop` 到新容器启动之间，服务是不可用的。虽然只有几秒钟，但如果有用户正在请求，会收到 502 错误。
+
+蓝绿部署是解决这个问题最经典的思路。维护两套环境（蓝和绿），同一时刻只有一套对外服务。部署新版本时，把新版本部署到空闲的那套环境，健康检查通过后，把流量切过去。
+
+在单机 Docker 场景下，简化版的蓝绿部署可以这样实现：
+
+```yaml
+- name: Deploy to server (blue-green)
+  uses: appleboy/ssh-action@2713531c2e928655077c02196c3d265e1e2f3791 # v1.1.0
+  with:
+    host: ${{ secrets.SERVER_HOST }}
+    username: ${{ secrets.SERVER_USER }}
+    key: ${{ secrets.SSH_PRIVATE_KEY }}
+    script: |
+      cd /home/deploy/flowapi
+
+      # 确定当前活跃的容器是哪个
+      # ACTIVE 文件记录当前对外服务的颜色（blue 或 green）
+      CURRENT=$(cat ACTIVE 2>/dev/null || echo "blue")
+
+      if [ "$CURRENT" = "blue" ]; then
+        TARGET="green"
+      else
+        TARGET="blue"
+      fi
+
+      echo "Current: $CURRENT, deploying to: $TARGET"
+
+      # 拉取新镜像
+      docker pull your-registry.com/flowapi:latest
+
+      # 部署到目标环境
+      docker stop flowapi-$TARGET || true
+      docker rm flowapi-$TARGET || true
+      docker run -d \
+        --name flowapi-$TARGET \
+        --restart unless-stopped \
+        -p 3001:3000 \
+        --env-file .env \
+        --network flowapi-network \
+        your-registry.com/flowapi:latest
+
+      # 健康检查：等待新容器就绪
+      for i in $(seq 1 30); do
+        if curl -sf http://localhost:3001/health > /dev/null 2>&1; then
+          echo "Health check passed"
+          break
+        fi
+        if [ "$i" = "30" ]; then
+          echo "Health check failed, aborting"
+          docker stop flowapi-$TARGET
+          exit 1
+        fi
+        sleep 1
+      done
+
+      # 切换流量：更新 Nginx 配置，把 upstream 指向新容器
+      sudo sed -i "s/flowapi-$CURRENT:3000/flowapi-$TARGET:3000/" \
+        /etc/nginx/sites-available/flowapi
+      sudo nginx -s reload
+
+      # 停掉旧容器
+      docker stop flowapi-$CURRENT || true
+
+      # 更新状态
+      echo "$TARGET" > ACTIVE
+
+      echo "Deployed to $TARGET, traffic switched"
+```
+
+这个方案里两个容器分别映射到 3000 和 3001 端口（宿主机），Nginx 的 upstream 指向当前活跃的那个。切换流量只需要 reload Nginx 配置——这个过程是优雅的，Nginx 会让正在处理的请求完成后再切换，不会丢请求。
+
+蓝绿部署的代价是多占一份资源（两个容器同时存在），但对 FlowAPI 这种 API 服务来说，多一个容器的开销微乎其微。真正复杂的蓝绿部署涉及数据库迁移、缓存预热等问题，这些在 Kubernetes 环境下有更成熟的方案。
+
+## 流水线安全
+
+CI/CD 流水线是一个高权限的入口——它能访问你的代码、构建镜像、部署到服务器。如果流水线被攻破，后果比代码泄露严重得多。
+
+### Pin Action 版本到 SHA
+
+前面所有 Action 的版本都是 SHA，不是 tag。比如：
+
+```yaml
+# 好的做法：用 commit SHA
+uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+# 不好的做法：用 tag
+uses: actions/checkout@v4
+```
+
+为什么？因为 tag 是可以被覆盖的。如果 `actions/checkout` 的维护者被入侵（或者仓库被 fork 恶意篡改），攻击者可以把 `v4` tag 指向一个包含恶意代码的 commit。所有用 `@v4` 的流水线都会执行恶意代码。
+
+用 SHA 就不会有这个问题——每个 commit 的 SHA 是唯一的、不可变的。当然，维护者发布了新版本你需要手动更新 SHA，但这正是你要的安全性。
+
+实际操作中，可以用 GitHub 的 **Dependabot** 自动检测 Action 的版本更新：
+
+```yaml
+# .github/dependabot.yml
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+```
+
+这样 Dependabot 会每周检查一次有没有新版本，有就给你提 PR。你 review 之后合并，既保持更新又不牺牲安全。
+
+### 最小权限原则
+
+给 workflow 的权限越少越好。在 workflow 级别设置：
+
+```yaml
+# 默认只给读权限
+permissions:
+  contents: read
+```
+
+大多数 CI workflow 只需要读代码的权限。只有需要 push tag、创建 release 的时候才需要写权限。不要图省事给 `permissions: write-all`。
+
+另外，Secrets 的范围是仓库级别的。如果组织里有多个仓库，考虑用 **Environment Secrets**——把 `production` 环境的 Secrets 和 `staging` 分开，避免测试环境的流水线意外访问到生产环境的密钥。
+
+## 构建加速
+
+CI 流水线的速度直接影响开发体验。每次 push 都等 5 分钟，开发者会很不耐烦。几个常用的加速手段。
+
+### Docker 层缓存
+
+前面已经用了 GitHub Actions Cache（`cache-from: type=gha`）。如果你的构建比较复杂，还可以用 Registry 缓存——把中间层镜像推到仓库：
+
+```yaml
+- name: Build and push Docker image
+  uses: docker/build-push-action@48aba3b46d1b1fec4febb7c5d0c644b249a11355 # v6.10.0
+  with:
+    context: .
+    push: true
+    tags: |
+      your-registry.com/flowapi:latest
+      your-registry.com/flowapi:${{ github.sha }}
+    # 同时使用 GitHub Cache 和 Registry Cache，双重保险
+    cache-from: |
+      type=gha
+      type=registry,ref=your-registry.com/flowapi:cache
+    cache-to: |
+      type=gha,mode=max
+      type=registry,ref=your-registry.com/flowapi:cache,mode=max
+```
+
+### 依赖缓存
+
+Node.js 的 `node_modules` 缓存前面已经配了（`cache: 'npm'`）。如果你的项目还有其他大的依赖目录，可以手动缓存：
+
+```yaml
+- name: Cache Prisma client
+  uses: actions/cache@6849a6489940f00c2f30c0fb92c6274307ccb58a # v4.1.2
+  with:
+    path: node_modules/.prisma
+    key: prisma-${{ runner.os }}-${{ hashFiles('prisma/schema.prisma') }}
+```
+
+`hashFiles` 用文件内容的哈希值做缓存 key。只有 `schema.prisma` 变了才重新生成 Prisma client。
+
+### 并行测试
+
+如果你的测试套件很大，可以考虑拆分并行跑：
+
+```yaml
+test:
+  runs-on: ubuntu-latest
+  strategy:
+    # 矩阵策略：同时跑 3 个 job，每个跑不同的测试文件
+    matrix:
+      shard: [1, 2, 3]
+  steps:
+    - name: Run tests (shard ${{ matrix.shard }})
+      run: npx vitest run --shard=${{ matrix.shard }}/3
+```
+
+`--shard=1/3` 表示"总共 3 份，跑第 1 份"。3 个 job 并行执行，测试时间缩短到约 1/3。
+
+## 常见陷阱
+
+搭 CI/CD 流水线踩坑是正常的。几个出现频率最高的问题。
+
+**测试在本地通过，在 CI 里失败**。最常见的原因是环境差异——本地 Node 版本和 CI 不一致、本地有全局安装的包、时区不同导致时间相关测试失败。解决办法：在本地也用 Docker 跑测试（和生产环境一致），或者锁定 Node 版本（`.nvmrc` 文件 + workflow 里指定版本）。
+
+**部署脚本是幂等的吗**。流水线可能因为网络问题重试，或者你手动重新触发。如果脚本不是幂等的（执行两次和一次结果不同），就会出问题。比如 `docker run` 如果容器已存在会报错——所以前面加了 `docker stop ... || true` 和 `docker rm ... || true`。
+
+**磁盘空间不足**。GitHub runner 的磁盘默认约 14GB 可用，Docker 镜像和层缓存很容易撑满。记得加 `docker image prune -f` 清理旧镜像。如果还不够，可以在 workflow 开头清理 runner 上的预装软件：
+
+```yaml
+- name: Free disk space
+  run: |
+    sudo rm -rf /usr/share/dotnet
+    sudo rm -rf /opt/ghc
+    sudo rm -rf /usr/local/share/boost
+    df -h
+```
+
+**Secrets 泄露**。虽然 GitHub 会在日志里自动打码 Secrets 的值，但不是 100% 可靠。如果你的脚本把环境变量输出到文件再打印文件内容，或者某个第三方 Action 有日志泄露 bug，Secrets 就可能暴露。定期轮换密钥是好的习惯。
+
+**流水线成了单点故障**。如果 GitHub Actions 宕机（虽然少见但确实发生过），你的部署就停了。对于关键业务，可以考虑备用方案——比如同时配一个 GitLab CI 或者 Jenkins 作为 fallback。不过在大多数情况下，GitHub Actions 的可靠性已经足够了。
+
+## 小结
+
+到这里，FlowAPI 的部署从手动 6 步变成了 push 即部署。整个过程是：
+
+```
+开发者 push 代码到 main
+  -> GitHub Actions 自动触发
+    -> 跑 lint + 测试（CI）
+    -> 构建并推送 Docker 镜像（Build）
+    -> SSH 到服务器部署新版本（CD）
+```
+
+几个 trade-off 值得权衡：
+
+GitHub Actions 的免费额度是公开仓库无限、私有仓库每月 2000 分钟。对 FlowAPI 这个规模够用了，但如果你的项目很大或者流水线很复杂，可能需要付费。和自建 Jenkins 相比，GitHub Actions 省去了运维 CI 服务器的成本，但你也把依赖放在了第三方平台上。
+
+蓝绿部署解决了停机问题，但增加了复杂度和资源占用。如果你的服务对几秒钟的停机不敏感（比如内部工具），直接停容器换新的可能更简单。
+
+Pin Action 到 SHA 提高了安全性，但也增加了维护成本。每个 Action 更新都要手动改 SHA 并合并。用 Dependabot 可以缓解这个问题，但终究比直接用 tag 多一步操作。
+
+流水线安全需要持续关注。这不是配一次就完的事——新的 Action 可能引入漏洞，Secrets 需要定期轮换，权限需要定期审查。
+
+下一篇，FlowAPI 要面对更大的挑战了：一台服务器扛不住流量增长，需要引入 Kubernetes 做容器编排。单机部署的经验会帮你更好地理解 K8s 在做什么。

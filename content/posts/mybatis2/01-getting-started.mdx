@@ -1,0 +1,369 @@
+---
+title: "01. 从 JDBC 到 MyBatis：为什么国内企业都选它"
+date: "2026-04-12"
+summary: "JDBC 写起来太痛苦，JPA 又不够灵活。MyBatis 处于什么位置？Spring Boot 3 + MyBatis 3.5 快速搭建，理解核心机制。"
+tags: ["MyBatis", "Java", "Spring Boot", "ORM"]
+category: "mybatis"
+cover: ""
+draft: false
+series: "MyBatis 实战指南"
+seriesOrder: 1
+---
+
+你接手了一个 Spring Boot 项目，打开数据访问层的代码，看到的是清一色的 JPA Repository。一个简单的多表联查要写 JPQL，性能差了要加 `@Query(nativeQuery = true)` 回退到原生 SQL，实体类上堆了一堆 `@OneToMany`、`@ManyToMany` 注解，改一个关联关系可能影响几十个查询。
+
+你想：有没有一种方案，让我直接写 SQL，但又不用处理 JDBC 那堆繁琐的代码？
+
+这就是 MyBatis 要解决的问题。
+
+## JDBC 的真实痛点
+
+先回顾一下纯 JDBC 的代码长什么样。这不是为了嘲笑 JDBC——它是 Java 数据库访问的基础，理解它的痛点才能理解 MyBatis 的价值。
+
+```java
+// 一个简单的"根据用户名查询用户"，JDBC 需要这么多代码
+public User findByUsername(String username) throws SQLException {
+    String sql = "SELECT id, username, email, age, create_time FROM users WHERE username = ?";
+    Connection conn = null;
+    PreparedStatement pstmt = null;
+    ResultSet rs = null;
+
+    try {
+        conn = dataSource.getConnection();
+        pstmt = conn.prepareStatement(sql);
+        pstmt.setString(1, username);
+        rs = pstmt.executeQuery();
+
+        if (rs.next()) {
+            User user = new User();
+            user.setId(rs.getLong("id"));
+            user.setUsername(rs.getString("username"));
+            user.setEmail(rs.getString("email"));
+            user.setAge(rs.getInt("age"));
+            user.setCreateTime(rs.getTimestamp("create_time").toLocalDateTime());
+            return user;
+        }
+        return null;
+    } finally {
+        // 别忘了关闭资源，而且顺序不能错
+        if (rs != null) rs.close();
+        if (pstmt != null) pstmt.close();
+        if (conn != null) conn.close();
+    }
+}
+```
+
+问题在哪？
+
+**代码堆砌**。5 个字段的手动映射就要写 5 行 `rs.getXxx()`，10 个字段就是 10 行。一个项目如果有 50 个表，每个表平均 10 个字段，光是映射代码就有 500 行。
+
+**资源管理容易出错**。Connection、PreparedStatement、ResultSet 都要关闭，顺序不能反（先开后关），异常时可能泄漏。`try-with-resources` 解决了一部分问题，但每次都要写。
+
+**SQL 硬编码在 Java 代码里**。改一个查询条件要改 Java 代码、重新编译、重新部署。DBA 没法直接审查 SQL。
+
+**没有自动化的参数绑定**。`pstmt.setString(1, username)` 中的索引 `1` 是硬编码的，加一个参数后面的索引全要改。
+
+## MyBatis 的核心思路
+
+MyBatis 的解决方案是：**把 SQL 从 Java 代码中抽离出来，放到 XML 文件（或注解）中，自动完成参数绑定和结果映射**。
+
+同样的查询，MyBatis 只需要两部分：
+
+Mapper 接口（Java）：
+
+```java
+public interface UserMapper {
+    User findByUsername(String username);
+}
+```
+
+Mapper XML（SQL 定义）：
+
+```xml
+<select id="findByUsername" resultType="com.bookhive.entity.User">
+    SELECT id, username, email, age, create_time
+    FROM users
+    WHERE username = #{username}
+</select>
+```
+
+调用的时候：
+
+```java
+User user = userMapper.findByUsername("zhang_wei");
+```
+
+三行代码搞定。SQL 在 XML 里，DBA 可以直接审查。参数绑定用 `#{username}`，MyBatis 自动处理 `PreparedStatement` 的参数设置。结果映射自动完成——只要数据库列名和 Java 属性名对应。
+
+这就是 MyBatis 的核心价值：**SQL 和代码分离，映射自动化**。
+
+## MyBatis vs JPA/Hibernate
+
+2026 年，Java 持久层框架的选择主要是 MyBatis 和 JPA（Hibernate 是最流行的 JPA 实现）。两者各有适用场景。
+
+| 维度       | MyBatis             | JPA/Hibernate                    |
+| ---------- | ------------------- | -------------------------------- |
+| SQL 控制   | 完全手写，精确控制  | 自动生成，优化空间有限           |
+| 学习曲线   | 低，会 SQL 就能上手 | 高，要理解 Session、懒加载、级联 |
+| 复杂查询   | 直接写 SQL，灵活    | 需要 JPQL 或原生 SQL             |
+| 性能优化   | 容易，SQL 是透明的  | 困难，要理解 SQL 生成逻辑        |
+| 切换数据库 | 需要修改 SQL        | 自动适配方言                     |
+| 国内使用率 | 约 80%              | 约 20%                           |
+
+选择建议不是"谁更好"的问题，而是"你的场景适合哪个"：
+
+**选 MyBatis 的场景**：业务查询复杂（多表联查、分组统计、子查询）、对 SQL 性能有严格要求、团队更熟悉 SQL、需要 DBA 参与 SQL 审查。国内大部分互联网公司属于这一类。
+
+**选 JPA 的场景**：业务以简单 CRUD 为主、需要快速开发、可能切换数据库、团队偏好面向对象的数据库操作方式。国外项目和初创公司更常见。
+
+BookHive 在线书店系统涉及多条件搜索、订单统计、库存管理等复杂查询，用 MyBatis 是合理的选择。
+
+## 搭建 BookHive 项目
+
+用 Spring Boot 3 + MyBatis 搭建项目。2026 年，直接用 Spring Boot 的 starter 依赖，不需要手动配置 `mybatis-config.xml`。
+
+### 项目依赖
+
+```xml
+<!-- pom.xml -->
+<parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>3.2.4</version>
+</parent>
+
+<dependencies>
+    <!-- MyBatis Spring Boot Starter -->
+    <dependency>
+        <groupId>org.mybatis.spring.boot</groupId>
+        <artifactId>mybatis-spring-boot-starter</artifactId>
+        <version>3.0.3</version>
+    </dependency>
+
+    <!-- MySQL 驱动 -->
+    <dependency>
+        <groupId>com.mysql</groupId>
+        <artifactId>mysql-connector-j</artifactId>
+        <scope>runtime</scope>
+    </dependency>
+
+    <!-- Spring Boot Web -->
+    <dependency>
+        <groupId>org.springframework.boot</groupId>
+        <artifactId>spring-boot-starter-web</artifactId>
+    </dependency>
+</dependencies>
+```
+
+注意版本：`mybatis-spring-boot-starter 3.0.x` 对应 MyBatis 3.5.x，支持 Spring Boot 3.x。
+
+### 数据库和表结构
+
+```sql
+-- BookHive 的用户表
+CREATE TABLE users (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    username VARCHAR(50) NOT NULL UNIQUE,
+    email VARCHAR(100) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    age INT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+-- 插入测试数据
+INSERT INTO users (username, email, password_hash, age)
+VALUES ('zhang_wei', 'zhangwei@bookhive.com', '$2a$10$xxxxx', 28),
+       ('li_na', 'lina@bookhive.com', '$2a$10$xxxxx', 25);
+```
+
+### 配置文件
+
+```yaml
+# application.yml
+spring:
+  datasource:
+    url: jdbc:mysql://localhost:3306/bookhive?useUnicode=true&characterEncoding=utf-8&serverTimezone=Asia/Shanghai
+    username: root
+    password: your_password
+    driver-class-name: com.mysql.cj.jdbc.Driver
+
+mybatis:
+  mapper-locations: classpath:mapper/*.xml
+  type-aliases-package: com.bookhive.entity
+  configuration:
+    map-underscore-to-camel-case: true # 下划线转驼峰，created_at → createdAt
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl # 开发时打印 SQL
+```
+
+三个关键配置：`mapper-locations` 告诉 MyBatis 去哪里找 XML 文件；`type-aliases-package` 让你在 XML 中写 `User` 而不是全限定类名；`map-underscore-to-camel-case` 自动处理数据库下划线命名和 Java 驼峰命名的转换。
+
+### 实体类和 Mapper
+
+```java
+package com.bookhive.entity;
+
+import java.time.LocalDateTime;
+
+public class User {
+    private Long id;
+    private String username;
+    private String email;
+    private String passwordHash;
+    private Integer age;
+    private LocalDateTime createdAt;
+    private LocalDateTime updatedAt;
+    // getter/setter 省略
+}
+```
+
+```java
+package com.bookhive.mapper;
+
+import com.bookhive.entity.User;
+import org.apache.ibatis.annotations.Mapper;
+
+@Mapper
+public interface UserMapper {
+    User findByUsername(String username);
+    User findById(Long id);
+    int insert(User user);
+}
+```
+
+`@Mapper` 注解让 Spring Boot 自动扫描并注册这个 Mapper 接口。也可以不用 `@Mapper`，而是在启动类上加 `@MapperScan("com.bookhive.mapper")` 一次性扫描整个包。
+
+Mapper XML：
+
+```xml
+<!-- src/main/resources/mapper/UserMapper.xml -->
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "https://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.bookhive.mapper.UserMapper">
+
+    <insert id="insert" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO users (username, email, password_hash, age)
+        VALUES (#{username}, #{email}, #{passwordHash}, #{age})
+    </insert>
+
+    <select id="findByUsername" resultType="User">
+        SELECT id, username, email, password_hash, age, created_at, updated_at
+        FROM users
+        WHERE username = #{username}
+    </select>
+
+    <select id="findById" resultType="User">
+        SELECT id, username, email, password_hash, age, created_at, updated_at
+        FROM users
+        WHERE id = #{id}
+    </select>
+</mapper>
+```
+
+注意 `useGeneratedKeys="true" keyProperty="id"`——插入后自动把数据库生成的主键回填到 `user.id`。没有这个配置，插入后 `user.getId()` 是 `null`。
+
+### Service 层调用
+
+```java
+package com.bookhive.service;
+
+import com.bookhive.entity.User;
+import com.bookhive.mapper.UserMapper;
+import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+
+@Service
+public class UserService {
+
+    private final UserMapper userMapper;
+
+    public UserService(UserMapper userMapper) {
+        this.userMapper = userMapper;
+    }
+
+    public User getByUsername(String username) {
+        return userMapper.findByUsername(username);
+    }
+
+    @Transactional
+    public void register(String username, String email, String passwordHash) {
+        User existing = userMapper.findByUsername(username);
+        if (existing != null) {
+            throw new IllegalArgumentException("用户名已存在: " + username);
+        }
+
+        User user = new User();
+        user.setUsername(username);
+        user.setEmail(email);
+        user.setPasswordHash(passwordHash);
+        userMapper.insert(user);
+        // user.getId() 此时已经有值（useGeneratedKeys 回填）
+    }
+}
+```
+
+到这里，BookHive 的用户注册和查询功能就完成了。启动项目，调用 `UserService.register()`，数据就写入数据库了。
+
+## 核心概念：SqlSession 和 Mapper 的关系
+
+理解 MyBatis 内部的工作机制有助于排查问题。
+
+**SqlSessionFactory**。整个应用只需要一个，它是线程安全的。Spring Boot 的 starter 会自动创建它。它负责创建 SqlSession。
+
+**SqlSession**。每次数据库操作都需要一个 SqlSession。它不是线程安全的，用完必须关闭（Spring 的 `@Transactional` 会自动管理它的生命周期）。
+
+**Mapper 接口**。你定义的 `UserMapper` 是一个接口，MyBatis 在运行时用 JDK 动态代理生成实现类。代理对象内部通过 SqlSession 执行 SQL。
+
+调用链路：`userMapper.findByUsername("zhang_wei")` → Mapper 代理对象 → SqlSession → `PreparedStatement` → 数据库 → 结果映射 → 返回 `User` 对象。
+
+在 Spring Boot 项目中，你不需要手动创建 SqlSessionFactory 和 SqlSession——starter 自动配置帮你做了这些。但如果出了问题（比如事务不生效、Mapper 找不到），了解这个链路能帮你快速定位。
+
+## #{} vs ${}：SQL 注入防护
+
+MyBatis 有两种参数占位符：`#{}` 和 `${}`。
+
+`#{}` 使用 `PreparedStatement` 的参数绑定。MyBatis 会把 `#{username}` 替换为 `?`，然后用 `setString` 设置参数值。这是安全的，能防止 SQL 注入。
+
+```xml
+<!-- MyBatis 实际执行的是：SELECT * FROM users WHERE username = ? -->
+<!-- 参数 "zhang_wei" 通过 PreparedStatement.setString() 绑定 -->
+<select id="findByUsername" resultType="User">
+    SELECT * FROM users WHERE username = #{username}
+</select>
+```
+
+`${}` 是字符串替换。MyBatis 直接把值拼接到 SQL 字符串中。如果值来自用户输入，就有 SQL 注入风险。
+
+```xml
+<!-- 危险！如果 column 来自用户输入，可能被注入恶意 SQL -->
+<select id="findByColumn" resultType="User">
+    SELECT * FROM users ORDER BY ${column}
+</select>
+```
+
+那 `${}` 什么时候用？只有一种场景：**SQL 的结构本身需要动态变化**。比如动态的列名、表名、`ORDER BY` 的排序方向——这些不能作为 `PreparedStatement` 的参数。
+
+```xml
+<!-- 合法用法：排序方向是 SQL 的一部分，不是参数值 -->
+<select id="findUsers" resultType="User">
+    SELECT * FROM users ORDER BY create_time ${sortDirection}
+</select>
+```
+
+在 Java 代码中，`sortDirection` 的值只能是 `"ASC"` 或 `"DESC"`，在传给 Mapper 之前就做好校验。不要把任何用户输入直接传给 `${}`。
+
+一个实用的原则：**默认用 `#{}`，只有确定需要字符串替换时才用 `${}`，并且 `${}` 的值必须在 Java 代码中校验**。
+
+## 什么时候不选 MyBatis
+
+MyBatis 不是万能的。如果你的项目符合以下特征，JPA 可能是更好的选择：
+
+- 业务逻辑以简单 CRUD 为主，很少有复杂查询
+- 频繁需要切换数据库（从 MySQL 换到 PostgreSQL）
+- 团队更习惯面向对象的方式操作数据
+- 项目周期很短，需要最快速度出活
+
+MyBatis 的代价是你要自己写 SQL。这意味着更多的代码量，以及维护 SQL 和 Java 之间的映射关系。如果项目简单，这个代价不值得。
+
+对于 BookHive 这样的项目——有复杂搜索、统计查询、多表关联——MyBatis 的灵活性优势是实打实的。下一篇我们深入 Mapper XML，掌握 MyBatis 最核心的配置方式。

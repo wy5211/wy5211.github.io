@@ -1,0 +1,394 @@
+---
+title: "04. 生产构建优化：代码分割与 Tree Shaking"
+date: "2026-04-12"
+summary: "开发服务器跑通了，但生产构建的产物体积怎么样？Vite 8 的 Rolldown 打包器和 Webpack 5 的分割策略有什么不同？"
+tags: ["Vite", "Rolldown", "Tree Shaking", "代码分割"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战指南"
+seriesOrder: 4
+---
+
+上一篇完成了基本迁移，开发服务器跑起来了。但生产构建的质量才是最终交付的标准。
+
+## 先看迁移前的产物
+
+TaskFlow Dashboard 用 Webpack 5 生产构建的产物：
+
+```
+dist/
+  static/
+    js/
+      main.a3f2b1c8.js        423 KB (gzip: 138 KB)
+      vendors.7e4d2f9a.js     892 KB (gzip: 276 KB)
+      chunk-dashboard.c8b3e1.js  67 KB (gzip: 22 KB)
+      chunk-settings.a1d4f2.js   34 KB (gzip: 12 KB)
+      chunk-tasks.e5c7b8.js      89 KB (gzip: 31 KB)
+    css/
+      main.d4e5f6.css          45 KB (gzip: 8 KB)
+  index.html                   1.2 KB
+```
+
+总共 1.49 MB 的 JS（gzip 后 479 KB），加上 45 KB CSS。首次加载需要下载 `main.js` + `vendors.js` + `main.css`，gzip 后合计 422 KB。
+
+这个数字不算差，但也不算好。`vendors.js` 将近 900 KB，里面包含了整个 React、React-DOM、React-Router、dayjs、zustand、antd 等依赖——不管用户当前在哪个页面，这些依赖都会被加载。
+
+构建时间呢？`npm run build` 从 4 分 12 秒。
+
+现在看 Vite 8 默认构建的产物。
+
+## Vite 8 默认的构建产物
+
+直接跑 `vite build`，不做任何额外配置：
+
+```
+dist/
+  assets/
+    index-Dk7b3N1M.js         412 KB (gzip: 135 KB)
+    index-C4sT8m2L.css         43 KB (gzip: 7.8 KB)
+    DashboardPage-Bk9pR4.js    58 KB (gzip: 19 KB)
+    SettingsPage-Hj2wN5.js     29 KB (gzip: 10 KB)
+    TasksPage-Qm7xY3.js        76 KB (gzip: 26 KB)
+    vendor-react-Cw1eR6.js    142 KB (gzip: 45 KB)
+    vendor-utils-Fg3hN7.js     89 KB (gzip: 31 KB)
+  index.html                    0.8 KB
+```
+
+总共 806 KB 的 JS（gzip 后 266 KB），加上 43 KB CSS。对比 Webpack 5：
+
+- 总体积从 1.49 MB 降到 806 KB，减少了 46%
+- gzip 后从 479 KB 降到 274 KB，减少了 43%
+- 首屏加载（index + vendor-react + vendor-utils + main.css）gzip 后约 219 KB，比 Webpack 的 422 KB 少了 48%
+
+构建时间呢？从 4 分 12 秒降到 **11 秒**。
+
+为什么差距这么大？主要有三个原因：Rolldown 的 Tree Shaking 更彻底、代码分割策略更合理、Oxc 的代码压缩率更高。
+
+## Rolldown 的构建管线
+
+Vite 8 用 Rolldown 做生产构建，替代了 Vite 5 的 esbuild 转换 + Rollup 打包的双阶段方案。整个构建管线在一个工具内完成，不需要在不同工具之间传递 AST。
+
+Rolldown 的构建过程分几个阶段：
+
+**解析阶段**。从入口文件开始，递归解析所有 `import` 语句，构建模块依赖图。Vite 8 用 Oxc 做 JavaScript/TypeScript 解析，速度比 SWC（Vite 5 使用的解析器）快约 2 倍。
+
+**链接阶段**。分析模块之间的引用关系，确定哪些导出被使用了、哪些是死代码。这一步是 Tree Shaking 的基础。
+
+**代码生成阶段**。把所有模块打包成最终的输出文件，执行代码分割、变量内联、常量折叠等优化。
+
+**压缩阶段**。用 Oxc 的压缩器（替代 terser）对输出代码做 minification。Oxc 的压缩速度比 terser 快 20-100 倍，压缩率基本持平。
+
+整个管线全在 Rust 中完成，没有跨语言调用。Vite 5 的管线需要在 JavaScript（Vite 主进程）、Go（esbuild）和 Rust（SWC）之间传递数据，每次传递都有序列化/反序列化开销。Rolldown 消除了这个开销。
+
+## 代码分割：Vite 和 Webpack 的策略差异
+
+代码分割（Code Splitting）的目标是把应用拆成多个文件，让浏览器只加载当前需要的代码。但"怎么拆"是个需要权衡的问题。
+
+### Webpack 5 的默认策略
+
+Webpack 5 默认使用 `SplitChunksPlugin`，它的策略比较保守：
+
+- 把所有来自 `node_modules` 的模块打包成一个 `vendors` chunk
+- 把被多个 chunk 共享的模块提取成单独的 chunk
+- 通过魔法注释（`/* webpackChunkName */`）手动指定 chunk
+
+这导致了 TaskFlow Dashboard 的问题：`vendors.js` 包含了所有依赖，即使用户只在设置页面用了 dayjs，它也会在首屏被加载。
+
+Webpack 可以通过配置 `SplitChunksPlugin` 的 `cacheGroups` 来细化分割，但这需要你手动列出哪些包应该单独分包。维护成本高，而且很容易过度分割（chunk 太多，HTTP 请求数增加）或分割不足（chunk 太大，首屏加载慢）。
+
+### Vite 8 的默认策略
+
+Vite 8 的代码分割策略更智能。Rolldown 默认的行为：
+
+- 动态 `import()` 的模块自动成为独立 chunk
+- 被 3 个以上 chunk 共享的模块自动提取
+- React 和 React-DOM 这种大型框架自动提取为独立 chunk
+
+Vite 8 引入了一个新的配置项 `build.splitChunks`（实验性），可以用 `manualChunks` 的方式更精细地控制分割：
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  build: {
+    splitChunks: {
+      // 策略一：按包名分割大型依赖
+      chunks(chunkInfo) {
+        const moduleIds = chunkInfo.modules.map((m) => m.id);
+        // 把 antd 单独分包
+        if (moduleIds.some((id) => id.includes("antd"))) {
+          return "vendor-antd";
+        }
+        // 把 React 生态单独分包
+        if (
+          moduleIds.some(
+            (id) => id.includes("react-dom") || id.includes("react-router")
+          )
+        ) {
+          return "vendor-react";
+        }
+      },
+    },
+    // 策略二：手动指定哪些包应该单独分包
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "vendor-react": ["react", "react-dom", "react-router-dom"],
+          "vendor-antd": ["antd", "@ant-design/icons"],
+          "vendor-utils": ["dayjs", "zustand", "axios"],
+        },
+      },
+    },
+  },
+});
+```
+
+`splitChunks` 和 `rollupOptions.output.manualChunks` 可以同时使用——`splitChunks` 的优先级更高。对于 TaskFlow Dashboard，用 `manualChunks` 就够了。
+
+### 路由级别的分割
+
+TaskFlow Dashboard 有 5 个主要路由页面。我们用了 React Router 的懒加载来做路由级分割：
+
+```typescript
+// router.tsx
+import { lazy, Suspense } from 'react';
+
+// 动态导入，每个页面自动成为独立 chunk
+const DashboardPage = lazy(() => import('./pages/DashboardPage'));
+const TasksPage = lazy(() => import('./pages/TasksPage'));
+const SettingsPage = lazy(() => import('./pages/SettingsPage'));
+const TeamPage = lazy(() => import('./pages/TeamPage'));
+const ReportsPage = lazy(() => import('./pages/ReportsPage'));
+
+export function AppRouter() {
+  return (
+    <Suspense fallback={<PageLoading />}>
+      <Routes>
+        <Route path="/" element={<DashboardPage />} />
+        <Route path="/tasks" element={<TasksPage />} />
+        <Route path="/settings" element={<SettingsPage />} />
+        <Route path="/team" element={<TeamPage />} />
+        <Route path="/reports" element={<ReportsPage />} />
+      </Routes>
+    </Suspense>
+  );
+}
+```
+
+这段代码在 Webpack 和 Vite 里都能工作——`React.lazy` + 动态 `import()` 是框架标准，不依赖构建工具。但 Vite 生成 chunk 的效果更好，因为它的分割粒度更合理。
+
+Webpack 生成的 chunk 里可能包含页面组件不需要的共享模块（因为 SplitChunksPlugin 的合并策略），而 Vite 只会包含页面真正用到的模块及其依赖。
+
+## Tree Shaking：为什么有些代码删不掉
+
+Tree Shaking 是基于 ES Module 的静态分析。打包器通过分析 `import` 和 `export` 语句，确定哪些导出没有被使用，然后在最终产物中删除这些"死代码"。
+
+理论上很简单，但实际中有不少情况会导致 Tree Shaking 失效。
+
+### sideEffects 的影响
+
+npm 包的 `package.json` 里有一个 `sideEffects` 字段，告诉打包器这个包在被 import 时是否有副作用。如果 `sideEffects: false`（或 `sideEffects: ["*.css"]`），打包器可以安全地删除没有被直接 import 的导出。如果 `sideEffects: true`（默认值），打包器不敢删除任何导出——因为可能存在全局的副作用代码。
+
+TaskFlow Dashboard 依赖了 23 个第三方包。检查发现其中 8 个没有声明 `sideEffects`。这意味着即使这些包的某些导出没有被使用，Rolldown 也不敢删除它们。
+
+大部分情况下这不会造成严重影响——只有那些导出很多函数但你只用了一两个的大型包（比如 lodash、datejs）才会因为这个原因多出几十 KB 的无用代码。
+
+解决方案：如果确认某个包没有副作用，可以在 Vite 配置里手动标记：
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  optimizeDeps: {
+    include: ["some-package"],
+  },
+  build: {
+    rollupOptions: {
+      treeshake: {
+        moduleSideEffects: (id) => {
+          // 告诉 Rolldown 这些包没有副作用
+          if (id.includes("some-safe-package")) return false;
+          return true;
+        },
+      },
+    },
+  },
+});
+```
+
+但这个操作有风险——如果你误判了一个包的副作用，可能导致运行时错误。只在确认安全的情况下才这样做。
+
+### CommonJS 模块无法 Tree Shake
+
+如果一个依赖是 CommonJS 格式（`module.exports = ...`），打包器无法做 Tree Shaking。因为 CommonJS 的导出是运行时赋值的，不是静态声明的，打包器无法静态分析哪些导出被使用了。
+
+这就是为什么 Vite 在开发模式要做依赖预构建——把 CommonJS 转成 ESM。在生产构建中，Rolldown 也会做同样的转换。但转换之后的 Tree Shaking 效果不如原生 ESM——转换过程可能丢失一些静态信息。
+
+TaskFlow Dashboard 的 23 个依赖中，15 个是原生 ESM（有 `"type": "module"` 或提供 ESM 入口），8 个是 CommonJS。后者的 Tree Shaking 效果较差，但 Rolldown 的转换质量比 esbuild 更好，损失较小。
+
+### 动态导入和间接引用
+
+Tree Shaking 只能分析静态的 `import` 语句。如果你用动态导入或间接引用，Tree Shaking 就失效了：
+
+```typescript
+// Tree Shaking 可以分析这种静态导入
+import { format, parse } from "date-fns";
+
+// Tree Shaking 无法分析这种动态导入
+const fn = await import(`./utils/${moduleName}`);
+
+// Tree Shaking 无法分析这种间接引用
+const utils = {
+  format: () => import("./format"),
+  parse: () => import("./parse"),
+};
+```
+
+TaskFlow Dashboard 有一个国际化模块用了动态导入来按需加载语言包：
+
+```typescript
+// i18n.ts
+const loadLocale = async (locale: string) => {
+  return import(`./locales/${locale}.json`);
+};
+```
+
+这种写法 Tree Shaking 无法处理——打包器不知道 `locale` 的值是什么，所以会把 `locales/` 目录下所有文件都打包进去。解决方法是改成明确的条件导入：
+
+```typescript
+// 优化后：打包器可以分析出可能加载的文件
+const localeMap: Record<string, () => Promise<any>> = {
+  "zh-CN": () => import("./locales/zh-CN.json"),
+  "en-US": () => import("./locales/en-US.json"),
+  "ja-JP": () => import("./locales/ja-JP.json"),
+};
+
+const loadLocale = async (locale: string) => {
+  const loader = localeMap[locale];
+  if (loader) return loader();
+  return import("./locales/zh-CN.json"); // 默认语言
+};
+```
+
+改完之后，只有被列出的 3 个语言文件会被打包（而且各自成为独立 chunk），其他语言文件不会进入产物。
+
+## 分析构建产物
+
+优化之前先要了解产物的组成。Vite 社区常用的分析工具是 `rollup-plugin-visualizer`：
+
+```bash
+npm install -D rollup-plugin-visualizer
+```
+
+```typescript
+// vite.config.ts
+import { visualizer } from "rollup-plugin-visualizer";
+
+export default defineConfig({
+  plugins: [
+    react(),
+    visualizer({
+      filename: "./stats.html",
+      open: true, // 构建完成后自动打开
+      gzipSize: true,
+    }),
+  ],
+});
+```
+
+跑一次 `vite build`，会生成一个 `stats.html` 文件，用交互式 treemap 展示每个 chunk 的组成。你可以看到哪个依赖占了多少空间，哪些模块可以进一步优化。
+
+TaskFlow Dashboard 的分析结果揭示了几个值得注意的点：
+
+**antd 的体积**。antd 占了总产物体积的 35%。但我们只用了 antd 20% 左右的组件。antd 支持 Tree Shaking（ESM 导出），但有些内部依赖（比如 `@ant-design/cssinjs`）的体积仍然不小。
+
+**dayjs 的 locale 文件**。dayjs 默认会加载所有 locale 文件（大约 80 个），但我们只用了中文和英文。在 Vite 里通过插件来只打包需要的 locale：
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  resolve: {
+    alias: {
+      "dayjs/locale$": "dayjs/locale/zh-cn.js",
+    },
+  },
+});
+```
+
+或者更好的做法是在代码里显式导入：
+
+```typescript
+// 只导入需要的 locale
+import "dayjs/locale/zh-cn";
+import "dayjs/locale/en";
+```
+
+**zustand 的体积**。zustand 本身很小（约 2 KB gzip），但 TaskFlow Dashboard 的 store 文件里有一些类型定义和序列化工具，占了额外 8 KB。这不是 zustand 的问题，是代码组织的问题。
+
+## 优化后的最终产物
+
+基于分析结果做了以下调整：
+
+1. 配置 `manualChunks` 把 antd 单独分包
+2. 去掉 dayjs 不需要的 locale
+3. 优化 i18n 模块的动态导入
+4. 清理几个未使用的工具函数（让 Tree Shaking 删除它们）
+
+优化后的产物：
+
+```
+dist/
+  assets/
+    index-Dk7b3N1M.js            398 KB (gzip: 128 KB)
+    index-C4sT8m2L.css            41 KB (gzip: 7.2 KB)
+    DashboardPage-Bk9pR4.js       52 KB (gzip: 17 KB)
+    SettingsPage-Hj2wN5.js        24 KB (gzip: 8 KB)
+    TasksPage-Qm7xY3.js           68 KB (gzip: 23 KB)
+    vendor-react-Cw1eR6.js       138 KB (gzip: 44 KB)
+    vendor-antd-Fg3hN7.js        156 KB (gzip: 49 KB)
+    vendor-utils-Hj4kP8.js        72 KB (gzip: 24 KB)
+    locale-zh-cn-Xm2bN9.js         4 KB (gzip: 1.5 KB)
+    locale-en-US-Yp3cM1.js         3.8 KB (gzip: 1.4 KB)
+  index.html                        0.8 KB
+```
+
+对比三个阶段的产物：
+
+| 指标            | Webpack 5  | Vite 8 默认 | Vite 8 优化后 |
+| --------------- | ---------- | ----------- | ------------- |
+| JS 总体积       | 1.49 MB    | 806 KB      | 916 KB        |
+| JS gzip 总体积  | 479 KB     | 266 KB      | 296 KB        |
+| 首屏加载 (gzip) | 422 KB     | 219 KB      | 229 KB        |
+| 构建时间        | 4 分 12 秒 | 11 秒       | 13 秒         |
+
+总体积略有增加（因为 antd 单独分包增加了 chunk 的 overhead），但首屏加载基本不变，而且路由切换时只加载对应的页面 chunk。用户实际体验到的加载体积更小了。
+
+构建时间从 13 秒比默认配置多了 2 秒——因为 `manualChunks` 和 `visualizer` 增加了一些处理开销。但相比 Webpack 的 4 分 12 秒，这完全可以忽略。
+
+## Vite 8 和 Webpack 5 的构建差异
+
+Rolldown 和 Webpack 5 在生产构建上的核心差异：
+
+**Tree Shaking 的深度**。Rolldown 基于 Rollup 的 Tree Shaking 实现，对 ESM 的支持比 Webpack 更彻底。Webpack 5 的 Tree Shaking 已经很好了，但在处理嵌套的 re-export（`export { x } from './a'`）和 namespace import（`import * as utils`）时，Rolldown 的分析更精确。
+
+**代码分割的默认行为**。Webpack 5 的默认分割策略偏保守（所有 node_modules 打成一个 chunk），Rolldown 的更激进（按共享关系自动分割）。前者对新手更友好（不需要配置），后者需要你理解分割策略并适当调整。
+
+**压缩器**。Vite 8 用 Oxc 压缩，Webpack 5 用 terser。Oxc 的压缩速度比 terser 快很多，但压缩率几乎一样。对最终用户没有区别，但 CI/CD 的构建时间差距明显。
+
+**CSS 处理**。Vite 8 用 lightningcss 处理 CSS，Webpack 5 用 PostCSS 生态。lightningcss 的 CSS 压缩率比 cssnano（Webpack 生态常用的 CSS 压缩器）高 5-10%，而且支持 CSS nesting、color-mix 等新特性的降级。
+
+**产物格式**。两者都支持 ES Module 和 SystemJS 格式。Webpack 5 还支持 AMD 和 CommonJS 格式输出，Vite 只支持 ES Module。如果你的项目需要非 ESM 格式的产物（比如给 Node.js 用的 CommonJS 包），Vite 不太适合。
+
+## 什么时候需要关心构建优化
+
+对于 TaskFlow Dashboard 这个规模的项目，Vite 8 的默认配置已经给出了不错的结果。手动优化的收益是首屏 gzip 从 219 KB 到 229 KB——几乎没有变化，但路由切换的体验更好了。
+
+构建优化投入产出比最高的场景：
+
+- **大型 SPA**（总产物 gzip 超过 500 KB）。默认分割策略不够用，需要精细控制 `manualChunks`。
+- **多页应用或微前端**。需要确保公共依赖只加载一次，页面之间的 chunk 不重复。
+- **移动端应用**。用户网络环境差，每减少 10 KB 都有意义。
+- **CDN 缓存命中率低**。chunk 的内容频繁变化导致缓存失效，需要优化 hash 策略。
+
+对于中小型项目，Vite 的默认配置就够了。把精力花在业务功能上比花在构建优化上更有价值。
+
+TaskFlow Dashboard 的迁移到这里就完成了。从 Webpack 到 Vite 8，开发体验的改善是显而易见的：启动从 18 秒到 300 毫秒，HMR 从秒级到毫秒级，构建从 4 分钟到 13 秒。配置文件从 4 个 800 行缩减到 1 个 80 行。团队里已经没人怀念 Webpack 了。

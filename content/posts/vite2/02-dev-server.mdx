@@ -1,0 +1,181 @@
+---
+title: "02. 开发服务器：ESM、HMR 与 Rolldown"
+date: "2026-04-12"
+summary: "Vite 的开发服务器为什么快？ESM 原生导入、依赖预构建、HMR——这些机制分别解决了什么问题？Vite 8 的 Rolldown 又带来了什么变化？"
+tags: ["Vite", "ESM", "HMR", "Rolldown"]
+category: "vite"
+cover: ""
+draft: false
+series: "Vite 实战指南"
+seriesOrder: 2
+---
+
+上一篇分析了 Webpack 的痛点，决定迁移到 Vite 8。这一篇理解迁移后的开发体验为什么不同。
+
+## 18 秒 vs 300 毫秒
+
+先看一个真实对比。TaskFlow Dashboard 在 Webpack 下启动开发服务器，流程是这样的：
+
+1. Webpack 从入口文件开始，递归解析所有 `import` 语句
+2. 340+ 个源文件 + 几百个 node_modules 依赖，全部读入内存
+3. 每个文件经过 loader 链处理：babel-loader 编译 TypeScript、postcss-loader 处理 CSS、url-loader 处理图片
+4. 所有模块打包成 bundle，写到磁盘（或内存文件系统）
+5. 浏览器加载这个巨大的 bundle，解析执行
+
+从你敲下 `npm run dev` 到浏览器能渲染页面，一共 18 秒。其中第 1-4 步占了 15 秒，第 5 步浏览器解析 bundle 花了 3 秒。
+
+换到 Vite 8 之后呢？同样的机器、同样的项目：
+
+1. Vite 启动一个静态文件服务器
+2. 浏览器请求 `index.html`
+3. 浏览器解析 HTML，遇到 `<script type="module" src="/src/main.tsx">`
+4. 浏览器向 Vite 请求 `main.tsx`
+5. Vite 收到请求，编译这个文件（TypeScript 转 JavaScript、JSX 转换），返回给浏览器
+6. 浏览器继续解析 `main.tsx`，发现它 `import` 了 `App.tsx`、`router.tsx` 等文件
+7. 浏览器逐个向 Vite 请求这些文件，Vite 按需编译返回
+
+从敲下 `npm run dev` 到页面可交互：**300 毫秒**。
+
+这不是夸张。Vite 根本没有在启动时做打包——它只在你需要某个文件的时候才编译那个文件。340 个源文件不会在启动时全部处理，只有首屏渲染涉及的大概 15-20 个文件会被即时编译。
+
+这两个数字之间的差距，就是 Webpack 和 Vite 在开发服务器架构上的根本差异。
+
+## 原生 ESM：浏览器自己做的事情，不需要构建工具代劳
+
+Webpack 的开发模式有一个核心假设：**浏览器不能直接运行你的源码**。所以它必须先把你所有的代码打包成浏览器能理解的格式。
+
+这个假设在 2020 年之前是对的。那时候大部分浏览器不支持 ES Modules（ESM），npm 上的包大多是 CommonJS 格式。Webpack 需要把所有东西转成浏览器能跑的 bundle。
+
+但到了 2026 年，所有主流浏览器都完整支持 ESM。`<script type="module">` 可以直接加载 ES 模块，浏览器自己处理模块依赖的解析和加载。这意味着构建工具不需要再在开发模式下做"打包"这件事——可以让浏览器按需加载模块。
+
+Vite 的开发服务器就是基于这个思路。它不打包你的源码，而是让浏览器通过原生 ESM 按需加载每个文件。Vite 只需要在中间做轻量的编译转换：TypeScript 转成 JavaScript、JSX 转成 `React.createElement` 调用、CSS 注入页面。
+
+这样做的好处是显而易见的：启动速度只取决于首屏需要的文件数量，而不是项目总文件数。一个 10000 个文件的项目和一个 100 个文件的项目，如果首屏都只需要加载 20 个文件，启动速度几乎一样。
+
+### 为什么 node_modules 不能直接用 ESM 加载
+
+你可能想：既然浏览器支持 ESM，那 node_modules 里的依赖也可以直接加载啊？
+
+不行。有两个原因：
+
+**第一，大部分 npm 包还是 CommonJS 格式**。虽然 ESM 是 JavaScript 的官方模块系统，但 npm 生态里有海量的包还在用 `module.exports` 导出。浏览器不认识 `module.exports`，它只认识 `import`/`export`。所以这些 CommonJS 包必须在服务端转成 ESM 格式，浏览器才能加载。
+
+**第二，npm 包的内部结构不适合按需加载**。一个 npm 包可能导出 50 个函数，分布在 30 个内部文件里。如果浏览器要加载这个包，它需要发 30 个 HTTP 请求——这比加载一个打包好的文件慢得多。
+
+所以 Vite 的做法是：**对你的源码按需加载，对 node_modules 里的依赖预构建**。
+
+## 依赖预构建：Rolldown 的用武之地
+
+依赖预构建（Dependency Pre-Bundling）是 Vite 开发服务器的关键环节。第一次启动时，Vite 会扫描你的源码找到所有 `import` 的第三方依赖，然后用 Rolldown（Vite 8 默认）把它们打包成 ESM 格式。
+
+具体来说，预构建做了三件事：
+
+**第一，CommonJS 转 ESM**。把 `module.exports = xxx` 转成 `export default xxx`，让浏览器能直接 `import`。
+
+**第二，合并内部模块**。`lodash-es` 有 600 多个文件，预构建会把它们合并成少量 ESM 模块。React、React-DOM、date-fns 这些包也是同理。
+
+**第三，处理内部依赖关系**。很多包之间有互相引用（比如 React-DOM 引用 React 的内部模块），预构建会理顺这些关系，避免浏览器发起循环请求。
+
+在 Vite 8 中，预构建由 Rolldown 完成。Vite 5 用的是 esbuild，切换到 Rolldown 之后有两个改进：
+
+- 预构建产物和生产构建使用同一个打包器，行为更一致。Vite 5 用 esbuild 预构建、用 Rollup 生产构建，有时候开发环境和生产环境的行为不一致（比如 Tree Shaking 的结果不同），现在这个问题少了。
+- 预构建的速度更快了。Rolldown 的多线程能力比 esbuild 的单线程更好，在大项目中（500+ 依赖）预构建时间减少了 30-40%。
+
+预构建的产物缓存在 `node_modules/.vite` 目录下。只要 `package.json` 的依赖列表和 lockfile 没变，下次启动会直接用缓存，不需要重新构建。这就是为什么第二次启动 Vite 通常比第一次快很多。
+
+## HMR：精确更新 vs 全量刷新
+
+HMR（Hot Module Replacement）是开发体验中影响最大的功能。改了一行代码，你希望立刻在页面上看到效果，而不是等页面刷新。
+
+Webpack 的 HMR 有一个固有问题：**它基于 bundle**。Webpack 开发模式下虽然也做了很多优化（比如缓存、增量编译），但最终产物仍然是一个或多个 bundle。当你改了一个文件，Webpack 需要重新编译受影响的模块，重新打包成 bundle，然后通过 WebSocket 通知浏览器更新。
+
+问题在于"受影响的模块"可能比你想象的多。假设你改了 `src/utils/format.ts` 里的一个工具函数，这个函数被 20 个组件引用，这 20 个组件又各自引用了其他模块。Webpack 需要重新编译整个依赖链，然后决定是精确更新还是全量刷新。如果依赖关系太复杂，Webpack 会放弃精确更新，直接刷新整个页面。
+
+Vite 的 HMR 完全不同。因为它用的是原生 ESM，每个文件都是一个独立的模块，浏览器直接加载。当你改了 `format.ts`，Vite 只需要：
+
+1. 重新编译 `format.ts`（几毫秒）
+2. 通过 WebSocket 通知浏览器："`format.ts` 变了"
+3. 浏览器重新请求 `format.ts`，获取新版本
+4. 引用了 `format.ts` 的模块执行更新逻辑
+
+整个过程不需要重新打包，不需要重新编译其他文件。**HMR 的范围精确到单个模块**。
+
+在 TaskFlow Dashboard 中的实际体验：
+
+- 改一个组件的 JSX：HMR 更新时间约 50 毫秒，页面上只有这个组件重新渲染
+- 改一个 CSS 文件：HMR 更新时间约 30 毫秒，只有使用这个 CSS 的元素重新渲染
+- 改 `App.tsx`（根组件）：HMR 更新时间约 80 毫秒，整个应用重新渲染但不会丢失状态
+- 改 `vite.config.ts`：需要重启开发服务器，因为配置变更影响了构建管线
+
+对比 Webpack 下的同一项目：
+
+- 改一个组件的 JSX：HMR 更新时间约 500-2000 毫秒（取决于依赖链长度）
+- 改一个 CSS 文件：约 300-800 毫秒
+- 改一个被广泛引用的工具函数：经常触发全量刷新，2-3 秒
+
+这个差距在大项目中会被放大。项目越大、依赖关系越复杂，Vite 的 ESM HMR 优势越明显。
+
+### Vite 8 的浏览器控制台转发
+
+Vite 8 新增了一个叫 Browser Console Forwarding 的功能。简单说，Vite 服务端的编译错误和警告可以直接转发到浏览器的开发者工具里显示。
+
+以前的做法是：Vite 服务端报了一个 TypeScript 类型错误，它会在终端打印错误信息，同时把错误信息嵌入到页面上（那个半透明的错误遮罩层）。你要在两个地方看错误——终端和浏览器。
+
+现在 Vite 8 把服务端的错误通过 WebSocket 推送到浏览器的 Console 面板。你只需要看浏览器开发者工具就能看到所有错误，包括编译错误、HMR 错误、插件报告的警告。终端的输出和浏览器的 Console 同步了。
+
+这个改动看起来不大，但在日常开发中体验提升很明显——你不需要在编辑器、终端、浏览器三个窗口之间来回切换了。
+
+## Full Bundle Mode：什么时候需要"全量打包"
+
+Vite 的按需加载在大多数场景下都很快，但有一种情况是例外：**首屏加载的模块非常多**。
+
+如果你的应用路由结构很深，首屏渲染需要加载 50 个以上的模块，浏览器需要发起 50+ 个 HTTP 请求。虽然每个请求都很快（本地服务器），但浏览器的并发连接数有限（Chrome 对同一域名最多 6 个并发连接），50 个请求需要排队。
+
+Vite 8 提供了一个实验性的 Full Bundle Mode 来解决这个问题。开启后，Vite 会在开发模式下也做全量打包——像 Webpack 一样把所有模块打包成 bundle，然后服务给浏览器。
+
+```typescript
+// vite.config.ts
+export default defineConfig({
+  server: {
+    bundleMode: "bundle", // 实验性功能
+  },
+});
+```
+
+什么场景下需要考虑这个选项：
+
+- 首屏加载模块超过 40-50 个，浏览器请求数成为瓶颈
+- 微前端架构中，子应用之间的依赖关系复杂
+- 需要和生产环境的行为完全一致（比如调试生产环境特有的问题）
+
+对于大多数普通项目，默认的按需加载模式已经够快了，不需要开启 Full Bundle Mode。TaskFlow Dashboard 的首屏模块大约 20 个，完全不需要。
+
+## 和 Webpack dev server 的关键差异
+
+总结一下两个开发服务器的架构差异，以及这些差异在实际开发中的影响。
+
+**启动机制**。Webpack 在启动时打包所有代码，Vite 按需编译。影响：大项目启动速度差距巨大（18 秒 vs 300 毫秒）。
+
+**模块加载**。Webpack 通过 bundle 加载模块，Vite 通过原生 ESM。影响：Vite 的 HMR 更精确，因为每个文件是独立的。Webpack 的 HMR 需要重新评估依赖链。
+
+**依赖处理**。Webpack 把所有依赖和源码一起打包，Vite 把源码和依赖分开处理（源码按需编译，依赖预构建）。影响：Vite 的预构建是独立步骤，缓存机制更清晰。
+
+**配置复杂度**。Webpack dev server 的配置分散在 `devServer`、`output`、`module` 等多个配置项中。Vite 的开发服务器配置集中在 `server` 字段。影响：Vite 的配置更直观，改一个地方不会意外影响其他地方。
+
+**代理配置**。两者都支持代理，但写法不同。Webpack 用 `devServer.proxy`，Vite 用 `server.proxy`。功能上基本等价，Vite 多了 `configure` 钩子可以自定义代理服务器。
+
+**错误处理**。Webpack 的编译错误通过 overlay 显示，终端也有输出。Vite 8 把所有错误统一推送到浏览器 Console。Vite 的方式更集中，但如果你习惯了看终端输出，可能需要适应。
+
+## TaskFlow Dashboard 的实际体验
+
+把 TaskFlow Dashboard 从 Webpack 迁到 Vite 之后，开发体验的改善是立竿见影的。
+
+**启动时间**：从 18 秒降到 300 毫秒。以前每次启动开发服务器都要等一会儿，现在基本上是即时的。早上打开电脑跑 `npm run dev`，页面秒开。
+
+**HMR 速度**：改组件代码从 500-2000 毫秒降到 50-80 毫秒。以前改样式要等一小会儿才看到效果，现在几乎是"改完就能看到"。这看起来只是几百毫秒的差距，但在高频修改的时候（调 UI 细节、试不同配色），累积起来的体验差异非常大。
+
+**配置维护**：Webpack 4 个配置文件加起来 800 多行，Vite 一个配置文件不到 80 行。而且 Vite 的配置是线性的——从上往下读就能理解整个构建流程，不需要在多个文件之间跳来跳去。
+
+**但也不是全没问题**。迁移之后发现两个小问题：一是某些 Webpack 特有的全局变量（`process.env.NODE_ENV`）需要改成 Vite 的 `import.meta.env.MODE`；二是 `index.html` 必须放在项目根目录（Webpack 允许放在任意位置通过配置指定）。这些我们下一篇迁移实战里详细说。
+
+理解了 Vite 开发服务器的工作原理之后，下一篇我们动手把 TaskFlow Dashboard 从 Webpack 迁移到 Vite 8，一步步来。

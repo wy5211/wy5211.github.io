@@ -1,0 +1,298 @@
+---
+title: "08 数据验证与插件"
+date: "2026-03-23"
+summary: "实现健壮的数据验证系统，开发可复用的 Mongoose 插件"
+tags: ["Mongoose", "验证", "插件", "Validator"]
+category: "mongoose"
+draft: false
+series: "Mongoose 渐进式学习"
+seriesOrder: 8
+---
+
+上一篇我们学习了中间件，能在数据操作前后自动执行逻辑。但中间件主要用于处理流程控制，对于数据本身的完整性和合法性检查，还需要更专门的机制。
+
+数据验证是确保数据质量的关键。如果数据库中充斥着格式错误的邮箱、必填字段缺失、超出范围的数值，会导致各种业务逻辑错误和用户体验问题。Mongoose 提供了丰富的验证器和可扩展的插件系统，帮助我们构建健壮的数据层。
+
+## 内置验证器
+
+Mongoose 提供了多种内置验证器，可以满足大多数常见的验证需求。这些验证器在 Schema 定义时直接配置，无需额外代码。
+
+```typescript
+const schema = new Schema({
+  // 必填验证
+  name: {
+    type: String,
+    required: [true, "姓名不能为空"], // 带错误消息
+    required: true, // 简洁形式
+  },
+
+  // 字符串长度验证
+  title: {
+    type: String,
+    minlength: [5, "标题至少 5 个字符"],
+    maxlength: [200, "标题最多 200 个字符"],
+  },
+
+  // 数字范围验证
+  age: {
+    type: Number,
+    min: [0, "年龄不能为负数"],
+    max: [150, "年龄超出合理范围"],
+  },
+
+  // 枚举验证
+  status: {
+    type: String,
+    enum: {
+      values: ["draft", "published", "archived"],
+      message: "状态值无效",
+    },
+  },
+
+  // 正则验证
+  email: {
+    type: String,
+    match: [/^[^\s@]+@[^\s@]+\.[^\s@]+$/, "邮箱格式不正确"],
+  },
+
+  // 自定义错误消息
+  username: {
+    type: String,
+    validate: {
+      validator: function (v) {
+        return v.length >= 3;
+      },
+      message: "用户名至少 3 个字符",
+    },
+  },
+});
+```
+
+这些内置验证器覆盖了大部分场景：required 确保字段存在，minlength/maxlength 限制字符串长度，min/max 限制数字范围，enum 限制取值范围，match 用正则表达式验证格式。
+
+验证的执行时机是在 save() 或 validate() 调用时。需要注意的是，updateOne() 和 updateMany() 默认不运行验证器，需要设置 runValidators: true 选项。
+
+```typescript
+// update 默认不验证
+await Post.updateOne({ _id: id }, { status: "invalid" });
+
+// 启用验证
+await Post.updateOne(
+  { _id: id },
+  { status: "invalid" },
+  { runValidators: true }
+); // 会抛出验证错误
+```
+
+## 自定义验证器
+
+当内置验证器不够用时，可以编写自定义验证器。验证器是一个函数，接收字段值作为参数，返回 true 表示验证通过，返回 false 或抛出错误表示验证失败。
+
+```typescript
+// 同步验证器
+userSchema.path("email").validate(function (email) {
+  const regex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return regex.test(email);
+}, "邮箱格式不正确");
+
+// 带上下文的验证器（可以访问其他字段）
+userSchema.path("password").validate(function (password) {
+  if (!this.isModified("password")) {
+    return true;
+  }
+  return password && password.length >= 8;
+}, "密码至少 8 个字符");
+
+// 验证确认密码
+userSchema.path("passwordConfirm").validate(function (value) {
+  return value === this.password;
+}, "两次密码输入不一致");
+```
+
+自定义验证器可以通过 this 访问文档实例，这样可以实现跨字段验证。比如验证确认密码是否匹配、结束日期是否晚于开始日期等。
+
+## 异步验证器
+
+有些验证需要查询数据库或调用外部服务，这时需要使用异步验证器。异步验证器返回 Promise，Mongoose 会等待验证完成。
+
+```typescript
+// 验证邮箱唯一性
+userSchema.path("email").validate(async function (email) {
+  const user = await this.constructor.findOne({ email });
+  // 如果是新用户，或者邮箱属于当前用户，则通过
+  return !user || this._id.equals(user._id);
+}, "邮箱已被使用");
+
+// 验证标签是否存在
+postSchema.path("tags").validate(async function (tags) {
+  const Tag = mongoose.model("Tag");
+  const existingTags = await Tag.find({ name: { $in: tags } });
+  return existingTags.length === tags.length;
+}, "部分标签不存在");
+
+// 验证用户余额
+orderSchema.path("userId").validate(async function (userId) {
+  const user = await User.findById(userId);
+  return user && user.balance >= this.totalAmount;
+}, "用户余额不足");
+```
+
+异步验证器虽然强大，但要注意性能问题。每次保存都会执行数据库查询，如果验证逻辑复杂，可能成为性能瓶颈。可以考虑使用缓存或者限制验证的触发频率。
+
+## 验证错误处理
+
+验证失败时，Mongoose 会抛出 ValidationError 异常，包含详细的错误信息。正确处理这些错误可以提供友好的用户反馈。
+
+```typescript
+try {
+  await user.save();
+} catch (error) {
+  if (error.name === "ValidationError") {
+    const errors = {};
+
+    // 遍历验证错误
+    for (const field in error.errors) {
+      errors[field] = error.errors[field].message;
+    }
+
+    // 返回给前端
+    return {
+      success: false,
+      errors,
+    };
+  }
+}
+
+// 或者使用 API 风格的错误处理
+app.post("/users", async (req, res) => {
+  try {
+    const user = await User.create(req.body);
+    res.json(user);
+  } catch (error) {
+    if (error.name === "ValidationError") {
+      res.status(400).json({
+        error: "验证失败",
+        details: Object.fromEntries(
+          Object.entries(error.errors).map(([field, err]) => [
+            field,
+            err.message,
+          ])
+        ),
+      });
+    } else {
+      res.status(500).json({ error: "服务器错误" });
+    }
+  }
+});
+```
+
+错误对象包含丰富的信息：错误字段、错误消息、错误类型等。可以根据这些信息定制错误处理逻辑，或者直接返回给前端显示。
+
+## 更新验证
+
+前面提到 update 操作默认不验证，但可以通过选项启用。不过要注意，更新验证有一些限制：它只验证被修改的字段，而且不会运行默认值和自定义验证器。
+
+```typescript
+// 启用验证的更新
+await Post.findByIdAndUpdate(
+  id,
+  { status: "invalid" },
+  {
+    runValidators: true,
+    context: "query", // 确保验证器可以访问查询上下文
+  }
+);
+
+// 批量更新时验证
+await User.updateMany(
+  { role: "user" },
+  { status: "active" },
+  { runValidators: true }
+);
+```
+
+如果需要完整的验证逻辑，建议先查询文档，修改字段后再保存。这样可以确保所有验证器都运行，包括默认值和自定义验证器。
+
+```typescript
+// 先查后改，确保完整验证
+const user = await User.findById(id);
+user.status = "active";
+user.email = "new@example.com";
+await user.save(); // 所有验证器都会运行
+```
+
+## 插件开发
+
+插件是复用 Schema 逻辑的好方法。一个插件本质上是一个函数，接收 Schema 和选项作为参数，可以添加字段、方法、中间件、验证器等。
+
+```typescript
+// 时间戳插件
+function timestampsPlugin(schema) {
+  schema.add({
+    createdAt: {
+      type: Date,
+      default: Date.now,
+      immutable: true, // 防止修改
+    },
+    updatedAt: {
+      type: Date,
+      default: Date.now,
+    },
+  });
+
+  schema.pre("save", function (next) {
+    if (this.isModified()) {
+      this.updatedAt = new Date();
+    }
+    next();
+  });
+}
+
+// 软删除插件
+function softDeletePlugin(schema, options = {}) {
+  const deletedAtField = options.deletedAtField || "deletedAt";
+  const deletedByField = options.deletedByField || "deletedBy";
+
+  schema.add({
+    [deletedAtField]: Date,
+    [deletedByField]: schema.options._id,
+  });
+
+  schema.pre(/^find/, function (next) {
+    this.where({ [deletedAtField]: { $exists: false } });
+    next();
+  });
+
+  schema.methods.softDelete = function (userId) {
+    this[deletedAtField] = new Date();
+    this[deletedByField] = userId;
+    return this.save();
+  };
+
+  schema.query.withDeleted = function () {
+    return this.where({ [deletedAtField]: { $exists: true } });
+  };
+}
+
+// 使用插件
+userSchema.plugin(timestampsPlugin);
+postSchema.plugin(timestampsPlugin);
+postSchema.plugin(softDeletePlugin, {
+  deletedAtField: "deletedAt",
+  deletedByField: "deletedBy",
+});
+```
+
+插件可以把通用逻辑封装起来，避免代码重复。比如时间戳、软删除、分页、全文搜索等功能都很适合做成插件。
+
+Mongoose 社区有很多成熟的插件可以直接使用，比如 mongoose-autopopulate（自动填充）、mongoose-lean-getters（支持 lean 模式下的 getter）、mongoose-delete（增强的软删除）等。在使用前先搜索一下，避免重复造轮子。
+
+## 验证的权衡
+
+数据验证是必要的，但也要考虑其成本。每次保存都要运行所有验证器，如果验证逻辑复杂，会影响性能。
+
+对于关键数据，比如邮箱、手机号、金额等，严格的验证是值得的。但对于一些非关键数据，可以适当放宽验证要求。比如用户昵称，不需要太严格的格式限制，让用户有更多自由度。
+
+另一个考虑是前后端验证的分工。前端验证可以提供即时反馈，提升用户体验；后端验证是最后的防线，确保数据完整性。不要依赖前端验证，因为用户可以绕过前端直接调用 API。
+
+验证器也不是万能的，有些业务规则无法在 Schema 层表达。比如"一个用户只能有三篇草稿文章"这样的规则，需要在服务层实现。合理分配验证逻辑，让代码既安全又清晰。

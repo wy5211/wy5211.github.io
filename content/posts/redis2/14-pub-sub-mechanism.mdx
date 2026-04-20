@@ -1,0 +1,471 @@
+---
+title: "14. 发布订阅机制：实时消息推送与广播"
+date: "2026-03-23"
+summary: "掌握 Redis 发布订阅机制，实现实时消息推送、聊天室和消息广播功能。"
+tags: ["Redis", "发布订阅", "Pub/Sub"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 14
+---
+
+上篇文章我们用分布式锁解决了礼物结算的并发问题。现在直播平台有个新需求：用户送礼物时，要实时通知主播和所有观众。
+
+这听起来像聊天室，但实现起来有很多细节：用户进入直播间要订阅消息，离开要取消订阅，消息要实时广播给所有人。Redis 的发布订阅（Pub/Sub）机制很适合这种场景。
+
+## 为什么要用发布订阅
+
+你可能觉得用 HTTP 轮询就能实现：客户端每隔几秒请求一次服务器，检查有没有新消息。但这种方式效率低，延迟高，而且服务器压力大。
+
+WebSocket 长连接可以解决实时性问题，但怎么管理连接？怎么把消息推送给所有订阅者？Redis Pub/Sub 提供了一个简单的解决方案：
+
+- 发布者把消息发送到频道
+- 订阅者订阅频道后，能实时收到消息
+- 一个频道可以有多个订阅者
+- 一个订阅者可以订阅多个频道
+
+## 基础用法
+
+先看最简单的发布订阅：
+
+```typescript
+import Redis from "ioredis";
+
+// 发布者和订阅者需要不同的连接
+const publisher = new Redis();
+const subscriber = new Redis();
+
+// 订阅频道
+async function setupSubscriber() {
+  // 订阅直播间礼物通知频道
+  await subscriber.subscribe("livestream:room:abc123:gifts");
+
+  // 监听消息
+  subscriber.on("message", (channel, message) => {
+    console.log(`收到消息 [${channel}]:`, message);
+    const data = JSON.parse(message);
+    console.log(`用户 ${data.username} 送了 ${data.giftName}`);
+  });
+}
+
+// 发布消息
+async function publishGift(roomId: string, username: string, giftName: string) {
+  const channel = `livestream:room:${roomId}:gifts`;
+
+  const message = JSON.stringify({
+    username,
+    giftName,
+    timestamp: Date.now(),
+  });
+
+  // 发布消息，返回订阅者数量
+  const count = await publisher.publish(channel, message);
+  console.log(`消息发送给 ${count} 个订阅者`);
+}
+```
+
+注意：发布者和订阅者必须用不同的 Redis 连接。因为订阅会让连接进入订阅模式，这个连接就不能执行其他命令了。
+
+## 模式订阅
+
+有时候需要订阅一类频道，比如所有直播间的礼物频道：
+
+```typescript
+// 使用模式订阅
+async function setupPatternSubscriber() {
+  // 订阅所有直播间的礼物频道
+  await subscriber.psubscribe("livestream:room:*:gifts");
+
+  // 监听消息
+  subscriber.on("pmessage", (pattern, channel, message) => {
+    console.log(`模式匹配 [${pattern}]: ${channel}`);
+    const data = JSON.parse(message);
+    console.log(`房间 ${channel} 收到礼物：${data.giftName}`);
+  });
+}
+```
+
+`*` 是通配符，匹配任意字符。这样就能订阅所有符合模式的频道。
+
+## 实际应用：直播间弹幕系统
+
+让我们用 Pub/Sub 实现一个完整的直播间弹幕系统：
+
+```typescript
+class LiveChatService {
+  private publisher: Redis;
+  private userSubscriptions: Map<string, Redis> = new Map();
+
+  constructor() {
+    this.publisher = new Redis();
+  }
+
+  // 用户加入直播间
+  async joinRoom(
+    userId: string,
+    roomId: string,
+    callback: (message: any) => void
+  ) {
+    console.log(`用户 ${userId} 加入房间 ${roomId}`);
+
+    // 每个用户用独立的订阅连接
+    const subscriber = new Redis();
+    const channel = `livestream:room:${roomId}:chat`;
+
+    // 订阅房间聊天频道
+    await subscriber.subscribe(channel);
+
+    // 监听消息
+    subscriber.on("message", (ch, message) => {
+      if (ch === channel) {
+        const data = JSON.parse(message);
+        // 过滤掉自己发的消息（如果需要）
+        if (data.userId !== userId) {
+          callback(data);
+        }
+      }
+    });
+
+    // 保存订阅连接
+    this.userSubscriptions.set(userId, subscriber);
+
+    // 通知其他人用户加入
+    await this.publishSystemMessage(roomId, "join", {
+      userId,
+      username: `user_${userId.slice(-4)}`,
+    });
+  }
+
+  // 用户离开直播间
+  async leaveRoom(userId: string, roomId: string) {
+    console.log(`用户 ${userId} 离开房间 ${roomId}`);
+
+    const subscriber = this.userSubscriptions.get(userId);
+    if (subscriber) {
+      // 取消订阅
+      const channel = `livestream:room:${roomId}:chat`;
+      await subscriber.unsubscribe(channel);
+      subscriber.disconnect();
+      this.userSubscriptions.delete(userId);
+    }
+
+    // 通知其他人用户离开
+    await this.publishSystemMessage(roomId, "leave", {
+      userId,
+      username: `user_${userId.slice(-4)}`,
+    });
+  }
+
+  // 发送弹幕
+  async sendChat(
+    roomId: string,
+    userId: string,
+    username: string,
+    content: string
+  ) {
+    const channel = `livestream:room:${roomId}:chat`;
+
+    const message = JSON.stringify({
+      type: "chat",
+      userId,
+      username,
+      content,
+      timestamp: Date.now(),
+    });
+
+    await this.publisher.publish(channel, message);
+  }
+
+  // 发送系统消息
+  private async publishSystemMessage(
+    roomId: string,
+    action: string,
+    data: any
+  ) {
+    const channel = `livestream:room:${roomId}:chat`;
+
+    const message = JSON.stringify({
+      type: "system",
+      action,
+      ...data,
+      timestamp: Date.now(),
+    });
+
+    await this.publisher.publish(channel, message);
+  }
+
+  // 发送礼物通知
+  async sendGift(
+    roomId: string,
+    userId: string,
+    username: string,
+    giftName: string,
+    count: number
+  ) {
+    const channel = `livestream:room:${roomId}:gifts`;
+
+    const message = JSON.stringify({
+      userId,
+      username,
+      giftName,
+      count,
+      timestamp: Date.now(),
+    });
+
+    await this.publisher.publish(channel, message);
+  }
+}
+
+// 使用示例
+const chatService = new LiveChatService();
+
+// 用户加入房间
+chatService.joinRoom("usr_a1b2c3", "abc123", (message) => {
+  console.log("收到消息：", message);
+  // 通过 WebSocket 推送给用户
+  websocket.send(JSON.stringify(message));
+});
+
+// 用户发送弹幕
+chatService.sendChat("abc123", "usr_a1b2c3", "zhang_wei", "主播好帅！");
+
+// 用户送礼物
+chatService.sendGift("abc123", "usr_a1b2c3", "zhang_wei", "火箭", 1);
+```
+
+## 实际应用：系统事件总线
+
+Pub/Sub 还可以实现系统事件总线，用于不同服务之间的通信：
+
+```typescript
+class EventBus {
+  private publisher: Redis;
+  private subscribers: Map<string, Redis> = new Map();
+  private handlers: Map<string, Set<(data: any) => void>> = new Map();
+
+  constructor() {
+    this.publisher = new Redis();
+  }
+
+  // 发布事件
+  async emit(event: string, data: any) {
+    const channel = `event:${event}`;
+
+    const message = JSON.stringify({
+      event,
+      data,
+      timestamp: Date.now(),
+    });
+
+    await this.publisher.publish(channel, message);
+  }
+
+  // 订阅事件
+  on(event: string, callback: (data: any) => void) {
+    if (!this.handlers.has(event)) {
+      this.handlers.set(event, new Set());
+
+      // 创建订阅连接
+      const subscriber = new Redis();
+      subscriber.subscribe(`event:${event}`);
+
+      subscriber.on("message", (channel, message) => {
+        const eventName = channel.replace("event:", "");
+        const handlers = this.handlers.get(eventName);
+        if (handlers) {
+          const data = JSON.parse(message);
+          handlers.forEach((handler) => handler(data));
+        }
+      });
+
+      this.subscribers.set(event, subscriber);
+    }
+
+    this.handlers.get(event)!.add(callback);
+  }
+
+  // 取消订阅
+  off(event: string, callback: (data: any) => void) {
+    const handlers = this.handlers.get(event);
+    if (handlers) {
+      handlers.delete(callback);
+
+      // 如果没有处理器了，取消订阅
+      if (handlers.size === 0) {
+        const subscriber = this.subscribers.get(event);
+        if (subscriber) {
+          subscriber.unsubscribe(`event:${event}`);
+          subscriber.disconnect();
+          this.subscribers.delete(event);
+        }
+        this.handlers.delete(event);
+      }
+    }
+  }
+}
+
+// 使用示例
+const eventBus = new EventBus();
+
+// 订阅用户创建事件
+eventBus.on("user.created", (data) => {
+  console.log("新用户注册：", data);
+  // 发送欢迎邮件
+  sendWelcomeEmail(data.email);
+});
+
+// 订阅礼物事件
+eventBus.on("gift.sent", (data) => {
+  console.log("收到礼物：", data);
+  // 更新排行榜
+  updateLeaderboard(data.roomId, data.userId, data.amount);
+});
+
+// 发布事件
+await eventBus.emit("user.created", {
+  id: "usr_new123",
+  username: "new_user",
+  email: "user@example.com",
+});
+
+await eventBus.emit("gift.sent", {
+  roomId: "abc123",
+  userId: "usr_a1b2c3",
+  giftName: "火箭",
+  amount: 5000,
+});
+```
+
+## Pub/Sub 的局限性
+
+Pub/Sub 虽然简单易用，但也有一些局限性：
+
+### 1. 消息不持久化
+
+如果订阅者离线，期间发送的消息就丢失了：
+
+```typescript
+// 订阅者 A 离线
+await publisher.publish("news", "消息1"); // A 收不到
+
+// 订阅者 A 上线
+await subscriber.subscribe("news");
+
+await publisher.publish("news", "消息2"); // A 能收到
+```
+
+这对聊天室来说可能没问题，但对于需要可靠消息的场景就不合适了。
+
+### 2. 没有消息确认机制
+
+Pub/Sub 是即发即弃的，不会追踪哪些订阅者收到了消息，哪些没收到。
+
+### 3. 网络断开需要重新订阅
+
+如果订阅者的网络断开，需要重新订阅频道。
+
+## 可靠消息方案
+
+如果需要可靠的消息传递，可以考虑以下方案：
+
+### 方案一：结合 Stream
+
+Redis 5.0+ 提供了 Stream 数据结构，支持消息持久化和消费组：
+
+```typescript
+class ReliablePubSub {
+  constructor(private redis: Redis) {}
+
+  // 发布消息（同时写入 Stream）
+  async publish(channel: string, message: any) {
+    const data = JSON.stringify(message);
+
+    // 发布实时消息
+    await this.redis.publish(channel, data);
+
+    // 写入 Stream（持久化）
+    await this.redis.xadd(
+      `stream:${channel}`,
+      "*",
+      "data",
+      data,
+      "timestamp",
+      Date.now().toString()
+    );
+  }
+
+  // 订阅消息（实时 + 历史）
+  async subscribe(channel: string, callback: (msg: any) => void) {
+    const subscriber = new Redis();
+
+    // 订阅实时消息
+    await subscriber.subscribe(channel);
+    subscriber.on("message", (ch, msg) => {
+      if (ch === channel) {
+        callback(JSON.parse(msg));
+      }
+    });
+
+    // 读取历史消息
+    const stream = `stream:${channel}`;
+    let lastId = "0";
+
+    while (true) {
+      const messages = await this.redis.xread(
+        "BLOCK",
+        1000,
+        "STREAMS",
+        stream,
+        lastId
+      );
+
+      if (messages) {
+        for (const [, streamMessages] of messages) {
+          for (const [id, fields] of streamMessages) {
+            lastId = id;
+            callback(JSON.parse(fields[1]));
+          }
+        }
+      }
+    }
+  }
+}
+```
+
+### 方案二：使用专用消息队列
+
+对于更复杂的消息场景，建议使用专门的消息队列：
+
+- RabbitMQ：支持消息确认、持久化、死信队列
+- Kafka：高吞吐量，适合大数据场景
+- Redis Stream：轻量级方案，功能足够
+
+## Trade-off 分析
+
+Pub/Sub 方案的权衡：
+
+**优势**：
+
+- 实时性好，消息即时推送
+- 实现简单，代码量少
+- 支持多对多通信
+- 支持模式订阅，灵活性强
+
+**劣势**：
+
+- 消息不持久化，离线订阅者收不到
+- 没有消息确认，可能丢消息
+- 网络断开需要重新订阅
+- 不支持消息回溯
+
+**适用场景**：
+
+- 实时聊天室
+- 实时通知系统
+- 系统事件总线
+- 能容忍消息丢失的场景
+
+对于直播平台的弹幕和礼物通知，Pub/Sub 是合适的选择：实时性要求高，消息丢了也没关系（用户不会因为错过一条弹幕而投诉）。而且实现简单，易于维护。
+
+如果需要可靠消息传递，建议使用 Redis Stream 或专门的消息队列。虽然复杂度增加，但能保证消息不丢失。

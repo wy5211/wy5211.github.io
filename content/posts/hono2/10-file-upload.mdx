@@ -1,0 +1,475 @@
+---
+title: "10. 文件上传处理"
+date: "2026-03-20"
+summary: "掌握文件上传的完整流程，学习处理 multipart/form-data、验证文件类型和大小、存储到本地或云服务，以及实现安全的文件上传功能。"
+tags: ["Hono", "File Upload", "Multipart", "Cloudflare R2", "Security"]
+category: "hono"
+cover: ""
+draft: false
+series: "Hono 渐进式学习"
+seriesOrder: 10
+---
+
+## 前言
+
+在上一篇文章中，我们实现了完整的 JWT 认证系统，用户可以安全地注册、登录，并通过 Token 访问受保护的资源。现在我们的博客 API 已经有了用户系统和文章管理功能，但还缺少一个重要的特性：文章封面图。
+
+你可能在想，为什么不能直接把图片转成 Base64 存在数据库里？确实可以这么做，但这会带来很多问题：数据库会变得臃肿、查询变慢、备份文件变大。更好的做法是把文件单独存储，在数据库里只保存文件路径或 URL。
+
+文件上传看似简单，但实际上有很多细节需要处理：如何验证文件类型和大小、如何防止恶意文件上传、如何存储文件（本地还是云服务）、如何处理大文件上传等等。这些细节处理不好，就可能导致安全漏洞或性能问题。
+
+在本篇文章中，我们将为博客 API 添加文章封面图上传功能，你会学习到如何安全地处理文件上传，以及如何将文件存储到 Cloudflare R2 这样的云存储服务。
+
+## 为什么文件上传需要特别处理
+
+你可能会问，不就是接收一个文件然后保存吗？为什么需要这么多步骤？
+
+让我举个例子说明文件上传可能带来的问题。假设你的博客 API 允许用户上传文章封面图，但没有做任何验证：
+
+- 攻击者上传一个名为 "avatar.jpg" 的 PHP 脚本文件，如果服务器执行了这个文件，就能获取服务器控制权
+- 攻击者上传一个 10GB 的文件，直接把服务器存储空间占满
+- 攻击者不断上传文件，耗尽服务器带宽和资源
+
+这些都是真实发生过的安全事件。所以我们需要做好验证和防护。
+
+Hono 提供了处理 multipart/form-data 的能力，这是文件上传使用的标准格式。我们结合 Zod 做数据验证，结合 Cloudflare R2 做云存储，就能构建一个安全可靠的文件上传系统。
+
+## 基础文件上传实现
+
+首先让我们看看如何处理一个简单的文件上传请求。
+
+```typescript
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+
+const upload = new Hono();
+
+// 定义上传验证 schema
+const uploadSchema = z.object({
+  file: z
+    .instanceof(File)
+    .refine(
+      (file) => file.size <= 5 * 1024 * 1024,
+      "File size must be less than 5MB"
+    )
+    .refine(
+      (file) => ["image/jpeg", "image/png", "image/webp"].includes(file.type),
+      "Only JPEG, PNG, and WebP images are allowed"
+    ),
+});
+
+// 上传接口
+upload.post("/cover", zValidator("form", uploadSchema), async (c) => {
+  const { file } = c.req.valid("form");
+
+  // 获取文件信息
+  const fileInfo = {
+    name: file.name,
+    type: file.type,
+    size: file.size,
+  };
+
+  return c.json({
+    success: true,
+    data: fileInfo,
+  });
+});
+```
+
+这段代码做了几件事：用 Zod 验证上传的文件，检查文件大小不超过 5MB，文件类型只能是 JPEG、PNG 或 WebP 图片。验证通过后，返回文件的基本信息。
+
+不过这只是接收了文件，还没有保存。接下来我们需要把文件存储起来。在边缘环境中，最好的方式是使用云存储服务，比如 Cloudflare R2。
+
+## 存储到 Cloudflare R2
+
+为什么选择 R2 而不是本地存储？边缘环境（比如 Cloudflare Workers）是无状态的，没有本地文件系统。即使有本地存储，在不同实例之间也无法共享。R2 是 Cloudflare 提供的对象存储服务，兼容 S3 API，非常适合存储用户上传的文件。
+
+```typescript
+upload.post("/cover", zValidator("form", uploadSchema), async (c) => {
+  const { file } = c.req.valid("form");
+  const user = c.get("user"); // 从认证中间件获取当前用户
+
+  // 生成唯一的文件名（使用 UUID 避免冲突）
+  const ext = file.name.split(".").pop();
+  const filename = `${crypto.randomUUID()}.${ext}`;
+
+  // 构建存储路径：covers/用户ID/文件名
+  const key = `covers/${user.id}/${filename}`;
+
+  // 上传到 R2
+  await c.env.R2.put(key, file.stream(), {
+    httpMetadata: {
+      contentType: file.type,
+    },
+  });
+
+  // 生成公开访问 URL
+  const publicUrl = `${c.env.R2_PUBLIC_URL}/${key}`;
+
+  return c.json({
+    success: true,
+    data: {
+      url: publicUrl,
+      key: key,
+      size: file.size,
+      type: file.type,
+    },
+  });
+});
+```
+
+这里我们为每个用户创建独立的文件夹，用 UUID 作为文件名，这样既避免了文件名冲突，也方便按用户管理文件。上传成功后，返回文件的公开访问 URL，前端可以直接用这个 URL 显示图片。
+
+## 处理多个文件
+
+有时候我们需要一次上传多个文件，比如文章配图。Hono 也能轻松处理。
+
+```typescript
+// 多文件上传 schema
+const multiUploadSchema = z.object({
+  files: z
+    .array(z.instanceof(File))
+    .min(1, "At least one file is required")
+    .max(10, "Maximum 10 files allowed"),
+});
+
+upload.post("/gallery", zValidator("form", multiUploadSchema), async (c) => {
+  const { files } = c.req.valid("form");
+  const user = c.get("user");
+
+  const uploadedFiles = [];
+
+  // 并发上传所有文件
+  await Promise.all(
+    files.map(async (file) => {
+      const ext = file.name.split(".").pop();
+      const filename = `${crypto.randomUUID()}.${ext}`;
+      const key = `gallery/${user.id}/${filename}`;
+
+      await c.env.R2.put(key, file.stream(), {
+        httpMetadata: {
+          contentType: file.type,
+        },
+      });
+
+      uploadedFiles.push({
+        url: `${c.env.R2_PUBLIC_URL}/${key}`,
+        key: key,
+        size: file.size,
+      });
+    })
+  );
+
+  return c.json({
+    success: true,
+    data: uploadedFiles,
+  });
+});
+```
+
+这段代码允许用户一次上传最多 10 个文件，使用 Promise.all 并发上传以提高效率。
+
+## 图片处理和优化
+
+用户上传的图片可能很大，直接存储和传输会浪费带宽和存储空间。我们可以在上传时对图片进行处理和优化。
+
+```typescript
+import sharp from "sharp";
+
+upload.post("/cover", zValidator("form", uploadSchema), async (c) => {
+  const { file } = c.req.valid("form");
+  const user = c.get("user");
+
+  // 将文件转换为 Buffer
+  const arrayBuffer = await file.arrayBuffer();
+  const buffer = Buffer.from(arrayBuffer);
+
+  // 使用 sharp 处理图片
+  const processedImage = await sharp(buffer)
+    .resize(1200, 630, {
+      // 调整大小为 1200x630（适合社交媒体分享）
+      fit: "cover",
+      position: "center",
+    })
+    .webp({ quality: 85 }) // 转换为 WebP 格式，质量 85%
+    .toBuffer();
+
+  // 生成文件名
+  const filename = `${crypto.randomUUID()}.webp`;
+  const key = `covers/${user.id}/${filename}`;
+
+  // 上传处理后的图片
+  await c.env.R2.put(key, processedImage, {
+    httpMetadata: {
+      contentType: "image/webp",
+    },
+  });
+
+  const publicUrl = `${c.env.R2_PUBLIC_URL}/${key}`;
+
+  return c.json({
+    success: true,
+    data: {
+      url: publicUrl,
+      key: key,
+      size: processedImage.length,
+      type: "image/webp",
+    },
+  });
+});
+```
+
+这段代码用 sharp 库处理图片：先调整大小为 1200x630（这是社交媒体推荐的封面图尺寸），然后转换为 WebP 格式（比 JPEG 更小，质量更好）。这样既能保证图片质量，又能减少存储空间和传输带宽。
+
+## 文件删除和管理
+
+用户可能会上传错误的图片，或者删除文章时需要同时删除封面图。我们需要提供删除文件的功能。
+
+```typescript
+// 删除文件
+upload.delete("/file/:key", authMiddleware, async (c) => {
+  const { key } = c.req.param();
+  const user = c.get("user");
+
+  // 检查文件是否属于当前用户
+  if (
+    !key.startsWith(`covers/${user.id}/`) &&
+    !key.startsWith(`gallery/${user.id}/`)
+  ) {
+    return c.json(
+      {
+        success: false,
+        message: "You can only delete your own files",
+      },
+      403
+    );
+  }
+
+  // 从 R2 删除
+  await c.env.R2.delete(key);
+
+  return c.json({
+    success: true,
+    message: "File deleted successfully",
+  });
+});
+
+// 列出用户的所有文件
+upload.get("/files", authMiddleware, async (c) => {
+  const user = c.get("user");
+
+  // 列出封面图
+  const covers = await c.env.R2.list({
+    prefix: `covers/${user.id}/`,
+  });
+
+  // 列出相册图片
+  const gallery = await c.env.R2.list({
+    prefix: `gallery/${user.id}/`,
+  });
+
+  return c.json({
+    success: true,
+    data: {
+      covers: covers.objects.map((obj) => ({
+        key: obj.key,
+        size: obj.size,
+        uploaded: obj.uploaded,
+        url: `${c.env.R2_PUBLIC_URL}/${obj.key}`,
+      })),
+      gallery: gallery.objects.map((obj) => ({
+        key: obj.key,
+        size: obj.size,
+        uploaded: obj.uploaded,
+        url: `${c.env.R2_PUBLIC_URL}/${obj.key}`,
+      })),
+    },
+  });
+});
+```
+
+删除文件时我们检查文件是否属于当前用户，防止用户删除别人的文件。列出文件功能让用户可以管理自己上传的所有文件。
+
+## 安全最佳实践
+
+文件上传是很多安全漏洞的源头，我们需要做好以下几点防护：
+
+**1. 验证文件内容，而不只是扩展名**
+
+```typescript
+// 使用 file-type 库检测真实的文件类型
+import { fileTypeFromBuffer } from "file-type";
+
+const buffer = await file.arrayBuffer();
+const type = await fileTypeFromBuffer(Buffer.from(buffer));
+
+if (!type || !["image/jpeg", "image/png", "image/webp"].includes(type.mime)) {
+  return c.json(
+    {
+      success: false,
+      message: "Invalid file type",
+    },
+    400
+  );
+}
+```
+
+**2. 限制文件大小**
+
+```typescript
+const MAX_FILE_SIZE = 5 * 1024 * 1024; // 5MB
+
+if (file.size > MAX_FILE_SIZE) {
+  return c.json(
+    {
+      success: false,
+      message: "File size exceeds limit",
+    },
+    400
+  );
+}
+```
+
+**3. 生成安全的文件名**
+
+```typescript
+// 不要使用原始文件名，可能包含特殊字符或路径遍历攻击
+const unsafeName = file.name; // ❌
+
+// 使用 UUID 生成唯一文件名
+const safeName = `${crypto.randomUUID()}.${ext}`; // ✅
+```
+
+**4. 隔离用户文件**
+
+```typescript
+// 为每个用户创建独立的文件夹
+const key = `uploads/${userId}/${filename}`;
+```
+
+**5. 设置速率限制**
+
+```typescript
+import { rateLimiter } from "hono/rate-limiter";
+
+// 限制每个用户每分钟最多上传 10 个文件
+const uploadLimiter = rateLimiter({
+  windowMs: 60 * 1000,
+  max: 10,
+  keyGenerator: (c) => c.get("user")?.id || "anonymous",
+});
+
+upload.post("/cover", uploadLimiter, ...);
+```
+
+## 完整的上传路由
+
+让我们把所有功能整合起来：
+
+```typescript
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+import { authMiddleware } from "../middleware/auth";
+
+const upload = new Hono();
+
+// 验证 schema
+const uploadSchema = z.object({
+  file: z
+    .instanceof(File)
+    .refine(
+      (file) => file.size <= 5 * 1024 * 1024,
+      "File size must be less than 5MB"
+    )
+    .refine(
+      (file) => ["image/jpeg", "image/png", "image/webp"].includes(file.type),
+      "Only JPEG, PNG, and WebP images are allowed"
+    ),
+});
+
+// 上传文章封面
+upload.post(
+  "/cover",
+  authMiddleware,
+  zValidator("form", uploadSchema),
+  async (c) => {
+    const { file } = c.req.valid("form");
+    const user = c.get("user");
+
+    const ext = file.name.split(".").pop();
+    const filename = `${crypto.randomUUID()}.${ext}`;
+    const key = `covers/${user.id}/${filename}`;
+
+    await c.env.R2.put(key, file.stream(), {
+      httpMetadata: {
+        contentType: file.type,
+      },
+    });
+
+    return c.json({
+      success: true,
+      data: {
+        url: `${c.env.R2_PUBLIC_URL}/${key}`,
+        key: key,
+      },
+    });
+  }
+);
+
+// 删除文件
+upload.delete("/:key", authMiddleware, async (c) => {
+  const { key } = c.req.param();
+  const user = c.get("user");
+
+  if (!key.includes(`${user.id}/`)) {
+    return c.json(
+      {
+        success: false,
+        message: "Unauthorized",
+      },
+      403
+    );
+  }
+
+  await c.env.R2.delete(key);
+
+  return c.json({
+    success: true,
+    message: "File deleted",
+  });
+});
+
+export default upload;
+```
+
+## Trade-off 分析
+
+文件上传有很多实现方式，每种都有各自的优缺点：
+
+**云存储 vs 本地存储**
+
+云存储（如 R2、S3）的优势是可扩展性强、不需要管理存储服务器、CDN 集成方便。缺点是需要额外成本、有网络延迟。本地存储的优势是速度快、无额外成本、完全控制。缺点是扩展性差、需要备份、边缘环境不可用。
+
+对于边缘应用，云存储是更好的选择，因为边缘节点本身没有持久化存储。
+
+**同步处理 vs 异步处理**
+
+同步处理（上传时立即处理图片）的优势是实现简单、用户立即得到结果。缺点是上传请求慢、服务器负载高。异步处理（上传后放入队列，后台处理）的优势是不阻塞用户请求、可以批量处理。缺点是实现复杂、需要存储任务状态。
+
+对于小型应用，同步处理就够用了。如果图片处理很耗时，可以考虑异步处理。
+
+**直接上传 vs 通过服务器代理**
+
+直接上传到云存储的优势是节省服务器带宽、上传速度快。缺点是需要配置 CORS、暴露云存储凭证（有安全风险）。通过服务器代理的优势是安全、可以做验证和处理。缺点是占用服务器带宽、上传速度慢。
+
+推荐使用通过服务器代理的方式，虽然会占用一些带宽，但更安全可控。
+
+## 小结
+
+在这篇文章中，我们为博客 API 添加了文件上传功能。我们学习了如何处理 multipart/form-data 请求、如何验证文件类型和大小、如何将文件存储到 Cloudflare R2、如何处理和优化图片、以及如何做好安全防护。
+
+文件上传看似简单，但涉及很多细节。做好验证和防护，才能构建安全可靠的文件上传系统。
+
+下一篇我们将学习如何实现 WebSocket 实时通信，为博客添加实时评论功能。

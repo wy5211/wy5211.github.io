@@ -1,0 +1,658 @@
+---
+title: "02 Schema 与 Model 详解"
+date: "2026-03-23"
+summary: "深入理解 Mongoose Schema 类型系统，掌握嵌套文档、实例方法、静态方法和虚拟字段的使用"
+tags: ["Mongoose", "Schema", "Model", "TypeScript", "虚拟字段"]
+category: "mongoose"
+draft: false
+series: "Mongoose 渐进式学习"
+seriesOrder: 2
+---
+
+上一篇文章我们搭建了环境，完成了第一个 CRUD 操作。你可能注意到了，那个 User Schema 很简单，只有 name、email、age 三个字段。但实际项目中的数据结构要复杂得多。
+
+比如我们的 CMS 系统，文章不仅要有标题、内容，还要有作者信息、标签、评论、SEO 元数据等。这些数据怎么组织？嵌套文档还是引用？虚拟字段是什么？实例方法和静态方法有什么区别？
+
+这篇文章我们围绕 CMS 的实际需求，设计完整的 User 和 Post Schema。
+
+## Schema 类型系统
+
+Mongoose 支持丰富的数据类型，比 MongoDB 原生类型要强很多：
+
+- **基础类型**：String、Number、Boolean、Date、Buffer、ObjectId、Array
+- **特殊类型**：Schema（嵌套文档）、Mixed（任意类型）、Decimal128（高精度小数）、Map（键值对集合）、UUID
+
+为什么需要这么多类型？想象一下，如果所有字段都用 Mixed 类型，就失去了类型检查的意义。Mongoose 的类型系统让你在定义 Schema 时就明确数据结构，不符合规则的数据会被拒绝。
+
+## 设计完整的 Post Schema
+
+我们为 CMS 的文章创建一个完整的 Schema。文章数据结构是这样的：
+
+```javascript
+{
+  "_id": "post_a1b2c3d4",
+  "title": "TypeScript 高级技巧",
+  "content": "这是一篇关于 TypeScript 的详细教程...",
+  "author": "usr_8x9k2m", // 引用 User
+  "status": "published",
+  "tags": ["TypeScript", "前端", "教程"],
+  "views": 1250,
+  "likes": 45,
+  "metadata": {
+    "seoTitle": "TypeScript 高级技巧 - 完整指南",
+    "seoDescription": "学习 TypeScript 高级特性的完整教程",
+    "keywords": ["typescript", "frontend", "tutorial"]
+  },
+  "comments": [
+    {
+      "content": "很棒的文章",
+      "author": "usr_xxx",
+      "createdAt": "2026-03-20T10:00:00Z"
+    }
+  ]
+}
+```
+
+创建 `src/models/Post.ts`：
+
+```typescript
+import mongoose, { Schema, Model, Document } from "mongoose";
+
+// 定义嵌入的子文档 Schema
+interface IMetadata {
+  seoTitle?: string;
+  seoDescription?: string;
+  keywords?: string[];
+}
+
+const metadataSchema = new Schema<IMetadata>({
+  seoTitle: { type: String, maxlength: 60 },
+  seoDescription: { type: String, maxlength: 160 },
+  keywords: [{ type: String }],
+});
+
+// 定义评论子文档
+interface IComment {
+  content: string;
+  author: mongoose.Types.ObjectId;
+  createdAt: Date;
+}
+
+const commentSchema = new Schema<IComment>({
+  content: {
+    type: String,
+    required: true,
+    minlength: 1,
+    maxlength: 1000,
+  },
+  author: {
+    type: Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+  },
+  createdAt: {
+    type: Date,
+    default: Date.now,
+  },
+});
+
+// 定义文章 Document 接口
+export interface IPost extends Document {
+  title: string;
+  content: string;
+  excerpt: string;
+  author: mongoose.Types.ObjectId;
+  status: "draft" | "published" | "archived";
+  tags: string[];
+  views: number;
+  likes: number;
+  metadata: IMetadata;
+  comments: IComment[];
+
+  // 虚拟字段
+  url: string;
+  commentCount: number;
+
+  // 实例方法
+  incrementViews(): Promise<IPost>;
+  publish(): Promise<IPost>;
+  addComment(
+    content: string,
+    authorId: mongoose.Types.ObjectId
+  ): Promise<IPost>;
+}
+
+// 定义文章 Model 接口（包含静态方法）
+export interface IPostModel extends Model<IPost> {
+  findPublished(): any;
+  findPopular(): any;
+  findByTag(tag: string): any;
+}
+
+// 定义文章 Schema
+const postSchema = new Schema<IPost, IPostModel>(
+  {
+    title: {
+      type: String,
+      required: [true, "标题是必填项"],
+      trim: true,
+      minlength: [5, "标题至少5个字符"],
+      maxlength: [200, "标题不能超过200个字符"],
+      index: true,
+    },
+
+    content: {
+      type: String,
+      required: [true, "内容是必填项"],
+      minlength: [10, "内容至少10个字符"],
+    },
+
+    author: {
+      type: Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+      index: true,
+    },
+
+    status: {
+      type: String,
+      enum: {
+        values: ["draft", "published", "archived"],
+        message: "{VALUE} 不是有效的状态",
+      },
+      default: "draft",
+      index: true,
+    },
+
+    tags: [
+      {
+        type: String,
+        lowercase: true,
+        trim: true,
+      },
+    ],
+
+    views: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
+    likes: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+
+    metadata: {
+      type: metadataSchema,
+      default: () => ({}),
+    },
+
+    comments: [commentSchema],
+  },
+  {
+    timestamps: true,
+    toJSON: { virtuals: true },
+    toObject: { virtuals: true },
+  }
+);
+
+// 创建 Model
+const Post = mongoose.model<IPost, IPostModel>("Post", postSchema);
+
+export default Post;
+```
+
+这个 Schema 有几个设计要点：
+
+1. **嵌套文档**：metadata 和 comments 是嵌套在文章文档内部的，适合一对一、一对少的关系
+2. **引用**：author 字段引用 User 模型，适合一对多关系（一个用户可以写多篇文章）
+3. **枚举**：status 字段只能是指定的几个值，避免无效状态
+4. **数组**：tags 和 comments 是数组，可以存储多个值
+5. **索引**：title、author、status 字段加了索引，提升查询性能
+
+## 虚拟字段
+
+虚拟字段是不存储在数据库中的字段，每次查询时动态计算。为什么需要虚拟字段？假设你需要计算文章的摘要，每次都从 content 截取很麻烦，用虚拟字段就能自动计算。
+
+在 Post Schema 中添加虚拟字段：
+
+```typescript
+// 生成文章 URL
+postSchema.virtual("url").get(function () {
+  return `/posts/${this._id}/${this.title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")}`;
+});
+
+// 评论数量
+postSchema.virtual("commentCount").get(function () {
+  return this.comments.length;
+});
+
+// 摘要（虚拟字段）
+postSchema.virtual("excerpt").get(function () {
+  return this.content.replace(/[#*`]/g, "").substring(0, 150) + "...";
+});
+```
+
+虚拟字段要用的时候才会计算，不会占用存储空间。但要注意，虚拟字段不能用于查询条件。
+
+## 实例方法
+
+实例方法是绑定在单个文档上的方法，比如发布文章、增加浏览量。这些操作针对具体的文章实例，适合作为实例方法。
+
+```typescript
+// 增加浏览次数
+postSchema.methods.incrementViews = async function () {
+  this.views += 1;
+  return this.save();
+};
+
+// 发布文章
+postSchema.methods.publish = async function () {
+  if (this.status !== "published") {
+    this.status = "published";
+    this.publishedAt = new Date();
+    return this.save();
+  }
+  return this;
+};
+
+// 添加评论
+postSchema.methods.addComment = async function (
+  content: string,
+  authorId: mongoose.Types.ObjectId
+) {
+  this.comments.push({
+    content,
+    author: authorId,
+    createdAt: new Date(),
+  });
+  return this.save();
+};
+```
+
+使用方式：
+
+```typescript
+const post = await Post.findById("post_a1b2c3d4");
+await post.incrementViews();
+await post.addComment("很棒的文章", userId);
+```
+
+## 静态方法
+
+静态方法是绑定在 Model 上的方法，适合查询和批量操作。比如查询已发布的文章、热门文章。
+
+```typescript
+// 查找已发布的文章
+postSchema.statics.findPublished = function () {
+  return this.find({ status: "published" })
+    .sort({ createdAt: -1 })
+    .populate("author", "name email avatar");
+};
+
+// 查找热门文章（按浏览量）
+postSchema.statics.findPopular = function (limit = 10) {
+  return this.find({ status: "published" })
+    .sort({ views: -1 })
+    .limit(limit)
+    .populate("author", "name avatar");
+};
+
+// 按标签查找文章
+postSchema.statics.findByTag = function (tag: string) {
+  return this.find({
+    status: "published",
+    tags: tag.toLowerCase(),
+  })
+    .sort({ createdAt: -1 })
+    .populate("author", "name email");
+};
+```
+
+使用方式：
+
+```typescript
+const publishedPosts = await Post.findPublished();
+const popularPosts = await Post.findPopular(5);
+const tagPosts = await Post.findByTag("mongodb");
+```
+
+## 查询辅助方法
+
+查询辅助方法让你可以链式调用自定义的查询逻辑。比如按作者筛选、按状态筛选。
+
+```typescript
+// 按作者分组
+postSchema.query.byAuthor = function (authorId: mongoose.Types.ObjectId) {
+  return this.where({ author: authorId });
+};
+
+// 按状态筛选
+postSchema.query.byStatus = function (status: string) {
+  return this.where({ status });
+};
+
+// 包含评论
+postSchema.query.withComments = function () {
+  return this.populate("comments.author", "name avatar");
+};
+```
+
+使用方式：
+
+```typescript
+const userPosts = await Post.find()
+  .byAuthor(userId)
+  .byStatus("published")
+  .withComments();
+```
+
+## 设计完整的 User Schema
+
+再来为用户创建一个完整的 Schema：
+
+```typescript
+import mongoose, { Schema, Model, Document } from "mongoose";
+
+export interface IUser extends Document {
+  name: string;
+  email: string;
+  password?: string;
+  avatar?: string;
+  bio?: string;
+  role: "user" | "author" | "admin";
+  isActive: boolean;
+  lastLoginAt?: Date;
+  preferences: {
+    emailNotifications: boolean;
+    theme: "light" | "dark";
+    language: string;
+  };
+
+  // 虚拟字段
+  fullName: string;
+  gravatar: string;
+
+  // 实例方法
+  comparePassword(password: string): Promise<boolean>;
+  updateLastLogin(): Promise<IUser>;
+}
+
+export interface IUserModel extends Model<IUser> {
+  findByEmail(email: string): any;
+  findActive(): any;
+  findByRole(role: string): any;
+}
+
+// 用户偏好设置子 Schema
+const preferencesSchema = new Schema(
+  {
+    emailNotifications: { type: Boolean, default: true },
+    theme: { type: String, enum: ["light", "dark"], default: "light" },
+    language: { type: String, default: "zh-CN" },
+  },
+  { _id: false }
+);
+
+// 用户 Schema
+const userSchema = new Schema<IUser, IUserModel>(
+  {
+    name: {
+      type: String,
+      required: [true, "姓名是必填项"],
+      trim: true,
+      minlength: [2, "姓名至少2个字符"],
+      maxlength: [50, "姓名不能超过50个字符"],
+    },
+
+    email: {
+      type: String,
+      required: [true, "邮箱是必填项"],
+      unique: true,
+      lowercase: true,
+      trim: true,
+      match: [/^\S+@\S+\.\S+$/, "请输入有效的邮箱地址"],
+      index: true,
+    },
+
+    password: {
+      type: String,
+      minlength: [6, "密码至少6个字符"],
+      select: false, // 默认查询时不返回密码
+    },
+
+    avatar: {
+      type: String,
+      default: function () {
+        return `https://www.gravatar.com/avatar/${this.email}?d=retro`;
+      },
+    },
+
+    bio: {
+      type: String,
+      maxlength: [500, "个人简介不能超过500个字符"],
+    },
+
+    role: {
+      type: String,
+      enum: ["user", "author", "admin"],
+      default: "user",
+      index: true,
+    },
+
+    isActive: {
+      type: Boolean,
+      default: true,
+      index: true,
+    },
+
+    lastLoginAt: {
+      type: Date,
+    },
+
+    preferences: {
+      type: preferencesSchema,
+      default: function () {
+        return {
+          emailNotifications: true,
+          theme: "light",
+          language: "zh-CN",
+        };
+      },
+    },
+  },
+  {
+    timestamps: true,
+    toJSON: {
+      transform: function (doc, ret) {
+        delete ret.password;
+        delete ret.__v;
+        return ret;
+      },
+      virtuals: true,
+    },
+  }
+);
+
+// 虚拟字段
+userSchema.virtual("fullName").get(function () {
+  return this.name;
+});
+
+userSchema.virtual("gravatar").get(function () {
+  const crypto = require("crypto");
+  const hash = crypto.createHash("md5").update(this.email).digest("hex");
+  return `https://www.gravatar.com/avatar/${hash}?d=retro`;
+});
+
+// 实例方法
+userSchema.methods.comparePassword = async function (password: string) {
+  const bcrypt = require("bcrypt");
+  return bcrypt.compare(password, this.password);
+};
+
+userSchema.methods.updateLastLogin = async function () {
+  this.lastLoginAt = new Date();
+  return this.save();
+};
+
+// 静态方法
+userSchema.statics.findByEmail = function (email: string) {
+  return this.findOne({ email }).select("+password");
+};
+
+userSchema.statics.findActive = function () {
+  return this.find({ isActive: true });
+};
+
+userSchema.statics.findByRole = function (role: string) {
+  return this.find({ role, isActive: true });
+};
+
+// 中间件：保存前加密密码
+userSchema.pre("save", async function (next) {
+  if (!this.isModified("password")) {
+    return next();
+  }
+
+  try {
+    const bcrypt = require("bcrypt");
+    const salt = await bcrypt.genSalt(10);
+    this.password = await bcrypt.hash(this.password, salt);
+    next();
+  } catch (error: any) {
+    next(error);
+  }
+});
+
+// 创建 Model
+const User = mongoose.model<IUser, IUserModel>("User", userSchema);
+
+export default User;
+```
+
+## 使用示例
+
+现在我们有完整的 User 和 Post 模型，来看看怎么用：
+
+```typescript
+import User from "../models/User";
+import Post from "../models/Post";
+import connectDB from "../config/database";
+
+await connectDB();
+
+// 创建用户
+const user = await User.create({
+  name: "张三",
+  email: "zhangsan@example.com",
+  password: "password123",
+  bio: "全栈开发者",
+  role: "author",
+  preferences: {
+    emailNotifications: true,
+    theme: "dark",
+  },
+});
+
+// 创建文章
+const post = await Post.create({
+  title: "Mongoose 入门教程",
+  content: "# Mongoose 入门\n\nMongoose 是 MongoDB 的优秀 ODM 库...",
+  author: user._id,
+  status: "published",
+  tags: ["mongodb", "nodejs", "tutorial"],
+  metadata: {
+    seoTitle: "Mongoose 入门教程 - 完整指南",
+    seoDescription: "学习 Mongoose ODM 的完整教程",
+    keywords: ["mongodb", "mongoose", "nodejs"],
+  },
+});
+
+// 使用虚拟字段
+console.log("文章 URL:", post.url);
+console.log("摘要:", post.excerpt);
+console.log("评论数:", post.commentCount);
+
+// 使用实例方法
+await post.incrementViews();
+await post.addComment("很棒的文章！", user._id);
+
+// 使用静态方法
+const publishedPosts = await Post.findPublished();
+const popularPosts = await Post.findPopular(5);
+
+// 使用查询辅助方法
+const userPosts = await Post.find()
+  .byAuthor(user._id)
+  .byStatus("published")
+  .withComments();
+
+// 关联查询
+const postWithAuthor = await Post.findById(post._id)
+  .populate("author", "name email avatar role bio")
+  .populate("comments.author", "name avatar");
+
+process.exit(0);
+```
+
+## 嵌入 vs 引用的选择
+
+设计 Schema 时一个关键问题是：什么时候用嵌入文档，什么时候用引用？
+
+- **嵌入文档**：适合一对一、一对少关系，数据不会频繁变化。比如文章的 metadata、少量评论
+- **引用**：适合一对多、多对多关系，数据会频繁变化。比如文章的 author、大量评论
+
+比如评论的设计：
+
+- 如果评论数量少且固定，可以用嵌入文档
+- 如果评论数量多且会不断增长，应该用引用
+
+## TypeScript 类型定义
+
+使用 TypeScript 时，需要定义接口来获得类型提示：
+
+```typescript
+// Document 接口（包含实例方法和虚拟字段）
+interface IUser extends Document {
+  name: string;
+  email: string;
+  comparePassword(password: string): Promise<boolean>;
+}
+
+// Model 接口（包含静态方法）
+interface IUserModel extends Model<IUser> {
+  findByEmail(email: string): any;
+}
+
+// 创建带类型的 Model
+const userSchema = new Schema<IUser, IUserModel>({ ... });
+const User = mongoose.model<IUser, IUserModel>("User", userSchema);
+```
+
+这样你在使用 User 时会有完整的类型提示和检查。
+
+## 总结与思考
+
+这篇文章我们设计了完整的 User 和 Post Schema，使用了嵌套文档、引用、虚拟字段、实例方法、静态方法等特性。你可能觉得这样设计有点复杂，比直接用 MongoDB 要多写很多代码。
+
+这个 trade-off 是值得的。多写的代码换来的是：
+
+- 数据验证保障，脏数据进不了数据库
+- 类型提示，开发时就能发现错误
+- 业务逻辑封装，复用性强
+- 代码可读性高，维护成本低
+
+比如你不用在每个地方都写"截取内容生成摘要"的逻辑，虚拟字段自动处理。不用到处写"按状态查询已发布文章"，静态方法封装好了。
+
+下一篇文章，我们会学习基础的 CRUD 操作，看看如何用这些模型完成数据的创建、读取、更新、删除。
+
+---
+
+上一篇：[01 快速入门与环境搭建](./01-getting-started.mdx)
+下一篇：[03 基础 CRUD 操作](./03-crud-basics.mdx)

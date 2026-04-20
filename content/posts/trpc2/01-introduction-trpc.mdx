@@ -1,0 +1,375 @@
+---
+title: "01 初识 tRPC：告别类型定义重复"
+date: "2026-03-23"
+summary: "探索 tRPC 如何通过端到端类型安全彻底解决前后端类型定义重复的问题，告别繁琐的 API 文档维护，提升开发效率和代码质量。"
+tags: ["tRPC", "TypeScript", "类型安全", "全栈开发", "API设计"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 1
+---
+
+我做过全栈开发，最头疼的一件事就是类型定义重复。后端定义了一个 User 接口，前端又得定义一遍。产品说加个字段，我得改两遍。忘了改一处，线上就报错。
+
+我一直在想，有没有一种方案能让前后端共享类型定义，后端改了类型，前端自动知道？不用手动同步接口定义，不用写 API 文档。
+
+后来我遇到了 tRPC。
+
+## 为什么会有类型重复问题
+
+在传统的 API 开发中，前后端的类型定义是割裂的。我们来看看一个典型的场景。
+
+假设我们在做一个**协作任务管理平台**，需要定义用户接口。后端这样写：
+
+```typescript
+// backend/src/types/user.ts
+interface User {
+  id: string;
+  name: string;
+  email: string;
+}
+```
+
+前端也需要定义一遍：
+
+```typescript
+// frontend/src/types/user.ts
+interface User {
+  id: string;
+  name: string;
+  email: string;
+}
+```
+
+这还不是最糟的。当产品经理说"我们需要给用户加个头像字段"时，你得改两个地方。更糟糕的是，有时候后端改了，前端忘了改，直到线上报错才发现。
+
+除了类型重复，还有这些问题：
+
+- API 文档需要单独维护，而且容易和代码不同步
+- 前端调用 API 时没有类型提示，经常需要翻文档
+- 后端改了接口返回的数据结构，前端 TypeScript 检查不出来
+- 每次调用 API 都要手动处理类型转换和错误
+
+这些问题看起来都是小事，但在日常开发中会不断消耗你的时间和精力。更严重的是，它们会增加线上 bug 的风险。
+
+## tRPC 的解决思路
+
+tRPC 的核心思想很简单：前后端共享同一个类型定义。
+
+后端定义一次类型，前端自动获得类型推断。不需要代码生成，不需要手动写类型定义，不需要维护 API 文档。
+
+我们来看看它是怎么做到的。
+
+## 快速体验 tRPC
+
+先搭建一个简单的 tRPC 服务，感受一下它的类型推断能力。
+
+### 创建服务端
+
+首先创建一个简单的 tRPC 服务：
+
+```typescript
+import { initTRPC } from "@trpc/server";
+import { z } from "zod";
+
+// 初始化 tRPC 实例
+const t = initTRPC.create();
+
+// 定义 Router
+export const appRouter = t.router({
+  // 一个简单的问候接口
+  greeting: t.procedure
+    .input(z.object({ name: z.string() }))
+    .query(({ input }) => {
+      return {
+        message: `你好，${input.name}！`,
+        timestamp: new Date().toISOString(),
+      };
+    }),
+
+  // 获取项目列表
+  getProjects: t.procedure.query(() => {
+    return [
+      { id: "1", name: "网站重构", status: "进行中" },
+      { id: "2", name: "移动端适配", status: "待开始" },
+    ];
+  }),
+});
+
+// 导出类型给前端使用
+export type AppRouter = typeof appRouter;
+```
+
+这段代码的关键在于最后一行：`export type AppRouter = typeof appRouter;`。
+
+TypeScript 的 `typeof` 操作符会提取出 `appRouter` 的类型，这个类型包含了所有接口的输入输出类型信息。我们把它导出，前端就能直接使用。
+
+### 创建客户端
+
+前端代码这样写：
+
+```typescript
+import { createTRPCProxyClient, httpBatchLink } from "@trpc/client";
+import type { AppRouter } from "./server";
+
+// 创建客户端，传入后端的类型
+const client = createTRPCProxyClient<AppRouter>({
+  links: [
+    httpBatchLink({
+      url: "http://localhost:3000",
+    }),
+  ],
+});
+
+// 调用 API - 完全类型安全！
+async function main() {
+  // TypeScript 自动推断输入参数类型
+  const greeting = await client.greeting.query({ name: "张三" });
+  console.log(greeting.message); // 类型：string
+
+  // TypeScript 自动推断返回类型
+  const projects = await client.projects.list.query();
+  // projects 的类型是：Array<{ id: string, name: string, status: string }>
+
+  // 错误示例：类型不匹配会在编译时报错
+  // const error = await client.greeting.query({ name: 123 });
+  //                                          ^^^
+  // Type 'number' is not assignable to type 'string'
+}
+```
+
+注意这里发生了什么：我们没有在前端定义任何类型，但 TypeScript 知道 `greeting` 接口需要什么参数，也知道它会返回什么数据。这些都是自动推断出来的。
+
+## 对比传统方案
+
+为了更好地理解 tRPC 的价值，我们对比一下传统 REST API 和 tRPC 的差异。
+
+### 类型定义对比
+
+传统 REST API 需要：
+
+```typescript
+// 后端定义（第1次）
+interface User {
+  id: string;
+  name: string;
+  email: string;
+}
+
+// 前端定义（第2次）
+interface User {
+  id: string;
+  name: string;
+  email: string;
+}
+
+// API 调用函数（手写）
+async function getUser(id: string): Promise<User> {
+  const res = await fetch(`/api/users/${id}`);
+  return res.json();
+}
+```
+
+tRPC 只需要：
+
+```typescript
+// 后端定义（只需要1次）
+export const appRouter = t.router({
+  getUserById: t.procedure
+    .input(z.object({ id: z.string() }))
+    .query(({ input }) => {
+      return db.user.findUnique({ where: { id: input.id } });
+    }),
+});
+
+// 前端自动获得类型
+const client = createTRPCProxyClient<AppRouter>({...});
+const user = await client.getUserById.query({ id: "123" });
+```
+
+### 开发效率对比
+
+我们用一个表格来对比：
+
+| 指标         | REST API | tRPC     | 差异       |
+| ------------ | -------- | -------- | ---------- |
+| 类型定义次数 | 2次      | 1次      | 减少50%    |
+| API 文档维护 | 需要     | 不需要   | 节省100%   |
+| 类型提示     | 需要手写 | 自动获得 | 质的飞跃   |
+| 编译时检查   | 无法检查 | 完整检查 | 安全性提升 |
+| 代码行数     | ~60行    | ~20行    | 减少67%    |
+
+## tRPC 的核心概念
+
+在深入使用 tRPC 之前，我们需要理解几个核心概念。
+
+### Router（路由器）
+
+Router 是组织 API 的方式，类似于文件系统的目录结构。你可以把相关的接口放在同一个 Router 下：
+
+```typescript
+export const appRouter = t.router({
+  // 项目相关接口
+  projects: t.router({
+    list: t.procedure.query(() => db.project.findMany()),
+    byId: t.procedure
+      .input(z.object({ id: z.string() }))
+      .query(({ input }) => db.project.findUnique({ where: { id: input.id } })),
+    create: t.procedure
+      .input(
+        z.object({
+          name: z.string(),
+          description: z.string(),
+        })
+      )
+      .mutation(({ input }) => db.project.create({ data: input })),
+  }),
+
+  // 任务相关接口
+  tasks: t.router({
+    list: t.procedure.query(() => db.task.findMany()),
+    // ...
+  }),
+});
+```
+
+这种嵌套结构让 API 的组织更清晰，也更容易维护。
+
+### Procedure（程序）
+
+Procedure 是 API 的最小执行单元，类似于函数。tRPC 有三种 Procedure：
+
+- **Query**：查询数据，对应 HTTP 的 GET
+- **Mutation**：修改数据，对应 HTTP 的 POST/PUT/DELETE
+- **Subscription**：实时数据推送，基于 WebSocket
+
+```typescript
+// Query：读取数据
+const getProjects = t.procedure.query(() => {
+  return db.project.findMany();
+});
+
+// Mutation：创建数据
+const createProject = t.procedure
+  .input(z.object({ name: z.string() }))
+  .mutation(({ input }) => {
+    return db.project.create({ data: input });
+  });
+```
+
+### Context（上下文）
+
+Context 用于在请求生命周期中共享数据，比如当前用户信息、数据库连接等：
+
+```typescript
+// 创建 Context
+const createContext = async () => {
+  return {
+    user: await getCurrentUser(),
+    db: await createDbConnection(),
+  };
+};
+
+// 使用 Context
+const t = initTRPC.context<Context>().create();
+
+const getMyProjects = t.procedure.query(({ ctx }) => {
+  // ctx.user 和 ctx.db 都是类型安全的
+  return ctx.db.project.findMany({ where: { userId: ctx.user.id } });
+});
+```
+
+## 类型推断的工作原理
+
+tRPC 的类型推断依赖于 TypeScript 的类型系统，核心是 `typeof` 操作符。
+
+看看这个例子：
+
+```typescript
+// 1. 后端定义
+export const appRouter = t.router({
+  getUserById: t.procedure
+    .input(z.object({ id: z.string() }))
+    .query(({ input }) => {
+      return {
+        id: input.id,
+        name: "张三",
+        email: "zhangsan@example.com",
+      };
+    }),
+});
+
+// 2. 提取类型
+export type AppRouter = typeof appRouter;
+
+// 3. 前端使用
+const client = createTRPCProxyClient<AppRouter>({...});
+
+// 类型推断：
+// - 输入参数：{ id: string }
+// - 返回类型：{ id: string, name: string, email: string }
+const user = await client.getUserById.query({ id: "123" });
+```
+
+`typeof appRouter` 会提取出整个 Router 的类型信息，包括每个 Procedure 的输入输出类型。前端把这个类型传给 `createTRPCProxyClient`，就能获得完整的类型推断。
+
+## 适用场景分析
+
+tRPC 不是银弹，它有适用的场景，也有不适合的场景。
+
+### 适合使用 tRPC 的场景
+
+如果你的项目满足以下条件，tRPC 会是一个很好的选择：
+
+1. **前后端都用 TypeScript**：这是硬性要求
+2. **内部应用**：API 不需要对外暴露
+3. **快速迭代**：需求经常变化，需要频繁修改 API
+4. **中小型团队**：团队规模在 50 人以内
+5. **Web 应用**：单页应用或服务端渲染应用
+
+我们的协作任务管理平台就完全符合这些条件：前后端都是 TypeScript，是内部使用的工具，需求会不断变化。
+
+### 不适合使用 tRPC 的场景
+
+以下情况使用 tRPC 可能不是最佳选择：
+
+1. **后端不是 TypeScript**：如果是 Java、Go、Python 等，无法共享类型
+2. **公开 API**：需要提供给第三方使用，无法要求对方也用 TypeScript
+3. **微服务架构**：服务间使用不同语言
+4. **超大规模团队**：需要严格的 API 版本管理和向后兼容
+
+### 需要权衡的场景
+
+有些场景可以用 tRPC，但需要仔细评估：
+
+1. **移动应用**：可以用，但需要考虑网络优化和数据传输效率
+2. **性能敏感**：tRPC 使用 JSON，性能不如二进制协议（如 Protobuf）
+3. **复杂查询**：GraphQL 在复杂查询场景更灵活，tRPC 返回整个对象
+
+## Trade-off 分析
+
+tRPC 在带来便利的同时，也有一些需要权衡的地方。
+
+**优势**：
+
+1. **开发效率大幅提升**：不需要维护类型定义和 API 文档，减少了大量重复工作
+2. **类型安全性增强**：编译时就能发现类型错误，减少了运行时 bug
+3. **代码更简洁**：不需要手写类型转换和 API 调用代码
+4. **重构更安全**：后端修改接口后，前端会立即报错，不会漏掉
+
+**代价**：
+
+1. **TypeScript 绑定**：必须前后端都用 TypeScript，无法支持多语言
+2. **耦合度增加**：前后端类型绑定后，独立部署需要更多协调
+3. **学习成本**：团队需要学习 tRPC 的概念和用法
+4. **生态相对年轻**：相比 REST 和 GraphQL，tRPC 的生态还不够成熟
+
+**我的建议**：
+
+对于 TypeScript 全栈项目，特别是中小型团队和内部应用，tRPC 的优势远大于代价。类型安全带来的开发效率提升和 bug 减少，是实实在在的生产力增益。
+
+但如果你的项目需要对外提供 API，或者后端不是 TypeScript，那么传统的 REST API 或 GraphQL 可能更合适。
+
+在协作任务管理平台这个项目中，我们前后端都用 TypeScript，是内部工具，需求会不断变化。这些特点正好契合 tRPC 的适用场景。所以我们选择 tRPC 作为技术方案。
+
+下一步，我们将深入学习 tRPC 的 Router 和 Procedure，看看如何构建一个结构清晰、类型安全的 API。

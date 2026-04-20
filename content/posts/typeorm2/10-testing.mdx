@@ -1,0 +1,877 @@
+---
+title: "10. 测试策略：给数据层加上安全网"
+date: "2026-03-29"
+tags: ["TypeORM"]
+category: "typeorm"
+cover: ""
+draft: false
+series: "TypeORM 渐进式学习计划"
+seriesOrder: 10
+---
+
+在上一篇文章中，我们花了不少时间优化查询性能——解决了 N+1 问题、加了合适的索引、调整了连接池。这些优化让 API 响应时间从 3 秒降到了 200ms，看起来很完美。
+
+但这时候你心里可能还是有点不踏实：这次优化会不会改坏了某个查询逻辑？加的索引会不会影响插入性能？更重要的是，下次需求变更时，怎么保证不会引入新的问题？
+
+这就是测试要解决的问题。测试不是追求 100% 的覆盖率，而是给你一个安全网——当你改代码时，如果有测试在，改动引起的问题会被立即发现；如果没有测试，问题可能要等到用户报障时才会被发现。
+
+对于 TypeORM 项目，测试要解决几个实际问题：
+
+1. **Repository 的查询逻辑对不对**——比如查"某个工作空间下进行中的任务"，SQL 写对了没？关联加载了没？
+
+2. **Service 的业务逻辑对不对**——比如创建任务时要同时创建活动日志，这两步是不是在同一个事务里？
+
+3. **API 的输入输出对不对**——比如请求参数不符合 DTO 验证规则时，是否返回了正确的错误码？
+
+4. **测试要跑得快**——如果每次测试都要连真实的 PostgreSQL，跑一次要几分钟，开发者就会偷懒不跑了
+
+5. **测试数据要好管理**——每个测试用例需要准备数据，怎么避免重复代码，怎么保证测试之间不互相影响？
+
+这篇文章会用我们的 SaaS 项目管理平台作为案例，展示如何搭建一套实用的测试体系。
+
+## 测试环境配置：用 SQLite 替代 PostgreSQL
+
+测试环境面临一个现实问题：如果每次测试都连接真实的 PostgreSQL 数据库，有几个问题：
+
+- 测试运行慢——每次都要建连接、跑迁移
+- 需要额外依赖——开发者的本地环境得装 PostgreSQL，CI 环境得配置数据库服务
+- 数据清理麻烦——测试之间要隔离，得频繁清空表数据
+
+TypeORM 支持多种数据库，其中 SQLite 特别适合做测试——它是一个文件型的数据库，可以配置成内存模式 `:memory:`，测试跑完数据就没了，天然隔离。
+
+但有一个细节要注意：项目的 Entity 是按 PostgreSQL 的语法设计的，有些类型在 SQLite 中不支持。不过对于测试来说，SQLite 的功能够用了——它能验证关系、索引、基本查询，这就覆盖了大部分测试场景。
+
+先安装测试依赖：
+
+```bash
+# Jest 测试框架（NestJS 默认用这个）
+npm install --save-dev jest @types/jest ts-jest
+
+# SQLite 驱动（better-sqlite3 比 node-sqlite3 快）
+npm install --save-dev better-sqlite3 @types/better-sqlite3
+
+# NestJS 测试工具包
+npm install --save-dev @nestjs/testing supertest
+```
+
+然后创建一个专门用于测试的 DataSource：
+
+```typescript
+// test/test-data-source.ts
+import { DataSource } from "typeorm";
+import { Workspace } from "../src/entities/workspace.entity";
+import { Project } from "../src/entities/project.entity";
+import { Task } from "../src/entities/task.entity";
+import { User } from "../src/entities/user.entity";
+import { TaskLabel } from "../src/entities/task-label.entity";
+import { ActivityLog } from "../src/entities/activity-log.entity";
+
+export async function createTestDataSource(): Promise<DataSource> {
+  const dataSource = new DataSource({
+    type: "better-sqlite3",
+    database: ":memory:", // 内存数据库，测试完即销毁
+    entities: [Workspace, Project, Task, User, TaskLabel, ActivityLog],
+    synchronize: true, // 测试环境自动同步，省去手动跑迁移
+    logging: false, // 测试时关闭 SQL 日志，避免输出太多
+  });
+
+  await dataSource.initialize();
+  return dataSource;
+}
+```
+
+这里用了 `synchronize: true`，这在生产环境是禁用的，但测试环境用这个没问题——测试数据库每次都是新建的，不需要保留数据，自动同步反而省去了写迁移文件的麻烦。
+
+再写几个测试工具函数，减少重复代码：
+
+```typescript
+// test/test-utils.ts
+import { DataSource, Repository } from "typeorm";
+import { Workspace } from "../src/entities/workspace.entity";
+import { Project } from "../src/entities/project.entity";
+import { Task } from "../src/entities/task.entity";
+import { User } from "../src/entities/user.entity";
+import { TaskLabel } from "../src/entities/task-label.entity";
+import { TaskStatus } from "../src/enums/task-status.enum";
+
+// 清空所有表的数据（保持表结构）
+export async function cleanAllTables(dataSource: DataSource) {
+  await dataSource
+    .getRepository(ActivityLog)
+    .query("DELETE FROM activity_logs");
+  await dataSource.getRepository(TaskLabel).query("DELETE FROM task_labels");
+  await dataSource.getRepository(Task).query("DELETE FROM tasks");
+  await dataSource.getRepository(Project).query("DELETE FROM projects");
+  await dataSource.getRepository(Workspace).query("DELETE FROM workspaces");
+  await dataSource.getRepository(User).query("DELETE FROM users");
+}
+
+// 创建测试工作空间
+export async function createTestWorkspace(
+  workspaceRepo: Repository<Workspace>,
+  overrides: Partial<Workspace> = {}
+): Promise<Workspace> {
+  const workspace = workspaceRepo.create({
+    id: `ws_test_${Date.now()}`,
+    name: "字节前端团队",
+    slug: "byte-dance-frontend",
+    ...overrides,
+  });
+  return workspaceRepo.save(workspace);
+}
+
+// 创建测试项目
+export async function createTestProject(
+  projectRepo: Repository<Project>,
+  workspace: Workspace,
+  overrides: Partial<Project> = {}
+): Promise<Project> {
+  const project = projectRepo.create({
+    id: `proj_test_${Date.now()}`,
+    name: "官网重构 v2.0",
+    workspaceId: workspace.id,
+    ...overrides,
+  });
+  return projectRepo.save(project);
+}
+
+// 创建测试用户
+export async function createTestUser(
+  userRepo: Repository<User>,
+  overrides: Partial<User> = {}
+): Promise<User> {
+  const user = userRepo.create({
+    id: `usr_test_${Date.now()}`,
+    name: "张伟",
+    email: `zhang_wei_${Date.now()}@example.com`,
+    ...overrides,
+  });
+  return userRepo.save(user);
+}
+
+// 创建测试任务
+export async function createTestTask(
+  taskRepo: Repository<Task>,
+  project: Project,
+  assignee: User,
+  overrides: Partial<Task> = {}
+): Promise<Task> {
+  const task = taskRepo.create({
+    id: `task_test_${Date.now()}`,
+    title: "修复导航栏在移动端的布局错位",
+    projectId: project.id,
+    assigneeId: assignee.id,
+    status: TaskStatus.IN_PROGRESS,
+    priority: "high",
+    ...overrides,
+  });
+  return taskRepo.save(task);
+}
+```
+
+这些工具函数的作用是减少测试代码中的重复逻辑。比如每个测试都要创建用户，与其每次都写 `userRepo.create({ ... })`，不如封装成一个函数，测试代码会更简洁。
+
+## Repository 集成测试：验证 SQL 查询
+
+Repository 层的测试属于集成测试——我们要验证的是"TypeORM 生成的 SQL 对不对"，所以需要一个真实的数据库（SQLite 内存库够用了）。
+
+测什么？测那些"容易写错"的查询逻辑：
+
+- 条件查询：`where` 条件组合得对不对
+- 关联加载：`relations` 配置对不对，会不会漏加载或多加载
+- 分页：`skip` 和 `take` 的计算对不对
+- 软删除：`deletedAt` 字段的处理对不对
+- 排序：多字段排序的优先级对不对
+
+举几个实际例子：
+
+```typescript
+// test/integration/task.repository.spec.ts
+import { DataSource, Repository } from "typeorm";
+import { createTestDataSource, cleanAllTables } from "../test-utils";
+import {
+  createTestWorkspace,
+  createTestProject,
+  createTestUser,
+  createTestTask,
+} from "../test-utils";
+import { Task } from "../../src/entities/task.entity";
+import { Project } from "../../src/entities/project.entity";
+import { User } from "../../src/entities/user.entity";
+import { Workspace } from "../../src/entities/workspace.entity";
+import { TaskStatus } from "../../src/enums/task-status.enum";
+import { TaskRepository } from "../../src/repositories/task.repository";
+
+describe("TaskRepository (Integration)", () => {
+  let dataSource: DataSource;
+  let taskRepo: TaskRepository;
+  let projectRepo: Repository<Project>;
+  let userRepo: Repository<User>;
+  let workspaceRepo: Repository<Workspace>;
+
+  // 所有测试前初始化数据库连接
+  beforeAll(async () => {
+    dataSource = await createTestDataSource();
+    taskRepo = dataSource.getCustomRepository(TaskRepository);
+    projectRepo = dataSource.getRepository(Project);
+    userRepo = dataSource.getRepository(User);
+    workspaceRepo = dataSource.getRepository(Workspace);
+  });
+
+  // 所有测试后关闭连接
+  afterAll(async () => {
+    await dataSource.destroy();
+  });
+
+  // 每个测试后清空数据，保证测试隔离
+  afterEach(async () => {
+    await cleanAllTables(dataSource);
+  });
+
+  describe("findByProjectId", () => {
+    it("应该只返回指定项目的任务，并按创建时间倒序", async () => {
+      // 准备测试数据
+      const workspace = await createTestWorkspace(workspaceRepo);
+      const project1 = await createTestProject(projectRepo, workspace, {
+        name: "项目 A",
+      });
+      const project2 = await createTestProject(projectRepo, workspace, {
+        name: "项目 B",
+      });
+      const user = await createTestUser(userRepo);
+
+      // 项目 A 的任务（先创建）
+      await createTestTask(taskRepo, project1, user, {
+        title: "任务 A1",
+      });
+      // 等待 1ms，确保 createdAt 不同
+      await new Promise((resolve) => setTimeout(resolve, 1));
+      await createTestTask(taskRepo, project1, user, {
+        title: "任务 A2",
+      });
+
+      // 项目 B 的任务
+      await createTestTask(taskRepo, project2, user, {
+        title: "任务 B1",
+      });
+
+      // 执行查询
+      const tasks = await taskRepo.findByProjectId(project1.id);
+
+      // 验证结果
+      expect(tasks).toHaveLength(2);
+      expect(tasks[0].title).toBe("任务 A2"); // 倒序，后创建的在前面
+      expect(tasks[1].title).toBe("任务 A1");
+      expect(tasks.every((t) => t.projectId === project1.id)).toBe(true);
+    });
+
+    it("应该支持状态筛选", async () => {
+      const workspace = await createTestWorkspace(workspaceRepo);
+      const project = await createTestProject(projectRepo, workspace);
+      const user = await createTestUser(userRepo);
+
+      await createTestTask(taskRepo, project, user, {
+        status: TaskStatus.TODO,
+      });
+      await createTestTask(taskRepo, project, user, {
+        status: TaskStatus.IN_PROGRESS,
+      });
+      await createTestTask(taskRepo, project, user, {
+        status: TaskStatus.DONE,
+      });
+
+      // 只查进行中的任务
+      const tasks = await taskRepo.findByProjectId(project.id, {
+        status: TaskStatus.IN_PROGRESS,
+      });
+
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0].status).toBe(TaskStatus.IN_PROGRESS);
+    });
+
+    it("应该支持分页", async () => {
+      const workspace = await createTestWorkspace(workspaceRepo);
+      const project = await createTestProject(projectRepo, workspace);
+      const user = await createTestUser(userRepo);
+
+      // 创建 15 个任务
+      for (let i = 1; i <= 15; i++) {
+        await createTestTask(taskRepo, project, user, {
+          title: `任务 ${i}`,
+        });
+      }
+
+      // 第 1 页，每页 10 条
+      const page1 = await taskRepo.findByProjectId(
+        project.id,
+        {},
+        {
+          page: 1,
+          limit: 10,
+        }
+      );
+      expect(page1).toHaveLength(10);
+
+      // 第 2 页
+      const page2 = await taskRepo.findByProjectId(
+        project.id,
+        {},
+        {
+          page: 2,
+          limit: 10,
+        }
+      );
+      expect(page2).toHaveLength(5);
+    });
+  });
+
+  describe("findWithRelations", () => {
+    it("应该同时加载任务的项目和指派人信息", async () => {
+      const workspace = await createTestWorkspace(workspaceRepo);
+      const project = await createTestProject(projectRepo, workspace, {
+        name: "官网重构 v2.0",
+      });
+      const user = await createTestUser(userRepo, {
+        name: "张伟",
+      });
+      const task = await createTestTask(taskRepo, project, user);
+
+      // 查询任务及其关联
+      const tasks = await taskRepo.findWithRelations({
+        where: { id: task.id },
+        relations: ["project", "assignee"],
+      });
+
+      expect(tasks).toHaveLength(1);
+      expect(tasks[0].project).toBeDefined();
+      expect(tasks[0].project.name).toBe("官网重构 v2.0");
+      expect(tasks[0].assignee).toBeDefined();
+      expect(tasks[0].assignee.name).toBe("张伟");
+    });
+
+    it("不加载关联时应该返回 null", async () => {
+      const workspace = await createTestWorkspace(workspaceRepo);
+      const project = await createTestProject(projectRepo, workspace);
+      const user = await createTestUser(userRepo);
+      const task = await createTestTask(taskRepo, project, user);
+
+      // 不指定 relations
+      const found = await taskRepo.findOneBy({ id: task.id });
+
+      expect(found.project).toBeUndefined();
+      expect(found.assignee).toBeUndefined();
+    });
+  });
+});
+```
+
+这个测试覆盖了几个关键点：
+
+1. **数据隔离**——每个 `afterTest` 都清空表，避免测试互相影响
+2. **边界条件**——测试分页时的最后一页（不足 10 条）
+3. **关联加载**——验证指定 `relations` 时数据是否被加载
+4. **排序**——验证按创建时间倒序是否正确
+
+Repository 测试的价值在于：当你改查询条件时，测试会立即告诉你结果对不对。比如你把 `order: { createdAt: "DESC" }` 改成 `ASC`，测试会失败，这能避免线上出问题。
+
+## Service 单元测试：Mock Repository，测业务逻辑
+
+Service 层的测试重点是业务逻辑，比如"创建任务时是否自动创建了活动日志"、"任务状态变更是否触发了通知"。这些逻辑不依赖数据库，所以应该 Mock Repository，让测试跑得更快。
+
+怎么 Mock？用 Jest 的 mock 功能，把 Repository 的方法都替换成假实现：
+
+```typescript
+// test/unit/tasks.service.spec.ts
+import { Test, TestingModule } from "@nestjs/testing";
+import { getRepositoryToken } from "@nestjs/typeorm";
+import { Repository } from "typeorm";
+import { TasksService } from "../../src/services/tasks.service";
+import { Task } from "../../src/entities/task.entity";
+import { ActivityLogService } from "../../src/services/activity-log.service";
+import { NotFoundException } from "@nestjs/common";
+import { TaskStatus } from "../../src/enums/task-status.enum";
+
+describe("TasksService (Unit)", () => {
+  let service: TasksService;
+  let taskRepo: jest.Mocked<Repository<Task>>;
+  let activityLogService: jest.Mocked<ActivityLogService>;
+
+  // 创建 Mock Repository
+  const mockTaskRepo = () => ({
+    create: jest.fn(),
+    save: jest.fn(),
+    findOne: jest.fn(),
+    findOneBy: jest.fn(),
+    find: jest.fn(),
+    update: jest.fn(),
+    softDelete: jest.fn(),
+  });
+
+  // 创建 Mock ActivityLogService
+  const mockActivityLogService = () => ({
+    createLog: jest.fn(),
+  });
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        TasksService,
+        {
+          provide: getRepositoryToken(Task),
+          useFactory: mockTaskRepo,
+        },
+        {
+          provide: ActivityLogService,
+          useFactory: mockActivityLogService,
+        },
+      ],
+    }).compile();
+
+    service = module.get<TasksService>(TasksService);
+    taskRepo = module.get(getRepositoryToken(Task));
+    activityLogService = module.get(ActivityLogService);
+  });
+
+  describe("createTask", () => {
+    it("应该创建任务并记录活动日志", async () => {
+      // 准备测试数据
+      const createTaskDto = {
+        title: "修复导航栏布局",
+        projectId: "proj_test_123",
+        assigneeId: "usr_test_456",
+      };
+
+      const savedTask = {
+        id: "task_test_789",
+        ...createTaskDto,
+        status: TaskStatus.TODO,
+        createdAt: new Date(),
+      };
+
+      // 设置 Mock 返回值
+      taskRepo.create.mockReturnValue(savedTask as any);
+      taskRepo.save.mockResolvedValue(savedTask as any);
+      activityLogService.createLog.mockResolvedValue(undefined as any);
+
+      // 执行
+      const result = await service.createTask(createTaskDto);
+
+      // 验证
+      expect(taskRepo.create).toHaveBeenCalledWith({
+        ...createTaskDto,
+        status: TaskStatus.TODO, // 默认状态
+      });
+      expect(taskRepo.save).toHaveBeenCalled();
+      expect(activityLogService.createLog).toHaveBeenCalledWith({
+        taskId: savedTask.id,
+        action: "created",
+        userId: createTaskDto.assigneeId,
+      });
+      expect(result).toEqual(savedTask);
+    });
+
+    it("项目不存在时应该抛出异常", async () => {
+      // 项目不存在的场景：需要在 createTask 里先查项目
+      // 这里简化处理，假设 projectId 验证在 Controller 层
+
+      const createTaskDto = {
+        title: "测试任务",
+        projectId: "non_existent_project",
+      };
+
+      taskRepo.create.mockReturnValue(createTaskDto as any);
+      taskRepo.save.mockRejectedValue(
+        new Error("Foreign key constraint failed")
+      );
+
+      await expect(service.createTask(createTaskDto)).rejects.toThrow();
+    });
+  });
+
+  describe("updateTaskStatus", () => {
+    it("应该更新状态并记录活动日志", async () => {
+      const taskId = "task_test_123";
+      const newStatus = TaskStatus.IN_PROGRESS;
+      const userId = "usr_test_456";
+
+      const existingTask = {
+        id: taskId,
+        title: "旧任务",
+        status: TaskStatus.TODO,
+      };
+
+      const updatedTask = {
+        ...existingTask,
+        status: newStatus,
+      };
+
+      taskRepo.findOneBy.mockResolvedValue(existingTask as any);
+      taskRepo.save.mockResolvedValue(updatedTask as any);
+      activityLogService.createLog.mockResolvedValue(undefined as any);
+
+      const result = await service.updateTaskStatus(taskId, newStatus, userId);
+
+      expect(taskRepo.findOneBy).toHaveBeenCalledWith({ id: taskId });
+      expect(taskRepo.save).toHaveBeenCalledWith({
+        ...existingTask,
+        status: newStatus,
+      });
+      expect(activityLogService.createLog).toHaveBeenCalledWith({
+        taskId,
+        action: "status_changed",
+        userId,
+        changes: { from: TaskStatus.TODO, to: newStatus },
+      });
+      expect(result.status).toBe(newStatus);
+    });
+
+    it("任务不存在时应该抛出异常", async () => {
+      taskRepo.findOneBy.mockResolvedValue(null);
+
+      await expect(
+        service.updateTaskStatus(
+          "non_existent",
+          TaskStatus.IN_PROGRESS,
+          "usr_123"
+        )
+      ).rejects.toThrow(NotFoundException);
+    });
+  });
+});
+```
+
+Service 层测试的要点：
+
+1. **Mock 所有外部依赖**——Repository、其他 Service 都要 Mock，只测试当前 Service 的逻辑
+2. **验证方法调用**——不仅验证返回值，还要验证"是否调用了正确的方法"、"参数对不对"
+3. **覆盖异常路径**——比如任务不存在时的错误处理
+4. **测试业务规则**——比如"状态变更时要记录日志"，这是业务逻辑，应该被测试
+
+Service 测试的价值在于：当你改业务逻辑时，测试会告诉你"新逻辑是否满足了旧需求"。比如你把"创建任务时默认状态是 TODO"改成了"从 DTO 读取状态"，测试会失败，提醒你这个改动可能影响现有功能。
+
+## E2E 测试：测试完整的 API 链路
+
+E2E（End-to-End）测试是模拟真实用户发送 HTTP 请求，验证整个请求-响应流程。它测试的是"API 能不能用"，而不是"某个函数对不对"。
+
+E2E 测试要用到真实的 NestJS 应用实例，并且要启动一个 HTTP 服务器。NestJS 提供了测试工具，可以在内存中启动应用，不需要真的监听端口：
+
+```typescript
+// test/e2e/tasks.e2e-spec.ts
+import { Test, TestingModule } from "@nestjs/testing";
+import { INestApplication, ValidationPipe } from "@nestjs/common";
+import * as request from "supertest";
+import { TypeOrmModule } from "@nestjs/typeorm";
+import { TasksModule } from "../../src/modules/tasks.module";
+import { Task } from "../../src/entities/task.entity";
+import { Workspace } from "../../src/entities/workspace.entity";
+import { Project } from "../../src/entities/project.entity";
+import { User } from "../../src/entities/user.entity";
+import { TaskStatus } from "../../src/enums/task-status.enum";
+
+describe("Tasks API (E2E)", () => {
+  let app: INestApplication;
+  let dataSource: DataSource;
+
+  beforeAll(async () => {
+    const moduleFixture: TestingModule = await Test.createTestingModule({
+      imports: [
+        TypeOrmModule.forRoot({
+          type: "better-sqlite3",
+          database: ":memory:",
+          entities: [Task, Workspace, Project, User],
+          synchronize: true,
+          logging: false,
+        }),
+        TasksModule,
+      ],
+    }).compile();
+
+    app = moduleFixture.createNestApplication();
+
+    // 配置与生产环境一致
+    app.useGlobalPipes(
+      new ValidationPipe({
+        whitelist: true, // 剔除未在 DTO 中定义的属性
+        forbidNonWhitelisted: true, // 如果有未定义的属性则报错
+        transform: true, // 自动转换类型（string -> number 等）
+      })
+    );
+
+    await app.init();
+
+    // 获取 DataSource 用于准备测试数据
+    dataSource = moduleFixture.get<DataSource>(DataSource);
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  afterEach(async () => {
+    // 清空测试数据
+    await dataSource.getRepository(Task).query("DELETE FROM tasks");
+    await dataSource.getRepository(Project).query("DELETE FROM projects");
+    await dataSource.getRepository(Workspace).query("DELETE FROM workspaces");
+    await dataSource.getRepository(User).query("DELETE FROM users");
+  });
+
+  describe("POST /tasks", () => {
+    it("应该成功创建任务", async () => {
+      // 先准备关联数据
+      const workspace = await dataSource.getRepository(Workspace).save({
+        id: "ws_fe_8x9k2m",
+        name: "字节前端团队",
+      });
+      const project = await dataSource.getRepository(Project).save({
+        id: "proj_web_2x9k3m",
+        name: "官网重构 v2.0",
+        workspaceId: workspace.id,
+      });
+      const user = await dataSource.getRepository(User).save({
+        id: "usr_a1x9k2m",
+        name: "张伟",
+        email: "zhang_wei@example.com",
+      });
+
+      const response = await request(app.getHttpServer())
+        .post("/tasks")
+        .send({
+          title: "修复导航栏在移动端的布局错位",
+          projectId: project.id,
+          assigneeId: user.id,
+          priority: "high",
+        })
+        .expect(201);
+
+      expect(response.body.success).toBe(true);
+      expect(response.body.data.id).toBeDefined();
+      expect(response.body.data.title).toBe("修复导航栏在移动端的布局错位");
+      expect(response.body.data.status).toBe(TaskStatus.TODO); // 默认状态
+      expect(response.body.data.projectId).toBe(project.id);
+    });
+
+    it("缺少必填字段应该返回 400", async () => {
+      const response = await request(app.getHttpServer())
+        .post("/tasks")
+        .send({
+          title: "测试任务",
+          // 缺少 projectId 和 assigneeId
+        })
+        .expect(400);
+
+      expect(response.body.success).toBe(false);
+      expect(response.body.error).toContain("projectId");
+      expect(response.body.error).toContain("assigneeId");
+    });
+
+    it("传递未定义的字段应该返回 400（forbidNonWhitelisted）", async () => {
+      const response = await request(app.getHttpServer())
+        .post("/tasks")
+        .send({
+          title: "测试任务",
+          projectId: "proj_123",
+          assigneeId: "usr_123",
+          unknownField: "should not be here", // DTO 中没有定义这个字段
+        })
+        .expect(400);
+
+      expect(response.body.success).toBe(false);
+    });
+  });
+
+  describe("GET /tasks/:id", () => {
+    it("应该返回任务详情", async () => {
+      const workspace = await dataSource.getRepository(Workspace).save({
+        id: "ws_fe_8x9k2m",
+        name: "字节前端团队",
+      });
+      const project = await dataSource.getRepository(Project).save({
+        id: "proj_web_2x9k3m",
+        name: "官网重构 v2.0",
+        workspaceId: workspace.id,
+      });
+      const user = await dataSource.getRepository(User).save({
+        id: "usr_a1x9k2m",
+        name: "张伟",
+        email: "zhang_wei@example.com",
+      });
+
+      const task = await dataSource.getRepository(Task).save({
+        id: "task_nav_3x9k4m",
+        title: "修复导航栏布局",
+        projectId: project.id,
+        assigneeId: user.id,
+        status: TaskStatus.IN_PROGRESS,
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/tasks/${task.id}`)
+        .expect(200);
+
+      expect(response.body.data.id).toBe(task.id);
+      expect(response.body.data.title).toBe("修复导航栏布局");
+      expect(response.body.data.project).toBeDefined();
+      expect(response.body.data.assignee).toBeDefined();
+    });
+
+    it("任务不存在应该返回 404", async () => {
+      await request(app.getHttpServer())
+        .get("/tasks/non_existent_task")
+        .expect(404);
+    });
+  });
+
+  describe("GET /tasks", () => {
+    it("应该支持分页查询", async () => {
+      const workspace = await dataSource.getRepository(Workspace).save({
+        id: "ws_fe_8x9k2m",
+        name: "字节前端团队",
+      });
+      const project = await dataSource.getRepository(Project).save({
+        id: "proj_web_2x9k3m",
+        name: "官网重构 v2.0",
+        workspaceId: workspace.id,
+      });
+      const user = await dataSource.getRepository(User).save({
+        id: "usr_a1x9k2m",
+        name: "张伟",
+      });
+
+      // 创建 15 个任务
+      for (let i = 1; i <= 15; i++) {
+        await dataSource.getRepository(Task).save({
+          id: `task_${i}`,
+          title: `任务 ${i}`,
+          projectId: project.id,
+          assigneeId: user.id,
+        });
+      }
+
+      // 第 1 页
+      const page1 = await request(app.getHttpServer())
+        .get("/tasks?page=1&limit=10")
+        .expect(200);
+
+      expect(page1.body.data.data).toHaveLength(10);
+      expect(page1.body.data.total).toBe(15);
+      expect(page1.body.data.page).toBe(1);
+
+      // 第 2 页
+      const page2 = await request(app.getHttpServer())
+        .get("/tasks?page=2&limit=10")
+        .expect(200);
+
+      expect(page2.body.data.data).toHaveLength(5);
+    });
+
+    it("应该支持按状态筛选", async () => {
+      const workspace = await dataSource.getRepository(Workspace).save({
+        id: "ws_fe_8x9k2m",
+      });
+      const project = await dataSource.getRepository(Project).save({
+        id: "proj_web_2x9k3m",
+        workspaceId: workspace.id,
+      });
+      const user = await dataSource.getRepository(User).save({
+        id: "usr_a1x9k2m",
+      });
+
+      await dataSource.getRepository(Task).save([
+        {
+          title: "任务 1",
+          projectId: project.id,
+          assigneeId: user.id,
+          status: TaskStatus.TODO,
+        },
+        {
+          title: "任务 2",
+          projectId: project.id,
+          assigneeId: user.id,
+          status: TaskStatus.IN_PROGRESS,
+        },
+        {
+          title: "任务 3",
+          projectId: project.id,
+          assigneeId: user.id,
+          status: TaskStatus.TODO,
+        },
+      ]);
+
+      const response = await request(app.getHttpServer())
+        .get("/tasks?status=TODO")
+        .expect(200);
+
+      expect(response.body.data.data).toHaveLength(2);
+      expect(
+        response.body.data.data.every((t) => t.status === TaskStatus.TODO)
+      ).toBe(true);
+    });
+  });
+});
+```
+
+E2E 测试的重点：
+
+1. **测试 HTTP 协议层**——状态码、请求格式、响应格式
+2. **测试验证逻辑**——DTO 验证是否生效
+3. **测试完整流程**——从请求到数据库，整条链路
+4. **数据隔离**——每个测试后清空数据
+
+E2E 测试的价值在于：它能发现"集成问题"——比如 Repository 和 Service 的接口不匹配、DTO 验证没生效、路由配置错误等。这些问题在单元测试中很难发现，但 E2E 测试一跑就会暴露。
+
+## 什么值得测，什么不值得测
+
+测试的投入产出比很重要，不是所有代码都需要测试。根据经验：
+
+**值得测的**：
+
+1. **核心业务逻辑**——比如任务创建时的状态初始化、状态流转的规则
+2. **复杂的查询**——比如多条件筛选、多表 JOIN、统计类查询
+3. **边界条件**——比如分页的最后一页、空数组、null 值处理
+4. **容易出错的地方**——比如日期计算、并发冲突、事务回滚
+
+**不值得测的**：
+
+1. **简单的 CRUD**——比如 `taskRepo.findOneBy({ id })` 这种，TypeORM 自己已经测过了
+2. **Getter/Setter**——纯数据存取，没有逻辑
+3. **DTO 类**——纯数据结构，没有行为
+4. **配置常量**——比如 `const MAX_RETRY = 3`
+
+一个实用的判断标准：如果这段代码写错了，会不会导致明显的 bug？如果答案是"会"，那就写测试；如果答案是"不太会"，那就跳过。
+
+## 测试的 Trade-off
+
+测试不是免费的，它有几个成本：
+
+1. **写测试的时间**——一般来说，写测试的时间是写功能代码的 30%-50%
+2. **维护测试的成本**——需求变了，测试也要改；有时候改测试比改代码还累
+3. **测试运行时间**——测试套件跑得越久，开发者越不想跑
+
+但测试带来的收益更明显：
+
+1. **重构的信心**——有测试在，你敢改代码；没测试，你不敢动旧代码
+2. **更少的 bug**——测试能发现大部分回归问题
+3. **活的文档**——测试用例本身就是"这段代码该怎么用"的文档
+4. **更快的开发速度**——长期来看，有测试的项目迭代更快，因为花在排查 bug 上的时间更少
+
+对于 TypeORM 项目，我的建议是：
+
+- **Repository 层**——只测试复杂查询，简单的 CRUD 不测
+- **Service 层**——重点测业务逻辑，覆盖率目标是 70%-80%
+- **E2E 层**——只测核心 API（增删改查），不需要覆盖所有边界
+
+这样既能保证质量，又不会因为测试太多而拖慢开发速度。
+
+## 小结
+
+这篇文章我们讨论了如何给 TypeORM 项目搭建测试体系：
+
+1. **测试环境配置**——用 SQLite 内存数据库替代 PostgreSQL，让测试跑得更快
+2. **Repository 集成测试**——验证 SQL 查询的正确性，重点测复杂查询和关联加载
+3. **Service 单元测试**——Mock Repository，只测试业务逻辑
+4. **E2E 测试**——测试完整的 HTTP 请求流程，验证 API 的输入输出
+5. **测试策略**——不是所有代码都需要测试，重点测核心逻辑和边界条件
+
+测试的核心价值是给你一个安全网，让你在改代码时有底气。它不是追求 100% 的覆盖率，而是在"投入"和"收益"之间找个平衡点。
+
+在下一篇文章中，我们将讨论最后一个环节：生产部署。怎么把项目用 Docker 容器化？怎么配置 CI/CD 自动跑迁移？怎么保证线上环境的稳定性？这些内容将帮我们把项目从开发环境推向生产环境。

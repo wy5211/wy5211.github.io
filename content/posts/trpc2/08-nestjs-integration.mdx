@@ -1,0 +1,929 @@
+---
+title: "08 NestJS 集成：企业级后端架构"
+date: "2026-03-23"
+summary: "掌握 NestJS 与 tRPC 的深度集成，利用 NestJS 的依赖注入和模块系统，构建企业级微服务架构的 tRPC 应用。"
+tags: ["tRPC", "NestJS", "企业级", "微服务", "依赖注入"]
+category: "trpc"
+draft: false
+series: "tRPC 端到端类型安全实战"
+seriesOrder: 8
+---
+
+在之前的文章中，我们学习了如何在 Next.js 和 Nuxt 这类全栈框架中使用 tRPC。这两个框架都很适合构建 Web 应用，但如果你的需求更复杂一些呢？
+
+比如，你需要构建一个专门的后端 API 服务，需要与多个前端应用通信，或者需要实现微服务架构。这时候，NestJS 就是一个更好的选择。
+
+## 为什么选择 NestJS
+
+NestJS 是一个用于构建高效、可扩展的 Node.js 企业级后端应用的框架。它借鉴了 Angular 的架构思想，提供了模块化、依赖注入、装饰器等企业级特性。
+
+将 tRPC 与 NestJS 结合，可以获得几个关键优势：
+
+首先，NestJS 的模块系统让代码组织非常清晰，每个功能模块都有自己的 router、service、controller，职责分明。
+
+其次，依赖注入机制让测试和代码复用变得简单。你可以轻松地在不同模块之间共享服务。
+
+最后，NestJS 提供了 Guards、Interceptors、Pipes 等机制，可以完美地与 tRPC 的中间件系统集成。
+
+让我们看看如何在协作任务管理平台的后端服务中使用 NestJS + tRPC。
+
+## 项目初始化
+
+创建 NestJS 项目：
+
+```bash
+npm i -g @nestjs/cli
+nest new task-manager-api
+cd task-manager-api
+```
+
+安装 tRPC 和相关依赖：
+
+```bash
+npm install @trpc/server zod superjson
+npm install @prisma/client prisma
+npm install @nestjs/jwt @nestjs/passport passport passport-jwt bcrypt
+npm install -D @types/passport-jwt @types/bcrypt
+```
+
+## 项目结构
+
+NestJS 的项目结构非常规范：
+
+```
+task-manager-api/
+├── src/
+│   ├── trpc/
+│   │   ├── trpc.module.ts
+│   │   ├── trpc.service.ts
+│   │   ├── routers/
+│   │   │   ├── index.ts
+│   │   │   ├── tasks.router.ts
+│   │   │   ├── projects.router.ts
+│   │   │   └── users.router.ts
+│   │   └── context.type.ts
+│   ├── modules/
+│   │   ├── tasks/
+│   │   ├── projects/
+│   │   └── auth/
+│   ├── common/
+│   │   ├── guards/
+│   │   ├── interceptors/
+│   │   └── pipes/
+│   ├── prisma/
+│   │   └── prisma.service.ts
+│   ├── app.module.ts
+│   └── main.ts
+├── prisma/
+└── package.json
+```
+
+## 创建 Prisma 服务
+
+首先创建一个 Prisma 服务，使用 NestJS 的依赖注入：
+
+```typescript
+// src/prisma/prisma.service.ts
+
+import { Injectable, OnModuleInit, OnModuleDestroy } from "@nestjs/common";
+import { PrismaClient } from "@prisma/client";
+
+@Injectable()
+export class PrismaService
+  extends PrismaClient
+  implements OnModuleInit, OnModuleDestroy
+{
+  async onModuleInit() {
+    await this.$connect();
+  }
+
+  async onModuleDestroy() {
+    await this.$disconnect();
+  }
+
+  cleanDb() {
+    return this.$transaction([
+      this.comment.deleteMany(),
+      this.task.deleteMany(),
+      this.projectMember.deleteMany(),
+      this.project.deleteMany(),
+      this.user.deleteMany(),
+    ]);
+  }
+}
+```
+
+## 创建 tRPC 服务
+
+这是整个集成最核心的部分：
+
+```typescript
+// src/trpc/trpc.service.ts
+
+import { Injectable } from "@nestjs/common";
+import { initTRPC, TRPCError } from "@trpc/server";
+import { ZodError } from "zod";
+import superjson from "superjson";
+import type { Context } from "./context.type";
+
+@Injectable()
+export class tRPCService {
+  // 初始化 tRPC
+  t = initTRPC.context<Context>().create({
+    transformer: superjson,
+    errorFormatter({ shape, error }) {
+      return {
+        ...shape,
+        data: {
+          ...shape.data,
+          zodError:
+            error.code === "BAD_REQUEST" && error.cause instanceof ZodError
+              ? error.cause.flatten()
+              : null,
+        },
+      };
+    },
+  });
+
+  // 创建路由和 procedure
+  router = this.t.router;
+  procedure = this.t.procedure;
+  middleware = this.t.middleware;
+
+  // 公开 API
+  publicProcedure = this.procedure;
+
+  // 受保护的 API（需要认证）
+  protectedProcedure = this.procedure.use(
+    this.middleware(({ ctx, next }) => {
+      if (!ctx.user) {
+        throw new TRPCError({
+          code: "UNAUTHORIZED",
+          message: "需要登录",
+        });
+      }
+      return next({
+        ctx: {
+          ...ctx,
+          user: ctx.user,
+        },
+      });
+    })
+  );
+
+  // 管理员 API
+  adminProcedure = this.protectedProcedure.use(
+    this.middleware(({ ctx, next }) => {
+      if (ctx.user?.role !== "ADMIN") {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "需要管理员权限",
+        });
+      }
+      return next();
+    })
+  );
+}
+```
+
+## 创建 Context 类型
+
+```typescript
+// src/trpc/context.type.ts
+
+import { CreateNestContextOptions } from "@trpc/server/adapters/nestjs";
+
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+  role: "ADMIN" | "MEMBER" | "GUEST";
+}
+
+export interface Context {
+  user: User | null;
+  req?: Request;
+}
+```
+
+## 创建 Router 模块
+
+在 NestJS 中，我们将每个 Router 创建为一个独立的类，这样可以利用依赖注入：
+
+```typescript
+// src/trpc/routers/tasks.router.ts
+
+import { Injectable } from "@nestjs/common";
+import { z } from "zod";
+import { TRPCError } from "@trpc/server";
+import { tRPCService, PrismaService } from "../../trpc";
+
+@Injectable()
+export class TasksRouter {
+  constructor(
+    private readonly trpc: tRPCService,
+    private readonly prisma: PrismaService
+  ) {}
+
+  get router() {
+    return this.trpc.router({
+      // 获取任务列表
+      list: this.trpc.protectedProcedure
+        .input(
+          z.object({
+            projectId: z.string(),
+            status: z
+              .enum(["TODO", "IN_PROGRESS", "REVIEW", "DONE", "CANCELLED"])
+              .optional(),
+            page: z.number().default(1),
+            limit: z.number().min(1).max(100).default(20),
+          })
+        )
+        .query(async ({ input, ctx }) => {
+          const { projectId, status, page, limit } = input;
+          const skip = (page - 1) * limit;
+
+          // 验证权限
+          const membership = await this.prisma.projectMember.findUnique({
+            where: {
+              projectId_userId: {
+                projectId,
+                userId: ctx.user.id,
+              },
+            },
+          });
+
+          if (!membership) {
+            throw new TRPCError({
+              code: "FORBIDDEN",
+              message: "你不是该项目的成员",
+            });
+          }
+
+          const [tasks, total] = await Promise.all([
+            this.prisma.task.findMany({
+              where: {
+                projectId,
+                ...(status && { status }),
+              },
+              skip,
+              take: limit,
+              orderBy: [{ priority: "desc" }, { createdAt: "desc" }],
+              include: {
+                creator: {
+                  select: {
+                    id: true,
+                    name: true,
+                    avatar: true,
+                  },
+                },
+                assignee: {
+                  select: {
+                    id: true,
+                    name: true,
+                    avatar: true,
+                  },
+                },
+                _count: {
+                  select: {
+                    comments: true,
+                  },
+                },
+              },
+            }),
+            this.prisma.task.count({
+              where: {
+                projectId,
+                ...(status && { status }),
+              },
+            }),
+          ]);
+
+          return {
+            tasks,
+            pagination: {
+              page,
+              limit,
+              total,
+              totalPages: Math.ceil(total / limit),
+            },
+          };
+        }),
+
+      // 创建任务
+      create: this.trpc.protectedProcedure
+        .input(
+          z.object({
+            title: z.string().min(1).max(200),
+            description: z.string().optional(),
+            projectId: z.string(),
+            assigneeId: z.string().optional(),
+            priority: z
+              .enum(["LOW", "MEDIUM", "HIGH", "URGENT"])
+              .default("MEDIUM"),
+            dueDate: z.date().optional(),
+          })
+        )
+        .mutation(async ({ input, ctx }) => {
+          const membership = await this.prisma.projectMember.findUnique({
+            where: {
+              projectId_userId: {
+                projectId: input.projectId,
+                userId: ctx.user.id,
+              },
+            },
+          });
+
+          if (!membership) {
+            throw new TRPCError({
+              code: "FORBIDDEN",
+              message: "你不是该项目的成员",
+            });
+          }
+
+          const task = await this.prisma.task.create({
+            data: {
+              ...input,
+              creatorId: ctx.user.id,
+            },
+            include: {
+              creator: {
+                select: {
+                  id: true,
+                  name: true,
+                  avatar: true,
+                },
+              },
+              assignee: {
+                select: {
+                  id: true,
+                  name: true,
+                  avatar: true,
+                },
+              },
+            },
+          });
+
+          return task;
+        }),
+
+      // 更新任务状态
+      updateStatus: this.trpc.protectedProcedure
+        .input(
+          z.object({
+            taskId: z.string(),
+            status: z.enum([
+              "TODO",
+              "IN_PROGRESS",
+              "REVIEW",
+              "DONE",
+              "CANCELLED",
+            ]),
+          })
+        )
+        .mutation(async ({ input, ctx }) => {
+          const task = await this.prisma.task.findUnique({
+            where: { id: input.taskId },
+          });
+
+          if (!task) {
+            throw new TRPCError({
+              code: "NOT_FOUND",
+              message: "任务不存在",
+            });
+          }
+
+          const membership = await this.prisma.projectMember.findUnique({
+            where: {
+              projectId_userId: {
+                projectId: task.projectId,
+                userId: ctx.user.id,
+              },
+            },
+          });
+
+          if (!membership) {
+            throw new TRPCError({
+              code: "FORBIDDEN",
+              message: "你不是该项目的成员",
+            });
+          }
+
+          const updated = await this.prisma.task.update({
+            where: { id: input.taskId },
+            data: { status: input.status },
+            include: {
+              creator: {
+                select: {
+                  id: true,
+                  name: true,
+                  avatar: true,
+                },
+              },
+              assignee: {
+                select: {
+                  id: true,
+                  name: true,
+                  avatar: true,
+                },
+              },
+            },
+          });
+
+          return updated;
+        }),
+
+      // 分配任务
+      assign: this.trpc.protectedProcedure
+        .input(
+          z.object({
+            taskId: z.string(),
+            assigneeId: z.string(),
+          })
+        )
+        .mutation(async ({ input, ctx }) => {
+          const task = await this.prisma.task.findUnique({
+            where: { id: input.taskId },
+          });
+
+          if (!task) {
+            throw new TRPCError({
+              code: "NOT_FOUND",
+              message: "任务不存在",
+            });
+          }
+
+          // 验证被分配人是否是项目成员
+          const assigneeMembership = await this.prisma.projectMember.findUnique(
+            {
+              where: {
+                projectId_userId: {
+                  projectId: task.projectId,
+                  userId: input.assigneeId,
+                },
+              },
+            }
+          );
+
+          if (!assigneeMembership) {
+            throw new TRPCError({
+              code: "BAD_REQUEST",
+              message: "被分配人不是该项目的成员",
+            });
+          }
+
+          const updated = await this.prisma.task.update({
+            where: { id: input.taskId },
+            data: { assigneeId: input.assigneeId },
+            include: {
+              assignee: {
+                select: {
+                  id: true,
+                  name: true,
+                  avatar: true,
+                },
+              },
+            },
+          });
+
+          return updated;
+        }),
+    });
+  }
+}
+```
+
+## 创建 tRPC 模块
+
+```typescript
+// src/trpc/trpc.module.ts
+
+import { Module, Global } from "@nestjs/common";
+import { tRPCService } from "./trpc.service";
+import { TasksRouter } from "./routers/tasks.router";
+import { ProjectsRouter } from "./routers/projects.router";
+import { UsersRouter } from "./routers/users.router";
+import { PrismaService } from "../prisma/prisma.service";
+
+@Global()
+@Module({
+  providers: [
+    tRPCService,
+    PrismaService,
+    TasksRouter,
+    ProjectsRouter,
+    UsersRouter,
+  ],
+  exports: [tRPCService, PrismaService],
+})
+export class tRPCModule {
+  constructor(
+    private readonly trpcService: tRPCService,
+    private readonly prisma: PrismaService,
+    private readonly tasksRouter: TasksRouter,
+    private readonly projectsRouter: ProjectsRouter,
+    private readonly usersRouter: UsersRouter
+  ) {}
+
+  // 合并所有路由
+  createRouter() {
+    return this.trpcService.router({
+      tasks: this.tasksRouter.router,
+      projects: this.projectsRouter.router,
+      users: this.usersRouter.router,
+    });
+  }
+}
+```
+
+## 创建 tRPC 控制器
+
+```typescript
+// src/trpc/trpc.controller.ts
+
+import { Controller } from "@nestjs/common";
+import { tRPCModule } from "./trpc.module";
+import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
+import type { Context } from "./context.type";
+
+@Controller("trpc")
+export class tRPCController {
+  constructor(private readonly trpcModule: tRPCModule) {}
+
+  async handleRequest(req: Request) {
+    const router = this.trpcModule.createRouter();
+
+    return fetchRequestHandler({
+      endpoint: "/trpc",
+      req,
+      router,
+      createContext: (): Context => ({
+        user: null, // 从 JWT 中提取
+        req,
+      }),
+    });
+  }
+}
+```
+
+## 创建 NestJS Guards
+
+虽然 tRPC 有自己的中间件机制，但在 NestJS 中，我们也可以利用其 Guards 系统：
+
+```typescript
+// src/common/guards/jwt-auth.guard.ts
+
+import { Injectable, CanActivate, ExecutionContext } from "@nestjs/common";
+import { Reflector } from "@nestjs/core";
+import { JwtService } from "@nestjs/jwt";
+
+@Injectable()
+export class JwtAuthGuard implements CanActivate {
+  constructor(
+    private readonly jwtService: JwtService,
+    private readonly reflector: Reflector
+  ) {}
+
+  async canActivate(context: ExecutionContext): Promise<boolean> {
+    // 检查是否跳过认证
+    const isPublic = this.reflector.get<boolean>(
+      "isPublic",
+      context.getHandler()
+    );
+
+    if (isPublic) {
+      return true;
+    }
+
+    const request = context.switchToHttp().getRequest();
+    const token = this.extractTokenFromHeader(request);
+
+    if (!token) {
+      return false;
+    }
+
+    try {
+      const payload = await this.jwtService.verifyAsync(token);
+      request.user = payload;
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private extractTokenFromHeader(request: any): string | undefined {
+    const [type, token] = request.headers.authorization?.split(" ") ?? [];
+    return type === "Bearer" ? token : undefined;
+  }
+}
+```
+
+## 创建 NestJS Interceptors
+
+用于日志记录和性能监控：
+
+```typescript
+// src/common/interceptors/logging.interceptor.ts
+
+import {
+  Injectable,
+  NestInterceptor,
+  ExecutionContext,
+  CallHandler,
+  Logger,
+} from "@nestjs/common";
+import { Observable } from "rxjs";
+import { tap } from "rxjs/operators";
+
+@Injectable()
+export class LoggingInterceptor implements NestInterceptor {
+  private readonly logger = new Logger(LoggingInterceptor.name);
+
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const request = context.switchToHttp().getRequest();
+    const { method, url } = request;
+    const now = Date.now();
+
+    return next.handle().pipe(
+      tap(() => {
+        const delay = Date.now() - now;
+        this.logger.log(`${method} ${url} - ${delay}ms`);
+      })
+    );
+  }
+}
+```
+
+## 应用入口
+
+```typescript
+// src/main.ts
+
+import { NestFactory } from "@nestjs/core";
+import { AppModule } from "./app.module";
+import { LoggingInterceptor } from "./common/interceptors/logging.interceptor";
+import * as trpcNest from "@trpc/server/adapters/nestjs";
+import type { Context } from "./trpc/context.type";
+
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule, {
+    logger: ["error", "warn"],
+  });
+
+  // 启用 CORS
+  app.enableCors();
+
+  // 全局拦截器
+  app.useGlobalInterceptors(new LoggingInterceptor());
+
+  // 注册 tRPC
+  const trpc = app.get(tRPCModule);
+
+  const adapter = new trpcNest.NestTRPCAdapter<Context>({
+    trpcOptions: {
+      createContext: ({ req }): Context => ({
+        user: req.user || null,
+        req,
+      }),
+    },
+  });
+
+  adapter.applyMiddleware(app, trpc.createRouter());
+
+  const port = process.env.PORT || 3000;
+  await app.listen(port);
+
+  console.log(`Server running on http://localhost:${port}`);
+}
+
+bootstrap();
+```
+
+## App 模块配置
+
+```typescript
+// src/app.module.ts
+
+import { Module } from "@nestjs/common";
+import { tRPCModule } from "./trpc/trpc.module";
+import { ConfigModule } from "@nestjs/config";
+import { JwtModule } from "@nestjs/jwt";
+import { PassportModule } from "@nestjs/passport";
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+    }),
+    JwtModule.register({
+      secret: process.env.JWT_SECRET,
+      signOptions: { expiresIn: "7d" },
+    }),
+    PassportModule.register({ defaultStrategy: "jwt" }),
+    tRPCModule,
+  ],
+})
+export class AppModule {}
+```
+
+## 测试
+
+NestJS 提供了完善的测试支持：
+
+### 单元测试
+
+```typescript
+// src/trpc/routers/tasks.router.spec.ts
+
+import { Test, TestingModule } from "@nestjs/testing";
+import { TasksRouter } from "./tasks.router";
+import { tRPCService } from "../trpc.service";
+import { PrismaService } from "../../prisma/prisma.service";
+
+describe("TasksRouter", () => {
+  let router: TasksRouter;
+  let prisma: PrismaService;
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      providers: [
+        TasksRouter,
+        tRPCService,
+        {
+          provide: PrismaService,
+          useValue: {
+            task: {
+              findMany: jest.fn(),
+              findUnique: jest.fn(),
+              create: jest.fn(),
+              update: jest.fn(),
+              count: jest.fn(),
+            },
+            projectMember: {
+              findUnique: jest.fn(),
+            },
+          },
+        },
+      ],
+    }).compile();
+
+    router = module.get<TasksRouter>(TasksRouter);
+    prisma = module.get<PrismaService>(PrismaService);
+  });
+
+  it("should be defined", () => {
+    expect(router).toBeDefined();
+  });
+
+  it("should get tasks list", async () => {
+    const caller = createCaller(router.router);
+
+    const result = await caller.tasks.list({
+      projectId: "test-project-id",
+      page: 1,
+      limit: 20,
+    });
+
+    expect(result.tasks).toBeDefined();
+    expect(result.pagination).toBeDefined();
+  });
+});
+```
+
+### E2E 测试
+
+```typescript
+// test/tasks.e2e-spec.ts
+
+import { Test, TestingModule } from "@nestjs/testing";
+import { INestApplication } from "@nestjs/common";
+import * as request from "supertest";
+import { AppModule } from "./../src/app.module";
+
+describe("Tasks (e2e)", () => {
+  let app: INestApplication;
+
+  beforeAll(async () => {
+    const moduleFixture: TestingModule = await Test.createTestingModule({
+      imports: [AppModule],
+    }).compile();
+
+    app = moduleFixture.createNestApplication();
+    await app.init();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  it("/trpc/tasks.list (GET)", () => {
+    return request(app.getHttpServer())
+      .get('/trpc/tasks.list?input={"projectId":"xxx","page":1,"limit":20}')
+      .expect(200)
+      .expect((res) => {
+        expect(res.body).toHaveProperty("result");
+      });
+  });
+});
+```
+
+## 部署
+
+### Docker 配置
+
+```dockerfile
+# Dockerfile
+
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+
+COPY package*.json ./
+RUN npm ci
+
+COPY . .
+RUN npm run build
+
+FROM node:18-alpine AS runner
+
+WORKDIR /app
+
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package*.json ./
+
+EXPOSE 3000
+
+CMD ["node", "dist/main"]
+```
+
+### Docker Compose
+
+```yaml
+# docker-compose.yml
+
+version: "3.8"
+
+services:
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=postgresql://user:pass@postgres:5432/db
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=user
+      - POSTGRES_PASSWORD=pass
+      - POSTGRES_DB=db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+```
+
+## 权衡与取舍
+
+NestJS + tRPC 的组合非常适合构建企业级后端服务，但也有一些需要考虑的地方：
+
+**优势：**
+
+- 模块化架构，代码组织清晰
+- 依赖注入，便于测试和代码复用
+- Guards、Interceptors 等机制完善
+- 微服务架构支持
+- 完善的测试支持
+
+**劣势：**
+
+- 学习曲线较陡，需要理解 NestJS 的概念
+- 对于简单的 API 服务，可能显得过于复杂
+- 需要更多的样板代码
+
+**适用场景：**
+
+- 企业级后端服务
+- 微服务架构
+- 需要与多个前端应用通信
+- 需要完善的权限控制和审计日志
+
+**不适用场景：**
+
+- 简单的 CRUD API
+- 快速原型开发
+- 团队不熟悉 NestJS
+
+## 下一步
+
+现在我们已经学习了在三个不同的框架中使用 tRPC：Next.js（React 全栈）、Nuxt（Vue 全栈）、NestJS（企业级后端）。每个框架都有自己的特点和适用场景。
+
+在下一篇文章中，我们将学习 Hono 框架的集成，看看如何在边缘计算环境中使用 tRPC，这对部署到 Cloudflare Workers 等平台的应用非常有用。
+
+---

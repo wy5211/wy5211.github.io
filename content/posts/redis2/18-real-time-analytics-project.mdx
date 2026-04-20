@@ -1,0 +1,996 @@
+---
+title: "18. 实战：直播平台实时统计系统"
+date: "2026-03-23"
+summary: "综合运用 Redis 知识，构建一个完整的实时统计系统，包括在线用户、弹幕消息、礼物排行榜和点赞计数。"
+tags: ["Redis", "实战项目", "实时统计"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 18
+---
+
+恭喜你来到 Redis 系列的最后一篇。在之前的 17 篇文章中，我们从 Redis 的基础命令开始，逐步学习了数据类型、缓存策略、高级特性，以及高可用架构。现在，是时候把这些知识整合起来，构建一个完整的实时统计系统了。
+
+在上一篇文章中，我们学习了 Redis Cluster 的架构原理和数据分片机制。我们了解了如何通过哈希槽将数据分散到多个节点，以及如何使用哈希标签确保相关数据在同一节点。这些知识为我们构建大规模的实时系统打下了基础。
+
+今天，我们要为直播平台设计一个完整的实时统计系统。这个系统需要处理每秒数万次的用户操作，实时更新在线人数、弹幕流、礼物排行榜和点赞计数。同时，它需要支持高并发读取，保证数据一致性，并在节点故障时快速恢复。
+
+## 系统架构设计
+
+在设计实时统计系统之前，让我们先明确系统的需求：
+
+1. **在线用户统计**：实时显示每个直播间的在线人数，支持用户进入/离开
+2. **弹幕消息流**：存储最近的弹幕消息，支持实时推送
+3. **礼物排行榜**：实时更新礼物积分，支持 Top N 查询和排名查询
+4. **点赞计数**：原子递增，支持高并发
+5. **用户 Session**：存储用户登录状态
+6. **监控告警**：监控 Redis 性能指标，异常时告警
+
+基于这些需求，我们的架构设计如下：
+
+```
+                    ┌─────────────────┐
+                    │   Web Server    │
+                    │  (Node.js)      │
+                    └────────┬────────┘
+                             │
+                    ┌────────▼────────┐
+                    │  Redis Cluster  │
+                    │  (3 主 3 从)    │
+                    └─────────────────┘
+                             │
+                    ┌────────▼────────┐
+                    │  Monitoring     │
+                    │  (Prometheus)   │
+                    └─────────────────┘
+```
+
+应用服务器通过 Redis Cluster 客户端连接到集群，所有实时数据都存储在 Redis 中。监控服务定期采集 Redis 的性能指标，异常时触发告警。
+
+## 数据结构设计
+
+在开始编码之前，我们需要设计 Redis 的键结构。好的键设计可以提高性能、方便维护。
+
+对于直播平台，我们采用这样的键命名规范：
+
+```
+livestream:room:{roomId}:viewers          - Set，在线用户集合
+livestream:room:{roomId}:active           - Sorted Set，用户活跃时间
+livestream:room:{roomId}:danmaku          - List，弹幕消息流
+livestream:room:{roomId}:gifts            - Sorted Set，礼物排行榜
+livestream:room:{roomId}:likes            - String，点赞计数
+livestream:room:{roomId}:info             - Hash，房间信息
+session:{sessionId}                       - String，用户 Session
+```
+
+使用 `{roomId}` 作为哈希标签，可以确保同一直播间的所有数据都在同一个节点，这样可以高效地使用 Pipeline 和多键操作。
+
+## 在线用户统计
+
+在线用户统计是实时系统的核心功能。我们需要在用户进入/离开房间时更新统计数据，并支持实时查询在线人数。
+
+这里使用 Set 来存储在线用户集合，使用 Sorted Set 来记录用户的活跃时间。Set 提供了 O(1) 复杂度的添加/删除操作，Sorted Set 让我们可以轻松地清理不活跃用户。
+
+```typescript
+import Redis from "ioredis";
+
+class OnlineUserManager {
+  constructor(private cluster: Redis.Cluster) {}
+
+  // 用户进入直播间
+  async joinRoom(roomId: string, userId: string): Promise<number> {
+    const now = Date.now();
+
+    // 使用 Pipeline 减少网络往返
+    const pipeline = this.cluster.pipeline();
+
+    // 添加到在线用户集合
+    pipeline.sadd(`livestream:room:{${roomId}}:viewers`, userId);
+
+    // 更新活跃时间戳
+    pipeline.zadd(`livestream:room:{${roomId}}:active`, now, userId);
+
+    // 设置过期时间（5 分钟后自动清理）
+    pipeline.expire(`livestream:room:{${roomId}}:viewers`, 300);
+    pipeline.expire(`livestream:room:{${roomId}}:active`, 300);
+
+    const results = await pipeline.exec();
+
+    // 返回当前在线人数
+    const count = await this.cluster.scard(
+      `livestream:room:{${roomId}}:viewers`
+    );
+    return count;
+  }
+
+  // 用户离开直播间
+  async leaveRoom(roomId: string, userId: string): Promise<void> {
+    const pipeline = this.cluster.pipeline();
+
+    // 从在线用户集合移除
+    pipeline.srem(`livestream:room:{${roomId}}:viewers`, userId);
+
+    // 从活跃集合移除
+    pipeline.zrem(`livestream:room:{${roomId}}:active`, userId);
+
+    await pipeline.exec();
+  }
+
+  // 用户活跃（心跳）
+  async heartbeat(roomId: string, userId: string): Promise<void> {
+    const now = Date.now();
+    await this.cluster.zadd(`livestream:room:{${roomId}}:active`, now, userId);
+  }
+
+  // 获取在线用户数
+  async getOnlineCount(roomId: string): Promise<number> {
+    return await this.cluster.scard(`livestream:room:{${roomId}}:viewers`);
+  }
+
+  // 获取在线用户列表
+  async getOnlineUsers(roomId: string, limit: number = 100): Promise<string[]> {
+    return await this.cluster.smembers(`livestream:room:{${roomId}}:viewers`);
+  }
+
+  // 清理不活跃用户（定期任务）
+  async cleanInactiveUsers(roomId: string): Promise<number> {
+    const now = Date.now();
+    const fiveMinutesAgo = now - 5 * 60 * 1000;
+
+    // 找出 5 分钟内没有活跃的用户
+    const inactiveUsers = await this.cluster.zrangebyscore(
+      `livestream:room:{${roomId}}:active`,
+      0,
+      fiveMinutesAgo
+    );
+
+    if (inactiveUsers.length > 0) {
+      const pipeline = this.cluster.pipeline();
+
+      // 从在线集合移除
+      pipeline.srem(`livestream:room:{${roomId}}:viewers`, ...inactiveUsers);
+
+      // 从活跃集合移除
+      pipeline.zremrangebyscore(
+        `livestream:room:{${roomId}}:active`,
+        0,
+        fiveMinutesAgo
+      );
+
+      await pipeline.exec();
+    }
+
+    return inactiveUsers.length;
+  }
+}
+```
+
+这段代码实现了在线用户管理的核心逻辑。用户进入房间时，同时更新 Set 和 Sorted Set，这样我们可以通过 Set 快速查询在线人数，通过 Sorted Set 清理不活跃用户。Pipeline 减少了网络往返，提升了性能。
+
+清理不活跃用户的方法应该被定时任务调用，比如每分钟执行一次：
+
+```typescript
+// 定时清理不活跃用户
+setInterval(async () => {
+  const rooms = await getActiveRooms(); // 获取活跃的房间列表
+  for (const roomId of rooms) {
+    const cleaned = await onlineUserManager.cleanInactiveUsers(roomId);
+    if (cleaned > 0) {
+      console.log(`清理了房间 ${roomId} 的 ${cleaned} 个不活跃用户`);
+    }
+  }
+}, 60000);
+```
+
+## 弹幕消息流
+
+弹幕是直播平台的核心功能，需要支持高并发的写入和读取。我们使用 List 来存储弹幕消息，因为 List 提供了高效的 LPUSH/RANGE 操作。
+
+```typescript
+class DanmakuManager {
+  constructor(private cluster: Redis.Cluster) {}
+
+  // 发送弹幕
+  async sendDanmaku(
+    roomId: string,
+    userId: string,
+    message: string
+  ): Promise<void> {
+    const danmaku = {
+      userId,
+      message,
+      timestamp: Date.now(),
+    };
+
+    // 添加到弹幕流（最新的在前面）
+    await this.cluster.lpush(
+      `livestream:room:{${roomId}}:danmaku`,
+      JSON.stringify(danmaku)
+    );
+
+    // 只保留最近 1000 条弹幕
+    await this.cluster.ltrim(`livestream:room:{${roomId}}:danmaku`, 0, 999);
+
+    // 发布到 Pub/Sub 频道（实时推送）
+    await this.cluster.publish(
+      `livestream:room:{${roomId}}:danmaku:pub`,
+      JSON.stringify(danmaku)
+    );
+  }
+
+  // 获取最近的弹幕
+  async getRecentDanmaku(roomId: string, count: number = 50): Promise<any[]> {
+    const danmakus = await this.cluster.lrange(
+      `livestream:room:{${roomId}}:danmaku`,
+      0,
+      count - 1
+    );
+
+    return danmakus.map((d) => JSON.parse(d));
+  }
+
+  // 订阅弹幕实时推送
+  async subscribeDanmaku(
+    roomId: string,
+    callback: (danmaku: any) => void
+  ): Promise<void> {
+    const subscriber = new Redis.Cluster(this.cluster.options);
+
+    subscriber.subscribe(`livestream:room:{${roomId}}:danmaku:pub`);
+
+    subscriber.on("message", (channel, message) => {
+      if (channel === `livestream:room:{${roomId}}:danmaku:pub`) {
+        callback(JSON.parse(message));
+      }
+    });
+  }
+}
+```
+
+这段代码结合了 List 和 Pub/Sub。List 存储弹幕历史，用于新进入的用户查看最近的弹幕；Pub/Sub 实时推送新弹幕给在线用户。
+
+LPUSH + LTRIM 是一个常见的模式，确保 List 不会无限增长。每次添加新弹幕后，我们立即裁剪列表，只保留最近 1000 条。
+
+## 礼物排行榜
+
+礼物排行榜是直播平台激发用户打赏意愿的重要功能。我们使用 Sorted Set 来存储礼物积分，Sorted Set 提供了高效的 ZINCRBY 和 ZREVRANGE 操作。
+
+```typescript
+class GiftLeaderboard {
+  constructor(private cluster: Redis.Cluster) {}
+
+  // 用户送礼物
+  async sendGift(
+    roomId: string,
+    userId: string,
+    giftId: string,
+    value: number
+  ): Promise<void> {
+    const pipeline = this.cluster.pipeline();
+
+    // 更新用户礼物积分
+    pipeline.zincrby(`livestream:room:{${roomId}}:gifts`, value, userId);
+
+    // 增加房间总礼物值
+    pipeline.incrbyfloat(`livestream:room:{${roomId}}:total_gift_value`, value);
+
+    // 记录礼物日志（最近 100 条）
+    pipeline.lpush(
+      `livestream:room:{${roomId}}:gift_log`,
+      JSON.stringify({
+        userId,
+        giftId,
+        value,
+        timestamp: Date.now(),
+      })
+    );
+    pipeline.ltrim(`livestream:room:{${roomId}}:gift_log`, 0, 99);
+
+    // 发布到 Pub/Sub
+    pipeline.publish(
+      `livestream:room:{${roomId}}:gift:pub`,
+      JSON.stringify({ userId, giftId, value })
+    );
+
+    await pipeline.exec();
+  }
+
+  // 获取礼物排行榜 Top N
+  async getTopGifters(
+    roomId: string,
+    limit: number = 10
+  ): Promise<
+    Array<{
+      rank: number;
+      userId: string;
+      score: number;
+    }>
+  > {
+    const results = await this.cluster.zrevrange(
+      `livestream:room:{${roomId}}:gifts`,
+      0,
+      limit - 1,
+      "WITHSCORES"
+    );
+
+    const leaderboard = [];
+    for (let i = 0; i < results.length; i += 2) {
+      leaderboard.push({
+        rank: i / 2 + 1,
+        userId: results[i],
+        score: parseFloat(results[i + 1]),
+      });
+    }
+
+    return leaderboard;
+  }
+
+  // 获取用户排名
+  async getUserRank(
+    roomId: string,
+    userId: string
+  ): Promise<{
+    rank: number | null;
+    score: number | null;
+  }> {
+    const pipeline = this.cluster.pipeline();
+
+    // 查询排名（分数从高到低）
+    pipeline.zrevrank(`livestream:room:{${roomId}}:gifts`, userId);
+
+    // 查询分数
+    pipeline.zscore(`livestream:room:{${roomId}}:gifts`, userId);
+
+    const results = await pipeline.exec();
+
+    const rank = results?.[0]?.[1];
+    const score = results?.[1]?.[1];
+
+    return {
+      rank: rank !== null ? rank + 1 : null,
+      score: score !== null ? parseFloat(score) : null,
+    };
+  }
+
+  // 获取用户及前后名次
+  async getUserWithNeighbors(
+    roomId: string,
+    userId: string,
+    range: number = 2
+  ): Promise<{
+    user: { rank: number; userId: string; score: number } | null;
+    neighbors: Array<{ rank: number; userId: string; score: number }>;
+  }> {
+    const { rank } = await this.getUserRank(roomId, userId);
+
+    if (!rank) {
+      return { user: null, neighbors: [] };
+    }
+
+    const start = Math.max(0, rank - range - 1);
+    const end = rank + range - 1;
+
+    const results = await this.cluster.zrevrange(
+      `livestream:room:{${roomId}}:gifts`,
+      start,
+      end,
+      "WITHSCORES"
+    );
+
+    const users = [];
+    for (let i = 0; i < results.length; i += 2) {
+      users.push({
+        rank: start + i / 2 + 1,
+        userId: results[i],
+        score: parseFloat(results[i + 1]),
+      });
+    }
+
+    const user = users.find((u) => u.userId === userId) || null;
+    const neighbors = users.filter((u) => u.userId !== userId);
+
+    return { user, neighbors };
+  }
+
+  // 获取房间礼物总值
+  async getTotalGiftValue(roomId: string): Promise<number> {
+    const value = await this.cluster.get(
+      `livestream:room:{${roomId}}:total_gift_value`
+    );
+    return value ? parseFloat(value) : 0;
+  }
+}
+```
+
+这段代码实现了完整的礼物排行榜功能。`sendGift` 方法使用 Pipeline 同时更新多个数据结构，保证原子性和性能。`getUserRank` 和 `getUserWithNeighbors` 支持用户查询自己的排名和周围的用户，这对于激发竞争意识很有帮助。
+
+## 点赞计数
+
+点赞计数看起来简单，但在高并发场景下需要特别小心。我们使用 String 的 INCR 命令，它提供了原子递增操作。
+
+```typescript
+class LikeCounter {
+  constructor(private cluster: Redis.Cluster) {}
+
+  // 用户点赞
+  async like(roomId: string, userId: string): Promise<number> {
+    // 使用 SET 防止重复点赞
+    const key = `livestream:room:{${roomId}}:likes:users`;
+    const liked = await this.cluster.sismember(key, userId);
+
+    if (!liked) {
+      const pipeline = this.cluster.pipeline();
+
+      // 添加到已点赞集合
+      pipeline.sadd(key, userId);
+
+      // 增加点赞计数
+      pipeline.incr(`livestream:room:{${roomId}}:likes`);
+
+      // 设置过期时间（防止集合无限增长）
+      pipeline.expire(key, 86400); // 24 小时
+
+      const results = await pipeline.exec();
+      return results?.[1]?.[1] as number;
+    }
+
+    // 已经点赞过了，返回当前计数
+    return (await this.cluster.get(
+      `livestream:room:{${roomId}}:likes`
+    )) as unknown as number;
+  }
+
+  // 取消点赞
+  async unlike(roomId: string, userId: string): Promise<number> {
+    const key = `livestream:room:{${roomId}}:likes:users`;
+    const liked = await this.cluster.sismember(key, userId);
+
+    if (liked) {
+      const pipeline = this.cluster.pipeline();
+
+      // 从已点赞集合移除
+      pipeline.srem(key, userId);
+
+      // 减少点赞计数
+      pipeline.decr(`livestream:room:{${roomId}}:likes`);
+
+      const results = await pipeline.exec();
+      return results?.[1]?.[1] as number;
+    }
+
+    // 没有点赞过，返回当前计数
+    return (await this.cluster.get(
+      `livestream:room:{${roomId}}:likes`
+    )) as unknown as number;
+  }
+
+  // 获取点赞数
+  async getLikeCount(roomId: string): Promise<number> {
+    const count = await this.cluster.get(`livestream:room:{${roomId}}:likes`);
+    return count ? parseInt(count) : 0;
+  }
+
+  // 批量获取多个房间的点赞数
+  async getMultipleLikeCounts(roomIds: string[]): Promise<Map<string, number>> {
+    const pipeline = this.cluster.pipeline();
+
+    for (const roomId of roomIds) {
+      pipeline.get(`livestream:room:{${roomId}}:likes`);
+    }
+
+    const results = await pipeline.exec();
+    const countMap = new Map<string, number>();
+
+    roomIds.forEach((roomId, index) => {
+      const count = results?.[index]?.[1] as string | null;
+      countMap.set(roomId, count ? parseInt(count) : 0);
+    });
+
+    return countMap;
+  }
+}
+```
+
+这段代码防止了用户重复点赞。我们使用 Set 来记录已点赞的用户，这样可以在 O(1) 复杂度内判断用户是否已经点赞。虽然这会增加一些内存开销，但对于防止刷赞是必要的。
+
+## 用户 Session
+
+用户 Session 管理是 Web 应用的基础功能。我们使用 Hash 来存储 Session，这样可以方便地更新单个字段。
+
+```typescript
+class SessionManager {
+  constructor(private cluster: Redis.Cluster) {}
+
+  // 创建 Session
+  async createSession(
+    userId: string,
+    data: {
+      username: string;
+      role: string;
+      platform: string;
+    }
+  ): Promise<string> {
+    const sessionId = this.generateSessionId();
+
+    const pipeline = this.cluster.pipeline();
+
+    // 存储 Session 数据
+    pipeline.hset(`session:${sessionId}`, {
+      userId,
+      username: data.username,
+      role: data.role,
+      platform: data.platform,
+      createdAt: Date.now(),
+    });
+
+    // 设置过期时间（7 天）
+    pipeline.expire(`session:${sessionId}`, 7 * 24 * 3600);
+
+    // 将 Session ID 添加到用户的 Session 列表
+    pipeline.sadd(`user:${userId}:sessions`, sessionId);
+
+    await pipeline.exec();
+
+    return sessionId;
+  }
+
+  // 获取 Session
+  async getSession(sessionId: string): Promise<any | null> {
+    const data = await this.cluster.hgetall(`session:${sessionId}`);
+
+    if (Object.keys(data).length === 0) {
+      return null;
+    }
+
+    return {
+      sessionId,
+      ...data,
+    };
+  }
+
+  // 更新 Session
+  async updateSession(
+    sessionId: string,
+    field: string,
+    value: string
+  ): Promise<void> {
+    await this.cluster.hset(`session:${sessionId}`, field, value);
+  }
+
+  // 删除 Session（登出）
+  async deleteSession(sessionId: string): Promise<void> {
+    const session = await this.getSession(sessionId);
+
+    if (session) {
+      const pipeline = this.cluster.pipeline();
+
+      // 删除 Session 数据
+      pipeline.del(`session:${sessionId}`);
+
+      // 从用户的 Session 列表移除
+      pipeline.srem(`user:${session.userId}:sessions`, sessionId);
+
+      await pipeline.exec();
+    }
+  }
+
+  // 删除用户的所有 Session（强制登出）
+  async deleteUserSessions(userId: string): Promise<void> {
+    const sessionIds = await this.cluster.smembers(`user:${userId}:sessions`);
+
+    if (sessionIds.length > 0) {
+      const pipeline = this.cluster.pipeline();
+
+      // 删除所有 Session
+      for (const sessionId of sessionIds) {
+        pipeline.del(`session:${sessionId}`);
+      }
+
+      // 删除 Session 列表
+      pipeline.del(`user:${userId}:sessions`);
+
+      await pipeline.exec();
+    }
+  }
+
+  // 刷新 Session 过期时间
+  async refreshSession(sessionId: string): Promise<void> {
+    await this.cluster.expire(`session:${sessionId}`, 7 * 24 * 3600);
+  }
+
+  private generateSessionId(): string {
+    return `usr_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+  }
+}
+```
+
+这段代码实现了完整的 Session 管理功能。使用 Hash 存储 Session 可以方便地更新单个字段，而不需要重新写入整个 Session。同时，我们维护了用户的 Session 列表，这样可以方便地强制用户登出（比如管理员封禁用户时）。
+
+## 整合服务
+
+现在，让我们把所有功能整合到一个服务类中：
+
+```typescript
+class LiveStreamStatsService {
+  private onlineUsers: OnlineUserManager;
+  private danmaku: DanmakuManager;
+  private gifts: GiftLeaderboard;
+  private likes: LikeCounter;
+  private sessions: SessionManager;
+
+  constructor(private cluster: Redis.Cluster) {
+    this.onlineUsers = new OnlineUserManager(cluster);
+    this.danmaku = new DanmakuManager(cluster);
+    this.gifts = new GiftLeaderboard(cluster);
+    this.likes =
+      LikeCounter.prototype instanceof LikeCounter
+        ? new LikeCounter()
+        : (null as any);
+    this.sessions = new SessionManager(cluster);
+  }
+
+  // 用户进入直播间
+  async joinRoom(
+    roomId: string,
+    userId: string
+  ): Promise<{
+    onlineCount: number;
+    recentDanmaku: any[];
+  }> {
+    const onlineCount = await this.onlineUsers.joinRoom(roomId, userId);
+    const recentDanmaku = await this.danmaku.getRecentDanmaku(roomId, 20);
+
+    return { onlineCount, recentDanmaku };
+  }
+
+  // 用户发送弹幕
+  async sendDanmaku(
+    roomId: string,
+    userId: string,
+    message: string
+  ): Promise<void> {
+    await this.danmaku.sendDanmaku(roomId, userId, message);
+  }
+
+  // 用户送礼物
+  async sendGift(
+    roomId: string,
+    userId: string,
+    giftId: string,
+    value: number
+  ): Promise<{
+    rank: number | null;
+    score: number | null;
+  }> {
+    await this.gifts.sendGift(roomId, userId, giftId, value);
+    return await this.gifts.getUserRank(roomId, userId);
+  }
+
+  // 用户点赞
+  async like(roomId: string, userId: string): Promise<number> {
+    return await this.likes.like(roomId, userId);
+  }
+
+  // 获取房间统计数据
+  async getRoomStats(roomId: string): Promise<{
+    onlineCount: number;
+    likeCount: number;
+    totalGiftValue: number;
+    topGifters: Array<{ rank: number; userId: string; score: number }>;
+    recentDanmaku: any[];
+  }> {
+    const [onlineCount, likeCount, totalGiftValue, topGifters, recentDanmaku] =
+      await Promise.all([
+        this.onlineUsers.getOnlineCount(roomId),
+        this.likes.getLikeCount(roomId),
+        this.gifts.getTotalGiftValue(roomId),
+        this.gifts.getTopGifters(roomId, 10),
+        this.danmaku.getRecentDanmaku(roomId, 20),
+      ]);
+
+    return {
+      onlineCount,
+      likeCount,
+      totalGiftValue,
+      topGifters,
+      recentDanmaku,
+    };
+  }
+}
+```
+
+这个服务类封装了所有实时统计功能，应用代码只需要调用这个类的方法即可。
+
+## API 示例
+
+最后，让我们看看如何在 Express API 中使用这个服务：
+
+```typescript
+import express from "express";
+
+const app = express();
+app.use(express.json());
+
+// 初始化 Redis Cluster
+const cluster = new Redis.Cluster(
+  [
+    { host: "redis-node1.example.com", port: 7000 },
+    { host: "redis-node2.example.com", port: 7001 },
+    { host: "redis-node3.example.com", port: 7002 },
+  ],
+  {
+    redisOptions: {
+      password: process.env.REDIS_PASSWORD,
+    },
+  }
+);
+
+// 初始化服务
+const statsService = new LiveStreamStatsService(cluster);
+
+// 用户进入直播间
+app.post("/api/room/:roomId/join", async (req, res) => {
+  const { roomId } = req.params;
+  const { userId } = req.body;
+
+  try {
+    const result = await statsService.joinRoom(roomId, userId);
+    res.json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// 发送弹幕
+app.post("/api/room/:roomId/danmaku", async (req, res) => {
+  const { roomId } = req.params;
+  const { userId, message } = req.body;
+
+  if (!message || message.length > 100) {
+    return res.status(400).json({
+      success: false,
+      error: "弹幕内容不能为空且不超过 100 字符",
+    });
+  }
+
+  try {
+    await statsService.sendDanmaku(roomId, userId, message);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// 送礼物
+app.post("/api/room/:roomId/gift", async (req, res) => {
+  const { roomId } = req.params;
+  const { userId, giftId, value } = req.body;
+
+  try {
+    const result = await statsService.sendGift(roomId, userId, giftId, value);
+    res.json({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// 点赞
+app.post("/api/room/:roomId/like", async (req, res) => {
+  const { roomId } = req.params;
+  const { userId } = req.body;
+
+  try {
+    const count = await statsService.like(roomId, userId);
+    res.json({
+      success: true,
+      data: { count },
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// 获取房间统计
+app.get("/api/room/:roomId/stats", async (req, res) => {
+  const { roomId } = req.params;
+
+  try {
+    const stats = await statsService.getRoomStats(roomId);
+    res.json({
+      success: true,
+      data: stats,
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message,
+    });
+  }
+});
+
+// WebSocket 支持（弹幕实时推送）
+import { WebSocketServer } from "ws";
+const wss = new WebSocketServer({ port: 8080 });
+
+wss.on("connection", (ws, req) => {
+  const url = new URL(req.url || "", `http://${req.headers.host}`);
+  const roomId = url.searchParams.get("roomId");
+
+  if (roomId) {
+    // 订阅弹幕频道
+    const subscriber = new Redis.Cluster(cluster.options);
+    subscriber.subscribe(`livestream:room:{${roomId}}:danmaku:pub`);
+
+    subscriber.on("message", (channel, message) => {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(message);
+      }
+    });
+
+    ws.on("close", () => {
+      subscriber.disconnect();
+    });
+  }
+});
+
+app.listen(3000, () => {
+  console.log("API 服务器运行在 http://localhost:3000");
+});
+```
+
+这段代码提供了一个完整的 REST API 和 WebSocket 服务。客户端可以通过 HTTP API 操作直播间数据，通过 WebSocket 接收实时弹幕推送。
+
+## 监控与告警
+
+生产环境中，我们需要监控 Redis 的性能指标，异常时及时告警：
+
+```typescript
+class RedisMonitor {
+  constructor(private cluster: Redis.Cluster) {}
+
+  // 定期检查
+  async startMonitoring(): Promise<void> {
+    setInterval(async () => {
+      await this.checkMemoryUsage();
+      await this.checkCommandStats();
+      await this.checkReplicationDelay();
+    }, 60000); // 每分钟检查一次
+  }
+
+  // 检查内存使用
+  private async checkMemoryUsage(): Promise<void> {
+    const nodes = await this.cluster.nodes();
+
+    for (const node of nodes) {
+      const info = await node.info("memory");
+      const usedMemory = this.parseInfo(info, "used_memory");
+      const maxMemory = this.parseInfo(info, "maxmemory");
+
+      if (maxMemory && usedMemory) {
+        const usage = (parseInt(usedMemory) / parseInt(maxMemory)) * 100;
+
+        if (usage > 80) {
+          console.warn(
+            `内存使用率过高: ${usage.toFixed(2)}% (${node.options.host})`
+          );
+          // 发送告警
+        }
+      }
+    }
+  }
+
+  // 检查命令统计
+  private async checkCommandStats(): Promise<void> {
+    const info = await this.cluster.info("commandstats");
+    const lines = info.split("\n");
+
+    for (const line of lines) {
+      if (line.startsWith("cmdstat_")) {
+        const match = line.match(/cmdstat_(\w+):calls=(\d+),usec=(\d+)/);
+        if (match) {
+          const [, cmd, calls, usec] = match;
+          const avgLatency = parseInt(usec) / parseInt(calls);
+
+          if (avgLatency > 1000) {
+            // 平均延迟超过 1ms
+            console.warn(`命令 ${cmd} 延迟过高: ${avgLatency.toFixed(2)}μs`);
+          }
+        }
+      }
+    }
+  }
+
+  // 检查复制延迟
+  private async checkReplicationDelay(): Promise<void> {
+    const nodes = await this.cluster.nodes();
+
+    for (const node of nodes) {
+      const info = await node.info("replication");
+      const role = this.parseInfo(info, "role");
+
+      if (role === "master") {
+        // 检查从节点延迟
+        const slaves = info.match(/slave\d+:.*lag=(\d+)/g);
+        if (slaves) {
+          for (const slave of slaves) {
+            const lag = parseInt(slave.match(/lag=(\d+)/)?.[1] || "0");
+            if (lag > 5) {
+              console.warn(`复制延迟过高: ${lag}秒`);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  private parseInfo(info: string, key: string): string | null {
+    const match = info.match(new RegExp(`${key}:(\\d+)`));
+    return match ? match[1] : null;
+  }
+}
+
+// 启动监控
+const monitor = new RedisMonitor(cluster);
+monitor.startMonitoring();
+```
+
+这个监控类定期检查内存使用、命令延迟和复制延迟，异常时输出告警。在生产环境中，你应该将这些告警发送到专门的监控系统（比如 Prometheus + Grafana）。
+
+## 性能优化建议
+
+在部署这个实时统计系统时，有几点优化建议：
+
+1. **使用 Pipeline**：批量操作时一定要使用 Pipeline，可以显著减少网络往返。
+
+2. **合理设置过期时间**：为所有 key 设置合理的过期时间，防止内存无限增长。
+
+3. **监控慢查询**：定期检查 SLOWLOG，找出执行时间过长的命令。
+
+4. **使用连接池**：ioredis 内置了连接池，确保配置合理的最大连接数。
+
+5. **分片策略**：使用哈希标签确保相关数据在同一节点，减少跨节点操作。
+
+6. **读写分离**：如果使用主从架构，读操作尽量走从节点。
+
+7. **缓存热数据**：对于特别热点的数据，可以在应用层增加本地缓存。
+
+8. **定期清理**：使用定时任务定期清理过期数据。
+
+## 系列回顾
+
+到这里，Redis 渐进式学习路线就全部完成了。让我们回顾一下这 18 篇文章的内容：
+
+**基础篇（01-05）**：我们从 Redis 的基本概念出发，学习了环境搭建、CLI 命令、五大数据类型、键设计规范和持久化机制。这些知识让我们能够使用 Redis 存储和查询数据。
+
+**数据结构篇（06-10）**：我们深入学习了每种数据类型的实战应用，包括 String 计数器、Hash 购物车、List 队列、Set 社交关系和 Sorted Set 排行榜。这些知识让我们能够为不同的业务场景选择合适的数据结构。
+
+**缓存策略篇（11-13）**：我们学习了 Cache-Aside 模式、缓存的三大经典问题（穿透、击穿、雪崩）的解决方案，以及分布式锁的实现。这些知识让我们能够在生产环境中正确使用 Redis 作为缓存。
+
+**高级特性篇（14-15）**：我们学习了发布订阅机制、事务、Pipeline 和 Lua 脚本。这些知识让我们能够实现实时消息推送、保证操作原子性和批量优化性能。
+
+**高可用篇（16-17）**：我们学习了主从复制、哨兵模式和 Redis Cluster。这些知识让我们能够构建高可用、可扩展的 Redis 架构。
+
+**实战篇（18）**：我们整合了所有知识，构建了一个完整的直播平台实时统计系统。这个项目展示了如何在实际应用中综合运用 Redis 的各种特性。
+
+学习 Redis 是一个循序渐进的过程。从最简单的 GET/SET 开始，到掌握复杂的数据结构和集群架构，你需要不断地实践和思考。记住，Redis 不是银弹，它有自己的适用场景和局限性。理解它的优势，也理解它的权衡，这样才能在实际项目中做出正确的技术选择。
+
+现在，你已经具备了在生产环境中使用 Redis 的能力。继续深入学习，探索 Redis 的更多可能性，构建更强大的应用。

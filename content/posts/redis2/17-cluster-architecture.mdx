@@ -1,0 +1,628 @@
+---
+title: "17. Redis Cluster 集群架构：分布式存储与扩容"
+date: "2026-03-23"
+summary: "深入理解 Redis Cluster 集群架构，掌握分布式存储、数据分片和集群扩容。"
+tags: ["Redis", "Cluster", "集群"]
+category: "redis"
+cover: ""
+draft: false
+series: "Redis 渐进式学习路线"
+seriesOrder: 17
+---
+
+在上一篇文章中，我们学习了主从复制和哨兵模式。这套方案解决了数据备份和自动故障转移的问题，让直播平台在单点故障时能够快速恢复。但有一个问题我们一直没有触及：数据量的上限。
+
+假设你的直播平台快速发展，从 1000 个直播间增长到 10 万个直播间，每个直播间存储的弹幕、礼物、点赞数据累积起来，单台 32GB 内存的服务器开始吃紧了。你打算升级到 64GB 内存，但成本太高。或者你考虑分库分表，把不同直播间分配到不同的 Redis 实例，但这需要应用层做大量改动。
+
+这时候，Redis Cluster 就派上用场了。它是一个分布式解决方案，可以自动将数据分散到多个节点，实现水平扩展。
+
+## 为什么需要 Redis Cluster
+
+Redis Cluster 的核心思想是数据分片（sharding）。它将整个数据集分割成 16384 个槽位（slot），每个槽位可以分配给不同的节点。当你执行 SET key value 时，Redis 会根据 key 计算出它属于哪个槽位，然后自动路由到对应的节点。
+
+这样做的好处是显而易见的：
+
+1. **水平扩展**：数据量大时，直接加节点就行，不用升级单机配置
+2. **负载均衡**：每个节点只承担一部分数据，压力被分散
+3. **高可用**：每个主节点都有从节点，故障时自动转移
+4. **透明路由**：客户端自动连接到正确的节点，应用代码基本无感知
+
+对于直播平台来说，这意味着你可以从 3 个节点起步，随着业务增长扩展到 6 个、9 个甚至更多节点，而不需要重构应用代码。
+
+## Redis Cluster 的架构原理
+
+Redis Cluster 采用去中心化的架构。没有专门的代理层或配置服务器，所有节点平等，通过 Gossip 协议交换状态信息。
+
+数据分片的核心是**哈希槽（Hash Slot）**。Redis 定义了 16384 个槽位（编号 0-16383），每个 key 通过 CRC16 算法计算哈希值，然后对 16384 取模，得到所属的槽位。
+
+```
+slot_number = CRC16(key) % 16384
+```
+
+比如你执行 `SET livestream:room:abc123:viewers 3421`，Redis 会计算 `livestream:room:abc123:viewers` 的哈希值，假设结果是 5432，那么这个 key 就会存储在负责槽位 5432 的节点上。
+
+每个节点负责一部分连续的槽位。比如一个 3 节点集群的典型分配是：
+
+```
+Node A: 槽位 0 - 5460
+Node B: 槽位 5461 - 10922
+Node C: 槽位 10923 - 16383
+```
+
+当你连接到任意一个节点执行命令时，如果 key 不在该节点负责的槽位，节点会返回一个重定向错误，告诉客户端正确的节点是谁。客户端收到后会自动连接到正确的节点重试。
+
+## 搭建 Redis Cluster
+
+让我们从零开始搭建一个 Redis Cluster。推荐的最小配置是 3 主 3 从（6 个节点），这样可以保证在任何单节点故障时，集群仍然可用。
+
+首先准备 6 个配置文件。每个文件只需要修改 port 和对应的路径：
+
+```bash
+# redis-7000.conf
+port 7000
+cluster-enabled yes
+cluster-config-file nodes-7000.conf
+cluster-node-timeout 5000
+appendonly yes
+dir /var/redis/cluster/7000
+```
+
+这段配置很简单但很重要。`cluster-enabled yes` 启用集群模式，`cluster-config-file` 存储节点的配置信息（不是数据），`cluster-node-timeout` 是节点故障检测的超时时间。`appendonly yes` 开启 AOF 持久化，确保数据安全。
+
+类似地创建 redis-7001.conf 到 redis-7005.conf，只需要修改 port（7001-7005）和 dir 路径。
+
+启动 6 个节点：
+
+```bash
+redis-server redis-7000.conf
+redis-server redis-7001.conf
+redis-server redis-7002.conf
+redis-server redis-7003.conf
+redis-server redis-7004.conf
+redis-server redis-7005.conf
+```
+
+然后使用 redis-cli 的集群管理工具创建集群：
+
+```bash
+redis-cli --cluster create \
+  127.0.0.1:7000 \
+  127.0.0.1:7001 \
+  127.0.0.1:7002 \
+  --cluster-replicas 1
+```
+
+`--cluster-replicas 1` 表示每个主节点配备 1 个从节点。redis-cli 会自动分配槽位，并将前 3 个节点设为主节点，后 3 个节点设为从节点。
+
+执行后你会看到类似的输出：
+
+```
+>>> Performing hash slots allocation on 3 nodes...
+Master[0] -> Slots 0 - 5460
+Master[1] -> Slots 5461 - 10922
+Master[2] -> Slots 10923 - 16383
+M: 3a4f8c9b... 127.0.0.1:7000
+   slots:[0-5460] (5461 slots) master
+M: 7b2e1d4f... 127.0.0.1:7001
+   slots:[5461-10922] (5462 slots) master
+M: 9c5f2e1a... 127.0.0.1:7002
+   slots:[10923-16383] (5461 slots) master
+S: 1d8e4c5f... 127.0.0.1:7003
+   replicates 3a4f8c9b...
+S: 2e9f5d1a... 127.0.0.1:7004
+   replicates 7b2e1d4f...
+S: 3f1a6e2b... 127.0.0.1:7005
+   replicates 9c5f2e1a...
+
+Can I set the above configuration? (type 'yes' to accept):
+```
+
+输入 yes 确认后，集群就创建成功了。
+
+## 连接和操作 Cluster
+
+连接 Redis Cluster 需要使用 `-c` 参数：
+
+```bash
+redis-cli -c -p 7000
+```
+
+`-c` 参数启用集群模式，redis-cli 会自动处理重定向。当你执行一个命令时，如果 key 不在当前节点，redis-cli 会自动连接到正确的节点并重试。
+
+```bash
+127.0.0.1:7000> SET livestream:room:abc123:viewers 3421
+-> Redirected to slot [5432] located at 127.0.0.1:7001
+OK
+127.0.0.1:7001> GET livestream:room:abc123:viewers
+"3421"
+```
+
+注意那个 `-> Redirected to slot` 的提示。SET 命令原本连接到 7000 端口，但 key 的槽位是 5432，属于节点 7001，所以 redis-cli 自动重定向到了 7001。
+
+查看集群状态：
+
+```bash
+127.0.0.1:7000> CLUSTER INFO
+cluster_state:ok
+cluster_slots_assigned:16384
+cluster_slots_ok:16384
+cluster_slots_pfail:0
+cluster_slots_fail:0
+cluster_known_nodes:6
+cluster_size:3
+cluster_current_epoch:6
+cluster_my_epoch:2
+```
+
+关键信息是 `cluster_state:ok` 表示集群正常，`cluster_size:3` 表示有 3 个主节点。
+
+查看节点列表：
+
+```bash
+127.0.0.1:7000> CLUSTER NODES
+3a4f8c9b... 127.0.0.1:7000@17000 master - 0 1234567890000 1 connected 0-5460
+7b2e1d4f... 127.0.0.1:7001@17001 master - 0 1234567890000 2 connected 5461-10922
+9c5f2e1a... 127.0.0.1:7002@17002 master - 0 1234567890000 3 connected 10923-16383
+1d8e4c5f... 127.0.0.1:7003@17003 slave 3a4f8c9b... 0 1234567890000 4 connected
+2e9f5d1a... 127.0.0.1:7004@17004 slave 7b2e1d4f... 0 1234567890000 5 connected
+3f1a6e2b... 127.0.0.1:7005@17005 slave 9c5f2e1a... 0 1234567890000 6 connected
+```
+
+每个节点后面标注了它负责的槽位范围。比如第一个节点负责 0-5460，第二个节点负责 5461-10922，依此类推。
+
+## 客户端连接 Cluster
+
+在 Node.js 中使用 ioredis 连接 Cluster 非常简单：
+
+```typescript
+import Redis from "ioredis";
+
+// 连接到集群（只需要提供部分节点的地址）
+const cluster = new Redis.Cluster(
+  [
+    { host: "127.0.0.1", port: 7000 },
+    { host: "127.0.0.1", port: 7001 },
+    { host: "127.0.0.1", port: 7002 },
+  ],
+  {
+    redisOptions: {
+      password: "your_password", // 如果有密码
+    },
+  }
+);
+
+// 正常使用，与单机 Redis 无异
+await cluster.set("livestream:room:abc123:viewers", "3421");
+const viewers = await cluster.get("livestream:room:abc123:viewers");
+console.log(viewers); // "3421"
+
+// 批量操作
+await cluster.mset(
+  "livestream:room:abc123:title",
+  "深夜编程直播",
+  "livestream:room:abc123:host",
+  "wang_dev"
+);
+const values = await cluster.mget(
+  "livestream:room:abc123:title",
+  "livestream:room:abc123:host"
+);
+```
+
+ioredis 会自动连接到所有节点，并缓存槽位映射关系。当你执行命令时，它会根据 key 计算槽位，然后连接到对应的节点执行命令。如果某个节点故障，ioredis 会自动重试其他节点。
+
+## 哈希标签
+
+Redis Cluster 有一个限制：不支持跨节点的多键操作。比如 MGET key1 key2，如果 key1 和 key2 在不同节点，命令会失败。
+
+```typescript
+// 可能会失败
+await cluster.mget(
+  "livestream:room:abc123:viewers",
+  "livestream:room:def456:viewers" // 可能在不同的节点
+);
+```
+
+Redis 提供了**哈希标签（Hash Tag）**机制来解决这个问题。如果 key 包含 `{...}` 这样的模式，Redis 只会计算 `{}` 内的内容的哈希值。
+
+```typescript
+// 两个 key 会被分配到同一个节点
+await cluster.set("{livestream:room:abc123}:viewers", "3421");
+await cluster.set("{livestream:room:abc123}:title", "深夜编程直播");
+
+// 多键操作成功
+const values = await cluster.mget(
+  "{livestream:room:abc123}:viewers",
+  "{livestream:room:abc123}:title"
+);
+```
+
+在这里，虽然 key 的完整名称不同，但它们都包含 `{livestream:room:abc123}` 这个标签，所以会被分配到同一个节点。
+
+在直播平台中，我们可以这样设计：
+
+```typescript
+// 同一个直播间的所有数据使用相同的哈希标签
+const roomId = "abc123";
+
+await cluster.hset(`livestream:room:{${roomId}}:info`, "title", "深夜编程直播");
+await cluster.hset(`livestream:room:{${roomId}}:info`, "host", "wang_dev");
+await cluster.set(`livestream:room:{${roomId}}:viewers`, "3421");
+await cluster.zadd(`livestream:room:{${roomId}}:gifts`, 50000, "usr_a1b2c3");
+
+// 这些 key 都会在同一个节点，可以安全地使用多键操作
+const roomInfo = await cluster.hgetall(`livestream:room:{${roomId}}:info`);
+```
+
+哈希标签是 Cluster 模式下非常重要的设计技巧，合理使用可以避免很多跨节点问题。
+
+## 集群扩容
+
+假设你的直播平台从 1000 个直播间增长到 10 万个，3 个节点开始吃力了。这时候需要扩容到 6 个节点（3 主 3 从 扩容到 6 主 6 从）。
+
+首先启动新的 6 个节点（7006-7011）：
+
+```bash
+redis-server redis-7006.conf
+# ... 启动到 7011
+```
+
+然后添加新节点到集群：
+
+```bash
+# 添加第一个新主节点
+redis-cli --cluster add-node 127.0.0.1:7006 127.0.0.1:7000
+
+# 添加第二个新主节点
+redis-cli --cluster add-node 127.0.0.1:7007 127.0.0.1:7000
+
+# 添加第三个新主节点
+redis-cli --cluster add-node 127.0.0.1:7008 127.0.0.1:7000
+
+# 为新主节点添加从节点
+redis-cli --cluster add-node 127.0.0.1:7009 127.0.0.1:7006 --cluster-slave
+redis-cli --cluster add-node 127.0.0.1:7010 127.0.0.1:7007 --cluster-slave
+redis-cli --cluster add-node 127.0.0.1:7011 127.0.0.1:7008 --cluster-slave
+```
+
+`--cluster-slave` 参数表示该节点是从节点，redis-cli 会自动将它分配给指定主节点。
+
+现在需要重新分配槽位。默认情况下，新节点不负责任何槽位，需要从旧节点迁移一部分：
+
+```bash
+redis-cli --cluster reshard 127.0.0.1:7000
+```
+
+redis-cli 会进入交互模式，询问你一系列问题：
+
+```
+How many slots do you want to move (from 1 to 16384)? 2731
+What is the receiving node ID? <新节点 7006 的 ID>
+Please enter all the source node IDs.
+  Type 'all' to use all the other nodes as source nodes for this hash slot.
+  Type 'done' once you entered all the source nodes IDs.
+Source node #1:all
+```
+
+解释一下：16384 个槽位平均分配给 6 个节点，每个节点应该负责 2730 或 2731 个槽位（16384 / 6 ≈ 2730.67）。所以这里输入 2731。
+
+重复这个过程，直到所有槽位都重新分配完毕。
+
+你也可以一次性完成所有迁移：
+
+```bash
+redis-cli --cluster reshard 127.0.0.1:7000 \
+  --cluster-from all \
+  --cluster-to <新节点ID> \
+  --cluster-slots 2731 \
+  --cluster-yes
+```
+
+## 在直播平台中的应用
+
+让我们为直播平台设计一个基于 Redis Cluster 的数据层。假设我们有 6 个节点（3 主 3 从），可以支撑 10 万+ 的直播间。
+
+```typescript
+import Redis from "ioredis";
+
+class LiveStreamCluster {
+  private cluster: Redis.Cluster;
+
+  constructor() {
+    this.cluster = new Redis.Cluster(
+      [
+        { host: "redis-node1.example.com", port: 7000 },
+        { host: "redis-node2.example.com", port: 7001 },
+        { host: "redis-node3.example.com", port: 7002 },
+      ],
+      {
+        redisOptions: {
+          password: process.env.REDIS_PASSWORD,
+        },
+        enableReadyCheck: true, // 等待集群就绪
+        maxRetriesPerRequest: 3, // 失败重试次数
+      }
+    );
+  }
+
+  // 用户进入直播间
+  async joinRoom(roomId: string, userId: string): Promise<number> {
+    const now = Date.now();
+
+    // 使用哈希标签确保相关数据在同一节点
+    const pipeline = this.cluster.pipeline();
+
+    // 添加到在线用户集合
+    pipeline.sadd(`livestream:room:{${roomId}}:viewers`, userId);
+
+    // 更新活跃时间
+    pipeline.zadd(`livestream:room:{${roomId}}:active`, now, userId);
+
+    // 增加在线人数计数器
+    pipeline.incr(`livestream:room:{${roomId}}:viewer_count`);
+
+    const results = await pipeline.exec();
+    return results?.[2]?.[1] as number;
+  }
+
+  // 用户送礼物
+  async sendGift(
+    roomId: string,
+    userId: string,
+    giftId: string,
+    value: number
+  ): Promise<void> {
+    const pipeline = this.cluster.pipeline();
+
+    // 更新用户礼物积分
+    pipeline.zincrby(`livestream:room:{${roomId}}:gifts`, value, userId);
+
+    // 增加房间总礼物数
+    pipeline.incrby(`livestream:room:{${roomId}}:total_gift_value`, value);
+
+    // 记录礼物日志（最近 100 条）
+    pipeline.lpush(
+      `livestream:room:{${roomId}}:gift_log`,
+      JSON.stringify({
+        userId,
+        giftId,
+        value,
+        timestamp: Date.now(),
+      })
+    );
+    pipeline.ltrim(`livestream:room:{${roomId}}:gift_log`, 0, 99);
+
+    await pipeline.exec();
+  }
+
+  // 获取房间信息（所有相关数据在同一节点，可以高效查询）
+  async getRoomInfo(roomId: string): Promise<{
+    viewerCount: number;
+    totalGiftValue: number;
+    giftLeaderboard: Array<{ userId: string; score: string }>;
+    recentGifts: any[];
+  }> {
+    // 使用哈希标签，所有 key 都在同一节点
+    const pipeline = this.cluster.pipeline();
+
+    pipeline.get(`livestream:room:{${roomId}}:viewer_count`);
+    pipeline.get(`livestream:room:{${roomId}}:total_gift_value`);
+    pipeline.zrevrange(`livestream:room:{${roomId}}:gifts`, 0, 9, "WITHSCORES");
+    pipeline.lrange(`livestream:room:{${roomId}}:gift_log`, 0, 9);
+
+    const results = await pipeline.exec();
+
+    const giftLeaderboard = [];
+    const giftData = (results?.[2]?.[1] as string[]) || [];
+    for (let i = 0; i < giftData.length; i += 2) {
+      giftLeaderboard.push({
+        userId: giftData[i],
+        score: giftData[i + 1],
+      });
+    }
+
+    const recentGifts = ((results?.[3]?.[1] as string[]) || []).map((log) =>
+      JSON.parse(log)
+    );
+
+    return {
+      viewerCount: parseInt((results?.[0]?.[1] as string) || "0"),
+      totalGiftValue: parseInt((results?.[1]?.[1] as string) || "0"),
+      giftLeaderboard,
+      recentGifts,
+    };
+  }
+
+  // 批量获取多个房间信息（注意：不同房间可能在不同节点）
+  async getMultipleRoomInfos(roomIds: string[]): Promise<Map<string, any>> {
+    const roomMap = new Map<string, any>();
+
+    // 按节点分组
+    const nodeGroups = new Map<string, string[]>();
+    for (const roomId of roomIds) {
+      // 计算槽位
+      const slot = this.calculateSlot(
+        `livestream:room:{${roomId}}:viewer_count`
+      );
+      const node = await this.getNodeForSlot(slot);
+
+      if (!nodeGroups.has(node)) {
+        nodeGroups.set(node, []);
+      }
+      nodeGroups.get(node)!.push(roomId);
+    }
+
+    // 为每个节点批量查询
+    for (const [node, nodeRoomIds] of nodeGroups) {
+      const promises = nodeRoomIds.map((roomId) => this.getRoomInfo(roomId));
+      const infos = await Promise.all(promises);
+
+      nodeRoomIds.forEach((roomId, index) => {
+        roomMap.set(roomId, infos[index]);
+      });
+    }
+
+    return roomMap;
+  }
+
+  // 辅助方法：计算槽位
+  private calculateSlot(key: string): number {
+    // 简化版，实际 ioredis 内部会处理
+    let hash = 0;
+    for (let i = 0; i < key.length; i++) {
+      hash = (hash << 5) - hash + key.charCodeAt(i);
+      hash |= 0;
+    }
+    return Math.abs(hash) % 16384;
+  }
+
+  // 辅助方法：获取槽位对应的节点
+  private async getNodeForSlot(slot: number): Promise<string> {
+    const nodes = await this.cluster.nodes();
+    for (const node of nodes) {
+      const slots = node.options.slots || [];
+      // 检查槽位是否在该节点
+      for (let i = 0; i < slots.length; i += 2) {
+        if (slot >= slots[i] && slot <= slots[i + 1]) {
+          return node.options.host || "";
+        }
+      }
+    }
+    return "";
+  }
+}
+
+// 使用示例
+const liveCluster = new LiveStreamCluster();
+
+// 用户进入直播间
+const count = await liveCluster.joinRoom("abc123", "usr_a1b2c3");
+console.log(`当前在线人数：${count}`);
+
+// 用户送礼
+await liveCluster.sendGift("abc123", "usr_a1b2c3", "rocket", 500);
+
+// 获取房间信息
+const roomInfo = await liveCluster.getRoomInfo("abc123");
+console.log(roomInfo);
+```
+
+这个类利用了哈希标签确保同一直播间的所有数据都在同一个节点，这样可以高效地使用 Pipeline 批量操作。对于跨房间的查询，我们按节点分组，减少跨节点的请求次数。
+
+## 集群监控
+
+生产环境中需要监控集群的健康状态：
+
+```typescript
+class ClusterMonitor {
+  constructor(private cluster: Redis.Cluster) {}
+
+  // 检查集群状态
+  async checkClusterHealth(): Promise<{
+    healthy: boolean;
+    state: string;
+    nodes: number;
+    slots: number;
+  }> {
+    const info = await this.cluster.info("cluster");
+
+    const state = this.parseInfo(info, "cluster_state");
+    const nodes = parseInt(this.parseInfo(info, "cluster_known_nodes") || "0");
+    const slots = parseInt(this.parseInfo(info, "cluster_slots_ok") || "0");
+
+    return {
+      healthy: state === "ok" && slots === 16384,
+      state,
+      nodes,
+      slots,
+    };
+  }
+
+  // 检查节点状态
+  async checkNodesStatus(): Promise<any[]> {
+    const nodes = await this.cluster.nodes();
+    const status = [];
+
+    for (const node of nodes) {
+      const info = await node.info("replication");
+      const role = this.parseInfo(info, "role");
+      const connectedSlaves = this.parseInfo(info, "connected_slaves") || "0";
+
+      status.push({
+        host: node.options.host,
+        port: node.options.port,
+        role,
+        connectedSlaves: parseInt(connectedSlaves),
+        status: node.status === "ready" ? "ok" : "disconnected",
+      });
+    }
+
+    return status;
+  }
+
+  // 检查内存使用
+  async checkMemoryUsage(): Promise<
+    Map<string, { used: string; peak: string }>
+  > {
+    const nodes = await this.cluster.nodes();
+    const memoryMap = new Map();
+
+    for (const node of nodes) {
+      const info = await node.info("memory");
+      const used = this.parseInfo(info, "used_memory_human");
+      const peak = this.parseInfo(info, "used_memory_peak_human");
+
+      memoryMap.set(`${node.options.host}:${node.options.port}`, {
+        used,
+        peak,
+      });
+    }
+
+    return memoryMap;
+  }
+
+  private parseInfo(info: string, key: string): string | null {
+    const match = info.match(new RegExp(`${key}:(.+)`));
+    return match ? match[1].trim() : null;
+  }
+}
+
+// 使用监控
+const monitor = new ClusterMonitor(liveCluster["cluster"]);
+
+setInterval(async () => {
+  const health = await monitor.checkClusterHealth();
+  if (!health.healthy) {
+    console.error("Cluster unhealthy:", health);
+    // 发送告警
+  }
+
+  const nodes = await monitor.checkNodesStatus();
+  console.log("Nodes status:", nodes);
+
+  const memory = await monitor.checkMemoryUsage();
+  console.log("Memory usage:", memory);
+}, 60000); // 每分钟检查一次
+```
+
+## 权衡与选择
+
+Redis Cluster 提供了强大的水平扩展能力，但它也带来了一些复杂度和限制。
+
+**优势**：
+
+数据可以分散到多个节点，理论上无上限。读写压力被分散，单节点瓶颈被打破。每个主节点都有从节点，高可用有保障。客户端自动路由，应用代码改动较小。
+
+**劣势**：
+
+多键操作有限制，必须使用哈希标签。事务只能在单个节点内执行，跨节点事务不支持。Pipeline 批量操作需要手动分组。运维复杂度增加，扩容需要重新分配槽位。
+
+那么，什么时候选择 Cluster，什么时候选择主从 + 哨兵？
+
+如果你的数据量能装在单机内存（比如 64GB 以内），主从 + 哨兵是更简单的选择。它配置简单、运维容易、功能完整（支持多键操作、事务等）。
+
+如果你的数据量超过了单机内存，或者需要支撑更大的并发量，Redis Cluster 是必然选择。虽然它有一些限制，但通过合理的设计（比如使用哈希标签），这些限制通常不会成为问题。
+
+对于直播平台来说，假设每个直播间平均占用 100KB 内存，10 万个直播间需要 10GB 内存，单机完全可以承受。但如果你要存储每个直播间的历史弹幕（假设每个直播间保留 10 万条弹幕，每条 200 字节，那就是 20GB/房间），数据量会迅速爆炸，这时候就需要 Cluster 了。
+
+现在，你已经掌握了 Redis 的两大高可用方案：主从 + 哨兵适合中小规模，Cluster 适合大规模。在下一篇文章中，我们将把这些知识整合起来，构建一个完整的直播平台实时统计系统。
