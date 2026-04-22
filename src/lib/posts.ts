@@ -5,8 +5,6 @@ import { compileMDX } from "next-mdx-remote/rsc";
 import { ReactElement } from "react";
 import rehypeRaw from "rehype-raw";
 import remarkGfm from "remark-gfm";
-import { dirToCategoryMap, categoryToDirMap } from "./category-map";
-
 const postsDirectory = path.join(process.cwd(), "content/posts");
 
 export type PostMeta = {
@@ -41,6 +39,10 @@ function getAllMdxFiles(dir: string, basePath: string = ""): string[] {
       : entry.name;
 
     if (entry.isDirectory()) {
+      // 跳过 _ 前缀的目录（归档目录）
+      if (entry.name.startsWith("_")) {
+        continue;
+      }
       // 递归读取子目录
       files.push(...getAllMdxFiles(fullPath, relativePath));
     } else if (entry.isFile() && entry.name.endsWith(".mdx")) {
@@ -61,7 +63,7 @@ export function getAllPosts(): PostMeta[] {
 
     // 从文件路径中提取目录名，并映射为中文分类名
     const dirName = path.dirname(fileName);
-    const categoryFromDir = dirToCategoryMap[dirName] || dirName;
+    const categoryFromDir = dirName;
 
     const fullPath = path.join(postsDirectory, fileName);
     const fileContents = fs.readFileSync(fullPath, "utf8");
@@ -99,7 +101,7 @@ function findFileByCategoryAndSlug(
   // 解码 URL 编码的 category
   const decodedCategory = decodeURIComponent(category);
   // 将中文分类名映射到实际目录名
-  const dirName = categoryToDirMap[decodedCategory] || decodedCategory;
+  const dirName = decodedCategory;
   const categoryDir = path.join(postsDirectory, dirName);
 
   if (!fs.existsSync(categoryDir)) {
@@ -176,7 +178,7 @@ export function getNextPost(
   // 解码 URL 编码的 category
   const decodedCategory = decodeURIComponent(category);
   // 将中文分类名映射到实际目录名
-  const dirName = categoryToDirMap[decodedCategory] || decodedCategory;
+  const dirName = decodedCategory;
   const categoryDir = path.join(postsDirectory, dirName);
 
   if (!fs.existsSync(categoryDir)) {
@@ -227,4 +229,13 @@ export function getNextPost(
   }
 
   return null;
+}
+
+// 自动从 content/posts 目录获取所有分类（跳过 _ 前缀的归档目录）
+export function getAllCategories(): string[] {
+  const entries = fs.readdirSync(postsDirectory, { withFileTypes: true });
+  return entries
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("_"))
+    .map((entry) => entry.name)
+    .sort();
 }

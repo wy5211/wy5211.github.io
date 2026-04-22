@@ -2,18 +2,12 @@ import { getAllPosts, getPostBySlug, getNextPost } from "@/lib/posts";
 import { notFound } from "next/navigation";
 import Link from "next/link";
 import BackButton from "./BackButton";
-import { categoryToDirMap } from "@/lib/category-map";
 import { getCategoryColor } from "@/lib/category-colors";
-
-// 从文件路径中提取目录名的辅助函数
-function getCategoryDirFromPath(category: string): string {
-  return categoryToDirMap[category] || category;
-}
 
 export async function generateStaticParams() {
   const posts = getAllPosts();
   const params = posts.map((post) => ({
-    category: getCategoryDirFromPath(post.category), // 使用目录名
+    category: post.category,
     slug: post.slug,
   }));
 
@@ -106,7 +100,7 @@ export default async function Post({
         {/* 下一篇链接 */}
         {nextPost && (
           <Link
-            href={`/posts/${getCategoryDirFromPath(nextPost.category)}/${nextPost.slug}`}
+            href={`/posts/${nextPost.category}/${nextPost.slug}`}
             className="glass block w-full rounded-xl p-6 border border-gray-200 dark:border-neutral-700 hover:border-blue-400 dark:hover:border-blue-500 transition-all group"
           >
             <div className="flex items-center justify-between">

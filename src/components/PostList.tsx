@@ -4,7 +4,6 @@ import { useMemo, useState } from "react";
 import Link from "next/link";
 import { useRouter, useSearchParams } from "next/navigation";
 import { PostMeta } from "@/lib/posts";
-import { categoryToDirMap, dirToCategoryMap } from "@/lib/category-map";
 import { getCategoryColor } from "@/lib/category-colors";
 
 interface PostListProps {
@@ -18,14 +17,11 @@ export default function PostList({ posts }: PostListProps) {
   const selectedCategory = categoryParam || "";
   const [mobileExpanded, setMobileExpanded] = useState(false);
 
-  // 将英文目录名转换为中文分类名（用于筛选）
-  const normalizedCategory =
-    dirToCategoryMap[selectedCategory] || selectedCategory;
+  // 将 URL 参数中的分类名直接使用（目录名即分类名）
+  const normalizedCategory = selectedCategory;
 
-  // 获取 URL 中使用的英文目录名
-  const getUrlCategory = (category: string) => {
-    return categoryToDirMap[category] || category;
-  };
+  // 目录名即分类名，直接使用
+  const getUrlCategory = (category: string) => category;
 
   // 更新 URL 参数的函数
   const updateCategory = (category: string) => {
@@ -33,65 +29,9 @@ export default function PostList({ posts }: PostListProps) {
   };
 
   const categories = useMemo(() => {
-    // 获取所有分类（按预定义顺序）
-    const categoryOrder = [
-      "agent",
-      "agent2",
-      "ai-fullstack",
-      "claude-code",
-      "claude-code2",
-      "database",
-      "database2",
-      "devops",
-      "devops2",
-      "docker",
-      "drizzle",
-      "golang",
-      "golang2",
-      "hono",
-      "hono2",
-      "java",
-      "langchain",
-      "mongoose",
-      "mongoose2",
-      "mybatis",
-      "mybatis2",
-      "mysql",
-      "nestjs",
-      "nextjs",
-      "nodejs-core",
-      "prisma",
-      "python",
-      "rag",
-      "redis",
-      "redis2",
-      "rust",
-      "rust2",
-      "springboot",
-      "trpc",
-      "trpc2",
-      "typeorm",
-      "typeorm2",
-      "typescript",
-      "typescript2",
-      "vite",
-      "vite2",
-    ];
-
-    // 获取文章中实际存在的分类
+    // 自动从文章中提取所有分类，按字母排序
     const postCategories = new Set(posts.map((post) => post.category));
-
-    // 按预定义顺序过滤存在的分类
-    const orderedCategories = categoryOrder.filter((cat) =>
-      postCategories.has(cat)
-    );
-
-    // 添加其他未在预定义列表中的分类
-    const otherCategories = [...postCategories].filter(
-      (cat) => !categoryOrder.includes(cat)
-    );
-
-    return [...orderedCategories, ...otherCategories];
+    return [...postCategories].sort();
   }, [posts]);
 
   // 根据选中的分类过滤文章
