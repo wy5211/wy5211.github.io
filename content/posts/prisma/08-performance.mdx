@@ -1,0 +1,490 @@
+---
+title: "08. 性能优化与多数据库"
+date: "2026-03-28"
+summary: "博客首页从 500ms 优化到 50ms：开启查询日志定位瓶颈、用 $queryRaw 绕过 Prisma、连接池调优、批量操作优化。"
+tags: ["Prisma", "TypeScript"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 8
+---
+
+博客上线两个月，用户量从 50 涨到 5000，首页加载时间也从 100ms 悄悄爬到了 500ms 以上。有用户在反馈里直接问"你们服务器是不是炸了"。你打开浏览器 DevTools，确认接口响应确实慢，但不知道瓶颈在哪——是查询太复杂？缺索引？还是 Prisma 本身的问题？
+
+第一步不是猜，是让 Prisma 把它执行的每一条 SQL 都吐出来。
+
+## 开启查询日志，定位瓶颈
+
+### 最简单的方式：log 配置
+
+在 PrismaClient 初始化时加一行配置：
+
+```typescript
+const prisma = new PrismaClient({
+  log: ["query"],
+});
+```
+
+现在每个查询都会在控制台打印实际执行的 SQL。刷新一下首页，你看到类似这样的输出：
+
+```text
+prisma:query SELECT "public"."posts"."id", "public"."posts"."title",
+"public"."posts"."content", "public"."posts"."author_id",
+"public"."posts"."status", "public"."posts"."created_at",
+"public"."posts"."updated_at", "public"."posts"."view_count",
+"public"."posts"."published_at"
+FROM "public"."posts"
+WHERE "public"."posts"."status" = $1
+ORDER BY "public"."posts"."published_at" DESC
+LIMIT $2
+```
+
+光看 SQL 语句不够，你还想知道每条查询花了多少毫秒。用 `$on("query")` 监听查询事件，拿到 SQL、参数和耗时：
+
+```typescript
+const prisma = new PrismaClient({
+  log: [
+    {
+      emit: "event",
+      level: "query",
+    },
+  ],
+});
+
+prisma.$on("query", (e) => {
+  console.log("SQL:", e.query);
+  console.log("参数:", e.params);
+  console.log("耗时:", e.duration, "ms");
+});
+```
+
+`e.params` 是参数化查询的值，`e.duration` 是查询耗时。再刷新首页，你看到一组完整的日志，发现有一条查询花了 200ms：
+
+```text
+SQL: SELECT ... FROM "public"."posts" WHERE "status" = $1 ORDER BY "published_at" DESC LIMIT $2
+参数: ["PUBLISHED", 10]
+耗时: 203ms
+```
+
+一个只查 10 条记录的 findMany 居然要 200ms，问题肯定出在数据库侧。
+
+### 用 EXPLAIN ANALYZE 分析执行计划
+
+拿到慢 SQL 后，直接去数据库客户端跑 EXPLAIN ANALYZE：
+
+```sql
+EXPLAIN ANALYZE
+SELECT * FROM "posts"
+WHERE "status" = 'PUBLISHED'
+ORDER BY "published_at" DESC
+LIMIT 10;
+```
+
+输出里有一行关键信息：
+
+```text
+Seq Scan on posts  (cost=0.00..1542.00 rows=5000 width=480) (actual time=0.012..45.231 ms)
+```
+
+`Seq Scan` 表示全表扫描——数据库挨行遍历整张表来匹配条件。当 posts 表有上万条记录时，这个操作的开销会线性增长。解决方法是加索引：
+
+```sql
+CREATE INDEX idx_posts_status_published
+ON "posts" ("status", "published_at" DESC);
+```
+
+在 Prisma 里通过迁移添加：
+
+```bash
+npx prisma migrate dev --create-only --name add_post_status_index
+```
+
+在生成的 migration.sql 里写入上面的 CREATE INDEX 语句，然后执行。加了索引后同样的查询从 200ms 降到 3ms。但日志里还有其他慢查询，问题不止这一个。
+
+## 常见性能问题清单
+
+### 问题一：N+1 查询
+
+第4篇我们详细讲过 N+1 问题，这里快速回顾检测方法。如果你在 `$on("query")` 日志里看到同一个接口触发了十几条甚至几十条 SQL，大概率是 N+1。典型模式：
+
+```typescript
+// N+1：先查列表，再循环查关联
+const posts = await prisma.post.findMany({ take: 20 });
+for (const post of posts) {
+  const author = await prisma.user.findUnique({
+    where: { id: post.authorId },
+  });
+}
+```
+
+20 篇文章产生 21 条 SQL。用 `include` 改成 2 条：
+
+```typescript
+const posts = await prisma.post.findMany({
+  take: 20,
+  include: { author: { select: { name: true, avatar: true } } },
+});
+```
+
+### 问题二：include 嵌套太深
+
+三层以上的 `include` 嵌套会让 Prisma 生成复杂的查询链。假设你的详情页查询长这样：
+
+```typescript
+const post = await prisma.post.findUnique({
+  where: { id: 42 },
+  include: {
+    author: true,
+    tags: { include: { tag: true } },
+    comments: {
+      include: {
+        author: true,
+        replies: {
+          include: {
+            author: true,
+          },
+        },
+      },
+    },
+  },
+});
+```
+
+四层嵌套。如果文章有 50 条评论，每条评论有 5 条回复，Prisma 可能需要执行多轮查询来组装这些数据。解决办法是第4篇提到的策略——拆分查询，超过三层就独立查：
+
+```typescript
+// 文章 + 作者 + 标签（两层）
+const post = await prisma.post.findUnique({
+  where: { id: 42 },
+  select: {
+    id: true,
+    title: true,
+    content: true,
+    author: { select: { name: true, avatar: true } },
+    tags: { select: { tag: { select: { name: true, slug: true } } } },
+  },
+});
+
+// 评论单独查，分页控制
+const comments = await prisma.comment.findMany({
+  where: { postId: 42, parentId: null },
+  select: {
+    id: true,
+    content: true,
+    createdAt: true,
+    author: { select: { name: true, avatar: true } },
+  },
+  orderBy: { createdAt: "desc" },
+  take: 20,
+});
+```
+
+拆成两次查询，各自可控，也方便对评论做分页。
+
+### 问题三：缺少索引
+
+EXPLAIN 显示 `Seq Scan`（全表扫描）时，就需要加索引。Prisma Schema 里用 `@@index` 声明复合索引：
+
+```prisma
+model Post {
+  id          Int        @id @default(autoincrement())
+  title       String
+  content     String
+  status      PostStatus @default(DRAFT)
+  authorId    Int
+  publishedAt DateTime?
+
+  @@index([status, publishedAt(sort: Desc)])
+  @@index([authorId])
+  @@map("posts")
+}
+```
+
+常见的加索引时机：WHERE 条件频繁出现的字段、ORDER BY 排序字段、JOIN 关联的外键字段。别加太多——每个索引都会增加写入开销和存储空间。一条经验：索引加在查询频率高的字段上，冷数据不需要。
+
+### 问题四：select \* 拖慢查询
+
+`findMany` 默认返回全部字段，包括 `content` 这个可能好几 KB 的文本字段。首页列表只需要标题和摘要，查完整内容纯粹浪费带宽和内存。用 `select` 只取需要的字段：
+
+```typescript
+const posts = await prisma.post.findMany({
+  where: { status: "PUBLISHED" },
+  select: {
+    id: true,
+    title: true,
+    excerpt: true,
+    publishedAt: true,
+    cover: true,
+    author: { select: { name: true, avatar: true } },
+  },
+  orderBy: { publishedAt: "desc" },
+  take: 10,
+});
+```
+
+文章表里 content 字段平均 15KB，列表页查 20 篇文章，`select *` 传输 300KB 数据，改成 `select` 后只传 5KB。数据库端也有收益——PostgreSQL 不需要从磁盘读取 content 列的数据，查询更快。
+
+## $queryRaw：绕过 Prisma 的 escape hatch
+
+Prisma 的查询 API 覆盖了大部分 CRUD 场景，但有些操作它确实做不到——全文搜索、窗口函数、复杂聚合、数据库特定的函数。这时候需要 `$queryRaw` 直接写 SQL。
+
+### 博客搜索：PostgreSQL 全文搜索
+
+Prisma 的 `contains` 只能做简单的 LIKE 搜索，不支持相关性排序、分词、权重。PostgreSQL 的 tsvector 全文搜索功能强大得多：
+
+```typescript
+import { Prisma } from "@prisma/client";
+
+const searchPosts = async (keyword: string) => {
+  return prisma.$queryRaw<
+    Array<{
+      id: number;
+      title: string;
+      excerpt: string;
+      rank: number;
+    }>
+  >`
+    SELECT id, title, excerpt,
+      ts_rank(
+        to_tsvector('simple', coalesce(title, '') || ' ' || coalesce(content, '')),
+        plainto_tsquery('simple', ${keyword})
+      ) AS rank
+    FROM posts
+    WHERE to_tsvector('simple', coalesce(title, '') || ' ' || coalesce(content, ''))
+      @@ plainto_tsquery('simple', ${keyword})
+      AND status = 'PUBLISHED'
+    ORDER BY rank DESC
+    LIMIT 20
+  `;
+};
+```
+
+`$queryRaw` 使用 tagged template literal，`${keyword}` 会被自动参数化，不会产生 SQL 注入。返回类型通过泛型参数标注，TypeScript 至少知道返回的字段名和类型。这个标注不是编译时验证——它信任你写的类型——但比 `any` 好得多。
+
+### 热门文章排行：窗口函数
+
+"按分类取阅读量最高的 3 篇文章"这种需求，Prisma 的查询 API 做不到。PostgreSQL 的窗口函数 `ROW_NUMBER` 正好处理这种场景：
+
+```typescript
+const topPostsByCategory = await prisma.$queryRaw<
+  Array<{
+    id: number;
+    title: string;
+    viewCount: number;
+    categoryName: string;
+  }>
+>`
+  SELECT * FROM (
+    SELECT p.id, p.title, p.view_count,
+      c.name AS category_name,
+      ROW_NUMBER() OVER (
+        PARTITION BY c.id ORDER BY p.view_count DESC
+      ) AS rn
+    FROM posts p
+    JOIN categories c ON c.id = p.category_id
+    WHERE p.status = 'PUBLISHED'
+  ) ranked
+  WHERE rn <= 3
+  ORDER BY category_name, view_count DESC
+`;
+```
+
+`PARTITION BY c.id` 按分类分组，每组内按阅读量排序取前 3。这在 Prisma 的 API 里没有对应写法，只能写原始 SQL。
+
+### SQL 注入防护
+
+`$queryRaw` 使用 tagged template literal 时，变量会自动参数化。以下两种写法都是安全的：
+
+```typescript
+// 安全：tagged template literal，自动参数化
+await prisma.$queryRaw`
+  SELECT * FROM posts WHERE title = ${userInput}
+`;
+
+// 安全：Prisma.sql 显式参数化
+await prisma.$queryRaw(
+  Prisma.sql`SELECT * FROM posts WHERE title = ${userInput}`
+);
+```
+
+但有一种写法是危险的，Prisma 无法保护你：
+
+```typescript
+// 危险：字符串拼接，有 SQL 注入风险
+const keyword = req.query.q as string;
+await prisma.$queryRawUnsafe(
+  `SELECT * FROM posts WHERE title LIKE '%${keyword}%'`
+);
+```
+
+`$queryRawUnsafe` 是安全逃逸口，Prisma 不会对它做任何处理。除非你有充分的理由，否则不要使用它。
+
+## 连接池调优
+
+### DATABASE_URL 的连接参数
+
+Prisma 底层使用连接池管理数据库连接。默认连接池大小取决于数据库驱动——PostgreSQL 默认是 `num_physical_cpus * 2 + 1`。你可以通过 DATABASE_URL 的参数调整：
+
+```bash
+# .env
+DATABASE_URL="postgresql://user:pass@host:5432/db?connection_limit=10&pool_timeout=10"
+```
+
+`connection_limit` 设置最大连接数，`pool_timeout` 设置获取连接的超时时间（秒）。连接数不是越大越好——PostgreSQL 的默认最大连接数是 100，每个连接占用几 MB 内存。一个合理的起始值是 10-20，根据实际并发量调整。
+
+### Serverless 环境的连接数问题
+
+Vercel、Cloudflare Workers 这类 Serverless 环境下，每个函数实例都会创建自己的 PrismaClient，每个 Client 维护自己的连接池。假设连接池大小设为 5，同时有 20 个函数实例在运行，数据库就可能收到 100 个并发连接请求——直接打满 PostgreSQL 的默认上限。
+
+有几个应对策略。
+
+第一，减小连接池大小。Serverless 环境下每个函数实例是短生命周期的，把 `connection_limit` 设为 1 或 2 通常够用：
+
+```bash
+DATABASE_URL="postgresql://user:pass@host:5432/db?connection_limit=2"
+```
+
+第二，使用 Prisma Accelerate。这是 Prisma 官方的连接池代理服务。你的应用不直连数据库，而是连 Prisma Accelerate 的边缘节点，由它统一管理到数据库的连接：
+
+```typescript
+import { PrismaClient } from "@prisma/client";
+
+const prisma = new PrismaClient({
+  datasourceUrl: "prisma://accelerate.prisma-data.net/?api_key=xxx",
+});
+```
+
+`prisma://` 协议替代了直连的 `postgresql://`。Accelerate 在边缘节点维护一个共享连接池，不管你的函数实例有多少个，到数据库的连接数是可控的。代价是它是一个付费服务，免费额度有限。
+
+第三，用外部连接池工具（比如 PgBouncer），自己部署一个连接池代理。配置复杂一些，但不需要额外付费。
+
+## 批量操作优化
+
+### createMany vs 循环 create
+
+从其他平台导入 500 篇文章，两种写法的性能差距有多大。先看循环 create：
+
+```typescript
+// 慢：500 次网络往返
+for (const post of importedPosts) {
+  await prisma.post.create({
+    data: {
+      title: post.title,
+      slug: post.slug,
+      content: post.content,
+      authorId: post.authorId,
+      status: "PUBLISHED",
+    },
+  });
+}
+```
+
+500 条记录，500 次数据库往返。在本地开发环境可能要 10 秒，跨机房部署可能要 30 秒以上。换成 `createMany`：
+
+```typescript
+// 快：1 次网络往返
+const result = await prisma.post.createMany({
+  data: importedPosts.map((post) => ({
+    title: post.title,
+    slug: post.slug,
+    content: post.content,
+    authorId: post.authorId,
+    status: "PUBLISHED",
+  })),
+  skipDuplicates: true,
+});
+```
+
+`createMany` 底层生成一条多行 INSERT 语句，一次网络往返搞定。实际测试中，导入 500 条记录从 10 秒降到不到 1 秒。`skipDuplicates` 在批量导入时很有用——重跑导入脚本不会因为唯一约束冲突而中断。
+
+`createMany` 的局限是不支持嵌套创建（不能同时创建关联记录）和 `include`（不返回完整记录）。如果导入的数据包含关联，需要先 createMany 插入主表，再单独处理关联。
+
+### updateMany 批量更新
+
+把所有超过一年没更新的草稿标记为归档：
+
+```typescript
+const result = await prisma.post.updateMany({
+  where: {
+    status: "DRAFT",
+    updatedAt: { lt: new Date(Date.now() - 365 * 24 * 60 * 60 * 1000) },
+  },
+  data: { status: "ARCHIVED" },
+});
+```
+
+一条 SQL 更新所有匹配记录，不需要循环。`result.count` 返回实际更新的行数。
+
+### $transaction 减少网络往返
+
+如果你需要在一组操作中保证原子性，同时减少网络往返次数，用 `$transaction` 的批处理模式：
+
+```typescript
+const oneYearAgo = new Date(Date.now() - 365 * 24 * 60 * 60 * 1000);
+
+const result = await prisma.$transaction([
+  prisma.post.updateMany({
+    where: { status: "DRAFT", updatedAt: { lt: oneYearAgo } },
+    data: { status: "ARCHIVED" },
+  }),
+  prisma.user.update({
+    where: { id: adminId },
+    data: { lastCleanupAt: new Date() },
+  }),
+  prisma.log.create({
+    data: { action: "ARCHIVE_OLD_DRAFTS", performedBy: adminId },
+  }),
+]);
+```
+
+三个操作在同一个事务中执行，一次网络往返。任何一个失败，全部回滚。和循环里逐个 await 相比，既保证了原子性，又减少了通信开销。
+
+## 多数据库支持
+
+### 切换 provider：理论上改一行就行
+
+Prisma 支持在 schema.prisma 里切换数据库 provider：
+
+```prisma
+datasource db {
+  provider = "postgresql"  // 改成 "mysql" 或 "sqlite"
+  url      = env("DATABASE_URL")
+}
+```
+
+改完 provider，跑 `prisma generate` 重新生成 Client，查询代码大部分不用动。但这只是"理论上"。
+
+### 实际的切换成本
+
+不同数据库之间有几个关键差异需要注意。
+
+**类型差异。** PostgreSQL 的 `Boolean` 和 MySQL 的 `TINYINT(1)` 不是一回事。Prisma 会在 Schema 层面统一类型，但底层数据库的行为不同——MySQL 存的 `0` 和 `1`，PostgreSQL 存的 `true` 和 `false`。`DateTime` 也有差异：PostgreSQL 支持时区，MySQL 的 DATETIME 不包含时区信息。
+
+**功能差异。** PostgreSQL 支持全文搜索（tsvector）、JSONB 的高级查询、数组类型、窗口函数。MySQL 在这些方面支持有限。SQLite 不支持 ALTER TABLE 的某些操作（比如删列在某些旧版本不支持），迁移策略需要调整。MongoDB 完全是另一套数据模型——文档存储而不是关系型，关联查询的方式完全不同。
+
+**迁移文件不通用。** `prisma/migrations/` 目录下的 SQL 文件是针对特定数据库的。从 PostgreSQL 切到 MySQL，迁移文件必须重新生成。如果项目已经在生产环境跑了，这不是改一行配置的事，而是一次完整的数据库迁移工程。
+
+### 云数据库选择
+
+Prisma 和几个主流云数据库服务搭配良好：
+
+**Supabase（PostgreSQL）。** 开箱即用，免费额度慷慨。自带认证、存储、实时订阅。Prisma 可以直连 Supabase 的 PostgreSQL 实例。适合需要 PostgreSQL 全功能（全文搜索、JSONB、窗口函数）的项目。
+
+**PlanetScale（MySQL 兼容）。** 基于 Vitess 的无服务器 MySQL，支持分支（database branching）——创建一个数据库分支来测试 Schema 变更，验证通过再合并到主线。Prisma 的迁移系统和 PlanetScale 的分支模型配合得不错。但 PlanetScale 的免费计划已经取消，起步成本比 Supabase 高。
+
+**Turso（SQLite）。** 边缘 SQLite 数据库，嵌入式复制。延迟极低，适合读多写少的场景。Prisma 对 SQLite 的支持覆盖了基本 CRUD，但复杂查询（如全文搜索）需要 `$queryRaw`。如果你的项目追求极致的边缘响应速度，Turso 值得考虑。
+
+选择的核心考量不是"哪个更好"，而是你的项目需要什么：需要 PostgreSQL 的丰富功能选 Supabase，需要数据库分支工作流选 PlanetScale，需要边缘低延迟选 Turso。
+
+## Trade-off 分析
+
+**$queryRaw 牺牲类型安全换性能和功能，值得吗？** 对于 Prisma API 做不到的查询——全文搜索、窗口函数、复杂聚合——你没有选择，必须用 `$queryRaw`。关键是用对方式：tagged template literal 自动参数化防注入，泛型标注提供基本的类型提示，把 `$queryRaw` 调用封装在独立函数里而不是散落在业务代码各处。不值得的是用 `$queryRaw` 替代本可以由 Prisma API 完成的简单查询——那只是多写了 SQL 还丢了类型推断。
+
+**连接池调优的性价比。** 修改 DATABASE_URL 里的 `connection_limit` 和 `pool_timeout` 是成本最低的优化——零代码改动，效果立竿见影。在 Serverless 环境下这是必做的。Prisma Accelerate 省心但要付费，自己部署 PgBouncer 免费但要运维。如果你刚上线，先调连接参数，等流量大到单机连接池撑不住再考虑代理方案。
+
+**批量操作的习惯养成。** `createMany` 和 `updateMany` 不是可选优化，是批量场景下的正确做法。循环里写 `create` 在数据量小的时候看不出问题，数据量一大就成了性能灾难。建议在 Code Review 里加入一条规则：凡是循环里出现 `await prisma.*.create` 或 `await prisma.*.update` 的代码，必须评估是否能改成批量操作。
+
+**多数据库切换的真实成本。** Prisma 统一的查询 API 让切换数据库"看起来"很简单，但迁移文件、类型差异、功能差异、数据迁移这些实际问题让切换成本远超预期。选择数据库时就要想清楚：你是只用 SQLite 做本地开发、PostgreSQL 做生产，还是真的需要在多个数据库之间无缝切换？前者很常见，后者很少见。不要为了"将来可能切换"而牺牲对特定数据库功能的利用。
+
+上一篇我们掌握了事务的使用——从简单包装到交互式事务，保证了多操作的原子性。但 Prisma 不会孤立地运行，它要嵌入到真实的项目框架里。下一篇就来解决这个集成问题——怎么在 Next.js 的 API Route 里管理 PrismaClient 的生命周期、怎么避免热重载时的连接泄漏、怎么把 Prisma 集成到 tRPC 或 NestJS 等框架中。

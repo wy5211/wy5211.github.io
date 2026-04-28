@@ -1,0 +1,351 @@
+---
+title: "02. Schema 设计：五张表撑起一个博客系统"
+date: "2026-03-22"
+summary: "从单张 users 表扩展到博客系统的完整数据模型：一对多、多对多、自引用、枚举、索引，用 Prisma Schema 定义五张表。"
+tags: ["Prisma", "TypeScript"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 2
+---
+
+上一篇我们跑通了 users 表的第一个查询，往里插了一条记录又按 email 查了出来。但真实项目不可能只有一张表。字段类型怎么选、枚举怎么定义、外键 onDelete 设什么策略、索引加在哪里——这些决策在 Schema 阶段就要想清楚，上线以后改起来代价很大。
+
+有人可能觉得"先写个能跑的 Schema，后面再优化"。这在 demo 阶段没问题，但一旦上线有了真实数据，改外键策略意味着要处理已有的关联数据，改索引意味着线上查询性能可能波动，改枚举意味着要跑一次 migration 锁表。所以 Schema 设计值得在项目初期多花一天时间想清楚。
+
+今天我们把那张单薄的 users 表扩展成一个完整的博客系统数据模型。五张表覆盖了你会遇到的绝大部分建模问题：一对多、多对多、自引用、枚举、软删除、索引策略。后续讲 CRUD、关联查询、事务迁移的时候都会用这套表结构。这五张表不是凭空设计的——每一个字段、每一个索引、每一个 onDelete 策略背后都有业务场景驱动。Schema 设计不是"把字段列出来"那么简单，它是把业务需求翻译成数据结构的过程。
+
+## 先想清楚要几张表
+
+博客系统的核心实体并不复杂：
+
+- **users** —— 注册、登录、发文章、写评论
+- **posts** —— 标题、内容、发布状态、浏览量
+- **comments** —— 支持嵌套回复，评论下面可以再回复评论
+- **tags** —— 一篇文章可以有多个标签，一个标签也可以归属多篇文章，典型的多对多
+- **post_tags** —— 多对多的中间表
+
+五张表，关系不算复杂，但已经够把 Prisma Schema 的核心特性都过一遍了。先整体看一下这五张表之间的关系：
+
+- User 一对多 Post（一个用户写多篇文章）
+- User 一对多 Comment（一个用户写多条评论）
+- Post 一对多 Comment（一篇文章有多条评论）
+- Comment 自引用一对多（评论下面有回复）
+- Post 多对多 Tag（通过 PostTag 中间表）
+
+接下来不是把五张表一口气贴出来，而是逐个展开，重点讲每个设计决策背后的"为什么"。先从最基础的状态约束开始。
+
+## 用 enum 约束状态值
+
+Prisma 的 `enum` 定义在 `datasource` 块之下，和表定义同级。它不是 TypeScript 的类型别名，而是会被翻译成真正的数据库枚举类型。先把两个枚举摆出来，后面建表的时候直接引用：
+
+```prisma
+enum Role {
+  USER
+  ADMIN
+}
+
+enum PostStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+```
+
+为什么不用 `String` 加应用层校验？因为 `enum` 在数据库层面就约束了合法值。你不可能往 `Role` 列里插入一个 `"SUPERUSER"`，数据库会直接报错。而 `String` 类型只在 TypeScript 编译时有约束，运行时写错值数据库不会拦你——等你在生产库里发现一条 `status: "PUBLISEHD"` 的脏数据时，已经晚了。
+
+这一点在实际项目中比想象中更容易发生。比如你从管理后台手动改了一条数据，或者另一个服务绕过 TypeScript 直接写了数据库，又或者某个 API 接口的类型定义没有同步更新。数据库层面的 `enum` 约束就是最后一道防线。
+
+但 `enum` 也有代价。Prisma 在 PostgreSQL 里会创建真正的数据库枚举类型，加一个值需要跑一次 migration。如果你的状态值频繁变动（比如做一个审批流程，状态经常新增），用 `String` 加 Zod 校验可能更灵活。博客系统的角色和文章状态基本是固定的，用 `enum` 正合适。
+
+还有一个细节：MySQL 对 `enum` 的支持跟 PostgreSQL 不同。MySQL 的枚举值实际上存在表的 `.frm` 文件里，修改枚举需要重建表，数据量大的时候可能锁表。如果你的项目需要在 MySQL 和 PostgreSQL 之间切换，可以考虑统一用 `String` 加应用层校验，避免数据库差异带来的坑。
+
+SQLite 的限制更严格——它根本不支持真正的 enum 类型。Prisma 在 SQLite 下会把 enum 映射成 `TEXT` 类型，约束全靠应用层。所以如果你用 SQLite 做本地开发、PostgreSQL 做生产环境，enum 的行为会不一致。这不是 Prisma 的问题，而是数据库本身的差异。如果你在意这种一致性，可以在开发环境也用 PostgreSQL（Docker 跑一个很方便）。
+
+## users 表：加上角色和软删除
+
+上一篇的 users 表只有四个字段。现在补充角色枚举和软删除字段，让它更接近生产环境的要求：
+
+```prisma
+model User {
+  id           Int       @id @default(autoincrement())
+  email        String    @unique @db.VarChar(255)
+  username     String    @unique @db.VarChar(50)
+  passwordHash String    @map("password_hash") @db.VarChar(255)
+  displayName  String?   @map("display_name") @db.VarChar(100)
+  bio          String?
+  avatarUrl    String?   @map("avatar_url") @db.VarChar(500)
+  role         Role      @default(USER)
+  deletedAt    DateTime? @map("deleted_at")
+  createdAt    DateTime  @default(now()) @map("created_at")
+  updatedAt    DateTime  @updatedAt @map("updated_at")
+
+  posts    Post[]
+  comments Comment[]
+
+  @@map("users")
+}
+```
+
+几个值得解释的设计选择：
+
+**为什么密码字段叫 `passwordHash` 而不是 `password`？** 命名即文档。叫 `password` 容易让新同事误以为存的是明文。叫 `passwordHash` 一眼就知道这是哈希值，减少理解成本。
+
+**`role` 为什么默认是 `USER`？** 绝大多数注册用户都是普通用户，管理员通过后台手动提权。默认值设成 `USER`，注册接口就不需要额外处理这个字段。
+
+**`deletedAt` 是什么？** 这是软删除模式。不物理删除记录，而是给 `deletedAt` 设一个时间戳。查询时过滤掉 `deletedAt` 不为 null 的记录，数据看起来"消失了"，但实际上还在数据库里。万一误删了可以恢复。后面讲中间件的文章会用 Prisma 的 `$extends` 自动过滤软删除记录，不用每次手动加 `where: { deletedAt: null }`。
+
+**`@map` 和 `@@map` 的区别：** `@map` 映射单个字段名，`@map("password_hash")` 让 TypeScript 里的 `passwordHash` 对应数据库列 `password_hash`；`@@map` 映射整张表名。这样做的好处是 TypeScript 侧保持 camelCase 命名，数据库侧保持 snake_case 命名，两边都符合各自的习惯。
+
+**`@updatedAt` 是什么？** Prisma 的 `@updatedAt` 是一个自动更新的时间戳注解。每次通过 Prisma Client 执行 `update` 操作时，这个字段会自动设为当前时间，不需要你手动传值。这比 Drizzle 那种每次手动 `.set({ updatedAt: new Date() })` 省事不少，但也意味着如果你绕过 Prisma 直接写 raw SQL，这个字段不会自动更新。
+
+**`bio` 为什么是 `String?`（可空）？** 注册时用户不一定要填个人简介。可空字段在 Prisma 里标记为 `String?`，TypeScript 类型会被推断为 `string | null`。查询出来之后你必须先判空再使用，这在编译时就被强制了，不容易遗漏。
+
+**`email` 为什么是 `@db.VarChar(255)` 而不是 `@db.Text`？** 技术上 PostgreSQL 的 `text` 和 `varchar` 性能几乎一样，PostgreSQL 不会真的按长度预分配空间。但 `varchar(255)` 有两个好处：一是应用层校验时有个明确的长度边界，二是某些数据库工具在比较 schema 差异时对 `text` 处理不够友好。255 是邮箱的标准上限（RFC 5321），不是随便拍脑袋的数字。`bio` 用 `String` 不设长度，因为个人简介可长可短，设硬上限没什么意义。
+
+**`posts Post[]` 和 `comments Comment[]` 是什么？** 这是 Prisma 的反向关系字段。它们不对应数据库列，只是告诉 Prisma Client："User 和 Post 之间有一对多关系，通过 User 可以访问他所有的 Post"。有了这个声明，后续查询时才能用 `include: { posts: true }` 一次性加载用户的所有文章。
+
+## posts 表：外键、索引和复合索引
+
+```prisma
+model Post {
+  id            Int        @id @default(autoincrement())
+  title         String     @db.VarChar(255)
+  slug          String     @unique @db.VarChar(255)
+  excerpt       String?    @db.VarChar(500)
+  content       String
+  coverImageUrl String?    @map("cover_image_url") @db.VarChar(500)
+  authorId      Int        @map("author_id")
+  status        PostStatus @default(DRAFT)
+  viewCount     Int        @default(0) @map("view_count")
+  isFeatured    Boolean    @default(false) @map("is_featured")
+  publishedAt   DateTime?  @map("published_at")
+  createdAt     DateTime   @default(now()) @map("created_at")
+  updatedAt     DateTime   @updatedAt @map("updated_at")
+
+  author   User      @relation(fields: [authorId], references: [id], onDelete: Cascade)
+  comments Comment[]
+  tags     PostTag[]
+
+  @@index([authorId])
+  @@index([status])
+  @@index([publishedAt])
+  @@index([authorId, status])
+  @@map("posts")
+}
+```
+
+**`authorId` 的外键为什么设 `onDelete: Cascade`？** 这意味着删除用户时，该用户的所有文章也会被自动删除。对于个人博客来说这是合理的——用户注销了，文章也没理由留着。但如果你做的是内容平台，可能需要 `onDelete: Restrict` 阻止删除还有文章的用户，或者 `onDelete: SetNull` 保留文章但把作者字段置空。Cascade 是最危险的选择，一定要想清楚再用。
+
+**slug 为什么用 `@unique`？** 文章的 URL 通常是 `/posts/how-to-use-prisma`，slug 就是 URL 的一部分。两条记录有相同的 slug 会导致路由冲突。`@unique` 在数据库层面保证不会出现重复，比应用层校验可靠得多。
+
+一个常见的疑问：slug 和 title 有什么区别？title 是给人看的标题，可以包含特殊字符、空格、中文；slug 是给机器看的标识，只能包含小写字母、数字和连字符。生成 slug 通常是把 title 转写成 URL 友好的格式，比如 `title: "Prisma 入门指南"` 变成 `slug: "prisma-getting-started"`。后续讲 CRUD 的文章会演示怎么在创建文章时自动生成 slug。
+
+**四个索引分别是干什么的？** 索引要跟着查询走。`@@index([authorId])` 服务于"查某用户的所有文章"；`@@index([status])` 服务于"查所有已发布文章"；`@@index([publishedAt])` 服务于"按发布时间排序"。`@@index([authorId, status])` 是复合索引，服务最频繁的查询："获取某作者的所有已发布文章"。单独的 authorId 索引或 status 索引都不是最优解，复合索引才能让 `WHERE author_id = ? AND status = 'PUBLISHED'` 走索引覆盖。
+
+你可能注意到 authorId 和 authorId+status 有重叠。有人会问：既然有了复合索引 `(authorId, status)`，单独的 `@@index([authorId])` 是不是冗余了？严格来说是的。复合索引 `(authorId, status)` 的最左前缀就是 `authorId`，单独查 authorId 时也能走这个索引。但在实际项目中，保留单独索引也不算浪费——索引占用的空间很小，查询优化器的选择也更灵活。如果你追求极致精简，可以去掉 `@@index([authorId])`，只保留复合索引。
+
+复合索引的列顺序有讲究。`(authorId, status)` 先通过 authorId 缩小范围，再过滤 status，适合"某作者的文章量远少于全站文章量"的场景。反过来的 `(status, authorId)` 先过滤状态再缩小到作者，更适合"已发布文章很少，但某作者文章很多"的情况。博客系统通常是前者。
+
+**`publishedAt` 为什么可空？** 草稿状态的文章还没有发布时间，只有从 DRAFT 变成 PUBLISHED 的那一刻才设置 `publishedAt`。这和 `createdAt` 不同——`createdAt` 是记录创建时间，不管发不发布都有值。如果你用 `createdAt` 来排序文章列表，草稿也会混进去；用 `publishedAt` 排序就只影响已发布文章。
+
+**`viewCount` 默认 0 而不是可空：** 浏览量一定是个数字，没有"还没浏览过"这种中间状态。默认 0 让你直接累加 `viewCount: { increment: 1 }`，不用先判断是不是 null 再决定加还是设值。
+
+**`isFeatured` 的用途：** 这是一个置顶标记。博客首页通常需要推荐几篇"精选文章"，`isFeatured: true` 就是最简单的实现方式。更复杂的推荐系统可能会用到单独的推荐表或者算法打分，但对于博客来说一个布尔值够了。
+
+## comments 表：双外键和自引用嵌套
+
+```prisma
+model Comment {
+  id        Int      @id @default(autoincrement())
+  postId    Int      @map("post_id")
+  authorId  Int?     @map("author_id")
+  parentId  Int?     @map("parent_id")
+  content   String
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  post    Post     @relation(fields: [postId], references: [id], onDelete: Cascade)
+  author  User?    @relation(fields: [authorId], references: [id], onDelete: SetNull)
+  parent  Comment?  @relation("CommentReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies Comment[] @relation("CommentReplies")
+
+  @@index([postId])
+  @@index([authorId])
+  @@index([parentId])
+  @@map("comments")
+}
+```
+
+这张表有两个值得细说的设计决策。
+
+**自引用外键 `parentId`：** 它引用的是同一张表的 `id`，实现嵌套评论。顶级评论的 `parentId` 为 null，回复的 `parentId` 指向被回复的评论。注意自引用关系必须指定关系名 `"CommentReplies"`，否则 Prisma 分不清 `parent` 和 `replies` 谁是谁。查某条评论的所有回复就是 `where: { parentId: someCommentId }`，简单直接。
+
+这种方案只支持一层父子关系。如果你需要 Reddit 那样的无限嵌套，得用闭包表或者路径枚举。但博客评论一两层嵌套足够了，不要过度设计。
+
+`"CommentReplies"` 这个关系名是必须的吗？是的。当一张表里有两个关系指向同一张目标表时（这里是 `parent` 和 `replies` 都指向 Comment），Prisma 要求你用关系名来区分它们。不指定关系名，Prisma 会在 generate 阶段报歧义错误。命名上没有强制要求，但建议用能表达语义的名字——`"CommentReplies"` 比 `"selfRef"` 或 `"relation1"` 好理解得多。
+
+**`authorId` 设了 `onDelete: SetNull`：** 和 posts 表的 Cascade 不同，评论的作者被删除时保留评论，只把 `authorId` 置为 null。前端显示时判断 authorId 为 null 就展示"已注销用户"。你肯定在论坛里见过这种评论——删了号但讨论上下文还在，对其他阅读者有价值。
+
+注意一个容易踩的坑：同一张表里不同外键可以设不同的 onDelete 策略。这里 `postId` 是 Cascade（删文章就删评论，没有评论的文章没有意义），`authorId` 是 SetNull（删用户保留评论），`parentId` 也是 Cascade（删父评论就删子回复，不然子回复悬空没意义）。不要偷懒全部设成一样的，每个外键的语义不同，删除策略也应该不同。
+
+Prisma 在 `prisma generate` 阶段不会校验 onDelete 策略的合理性——它只管生成类型定义。真正校验发生在数据库执行 SQL 的时候。所以你可能在开发阶段一切正常，到了生产环境删数据时才发现 Cascade 把不该删的记录都删了。强烈建议在 Schema 设计完之后，写几条测试用例验证各种删除场景：删用户、删文章、删评论、删标签，看看关联数据是否符合预期。
+
+**`authorId` 为什么是 `Int?`（可空）？** 因为 `onDelete: SetNull` 会把 authorId 设为 null。如果字段定义为 `Int`（非空），SetNull 操作会失败——数据库拒绝在非空列里写入 null。Prisma 不会在 Schema 层面拦截这个矛盾，但 migrate 时数据库会报错。记住一条规则：用 `SetNull` 的外键必须是可空字段。
+
+这条规则也适用于其他使用 SetNull 的场景。如果你发现 migrate 报错说"cannot use SET NULL on non-nullable column"，第一时间检查外键字段是不是忘了加 `?`。这是 Prisma Schema 设计里最常见的低级错误之一。
+
+## tags 表和中间表：多对多的两种写法
+
+先看标签表，很简单：
+
+```prisma
+model Tag {
+  id        Int      @id @default(autoincrement())
+  name      String    @unique @db.VarChar(50)
+  slug      String    @unique @db.VarChar(50)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  posts PostTag[]
+
+  @@map("tags")
+}
+```
+
+`name` 存显示名（"TypeScript"），`slug` 存 URL 友好的标识（"typescript"）。两个都加了 `@unique`，标签名不能重复，slug 也不能重复。
+
+为什么标签表只有四个字段？标签是一个典型的"轻量实体"——它的核心职责就是分类，不需要太多属性。有些项目会给标签加 `description`（标签描述）、`color`（标签颜色）、`usageCount`（使用次数），这些都可以加，但在博客系统里不是核心需求。Schema 设计的一个原则是：开始只加你确定需要的字段，后续按需扩展。每次 `ALTER TABLE` 都是一次 migration，但加字段比删字段安全得多。
+
+这里还有一个命名习惯值得提一下：标签的 `slug` 和文章的 `slug` 用途相同，都是 URL 友好的唯一标识。Tag 的 URL 是 `/tags/typescript`，Post 的 URL 是 `/posts/how-to-use-prisma`。保持命名一致，让整个项目的 slug 语义统一，后面做路由的时候就不会困惑。
+
+接下来是关键的多对多中间表。Prisma 有两种写法：隐式和显式。这是 Schema 设计里最容易纠结的选择之一。
+
+隐式写法长这样，不需要定义 model，Prisma 自动生成表：
+
+```prisma
+model Post {
+  tags Tag[] @relation("PostToTag")
+}
+
+model Tag {
+  posts Post[] @relation("PostToTag")
+}
+```
+
+简洁，但这里是黑盒。隐式中间表在数据库里会生成一张 `_PostToTag` 表（Prisma 自动命名），你可以用 Prisma Studio 看到，但不能在 Schema 里给它加字段。查"某篇文章的所有标签"和"某个标签的所有文章"都走 `include` 语法，很方便。但如果你想查"这篇文章是什么时候被打上这个标签的"，隐式表做不到。
+
+我们选择显式中间表：
+
+```prisma
+model PostTag {
+  postId    Int      @map("post_id")
+  tagId     Int      @map("tag_id")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  post Post @relation(fields: [postId], references: [id], onDelete: Cascade)
+  tag  Tag  @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([postId, tagId])
+  @@map("post_tags")
+}
+```
+
+为什么不选隐式？因为隐式中间表不能加额外字段。一旦未来需要记录"谁给文章打的标签"或者"标签的排序权重"，你就得把隐式改成显式——一次 migration 加数据迁移，相当麻烦。显式中间表提前多写几行代码，但保留了加字段的灵活性。
+
+另一个隐式中间表的限制是：查询语法不同。隐式中间表用 `include: { tags: true }` 直接从 Post 跳到 Tag。显式中间表需要先 include PostTag，再从 PostTag include Tag，多一层嵌套。后面讲关联查询的文章会详细对比两种写法的区别。这里先记住：显式的查询稍显啰嗦，但换来了灵活性。
+
+`@@id([postId, tagId])` 是复合主键。同一篇文章不能重复打同一个标签，复合主键在数据库层面就保证了这个约束。关联表不需要自增 ID，`(post_id, tag_id)` 的组合就是天然的主键。
+
+两边都设了 `onDelete: Cascade`。删除文章时自动清除关联记录，删除标签时也是。标签被删了，文章还留着，只是少了那个标签。
+
+注意 `createdAt` 加在了中间表上。多对多关联表加时间戳不是必须的，但知道"这篇文章是什么时候被打上这个标签的"有时候有用——比如做"最近添加的标签"推荐功能。不加也可以，看你有没有这个需求。隐式中间表就不能加这个字段，这也是选择显式的一个理由。
+
+## 索引策略：不是越多越好
+
+把五张表的索引放在一起看：
+
+| 表        | 索引字段                    | 服务场景             |
+| --------- | --------------------------- | -------------------- |
+| users     | email（unique 自带索引）    | 登录查询             |
+| users     | username（unique 自带索引） | 用户主页             |
+| posts     | authorId                    | 查某用户的所有文章   |
+| posts     | status                      | 查所有已发布文章     |
+| posts     | publishedAt                 | 按时间排序           |
+| posts     | authorId + status           | 查某用户的已发布文章 |
+| comments  | postId                      | 查文章的所有评论     |
+| comments  | authorId                    | 查用户的所有评论     |
+| comments  | parentId                    | 查评论的所有回复     |
+| tags      | name（unique）              | 标签名查重           |
+| tags      | slug（unique）              | URL 路由             |
+| post_tags | postId + tagId（复合主键）  | 关联查询             |
+
+每个索引都会占用额外的存储空间，并且在插入和更新时拖慢写入速度。一个经验值是：每多一个索引，写入性能大约下降 5%-10%（取决于索引列的数据类型和表的大小）。对于读多写少的场景（比如博客），索引的收益远大于代价。但对于高频写入的场景（比如日志表、消息队列），索引要尽量克制。
+
+只给真正频繁出现在 `WHERE`、`JOIN`、`ORDER BY` 里的列加索引，不要"先加一堆再说"。加索引之前问自己一个问题：这个索引服务的是哪条查询？如果答不上来，先不加。
+
+`@unique` 约束自带索引效果，不需要重复加。posts 的 slug 和 tags 的 name/slug 都有 unique 约束，所以不需要额外建索引。
+
+还有一个容易忽略的点：复合主键 `@@id([postId, tagId])` 本身也会创建索引，而且是覆盖两个列的复合索引。所以 post_tags 表不需要额外加 `@@index([postId])`——复合主键索引已经能服务按 postId 查询的场景了。但如果你经常单独按 tagId 查询（比如"查某个标签下的所有文章"），可以加一个 `@@index([tagId])` 来优化。不过实际开发中，查"某标签下的文章"通常走的是 `include` 关联查询，Prisma 内部会处理好索引，手动加的场景不多。
+
+## 软删除：为什么用 deletedAt 而不是 isDeleted
+
+users 表用了 `deletedAt DateTime?` 而不是 `isDeleted Boolean`。两个原因：一是时间戳比布尔值多了"什么时候删除的"信息，方便做"删除 30 天后自动清理"之类的策略；二是 null 判断比布尔值更不容易出错——`isDeleted` 你得约定 `false` 还是 `null` 代表未删除，`deletedAt` 只有一种语义：null 就是没删，有值就是删了。
+
+软删除的代价是查询时得手动过滤。每条查询都要加 `where: { deletedAt: null }`，忘了一次就会查出已删除的数据。后面讲中间件的文章会用 `$extends` 自动处理这个问题，这里先知道有这个字段就行。
+
+还有一点值得注意：软删除和 unique 约理会冲突。假设你软删除了一个 email 为 `alice@example.com` 的用户，后来又有人用这个 email 注册——数据库会报 unique 冲突，因为那条"已删除"的记录还在。解法有两种：一是把 unique 约束改成部分索引（PostgreSQL 支持 `WHERE deleted_at IS NULL` 的条件唯一索引，但 Prisma 不原生支持，需要手写 migration）；二是软删除时同时把 email 改成 `deleted_{id}_{timestamp}@example.com` 之类的占位值。前者优雅但复杂，后者粗暴但简单。看你的项目规模选择。
+
+这个问题在 username 上同样存在。如果用户注销后其他人想注册同名账号，软删除会阻止这种情况。有些产品确实需要这种"用户名被占用"的行为（比如知乎），有些则不需要（注册时换个名字就行）。在 Schema 设计阶段想清楚这个行为，比上线后再补救要好得多。
+
+## 跑通 migration
+
+每个 model 已经在上面分别展示过了。实际的 `schema.prisma` 文件只需要在顶部加上 `generator client` 和 `datasource db` 配置，然后把两个 enum 和五个 model 按顺序排列进去。
+
+改完 `schema.prisma` 之后，跑一次 migration 就能在数据库里生成这五张表：
+
+```bash
+npx prisma migrate dev --name init
+```
+
+这条命令做了三件事：根据 schema 生成 SQL 迁移文件、在数据库执行建表操作、自动运行 `prisma generate` 更新 TypeScript 类型定义。三个步骤一气呵成，不需要分别手动执行。之后你的代码里就能 import PrismaClient，用到所有模型的完整类型了。
+
+你会在 `prisma/migrations/` 目录下看到一个以时间戳命名的文件夹，里面有一个 `migration.sql` 文件。打开它看看生成的 SQL，确认 Prisma 的理解和你预期一致——尤其是外键约束、索引、enum 类型这些容易出错的地方。养成 migration 前先看 SQL 的习惯，比出了问题再排查高效得多。
+
+第一次跑完 migrate 之后，可以用 Prisma Studio 可视化查看表结构：
+
+```bash
+npx prisma studio
+```
+
+浏览器会打开一个管理界面，你能看到所有五张表和它们的字段。虽然现在表里还没有数据，但可以确认表结构是否正确：字段名、类型、默认值、外键关系是否都符合预期。Prisma Studio 也是后续开发时快速查看和编辑数据的好工具，比手写 SQL 方便。
+
+如果你想直接看 SQL，也可以连接数据库执行 `\d users`（psql 命令）或者用任何数据库客户端查看建表语句。重点确认以下几点：enum 类型是否正确创建、外键约束是否带上 onDelete 策略、索引是否按预期建立、字段类型（VarChar 长度、DateTime 精度）是否正确。早期发现 Schema 和预期不一致，改起来成本几乎为零——改一下 schema.prisma 再跑一次 `prisma migrate dev` 就行。
+
+## Trade-off：Schema 设计的取舍
+
+Schema 设计几乎每个决策都有两面性，做选择之前想清楚场景。
+
+**隐式中间表 vs 显式中间表。** 隐式写法简洁，两行 `@relation` 就搞定多对多。但隐式表是黑盒，不能加字段。今天你只需要文章和标签的关联，明天产品说"加个标签排序权重"或者"记录谁打的标签"，你就得改成显式。显式中间表多写几行，但一劳永逸。如果你百分之百确定多对多关联永远只需要两个外键，隐式没问题；但凡有一丝犹豫，用显式。
+
+实际项目中，我建议默认用显式中间表。理由很简单：从隐式迁移到显式是一次破坏性操作——你需要创建新表、迁移数据、删除旧表、更新所有引用这个关系的查询代码。而从显式"降级"到隐式几乎没有场景——多写了十几行代码不是什么问题，但少写了可能导致返工。显式的额外成本是一次性的，收益是长期的。
+
+**enum vs String。** enum 有数据库层面的约束，类型安全性高，但修改枚举值需要跑 migration。PostgreSQL 的 `ALTER TYPE ... ADD VALUE` 不能在事务里执行，这在某些部署流程里是麻烦事。String 灵活，加一个状态值不需要改数据库，但校验全靠应用层。状态值固定且变更频率低的场景用 enum，经常变动的场景用 String 加 Zod。
+
+有个折中方案：用 `String` 类型但在 Prisma 层面做校验。结合 Zod 定义一个 `PostStatusSchema = z.enum(["DRAFT", "PUBLISHED", "ARCHIVED"])`，在写入数据库之前校验。这样你既有运行时的类型安全，又不受数据库 enum 修改的限制。代价是校验逻辑分散在应用层而不是集中在数据库层。后面讲类型安全的文章会展开讲 Zod 和 Prisma 的配合方式。
+
+**onDelete: Cascade vs Restrict vs SetNull。** Cascade 最省事但也最危险——删一个用户，他的文章、评论全没了，不可恢复。Restrict 最安全，有子记录就不让你删，但业务层得处理"先删子记录再删父记录"的逻辑。SetNull 是折中方案，保留数据但断开关联。选择取决于业务场景：个人博客用 Cascade 没问题，内容平台用 Restrict 或 SetNull 更安全。
+
+本次设计中，同一个 User 表的关联用了两种不同策略：posts 用 Cascade（文章是用户的私有内容，用户删了文章跟着删），comments 用 SetNull（评论是公共讨论，删了用户但讨论要保留）。这说明 onDelete 策略不应该统一设置，而是要根据每条外键的业务语义单独决定。
+
+**软删除 vs 物理删除。** 软删除保留数据可恢复，但查询时必须记得过滤 `deletedAt`，忘了就泄露"已删除"数据。物理删除干净利落，但删了就没了。如果你有合规要求（比如 GDPR 的"被遗忘权"），物理删除是必须的。如果只是怕误删，软删除加中间件自动过滤是好方案。
+
+还有一种混合策略：软删除后设置一个保留期（比如 30 天），到期后通过定时任务物理删除。这样既有恢复窗口，又不会让数据库里堆积大量"已删除"记录。具体实现涉及 Prisma 的 `$queryRaw` 和定时任务，后面讲性能优化的文章会提到。
+
+**`@map` 命名惯例 vs 全 camelCase。** 本次设计用了 `@map` 把每个字段都映射成 snake_case，TypeScript 侧用 camelCase。这在大型项目中是值得的，因为数据库管理员、数据分析师可能直接看 SQL，snake_case 是他们的惯例。但在小项目或个人项目中，这个映射增加了 Schema 的视觉噪音——每个字段都多了一个 `@map(...)` 注解。如果你的团队全栈都是 TypeScript 开发者，没有人直接操作 SQL，可以考虑省掉 `@map`，让数据库列名也用 camelCase。Prisma 支持这样做的，只是不太常规。
+
+关键是要在项目初期就统一这个决定，然后在所有表里保持一致。混用是最糟糕的——有的表用了 `@map`，有的表没用，维护的人需要不停地猜"这个字段在数据库里到底叫什么"。Prisma 的 `@map` 和 `@@map` 机制让这种映射变得简单，但前提是你真的在用。如果团队里有人写新表的时候忘了加 `@map`，就会出现 camelCase 和 snake_case 混用的情况，代码审查时记得检查这一点。
+
+五张表建好了，接下来该往里写数据了。
+
+下一篇我们从最基础的 CRUD 开始——创建文章、查询列表、更新状态、删除记录，以及 Prisma 那些不太直觉但很实用的查询技巧。有了这五张表做基础，后面的 CRUD、关联查询、事务操作都有真实的数据模型可以操作，不用再拿假数据凑合了。

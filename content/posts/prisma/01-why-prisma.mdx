@@ -1,0 +1,270 @@
+---
+title: "01. 为什么选 Prisma 而不是手写 SQL"
+date: "2026-03-21"
+summary: "从一次 raw SQL 导致的生产事故出发，对比 Prisma、TypeORM、Drizzle、原生 SQL 在类型安全、开发体验上的差异，跑通第一个查询。"
+tags: ["Prisma", "TypeScript"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 1
+---
+
+上周五晚上十点，你收到告警——线上接口 500 错误刷了一整屏。查了一圈发现，下午有人把 `users` 表的 `email` 字段重命名为 `user_email`，SQL 迁移跑了，代码里的 TypeScript 类型也改了，但漏了一处手写的 raw SQL：
+
+```typescript
+const result = await pool.query(
+  "SELECT id, email, name FROM users WHERE id = $1",
+  [userId]
+);
+```
+
+数据库里已经没有 `email` 列了，PostgreSQL 直接报 `column "email" does not exist`。TypeScript 编译器帮不了你——字符串里的 SQL 就是字符串，编译器看不懂。如果你的数据访问层能感知到 schema 变化，这种事故根本不会发生。
+
+这就是 ORM 存在的意义。但 TypeScript 生态里 ORM 选择太多了，Prisma、TypeORM、Drizzle、还有直接写 SQL 的 `pg` 库，到底该选哪个？
+
+## 同一个查询任务，四个方案写出来差别有多大
+
+别看特性对比表了，直接用代码说话。场景很简单：查一个用户，顺便统计他发了多少篇文章。
+
+### 方案一：原生 SQL
+
+用 `pg` 驱动直接写查询：
+
+```typescript
+import { Pool } from "pg";
+
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+
+const result = await pool.query(
+  `SELECT u.id, u.email, u.name, COUNT(p.id) AS post_count
+   FROM users u
+   LEFT JOIN posts p ON p.author_id = u.id
+   WHERE u.id = $1
+   GROUP BY u.id`,
+  [userId]
+);
+```
+
+查询本身没问题，但 `result.rows[0]` 的类型是 `any`。你不知道 `post_count` 返回的是字符串还是数字（PostgreSQL 的 COUNT 返回 bigint，pg 驱动默认转成字符串）。你也不知道 `name` 是 `string | null` 还是 `string`。改了 schema？编译器不会报错，运行时才炸。
+
+### 方案二：TypeORM
+
+```typescript
+import { Entity, PrimaryGeneratedColumn, Column, OneToMany } from "typeorm";
+
+@Entity()
+class User {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  email: string;
+
+  @Column({ nullable: true })
+  name: string | null;
+
+  @OneToMany(() => Post, (post) => post.author)
+  posts: Post[];
+}
+
+const user = await userRepository.findOne({
+  where: { id: userId },
+  relations: ["posts"],
+});
+```
+
+TypeORM 的装饰器语法很"Java"，在 TypeScript 项目里显得笨重。更大的问题是类型推断：`user` 的类型是 `User | null`，你需要手动判空。而 `user.posts` 在 TypeScript 看来可能是 `undefined`，即使你在数据库层面定义了关系。联表查询的返回类型不够精确，经常需要手动断言。
+
+还有一点——TypeORM 的装饰器和 `reflect-metadata` 依赖在某些构建工具里配置麻烦，尤其是 Next.js App Router 和 Vite 项目。
+
+### 方案三：Drizzle
+
+```typescript
+const result = await db
+  .select({
+    id: users.id,
+    email: users.email,
+    name: users.name,
+    postCount: sql<number>`count(${posts.id})`,
+  })
+  .from(users)
+  .leftJoin(posts, eq(users.id, posts.authorId))
+  .where(eq(users.id, userId))
+  .groupBy(users.id);
+```
+
+Drizzle 很轻量，API 是 SQL 的 1:1 映射，返回类型推断精确。但它的生态还比较新，社区规模、文档完善度、踩坑经验都比不上 Prisma。如果你的项目需要 MongoDB 支持，Drizzle 也帮不了你。更关键的是，当你想要一个可视化的数据库浏览器来快速检查数据，Drizzle Studio 还不够成熟。
+
+### 方案四：Prisma
+
+```typescript
+const user = await prisma.user.findUnique({
+  where: { id: userId },
+  include: {
+    _count: {
+      select: { posts: true },
+    },
+  },
+});
+```
+
+`user` 的类型是精确的：TypeScript 知道它包含 `id`、`email`、`name`，还知道 `_count.posts` 是个数字。你在 `include` 里加了什么，类型就有什么。改了 schema，重新 generate 一次，所有查询里的类型错误立刻暴露——编译过不了，根本到不了运行时。
+
+四种方案的核心差异可以归结为一个问题：**schema 变了，你的查询代码能在编译阶段报错吗？** 原生 SQL 做不到，TypeORM 做得不够好，Drizzle 做得到但生态年轻，Prisma 做得到且生态成熟。
+
+## Prisma 的架构是怎么工作的
+
+理解 Prisma 的设计有助于你后续排查问题。它的工作流是一条清晰的管线：
+
+```
+schema.prisma → prisma generate → Prisma Client (TypeScript 类型) → Query Engine (Rust) → 数据库
+```
+
+你在 `schema.prisma` 文件里声明式地定义数据模型，这是一个独立的 DSL，不是 TypeScript 代码。运行 `prisma generate` 后，Prisma 生成一个完整的 TypeScript Client，包含所有表的类型定义和查询方法。你的业务代码只和这个 Client 打交道。
+
+查询引擎是 Prisma 和其他 ORM 差异最大的地方。它用 Rust 编写，负责把 Prisma Client 的查询请求编译成 SQL，发送给数据库，再把结果映射回 TypeScript 对象。这带来了一些开销——后文会讨论利弊——但也让 Prisma 能在不同数据库（PostgreSQL、MySQL、SQLite、MongoDB）之间提供统一的查询 API。
+
+这个架构的核心收益是：schema 是唯一的真相来源。数据库结构、TypeScript 类型、查询方法全部从 `schema.prisma` 派生。你改了 schema，重新 generate，所有下游代码立刻感知到变化。
+
+## 从零搭建项目，跑通第一个查询
+
+### 初始化项目
+
+```bash
+mkdir prisma-blog && cd prisma-blog
+npm init -y
+npm install prisma @prisma/client typescript tsx @types/node
+npx tsc --init
+```
+
+`prisma` 是 CLI 工具，`@prisma/client` 是运行时客户端。两者是分开的包，CLI 只在开发和 CI 里需要。
+
+### 初始化 Prisma
+
+```bash
+npx prisma init --datasource-provider postgresql
+```
+
+这个命令做了三件事：创建 `prisma/schema.prisma` 文件，创建 `.env` 文件，在 `.env` 里写入 `DATABASE_URL` 占位符。把你的 PostgreSQL 连接字符串填进去：
+
+```bash
+# .env
+DATABASE_URL="postgresql://postgres:password@localhost:5432/prisma_blog?schema=public"
+```
+
+### 定义 users 表
+
+打开 `prisma/schema.prisma`，把内容替换为：
+
+```prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        Int      @id @default(autoincrement())
+  email     String   @unique
+  name      String?
+  bio       String?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("users")
+}
+```
+
+几个关键语法需要解释。`@id @default(autoincrement())` 声明主键并自增。`@unique` 给 email 加唯一约束。`String?` 表示可为空。`@map("created_at")` 把 TypeScript 里的 `createdAt` 映射到数据库的 `snake_case` 列名。`@@map("users")` 把模型名 `User` 映射到表名 `users`。这种映射机制让你在代码里保持 camelCase 惯例，数据库里保持 snake_case 惯例。
+
+### 创建数据库表并生成 Client
+
+```bash
+npx prisma migrate dev --name init
+```
+
+这一条命令做了两件事：根据 schema 生成 SQL 迁移文件，然后执行迁移在数据库里创建 `users` 表。同时它会自动运行 `prisma generate`，生成 TypeScript Client。
+
+### 跑通 CRUD
+
+创建 `src/index.ts`：
+
+```typescript
+import { PrismaClient } from "@prisma/client";
+
+const prisma = new PrismaClient();
+
+async function main() {
+  // 创建用户
+  const user = await prisma.user.create({
+    data: {
+      email: "zhang_wei@example.com",
+      name: "张伟",
+      bio: "全栈开发者，喜欢写博客",
+    },
+  });
+  console.log("创建用户:", user);
+
+  // 按 ID 查询单个用户
+  const found = await prisma.user.findUnique({
+    where: { id: user.id },
+  });
+  console.log("查询结果:", found);
+
+  // 查询所有用户
+  const all = await prisma.user.findMany();
+  console.log("全部用户:", all);
+}
+
+main()
+  .catch(console.error)
+  .finally(() => prisma.$disconnect());
+```
+
+运行：
+
+```bash
+npx tsx src/index.ts
+```
+
+如果一切正常，你会看到创建、查询、列表三组输出。注意 `user` 变量的类型——TypeScript 知道它包含 `id`（number）、`email`（string）、`name`（string | null）、`bio`（string | null）、`createdAt`（Date）。不是 `any`，不需要你手动定义接口，Prisma 自动生成了精确类型。
+
+`prisma.$disconnect()` 在脚本末尾调用，确保关闭数据库连接。在长期运行的服务里（比如 Next.js API Route），你通常不需要手动调用它。
+
+### 用 Prisma Studio 浏览数据
+
+Prisma 自带一个可视化的数据库管理工具：
+
+```bash
+npx prisma studio
+```
+
+浏览器打开 `http://localhost:5555`，你可以直接在界面里查看、编辑、新增、删除数据。开发阶段用它在数据库里手动插入测试数据，比写 SQL 或者用 pgAdmin 快得多。当你的表结构越来越复杂、表越来越多的时候，一个开箱即用的可视化工具能省不少事。
+
+## Prisma 什么时候该用，什么时候别碰
+
+Prisma 不是所有场景的最优解。它的架构选择带来了一些硬性限制。
+
+**适合用 Prisma 的场景：**
+
+- 你的项目需要从数据库到应用层的端到端类型安全。改了 schema，编译阶段就能发现所有受影响的查询代码，不用等运行时爆炸。
+- 团队成员 SQL 水平参差不齐，Prisma 的查询 API 比 raw SQL 更容易上手。`findMany`、`include`、`where` 这些概念比 `LEFT JOIN`、`GROUP BY` 的学习曲线平缓得多。
+- 你需要快速搭建项目原型。`prisma init` 到跑通第一个查询，整个过程不超过十分钟。Prisma Studio 让你不需要额外装数据库管理工具。
+- 项目可能需要切换数据库。Prisma 对 PostgreSQL、MySQL、SQLite、MongoDB 提供统一的查询 API，切换时改一行 provider 配置就行（虽然实际迁移没那么简单，但至少查询代码不用重写）。
+- 你需要开箱即用的可视化数据管理。Prisma Studio 在开发阶段非常实用。
+
+**不太适合的场景：**
+
+- 你要部署到 Edge 环境（Cloudflare Workers、Deno Deploy）。Prisma 的 Rust 查询引擎依赖 Node.js 运行时，没法在 Edge 上跑。虽然 Prisma 有 Prisma Accelerate 和 Data Proxy 这类代理方案，但增加了架构复杂度和延迟。这种场景下 Drizzle 是更好的选择，它没有查询引擎，纯 JS 实现，打包后只有 15KB。
+- 你对查询延迟极其敏感。Prisma 的查询引擎通过 IPC 通信，一个简单查询的固定开销在 10-40ms。如果你的接口 P99 要求在 10ms 以内，直接用 `pg` 驱动写 SQL 更合适。
+- 项目已经在用 TypeORM，而且运行稳定。迁移到 Prisma 意味着重写所有实体定义和查询代码，成本不低。除非 TypeORM 的类型推断问题真的在拖累开发效率，否则没必要折腾。
+- 你需要写大量复杂的原生 SQL。Prisma 支持 `$queryRaw` 执行原始 SQL，但这样做就失去了类型安全的优势。如果你的业务查询 80% 都是复杂的原生 SQL，Prisma 提供的价值有限。
+
+**和 Drizzle 怎么选？** 如果你追求极致的轻量和 Edge 兼容，选 Drizzle。如果你更看重开发体验、生态成熟度、可视化工具，选 Prisma。两者都提供类型安全，但设计哲学不同：Drizzle 是"用 TypeScript 写 SQL"，Prisma 是"用声明式 schema 生成一切"。
+
+---
+
+下一篇我们要面对一个更实际的问题：真实项目的表结构远比一张 users 表复杂。一个博客系统至少需要 users、posts、comments、tags 这些表，还有多对多关联、枚举状态、自引用嵌套评论。我们会用 Prisma 设计完整的博客 schema——字段类型怎么选、关系怎么建、索引加在哪里、为什么有些场景用显式中间表比隐式中间表更合适。

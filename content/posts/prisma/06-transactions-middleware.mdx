@@ -1,0 +1,503 @@
+---
+title: "06. 事务与中间件"
+date: "2026-03-26"
+summary: "创建文章同时关联标签需要原子性保证，软删除需要全局拦截。用 Prisma 事务和中间件解决这些工程问题。"
+tags: ["Prisma", "TypeScript"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 6
+---
+
+发布一篇文章，代码分两步：先 `prisma.post.create` 插入文章，再循环 `prisma.postToTag.create` 插入标签关联。第一步成功了，第二步因为某个标签的 slug 不存在报错了。用户看到的是"发布失败"，但数据库里已经多了一篇没有标签的孤儿文章。
+
+第3篇我们掌握了 CRUD 操作，嵌套创建能解决一部分问题。但当你需要在多个操作之间加判断逻辑、需要确保一组操作全部成功或全部失败、或者需要在每次查询时自动过滤已删除的记录——这就需要事务和中间件了。
+
+## 不用事务的真实后果
+
+先看一段有问题的代码：
+
+```typescript
+async function publishPost(data: PostData) {
+  // 第一步：创建文章
+  const post = await prisma.post.create({
+    data: {
+      title: data.title,
+      slug: data.slug,
+      content: data.content,
+      status: "PUBLISHED",
+      publishedAt: new Date(),
+      author: { connect: { id: data.authorId } },
+    },
+  });
+
+  // 第二步：关联标签
+  for (const tagId of data.tagIds) {
+    await prisma.postToTag.create({
+      data: { postId: post.id, tagId },
+    });
+  }
+
+  return post;
+}
+```
+
+问题出在哪？如果 `tagIds` 里有一个 id 不存在，`postToTag.create` 会因为外键约束失败抛错。函数中断了，但第一步的 `post.create` 已经提交了。数据库里多了一篇没有标签的文章，前端展示时标签栏是空的，用户编辑时发现这篇文章已经存在但标签全丢了。
+
+这就是缺乏原子性保证的后果——多个操作之间没有绑定在一起，成功了一半停了下来，留了一个半成品。
+
+## 批量事务：$transaction([op1, op2, op3])
+
+### 最简单的用法
+
+Prisma 提供的第一种事务形式是批量事务。把多个操作放进一个数组，全部成功才提交，任何一个失败全部回滚：
+
+```typescript
+const [post, ...tagRelations] = await prisma.$transaction([
+  prisma.post.create({
+    data: {
+      title: "事务与中间件",
+      slug: "transactions-middleware",
+      content: "正文内容...",
+      status: "PUBLISHED",
+      publishedAt: new Date(),
+      author: { connect: { id: 1 } },
+    },
+  }),
+  prisma.postToTag.create({
+    data: { postId: 1, tagId: 1 },
+  }),
+  prisma.postToTag.create({
+    data: { postId: 1, tagId: 2 },
+  }),
+]);
+```
+
+数组里的操作按顺序执行。返回值也是一个数组，和传入的操作一一对应。第一条的结果是创建的 post 对象，后面两条是创建的关联记录。如果第二条 `postToTag.create` 失败了，第一条的 `post.create` 也会回滚，数据库回到事务开始前的状态。
+
+但这里有个明显的限制：你没法在操作之间加逻辑。比如"先检查 slug 是否重复，不重复才创建"——因为数组里的所有操作是预先定义好的，不能根据上一步的结果决定下一步做什么。
+
+### 适合的场景
+
+批量事务适合操作之间没有条件依赖的情况：创建订单同时扣减库存、插入用户记录同时初始化用户配置、批量更新多条记录。操作顺序固定、逻辑确定，用数组形式最简洁。
+
+一个实际案例——发布文章同时更新用户的文章计数缓存：
+
+```typescript
+const [post, _updateResult] = await prisma.$transaction([
+  prisma.post.create({
+    data: {
+      title: "事务测试",
+      slug: "tx-test",
+      content: "...",
+      status: "PUBLISHED",
+      publishedAt: new Date(),
+      author: { connect: { id: 1 } },
+    },
+  }),
+  prisma.user.update({
+    where: { id: 1 },
+    data: { postCount: { increment: 1 } },
+  }),
+]);
+```
+
+两个操作互不依赖，只是需要原子性保证，数组形式刚好。
+
+## 交互式事务：`$transaction(async (tx) => { ... })`
+
+### 可以在中间加逻辑判断
+
+当操作之间有条件依赖时，需要交互式事务。它接收一个回调函数，回调参数 `tx` 是事务内的 Prisma Client：
+
+```typescript
+const post = await prisma.$transaction(async (tx) => {
+  // 第一步：检查 slug 是否重复
+  const existing = await tx.post.findUnique({
+    where: { slug: "transactions-middleware" },
+  });
+
+  if (existing) {
+    throw new Error("slug 已被占用");
+  }
+
+  // 第二步：创建文章
+  const newPost = await tx.post.create({
+    data: {
+      title: "事务与中间件",
+      slug: "transactions-middleware",
+      content: "正文内容...",
+      status: "PUBLISHED",
+      publishedAt: new Date(),
+      author: { connect: { id: 1 } },
+    },
+  });
+
+  // 第三步：关联标签
+  for (const tagId of [1, 2, 3]) {
+    await tx.postToTag.create({
+      data: { postId: newPost.id, tagId },
+    });
+  }
+
+  return newPost;
+});
+```
+
+回调里的每一步都可以使用 `await`，可以根据上一步的结果决定下一步。任何一步抛出异常，整个事务回滚。
+
+### tx 和 prisma 的区别
+
+`tx` 是事务内的客户端实例。它的 API 和 `prisma` 完全一样——`tx.post.create`、`tx.user.findUnique`，你能用 `prisma` 做的事 `tx` 都能做。区别在于 `tx` 上的所有操作共享同一个数据库连接和事务上下文。
+
+关键规则：事务内的操作必须全部使用 `tx`，不能混用 `prisma`。下面的写法是错误的：
+
+```typescript
+// 错误示范：事务内混用了 prisma
+await prisma.$transaction(async (tx) => {
+  const post = await tx.post.create({
+    data: {
+      /* ... */
+    },
+  });
+  // 这里用了 prisma 而不是 tx，不在事务范围内
+  await prisma.postToTag.create({
+    data: { postId: post.id, tagId: 1 },
+  });
+});
+```
+
+第二条操作走的是独立的数据库连接，不受事务保护。如果 `postToTag.create` 失败了，`tx` 里的 `post.create` 会回滚，但第二条操作的连接不在事务里，结果不可预期。简单记：事务回调内只用 `tx`，把 `prisma` 当不存在。
+
+### 注册用户的完整检查
+
+交互式事务的另一个典型场景——注册用户时检查用户名和邮箱是否已被占用，都不存在才创建：
+
+```typescript
+async function register(data: RegisterInput) {
+  return prisma.$transaction(async (tx) => {
+    // 检查用户名
+    const byUsername = await tx.user.findUnique({
+      where: { username: data.username },
+    });
+    if (byUsername) {
+      throw new ConflictError("用户名已被注册");
+    }
+
+    // 检查邮箱
+    const byEmail = await tx.user.findUnique({
+      where: { email: data.email },
+    });
+    if (byEmail) {
+      throw new ConflictError("邮箱已被注册");
+    }
+
+    // 创建用户
+    const user = await tx.user.create({
+      data: {
+        username: data.username,
+        email: data.email,
+        passwordHash: hashPassword(data.password),
+        name: data.name,
+      },
+    });
+
+    return user;
+  });
+}
+```
+
+两个检查和一个创建在同一个事务里。如果两个人同时用同一个用户名注册，事务的隔离级别会保证只有一个成功。这一点用批量事务做不到，因为你没法在中间插入 `if` 判断。
+
+## 隔离级别与超时配置
+
+### 超时参数
+
+交互式事务默认超时 5 秒。如果你的业务逻辑需要更长的执行时间（比如在事务内做复杂计算），可以调整 `maxWait` 和 `timeout`：
+
+```typescript
+await prisma.$transaction(
+  async (tx) => {
+    // 长时间运行的事务逻辑
+  },
+  {
+    maxWait: 10000, // 最多等 10 秒获取数据库连接
+    timeout: 30000, // 事务最多运行 30 秒
+  }
+);
+```
+
+`maxWait` 是等待获取数据库连接的超时时间，连接池满了就得排队。`timeout` 是事务本身的执行超时。两个参数独立控制，不要混淆。
+
+### 隔离级别
+
+Prisma 支持设置事务的隔离级别，取决于底层数据库：
+
+```typescript
+import { Prisma } from "@prisma/client";
+
+await prisma.$transaction(
+  async (tx) => {
+    const post = await tx.post.findUnique({ where: { id: 1 } });
+    await tx.post.update({
+      where: { id: 1 },
+      data: { viewCount: post.viewCount + 1 },
+    });
+  },
+  {
+    isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
+  }
+);
+```
+
+可选的隔离级别包括 `ReadUncommitted`、`ReadCommitted`、`RepeatableRead`、`Serializable`。隔离级别越高，并发安全性越好，但性能开销也越大。大多数业务场景用数据库默认级别（PostgreSQL 默认 `ReadCommitted`，MySQL 默认 `RepeatableRead`）就够了，不需要显式设置。只有在对数据一致性要求极高的场景（比如库存扣减、余额操作）才考虑提升隔离级别。
+
+## Middleware：$use 拦截查询
+
+### 查询日志中间件
+
+Prisma 的 `$use` 方法可以在每个查询前后插入自定义逻辑。最常用的场景是记录查询耗时：
+
+```typescript
+prisma.$use(async (params, next) => {
+  const before = Date.now();
+  const result = await next(params);
+  const after = Date.now();
+  const duration = after - before;
+
+  console.log(`[${params.model}.${params.action}] ${duration}ms`);
+
+  return result;
+});
+```
+
+每次执行 Prisma 查询时，这段代码都会打印模型名、操作类型和耗时。输出类似：
+
+```
+[Post.findMany] 12ms
+[PostToTag.create] 3ms
+[User.findUnique] 5ms
+```
+
+`params` 对象包含当前查询的完整信息：`params.model` 是模型名（Post、User 等），`params.action` 是操作类型（findMany、create 等），`params.args` 是查询参数。`next(params)` 执行实际的查询，返回结果后你可以做后处理。
+
+### 慢查询检测
+
+在日志基础上加一个阈值判断，就能自动检测慢查询：
+
+```typescript
+const SLOW_QUERY_THRESHOLD = 500; // 500ms
+
+prisma.$use(async (params, next) => {
+  const before = Date.now();
+  const result = await next(params);
+  const duration = Date.now() - before;
+
+  if (duration > SLOW_QUERY_THRESHOLD) {
+    console.warn(
+      `慢查询警告: ${params.model}.${params.action} 耗时 ${duration}ms`,
+      JSON.stringify(params.args)
+    );
+  }
+
+  return result;
+});
+```
+
+超过阈值的查询会打印警告信息，包含完整的查询参数。这在开发和测试环境很有用，帮你提前发现缺少索引、返回字段过多、关联层级太深等问题。
+
+生产环境要注意两点：日志中间件会增加每次查询的开销（虽然很小），建议只在开发和测试环境启用；`params.args` 里可能包含敏感数据（用户密码、个人信息），不要直接打印到日志里。
+
+## $extends：更强大的扩展方式
+
+### 实现软删除过滤
+
+Prisma 从 4.7 版本开始推荐用 `$extends` 替代 `$use`。一个典型的应用场景是软删除——所有查询自动过滤掉 `deletedAt` 不为 null 的记录。
+
+首先在 Schema 里给 Post 模型加上 `deletedAt` 字段：
+
+```prisma
+model Post {
+  id         Int       @id @default(autoincrement())
+  title      String
+  content    String
+  deletedAt  DateTime?
+  // ... 其他字段
+
+  @@map("posts")
+}
+```
+
+然后用 `$extends` 定义一个扩展客户端：
+
+```typescript
+const prisma = new PrismaClient().$extends({
+  name: "softDelete",
+  query: {
+    post: {
+      findMany({ args, query }) {
+        args.where = { ...args.where, deletedAt: null };
+        return query(args);
+      },
+      findFirst({ args, query }) {
+        args.where = { ...args.where, deletedAt: null };
+        return query(args);
+      },
+      findUnique({ args, query }) {
+        args.where = { ...args.where, deletedAt: null };
+        return query(args);
+      },
+      count({ args, query }) {
+        args.where = { ...args.where, deletedAt: null };
+        return query(args);
+      },
+    },
+  },
+});
+```
+
+之后所有通过这个扩展客户端执行的查询，都会自动加上 `deletedAt: null` 的过滤条件。业务代码里不需要手动写 `where: { deletedAt: null }`，也不怕漏写。
+
+删除操作也改成软删除：
+
+```typescript
+// 不再是真的删，而是设置 deletedAt
+await prisma.post.update({
+  where: { id: 1 },
+  data: { deletedAt: new Date() },
+});
+```
+
+### $extends 和 $use 的关键区别
+
+`$use` 是全局中间件，作用于所有模型和所有操作，类型信息会丢失——`params` 的类型是泛化的，你拿不到具体的查询参数类型。`$extends` 是按模型按操作注册的，类型系统完全保留。上面的 `post.findMany` 回调里，`args` 的类型就是 `PostFindManyArgs`，编辑器有完整的自动补全。
+
+另一个区别是 `$extends` 返回一个新的客户端实例，原始 `prisma` 不受影响。这意味着你可以在同一个项目里同时使用有扩展和无扩展的客户端：
+
+```typescript
+// 原始客户端，能看到已删除的记录
+const rawPrisma = new PrismaClient();
+
+// 扩展客户端，自动过滤已删除记录
+const softDeletePrisma = rawPrisma.$extends({
+  /* ... */
+});
+
+// 管理后台需要看到所有文章（包括已删除的）
+const allPosts = await rawPrisma.post.findMany();
+
+// 前台只展示未删除的
+const visiblePosts = await softDeletePrisma.post.findMany();
+```
+
+### $extends 的其他用途
+
+除了软删除，`$extends` 还能做很多事。比如给所有查询结果加计算字段：
+
+```typescript
+const extendedPrisma = prisma.$extends({
+  result: {
+    post: {
+      readingTime: {
+        needs: { content: true },
+        compute(post) {
+          const wordCount = post.content.length;
+          return Math.ceil(wordCount / 500); // 假设每分钟 500 字
+        },
+      },
+    },
+  },
+});
+
+const posts = await extendedPrisma.post.findMany();
+// posts[0].readingTime 是一个数字，类型安全
+```
+
+`readingTime` 不是数据库字段，而是在查询时动态计算的。`needs` 声明依赖哪些字段，`compute` 定义计算逻辑。返回的 TypeScript 类型自动包含这个虚拟字段。
+
+## 实战：完整的"创建文章"函数
+
+把前面学的东西组合起来，写一个健壮的发布文章函数：
+
+```typescript
+import { PrismaClient, Prisma } from "@prisma/client";
+
+const prisma = new PrismaClient();
+
+interface CreatePostInput {
+  title: string;
+  slug: string;
+  content: string;
+  excerpt?: string;
+  authorId: number;
+  tagIds: number[];
+}
+
+async function createPost(input: CreatePostInput) {
+  return prisma.$transaction(
+    async (tx) => {
+      // 1. 检查 slug 唯一性
+      const existing = await tx.post.findUnique({
+        where: { slug: input.slug },
+      });
+      if (existing) {
+        throw new Error(`slug "${input.slug}" 已被使用`);
+      }
+
+      // 2. 验证所有标签存在
+      const tags = await tx.tag.findMany({
+        where: { id: { in: input.tagIds } },
+      });
+      if (tags.length !== input.tagIds.length) {
+        const foundIds = tags.map((t) => t.id);
+        const missingIds = input.tagIds.filter((id) => !foundIds.includes(id));
+        throw new Error(`标签不存在: ${missingIds.join(", ")}`);
+      }
+
+      // 3. 创建文章并关联标签
+      const post = await tx.post.create({
+        data: {
+          title: input.title,
+          slug: input.slug,
+          content: input.content,
+          excerpt: input.excerpt ?? input.content.slice(0, 200),
+          status: "DRAFT",
+          author: { connect: { id: input.authorId } },
+          tags: {
+            create: input.tagIds.map((tagId) => ({
+              tag: { connect: { id: tagId } },
+            })),
+          },
+        },
+        include: {
+          author: { select: { id: true, name: true } },
+          tags: { include: { tag: true } },
+        },
+      });
+
+      return post;
+    },
+    {
+      maxWait: 5000,
+      timeout: 10000,
+    }
+  );
+}
+```
+
+这个函数做了三件事，全部在事务内完成：先检查 slug 唯一性，再验证标签是否存在，最后创建文章并关联标签。任何一步失败，前面的操作都会回滚。`include` 确保返回完整数据，调用方不需要再查一次。
+
+注意创建标签关联用的是嵌套 `create` 而不是循环 `tx.postToTag.create`——嵌套操作在事务内只生成一次 SQL，比循环多次调用效率更高。
+
+## Trade-off
+
+**事务的锁开销不要滥用。** 事务持有数据库连接和行锁，时间越长，阻塞其他请求的概率越高。批量事务适合简单操作，交互式事务适合有条件判断的场景，但都应该尽量短。不要在事务里做 HTTP 请求、发邮件、读写文件——这些和数据库无关的操作不应该锁住数据库连接。如果一个操作确实很长，考虑把数据库操作和外部操作分开，只在数据库操作部分使用事务。
+
+**$use 是旧 API，优先用 $extends。** `$use` 作为全局中间件，每个查询都会经过，缺乏细粒度控制。更关键的是类型安全问题——`$use` 的 `params` 类型是泛化的，编辑器帮不了你。`$extends` 按模型按操作注册，类型系统完整保留，还能返回独立的客户端实例。新项目应该直接用 `$extends`，已有项目逐步迁移。
+
+**软删除的代价。** 用 `$extends` 实现软删除很优雅，但它引入了隐式行为——`findMany` 不加任何 where 条件，返回的却不是全部记录。新加入团队的成员可能不知道这个过滤的存在，查数据时产生困惑。建议在项目文档里明确说明哪些模型启用了软删除、用了哪个扩展客户端，或者用命名区分（`softDeletePrisma` vs `rawPrisma`）。
+
+---
+
+事务保证了操作的原子性，中间件和扩展提供了全局拦截和增强查询的能力。但 Prisma 的类型安全优势远不止编译时检查字段名——下一篇来看看 Prisma Client 生成的类型到底有多精确，以及如何在业务层充分利用这些类型。

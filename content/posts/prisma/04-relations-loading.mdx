@@ -1,0 +1,390 @@
+---
+title: "04. 关联查询：include、select 与 N+1 问题"
+date: "2026-03-24"
+summary: "博客首页需要文章带作者名、详情页需要文章带标签和评论——用 include 和 select 高效加载关联数据，避开 N+1 陷阱。"
+tags: ["Prisma", "TypeScript"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 4
+---
+
+上一篇我们掌握了单表的 CRUD 操作——插文章、条件筛选、分页排序、字段选择，日常 80% 的场景够用了。
+
+但真实需求几乎总是跨表的。博客首页要展示文章标题加作者昵称，详情页要同时拿到文章内容、作者信息、标签列表和评论。如果每篇文章都单独查一次作者，10 篇文章就是 11 条 SQL，页面加载从 200ms 飙到 2000ms。
+
+Prisma 提供了 `include` 和 `select` 两种方式加载关联数据，今天就从这两个 API 入手，把跨表查询的常见模式和 N+1 陷阱一次性说清楚。
+
+## 用 include 加载关联数据
+
+### 基础用法：查文章带作者
+
+博客首页最简单的需求——文章列表，每篇带上作者信息：
+
+```typescript
+const posts = await prisma.post.findMany({
+  where: { status: "PUBLISHED" },
+  orderBy: { publishedAt: "desc" },
+  take: 10,
+  include: {
+    author: true,
+  },
+});
+```
+
+`include: { author: true }` 的意思是：除了 post 表的所有字段，把关联的 author 记录也一并加载。返回的结构是嵌套的：
+
+```typescript
+[
+  {
+    id: 1,
+    title: "Prisma 渐进式学习",
+    content: "...",
+    authorId: 1,
+    status: "PUBLISHED",
+    author: {
+      id: 1,
+      name: "老王",
+      email: "wang@example.com",
+      avatar: "/avatars/wang.jpg",
+      // ... users 表的全部字段
+    },
+  },
+  // ...
+];
+```
+
+注意返回结果里的 `author` 是一个完整对象，包含 users 表的所有字段。如果你只需要作者的昵称和头像，可以搭配 `select` 使用，后面会讲。
+
+### 嵌套加载：文章 + 作者 + 标签 + 评论
+
+详情页的需求更复杂，需要一次性加载多层关联：
+
+```typescript
+const post = await prisma.post.findUnique({
+  where: { id: 42 },
+  include: {
+    author: true,
+    tags: {
+      include: {
+        tag: true,
+      },
+    },
+    comments: {
+      include: {
+        author: true,
+      },
+    },
+  },
+});
+```
+
+这里发生了三层嵌套。`tags` 是多对多关系（通过中间表 `_PostToTag`），所以 `tags` 数组里的每个元素包含中间表字段和 `tag` 对象。`comments` 是一对多，每条评论又 `include` 了它的作者。
+
+返回的数据结构大致是：
+
+```typescript
+{
+  id: 42,
+  title: "Prisma 关联查询",
+  content: "正文内容...",
+  author: { id: 1, name: "老王", email: "wang@example.com" },
+  tags: [
+    { tag: { id: 1, name: "TypeScript", slug: "typescript" } },
+    { tag: { id: 2, name: "ORM", slug: "orm" } },
+  ],
+  comments: [
+    {
+      id: 101,
+      content: "写得清楚",
+      author: { id: 2, name: "小明" },
+    },
+  ],
+}
+```
+
+Prisma 底层会自动把这些查询合并成最高效的方式，不需要你手动拼 JOIN。
+
+### 过滤关联数据：只加载顶级评论
+
+评论系统通常支持嵌套回复。列表页可能只想展示顶级评论（没有父评论的），回复折叠起来。Prisma 支持在 `include` 里对关联数据做过滤和排序：
+
+```typescript
+const post = await prisma.post.findUnique({
+  where: { id: 42 },
+  include: {
+    comments: {
+      where: {
+        parentId: null,
+      },
+      orderBy: {
+        createdAt: "desc",
+      },
+      include: {
+        author: {
+          select: { id: true, name: true, avatar: true },
+        },
+      },
+    },
+  },
+});
+```
+
+这段查询做了三件事：只加载 `parentId` 为 null 的顶级评论，按创建时间倒序排列，每条评论只带作者的部分字段。`where`、`orderBy`、`include` 可以在同一层关联里组合使用，灵活度很高。
+
+需要注意一点：这里的 `where` 只过滤了关联数据，不影响主查询的结果。也就是说，即使这篇文章没有任何顶级评论，文章本身还是会被返回，只是 `comments` 数组为空。
+
+## select：精确控制返回字段
+
+### 只取需要的字段
+
+`include` 会返回主表和关联表的所有字段。但实际开发中，你很少需要全部字段。首页列表只要文章的 id、标题和作者的昵称就够了：
+
+```typescript
+const posts = await prisma.post.findMany({
+  where: { status: "PUBLISHED" },
+  orderBy: { publishedAt: "desc" },
+  take: 10,
+  select: {
+    id: true,
+    title: true,
+    publishedAt: true,
+    author: {
+      select: {
+        name: true,
+        avatar: true,
+      },
+    },
+  },
+});
+```
+
+返回的数据干净得多：
+
+```typescript
+[
+  {
+    id: 1,
+    title: "Prisma 渐进式学习",
+    publishedAt: new Date("2026-03-20"),
+    author: { name: "老王", avatar: "/avatars/wang.jpg" },
+  },
+  // ...
+];
+```
+
+和 `include` 不同，`select` 会替换默认的字段选择——你写了 `select`，主表就只返回你指定的字段。而 `include` 是在默认返回全部字段的基础上追加关联数据。
+
+### include 和 select 的本质区别
+
+这可能是新手最容易混淆的地方，一句话总结：
+
+- **include**：主表返回全部字段，额外加载关联数据。你不能在 `include` 里指定主表的字段。
+- **select**：完全控制返回什么，包括主表字段和关联数据。写了 `select`，主表不会自动返回全部字段。
+
+看一个对比。同样是查文章带作者：
+
+```typescript
+// include：主表全字段 + author 全字段
+const withInclude = await prisma.post.findFirst({
+  include: { author: true },
+});
+// 返回：{ id, title, content, authorId, status, createdAt, updatedAt,
+//         viewCount, publishedAt, author: { id, name, email, avatar, ... } }
+
+// select：只返回指定的字段
+const withSelect = await prisma.post.findFirst({
+  select: {
+    title: true,
+    author: { select: { name: true } },
+  },
+});
+// 返回：{ title: "Prisma 入门", author: { name: "老王" } }
+```
+
+### 什么时候用哪个
+
+简单原则：
+
+- 需要主表的全部字段，只是额外加载关联数据，用 `include`。开发阶段常用，写起来快。
+- 需要控制传输量，明确知道前端需要哪些字段，用 `select`。生产环境推荐，减少不必要的数据库传输。
+- `include` 和 `select` 不能同时用在同一层级。但可以在 `include` 的关联对象内部用 `select`（就像前面过滤评论那个例子）。
+
+## \_count：关联计数
+
+"这篇文章有几条评论？"、"这个作者发了多少篇文章？"——这类计数需求太常见了。Prisma 提供了 `_count` 来做关联聚合，不需要手动 GROUP BY：
+
+```typescript
+const posts = await prisma.post.findMany({
+  where: { status: "PUBLISHED" },
+  select: {
+    id: true,
+    title: true,
+    _count: {
+      select: {
+        comments: true,
+      },
+    },
+  },
+});
+```
+
+返回结果：
+
+```typescript
+[
+  { id: 1, title: "Prisma 入门", _count: { comments: 12 } },
+  { id: 2, title: "Schema 设计", _count: { comments: 5 } },
+  // ...
+];
+```
+
+`_count` 支持同时计数多个关联：
+
+```typescript
+const author = await prisma.user.findUnique({
+  where: { id: 1 },
+  select: {
+    name: true,
+    _count: {
+      select: {
+        posts: true,
+        comments: true,
+      },
+    },
+  },
+});
+// { name: "老王", _count: { posts: 23, comments: 47 } }
+```
+
+`_count` 还支持条件过滤。比如"只统计已发布文章的数量"：
+
+```typescript
+_count: {
+  select: {
+    posts: {
+      where: { status: "PUBLISHED" },
+    },
+  },
+},
+```
+
+这在管理后台做统计面板的时候特别好用，一条查询就能拿到各种维度的计数。
+
+## N+1 问题：性能杀手
+
+### 什么是 N+1
+
+来看一段有问题的代码。需求很简单：查 10 篇文章，每篇带上作者昵称。
+
+```typescript
+// 错误示范：N+1 查询
+const posts = await prisma.post.findMany({
+  where: { status: "PUBLISHED" },
+  take: 10,
+});
+
+for (const post of posts) {
+  // 每篇文章都查一次数据库
+  const author = await prisma.user.findUnique({
+    where: { id: post.authorId },
+  });
+  console.log(`${post.title} - ${author?.name}`);
+}
+```
+
+这段代码执行了多少条 SQL？1 条查文章列表 + 10 条查作者 = 11 条。文章数增加到 100 篇就是 101 条。这就是经典的 N+1 问题——1 次主查询 + N 次关联查询。
+
+在开发环境，11 条 SQL 查询可能只要 50ms，你觉得"还行"。上线后数据库和应用分机房部署，每次查询的网络延迟从 1ms 变成 20ms，11 次就是 220ms。如果有 50 篇文章，就是 1020ms。用户已经看到白屏了。
+
+### 用 include 一次解决
+
+把前面的代码改成 `include`：
+
+```typescript
+const posts = await prisma.post.findMany({
+  where: { status: "PUBLISHED" },
+  take: 10,
+  include: {
+    author: {
+      select: { name: true },
+    },
+  },
+});
+
+for (const post of posts) {
+  console.log(`${post.title} - ${post.author.name}`);
+}
+```
+
+Prisma 底层的策略是：先查 posts 拿到所有 `authorId`，然后用 `WHERE id IN (...)` 一次查回所有关联的 authors，最后在内存中组装。总共 2 条 SQL，不管你查 10 篇还是 100 篇文章。
+
+### 怎么检测 N+1
+
+最直接的方法是开启 Prisma 的查询日志，观察实际执行的 SQL 数量：
+
+```typescript
+const prisma = new PrismaClient({
+  log: [
+    {
+      emit: "event",
+      level: "query",
+    },
+  ],
+});
+
+prisma.$on("query", (e) => {
+  console.log(`Query: ${e.query}`);
+  console.log(`Duration: ${e.duration}ms`);
+});
+```
+
+开发阶段把这个打开，如果看到一个列表请求产生了两位数以上的 SQL 查询，大概率就是 N+1 了。
+
+一个实用的经验法则：如果你的代码里出现了"先查列表，再循环查关联"的模式，立刻警觉。99% 的情况应该用 `include` 替换。
+
+## 嵌套太深怎么办
+
+`include` 支持无限层级嵌套，但并不意味着你应该这么做。三层以上的关联加载通常会导致两个问题：
+
+**查询性能下降。** Prisma 的关联加载策略是分批查询。每多一层关联就多一轮查询。如果第一层查了 20 篇文章，第二层每篇有 5 条评论，第三层每条评论有 1 个作者，查询次数会累积。虽然不是 N+1 那么夸张，但也比一条精心设计的 JOIN 慢。
+
+**返回数据膨胀。** 一篇文章有 50 条评论，每条评论关联一个作者对象（包含 email、bio 等你不一定需要的字段），传输量会远超预期。
+
+一个务实的做法：超过三层的关联，拆成多次独立查询。
+
+```typescript
+// 查文章 + 作者 + 标签（两层）
+const post = await prisma.post.findUnique({
+  where: { id: 42 },
+  include: {
+    author: { select: { name: true, avatar: true } },
+    tags: { include: { tag: { select: { name: true, slug: true } } } },
+  },
+});
+
+// 评论单独查，带分页
+const comments = await prisma.comment.findMany({
+  where: { postId: 42, parentId: null },
+  include: {
+    author: { select: { name: true, avatar: true } },
+  },
+  orderBy: { createdAt: "desc" },
+  take: 20,
+});
+```
+
+拆成两次查询，代码更清晰，也更容易对评论做分页。详情页的场景下，文章信息和评论分属不同的 UI 区块，分开请求反而是合理的架构。
+
+## Trade-off 分析
+
+**include 的便利性和代价。** `include` 写起来最简单，一行 `{ author: true }` 就能加载关联数据。代价是你无法控制主表返回哪些字段，所有列都会被查出来。在开发阶段这无所谓，但生产环境的列表页，一篇文章的内容可能有几十 KB，查 20 篇就白白传输了 1MB 的 content 字段。用 `select` 可以精确控制，但写起来更繁琐，每次加字段都要记得更新查询。
+
+**N+1 的隐蔽性。** N+1 问题在开发环境几乎不可感知——数据量小，数据库和应用在同一台机器上。到了生产环境才暴露。养成习惯：凡是写循环里查数据库的代码，立刻想想能不能用 `include` 替代。开启 query 日志作为开发阶段的常规检查。
+
+**嵌套深度和查询拆分。** Prisma 的 `include` 可以无限嵌套，但超过三层就要考虑拆分了。拆分查询的代价是多一次数据库往返，换来的是更可控的查询性能、更清晰的代码结构、以及对每部分数据独立分页的能力。详情页这种场景，文章内容和评论列表本来就适合分开加载。
+
+**\_count 的性能。** `_count` 用起来方便，但它的底层实现是 `SELECT COUNT(*)` 子查询。如果你在 findMany 里同时加载 20 篇文章的 `_count`，Prisma 会为每篇文章执行一次 COUNT 子查询（或者用一个 LEFT JOIN 加 GROUP BY）。对于大数据量表（评论超过 10 万条），这个 COUNT 可能变慢。如果计数场景对性能极其敏感，考虑用单独的聚合查询或者缓存计数结果。
+
+下一篇要解决的问题是：Schema 在开发过程中一定会变。上线后要加一个封面图字段、评论要加审核状态，怎么安全地修改数据库结构而不丢数据？这就是 Prisma 迁移系统的用武之地。

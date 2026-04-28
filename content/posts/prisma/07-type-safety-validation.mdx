@@ -1,0 +1,460 @@
+---
+title: "07. 类型安全与 Zod 验证"
+date: "2026-03-27"
+summary: "用户注册接口从表单提交到数据库写入，用 Prisma 生成类型 + Zod 运行时验证实现端到端类型安全。"
+tags: ["Prisma", "TypeScript"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 7
+---
+
+周五下午，前端同事在注册表单上加了一个 `nickname` 字段，改完表单、改完 API 调用，发到测试环境一提交——接口返回 500。后端日志显示 `PrismaClientValidationError: Unknown field 'nickname'`。数据库里压根没有这个列，但 TypeScript 编译没报错，因为后端的注册接口用 `any` 接收请求体，Prisma Client 的类型检查形同虚设。
+
+前端改了字段、后端没同步、运行时才炸，这个场景在实际项目中反复发生。TypeScript 的编译时类型安全覆盖不到"来自用户输入的数据"，而 Prisma 生成的类型只能约束你传给数据库的参数。中间这段空白——从 HTTP 请求到数据库调用之间——需要一个运行时验证层来补全。这篇就来讲怎么用 Prisma 的生成类型配合 Zod，把这条链路焊死。
+
+## Prisma 自动生成了哪些类型
+
+运行 `npx prisma generate` 之后，Prisma Client 里携带了大量可以直接使用的类型。理解这些类型是做好类型安全的基础。
+
+### 模型类型和操作输入类型
+
+最基础的四个类型：
+
+```typescript
+import { Prisma } from "@prisma/client";
+
+// User 模型本身——对应数据库一条记录的完整形状
+type UserRecord = {
+  id: number;
+  email: string;
+  username: string;
+  passwordHash: string;
+  displayName: string | null;
+  bio: string | null;
+  avatarUrl: string | null;
+  role: "USER" | "ADMIN";
+  deletedAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+};
+
+// 创建时的输入类型——必填字段必须有，可空字段可以不传
+type CreateInput = Prisma.UserCreateInput;
+
+// 更新时的输入类型——所有字段都变成可选的
+type UpdateInput = Prisma.UserUpdateInput;
+
+// 查询时的 where 条件类型——支持各种操作符
+type WhereInput = Prisma.UserWhereInput;
+```
+
+`User` 是记录的完整形状，字段类型和 schema.prisma 一一对应。`UserCreateInput` 是创建时可以传入的字段，必填字段必须出现，关联字段用 `connect` 或 `create` 语法。`UserUpdateInput` 所有字段都变成可选的，只传你要改的。`UserWhereInput` 支持各种过滤操作符（`contains`、`gte`、`in` 等）。
+
+这些类型最直接的用法是给函数参数加类型注解。当你把 `Prisma.UserCreateInput` 写在函数签名上，TypeScript 会强制你传入正确的字段组合，漏字段或者类型不匹配都直接报错。
+
+### 从查询结果推断类型
+
+有时候你不需要手写类型，让 TypeScript 从查询语句本身推断就行：
+
+```typescript
+// typeof 自动推断——知道 user 是 User | null
+const user = await prisma.user.findUnique({
+  where: { id: 1 },
+});
+
+// 推断出的类型是 { id: number; title: string; author: { name: string | null } }
+const post = await prisma.post.findUnique({
+  where: { id: 1 },
+  select: {
+    id: true,
+    title: true,
+    author: { select: { name: true } },
+  },
+});
+```
+
+第一种情况，`user` 的类型是完整的 `User | null`。第二种更有意思——你用 `select` 挑了几个字段，TypeScript 的返回类型精确到只包含你选的那些字段。你选了 `id` 和 `title`，类型里就只有这两个，`content` 连出现的资格都没有。这就是 Prisma 类型系统最强大的地方：查询决定类型，类型随查询变化。
+
+### 关联查询的精确类型
+
+当查询涉及 `include` 时，类型推断变得更有用也更复杂。Prisma 提供了 `UserGetPayload` 来精确描述带关联的查询结果：
+
+```typescript
+// 精确描述"查用户同时带上他所有文章"的返回类型
+type UserWithPosts = Prisma.UserGetPayload<{
+  include: { posts: true };
+}>;
+
+// 手动构造更复杂的载荷类型
+type PostWithAuthorAndTags = Prisma.PostGetPayload<{
+  include: {
+    author: { select: { id: true; name: true; avatarUrl: true } };
+    tags: { include: { tag: true } };
+  };
+}>;
+```
+
+`UserGetPayload` 接受一个泛型参数，内容和你在 `findUnique` 或 `findMany` 里写的 `include` / `select` 完全一样。返回的类型也是精确匹配的。这在你需要把查询结果传给其他函数时特别有用——不用手写返回类型，从查询本身派生就行。
+
+另一种方式是用 `Prisma.Result`：
+
+```typescript
+type FindFirstResult = Prisma.Result<
+  typeof prisma.user,
+  { include: { posts: true } },
+  "findFirst"
+>;
+```
+
+这种方式从"操作 + 参数"的角度推断结果类型。两种写法效果一样，`GetPayload` 更直观，`Result` 更灵活（可以针对不同查询方法推断）。
+
+## 编译时安全不够——运行时数据没有类型
+
+Prisma 的类型系统再强，也只覆盖了"TypeScript 代码到数据库"这段路。问题在于，数据在进入你的代码之前就已经是 `any` 了。
+
+```typescript
+// Express 风格的接口
+app.post("/api/register", async (req, res) => {
+  // req.body 的类型是 any
+  // 用户传了什么、类型对不对、有没有多余字段——一概不知
+  const user = await prisma.user.create({
+    data: {
+      email: req.body.email, // 可能是 undefined
+      username: req.body.username, // 可能是数字 123
+      passwordHash: hash(req.body.password),
+    },
+  });
+  res.json(user);
+});
+```
+
+这段代码 TypeScript 编译能过，但运行时可能炸：`email` 没传会报 `null constraint violation`，`username` 传了数字 Prisma 会自动转成字符串（不是你想要的行为），更危险的是 `user` 对象直接 `res.json` 出去，`passwordHash` 暴露在响应里。
+
+编译时类型安全解决不了这些问题，因为 `req.body` 从 HTTP 请求解析而来，TypeScript 对它的类型假定完全不可信。你需要运行时验证——在数据进入业务逻辑之前，校验它的结构、类型和业务规则。
+
+## Zod 集成：从手动写 Schema 开始
+
+Zod 是 TypeScript 生态里最主流的运行时校验库。它的核心能力是：定义一个 Schema，用这个 Schema 校验运行时数据，校验通过后返回的数据带有精确的 TypeScript 类型。
+
+### 用户注册的 Zod Schema
+
+回顾第2篇定义的 User 模型，注册接口需要校验以下字段：
+
+```typescript
+import { z } from "zod";
+
+const registerSchema = z.object({
+  email: z.string().email("邮箱格式不正确").max(255),
+  username: z
+    .string()
+    .min(3, "用户名至少 3 个字符")
+    .max(50)
+    .regex(/^[a-zA-Z0-9_]+$/, "用户名只能包含字母、数字和下划线"),
+  password: z
+    .string()
+    .min(8, "密码至少 8 个字符")
+    .regex(/[A-Z]/, "密码需要包含大写字母")
+    .regex(/[0-9]/, "密码需要包含数字"),
+  displayName: z.string().max(100).optional(),
+});
+```
+
+注意 Schema 和 Prisma 模型的对应关系。`email` 在 Prisma 里是 `String @unique @db.VarChar(255)`，Zod 里用 `.email()` 校验格式、`.max(255)` 匹配数据库长度。`username` 在 Prisma 里是 `String @unique @db.VarChar(50)`，Zod 里限制长度和字符集。`password` 不在 Prisma 模型里直接出现（模型里是 `passwordHash`），所以 Zod 校验的是原始密码的强度规则，传给 Prisma 时才做哈希。`displayName` 在 Prisma 里是 `String?`，Zod 里对应 `.optional()`。
+
+这种手动对齐不是多余的。Zod Schema 承担的是"用户输入应该长什么样"，Prisma 类型约束的是"数据库能接受什么"。两者关注的层面不同：Zod 关心邮箱格式和密码强度，Prisma 关心字段类型和 nullable。中间的转换由你的业务代码负责——把 `password` 哈希成 `passwordHash`，把 `displayName` 映射到正确的列。
+
+### 为什么不自动生成 Zod Schema
+
+社区有 `prisma-zod-generator` 这类工具，可以扫描 schema.prisma 自动生成 Zod Schema。看起来省事，但有几个实际问题：
+
+第一，生成的 Schema 和 Prisma 模型是 1:1 映射的，它不知道你的业务规则。自动生成的 `email` Schema 只是 `z.string()`，不会加 `.email()` 校验；自动生成的 `passwordHash` Schema 对注册接口毫无意义——用户提交的是原始密码，不是哈希值。
+
+第二，同一个 Prisma 模型在不同接口的校验规则不同。注册时的 username 允许 3-50 个字符，更新个人资料时可能允许改 displayName 但不允许改 username。自动生成的 Schema 只有一份，你需要手动拆分或者覆盖，反而增加复杂度。
+
+第三，自动生成引入了另一个构建步骤和依赖。每次改 schema.prisma 都得重新生成 Zod Schema，维护成本和 Prisma Client 的 generate 是双倍的。
+
+手动写 Schema 确实需要对照 Prisma 模型逐字段对齐，但这也逼着你在写每个接口时思考"这个接口到底接受什么字段"。一旦写好，后续改 Prisma 模型时 TypeScript 会在所有引用处报类型不匹配的错误——这正是类型安全的价值。
+
+## Hono + Zod 验证中间件
+
+手动写 Schema 之后，怎么在接口里优雅地使用它？Hono 框架的 `zValidator` 中间件是最干净的方案之一。
+
+### zValidator 的工作方式
+
+```typescript
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+
+const app = new Hono();
+
+app.post("/api/register", zValidator("json", registerSchema), async (c) => {
+  // 验证通过后，c.req.valid("json") 的类型是从 registerSchema 推导出来的
+  const body = c.req.valid("json");
+  // body 的类型: { email: string; username: string; password: string; displayName?: string }
+
+  // 密码哈希
+  const passwordHash = await bcrypt.hash(body.password, 10);
+
+  // 创建用户
+  const user = await prisma.user.create({
+    data: {
+      email: body.email,
+      username: body.username,
+      passwordHash,
+      displayName: body.displayName ?? null,
+    },
+  });
+
+  return c.json({ id: user.id, username: user.username }, 201);
+});
+```
+
+`zValidator("json", registerSchema)` 做了三件事：第一，从请求体解析 JSON；第二，用 `registerSchema.parse()` 校验数据结构；第三，校验失败自动返回 400 状态码和错误详情，校验通过后 `c.req.valid("json")` 返回带有精确类型的数据。
+
+前端收到验证失败的响应大概是这个样子：
+
+```json
+{
+  "success": false,
+  "error": {
+    "issues": [
+      {
+        "path": ["email"],
+        "message": "邮箱格式不正确"
+      },
+      {
+        "path": ["password"],
+        "message": "密码需要包含大写字母"
+      }
+    ]
+  }
+}
+```
+
+`zValidator` 校验失败时直接中断请求处理，不会进入你的业务逻辑。这意味着你不需要在业务代码里写任何防御性校验——`c.req.valid("json")` 拿到的数据一定是合法的。
+
+### 自定义错误响应格式
+
+默认的错误格式包含 Zod 的完整 issue 列表，直接暴露给前端可能不够友好。可以用 `zValidator` 的第三个参数自定义错误处理：
+
+```typescript
+app.post(
+  "/api/register",
+  zValidator("json", registerSchema, (result, c) => {
+    if (!result.success) {
+      // 把 Zod 的 issue 列表转成 { field: string; message: string }[] 的格式
+      const errors = result.error.issues.map((issue) => ({
+        field: issue.path.join("."),
+        message: issue.message,
+      }));
+      return c.json({ success: false, errors }, 400);
+    }
+  }),
+  async (c) => {
+    const body = c.req.valid("json");
+    // ...
+  }
+);
+```
+
+这样前端拿到的错误就是干净的 `{ field, message }` 数组，可以直接用来在表单字段下面显示错误提示。
+
+## 完整的用户注册接口
+
+把前面的零散代码拼成一个完整的、可以直接运行的接口：
+
+```typescript
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+import { PrismaClient } from "@prisma/client";
+import bcrypt from "bcryptjs";
+
+const prisma = new PrismaClient();
+const app = new Hono();
+
+const registerSchema = z.object({
+  email: z.string().email().max(255),
+  username: z
+    .string()
+    .min(3)
+    .max(50)
+    .regex(/^[a-zA-Z0-9_]+$/),
+  password: z.string().min(8).regex(/[A-Z]/).regex(/[0-9]/),
+  displayName: z.string().max(100).optional(),
+});
+
+app.post(
+  "/api/register",
+  zValidator("json", registerSchema, (result, c) => {
+    if (!result.success) {
+      const errors = result.error.issues.map((issue) => ({
+        field: issue.path.join("."),
+        message: issue.message,
+      }));
+      return c.json({ success: false, errors }, 400);
+    }
+  }),
+  async (c) => {
+    const { email, username, password, displayName } = c.req.valid("json");
+
+    // 检查 email 和 username 是否已被占用
+    const existing = await prisma.user.findFirst({
+      where: {
+        OR: [{ email }, { username }],
+      },
+      select: { email: true, username: true },
+    });
+
+    if (existing) {
+      const field = existing.email === email ? "email" : "username";
+      return c.json(
+        { success: false, errors: [{ field, message: "已被注册" }] },
+        409
+      );
+    }
+
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    const user = await prisma.user.create({
+      data: { email, username, passwordHash, displayName: displayName ?? null },
+      select: { id: true, email: true, username: true, displayName: true },
+    });
+
+    return c.json({ success: true, data: user }, 201);
+  }
+);
+```
+
+这段代码里的类型安全链路是这样的：`registerSchema` 校验请求体（运行时），校验通过后 `c.req.valid("json")` 提供精确类型（编译时），`prisma.user.create` 的 `data` 参数接受 `Prisma.UserCreateInput`（编译时），`select` 控制返回哪些字段（编译时），最终 `c.json` 返回的响应数据类型也是精确推导的。
+
+值得注意的是 `select` 的使用。创建用户后返回给前端的数据通过 `select` 精确控制——只有 `id`、`email`、`username`、`displayName` 四个字段，`passwordHash`、`deletedAt`、`role` 这些敏感或内部字段不会泄露到响应中。这不是"忘了就泄露"的约定，而是 TypeScript 类型层面的保证——你不在 `select` 里写 `passwordHash`，这个字段在返回对象的类型里就不存在。
+
+## API 响应类型：从 Prisma 类型推导
+
+接口写好了，前端怎么知道返回的数据长什么样？最稳的做法是从 Prisma 查询推导响应类型，而不是单独维护一个 interface。
+
+```typescript
+// 定义"用户公开信息"的类型——直接从 select 推导
+type UserPublic = Prisma.UserGetPayload<{
+  select: {
+    id: true;
+    email: true;
+    username: true;
+    displayName: true;
+    avatarUrl: true;
+    bio: true;
+    createdAt: true;
+  };
+}>;
+
+// 用在接口签名上
+function formatUserResponse(user: UserPublic) {
+  return {
+    id: user.id,
+    username: user.username,
+    displayName: user.displayName,
+    avatar: user.avatarUrl,
+    bio: user.bio,
+    joinedAt: user.createdAt.toISOString(),
+  };
+}
+```
+
+`UserPublic` 的定义和实际查询的 `select` 保持完全一致。如果你改了查询的 `select` 但忘了改类型定义，TypeScript 会报错。反过来，如果你改了类型定义，对应的查询代码也会标红——因为 `GetPayload` 推导出来的类型和你的定义对不上。
+
+这种"单一真相来源"的模式消除了一个常见的 bug 来源：Prisma 查询返回的字段和前端期望的字段不一致。在传统开发中，后端可能改了查询加了新字段但没更新接口文档，前端不知道新字段的存在。用 Prisma 类型推导，改了查询就必须更新类型，前端拿到的类型定义也跟着变。
+
+## 前后端共享类型：Monorepo 场景
+
+如果你的项目是 Monorepo 结构（比如 Turborepo 或 pnpm workspace），前后端可以共享 Prisma 生成的类型和 Zod Schema：
+
+```
+packages/
+  database/
+    prisma/
+      schema.prisma
+    src/
+      client.ts       <- 导出 PrismaClient 实例
+      types.ts        <- 导出 Prisma 类型别名
+      schemas/
+        user.ts       <- 导出用户相关的 Zod Schema
+        post.ts       <- 导出文章相关的 Zod Schema
+apps/
+  web/                <- 前端 (Next.js / React)
+  api/                <- 后端 (Hono)
+```
+
+`packages/database/src/schemas/user.ts` 里导出注册和更新的 Zod Schema：
+
+```typescript
+import { z } from "zod";
+
+// 注册接口的校验规则
+export const registerSchema = z.object({
+  email: z.string().email().max(255),
+  username: z
+    .string()
+    .min(3)
+    .max(50)
+    .regex(/^[a-zA-Z0-9_]+$/),
+  password: z.string().min(8).regex(/[A-Z]/).regex(/[0-9]/),
+  displayName: z.string().max(100).optional(),
+});
+
+// 从 Schema 推导 TypeScript 类型，前端也可以用
+export type RegisterInput = z.infer<typeof registerSchema>;
+
+// 更新个人资料的校验规则——和注册不同，这里没有 password
+export const updateProfileSchema = z.object({
+  displayName: z.string().max(100).optional(),
+  bio: z.string().max(1000).optional(),
+  avatarUrl: z.string().url().max(500).optional(),
+});
+```
+
+前端代码直接引用：
+
+```typescript
+import type { RegisterInput } from "@repo/database/schemas/user";
+import { registerSchema } from "@repo/database/schemas/user";
+
+// 前端表单提交前也可以用同一个 Schema 做预校验
+function handleSubmit(formData: RegisterInput) {
+  const result = registerSchema.safeParse(formData);
+  if (!result.success) {
+    // 表单还没提交就能显示校验错误
+    showFormErrors(result.error.issues);
+    return;
+  }
+  // 提交到后端
+  fetch("/api/register", {
+    method: "POST",
+    body: JSON.stringify(result.data),
+  });
+}
+```
+
+同一个 Schema，前端用来做表单预校验，后端用来做请求体验证。改一个地方，两端同时更新。前端甚至不需要知道后端用的是 Prisma 还是 TypeORM——它只关心 Zod Schema 定义的输入输出契约。
+
+但 Monorepo 共享类型也有成本。你需要配置 workspace 的构建和类型路径，确保 `@prisma/client` 的 generate 在前后端构建之前完成。Turborepo 的 `dependsOn: ["^build"]` 配置可以处理这个依赖顺序。如果你用的是独立仓库（前后端分开部署），共享类型需要发布到 npm 私有包或者用 Git submodule，复杂度会明显上升。
+
+## Trade-off
+
+**类型安全的前期搭建成本不低。** 你要为每个接口定义 Zod Schema、在 Hono 里配置 zValidator、用 Prisma 的 GetPayload 派生响应类型、在 Monorepo 里配置类型导出路径。一个注册接口可能要多写 50 行"类型相关"的代码。这在前期的确拖慢了开发速度。
+
+但这个成本是一次性的。等 Schema 写好、中间件配好、类型推导链路跑通之后，后续的每个接口只是重复同样的模式。更关键的是，当你改了一个字段类型（比如把 `username` 的最大长度从 50 改成 100），TypeScript 编译器会在 Zod Schema、Prisma 查询、API 响应类型、前端表单校验——所有引用处同时报错。这种"改一处、全链路感知"的能力，在项目变大之后省下的调试时间远超前期投入。
+
+**手动对齐 Zod Schema 和 Prisma 模型是维护负担。** 每次 schema.prisma 改了字段，你都得记得去更新对应的 Zod Schema。漏了就是运行时漏洞。自动生成工具（prisma-zod-generator）可以减轻这个负担，但前面说过，它生成的 Schema 和业务规则有差距。折中方案是：用自动生成作为起点，然后在业务层覆盖和扩展。这样你既有基础字段的自动同步，又有业务规则的精确控制。
+
+**Zod 的运行时校验有性能开销。** 一个复杂对象的 parse 通常在 0.1-1ms 之间。对于绝大多数接口来说可以忽略不计，但如果你在高吞吐场景下（每秒几千次请求），这个开销会累积。如果性能是硬约束，可以考虑在热路径上用更轻量的校验（比如手写 if-else 检查关键字段），Zod 用在写入接口和对外 API 上。
+
+**Monorepo 共享类型适合持续维护的项目。** 如果项目会长期迭代、前后端团队协作频繁，共享类型的价值很大。如果是一次性的短期项目，或者前后端团队完全独立部署，维护 Monorepo 的构建流程可能得不偿失。这时候可以退一步：后端用 Zod + Prisma 保证自己的类型安全，前端用 OpenAPI 或手写类型对接，两端的类型同步靠接口文档和沟通而不是编译器。
+
+**如果是一次性项目或者原型阶段，可以先用 `any` 后补类型。** 类型安全不是第一天的需求——先让功能跑通，再回头加 Zod Schema 和类型注解。但要有意识地标记技术债：用了 `any` 的地方加 `// TODO: add validation`，不要让 `any` 在代码库里无声地扩散。Prisma 生成的类型一直在那里，你随时可以用 `typeof` 和 `GetPayload` 把精确类型补上。
+
+---
+
+上一篇我们用事务保证了多步操作的原子性，这篇又在类型安全上加了 Zod 验证层。数据写进去了、类型也安全了，但接口变慢了怎么办？下一篇来看 Prisma 的性能问题——查询慢了怎么排查、N+1 怎么从日志里发现、索引该加在哪里、什么时候该绕过 Prisma 直接写 SQL。

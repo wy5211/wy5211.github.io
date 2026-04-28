@@ -1,0 +1,413 @@
+---
+title: "03. CRUD 与查询技巧"
+date: "2026-03-23"
+summary: "博客系统的日常数据库操作：创建文章、查询列表、更新状态、删除评论，以及过滤、排序、分页的实战技巧。"
+tags: ["Prisma", "TypeScript"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 3
+---
+
+上一篇我们定义了五张表的 Schema——users、posts、comments、tags、postsToTags，字段类型、枚举、关联关系都就位了，迁移也跑通了。但表建好了只是空壳，真正的问题是：怎么往里面写数据？又怎么把数据查出来？
+
+一个博客系统的日常操作远不止"插一条、查一条"这么简单。发布文章时要同时关联作者和标签，列表页要支持搜索和分页，编辑文章时要原子更新状态，删除评论时还要考虑级联影响。今天就用博客文章管理这个场景，把 Prisma 的增删改查完整过一遍。
+
+## Create：从单条到嵌套创建
+
+### 基本创建
+
+最基础的场景：往数据库里插入一篇文章。
+
+```typescript
+import { prisma } from "./prisma";
+
+const post = await prisma.post.create({
+  data: {
+    title: "Prisma 渐进式学习",
+    slug: "prisma-gradual-learning",
+    content: "正文内容...",
+    excerpt: "从零开始学 Prisma",
+    status: "DRAFT",
+    author: {
+      connect: { id: 1 },
+    },
+  },
+});
+```
+
+注意几个细节：`status` 字段的值 `"DRAFT"` 必须和 Schema 中定义的枚举值完全匹配，Prisma 生成的类型会帮你约束这一点。`author` 是关联字段，不能直接传 id，要用 `connect` 连接一条已有的 user 记录。如果 authorId: 1 的用户不存在，这条 create 会直接报错，不会留一个孤儿外键。
+
+这种类型约束在实际开发中非常有价值。拼错一个字段名、传了错误类型的值、忘了必填字段——这些低级错误在写代码时就被 TypeScript 捕获了，不用等到运行时才发现。
+
+### 嵌套创建：一次请求搞定关联
+
+你要发布一篇文章，同时给它打上两个标签。一个已存在（TypeScript），另一个是新的（Prisma）。如果不嵌套创建，你得先查标签、判断是否需要创建、创建文章、再关联标签——至少四次数据库操作，还得自己包一层事务。
+
+```typescript
+const post = await prisma.post.create({
+  data: {
+    title: "Prisma 渐进式学习",
+    slug: "prisma-gradual-learning",
+    content: "正文内容...",
+    status: "PUBLISHED",
+    publishedAt: new Date(),
+    author: { connect: { id: 1 } },
+    tags: {
+      create: [
+        { tag: { connect: { slug: "typescript" } } },
+        { tag: { create: { name: "Prisma", slug: "prisma" } } },
+      ],
+    },
+  },
+  include: { tags: { include: { tag: true } } },
+});
+```
+
+这段代码做了四件事：创建文章、连接已有作者、连接已有标签 TypeScript、创建新标签 Prisma 并关联。全部在同一个事务中完成，任何一步失败都会回滚。
+
+嵌套创建很强大，但底层会执行多条 SQL。如果关联层级太深，生成的 SQL 可能比你预期的复杂。简单的一两层嵌套放心用，三层以上建议拆成显式的多步调用。
+
+### createMany：批量导入
+
+从其他平台迁移博客数据时，需要一次性插入大量记录：
+
+```typescript
+const result = await prisma.post.createMany({
+  data: [
+    {
+      title: "第一篇文章",
+      slug: "first-post",
+      content: "内容...",
+      authorId: 1,
+      status: "PUBLISHED",
+    },
+    {
+      title: "第二篇文章",
+      slug: "second-post",
+      content: "内容...",
+      authorId: 1,
+      status: "DRAFT",
+    },
+  ],
+  skipDuplicates: true,
+});
+
+console.log(result.count); // 实际插入的行数
+```
+
+`skipDuplicates: true` 跳过违反唯一约束的记录，迁移数据时跑两遍不会炸。但 `createMany` 不支持嵌套创建和 `include`，返回的是 `{ count: number }` 而非插入的记录本身。如果你需要拿到新插入的 id，还是得用循环 `create`。另外，不同数据库对批量插入的实现不同——PostgreSQL 会生成一条多行 INSERT，MySQL 也是如此，但 SQLite 在某些版本下可能退化为逐条插入。
+
+四种创建方式的选择思路：单条简单插入用 `create`，需要处理关联用嵌套 `create`，纯批量灌数据用 `createMany`，需要"有就更新没有就创建"用后面要讲的 `upsert`。
+
+## Read：四种查找方式各有适用场景
+
+### findUnique：按唯一键查找
+
+用 `@id` 或 `@unique` 标注的字段查找时，用 `findUnique`。它的 `where` 只接受唯一字段——传非唯一字段 TypeScript 编译阶段就会报错。这个设计不是多余的：Prisma 希望语义上明确"我预期最多返回一条记录"。如果查的字段不唯一，你应该用 `findFirst` 或 `findMany`。找不到返回 `null`。
+
+```typescript
+const post = await prisma.post.findUnique({
+  where: { slug: "prisma-gradual-learning" },
+});
+```
+
+### findFirst：条件查第一条
+
+按非唯一字段查找，但只需要第一条匹配记录时用 `findFirst`。本质上就是 `findMany` 加了 `limit: 1`，经常配合 `orderBy` 确定排序规则。
+
+```typescript
+const firstDraft = await prisma.post.findFirst({
+  where: { status: "DRAFT" },
+  orderBy: { createdAt: "asc" },
+});
+```
+
+### findMany：列表查询的主力
+
+查所有匹配记录，返回数组。空数组表示没有匹配，永远不会返回 `null`。
+
+```typescript
+const publishedPosts = await prisma.post.findMany({
+  where: { status: "PUBLISHED" },
+  orderBy: { publishedAt: "desc" },
+  take: 10,
+});
+```
+
+### OrThrow 变体：找不到就抛错
+
+用户点击文章详情页，那篇文章必须存在。`findUniqueOrThrow` 和 `findFirstOrThrow` 在找不到时直接抛出 `P2025` 错误，配合 try-catch 返回 404 比手动判空更简洁：
+
+```typescript
+try {
+  const post = await prisma.post.findUniqueOrThrow({
+    where: { slug: req.params.slug },
+  });
+  res.json(post);
+} catch (e) {
+  if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === "P2025") {
+    res.status(404).json({ error: "文章不存在" });
+  }
+}
+```
+
+## Update：更新与关联操作
+
+### 单条更新和批量更新
+
+修改文章标题用 `update`，`data` 里只写要改的字段：
+
+```typescript
+const updated = await prisma.post.update({
+  where: { id: 1 },
+  data: {
+    title: "Prisma 渐进式学习（修订版）",
+  },
+});
+```
+
+批量更新用 `updateMany`，比如把所有草稿标记为归档：
+
+```typescript
+const result = await prisma.post.updateMany({
+  where: { status: "DRAFT", createdAt: { lt: new Date("2026-01-01") } },
+  data: { status: "ARCHIVED" },
+});
+```
+
+两个注意点：`update` 匹配不到记录会抛 `P2025`，这一点和 `findUnique` 返回 `null` 的行为不同；不带 `where` 的 `updateMany` 会更新整张表，Prisma 不会阻止你这么做。
+
+Prisma 的 `@updatedAt` 注解可以自动维护更新时间。如果 Schema 里写了 `updatedAt DateTime @updatedAt`，你不需要手动传 `updatedAt` 字段，Prisma 会在每次 `update` 时自动设置为当前时间。
+
+### upsert：有则更新无则创建
+
+用 email 做用户去重是最典型的场景——邮箱已存在就更新登录时间，不存在就创建新用户：
+
+```typescript
+const user = await prisma.user.upsert({
+  where: { email: "wang@example.com" },
+  update: { lastLoginAt: new Date() },
+  create: {
+    email: "wang@example.com",
+    username: "wang_dev",
+    passwordHash: "hashed_xxx",
+    name: "老王",
+    lastLoginAt: new Date(),
+  },
+});
+```
+
+`where` 必须是唯一字段，`update` 是找到后的更新内容，`create` 是找不到时的新建内容。一次数据库往返搞定，也避免了并发时的竞态条件。
+
+### 更新关联：标签的 connect、disconnect 和 set
+
+文章编辑时修改标签，Prisma 提供了三种操作：
+
+```typescript
+await prisma.post.update({
+  where: { id: 1 },
+  data: {
+    tags: {
+      disconnect: [{ tagId: 2 }], // 断开旧标签
+      connect: [{ tagId: 5 }, { tagId: 6 }], // 连接已有标签
+      create: [{ tag: { create: { name: "ORM", slug: "orm" } } }], // 创建新标签并关联
+    },
+  },
+});
+```
+
+三者可以在一次操作中组合使用。如果要完全替换旧列表，用 `set` 更直接——它先清除所有旧关联，再建立新的。增量修改用 connect/disconnect，全量替换用 set。
+
+## Delete：删除与级联
+
+单条删除用 `delete`，批量删除用 `deleteMany`，逻辑和 update 系列对称：
+
+```typescript
+const deleted = await prisma.comment.delete({ where: { id: 42 } });
+const result = await prisma.comment.deleteMany({
+  where: { createdAt: { lt: new Date("2025-01-01") } },
+});
+```
+
+需要特别关注的是级联删除。Schema 里定义了 `onDelete: Cascade`，删除用户会连带删除所有文章，文章的 Cascade 又会连带删除所有评论。一条 `prisma.user.delete` 可能触发多张表的级联操作。`deleteMany` 也支持关联过滤——比如"删除所有已归档文章的评论"。生产环境要谨慎使用级联删除——如果文章被其他系统引用（搜索引擎索引、收藏列表），级联删除会造成数据悬空。更稳妥的做法是上一篇提到的软删除（`deletedAt` 字段），或者用 `onDelete: Restrict` 阻止有子记录时删除父记录。
+
+## 过滤技巧：组合出灵活的查询条件
+
+### 逻辑组合
+
+`where` 顶层写多个条件时，它们之间默认是 AND 关系。需要 OR 或 NOT 时显式使用：
+
+```typescript
+// 已发布，但不是某个作者写的
+const posts = await prisma.post.findMany({
+  where: {
+    status: "PUBLISHED",
+    NOT: { authorId: 1 },
+  },
+});
+
+// 标题或摘要包含关键词
+const searchResults = await prisma.post.findMany({
+  where: {
+    status: "PUBLISHED",
+    OR: [
+      { title: { contains: "prisma", mode: "insensitive" } },
+      { excerpt: { contains: "prisma", mode: "insensitive" } },
+    ],
+  },
+});
+```
+
+`mode: "insensitive"` 在 PostgreSQL 下生成 `ILIKE`，MySQL 下生成 `LOWER()` 查询。SQLite 不支持此模式。
+
+注意 AND/OR 的嵌套关系。上面的搜索示例中，`status: "PUBLISHED"` 是顶层条件，`OR` 数组里的两个 `contains` 是子条件。Prisma 生成的 SQL 等价于 `WHERE status = 'PUBLISHED' AND (title ILIKE '%prisma%' OR excerpt ILIKE '%prisma%')`。当条件组合复杂时，建议先在 SQL 客户端验证查询逻辑，再翻译成 Prisma 的 where 子句。
+
+### 字符串和范围过滤
+
+字符串操作有 `contains`（包含）、`startsWith`（前缀匹配）、`endsWith`（后缀匹配），配合 `mode: "insensitive"` 做大小写不敏感的搜索。范围操作对数字和日期都适用：
+
+```typescript
+// 2026 年发布的文章
+const thisYear = await prisma.post.findMany({
+  where: {
+    publishedAt: {
+      gte: new Date("2026-01-01"),
+      lt: new Date("2027-01-01"),
+    },
+  },
+});
+
+// 状态为 DRAFT 或 ARCHIVED
+const drafts = await prisma.post.findMany({
+  where: { status: { in: ["DRAFT", "ARCHIVED"] } },
+});
+```
+
+`gt`（大于）、`gte`（大于等于）、`lt`（小于）、`lte`（小于等于）实现区间查询，`in`/`notIn` 匹配多个值。这些操作符可以组合使用——`publishedAt` 同时写 `gte` 和 `lt` 就是标准的日期范围查询。
+
+### 关联过滤
+
+通过关联关系过滤主表——查"带有 TypeScript 标签的所有文章"：
+
+```typescript
+const typescriptPosts = await prisma.post.findMany({
+  where: {
+    tags: {
+      some: { tag: { slug: "typescript" } },
+    },
+  },
+});
+```
+
+`some` 表示"至少有一个匹配"，还有 `every`（全部匹配）和 `none`（没有匹配）。底层生成的是 EXISTS 子查询。
+
+## 排序与分页
+
+### orderBy：单字段和多字段
+
+```typescript
+// 先按精选排，再按发布时间
+const sorted = await prisma.post.findMany({
+  orderBy: [{ isFeatured: "desc" }, { publishedAt: "desc" }],
+});
+```
+
+数组顺序即优先级。上面的查询先按 `isFeatured` 降序（精选在前），同组内再按发布时间降序。这和 SQL 的 `ORDER BY is_featured DESC, published_at DESC` 完全等价。
+
+### skip/take：偏移分页
+
+```typescript
+const page = 2;
+const pageSize = 10;
+
+const [posts, total] = await Promise.all([
+  prisma.post.findMany({
+    where: { status: "PUBLISHED" },
+    orderBy: { publishedAt: "desc" },
+    skip: (page - 1) * pageSize,
+    take: pageSize,
+  }),
+  prisma.post.count({ where: { status: "PUBLISHED" } }),
+]);
+```
+
+用 `Promise.all` 并行查数据和总数，比串行快。分页计算 `skip = (page - 1) * pageSize` 是标准做法。
+
+偏移分页逻辑直观，前端可以直接渲染页码导航。但有个已知的性能问题：当 `skip` 值很大时（比如第 10000 页），数据库需要扫描并跳过前面所有行，查询变慢。对于大多数博客来说这不是问题，但数据量大时需要考虑替代方案。
+
+### cursor：游标分页
+
+大数据量场景下，游标分页更高效。它记住上一页最后一条记录的位置，从那里继续取：
+
+```typescript
+// 第一页
+const firstPage = await prisma.post.findMany({
+  where: { status: "PUBLISHED" },
+  orderBy: { id: "desc" },
+  take: 10,
+});
+
+// 下一页
+const lastId = firstPage[firstPage.length - 1].id;
+const secondPage = await prisma.post.findMany({
+  where: { status: "PUBLISHED" },
+  orderBy: { id: "desc" },
+  take: 10,
+  cursor: { id: lastId },
+  skip: 1,
+});
+```
+
+底层生成的是 `WHERE id < lastId ORDER BY id DESC LIMIT 10`，走主键索引，不管翻到第几页性能都一样。代价是不支持跳页——你没法直接跳到第 50 页，只能一页一页往下翻。适合"无限滚动"或"加载更多"的场景。
+
+## select：只查需要的字段
+
+默认 Prisma 返回所有字段。文章表存了好几 KB 的 `content`，列表页用不到。用 `select` 精确控制返回内容：
+
+```typescript
+const posts = await prisma.post.findMany({
+  where: { status: "PUBLISHED" },
+  select: {
+    id: true,
+    title: true,
+    excerpt: true,
+    publishedAt: true,
+    author: { select: { id: true, name: true } },
+  },
+});
+```
+
+返回的 TypeScript 类型会精确匹配你选的字段——选了 `id` 和 `title`，类型里就只有这两个字段，`content` 连出现的资格都没有。
+
+`select` 的另一个重要用途是排除敏感字段。用户表的 `passwordHash` 不该出现在 API 响应里：
+
+```typescript
+const user = await prisma.user.findUnique({
+  where: { id: 1 },
+  select: {
+    id: true,
+    email: true,
+    username: true,
+    name: true,
+    // passwordHash 不出现在返回值里
+  },
+});
+```
+
+`select` 和 `include` 互斥：`select` 精确指定字段，`include` 是在返回全部字段基础上额外加载关联数据。
+
+## Trade-off 分析
+
+**select 精确但类型复杂，include 简单但返回全量。** `select` 让你精确控制字段，TypeScript 类型也随之收窄，但每个查询都得手写 `select`，类型定义随查询变化。如果接口要传给前端，还得额外维护类型。`include` 简单，返回全部字段加关联数据，但列表页返回完整 `content` 确实浪费。务实做法：列表用 `select`，详情用 `include`。
+
+**偏移分页简单但大偏移慢，游标分页高效但不支持跳页。** 偏移分页逻辑直观，前端能生成页码导航。但 `skip 90000` 要求数据库扫描 9 万行后丢弃。游标分页没这问题，但用户没法跳到任意页。管理后台用偏移分页，无限滚动用游标分页，两者可以在同一项目中共存。
+
+**嵌套创建的便利与隐含复杂度。** 嵌套创建让多表操作看起来像一条语句，代码简洁。但底层 SQL 可能比你预期的复杂，出问题时调试难度也高——错误信息指向的是内部生成的 SQL。建议一两层嵌套放心用，三层以上拆成显式多步调用配 `$transaction`。
+
+**级联删除的便利与风险。** `onDelete: Cascade` 省去了手动清理子记录的代码。但删除用户连带删除文章和评论，如果文章被收藏列表或其他系统引用，会造成数据悬空。更稳妥的做法是软删除加 `onDelete: Restrict`，把删除决策权留给业务层。
+
+---
+
+今天我们把五张表的增删改查过了一遍，但有一个关键问题一直没深入：查文章时怎么把作者名、标签列表、评论数一起带出来？`include` 和 `select` 嵌套关联的写法还不算复杂，但底层的 N+1 查询问题可能正在拖慢你的接口。下一篇就来拆解关联查询——看看 Prisma 的 include 是怎么工作的，N+1 问题怎么发现和解决。

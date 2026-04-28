@@ -1,0 +1,329 @@
+---
+title: "05. 迁移管理：Schema 变更的安全之道"
+date: "2026-03-25"
+summary: "Schema 一定会变——加字段、改类型、加索引。用 Prisma Migrate 安全管理数据库结构变更，从开发到生产的完整流程。"
+tags: ["Prisma", "TypeScript"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 5
+---
+
+产品经理跑过来说："每篇文章需要一张封面图。" 你打开 `schema.prisma`，在 Post 模型上加了一行 `cover String?`，保存，运行 `npx prisma generate`，类型更新了，编辑器也不报错了。然后你启动项目，写了一篇文章试试——数据库直接报错：`column "cover" of relation "Post" does not exist`。
+
+你改了 Schema 定义，Prisma Client 也更新了，但数据库那张表里根本没有这个列。Schema 定义、Prisma Client 类型和实际数据库结构三者脱节了。Prisma Migrate 就是用来解决这个问题的：它让你的 Schema 变更安全、可控地同步到数据库。
+
+## migrate dev：开发环境的核心工作流
+
+### 一条命令，三件事
+
+回到刚才的场景。我们在 `schema.prisma` 的 Post 模型上加一个 `cover` 字段：
+
+```prisma
+model Post {
+  id        Int      @id @default(autoincrement())
+  title     String
+  content   String
+  cover     String?  // 新增：封面图 URL
+  status    PostStatus @default(DRAFT)
+  authorId  Int
+  author    User     @relation(fields: [authorId], references: [id])
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  comments  Comment[]
+  tags      PostToTag[]
+
+  @@index([authorId])
+  @@map("posts")
+}
+```
+
+然后运行：
+
+```bash
+npx prisma migrate dev --name add_cover_image
+```
+
+这一条命令做了三件事：第一，对比当前 `schema.prisma` 和数据库的实际状态，找出需要执行的变更；第二，在 `prisma/migrations/` 目录下创建一个新文件夹，里面包含一个 `migration.sql`；第三，执行这个 SQL 更新数据库，同时自动运行 `prisma generate` 更新 Client 类型。
+
+### 迁移文件里到底写了什么
+
+执行完上面的命令，项目里会多出一个文件夹：
+
+```
+prisma/
+  migrations/
+    20260325083000_add_cover_image/
+      migration.sql
+```
+
+打开 `migration.sql` 看看：
+
+```sql
+-- AlterTable
+ALTER TABLE "posts" ADD COLUMN "cover" TEXT;
+```
+
+就这么一行。Prisma 把 Schema diff 翻译成了原生 SQL。这个文件会被提交到 Git，跟着代码走。任何人在任何环境拉了这段代码，执行 `prisma migrate deploy` 就能把数据库同步到最新状态。
+
+文件夹名里的时间戳保证了迁移的执行顺序。Prisma 会在数据库里维护一个 `_prisma_migrations` 表，记录哪些迁移已经执行过了，避免重复执行。
+
+## migrate deploy：生产环境的安全执行
+
+### 为什么不用 migrate dev
+
+`migrate dev` 会提示确认、可能在开发环境重置数据库、会自动 generate——这些在本地开发时很方便，但在生产环境全是危险行为。生产环境用的是 `migrate deploy`：
+
+```bash
+npx prisma migrate deploy
+```
+
+它只做一件事：按顺序执行所有还没跑过的迁移文件。不提示确认，不重置数据，不做 generate。如果某条迁移执行失败，整个流程停下来，数据库停留在上一个成功的状态。
+
+### 在 CI/CD 里集成
+
+最常见的做法是在部署流程里加上迁移步骤。以 GitHub Actions 为例：
+
+```yaml
+# .github/workflows/deploy.yml
+- name: Run migrations
+  run: npx prisma migrate deploy
+  env:
+    DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+- name: Deploy application
+  run: # 你的部署命令
+```
+
+迁移在前，部署在后。这样保证应用启动时数据库结构已经是最新的。如果迁移失败，部署也会中止——不会出现代码期望新字段但数据库还没更新的情况。
+
+一个值得注意的细节：`migrate deploy` 执行失败时不会回滚已成功的迁移。它会在失败的迁移处停下来，数据库保持在一个中间状态——前面的迁移已经执行了，后面的还没执行。你修好问题后重新跑 `migrate deploy`，它会从失败的那条继续。这个行为在生产环境是合理的：已执行的迁移通常意味着数据已经变了，贸然回滚反而更危险。
+
+## db push：原型阶段的速度优先
+
+### 跳过迁移文件，直接推到数据库
+
+`db push` 和 `migrate dev` 的区别在于：它不生成迁移文件，直接把 Schema 变更推到数据库。
+
+```bash
+npx prisma db push
+```
+
+适合什么场景？项目刚启动，还在频繁调表结构。今天加个字段，明天发现不对又删了，后天改个类型。如果每次都生成迁移文件，`prisma/migrations/` 目录会被一堆无意义的中间状态文件塞满。
+
+### 什么时候别用
+
+但凡有以下任何一种情况，就别用 `db push`：多人协作的项目——没有迁移文件，别人的数据库没法同步你的变更；有生产环境的项目——你没法用 `db push` 去更新生产数据库，最终还是要迁移文件；需要回滚能力的场景——`db push` 不留历史记录，出了问题没辙。
+
+建议是：项目确定 Schema 大方向之后，尽早切换到 `migrate dev` 工作流。`db push` 适合个人项目的探索阶段，仅此而已。
+
+## 回滚：Prisma 的短板
+
+### 没有内置回滚
+
+这是 Prisma 最常被诟病的迁移短板之一。Rails 有 `rake db:rollback`，Django 有 `migrate app_name 0002`，Prisma 什么都没有。官方态度很明确：不支持自动回滚。
+
+原因在于 Prisma 的设计哲学——迁移是单向的、不可逆的。一旦迁移执行了，数据库状态就变了，自动生成的"反向 SQL"不一定安全。比如你删了一列，数据已经丢了，回滚加回来也是空列，原来的数据找不回来了。
+
+### 手动回滚的实践
+
+虽然没有自动回滚，但你可以手动创建一个"反向迁移"。关键是先预览再执行：
+
+```bash
+npx prisma migrate dev --create-only --name remove_cover_image
+```
+
+`--create-only` 只生成迁移文件，不执行。这样你有机会审查和修改 SQL：
+
+```sql
+-- 手动编写的反向迁移
+ALTER TABLE "posts" DROP COLUMN "cover";
+```
+
+确认无误后再手动执行：
+
+```bash
+npx prisma migrate deploy
+```
+
+团队实践中一个值得坚持的习惯是：永远用 `--create-only` 先生成迁移文件，审查 SQL 内容后再应用。尤其是涉及删列、改类型、加 NOT NULL 约束这类破坏性操作，自动生成的 SQL 不一定考虑了数据迁移的需求。
+
+## 数据迁移：不只改结构，还要改数据
+
+### 一个真实的场景
+
+第2篇我们定义了 Post 模型，status 字段用了枚举 `DRAFT | PUBLISHED | ARCHIVED`。假设上线一段时间后，产品要求所有现有文章如果没有明确设置过状态，都应该标记为 `DRAFT`，而不是依赖数据库默认值。
+
+纯结构迁移解决不了这个问题。你需要在改表结构的同时把数据也迁移了。做法是先创建迁移文件，然后在里面加数据操作：
+
+```bash
+npx prisma migrate dev --create-only --name set_default_status
+```
+
+打开生成的 `migration.sql`，手动补上 UPDATE 语句：
+
+```sql
+-- 先加 status 列（如果还没有的话）
+ALTER TABLE "posts" ADD COLUMN "status" TEXT NOT NULL DEFAULT 'DRAFT';
+
+-- 数据迁移：把所有旧文章的 status 设为 DRAFT
+UPDATE "posts" SET "status" = 'DRAFT' WHERE "status" IS NULL;
+```
+
+这样做的好处是数据迁移跟着结构迁移走，在同一个事务里执行。如果 UPDATE 失败了，ALTER TABLE 也会回滚，不会留下一个结构更新了但数据没迁的半成品状态。
+
+### 复杂数据迁移用脚本
+
+如果数据迁移逻辑很复杂——比如要根据关联表的数据做计算、要分批处理百万级记录——写在迁移 SQL 里就不合适了。这种情况下建议把结构变更和数据迁移分开处理：迁移文件只管结构变更，单独写一个 TypeScript 脚本处理数据迁移，脚本也纳入版本控制，但和迁移文件分开管理。
+
+举个例子，假设你需要给每篇文章根据内容自动生成摘要（excerpt）。这个逻辑涉及文本处理，在 SQL 里写起来很痛苦，用 TypeScript 就清晰得多：
+
+```typescript
+// scripts/migrate-add-excerpt.ts
+import { PrismaClient } from "@prisma/client";
+
+const prisma = new PrismaClient();
+
+async function main() {
+  const posts = await prisma.post.findMany({
+    where: { excerpt: null },
+    select: { id: true, content: true },
+  });
+
+  for (const post of posts) {
+    const excerpt = post.content.slice(0, 200) + "...";
+    await prisma.post.update({
+      where: { id: post.id },
+      data: { excerpt },
+    });
+  }
+
+  console.log(`Updated ${posts.length} posts`);
+}
+
+main()
+  .then(() => prisma.$disconnect())
+  .catch((e) => {
+    console.error(e);
+    prisma.$disconnect();
+    process.exit(1);
+  });
+```
+
+这种脚本应该在部署后手动执行一次，执行完不需要保留在自动化流程里。关键是把它纳入版本控制，这样将来回溯时知道做过什么数据迁移。
+
+## 迁移冲突：多人协作的常见坑
+
+### 冲突是怎么发生的
+
+你和同事同时从 main 拉了分支。你加了 `cover` 字段，他加了 `excerpt` 字段。你们各自在本地跑 `migrate dev`，各自生成了迁移文件。然后你先合并了，他再合并时发现冲突：
+
+```
+prisma/migrations/
+  20260325083000_add_cover_image/    ← 你的
+  20260325083000_add_excerpt/        ← 他的，时间戳冲突
+```
+
+迁移文件夹名带时间戳，两个人在同一时间段操作就可能生成相同或接近的时间戳，导致顺序混乱。
+
+### 解决方法
+
+最稳妥的做法是合并代码后重新生成迁移：
+
+```bash
+git pull origin main
+npx prisma migrate dev
+```
+
+如果 Prisma 检测到迁移历史和数据库状态不一致，会提示你重置。开发环境重置通常没问题（`migrate dev` 默认行为），但如果你的开发数据库里有重要的测试数据，可以用 `--create-only` 先看看它会做什么。
+
+避免冲突的根本办法是迁移文件尽早提交、尽早合并。别在本地攒一堆迁移不推。团队规模大了以后，可以考虑把 Schema 变更集中到一个人审核，类似数据库变更审批流程。
+
+还有一个实际的小技巧：如果你知道有人在改 Schema，先沟通一下再动手。数据库模型变更往往牵涉到业务逻辑的调整，两个人同时改同一张表，冲突只是时间问题。
+
+## 种子数据：让开发环境开箱即用
+
+### prisma/seed.ts
+
+每次重置数据库后，你得手动插入测试数据才能开发。种子数据脚本就是自动化这个过程。创建 `prisma/seed.ts`：
+
+```typescript
+import { PrismaClient } from "@prisma/client";
+
+const prisma = new PrismaClient();
+
+async function main() {
+  // 创建管理员用户
+  const admin = await prisma.user.upsert({
+    where: { email: "admin@blog.dev" },
+    update: {},
+    create: {
+      email: "admin@blog.dev",
+      name: "Admin",
+      password: "hashed_password_here",
+    },
+  });
+
+  // 创建默认标签
+  const tags = await Promise.all([
+    prisma.tag.upsert({
+      where: { slug: "typescript" },
+      update: {},
+      create: { name: "TypeScript", slug: "typescript" },
+    }),
+    prisma.tag.upsert({
+      where: { slug: "prisma" },
+      update: {},
+      create: { name: "Prisma", slug: "prisma" },
+    }),
+  ]);
+
+  console.log({ admin, tags });
+}
+
+main()
+  .then(() => prisma.$disconnect())
+  .catch((e) => {
+    console.error(e);
+    prisma.$disconnect();
+    process.exit(1);
+  });
+```
+
+注意这里用了 `upsert` 而不是 `create`。种子数据应该可以反复执行——跑两次不应该报唯一约束冲突。`upsert` 的 `where` 条件匹配到已有记录就走 `update`（这里是空操作），匹配不到就走 `create`。这比 `create` 加 try-catch 要干净得多。
+
+种子数据的另一个实践是按依赖顺序插入。上面的例子先创建用户和标签，因为后续的测试文章需要关联它们。如果你的种子数据涉及更复杂的关联（比如文章要关联标签、评论要关联文章和用户），用第3篇学过的嵌套 create 会在一个调用里搞定，代码也更紧凑。
+
+### 配置 package.json
+
+在 `package.json` 里告诉 Prisma 怎么跑种子脚本：
+
+```json
+{
+  "prisma": {
+    "seed": "ts-node --compiler-options {\"module\":\"CommonJS\"} prisma/seed.ts"
+  }
+}
+```
+
+然后一条命令搞定重置和种子：
+
+```bash
+npx prisma migrate reset
+```
+
+`migrate reset` 会重置数据库、重新执行所有迁移、然后自动跑种子脚本。开发阶段经常用，是迭代效率的关键。
+
+## Trade-off
+
+Prisma Migrate 提供了从 Schema 到数据库的完整变更管理链路，但它不是没有取舍。
+
+**migrate vs push。** `migrate dev` 生成可追溯的迁移文件，适合任何有协作或生产环境的项目。`db push` 跳过迁移文件直接推，只在个人项目早期原型阶段有意义。一旦项目进入正式开发，就应该全面切换到 migrate 工作流。迁移文件是数据库变更的"源代码"，和业务代码一样应该进 Git、走 Code Review。
+
+**没有回滚是最大的短板。** Prisma 的官方立场是迁移不可逆，这对团队协作有实际影响。你需要在每次迁移前评估风险，用 `--create-only` 先预览 SQL，必要的时候手动准备反向迁移。如果你们团队有严格的数据库变更审批流程，这一点会让 Prisma 的迁移管理显得不够完善。
+
+**数据迁移要自己管。** Prisma 只管结构变更，数据迁移要么写在 migration.sql 里，要么单独写脚本。对于简单的默认值填充，写在 SQL 里就够了；对于复杂的数据转换，建议结构迁移和数据迁移分开处理，降低出问题时的排查难度。
+
+下一篇要解决的问题是：创建一篇文章的同时要关联标签、更新计数，多个操作需要原子性保证——事务怎么用。

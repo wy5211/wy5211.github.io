@@ -1,0 +1,264 @@
+---
+title: "10. 实战项目：从零搭建博客系统"
+date: "2026-03-30"
+summary: "把前九篇的知识整合成一个可部署的博客系统：Monorepo 架构、完整 Schema、前后端实现、测试策略、部署方案。"
+tags: ["Prisma", "TypeScript"]
+category: "prisma"
+cover: ""
+draft: false
+series: "Prisma 渐进式学习"
+seriesOrder: 10
+---
+
+你一个人负责一个博客产品的全栈开发。前端用 Next.js 做服务端渲染，后端需要一个独立的 API 给移动端调用，数据库 Schema 要前后端共享，类型定义不能写两遍。你不想把 Prisma Client 的初始化代码复制粘贴到每个项目里，也不想每次改了 Schema 在三个地方跑 migrate。
+
+这就是 Monorepo 发挥作用的时候。前九篇我们一块一块地学了 Prisma：Schema 设计、CRUD、关联查询、迁移、事务、类型安全、性能优化、框架集成。今天把所有知识整合到一个完整的博客项目里，从项目结构到部署上线，跑通整个链路。
+
+## Monorepo 架构：为什么 Schema 只定义一次
+
+用 pnpm workspace 搭建 Monorepo，核心动机只有一个：数据库 Schema 定义一次，前后端共享类型。
+
+```
+blog/
+├── packages/
+│   └── database/          # 共享 Schema + Prisma Client
+│       ├── prisma/
+│       │   └── schema.prisma
+│       ├── src/
+│       │   └── client.ts  # Prisma Client 单例
+│       └── package.json
+├── apps/
+│   ├── web/               # Next.js 前端
+│   └── api/               # Hono API 服务
+├── pnpm-workspace.yaml
+└── package.json
+```
+
+`packages/database` 是关键。它持有第 2 篇设计的完整 `schema.prisma`，运行 `prisma generate`，导出一个 Prisma Client 单例。web 和 api 两个应用都依赖这个包，拿到的类型定义完全一致。改一次 Schema，CI 统一跑 migrate，所有应用自动拿到新的类型。没有同步问题，没有"API 已经用新类型了但前端还在用旧类型"的窘境。
+
+Prisma Client 单例的实现参考了第 9 篇讲的连接管理策略——开发环境复用全局变量，避免 Next.js 热重载时创建过多连接：
+
+```typescript
+// packages/database/src/client.ts
+import { PrismaClient } from "@prisma/client";
+
+const globalForPrisma = globalThis as unknown as {
+  prisma: PrismaClient | undefined;
+};
+
+export const prisma = globalForPrisma.prisma ?? new PrismaClient();
+
+if (process.env.NODE_ENV !== "production") {
+  globalForPrisma.prisma = prisma;
+}
+```
+
+## 完整 Schema 整合
+
+第 2 篇设计了五张表，这里直接落地。Schema 内容和第 2 篇完全一致，不再重复完整代码。核心设计决策的来源梳理如下：
+
+enum 约束状态值（`Role` 和 `PostStatus`）在数据库层面拦截非法值，改枚举需要跑 migration，第 2 篇讨论过和 String 加应用层校验的取舍。User 表的 `passwordHash` 命名即文档，`deletedAt` 实现软删除。Post 表的 `authorId` 外键用 `onDelete: Cascade`——第 2 篇分析过个人博客用 Cascade、内容平台用 Restrict 或 SetNull 的不同场景。Comment 表用了三种 onDelete 策略：postId 是 Cascade（删文章删评论），authorId 是 SetNull（删用户保留评论），parentId 也是 Cascade（删父评论删子回复）。PostTag 是显式中间表，比隐式写法多几行代码但保留了加字段的灵活性——第 2 篇详细对比过。索引跟着查询走：`@@index([authorId, status])` 服务于"某作者的已发布文章"这个最频繁的查询。
+
+## API 实现：把前九篇的知识串起来
+
+API 层用 Hono 框架，轻量且类型友好。第 9 篇已经讲过 Hono 和 Prisma 的集成方式，这里聚焦于每个接口用到了哪些知识点。
+
+### 文章 Router
+
+文章列表接口融合了第 3 篇的分页查询、第 4 篇的 select 和关联加载、第 8 篇的性能意识：
+
+```typescript
+posts.get("/", async (c) => {
+  const page = Number(c.req.query("page") ?? "1");
+  const pageSize = Number(c.req.query("size") ?? "10");
+  const tag = c.req.query("tag");
+
+  const where = {
+    status: "PUBLISHED" as const,
+    ...(tag ? { tags: { some: { tag: { slug: tag } } } } : {}),
+  };
+
+  const [list, total] = await Promise.all([
+    prisma.post.findMany({
+      where,
+      orderBy: [{ isFeatured: "desc" }, { publishedAt: "desc" }],
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+      select: {
+        id: true,
+        title: true,
+        slug: true,
+        excerpt: true,
+        publishedAt: true,
+        author: { select: { id: true, username: true, displayName: true } },
+        tags: { select: { tag: { select: { name: true, slug: true } } } },
+        _count: { select: { comments: true } },
+      },
+    }),
+    prisma.post.count({ where }),
+  ]);
+
+  return c.json({ list, total, page, pageSize });
+});
+```
+
+这里用 `select` 而不是 `include`——第 4 篇讨论过：列表页不需要 `content` 字段，一篇文章几十 KB 的内容查 20 篇就是 1MB 的无效传输。`_count` 统计评论数避免 N+1 问题。`Promise.all` 并行执行列表和计数查询，第 3 篇讲过这个模式。关联过滤 `tags: { some: ... }` 来自第 3 篇的关联过滤技巧。
+
+详情接口按 slug 查询，用 `include` 加载完整内容加关联数据，评论只加载顶级评论（`parentId: null`），回复嵌套在 `replies` 里——两层关联没有超过第 4 篇建议的三层上限。
+
+创建文章接口用第 6 篇讲的交互式事务，保证文章和标签关联的原子性：
+
+```typescript
+const post = await prisma.$transaction(async (tx) => {
+  const newPost = await tx.post.create({
+    data: {
+      title,
+      slug,
+      content,
+      status: "PUBLISHED",
+      publishedAt: new Date(),
+      author: { connect: { id: body.authorId } },
+    },
+  });
+
+  if (tagSlugs?.length) {
+    await tx.postTag.createMany({
+      data: tagSlugs.map((ts: string) => ({ postId: newPost.id, tagId: ts })),
+      skipDuplicates: true,
+    });
+  }
+
+  return newPost;
+});
+```
+
+`skipDuplicates` 来自第 3 篇的 `createMany` 用法。任何一步失败自动回滚——这是第 6 篇事务的核心保证。
+
+### 认证 Router
+
+注册接口用 Zod 做输入验证，第 7 篇完整讨论了 Prisma 和 Zod 的配合方式。`registerSchema.parse()` 在数据进入数据库之前完成验证——邮箱格式、用户名长度、密码强度。`select` 排除 `passwordHash`，确保敏感字段不出现在 API 响应里。登录接口验证密码后签发 JWT，用解构赋值排除敏感字段——第 7 篇对比过 `select` 和解构赋值两种方式的安全性和类型推断差异。
+
+### 评论 Router
+
+评论创建时用 `connect` 关联文章和用户（第 3 篇讲过这个语法），`parentId` 可选——没有就是顶级评论，有就是回复，对应第 2 篇设计的自引用关系。
+
+## 前端实现
+
+前端用 Next.js App Router，第 9 篇详细讲过集成方式。关键页面的查询策略如下。
+
+首页是 Server Component 加 ISR（Incremental Static Regeneration），`revalidate = 300` 让 Next.js 每 5 分钟在后台重新生成页面，兼顾性能和数据新鲜度。查询逻辑和 API 列表接口几乎一致——`select` 排除 `content`，用 `include` 加载作者和标签。Server Component 里直接调用 Prisma，不需要 API 中间层。
+
+详情页用动态渲染，每次请求拿到最新数据。文章和评论分两次查询——第 4 篇的建议是超过两层的关联拆成独立查询，性能更可控，也方便对评论做独立分页。
+
+评论发表是客户端组件，通过 API Route 调用后端。第 9 篇讨论过 Next.js 全栈模式和 API 分离模式的取舍——如果你的博客只需要 Web 端，Server Actions 就够了；如果有移动端，独立 API 更合适。
+
+## 测试策略
+
+第 3 篇学了 CRUD，第 6 篇学了事务验证，现在把它们组合成完整的测试体系。用 Vitest 跑集成测试，每个测试结束后用 `TRUNCATE ... CASCADE` 清空所有表，保证测试之间互不干扰。
+
+定义工厂函数减少重复代码，每次生成的 email 和 slug 带时间戳避免唯一约束冲突：
+
+```typescript
+// packages/database/test/factories.ts
+export async function createUser(overrides = {}) {
+  return prisma.user.create({
+    data: {
+      email: `test-${Date.now()}@example.com`,
+      username: `user-${Date.now()}`,
+      passwordHash: await bcrypt.hash("password123", 4),
+      displayName: "Test User",
+      ...overrides,
+    },
+  });
+}
+
+export async function createPost(authorId: number, overrides = {}) {
+  return prisma.post.create({
+    data: {
+      title: "Test Post",
+      slug: `test-${Date.now()}`,
+      content: "Test content",
+      status: "PUBLISHED",
+      publishedAt: new Date(),
+      authorId,
+      ...overrides,
+    },
+  });
+}
+```
+
+工厂函数用 `overrides` 参数支持覆盖默认值，调用时只需要传关心的字段。核心测试用例覆盖三个维度：第 6 篇的事务原子性（创建文章加关联标签，任何一步失败自动回滚）、第 3 篇的 CRUD（分页过滤、条件查询）、第 7 篇的唯一约束（重复邮箱注册应该被拒绝）。
+
+## 部署方案
+
+### 方案一：Vercel + Supabase
+
+最简单的部署组合。Supabase 提供托管 PostgreSQL，Vercel 部署 Next.js 应用。迁移在部署前执行：
+
+```yaml
+# .github/workflows/deploy.yml
+- name: Install dependencies
+  run: pnpm install --frozen-lockfile
+
+- name: Run migrations
+  run: pnpm --filter database exec prisma migrate deploy
+  env:
+    DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+- name: Deploy to Vercel
+  run: vercel --prod
+```
+
+`prisma migrate deploy` 只执行还没跑过的迁移文件，不会重置数据。第 5 篇对比过 `migrate dev` 和 `migrate deploy` 的区别。迁移在前部署在后，保证应用启动时数据库结构已经是最新的。
+
+### 方案二：Cloudflare Workers + PlanetScale
+
+Edge 部署代价更高。Prisma 的 Rust 查询引擎不能在 Edge 环境运行，需要借助 Prisma Accelerate 做代理。第 1 篇提到过这个限制，第 9 篇讨论过集成方案。Accelerate 在 Edge 和数据库之间加了一层代理，查询延迟增加 10-30ms。如果接口对延迟极其敏感，Edge 场景下 Drizzle 是更轻量的替代——第 8 篇讨论过 Prisma 查询性能的天花板问题。
+
+不管哪种方案，迁移流程一致：本地用 `prisma migrate dev --name xxx` 创建迁移文件，文件提交到 Git，CI/CD 里部署前执行 `prisma migrate deploy`。如果迁移失败部署中止，不会出现代码和数据库不同步的情况。
+
+## 上线检查清单
+
+项目上线前逐项确认这些问题。
+
+**索引覆盖核心查询。** 第 2 篇设计的索引服务于哪些查询？`@@index([authorId, status])` 覆盖"某作者的已发布文章"，`@@index([publishedAt])` 覆盖时间排序。用 `EXPLAIN ANALYZE` 验证关键查询是否走索引，排查方法在第 8 篇。
+
+**连接池配置。** Supabase 免费版连接池上限 60，Vercel Serverless 函数可能并发创建多个 Prisma Client 实例。第 8 篇讨论过连接池管理和 Prisma Accelerate 的作用。生产环境一定要配连接池，否则并发一上来就会耗尽连接数。
+
+**迁移已全部执行。** 部署前确认所有迁移文件都已应用到生产数据库，跑一次 `prisma migrate status` 检查状态。
+
+**错误处理覆盖关键路径。** 第 9 篇讨论了 Prisma 错误码到 HTTP 状态码的映射。确保接口对 `P2002`（唯一约束冲突）、`P2025`（记录不存在）、`P2003`（外键约束）都有对应的用户友好提示。
+
+**安全检查。** 密码用 bcrypt 哈希存储，JWT 密钥通过环境变量注入不在代码里出现，`select` 排除敏感字段不返回给前端。
+
+## 系列回顾
+
+十篇文章，一条线串下来，每一篇都在为后面的内容打基础。
+
+第 1 篇回答了"为什么选 Prisma"——从一次 raw SQL 导致的生产事故出发，理解了端到端类型安全的价值。第 2 篇用五张表定义了完整的数据模型，enum、外键策略、索引、显式中间表的设计决策贯穿了后续所有操作。第 3 篇的 CRUD 覆盖了日常 80% 的数据库操作，分页、过滤、嵌套创建是后面每个接口的基础。第 4 篇解决了关联数据加载的问题，include 和 select 的选择、N+1 问题的识别，在今天的列表和详情接口里都有体现。
+
+第 5 篇建立了迁移管理的工作流，从 `migrate dev` 到 `migrate deploy`，今天的 CI/CD 流程直接复用了这套模式。第 6 篇的事务保证了创建文章关联标签的原子性，中间件和 `$extends` 为软删除和查询日志提供了基础设施。第 7 篇打通了从数据库到前端的类型安全链路，Zod 验证在注册接口里落地。第 8 篇的性能优化意识指导了 select 的使用、N+1 的规避、连接池的配置。第 9 篇解决了 Prisma 在 Next.js 和 Hono 里的集成问题，Server Components 直连数据库的模式在首页和详情页里实现。
+
+到今天这篇，所有知识点在一个项目里汇合。Schema 只定义一次，前后端共享类型；每个接口的查询策略都有前篇的依据；测试覆盖了核心操作；部署流程把迁移和应用更新绑定在一起。
+
+## 进阶方向
+
+这个博客项目是一个起点，不是终点。几个值得深入的方向。
+
+**Prisma Optimize。** Prisma 官方的查询优化建议工具，能分析你的查询模式并给出索引建议。适合项目上线后数据量增长、查询变慢时使用。
+
+**Prisma Pulse。** 实时数据订阅功能，基于数据库的 logical replication。适合聊天、协作编辑等需要实时更新的场景。博客的评论通知可以用它实现。
+
+**多租户架构。** 如果博客系统要支持多个站点，每个站点独立数据，需要用 Prisma 的 schema 多实例或行级隔离策略。这涉及 `$extends` 对 where 条件的全局注入，第 6 篇讲过扩展的基本用法。
+
+**从 Prisma 迁移到 Drizzle。** 如果遇到了 Prisma 的瓶颈——Edge 环境的兼容性问题、查询性能的天花板、或者包体积过大——Drizzle 是最直接的替代方案。迁移路径是先用 Drizzle 重写 Schema 定义（几乎是 1:1 翻译），然后逐步替换查询代码。第 1 篇对比过两者的设计哲学：Drizzle 是"用 TypeScript 写 SQL"，Prisma 是"用声明式 Schema 生成一切"。
+
+## 最终 Trade-off：Prisma 的强项和短板
+
+十篇走下来，对 Prisma 的能力边界应该有清醒的认知了。
+
+**强项。** 开发体验是 Prisma 最大的卖点。声明式 Schema、自动生成的类型、直观的查询 API、开箱即用的 Prisma Studio——从定义表结构到跑通第一个查询不超过十分钟。改了 Schema，`prisma generate` 一次，所有查询的类型错误立刻暴露在编译阶段。这种从数据库到应用层的端到端类型安全，是原生 SQL 和 TypeORM 做不到的。工具链成熟度也是优势：迁移管理、种子数据、Studio 可视化、多数据库支持，生态完善。
+
+**短板。** Edge 兼容性是硬伤。Rust 查询引擎依赖 Node.js 运行时，Cloudflare Workers 和 Deno Deploy 上只能通过 Accelerate 代理，增加了架构复杂度和延迟。查询性能有上限，简单查询的固定开销在 10-40ms，对延迟极其敏感的场景不适合。包体积大，Prisma Client 加查询引擎打包后好几 MB，Serverless 冷启动会受影响。不支持自动回滚，迁移管理相比 Rails 和 Django 显得粗糙。复杂查询（多表 JOIN、窗口函数、CTE）的表达能力不如原生 SQL，最终还是得回 `$queryRaw`。
+
+选 Prisma 还是选别的，取决于你的项目约束。如果你做的是一个标准的 Web 应用，部署在 Vercel 或传统服务器上，重视开发效率和类型安全，Prisma 是可靠的选择。如果你需要 Edge 部署、极致性能、或者对 SQL 有完全控制权的要求，Drizzle 或原生 SQL 更合适。技术选型没有银弹，只有适合不适合。
