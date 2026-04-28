@@ -9,109 +9,201 @@ series: "Mongoose 渐进式学习"
 seriesOrder: 9
 ---
 
-## 前言
+在上一篇文章中，我们为 CMS 系统添加了完整的数据验证层，确保了入库数据的质量。但数据验证虽然能保证数据正确性，却解决不了性能问题。
 
-性能优化是生产应用的关键。本文将学习索引设计、查询优化和最佳实践。
+想象这样一个场景：你的 CMS 系统上线后，文章数量从几百篇增长到几万篇，原本毫秒级返回的查询现在需要几秒甚至更久。用户打开文章列表要等半天，搜索功能更是慢得让人抓狂。这时候就需要对数据库进行性能优化。
 
-## 索引基础
+MongoDB 性能优化的核心是索引。没有索引的查询就像在整本字典里找一个字，必须从第一页翻到最后一页；而有了索引，就像直接查字典的目录，几秒钟就能定位到目标位置。让我带你看看如何在 CMS 系统中设计和使用索引。
 
-### 创建索引
+## 理解索引的工作原理
+
+先说说索引到底是什么。索引是存储在数据库中的特殊数据结构，用于快速定位文档。MongoDB 使用 B-Tree 结构来组织索引，这意味着查找操作的时间复杂度是 O(log n)，而不是全表扫描的 O(n)。
+
+在 CMS 系统中，哪些字段需要索引？这取决于你的查询模式。比如你经常根据作者 ID 查找文章，根据发布状态筛选文章，或者根据标题搜索文章，这些字段就应该加索引。
+
+看看我们如何在 Post Schema 中定义索引：
 
 ```typescript
-// 单字段索引
-postSchema.index({ title: 1 });
+import { Schema } from "mongoose";
 
-// 复合索引
-postSchema.index({ author: 1, createdAt: -1 });
+const postSchema = new Schema({
+  title: { type: String, required: true },
+  content: { type: String, required: true },
+  author: {
+    type: Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+  },
+  status: {
+    type: String,
+    enum: ["draft", "published", "archived"],
+    default: "draft",
+  },
+  tags: [{ type: String }],
+  views: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now },
+  publishedAt: { type: Date },
+});
 
-// 文本索引
+// 为常用查询字段创建索引
+// 单字段索引：根据作者查询文章
+postSchema.index({ author: 1 });
+
+// 复合索引：根据状态和发布时间查询已发布文章
+// 1 表示升序，-1 表示降序
+postSchema.index({ status: 1, publishedAt: -1 });
+
+// 文本索引：支持全文搜索标题和内容
 postSchema.index({ title: "text", content: "text" });
 
-// 唯一索引
-postSchema.index({ email: 1 }, { unique: true });
-
-// 稀疏索引
-postSchema.index({ phone: 1 }, { sparse: true });
-
-// TTL 索引
-logSchema.index({ createdAt: 1 }, { expireAfterSeconds: 3600 });
+// 唯一索引：确保文章 slug 唯一
+postSchema.index({ slug: 1 }, { unique: true });
 ```
 
-## 性能优化技巧
+这段代码定义了四种不同类型的索引。单字段索引最简单，适合根据单个字段查询的场景。复合索引则需要仔细设计字段的顺序，这个顺序直接影响索引能否被正确使用。文本索引让我们能够实现类似 Google 的全文搜索功能。唯一索引除了提升查询性能，还能保证数据完整性。
 
-### 1. 使用 lean()
+## 复合索引的设计策略
+
+复合索引的字段顺序很关键，MongoDB 社区有个 ESR 规则可以参考：Equality（精确匹配）→ Sort（排序）→ Range（范围查询）。把等值匹配的字段放在前面，排序字段放中间，范围查询字段放最后。
+
+比如在 CMS 系统中，我们经常需要查询某位作者的已发布文章，按发布时间倒序排列：
 
 ```typescript
-// ✅ lean() 返回普通对象（快）
-const posts = await Post.find().lean();
+// 查询示例：查找作者 usr_8x9k2m 的已发布文章，按发布时间倒序
+const posts = await Post.find({
+  author: "usr_8x9k2m",
+  status: "published",
+})
+  .sort({ publishedAt: -1 })
+  .limit(20);
 
-// ❌ 默认返回 Mongoose Document（慢）
-const posts = await Post.find();
+// 对应的复合索引设计
+postSchema.index({ author: 1, status: 1, publishedAt: -1 });
 ```
 
-### 2. 选择必要字段
+这个索引设计符合 ESR 规则：author 和 status 是精确匹配，publishedAt 是排序字段。查询时 MongoDB 可以直接利用这个索引完成筛选和排序，不需要额外的排序操作。
+
+但如果我们设计成错误的索引顺序，比如把范围查询字段放在前面：
 
 ```typescript
-const posts = await Post.find().select("title views").lean();
+// 不好的索引设计
+postSchema.index({ publishedAt: -1, author: 1, status: 1 });
+
+// 这种查询无法有效利用索引
+const posts = await Post.find({
+  publishedAt: { $gte: new Date("2026-01-01") },
+  status: "published",
+});
 ```
 
-### 3. 批量操作
+当范围查询字段在索引前面时，MongoDB 需要扫描大量索引条目才能找到匹配的文档，查询效率会大幅下降。
+
+## 使用 explain 分析查询性能
+
+怎么知道索引是否生效？MongoDB 提供了 explain 方法，可以展示查询的执行计划：
 
 ```typescript
-// ✅ 批量插入
-await Post.insertMany([...posts]);
+// 分析查询执行计划
+const explanation = await Post.find({
+  author: "usr_8x9k2m",
+  status: "published",
+})
+  .sort({ publishedAt: -1 })
+  .explain("executionStats");
 
-// ❌ 循环插入
-for (const post of posts) {
-  await Post.create(post);
+console.log(explanation.executionStats);
+```
+
+explain 会返回详细的执行统计信息。重点关注这几个指标：
+
+- executionTimeMillis：查询执行时间
+- totalDocsExamined：扫描的文档数
+- totalKeysExamined：扫描的索引条目数
+- stage：查询阶段，理想情况是 IXSCAN（索引扫描）
+
+一个高效的查询，totalDocsExamined 应该接近返回的文档数。如果扫描了大量文档但只返回少量结果，说明索引设计有问题。
+
+## lean 提升查询性能
+
+Mongoose 默认返回的 Document 对象包含很多功能，比如变更追踪、虚拟字段、中间件等。但这些功能也带来了性能开销。如果你只需要读取数据，不需要修改，可以使用 lean 方法返回普通 JavaScript 对象：
+
+```typescript
+// 不使用 lean：返回完整的 Mongoose Document
+const posts1 = await Post.find({ author: "usr_8x9k2m" });
+// posts1[0] 是 Mongoose Document，有 save、populate 等方法
+
+// 使用 lean：返回普通对象，性能提升 30-50%
+const posts2 = await Post.find({ author: "usr_8x2k9m" }).lean();
+// posts2[0] 是普通对象，只是数据的简单表示
+```
+
+lean 的性能提升在大数据量时特别明显。比如查询 10000 篇文章，使用 lean 可以节省几百毫秒。
+
+但要注意，lean 返回的对象没有 Mongoose 的功能，不能调用 save、populate 等方法。如果你需要这些功能，就不能使用 lean。
+
+## 批量操作优化
+
+CMS 系统经常需要批量操作数据，比如批量导入文章、批量更新状态。循环单条操作是性能杀手，应该使用批量操作 API：
+
+```typescript
+// 不好的做法：循环插入
+for (const postData of postsData) {
+  await Post.create(postData); // 每次 create 都是一次网络往返
 }
+
+// 好的做法：批量插入
+await Post.insertMany(postsData); // 只需一次网络往返
 ```
 
-## 索引策略
+insertMany 会把所有文档打包成一次请求发送给 MongoDB，大幅减少网络开销。实测显示，插入 1000 篇文章时，insertMany 比循环 create 快 10 倍以上。
 
-### ESR 规则
-
-```
-E - Equality (精确匹配)
-S - Sort (排序字段)
-R - Range (范围查询)
-
-索引顺序: E → S → R
-```
-
-### 示例
+更新操作也可以批量进行：
 
 ```typescript
-// ✅ 好的索引
-postSchema.index({ status: 1, createdAt: -1 });
-
-// 查询
-Post.find({ status: "published" }).sort({ createdAt: -1 });
-
-// ❌ 差的索引
-postSchema.index({ createdAt: -1, status: 1 });
-
-// 查询
-Post.find({ createdAt: { $gte: date } }).sort({ createdAt: -1 });
-```
-
-## 性能监控
-
-### 使用 explain()
-
-```typescript
-const explanation = await Post.find({ author: userId }).explain(
-  "executionStats"
+// 批量更新文章状态
+await Post.updateMany(
+  { author: "usr_8x9k2m", status: "draft" },
+  { $set: { status: "published", publishedAt: new Date() } }
 );
-
-console.log(explanation);
 ```
 
-## 总结
+## 投影优化
 
-1. ✅ 索引设计和 ESR 规则
-2. ✅ lean() 和投影优化
-3. ✅ 批量操作
-4. ✅ 性能监控
+不需要的字段就不要查询，这在网络传输和内存占用上都能节省开销：
 
----
+```typescript
+// 只查询需要的字段
+const posts = await Post.find({ author: "usr_8x9k2m" })
+  .select("title status views publishedAt") // 只选择需要的字段
+  .lean();
+
+// 排除特定字段
+const posts = await Post.find({ author: "usr_8x9k2m" })
+  .select("-content -__v") // 排除内容字段和版本号
+  .lean();
+```
+
+对于文章列表这种场景，我们通常不需要显示完整的文章内容，只需要标题、状态、浏览量等摘要信息。这时候就应该用 select 排除掉 content 这种大字段。
+
+## 连接池配置
+
+数据库连接是有限的资源，合理配置连接池能避免连接不足导致的性能问题：
+
+```typescript
+await mongoose.connect(uri, {
+  maxPoolSize: 10, // 最大连接数
+  minPoolSize: 5, // 最小连接数
+  socketTimeoutMS: 45000, // Socket 超时时间
+  serverSelectionTimeoutMS: 5000, // 服务器选择超时
+});
+```
+
+maxPoolSize 应该根据应用的并发量来设置。对于典型的 Web 应用，10 个连接通常足够。设置得太大会浪费资源，设置得太小会导致连接等待。
+
+## 权衡与取舍
+
+性能优化需要权衡。索引能加快查询，但会减慢写入速度（每次写入都要更新索引）。lean 能提升读取性能，但失去了 Mongoose 的便利功能。批量操作能提高效率，但代码可读性会下降。
+
+在实际项目中，建议先用 explain 找到真正的性能瓶颈，再针对性地优化，而不是过早优化。对于中小规模的 CMS 系统，合理的索引设计和使用 lean 就能解决 80% 的性能问题。
+
+优化是个持续的过程，随着数据量和业务的变化，需要不断监控和调整。下一篇文章我们会讨论一个更复杂的话题：如何在跨多个集合的操作中保证数据一致性，也就是事务处理。

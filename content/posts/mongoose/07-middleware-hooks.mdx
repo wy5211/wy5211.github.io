@@ -1,7 +1,7 @@
 ---
 title: "07 中间件与 Hooks 机制"
 date: "2026-03-23"
-summary: "掌握 Mongoose 中间件系统，使用 pre/post Hooks 实现业务逻辑、数据验证和自动化操作"
+summary: "掌握 Mongoose 中间件系统,使用 pre/post Hooks 实现业务逻辑、数据验证和自动化操作"
 tags: ["Mongoose", "中间件", "Hooks", "业务逻辑"]
 category: "mongoose"
 draft: false
@@ -9,96 +9,144 @@ series: "Mongoose 渐进式学习"
 seriesOrder: 7
 ---
 
-## 前言
+上一篇我们学习了聚合管道,能在数据库层面做复杂的数据统计和分析。但实际开发中,还有一类需求也很常见:需要在数据操作前后自动执行一些逻辑,比如保存文档前自动更新时间戳、删除用户前检查是否有依赖数据、文章发布后发送通知等。
 
-Mongoose 的中间件（Middleware）和 Hooks 机制允许我们在文档操作的生命周期中插入自定义逻辑。这是实现业务规则、数据验证和自动化操作的关键功能。
+这些逻辑如果写在每个业务接口里,会导致代码重复和维护困难。你可能在创建文章的接口、更新文章的接口、导入文章的接口都要写一遍"更新时间戳"的代码,一旦逻辑变化就要改多处。Mongoose 的中间件和 Hooks 机制就是为了解决这个问题,它让我们在 Schema 层面定义这些自动执行的逻辑,类似数据库的触发器,但更灵活。
 
-## 核心概念
+## 为什么要用中间件
 
-### 中间件类型
+中间件的核心价值在于把通用逻辑从业务代码中抽离出来,让代码更简洁、更可靠。以我们 CMS 系统为例,有几个典型的应用场景:
 
-```
-Document Hooks:
-  - save, validate
-  - init (创建时)
+一是数据一致性维护。比如文章有浏览数字段,每次有人访问文章就要加 1,如果在业务层写 `Post.findByIdAndUpdate(id, { $inc: { views: 1 } })`,很容易遗漏。用中间件可以自动处理。
 
-Query Hooks:
-  - find, findOne, updateOne, deleteOne
-  - count (支持正则匹配: /^find/)
+二是数据清理和转换。用户输入的邮箱可能大小写不一,文章内容可能包含危险的 HTML 标签,保存前需要统一处理。这些逻辑如果散落在各个接口,很容易被忽略。
 
-Model Hooks:
-  - insertMany, validate, bulkWrite
-```
+三是级联操作。删除用户时需要同时删除他的文章和评论,删除分类时需要更新相关文章的分类字段。用中间件可以自动执行这些操作,避免数据不一致。
 
-### Hook 执行顺序
+四是业务规则执行。比如不允许删除管理员用户、文章标题不能为空、用户名必须唯一等。这些验证逻辑可以在中间件中统一处理。
 
-```
-pre (前置钩子)
-  ↓
-操作 (save, find, update 等)
-  ↓
-post (后置钩子)
-```
+## 中间件的类型
 
-## 实战演练
+Mongoose 中间件分为两类:Document 中间件和 Query 中间件。
 
-### pre/post save Hooks
+Document 中间件针对文档实例操作,比如 `save`、`validate`。当你调用 `document.save()` 时会触发。这类中间件可以访问 `this` 指向的文档实例,能修改字段值或取消操作。
+
+Query 中间件针对查询操作,比如 `find`、`updateOne`、`deleteOne`。当你调用 `Model.find()` 或 `Model.updateOne()` 时会触发。这类中间件里的 `this` 是查询对象,不是文档实例。
+
+中间件还分为 pre(前置)和 post(后置)。pre 在操作执行前运行,可以修改数据或取消操作;post 在操作执行后运行,可以获取操作结果。
+
+执行顺序也有讲究。对于同一个操作,pre 中间件按定义顺序执行,post 中间件按倒序执行。而且 Document 中间件和 Query 中间件是独立的,互不影响。
+
+## Document 中间件
+
+先看 Document 中间件,最常用的是 `save` 和 `validate`。以我们 CMS 的用户 Schema 为例:
 
 ```typescript
+import { Schema, model } from "mongoose";
+import bcrypt from "bcrypt";
+
+const userSchema = new Schema({
+  username: { type: String, required: true },
+  email: { type: String, required: true },
+  password: { type: String, required: true },
+  updatedAt: { type: Date, default: Date.now },
+});
+
 // 自动更新时间戳
 userSchema.pre("save", function (next) {
-  this.updatedAt = new Date();
+  if (this.isModified()) {
+    this.updatedAt = new Date();
+  }
   next();
 });
 
-// 密码加密
+// 密码自动加密
 userSchema.pre("save", async function (next) {
+  // 只有密码被修改时才加密,避免重复加密
   if (!this.isModified("password")) {
     return next();
   }
 
-  const bcrypt = require("bcrypt");
   const salt = await bcrypt.genSalt(10);
   this.password = await bcrypt.hash(this.password, salt);
   next();
 });
 
-// 发送通知
+// 邮箱转小写,确保唯一性
+userSchema.pre("save", function (next) {
+  if (this.email) {
+    this.email = this.email.toLowerCase();
+  }
+  next();
+});
+```
+
+pre 中间件接收一个 `next` 参数,调用 `next()` 会继续执行后续中间件和操作;如果传入错误,会取消操作并触发错误处理。注意在异步操作中,要么使用 async/await,要么确保在异步完成后调用 `next()`。
+
+post 中间件可以获取操作完成后的文档,适合做一些不需要修改数据的后处理:
+
+```typescript
+// 用户注册后发送欢迎邮件
+userSchema.post("save", async function (doc, next) {
+  // wasNew 是 Mongoose 提供的标记,表示是否是新文档
+  if (doc.wasNew && doc.role === "user") {
+    await EmailService.sendWelcome(doc.email, doc.name);
+  }
+  next();
+});
+
+// 文章发布后发送通知
 postSchema.post("save", async function (doc, next) {
-  if (doc.status === "published") {
+  if (doc.status === "published" && doc.wasNew) {
     await Notification.create({
       type: "post_published",
       postId: doc._id,
       userId: doc.author,
+      message: `您的新文章《${doc.title}》已发布`,
     });
   }
   next();
 });
 ```
 
-### Query Hooks
+注意 post 中间件的第一个参数是操作完成的文档,而不是 `this`。`doc.isNew` 无法直接使用,但可以通过 `doc.wasNew` 这样的标记来判断是否是新文档。
+
+## Query 中间件
+
+Query 中间件在查询操作时触发,可以用来修改查询条件或添加默认过滤。最常用的场景是软删除,即在查询时自动过滤已删除的数据:
 
 ```typescript
-// 软删除过滤
+const postSchema = new Schema(
+  {
+    title: { type: String, required: true },
+    content: { type: String, required: true },
+    status: { type: String, enum: ["draft", "published"], default: "draft" },
+    deletedAt: { type: Date }, // 软删除标记
+  },
+  { timestamps: true }
+);
+
+// 软删除:所有 find 操作自动过滤已删除文档
+// /^find/ 正则匹配 find、findOne、findById 等所有查询
 postSchema.pre(/^find/, function (next) {
   this.where({ deletedAt: { $exists: false } });
   next();
 });
 
-// 更新时间
+// 更新时自动更新时间戳
 postSchema.pre("findOneAndUpdate", function (next) {
   this.set({ updatedAt: new Date() });
   next();
 });
 
-// 删除前验证
+// 删除前检查权限
 userSchema.pre(
   "deleteOne",
   { query: true, document: false },
   async function (next) {
     const user = await this.model.findOne(this.getFilter());
     if (user.role === "admin") {
-      next(new Error("Cannot delete admin user"));
+      next(new Error("无法删除管理员用户"));
     } else {
       next();
     }
@@ -106,72 +154,217 @@ userSchema.pre(
 );
 ```
 
-### 虚拟字段更新
+Query 中间件中的 `this` 是查询对象,不是文档实例。需要通过 `this.model.findOne()` 来获取文档。而且 `deleteOne` 这种操作需要明确指定 `{ query: true, document: false }`,因为默认情况下它可能被当作 Document 中间件处理。
+
+Query 中间件支持正则匹配,比如 `/^find/` 会匹配所有以 find 开头的查询(find、findOne、findById 等)。这样可以一次性为多个查询添加相同的行为。
+
+## 级联操作
+
+中间件很适合实现级联操作,比如删除用户时同时删除其文章,或者删除文章时同时删除相关评论。这在 CMS 系统中很常见:
 
 ```typescript
-// 评论计数器
-postSchema.virtual("commentCount").get(function () {
-  return this.comments.length;
+// 删除用户前删除其文章和评论
+userSchema.pre("deleteOne", { query: true }, async function (next) {
+  const user = await this.model.findOne(this.getFilter());
+
+  // 先删除用户的文章
+  await Post.deleteMany({ author: user._id });
+
+  // 再删除用户的评论
+  await Comment.deleteMany({ author: user._id });
+
+  next();
 });
 
-// 或使用钩子更新
-postSchema.post("save", async function (doc) {
-  await User.findByIdAndUpdate(doc.author, {
-    $inc: { postCount: 1 },
-  });
+// 删除文章时删除相关评论
+postSchema.pre("deleteOne", { query: true }, async function (next) {
+  const post = await this.model.findOne(this.getFilter());
+  await Comment.deleteMany({ postId: post._id });
+  next();
 });
-```
 
-## 最佳实践
+// 删除标签时更新相关文章
+tagSchema.pre("deleteOne", { query: true }, async function (next) {
+  const tag = await this.model.findOne(this.getFilter());
 
-### Hook 错误处理
+  // 从所有文章中移除这个标签
+  await Post.updateMany({ tags: tag.name }, { $pull: { tags: tag.name } });
 
-```typescript
-schema.pre("save", function (next) {
-  if (someCondition) {
-    next(new Error("Validation failed"));
-  } else {
-    next();
-  }
-});
-```
-
-### 异步 Hook
-
-```typescript
-schema.pre("save", async function (next) {
-  await doSomething();
   next();
 });
 ```
 
-## 常见问题
+这些级联操作保证了数据的一致性,避免了数据库中残留无法访问的关联数据。但也要注意性能问题,如果用户有大量文章,删除用户可能会很慢。这种情况下可以考虑用后台任务或软删除来替代。
 
-### Q1: Hook 中可以使用 this 吗？
+## 数据校验和清理
 
-**A**: 可以，但要注意：
-
-- pre Hook: this 是文档实例
-- post Hook: this 是已保存的文档
-
-### Q2: 如何跳过某些 Hook？
-
-**A**:
+中间件可以用于数据校验和清理,在数据保存前确保其符合业务规则:
 
 ```typescript
-const user = new User({ ... });
-await user.save({ validateBeforeSave: false });
+// 确保用户名唯一
+userSchema.pre("save", async function (next) {
+  if (!this.isModified("username")) {
+    return next();
+  }
+
+  const existingUser = await this.constructor.findOne({
+    username: this.username,
+    _id: { $ne: this._id }, // 排除自己
+  });
+
+  if (existingUser) {
+    next(new Error("用户名已被使用"));
+  } else {
+    next();
+  }
+});
+
+// 清理 HTML 标签(移除危险的 script 标签)
+postSchema.pre("save", function (next) {
+  if (this.content) {
+    // 移除 script 标签及其内容
+    // 注意: MDX 中避免直接写正则中的尖括号,这里用字符串拼接
+    const scriptPattern = "<script[^>]*>.*?</script>";
+    const scriptRegex = new RegExp(scriptPattern, "gi");
+    this.content = this.content.replace(scriptRegex, "");
+  }
+  next();
+});
+
+// 自动生成 slug
+postSchema.pre("save", function (next) {
+  if (!this.slug && this.title) {
+    this.slug = this.title
+      .toLowerCase()
+      .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, "-")
+      .replace(/^-+|-+$/g, ""); // 移除首尾的连字符
+  }
+  next();
+});
 ```
 
-## 总结
+这类中间件可以确保数据的完整性和安全性,避免脏数据进入数据库。但要注意不要在中间件中做太耗时的操作,否则会影响保存性能。比如检查用户名唯一性需要查询数据库,要确保有合适的索引。
 
-1. ✅ Document Hooks: save, validate
-2. ✅ Query Hooks: find, update, delete
-3. ✅ pre/post Hooks
-4. ✅ 错误处理和异步操作
+## 计数器缓存
 
-## 下一步
+中间件可以用来维护计数器,比如文章的评论数、用户的文章数等。这比每次都用 `countDocuments()` 查询要高效得多:
 
-下一篇文章将学习 **数据验证与插件**。
+```typescript
+const postSchema = new Schema({
+  title: String,
+  author: { type: Schema.Types.ObjectId, ref: "User" },
+  status: { type: String, enum: ["draft", "published"], default: "draft" },
+  commentCount: { type: Number, default: 0 },
+});
 
----
+const userSchema = new Schema({
+  username: String,
+  postCount: { type: Number, default: 0 },
+});
+
+// 文章保存时更新用户的文章计数
+postSchema.post("save", async function (doc, next) {
+  if (doc.status === "published") {
+    await User.findByIdAndUpdate(doc.author, { $inc: { postCount: 1 } });
+  }
+  next();
+});
+
+// 文章删除时更新计数
+postSchema.post("deleteOne", { query: true }, async function (next) {
+  const post = await this.model.findOne(this.getFilter());
+  if (post.status === "published") {
+    await User.findByIdAndUpdate(post.author, { $inc: { postCount: -1 } });
+  }
+  next();
+});
+
+// 评论添加时更新文章的评论计数
+commentSchema.post("save", async function (doc, next) {
+  await Post.findByIdAndUpdate(doc.postId, { $inc: { commentCount: 1 } });
+  next();
+});
+
+// 评论删除时更新计数
+commentSchema.post("deleteOne", { query: true }, async function (next) {
+  const comment = await this.model.findOne(this.getFilter());
+  await Post.findByIdAndUpdate(comment.postId, { $inc: { commentCount: -1 } });
+  next();
+});
+```
+
+这种方式需要在 Schema 中添加计数器字段,并通过中间件维护其值。虽然增加了复杂度,但查询性能会大幅提升,特别是对于频繁读取的数据。展示用户主页时直接读 `postCount` 字段,而不需要实时查询数据库统计文章数。
+
+## 错误处理
+
+中间件中的错误处理很重要。pre 中间件可以通过传递错误给 `next()` 来取消操作,post 中间件中的错误通常需要记录日志而不是抛出异常:
+
+```typescript
+// pre 中间件取消操作
+userSchema.pre("save", function (next) {
+  if (this.username.includes("admin")) {
+    next(new Error("用户名不能包含 admin"));
+  } else {
+    next();
+  }
+});
+
+// 处理错误
+try {
+  await user.save();
+} catch (error) {
+  if (error.message === "用户名不能包含 admin") {
+    // 返回友好的错误提示
+  }
+}
+
+// post 中间件记录错误
+postSchema.post("save", async function (doc, next) {
+  try {
+    await NotificationService.sendPostPublished(doc);
+  } catch (error) {
+    console.error("发送文章发布通知失败:", error);
+    // 不调用 next(error),避免影响保存操作
+    // 通知失败不应该导致文章保存失败
+  }
+  next();
+});
+```
+
+## Trade-off 分析
+
+中间件是 Mongoose 最强大的特性之一,但也要谨慎使用。让我们看看它的优缺点:
+
+**优势:**
+
+1. 代码复用。通用逻辑只需写一次,所有操作自动生效。比如时间戳更新,不需要在每个更新接口重复写。
+
+2. 数据一致性。级联删除、计数器维护等逻辑自动执行,不会因为开发者忘记而导致数据不一致。
+
+3. 关注点分离。业务逻辑和数据维护逻辑分离,业务代码更清晰。比如创建文章的接口只需关注业务逻辑,不用管时间戳和计数器。
+
+4. 灵活性。可以针对特定操作添加中间件,比如只在 `save` 时加密密码,不影响查询操作。
+
+**代价:**
+
+1. 性能开销。每次操作都会执行中间件,如果中间件中有耗时操作(如数据库查询、外部 API 调用),会影响性能。
+
+2. 调试困难。中间件是隐式执行的,出问题时不容易定位。特别是多个中间件串联时,难以判断是哪个环节出问题。
+
+3. 隐式行为。开发者可能不知道中间件的存在,导致意外的行为。比如查询为什么找不到某些文档,可能是因为软删除中间件自动过滤了。
+
+4. 测试复杂度。测试时需要考虑中间件的影响,可能需要 Mock 或禁用某些中间件。
+
+**使用建议:**
+
+1. 中间件适合处理通用的、跨领域的逻辑,比如时间戳、数据清理、默认值、软删除等。
+
+2. 业务相关的逻辑应该写在服务层或控制器中,这样代码更容易理解和维护。比如支付成功后的业务逻辑,不适合放在中间件里。
+
+3. 中间件中避免耗时操作,如果必须有,考虑用后台任务或消息队列异步处理。
+
+4. 给中间件加注释,说明其作用和触发条件,方便其他开发者理解。
+
+5. 关键业务逻辑不要过度依赖中间件,保持一定的显式调用,让代码更直观。
+
+下一篇我们将学习数据验证与插件,看看如何在 Mongoose 中构建更完善的数据验证体系,以及如何通过插件复用 Schema 逻辑。

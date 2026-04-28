@@ -9,104 +9,405 @@ series: "Mongoose 渐进式学习"
 seriesOrder: 11
 ---
 
-## 前言
+在上一篇文章中，我们学习了如何使用事务来保证跨集合操作的数据一致性。事务能处理运行时可能出现的数据不一致问题，但怎么知道我们的代码逻辑本身是正确的？怎么确保修改代码时没有破坏原有功能？这就需要测试。
 
-测试是确保代码质量的关键。本文将学习 Mongoose 应用的测试策略。
+想象这样一个场景：你正在为 CMS 系统添加一个新功能，不小心改动了文章查询的逻辑。如果没有测试，你可能要到生产环境才发现文章列表显示有问题，那时候就晚了。如果有完善的测试覆盖，这个问题在开发阶段就能被发现。
 
-## 测试环境
+测试是保证代码质量的重要手段。对于 Mongoose 这种数据层代码，我们需要测试 Schema 验证逻辑、CRUD 操作、复杂查询、事务处理等。让我们看看如何为 CMS 系统构建完整的测试体系。
 
-### mongodb-memory-server
+## 搭建测试环境
+
+测试 Mongoose 代码需要一个真实的 MongoDB 环境，但又不能直接使用开发或生产数据库。mongodb-memory-server 是一个很好的解决方案，它会在内存中启动一个真实的 MongoDB 实例，测试完成后自动清理，不影响任何真实数据。
+
+先安装必要的依赖：
 
 ```bash
-npm install --save-dev mongodb-memory-server @types/mongodb-memory-server
+npm install --save-dev mongodb-memory-server @types/jest jest ts-jest
 ```
 
-## 测试示例
-
-### Model 测试
+然后创建一个测试辅助文件，用于管理测试数据库的连接：
 
 ```typescript
+// tests/setup.ts
 import { MongoMemoryServer } from "mongodb-memory-server";
 import mongoose from "mongoose";
-import { User, IUser } from "../models/User";
+
+let mongoServer: MongoMemoryServer;
+
+export async function connect() {
+  mongoServer = await MongoMemoryServer.create();
+  const uri = mongoServer.getUri();
+
+  await mongoose.connect(uri);
+}
+
+export async function closeDatabase() {
+  await mongoose.connection.dropDatabase();
+  await mongoose.connection.close();
+  await mongoServer.stop();
+}
+
+export async function clearDatabase() {
+  const collections = mongoose.connection.collections;
+
+  for (const key in collections) {
+    await collections[key].deleteMany({});
+  }
+}
+```
+
+这段代码提供了三个辅助函数：connect 用于连接内存数据库，closeDatabase 用于断开连接并清理资源，clearDatabase 用于清空所有集合的数据。
+
+在 Jest 配置文件中指定这个 setup 文件，确保每个测试套件运行前都执行这些初始化操作：
+
+```typescript
+// jest.config.js
+module.exports = {
+  preset: "ts-jest",
+  testEnvironment: "node",
+  setupFilesAfterEnv: ["<rootDir>/tests/setup.ts"],
+  testMatch: ["**/tests/**/*.test.ts"],
+};
+```
+
+## 测试 Schema 验证逻辑
+
+Schema 验证是 Mongoose 的第一道防线，我们需要确保各种验证规则都能正确工作。为 CMS 系统的用户 Schema 编写测试：
+
+```typescript
+// tests/models/user.test.ts
+import { connect, closeDatabase, clearDatabase } from "../setup";
+import { User } from "../../src/models/User";
+import { ValidationError } from "mongoose";
 
 describe("User Model", () => {
-  let mongod: MongoMemoryServer;
-  let conn: typeof mongoose;
-
+  // 所有测试前连接数据库
   beforeAll(async () => {
-    mongod = await MongoMemoryServer.create();
-    conn = await mongoose.createConnection(mongod.getUri());
+    await connect();
+  });
+
+  // 每个测试后清空数据
+  afterEach(async () => {
+    await clearDatabase();
+  });
+
+  // 所有测试后关闭连接
+  afterAll(async () => {
+    await closeDatabase();
+  });
+
+  it("应该成功创建有效用户", async () => {
+    const validUser = {
+      username: "zhangsan",
+      email: "zhangsan@example.com",
+      password: "password123",
+    };
+
+    const user = await User.create(validUser);
+
+    expect(user.username).toBe("zhangsan");
+    expect(user.email).toBe("zhangsan@example.com");
+    expect(user.password).not.toBe("password123"); // 密码应该被哈希
+  });
+
+  it("应该拒绝无效的邮箱格式", async () => {
+    const invalidUser = {
+      username: "zhangsan",
+      email: "invalid-email",
+      password: "password123",
+    };
+
+    // expect 断言会抛出验证错误
+    await expect(User.create(invalidUser)).rejects.toThrow(ValidationError);
+  });
+
+  it("应该拒绝重复的用户名", async () => {
+    const userData = {
+      username: "zhangsan",
+      email: "zhangsan@example.com",
+      password: "password123",
+    };
+
+    await User.create(userData);
+
+    const duplicateUser = {
+      username: "zhangsan",
+      email: "lisi@example.com",
+      password: "password456",
+    };
+
+    await expect(User.create(duplicateUser)).rejects.toThrow();
+  });
+
+  it("应该拒绝太短的密码", async () => {
+    const invalidUser = {
+      username: "zhangsan",
+      email: "zhangsan@example.com",
+      password: "12345", // 少于 6 位
+    };
+
+    await expect(User.create(invalidUser)).rejects.toThrow(ValidationError);
+  });
+
+  it("应该正确验证密码", async () => {
+    const userData = {
+      username: "zhangsan",
+      email: "zhangsan@example.com",
+      password: "password123",
+    };
+
+    const user = await User.create(userData);
+
+    // 正确密码应该验证通过
+    const isValid = await user.comparePassword("password123");
+    expect(isValid).toBe(true);
+
+    // 错误密码应该验证失败
+    const isInvalid = await user.comparePassword("wrongpassword");
+    expect(isInvalid).toBe(false);
+  });
+});
+```
+
+这些测试覆盖了用户模型的主要验证逻辑：必填字段、邮箱格式、唯一性约束、密码长度、密码验证等。beforeAll、afterEach、afterAll 这些钩子确保了测试的隔离性，每个测试都在干净的数据环境中运行。
+
+## 测试 CRUD 操作
+
+除了验证逻辑，我们还需要测试 CRUD 操作是否正确工作。为 CMS 系统的文章模型编写集成测试：
+
+```typescript
+// tests/models/post.test.ts
+import { connect, closeDatabase, clearDatabase } from "../setup";
+import { Post } from "../../src/models/Post";
+import { User } from "../../src/models/User";
+
+describe("Post Model", () => {
+  beforeAll(async () => {
+    await connect();
+  });
+
+  afterEach(async () => {
+    await clearDatabase();
   });
 
   afterAll(async () => {
-    await conn.disconnect();
-    await mongod.stop();
+    await closeDatabase();
   });
 
-  it("should create user with valid data", async () => {
+  let userId: string;
+
+  beforeEach(async () => {
+    // 每个测试前创建一个测试用户
     const user = await User.create({
-      name: "张三",
-      email: "zhang@example.com",
+      username: "testuser",
+      email: "test@example.com",
       password: "password123",
     });
-
-    expect(user.name).toBe("张三");
-    expect(user.email).toBe("zhang@example.com");
+    userId = user._id.toString();
   });
 
-  it("should fail validation for invalid email", async () => {
-    await expect(
-      User.create({
-        name: "张三",
-        email: "invalid-email",
-        password: "password123",
-      })
-    ).rejects.toThrow();
+  it("应该成功创建文章", async () => {
+    const postData = {
+      title: "测试文章",
+      content: "这是测试内容",
+      author: userId,
+      status: "draft",
+    };
+
+    const post = await Post.create(postData);
+
+    expect(post.title).toBe("测试文章");
+    expect(post.author.toString()).toBe(userId);
+    expect(post.status).toBe("draft");
+    expect(post.views).toBe(0); // 默认值
   });
-});
-```
 
-### 集成测试
-
-```typescript
-describe("Post CRUD", () => {
-  it("should create and find post", async () => {
+  it("应该正确更新文章", async () => {
     const post = await Post.create({
-      title: "Test Post",
-      content: "Test content",
+      title: "原标题",
+      content: "原内容",
       author: userId,
     });
 
-    const found = await Post.findById(post.id);
-    expect(found.title).toBe("Test Post");
-  });
-
-  it("should update post", async () => {
-    await Post.findByIdAndUpdate(
-      postId,
-      { $set: { title: "Updated" } },
+    const updated = await Post.findByIdAndUpdate(
+      post._id,
+      {
+        $set: {
+          title: "新标题",
+          status: "published",
+        },
+      },
       { new: true }
     );
 
-    const updated = await Post.findById(postId);
-    expect(updated.title).toBe("Updated");
+    expect(updated.title).toBe("新标题");
+    expect(updated.status).toBe("published");
+  });
+
+  it("应该正确查询作者的文章", async () => {
+    // 创建另一位用户
+    const otherUser = await User.create({
+      username: "otheruser",
+      email: "other@example.com",
+      password: "password123",
+    });
+
+    // 创建两篇文章
+    await Post.create({
+      title: "文章1",
+      content: "内容1",
+      author: userId,
+      status: "published",
+    });
+
+    await Post.create({
+      title: "文章2",
+      content: "内容2",
+      author: otherUser._id,
+      status: "published",
+    });
+
+    // 查询第一位用户的文章
+    const userPosts = await Post.find({
+      author: userId,
+      status: "published",
+    });
+
+    expect(userPosts).toHaveLength(1);
+    expect(userPosts[0].title).toBe("文章1");
+  });
+
+  it("应该正确增加浏览量", async () => {
+    const post = await Post.create({
+      title: "测试文章",
+      content: "内容",
+      author: userId,
+    });
+
+    // 使用原子操作增加浏览量
+    await Post.findByIdAndUpdate(post._id, { $inc: { views: 1 } });
+
+    const updated = await Post.findById(post._id);
+    expect(updated.views).toBe(1);
+
+    // 再次增加
+    await Post.findByIdAndUpdate(post._id, { $inc: { views: 5 } });
+
+    const final = await Post.findById(post._id);
+    expect(final.views).toBe(6);
   });
 });
 ```
 
-## 最佳实践
+这些测试覆盖了文章的创建、更新、查询、字段更新等操作。通过 beforeEach 钩子创建测试数据，确保每个测试都在一致的初始状态下运行。
 
-1. ✅ 使用内存数据库测试
-2. ✅ 测试验证逻辑
-3. � Mock 外部依赖
-4. ✅ 测试覆盖率目标
+## 测试事务逻辑
 
-## 总结
+事务是相对复杂的功能，需要特别测试错误处理和回滚逻辑：
 
-1. ✅ 测试环境搭建
-2. ✅ Model 测试
-3. ✅ CRUD 测试
-4. ✅ 测试最佳实践
+```typescript
+// tests/integration/subscription.test.ts
+import { connect, closeDatabase, clearDatabase } from "../setup";
+import { User } from "../../src/models/User";
+import { Plan } from "../../src/models/Plan";
+import { Subscription } from "../../src/models/Subscription";
+import { subscribeUser } from "../../src/services/subscription";
 
----
+describe("Subscription Service", () => {
+  beforeAll(async () => {
+    await connect();
+  });
+
+  afterEach(async () => {
+    await clearDatabase();
+  });
+
+  afterAll(async () => {
+    await closeDatabase();
+  });
+
+  let planId: string;
+  let userId: string;
+
+  beforeEach(async () => {
+    // 创建测试套餐
+    const plan = await Plan.create({
+      name: "月度会员",
+      price: 29.99,
+      duration: 30,
+    });
+    planId = plan._id.toString();
+
+    // 创建测试用户
+    const user = await User.create({
+      username: "testuser",
+      email: "test@example.com",
+      password: "password123",
+      balance: 100,
+    });
+    userId = user._id.toString();
+  });
+
+  it("应该成功订阅并扣费", async () => {
+    const result = await subscribeUser(userId, planId);
+
+    expect(result.success).toBe(true);
+
+    // 检查用户余额是否正确扣除
+    const user = await User.findById(userId);
+    expect(user.balance).toBe(70.01); // 100 - 29.99
+
+    // 检查订阅记录是否创建
+    const subscriptions = await Subscription.find({ user: userId });
+    expect(subscriptions).toHaveLength(1);
+    expect(subscriptions[0].status).toBe("active");
+  });
+
+  it("余额不足时订阅失败", async () => {
+    // 修改用户余额为不足状态
+    await User.findByIdAndUpdate(userId, { balance: 10 });
+
+    await expect(subscribeUser(userId, planId)).rejects.toThrow("余额不足");
+
+    // 检查订阅记录未创建
+    const subscriptions = await Subscription.find({ user: userId });
+    expect(subscriptions).toHaveLength(0);
+
+    // 检查余额未变动
+    const user = await User.findById(userId);
+    expect(user.balance).toBe(10);
+  });
+
+  it("套餐不存在时订阅失败", async () => {
+    const invalidPlanId = "507f1f77bcf86cd799439011";
+
+    await expect(subscribeUser(userId, invalidPlanId)).rejects.toThrow(
+      "套餐不存在"
+    );
+  });
+});
+```
+
+事务测试的关键在于验证"要么全部成功，要么全部失败"的特性。余额不足时，不仅订阅记录不应该创建，用户余额也不应该变动。
+
+## 测试最佳实践
+
+编写测试时，有几个最佳实践值得遵循：
+
+第一，保持测试独立性。每个测试应该能独立运行，不依赖其他测试的执行顺序。使用 beforeEach 和 afterEach 钩子确保每个测试在干净的初始状态下运行。
+
+第二，测试命名要清晰。测试名称应该描述测试的内容和期望结果，比如"应该成功创建有效用户"、"应该拒绝无效的邮箱格式"。这样当测试失败时，能快速定位问题。
+
+第三，只测试公共接口。不要测试内部实现细节，只测试模块对外暴露的 API。内部实现改变时，测试不应该需要修改。
+
+第四，使用真实的数据。测试数据要贴近真实场景，比如用户邮箱要用真实的格式，文章标题要符合实际长度。这样才能发现实际问题。
+
+第五，注意异步测试。Mongoose 的操作都是异步的，记得使用 async/await 或返回 Promise。否则测试可能在数据库操作完成前就结束了。
+
+## 权衡与取舍
+
+测试能显著提升代码质量和开发信心，但也需要投入时间编写和维护。对于小型项目，可能不需要达到 100% 的测试覆盖率。建议优先测试核心业务逻辑和复杂查询，这些地方的 bug 代价最高。
+
+测试也需要维护成本。代码重构时，测试代码也需要相应修改。但这个成本是值得的，好的测试能让你更放心地重构，而不必担心破坏原有功能。
+
+下一篇文章是这个系列的最后一篇，我们会讨论如何将 CMS 系统部署到生产环境，包括 MongoDB Atlas 配置、连接优化、监控告警等实战内容。

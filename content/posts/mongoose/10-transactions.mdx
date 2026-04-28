@@ -9,85 +9,252 @@ series: "Mongoose 渐进式学习"
 seriesOrder: 10
 ---
 
-## 前言
+在上一篇文章中，我们通过索引设计优化了 CMS 系统的查询性能，让原本需要几秒的查询现在能毫秒级返回。但性能优化只能解决单点操作的问题，当业务涉及多个文档、多个集合的协同操作时，就会遇到新的挑战。
 
-MongoDB 4.0+ 支持多文档 ACID 事务。本文将学习事务使用和并发控制。
+想象这样一个场景：用户订阅了你的 CMS 平台的付费服务，需要同时更新用户余额、创建订阅记录、发送确认邮件。如果在更新余额后系统突然崩溃，订阅记录还没创建，用户的钱扣了但服务没开通，这就是严重的数据不一致问题。
 
-## 事务基础
+传统关系型数据库用事务来解决这个问题，MongoDB 从 4.0 版本开始也支持多文档 ACID 事务。让我们看看如何在 CMS 系统中使用事务来保证数据一致性。
 
-### 开启事务
+## 理解 MongoDB 事务
 
-```typescript
-const session = await mongoose.startSession();
-session.startTransaction();
+事务的核心是保证一组操作要么全部成功，要么全部失败，不会出现中间状态。MongoDB 事务基于会话（Session）机制，所有在同一个会话中的操作都属于同一个事务。
 
-try {
-  // 操作
-  await session.commitTransaction();
-} catch (error) {
-  await session.abortTransaction();
-  throw error;
-} finally {
-  session.endSession();
-}
-```
+但使用 MongoDB 事务有几个前提条件：首先，必须使用副本集部署模式（单节点不支持事务）；其次，事务中的操作必须是同一分片上的文档（对于分片集群）。对于大多数中小型应用，使用 MongoDB Atlas 的副本集就能满足要求。
 
-### withTransaction
+看看如何在 CMS 系统中实现一个简单的订阅功能：
 
 ```typescript
-const session = await mongoose.startSession();
+import mongoose from "mongoose";
 
-try {
-  await session.withTransaction(async () => {
+// 用户订阅服务的完整流程
+async function subscribeUser(userId: string, planId: string) {
+  // 1. 创建会话并开启事务
+  const session = await mongoose.startSession();
+
+  try {
+    session.startTransaction();
+
+    // 2. 查询套餐价格
+    const plan = await Plan.findById(planId).session(session);
+    if (!plan) {
+      throw new Error("套餐不存在");
+    }
+
+    // 3. 检查用户余额
     const user = await User.findById(userId).session(session);
-    user.balance -= amount;
+    if (!user || user.balance < plan.price) {
+      throw new Error("余额不足");
+    }
+
+    // 4. 扣除用户余额
+    user.balance -= plan.price;
     await user.save({ session });
 
-    await Transaction.create([{ userId, amount }], { session });
-  });
-} finally {
-  session.endSession();
+    // 5. 创建订阅记录
+    const subscription = await Subscription.create(
+      [
+        {
+          user: userId,
+          plan: planId,
+          price: plan.price,
+          status: "active",
+          startDate: new Date(),
+          endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 天后
+        },
+      ],
+      { session }
+    );
+
+    // 6. 记录交易日志
+    await Transaction.create(
+      [
+        {
+          user: userId,
+          type: "subscription",
+          amount: -plan.price,
+          description: `订阅 ${plan.name}`,
+          relatedSubscription: subscription[0]._id,
+        },
+      ],
+      { session }
+    );
+
+    // 7. 提交事务
+    await session.commitTransaction();
+
+    return { success: true, subscription: subscription[0] };
+  } catch (error) {
+    // 发生错误时回滚事务
+    await session.abortTransaction();
+    throw error;
+  } finally {
+    // 8. 结束会话
+    session.endSession();
+  }
 }
 ```
 
-## 并发控制
+这段代码实现了一个完整的订阅流程，涉及用户、订阅、交易三个集合的操作。如果任何一步失败，整个事务都会回滚，不会出现数据不一致的情况。
 
-### 乐观锁
+有个细节要注意：使用 create 方法时，需要传入数组格式 `[{ ...data }]` 而不是直接传对象，这样才能正确地传入 session 选项。
+
+## 使用 withTransaction 简化事务处理
+
+手动管理事务的生命周期容易出错，Mongoose 提供了 withTransaction 方法来自动处理提交和回滚：
 
 ```typescript
-productSchema.pre("save", function (next) {
-  if (!this.isNew) {
-    this.increment();
+async function subscribeUser(userId: string, planId: string) {
+  const session = await mongoose.startSession();
+
+  try {
+    return await session.withTransaction(async () => {
+      // 事务内的所有操作
+      const plan = await Plan.findById(planId).session(session);
+      const user = await User.findById(userId).session(session);
+
+      if (!user || user.balance < plan.price) {
+        throw new Error("余额不足");
+      }
+
+      user.balance -= plan.price;
+      await user.save({ session });
+
+      const subscription = await Subscription.create(
+        [
+          {
+            user: userId,
+            plan: planId,
+            price: plan.price,
+            status: "active",
+            startDate: new Date(),
+            endDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
+          },
+        ],
+        { session }
+      );
+
+      await Transaction.create(
+        [
+          {
+            user: userId,
+            type: "subscription",
+            amount: -plan.price,
+            description: `订阅 ${plan.name}`,
+            relatedSubscription: subscription[0]._id,
+          },
+        ],
+        { session }
+      );
+
+      return { success: true, subscription: subscription[0] };
+    });
+  } finally {
+    session.endSession();
   }
-  next();
+}
+```
+
+withTransaction 会自动处理提交和回滚，如果回调函数执行成功就提交，抛出异常就回滚。它还内置了重试机制，遇到瞬时网络错误会自动重试。
+
+## 处理并发冲突
+
+当多个用户同时操作同一份数据时，可能会出现并发冲突。比如文章浏览量统计，两个用户同时访问同一篇文章，都读取到当前浏览量是 100，各自加 1 后写入，结果浏览量变成了 101 而不是正确的 102。
+
+MongoDB 提供了原子更新操作符来解决这个问题：
+
+```typescript
+// 不好的做法：读取-修改-写入（存在并发问题）
+const post = await Post.findById("post_a1b2c3d4");
+post.views += 1;
+await post.save(); // 可能并发冲突
+
+// 好的做法：使用原子更新操作符
+await Post.findByIdAndUpdate(
+  "post_a1b2c3d4",
+  { $inc: { views: 1 } } // 原子操作，不会并发冲突
+);
+```
+
+$inc 是原子操作符，MongoDB 会保证这个操作在数据库层面是原子的，不会受到并发影响。
+
+但对于更复杂的场景，比如库存扣减，就需要使用版本号或时间戳来实现乐观锁：
+
+```typescript
+// 商品 Schema 增加版本号字段
+const productSchema = new Schema({
+  name: String,
+  stock: { type: Number, min: 0 },
+  version: { type: Number, default: 0 },
 });
 
-const product = await Product.findById(id);
-product.stock -= quantity;
-await product.save(); // version 冲突会失败
+// 购买商品时检查版本号
+async function purchaseProduct(productId: string, quantity: number) {
+  const session = await mongoose.startSession();
+
+  try {
+    return await session.withTransaction(async () => {
+      const product = await Product.findById(productId).session(session);
+
+      if (!product || product.stock < quantity) {
+        throw new Error("库存不足");
+      }
+
+      // 使用 version 字段实现乐观锁
+      const result = await Product.findOneAndUpdate(
+        {
+          _id: productId,
+          version: product.version, // 确保数据未被其他事务修改
+        },
+        {
+          $inc: { stock: -quantity, version: 1 },
+        },
+        { session, new: true }
+      );
+
+      if (!result) {
+        throw new Error("商品信息已变更，请重试");
+      }
+
+      // 创建订单
+      await Order.create(
+        [
+          {
+            product: productId,
+            quantity,
+            price: result.price,
+          },
+        ],
+        { session }
+      );
+
+      return { success: true };
+    });
+  } finally {
+    session.endSession();
+  }
+}
 ```
 
-### 悲观锁
+这段代码通过 version 字段实现了乐观锁：更新时检查 version 是否变化，如果变化说明数据被其他事务修改过，需要重试。
 
-```typescript
-const doc = await Model.findById(id).session(session).exec();
-await doc.lock();
-// 操作
-await doc.save();
-```
+## 事务的局限性和最佳实践
 
-## 最佳实践
+MongoDB 事务虽然强大，但也有一些限制需要注意。首先，事务中的操作不能创建或删除集合，只能对已存在的集合进行增删改查。其次，事务有大小限制，单个事务不能超过 16MB，执行时间不能过长（默认 60 秒）。
 
-1. ✅ 事务尽可能短小
-2. ✅ 使用重试逻辑
-3. ✅ 注意性能影响
-4. ✅ 错误处理和回滚
+在实际使用中，建议遵循以下最佳实践：
 
-## 总结
+第一，事务尽可能短小。不要在事务中执行耗时操作，比如调用外部 API、发送邮件等。这些操作应该在事务外完成。
 
-1. ✅ ACID 事务
-2. ✅ 并发控制
-3. ✅ 乐观锁和悲观锁
-4. ✅ 错误处理
+第二，避免在事务中查询大量数据。事务中的查询会占用锁，影响其他事务的执行。
 
----
+第三，合理设计数据模型，减少跨集合操作。如果可能的话，把相关数据嵌入到同一个文档中，这样就不需要事务了。
+
+比如在 CMS 系统中，文章的浏览量统计、评论数统计，可以用原子更新操作符解决，不需要事务。只有涉及资金、订单等核心业务时才需要事务的强一致性保证。
+
+## 权衡与取舍
+
+事务提供了数据一致性保证，但也带来了性能开销和复杂度提升。事务中的操作会锁定文档，影响并发性能；事务代码也比普通代码更复杂，需要仔细处理错误和回滚。
+
+在实际项目中，不是所有场景都需要事务。对于 CMS 系统这种读多写少的应用，大多数操作不需要事务。只有在涉及多个集合的强一致性场景，比如支付、订单、权限变更等，才需要使用事务。
+
+下一篇文章我们会讨论另一个重要话题：如何为 Mongoose 代码编写测试，确保我们的数据层逻辑正确可靠。
