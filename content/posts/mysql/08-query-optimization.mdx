@@ -1,6 +1,7 @@
 ---
 title: "08 查询优化实战"
 date: "2026-03-23"
+summary: "从电商系统三个真实慢查询出发，用 EXPLAIN 诊断问题，逐一解决深分页、LIKE 全表扫描、子查询低效等痛点，并介绍全文索引、批量操作、分区表等进阶手段。"
 tags: ["MySQL"]
 category: "mysql"
 cover: ""
@@ -9,383 +10,413 @@ series: "MySQL 渐进式学习指南"
 seriesOrder: 8
 ---
 
-## 前言
+上一篇我们搞清楚了事务和锁——用 COMMIT/ROLLBACK 保证下单操作的原子性，用行锁和间隙锁防止并发扣库存时的数据错乱。但你现在面临的是另一个维度的问题：锁和事务解决的是"数据对不对"，而查询优化要解决的是"查询快不快"。
 
-查询优化是数据库性能调优的核心环节。一个优化良好的查询可以比原始查询快几十倍甚至上百倍。
+你负责的电商系统上线半年了。运营那边反馈了三个问题：订单管理后台翻到第 500 页要等 3 秒、商品搜索框输入关键词后转圈转半天、每日销售统计报表越跑越慢，从最初 2 秒变成了 30 秒。表上有索引，但就是快不起来。
 
-本文将系统介绍查询优化的各种技巧和实战方法。
+这篇文章我们就围绕这三个真实场景，用 EXPLAIN 逐个诊断，逐个优化。你读完之后会对"查询优化到底在优化什么"有一个系统的认知。
 
-## EXPLAIN 详解
+## 第一步：打开慢查询日志，找到罪魁祸首
 
-### 基本用法
-
-```sql
--- 分析查询执行计划
-EXPLAIN SELECT * FROM users WHERE id = 1;
-
--- 关键列说明：
--- id          - 查询序列号
--- select_type - 查询类型
--- table       - 访问的表
--- type        - 访问类型（最重要）
--- possible_keys - 可能使用的索引
--- key         - 实际使用的索引
--- key_len     - 使用的索引长度
--- ref         - 索引比较的列
--- rows        - 预计扫描的行数
--- Extra       - 额外信息
-```
-
-### type 字段（访问类型）
-
-性能从差到好排序：
-
-```sql
--- ALL：全表扫描（最差）
-EXPLAIN SELECT * FROM users WHERE username LIKE '%user%';
-
--- index：索引扫描（全索引）
-EXPLAIN SELECT id FROM users;
-
--- range：范围扫描
-EXPLAIN SELECT * FROM users WHERE id BETWEEN 1 AND 100;
-
--- ref：非唯一索引查找
-EXPLAIN SELECT * FROM users WHERE email = 'user@example.com';
-
--- eq_ref：唯一索引查找
-EXPLAIN SELECT * FROM users u JOIN orders o ON u.id = o.user_id;
-
--- const：主键或唯一索引（最好）
-EXPLAIN SELECT * FROM users WHERE id = 1;
-```
-
-### Extra 字段
-
-```sql
--- Using index：使用了覆盖索引（好）
-EXPLAIN SELECT user_id FROM orders WHERE user_id = 1;
-
--- Using where：使用了 WHERE 过滤
-EXPLAIN SELECT * FROM users WHERE age > 25;
-
--- Using filesort：需要文件排序（避免）
-EXPLAIN SELECT * FROM users ORDER BY age;
-
--- Using temporary：使用临时表（避免）
-EXPLAIN SELECT status, COUNT(*) FROM orders GROUP BY status ORDER BY COUNT(*);
-```
-
-## 查询优化技巧
-
-### 1. 避免 SELECT \*
-
-```sql
--- ❌ 避免
-SELECT * FROM users WHERE id = 1;
-
--- ✅ 推荐
-SELECT id, username, email FROM users WHERE id = 1;
--- 原因：
--- 1. 减少网络传输
--- 2. 减少内存占用
--- 3. 可以使用覆盖索引
-```
-
-### 2. 避免 SELECT DISTINCT
-
-```sql
--- ❌ 避免
-SELECT DISTINCT user_id FROM orders;
-
--- ✅ 改写
-SELECT user_id FROM orders GROUP BY user_id;
-```
-
-### 3. 优化 JOIN
-
-```sql
--- ❌ 避免 JOIN 太多表
-SELECT * FROM a
-JOIN b ON ...
-JOIN c ON ...
-JOIN d ON ...
-JOIN e ON ...
-
--- ✅ 建议：
--- 1. JOIN 不超过 5 个
--- 2. 小表驱动大表
--- 3. 确保 JOIN 字段有索引
-
--- ✅ 优化：先过滤再 JOIN
-SELECT u.*, o.*
-FROM users u
-INNER JOIN orders o ON u.id = o.user_id
-WHERE o.status = 'completed';
-
--- ✅ 更好：先过滤再 JOIN
-SELECT u.*, o.*
-FROM users u
-INNER JOIN (SELECT * FROM orders WHERE status = 'completed') o ON u.id = o.user_id;
-```
-
-### 4. 优化子查询
-
-```sql
--- ❌ 避免：相关子查询
-SELECT u.*, (
-  SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id
-) AS order_count
-FROM users u;
-
--- ✅ 改写：JOIN
-SELECT
-  u.*,
-  COUNT(o.id) AS order_count
-FROM users u
-LEFT JOIN orders o ON u.id = o.user_id
-GROUP BY u.id;
-```
-
-### 5. 优化 ORDER BY
-
-```sql
--- ❌ filesort
-SELECT * FROM orders ORDER BY user_id;
-
--- ✅ 使用索引
-CREATE INDEX idx_user_id_created ON orders(user_id, created_at);
-SELECT * FROM orders WHERE user_id = 1 ORDER BY created_at;
-
--- ✅ 限制排序数据量
-SELECT * FROM orders ORDER BY created_at DESC LIMIT 20;
-```
-
-### 6. 优化 GROUP BY
-
-```sql
--- ❌ Using filesort
-SELECT user_id, COUNT(*) FROM orders GROUP BY user_id ORDER BY COUNT(*);
-
--- ✅ 使用索引
-CREATE INDEX idx_user_id ON orders(user_id);
-SELECT user_id, COUNT(*) FROM orders GROUP BY user_id;
-
--- ✅ 减少分组数据
-SELECT user_id, COUNT(*) FROM orders
-WHERE status = 'completed'
-GROUP BY user_id;
-```
-
-## 分区表
-
-对大表进行水平分割。
-
-### 分区类型
-
-```sql
--- RANGE 分区
-CREATE TABLE orders (
-  id BIGINT,
-  user_id BIGINT,
-  created_at DATE,
-  PRIMARY KEY (id, created_at)
-) PARTITION BY RANGE (YEAR(created_at)) (
-  PARTITION p2023 VALUES LESS THAN (2024),
-  PARTITION p2024 VALUES LESS THAN (2025),
-  PARTITION p2025 VALUES LESS THAN (2026)
-);
-
--- 查询只扫描相关分区
-SELECT * FROM orders WHERE created_at >= '2024-01-01';
-
--- 分区管理
-ALTER TABLE orders DROP PARTITION p2023;  -- 删除分区
-ALTER TABLE orders ADD PARTITION (
-  PARTITION p2026 VALUES LESS THAN (2027)
-);
-```
-
-### 分区表限制
-
-```sql
--- ⚠️ 分区表限制：
--- 1. 主键必须包含分区键
--- 2. 外键不支持
--- 3. 所有分区必须使用相同存储引擎
--- 4. 分区键必须是整数类型或函数
-```
-
-## 配置优化
-
-### 重要参数
-
-```sql
--- InnoDB Buffer Pool（最重要的参数）
-SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
--- 建议：物理内存的 50-70%
-SET GLOBAL innodb_buffer_pool_size = 4294967296;  -- 4GB
-
--- 连接数
-SHOW VARIABLES LIKE 'max_connections';
-SET GLOBAL max_connections = 500;
-
--- 查询缓存（MySQL 8.0 已移除）
--- MySQL 5.7 及以下可以设置
--- SET GLOBAL query_cache_size = 268435456;
-
--- 临时表大小
-SHOW VARIABLES LIKE 'tmp_table_size';
-SET GLOBAL tmp_table_size = 268435456;
-
--- my.cnf 配置示例
-[mysqld]
-innodb_buffer_pool_size = 4G
-max_connections = 500
-tmp_table_size = 256M
-max_heap_table_size = 256M
-```
-
-## 优化案例
-
-### 案例1：慢查询优化
-
-```sql
--- 原始查询（3秒）
-SELECT
-  u.username,
-  o.order_no,
-  oi.product_id,
-  p.name AS product_name
-FROM users u
-INNER JOIN orders o ON u.id = o.user_id
-INNER JOIN order_items oi ON o.id = oi.order_id
-INNER JOIN products p ON oi.product_id = p.id
-WHERE u.city = '北京'
-  AND o.status = 'completed'
-  AND o.created_at >= '2024-01-01';
-
--- EXPLAIN 分析
--- type: ALL（全表扫描）
--- rows: 1000000
-
--- 优化方案：
--- 1. 添加索引
-CREATE INDEX idx_city ON users(city);
-CREATE INDEX idx_status_created ON orders(status, created_at);
-CREATE INDEX idx_order_id ON order_items(order_id);
-CREATE INDEX idx_product_id ON order_items(product_id);
-
--- 2. 优化查询
-SELECT
-  u.username,
-  o.order_no,
-  oi.product_id,
-  p.name AS product_name
-FROM users u
-INNER JOIN orders o ON u.id = o.user_id
-  AND o.status = 'completed'
-  AND o.created_at >= '2024-01-01'
-INNER JOIN order_items oi ON o.id = oi.order_id
-INNER JOIN products p ON oi.product_id = p.id
-WHERE u.city = '北京';
-
--- 结果：0.05秒（提升60倍）
-```
-
-### 案例2：分页优化
-
-```sql
--- 深分页问题
-SELECT * FROM orders ORDER BY created_at DESC LIMIT 1000000, 20;
--- 耗时：10秒
-
--- 优化方案1：使用上一次的最大ID
-SELECT * FROM orders
-WHERE id > 1000000
-ORDER BY id ASC
-LIMIT 20;
-
--- 优化方案2：延迟关联
-SELECT o.* FROM orders o
-INNER JOIN (
-  SELECT id FROM orders ORDER BY created_at DESC LIMIT 1000000, 20
-) tmp ON o.id = tmp.id;
-
--- 结果：0.1秒（提升100倍）
-```
-
-## 最佳实践
-
-### 1. 使用 EXPLAIN 分析
-
-```sql
--- ✅ 执行前先分析
-EXPLAIN SELECT * FROM users WHERE email = 'user@example.com';
-
--- ✅ 关注 type、key、rows、Extra
-```
-
-### 2. 定期分析慢查询
+优化查询之前，你得先知道哪些查询慢。靠猜是不行的，MySQL 提供了慢查询日志（Slow Query Log），自动记录执行时间超过阈值的 SQL。
 
 ```sql
 -- 开启慢查询日志
 SET GLOBAL slow_query_log = 'ON';
+
+-- 设置阈值：执行超过 1 秒的查询都会被记录
 SET GLOBAL long_query_time = 1;
 
--- 使用 pt-query-digest 分析
--- shell
+-- 查看日志文件位置
+SHOW VARIABLES LIKE 'slow_query_log_file';
+```
+
+开启后，执行时间超过 1 秒的查询会被写入日志文件。但日志里可能积累了成千上万条慢查询，手动翻不现实。推荐用 Percona 提供的 `pt-query-digest` 工具来做汇总分析：
+
+```bash
+# 按总执行时间排序，输出 Top 10 慢查询
 pt-query-digest slow-query.log > report.txt
 ```
 
-### 3. 使用 SHOW PROFILE
+它会告诉你哪些 SQL 执行次数最多、累计耗时最长、扫描了多少行。拿到这份报告，你就知道该优先优化哪条查询了。
+
+为什么要关注这个？因为在实际项目中，80% 的性能问题来自 20% 的查询。你不需要优化每一条 SQL，只需要找到那几条最慢的，集中火力解决它们。
+
+## EXPLAIN：查询优化的听诊器
+
+拿到慢查询之后，下一步是用 EXPLAIN 分析它的执行计划。上一篇我们介绍索引时简单用过 EXPLAIN，这次我们把它每个字段都搞透。
+
+在你要优化的 SQL 前面加上 `EXPLAIN`，MySQL 不会真正执行这条查询，而是返回一张执行计划表：
 
 ```sql
--- 启用 profiling
-SET profiling = 1;
-
--- 执行查询
-SELECT * FROM users WHERE email = 'user@example.com';
-
--- 查看性能分析
-SHOW PROFILES;
-SHOW PROFILE FOR QUERY 1;
+EXPLAIN
+SELECT o.order_no, o.total_amount, u.username
+FROM orders o
+JOIN users u ON o.user_id = u.id
+WHERE o.status = 'completed' AND o.created_at >= '2024-01-01';
 ```
 
-## 总结
+执行计划返回 12 列信息，其中最关键的 4 列：
 
-本文介绍了查询性能优化，主要内容：
+**type —— 访问类型**，这是判断查询效率最重要的指标。从好到差的排序：
 
-**EXPLAIN 分析**：
+| type 值      | 含义                                | 性能 |
+| ------------ | ----------------------------------- | ---- |
+| system/const | 主键或唯一索引等值查询，最多一行    | 极好 |
+| eq_ref       | JOIN 时通过主键或唯一索引关联       | 很好 |
+| ref          | 普通索引等值查询                    | 好   |
+| range        | 索引范围扫描（BETWEEN、&gt;、&lt;） | 还行 |
+| index        | 全索引扫描（扫描整棵索引树）        | 较差 |
+| ALL          | 全表扫描                            | 差   |
 
-- ✅ type 字段：访问类型
-- ✅ key 字段：使用的索引
-- ✅ rows 字段：扫描行数
-- ✅ Extra 字段：额外信息
+你的目标是让每张表的 type 至少达到 ref 级别。如果看到 ALL，就要考虑加索引或改写查询了。
 
-**优化技巧**：
+**key —— 实际用到了哪个索引**。如果显示 NULL，说明 MySQL 没有使用任何索引，需要排查原因。注意 `possible_keys` 列列出了"可能用到的索引"，但 MySQL 最终可能因为成本估算而选择不用。
 
-- ✅ 避免 SELECT \*
-- ✅ 优化 JOIN
-- ✅ 优化子查询
-- ✅ 优化 ORDER BY / GROUP BY
+**rows —— 预估扫描行数**。这个数字越小越好。它不是精确值，是 MySQL 基于统计信息的估算，但能帮你判断查询的大致代价。扫描 100 行和扫描 100 万行，性能差距是量级的。
 
-**高级技术**：
+**Extra —— 额外信息**，这里面藏着很多线索：
 
-- ✅ 分区表
-- ✅ 配置参数优化
-- ✅ 慢查询分析
+- `Using index`：覆盖索引，查询所需的所有列都在索引中，不需要回表。这是好现象。
+- `Using where`：MySQL 在存储引擎返回数据后，还需要在 Server 层做 WHERE 过滤。通常意味着扫描了过多行。
+- `Using filesort`：需要额外的排序操作，无法利用索引的有序性。数据量大时会很慢。
+- `Using temporary`：使用了临时表，常见于 GROUP BY 和 DISTINCT。需要关注。
 
-掌握查询优化后，任何慢查询都能找到优化方案。接下来我们将学习事务与锁机制。
+看到 `Using filesort` 或 `Using temporary` 时不要慌，它们不代表一定有问题。但如果同时出现 rows 很大，就要警惕了。
 
-## 下一步
+## 场景一：订单分页 —— 第 500 页为什么要 3 秒？
 
-在下一篇文章《11 事务与锁机制》中，我们将学习：
+先看第一个慢查询。订单管理后台的分页查询，前面几页秒开，翻到第 500 页就要 3 秒。
 
-- 事务 ACID 特性
-- 事务隔离级别
-- 锁类型与机制
-- 死锁处理
-- 并发控制最佳实践
+### 问题诊断
 
----
+```sql
+SELECT id, order_no, total_amount, status, created_at
+FROM orders
+WHERE status = 'completed'
+ORDER BY created_at DESC
+LIMIT 10000, 20;
+```
+
+加上 EXPLAIN 看看：
+
+```sql
+EXPLAIN SELECT id, order_no, total_amount, status, created_at
+FROM orders
+WHERE status = 'completed'
+ORDER BY created_at DESC
+LIMIT 10000, 20;
+```
+
+结果：`type: ref`（走了 status 索引），`rows: 50000`，`Extra: Using filesort`。问题出在两件事：
+
+第一，MySQL 需要先通过 status 索引找到所有"已完成"的订单（假设有 5 万条），然后对这些数据按 `created_at` 排序（filesort），最后跳过前 10000 行，只取 20 条。也就是说，为了拿到 20 条数据，MySQL 排序了 5 万条记录。
+
+第二，`LIMIT 10000, 20` 的语义是"跳过前 10000 行，取接下来的 20 行"。MySQL 必须先找到并跳过前 10000 行，不管你用什么索引，这 10000 行都得走一遍。这就是深分页的性能杀手。
+
+### 优化方案一：游标分页（推荐）
+
+如果你不需要精确跳转到第 N 页，而是"下一页"式的翻页，可以用上一页最后一条记录的 ID 作为游标：
+
+```sql
+-- 上一页最后一条记录的 created_at 和 id：
+-- created_at = '2024-08-15 10:30:00', id = 52341
+
+SELECT id, order_no, total_amount, status, created_at
+FROM orders
+WHERE status = 'completed'
+  AND (created_at < '2024-08-15 10:30:00'
+       OR (created_at = '2024-08-15 10:30:00' AND id < 52341))
+ORDER BY created_at DESC, id DESC
+LIMIT 20;
+```
+
+这个查询可以利用 `(status, created_at, id)` 上的复合索引直接定位，不需要跳过任何行。不管翻到第几页，性能都是恒定的。
+
+这里有个细节：为什么条件里要加上 `id < 52341`？因为 `created_at` 可能重复。如果两条订单的 `created_at` 完全一样，只用 `created_at` 做游标可能会漏数据或重复数据。加上 `id` 做联合游标才能保证分页的正确性。
+
+游标分页的缺点是只能"上一页/下一页"，不能跳转到指定页码。但对于大多数场景（App 订单列表、后台管理系统），游标分页的体验反而更好，因为不需要显示总页数。
+
+### 优化方案二：延迟关联
+
+如果业务上确实需要跳转到第 N 页，可以用延迟关联（Deferred Join）：
+
+```sql
+SELECT o.id, o.order_no, o.total_amount, o.status, o.created_at
+FROM orders o
+INNER JOIN (
+  -- 子查询只查主键 id，利用覆盖索引快速定位
+  SELECT id
+  FROM orders
+  WHERE status = 'completed'
+  ORDER BY created_at DESC
+  LIMIT 10000, 20
+) tmp ON o.id = tmp.id;
+```
+
+原理是：子查询只查 `id` 一个字段，如果 `status` 和 `created_at` 上有复合索引，MySQL 可以通过覆盖索引（不回表）快速找到目标行的 id，然后再用这 20 个 id 去回表取完整数据。回表操作只有 20 次，而不是 10020 次。
+
+### 优化方案三：限制最大页码
+
+还有一种务实做法：直接限制最大翻页数。Google 搜索的结果页也不会让你翻到第 1000 页。如果用户真的要看很老的数据，提供时间范围筛选比翻页更合理。
+
+## 场景二：商品搜索 —— LIKE '%关键词%' 为什么这么慢？
+
+运营反馈，在商品搜索框输入"蓝牙耳机"后，页面要转圈 5 秒才能出结果。查了一下代码：
+
+```sql
+SELECT id, name, price, stock
+FROM products
+WHERE name LIKE '%蓝牙耳机%';
+```
+
+### 问题在哪
+
+`LIKE '%蓝牙耳机%'` 的 `%` 通配符在前面，MySQL 无法使用 B+ 树索引来加速查找。为什么？因为 B+ 树是按字段值排序的，"以某个值开头"可以快速定位，但"包含某个值"意味着要检查每一行——相当于全表扫描。
+
+`LIKE '蓝牙耳机%'`（只有后面有 %）可以用索引，因为 MySQL 可以定位到"蓝牙耳机"开头的位置，然后顺着链表扫。但 `LIKE '%蓝牙耳机%'` 前面也有 %，树形结构帮不上忙。
+
+### 解决方案：全文索引
+
+MySQL 8.0 自带全文索引（FULLTEXT Index），专门解决文本搜索的问题：
+
+```sql
+-- 给商品名称添加全文索引（需要表使用 InnoDB 引擎）
+CREATE FULLTEXT INDEX ft_product_name ON products(name);
+
+-- 使用全文搜索语法
+SELECT id, name, price, stock
+FROM products
+WHERE MATCH(name) AGAINST('蓝牙耳机');
+```
+
+全文索引的工作原理和 B+ 树完全不同。它会在索引创建时对文本进行分词，建立"词 -> 文档"的倒排索引。查询时直接通过关键词找到对应的文档 ID，不需要逐行扫描。
+
+几种搜索模式的区别：
+
+```sql
+-- 自然语言模式（默认）：按相关性排序
+MATCH(name) AGAINST('蓝牙耳机');
+
+-- 布尔模式：支持 +（必须包含）、-（排除）、*（通配符）
+MATCH(name) AGAINST('+蓝牙 +耳机 -有线' IN BOOLEAN MODE);
+
+-- 查询扩展模式：先搜关键词，再用结果中的词扩展搜索范围
+MATCH(name) AGAINST('蓝牙耳机' WITH QUERY EXPANSION);
+```
+
+全文索引适合中文吗？这里有个坑：MySQL 内置的全文索引分词器主要面向英文，按空格分词。中文没有天然空格分隔，所以需要配合 `ngram` 分词器：
+
+```sql
+-- 创建表时指定 ngram 分词器（ngram_token_size=2 表示按两字分词）
+CREATE TABLE products (
+  id BIGINT PRIMARY KEY AUTO_INCREMENT,
+  name VARCHAR(200) NOT NULL,
+  price DECIMAL(10, 2) NOT NULL,
+  stock INT NOT NULL DEFAULT 0,
+  FULLTEXT INDEX ft_name(name) WITH PARSER ngram
+) ENGINE=InnoDB;
+```
+
+ngram 分词器会把"蓝牙耳机"切分成"蓝牙"、"牙耳"、"耳机"这些二元组合，搜索时能匹配到包含其中任意组合的记录。
+
+如果你对搜索的要求比较高（模糊匹配、拼音搜索、同义词），MySQL 的全文索引可能不够用，这时候可以考虑 Elasticsearch 或 Meilisearch 这类专业搜索引擎。但对于中小规模的电商系统，MySQL 全文索引已经够用了，不需要引入额外的技术栈。
+
+## 场景三：统计报表 —— 子查询改 JOIN 提速 10 倍
+
+第三个慢查询是每日销售统计报表。运营需要看"每个品类的日销售额、订单数、客单价"，这个报表从最初 2 秒变成 30 秒。
+
+### 原始查询
+
+```sql
+SELECT
+  c.name AS category_name,
+  (
+    SELECT COALESCE(SUM(oi.quantity * oi.unit_price), 0)
+    FROM order_items oi
+    JOIN orders o ON oi.order_id = o.id
+    JOIN products p ON oi.product_id = p.id
+    WHERE p.category_id = c.id
+      AND o.status = 'completed'
+      AND o.created_at >= '2024-01-01'
+  ) AS total_sales,
+  (
+    SELECT COUNT(DISTINCT o.id)
+    FROM order_items oi
+    JOIN orders o ON oi.order_id = o.id
+    JOIN products p ON oi.product_id = p.id
+    WHERE p.category_id = c.id
+      AND o.status = 'completed'
+      AND o.created_at >= '2024-01-01'
+  ) AS order_count
+FROM categories c;
+```
+
+这个查询的问题很明显：对每个品类，都执行了两次相关子查询（`total_sales` 和 `order_count`）。如果 categories 表有 50 个品类，这两个子查询就会分别执行 50 次，共 100 次子查询。每次子查询都要 JOIN 三张表再聚合。
+
+### 改写为 JOIN + GROUP BY
+
+把相关子查询改写成 JOIN，让 MySQL 做一次关联、一次聚合：
+
+```sql
+SELECT
+  c.name AS category_name,
+  COALESCE(SUM(oi.quantity * oi.unit_price), 0) AS total_sales,
+  COUNT(DISTINCT o.id) AS order_count,
+  COALESCE(SUM(oi.quantity * oi.unit_price) / NULLIF(COUNT(DISTINCT o.id), 0), 0) AS avg_order_amount
+FROM categories c
+LEFT JOIN products p ON p.category_id = c.id
+LEFT JOIN order_items oi ON oi.product_id = p.id
+LEFT JOIN orders o ON oi.order_id = o.id
+  AND o.status = 'completed'
+  AND o.created_at >= '2024-01-01'
+GROUP BY c.id, c.name;
+```
+
+改写后的查询只做一次三表 JOIN，然后按品类聚合。MySQL 可以选择最优的 JOIN 顺序和访问路径，而不是被迫对每个品类重复执行子查询。在实际测试中，这条改写后的查询通常比原版快 5-10 倍。
+
+### 什么时候用 EXISTS？
+
+你可能会问：子查询是不是都不好？不是。有一种场景用 EXISTS 比 JOIN 更合适——判断"存在性"：
+
+```sql
+-- 找出"有过退货记录"的用户
+SELECT u.id, u.username
+FROM users u
+WHERE EXISTS (
+  SELECT 1 FROM orders o
+  WHERE o.user_id = u.id AND o.status = 'refunded'
+);
+```
+
+为什么这里 EXISTS 比 JOIN 好？因为 EXISTS 的语义是"存在就停"——找到一条匹配的记录就不再继续扫描了。而 JOIN 会返回所有匹配行，可能产生重复数据，还需要你加 DISTINCT 去重。
+
+简单的判断标准：**需要关联表的计算结果（SUM、COUNT）用 JOIN，只需要判断有没有用 EXISTS**。
+
+## 别小看 SELECT \* —— 它不只是"多传了几个字段"
+
+前面几个场景都是具体的查询优化，这里说一个很多人忽视的点：为什么不要写 `SELECT *`？
+
+```sql
+-- 懒人写法
+SELECT * FROM orders WHERE user_id = 10086;
+
+-- 只查需要的列
+SELECT id, order_no, status, created_at
+FROM orders WHERE user_id = 10086;
+```
+
+不只是网络传输多了几个字段那么简单。更关键的原因是：**`SELECT *` 会阻止覆盖索引生效**。
+
+假设 `orders` 表上有索引 `(user_id, status, created_at)`。如果你只查 `user_id, status, created_at` 这三个字段，MySQL 可以直接从索引中拿到所有需要的数据，不需要回表（查主键索引拿完整行）。这在 EXPLAIN 中会显示 `Extra: Using index`，性能提升非常明显。
+
+一旦你写了 `SELECT *`，索引里没有 `order_no`、`total_amount` 等字段，MySQL 不得不回表取完整数据，覆盖索引的优势就没了。
+
+另外，`SELECT *` 还有一个隐患：表结构变更时，如果新增了一个大字段（比如 TEXT 类型的 `remark`），原来很快的查询会突然变慢，因为每条记录都要多传输一个大数据块。只查需要的列，对未来的变更更加稳健。
+
+## 批量操作：一条一条 INSERT 是在浪费生命
+
+电商系统经常需要批量操作：批量导入商品、批量更新价格、批量插入订单明细。很多开发者习惯用循环一条一条执行：
+
+```sql
+-- 循环 1000 次，每次插入一条
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (1001, 2001, 1, 14999.00);
+
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES (1001, 2002, 2, 299.00);
+```
+
+问题在于，每执行一条 INSERT，MySQL 都要做：解析 SQL -> 开启事务 -> 写入 redo log -> 写入 binlog -> 提交事务。1000 条 INSERT 就是 1000 次完整的事务周期。
+
+改用批量插入，一条 SQL 搞定：
+
+```sql
+INSERT INTO order_items (order_id, product_id, quantity, unit_price)
+VALUES
+  (1001, 2001, 1, 14999.00),
+  (1001, 2002, 2, 299.00),
+  (1001, 2003, 1, 599.00),
+  (1001, 2004, 3, 49.90);
+-- 一次性插入几百条都没问题
+```
+
+批量插入只需要一次事务，性能差距在数据量大时非常明显。实测 1000 条记录：循环插入约 10 秒，批量插入约 0.3 秒。
+
+批量更新也有技巧。MySQL 支持 `INSERT ... ON DUPLICATE KEY UPDATE`，可以实现"有就更新，没有就插入"：
+
+```sql
+INSERT INTO products (id, name, price, stock)
+VALUES
+  (101, 'MacBook Pro 14', 14999.00, 120),
+  (102, 'AirPods Pro', 1899.00, 500),
+  (103, 'iPhone 16 Pro', 8999.00, 300)
+ON DUPLICATE KEY UPDATE
+  price = VALUES(price),
+  stock = VALUES(stock);
+```
+
+但批量操作也不是越大越好。一条 SQL 插入上万条记录会导致单次事务过大，锁住很多资源，甚至撑爆 `max_allowed_packet`。一个经验值是每批 500-1000 条，分批执行。
+
+## 分区表：当单表数据量真的扛不住时
+
+前面讲的优化手段都是在"查询层面"做文章。如果订单表已经有几千万条数据，即使索引设计得再好，查询和维护的代价也会越来越大。这时候可以考虑**分区表**。
+
+分区表的思路是：把一张大表按某个规则拆分成多个物理存储单元（分区），但对应用层来说它仍然是一张表，SQL 不需要改。MySQL 会根据查询条件自动只扫描相关的分区。
+
+最常见的是按时间做 RANGE 分区：
+
+```sql
+CREATE TABLE orders (
+  id BIGINT AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL,
+  order_no VARCHAR(50) NOT NULL,
+  total_amount DECIMAL(10, 2) NOT NULL,
+  status VARCHAR(20) NOT NULL,
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (id, created_at)
+) ENGINE=InnoDB
+PARTITION BY RANGE (YEAR(created_at)) (
+  PARTITION p2023 VALUES LESS THAN (2024),
+  PARTITION p2024 VALUES LESS THAN (2025),
+  PARTITION p2025 VALUES LESS THAN (2026),
+  PARTITION pmax VALUES LESS THAN MAXVALUE
+);
+```
+
+当你查询 `WHERE created_at >= '2024-01-01'` 时，MySQL 会跳过 p2023 分区，只扫描 p2024 和 p2025。这在数据量特别大时效果显著。
+
+分区表的另一个好处是数据归档变得很简单。2023 年的数据不再需要在线查询了？直接删掉那个分区：
+
+```sql
+-- 删分区比 DELETE 快得多，不会产生大量 binlog
+ALTER TABLE orders DROP PARTITION p2023;
+```
+
+但分区表有不少限制你需要知道：
+
+- **主键必须包含分区键**。上面的例子中 PRIMARY KEY 是 `(id, created_at)` 而不是单独的 `id`，因为分区键 `created_at` 必须在主键里。这意味着很多现有表需要改主键才能做分区。
+- **不支持外键**。分区表之间的外键约束不生效。
+- **唯一索引必须包含分区键**。如果你想给 `order_no` 加唯一索引，必须变成 `UNIQUE KEY(order_no, created_at)`。
+
+这些限制让分区表在实际应用中不够灵活。对于大多数中等规模的应用（单表几百万到两千万），优化索引和查询比引入分区更划算。分区表更适合那种数据量特别大（单表过亿）且查询模式相对固定的场景，比如日志表、流水表。
+
+如果分区表的限制太多，还可以考虑在应用层做分表（按用户 ID 哈希、按时间范围等），或者用 TiDB 这类分布式数据库。但那是更复杂的话题了。
+
+## Trade-off 分析：什么时候用什么手段
+
+我们把这篇文章涉及的优化手段做一个对比，帮你判断该在什么场景下用什么：
+
+**EXPLAIN + 慢查询日志**是基础工具，任何查询优化都应该从它们开始。没有诊断就动手加索引，大概率是盲猜。
+
+**分页优化**的选择取决于业务需求：App 端和大多数后台列表用游标分页，体验好性能稳；如果一定要支持"跳转到第 N 页"，用延迟关联；但最务实的做法是限制最大页码 + 提供筛选条件。
+
+**全文索引**适合中等规模的文本搜索（万级到百万级商品），加上 ngram 分词器能处理中文。数据量再大或搜索需求再复杂（拼音、同义词、纠错），就该上 Elasticsearch 了。
+
+**子查询改 JOIN**几乎是万金油的优化，但也有例外：当子查询只做存在性判断时，EXISTS 往往比 JOIN 更快更简洁。另外，如果改写后的 JOIN 产生了巨大的中间结果集（笛卡尔积），可能比子查询还慢，要用 EXPLAIN 验证。
+
+**分区表**是最后的手段。在尝试分区之前，确保你已经做完了索引优化、查询改写、读写分离这些步骤。分区表引入的复杂性（主键必须包含分区键、运维成本增加、跨分区查询的性能问题）往往被低估了。
+
+所有这些优化手段都有一个共同的前提：**先测量，再优化**。用慢查询日志找到瓶颈，用 EXPLAIN 诊断原因，优化后用实际执行时间验证效果。不要凭感觉加索引，更不要把所有优化手段堆上去——每个索引都有写入代价，每个分区都有维护成本。
+
+下一篇我们回到设计的源头——数据库设计原则。前面几篇都是在已有的表结构上做优化，但如果表本身设计得不合理，优化查询能做的事情是有限的。下一篇会聊到三范式、适度的反范式、商品 SPU/SKU 模型、订单状态机这些设计话题。好的设计，是从根本上减少查询优化工作的最佳方式。

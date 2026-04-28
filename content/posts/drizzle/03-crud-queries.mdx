@@ -1,789 +1,498 @@
 ---
-title: "03. CRUD 操作和查询构建器"
+title: "03 CRUD 操作：往博客系统里放数据"
 date: "2026-03-24"
-summary: "深入掌握 Drizzle ORM 的 CRUD 操作，学习类型安全的查询构建器，掌握 where 条件、orderBy、分页等核心功能。"
-tags: ["Drizzle ORM", "CRUD", "查询构建器", "TypeScript", "PostgreSQL"]
+summary: "用博客文章管理的真实场景，串起 Drizzle ORM 的增删改查——批量导入、条件筛选、分页查询、软删除、浏览量自增，以及当 API 不够用时怎么写原生 SQL 片段。"
+tags: ["Drizzle ORM", "TypeScript"]
 category: "drizzle"
 draft: false
 series: "Drizzle ORM 类型安全的数据库访问实战"
 seriesOrder: 3
 ---
 
-## 前言
+上一篇我们把博客系统的 Schema 设计好了——users、posts、comments、tags、post_to_tags 五张表，字段、索引、外键都就位了。现在面临一个很现实的问题：表建好了，数据呢？
 
-CRUD（增删改查）是数据库操作的核心。Drizzle ORM 提供了**类型安全**的查询 API，让编写查询变得简单而可靠。
+你可能会说，不就是 INSERT 几条数据嘛。但实际做博客系统的时候，光"插入数据"这件事就有不少门道：批量导入文章的时候 slug 冲突怎么办？文章列表怎么分页？浏览量怎么原子递增？删除文章是真删还是假删？
 
-**本文核心内容**：
+今天就用"博客文章管理"这个场景，把 Drizzle ORM 的增删改查完整过一遍。
 
-- ✅ Create（插入数据）
-- ✅ Read（查询数据）
-- ✅ Update（更新数据）
-- ✅ Delete（删除数据）
-- ✅ 查询构建器详解
-- ✅ where 条件、orderBy、分页
+## 插入数据：从单条到批量
 
----
+### 基本插入和 returning
 
-## 一、Create - 插入数据
-
-### 1.1 基础插入
+最简单的场景：注册一个新用户。
 
 ```typescript
 import { db } from "./db";
 import { users } from "./schema";
+import { eq } from "drizzle-orm";
 
-// 插入单条数据
 const [newUser] = await db
   .insert(users)
   .values({
-    email: "test@example.com",
-    name: "Test User",
+    email: "wang@example.com",
+    username: "wang_dev",
+    passwordHash: "hashed_xxx",
+    name: "老王",
   })
   .returning();
 
-// 返回值：{ id: 1, email: 'test@example.com', name: 'Test User', createdAt: Date }
-
-// 不使用 returning
-await db.insert(users).values({
-  email: "test2@example.com",
-  name: "Test User 2",
-});
-// 返回值：无（只影响行数）
+// newUser 的类型被自动推断为：
+// { id: number; email: string; username: string; ... }
+// 不需要手写任何类型
 ```
 
-### 1.2 批量插入
+`returning()` 是 PostgreSQL 的特性，INSERT 的同时把新行的数据返回给你。不加 `returning()` 的话，你拿不到新插入的 id，这在后续关联插入的时候会很麻烦。
+
+### 批量导入文章
+
+场景来了：你从 WordPress 迁移博客，需要一次性导入 50 篇文章。Drizzle 支持直接传数组：
 
 ```typescript
-// 批量插入多条数据
-const insertedUsers = await db
-  .insert(users)
+import { posts } from "./schema";
+
+const importedPosts = await db
+  .insert(posts)
   .values([
-    { email: "user1@example.com", name: "User 1" },
-    { email: "user2@example.com", name: "User 2" },
-    { email: "user3@example.com", name: "User 3" },
+    {
+      title: "Drizzle ORM 入门",
+      slug: "drizzle-orm-intro",
+      content: "正文内容...",
+      authorId: 1,
+      status: "PUBLISHED",
+      publishedAt: new Date("2026-01-15"),
+    },
+    {
+      title: "TypeScript 5.x 新特性",
+      slug: "typescript-5-features",
+      content: "正文内容...",
+      authorId: 1,
+      status: "PUBLISHED",
+      publishedAt: new Date("2026-02-20"),
+    },
+    // ... 更多文章
   ])
   .returning();
-
-// 生成的 SQL：
-// INSERT INTO users (email, name) VALUES
-//   ('user1@example.com', 'User 1'),
-//   ('user2@example.com', 'User 2'),
-//   ('user3@example.com', 'User 3')
-// RETURNING *
 ```
 
-### 1.3 使用默认值
+Drizzle 会生成一条 `INSERT INTO posts ... VALUES (...), (...)` 语句，而不是循环执行 50 条 INSERT。性能差别很大。
+
+### 冲突处理：onConflictDoUpdate
+
+但迁移的时候大概率会遇到问题：某篇文章的 slug 已经存在了。slug 上有 unique 约束，直接插入会报错。
+
+Drizzle 提供了 `onConflictDoUpdate` 来处理这种情况——冲突时更新，不冲突时插入：
 
 ```typescript
-import { pgTable, serial, varchar, text, timestamp } from "drizzle-orm/pg-core";
-
-export const users = pgTable("users", {
-  id: serial("id").primaryKey(),
-  email: varchar("email", { length: 255 }).notNull(),
-  name: text("name"),
-  role: varchar("role", { length: 50 }).default("user"),
-  createdAt: timestamp("created_at").defaultNow(),
-});
-
-// 只提供必要字段，其他使用默认值
-await db.insert(users).values({
-  email: "test@example.com",
-  // role 默认为 'user'
-  // createdAt 默认为当前时间
-});
-```
-
-### 1.4 插入并获取 ID
-
-```typescript
-// PostgreSQL 使用 returning 获取自增 ID
-const [user] = await db
-  .insert(users)
+await db
+  .insert(posts)
   .values({
-    email: "test@example.com",
-    name: "Test",
+    title: "Drizzle ORM 入门（修订版）",
+    slug: "drizzle-orm-intro",
+    content: "更新后的正文...",
+    authorId: 1,
   })
-  .returning();
-
-console.log(user.id); // 新插入记录的 ID
-
-// 或者只返回特定字段
-const [userId] = await db
-  .insert(users)
-  .values({
-    email: "test@example.com",
-    name: "Test",
-  })
-  .returning({ id: users.id });
+  .onConflictDoUpdate({
+    target: posts.slug,
+    set: {
+      title: "Drizzle ORM 入门（修订版）",
+      content: "更新后的正文...",
+      updatedAt: new Date(),
+    },
+  });
 ```
 
----
+生成的 SQL 等价于：
 
-## 二、Read - 查询数据
+```sql
+INSERT INTO posts (title, slug, content, author_id)
+VALUES ('Drizzle ORM 入门（修订版）', 'drizzle-orm-intro', ...)
+ON CONFLICT (slug) DO UPDATE SET
+  title = EXCLUDED.title,
+  content = EXCLUDED.content,
+  updated_at = NOW();
+```
 
-### 2.1 基础查询
+如果你不想更新，只是想"有就跳过"，用 `onConflictDoNothing`：
 
 ```typescript
-// 查询所有字段
-const allUsers = await db.select().from(users);
+await db
+  .insert(tags)
+  .values([{ name: "TypeScript", slug: "typescript" }])
+  .onConflictDoNothing({
+    target: tags.slug,
+  });
+```
 
-// 生成的 SQL：
-// SELECT id, email, name, role, created_at FROM users
+这在批量导入标签的时候特别好用——标签已存在就跳过，不存在就创建，不需要先 SELECT 再决定 INSERT 还是 UPDATE。
 
-// 查询特定字段
-const userEmails = await db
+## 查询数据：从全表到精准筛选
+
+### select 的基本姿势
+
+查所有文章的标题和发布状态：
+
+```typescript
+const allPosts = await db
   .select({
-    id: users.id,
-    email: users.email,
+    id: posts.id,
+    title: posts.title,
+    status: posts.status,
+    createdAt: posts.createdAt,
   })
-  .from(users);
-
-// 生成的 SQL：
-// SELECT id, email FROM users
+  .from(posts);
 ```
 
-### 2.2 where 条件
+注意这里我明确指定了要查的字段，而不是 `db.select().from(posts)` 查所有列。文章表的 `content` 字段可能存了好几 KB 的内容，列表页根本用不到，全查出来浪费带宽和内存。养成习惯：列表查询只 select 你需要的字段。
+
+### where 条件：各种姿势的筛选
+
+Drizzle 的条件操作符都是从 `drizzle-orm` 导入的函数，拼接方式很接近 SQL 的心理模型。
+
+**精确匹配和范围查询：**
 
 ```typescript
-import { eq, and, or, ne, gt, gte, lt, lte, like, ilike } from "drizzle-orm";
+import { eq, gt, lt, between } from "drizzle-orm";
 
-// 等于
-const users = await db
-  .select()
-  .from(users)
-  .where(eq(users.email, "test@example.com"));
-// SQL：WHERE email = 'test@example.com'
+// 查某个用户的所有文章
+const userPosts = await db.select().from(posts).where(eq(posts.authorId, 1));
 
-// 不等于
-const activeUsers = await db
+// 查 2026 年 1 月之后发布的文章
+const recentPosts = await db
   .select()
-  .from(users)
-  .where(ne(users.role, "banned"));
+  .from(posts)
+  .where(gt(posts.publishedAt, new Date("2026-01-01")));
 
-// 大于
-const recentUsers = await db
+// 查浏览量在 100-500 之间的文章
+const midRange = await db
   .select()
-  .from(users)
-  .where(gt(users.createdAt, new Date("2024-01-01")));
+  .from(posts)
+  .where(between(posts.viewCount, 100, 500));
+```
 
-// AND 条件
-const result = await db
-  .select()
-  .from(users)
+**模糊搜索——博客的搜索功能：**
+
+```typescript
+import { ilike, or, and } from "drizzle-orm";
+
+const searchResults = await db
+  .select({
+    id: posts.id,
+    title: posts.title,
+    excerpt: posts.excerpt,
+  })
+  .from(posts)
   .where(
-    and(eq(users.role, "admin"), gt(users.createdAt, new Date("2024-01-01")))
-  );
-// SQL：WHERE role = 'admin' AND created_at > '2024-01-01'
-
-// OR 条件
-const result = await db
-  .select()
-  .from(users)
-  .where(or(eq(users.email, "admin@example.com"), eq(users.role, "admin")));
-// SQL：WHERE email = 'admin@example.com' OR role = 'admin'
-
-// 复杂条件
-const result = await db
-  .select()
-  .from(users)
-  .where(
-    or(
-      and(eq(users.role, "admin"), gt(users.createdAt, new Date("2024-01-01"))),
-      eq(users.email, "superadmin@example.com")
+    and(
+      eq(posts.status, "PUBLISHED"),
+      or(ilike(posts.title, "%drizzle%"), ilike(posts.content, "%drizzle%"))
     )
   );
-// SQL：WHERE (role = 'admin' AND created_at > '2024-01-01') OR email = 'superadmin@example.com'
 ```
 
-### 2.3 模糊查询
+`ilike` 是 PostgreSQL 特有的不区分大小写的 LIKE。如果你想区分大小写，用 `like`。不过大多数搜索场景用 `ilike` 更符合用户预期。
+
+**inArray——按多个标签筛选：**
 
 ```typescript
-// LIKE（区分大小写）
-const users = await db.select().from(users).where(like(users.name, "John%"));
-// SQL：WHERE name LIKE 'John%'
+import { inArray } from "drizzle-orm";
 
-// ILIKE（不区分大小写）
-const users = await db.select().from(users).where(ilike(users.name, "%john%"));
-// SQL：WHERE name ILIKE '%john%'
-```
-
-### 2.4 排序
-
-```typescript
-import { desc, asc } from "drizzle-orm";
-
-// 升序
-const users = await db.select().from(users).orderBy(asc(users.createdAt));
-
-// 降序
-const users = await db.select().from(users).orderBy(desc(users.createdAt));
-
-// 多字段排序
-const users = await db
+// 查状态为 DRAFT 或 ARCHIVED 的文章
+const draftOrArchived = await db
   .select()
-  .from(users)
-  .orderBy(desc(users.role), asc(users.createdAt));
-// SQL：ORDER BY role DESC, created_at ASC
+  .from(posts)
+  .where(inArray(posts.status, ["DRAFT", "ARCHIVED"]));
 ```
 
-### 2.5 限制和偏移
+### 排序和分页
+
+博客列表页的标配：按发布时间倒序排列，每页 10 条。
 
 ```typescript
-// 限制结果数量
-const users = await db.select().from(users).limit(10);
+import { desc, asc, count } from "drizzle-orm";
 
-// 分页
-const page = 2;
+const page = 1;
 const pageSize = 10;
-const users = await db
-  .select()
-  .from(users)
-  .limit(pageSize)
-  .offset((page - 1) * pageSize);
 
-// SQL：SELECT ... LIMIT 10 OFFSET 10
-```
-
-### 2.6 单条记录查询
-
-```typescript
-// 使用 findFirst 获取第一条
-const user = await db
-  .select()
-  .from(users)
-  .where(eq(users.email, "test@example.com"))
-  .limit(1);
-
-// 使用解构获取单条
-const [user] = await db.select().from(users).where(eq(users.id, 1));
-
-// 如果没有找到，user 为 undefined
-if (!user) {
-  throw new Error("User not found");
-}
-```
-
----
-
-## 三、Update - 更新数据
-
-### 3.1 基础更新
-
-```typescript
-// 更新单条记录
-await db.update(users).set({ name: "Updated Name" }).where(eq(users.id, 1));
-
-// SQL：UPDATE users SET name = 'Updated Name' WHERE id = 1
-
-// 更新并返回
-const [updatedUser] = await db
-  .update(users)
-  .set({ name: "Updated Name" })
-  .where(eq(users.id, 1))
-  .returning();
-```
-
-### 3.2 更新多个字段
-
-```typescript
-await db
-  .update(users)
-  .set({
-    name: "New Name",
-    email: "newemail@example.com",
-    role: "admin",
-  })
-  .where(eq(users.id, 1));
-```
-
-### 3.3 条件更新
-
-```typescript
-import { sql } from "drizzle-orm";
-
-// 使用 SQL 表达式
-await db
-  .update(users)
-  .set({
-    // 访问次数 +1
-    visitCount: sql`${users.visitCount} + 1`,
-    // 更新时间
-    updatedAt: new Date(),
-  })
-  .where(eq(users.id, 1));
-
-// 多条件更新
-await db
-  .update(users)
-  .set({ role: "inactive" })
-  .where(
-    and(lt(users.lastLoginAt, new Date("2024-01-01")), eq(users.role, "user"))
-  );
-```
-
-### 3.4 批量更新
-
-```typescript
-// 更新所有匹配的记录
-await db
-  .update(users)
-  .set({ status: "inactive" })
-  .where(lt(users.lastLoginAt, new Date("2024-01-01")));
-
-// 注意：没有 where 时会更新所有记录！
-await db.update(users).set({ status: "active" });
-// SQL：UPDATE users SET status = 'active'（影响所有行！）
-```
-
----
-
-## 四、Delete - 删除数据
-
-### 4.1 基础删除
-
-```typescript
-// 删除单条记录
-await db.delete(users).where(eq(users.id, 1));
-
-// SQL：DELETE FROM users WHERE id = 1
-
-// 删除并返回
-const [deletedUser] = await db.delete(users).where(eq(users.id, 1)).returning();
-```
-
-### 4.2 条件删除
-
-```typescript
-// 删除所有符合条件的记录
-await db
-  .delete(users)
-  .where(
-    and(lt(users.createdAt, new Date("2023-01-01")), eq(users.role, "guest"))
-  );
-
-// 删除所有记录（危险！）
-await db.delete(users);
-// SQL：DELETE FROM users（删除所有行！）
-```
-
-### 4.3 软删除
-
-```typescript
-import {
-  pgTable,
-  serial,
-  varchar,
-  timestamp,
-  boolean,
-} from "drizzle-orm/pg-core";
-
-export const users = pgTable("users", {
-  id: serial("id").primaryKey(),
-  email: varchar("email", { length: 255 }).notNull(),
-  deleted: boolean("deleted").default(false),
-  deletedAt: timestamp("deleted_at"),
-});
-
-// 软删除：更新 deleted 标记
-await db
-  .update(users)
-  .set({
-    deleted: true,
-    deletedAt: new Date(),
-  })
-  .where(eq(users.id, 1));
-
-// 查询时过滤已删除
-const activeUsers = await db
-  .select()
-  .from(users)
-  .where(eq(users.deleted, false));
-```
-
----
-
-## 五、查询构建器详解
-
-### 5.1 链式调用
-
-```typescript
-const result = await db
-  .select({
-    id: users.id,
-    name: users.name,
-    email: users.email,
-  })
-  .from(users)
-  .where(eq(users.role, "admin"))
-  .orderBy(desc(users.createdAt))
-  .limit(10)
-  .offset(0);
-```
-
-### 5.2 动态查询
-
-```typescript
-// 根据条件动态构建查询
-async function findUsers(filters: {
-  role?: string;
-  search?: string;
-  limit?: number;
-}) {
-  const conditions = [];
-
-  if (filters.role) {
-    conditions.push(eq(users.role, filters.role));
-  }
-
-  if (filters.search) {
-    conditions.push(
-      or(
-        ilike(users.name, `%${filters.search}%`),
-        ilike(users.email, `%${filters.search}%`)
-      )
-    );
-  }
-
-  const query = db
-    .select()
-    .from(users)
-    .where(conditions.length > 0 ? and(...conditions) : undefined);
-
-  if (filters.limit) {
-    query.limit(filters.limit);
-  }
-
-  return await query;
-}
-
-// 使用
-const admins = await findUsers({ role: "admin", limit: 10 });
-const searchResults = await findUsers({ search: "john" });
-```
-
-### 5.3 计数
-
-```typescript
-import { count, sql } from "drizzle-orm";
-
-// 方式 1：使用 count 函数
-const [result] = await db
-  .select({
-    count: count(),
-  })
-  .from(users);
-console.log(result.count); // 总用户数
-
-// 方式 2：使用 sql
-const [result] = await db
-  .select({
-    count: sql<number>`COUNT(*)`.as("count"),
-  })
-  .from(users);
-
-// 条件计数
-const [result] = await db
-  .select({
-    count: count(),
-  })
-  .from(users)
-  .where(eq(users.role, "admin"));
-```
-
-### 5.4 去重
-
-```typescript
-import { distinct } from "drizzle-orm";
-
-// 获取所有不同的角色
-const roles = await db
-  .selectDistinct({
-    role: users.role,
-  })
-  .from(users);
-
-// SQL：SELECT DISTINCT role FROM users
-```
-
----
-
-## 六、实战示例
-
-### 6.1 博客文章 CRUD
-
-```typescript
-import {
-  pgTable,
-  serial,
-  varchar,
-  text,
-  timestamp,
-  boolean,
-} from "drizzle-orm/pg-core";
-import { eq, and, desc, asc } from "drizzle-orm";
-
-export const posts = pgTable("posts", {
-  id: serial("id").primaryKey(),
-  title: varchar("title", { length: 255 }).notNull(),
-  slug: varchar("slug", { length: 255 }).notNull().unique(),
-  content: text("content").notNull(),
-  excerpt: text("excerpt"),
-  published: boolean("published").default(false),
-  authorId: integer("author_id").references(() => users.id),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
-});
-
-// 创建文章
-async function createPost(data: {
-  title: string;
-  slug: string;
-  content: string;
-  excerpt?: string;
-  authorId: number;
-}) {
-  const [post] = await db
-    .insert(posts)
-    .values({
-      ...data,
-      published: false,
+const [items, [{ total }]] = await Promise.all([
+  db
+    .select({
+      id: posts.id,
+      title: posts.title,
+      excerpt: posts.excerpt,
+      publishedAt: posts.publishedAt,
+      viewCount: posts.viewCount,
     })
-    .returning();
-  return post;
-}
+    .from(posts)
+    .where(eq(posts.status, "PUBLISHED"))
+    .orderBy(desc(posts.publishedAt))
+    .limit(pageSize)
+    .offset((page - 1) * pageSize),
 
-// 获取文章列表
-async function getPosts(filters: {
-  published?: boolean;
+  db
+    .select({ total: count() })
+    .from(posts)
+    .where(eq(posts.status, "PUBLISHED")),
+]);
+```
+
+这里用 `Promise.all` 并行查数据和总数，比串行快。分页计算 `offset = (page - 1) * pageSize` 是标准做法，没什么花哨的。
+
+`orderBy` 支持多字段排序。比如先按是否精选排（精选在前），再按发布时间倒序：
+
+```typescript
+// 注意：isFeatured 默认 false，asc 排序时 false 在前
+// 要精选在前，得用 desc
+db.select()
+  .from(posts)
+  .orderBy(desc(posts.isFeatured), desc(posts.publishedAt));
+```
+
+这种细节，TypeScript 不会帮你检查，需要自己对 SQL 排序规则有理解。
+
+### 动态查询构建
+
+实际业务中，筛选条件往往是动态的——用户可能只选了分类，可能同时选了分类和关键词，也可能什么都没选。
+
+```typescript
+import { SQL, and, or, ilike, eq, desc } from "drizzle-orm";
+
+async function getPostList(filters: {
+  status?: "DRAFT" | "PUBLISHED" | "ARCHIVED";
   authorId?: number;
+  keyword?: string;
   page?: number;
-  limit?: number;
 }) {
-  const conditions = [];
+  const conditions: SQL[] = [];
 
-  if (filters.published !== undefined) {
-    conditions.push(eq(posts.published, filters.published));
+  if (filters.status) {
+    conditions.push(eq(posts.status, filters.status));
   }
-
   if (filters.authorId) {
     conditions.push(eq(posts.authorId, filters.authorId));
   }
+  if (filters.keyword) {
+    conditions.push(
+      or(
+        ilike(posts.title, `%${filters.keyword}%`),
+        ilike(posts.excerpt, `%${filters.keyword}%`)
+      )!
+    );
+  }
 
-  const page = filters.page || 1;
-  const limit = filters.limit || 10;
+  const page = filters.page ?? 1;
+  const pageSize = 10;
 
-  const items = await db
+  return db
     .select()
     .from(posts)
     .where(conditions.length > 0 ? and(...conditions) : undefined)
     .orderBy(desc(posts.createdAt))
-    .limit(limit)
-    .offset((page - 1) * limit);
-
-  return items;
-}
-
-// 根据 slug 获取文章
-async function getPostBySlug(slug: string) {
-  const [post] = await db
-    .select()
-    .from(posts)
-    .where(eq(posts.slug, slug))
-    .limit(1);
-
-  return post;
-}
-
-// 更新文章
-async function updatePost(
-  id: number,
-  data: {
-    title?: string;
-    content?: string;
-    excerpt?: string;
-    published?: boolean;
-  }
-) {
-  const [post] = await db
-    .update(posts)
-    .set({
-      ...data,
-      updatedAt: new Date(),
-    })
-    .where(eq(posts.id, id))
-    .returning();
-
-  return post;
-}
-
-// 删除文章
-async function deletePost(id: number) {
-  await db.delete(posts).where(eq(posts.id, id));
+    .limit(pageSize)
+    .offset((page - 1) * pageSize);
 }
 ```
 
-### 6.2 用户管理 CRUD
+把条件收集到数组里，最后用 `and(...conditions)` 组装。没有条件时传 `undefined`，Drizzle 会忽略 where 子句。这种模式在实际项目中用得非常多。
+
+## 更新数据：不只是改个字段
+
+### 基本更新
+
+修改文章标题是常规操作：
 
 ```typescript
-import { eq, and, or, ilike, ne } from "drizzle-orm";
-
-// 获取活跃用户
-async function getActiveUsers(limit = 50) {
-  return await db
-    .select({
-      id: users.id,
-      email: users.email,
-      name: users.name,
-      role: users.role,
-      createdAt: users.createdAt,
-    })
-    .from(users)
-    .where(ne(users.role, "banned"))
-    .orderBy(desc(users.createdAt))
-    .limit(limit);
-}
-
-// 搜索用户
-async function searchUsers(query: string) {
-  return await db
-    .select()
-    .from(users)
-    .where(
-      or(ilike(users.name, `%${query}%`), ilike(users.email, `%${query}%`))
-    )
-    .limit(20);
-}
-
-// 更新用户角色
-async function updateUserRole(userId: number, role: string) {
-  const [user] = await db
-    .update(users)
-    .set({ role })
-    .where(eq(users.id, userId))
-    .returning();
-
-  return user;
-}
-
-// 封禁用户
-async function banUser(userId: number) {
-  await db.update(users).set({ role: "banned" }).where(eq(users.id, userId));
-}
+const [updated] = await db
+  .update(posts)
+  .set({
+    title: "Drizzle ORM 入门（第二版）",
+    updatedAt: new Date(),
+  })
+  .where(eq(posts.id, 1))
+  .returning();
 ```
 
----
+`set()` 里只写要改的字段就行，其他字段保持不变。注意 `updatedAt` 需要手动维护——Drizzle 不会帮你自动更新这个字段，除非你在 Schema 里用 `.$onUpdate(() => new Date())` 钩子（Drizzle 0.38+ 支持这个特性）。
 
-## 七、最佳实践
+### 浏览量原子自增
 
-### 7.1 类型安全
+文章被阅读一次，viewCount 加 1。你不能先 SELECT 再 UPDATE——并发时会丢计数。得用 SQL 表达式在数据库层面完成：
 
 ```typescript
-// ✅ 好的做法：使用 select 指定字段
+import { sql } from "drizzle-orm";
+
+await db
+  .update(posts)
+  .set({
+    viewCount: sql`${posts.viewCount} + 1`,
+  })
+  .where(eq(posts.id, postId));
+```
+
+`sql` 模板标签是 Drizzle 的"逃生舱"——当你需要写原生 SQL 片段，但又不想完全脱离类型系统时，用它嵌入 SQL 表达式。生成的 SQL：
+
+```sql
+UPDATE posts SET view_count = view_count + 1 WHERE id = $1
+```
+
+这是一个原子操作，不管多少并发请求同时进来，每次浏览都会被正确计数。
+
+### 批量更新
+
+"把所有草稿文章标记为归档"——一次更新符合条件的所有行：
+
+```typescript
+await db
+  .update(posts)
+  .set({ status: "ARCHIVED", updatedAt: new Date() })
+  .where(
+    and(eq(posts.status, "DRAFT"), lt(posts.createdAt, new Date("2025-01-01")))
+  );
+```
+
+一条 SQL 搞定，不需要先查出来再逐条更新。
+
+**一个危险的注意点**：如果 `update` 不加 `where`，会更新整张表。Drizzle 不会阻止你这么干。这是个设计哲学问题——Drizzle 信任开发者，不像某些 ORM 会默认加 LIMIT 1。
+
+## 删除数据：真删还是假删
+
+### 物理删除
+
+直接从数据库删除记录：
+
+```typescript
+// 删除某篇文章
+await db.delete(posts).where(eq(posts.id, 42));
+
+// 删除某用户的所有草稿
+await db
+  .delete(posts)
+  .where(and(eq(posts.authorId, 3), eq(posts.status, "DRAFT")));
+```
+
+同样，不加 `where` 会清空整张表。
+
+### 软删除：更安全的做法
+
+对于博客系统，直接 DELETE 一篇文章太危险了——万一误删呢？常见的做法是软删除：不真删，而是打个标记。
+
+我们的 posts 表没有 `deletedAt` 字段，需要先加上：
+
+```typescript
+// schema 里新增字段
+deletedAt: timestamp("deleted_at"),
+```
+
+然后软删除就是一次 UPDATE：
+
+```typescript
+// 软删除
+await db.update(posts).set({ deletedAt: new Date() }).where(eq(posts.id, 42));
+
+// 查询时排除已删除的文章
+const activePosts = await db
+  .select()
+  .from(posts)
+  .where(sql`${posts.deletedAt} IS NULL`);
+```
+
+这里又用到了 `sql` 模板标签。Drizzle 提供了 `isNull()` 函数，写法是 `sql`${posts.deletedAt} IS NULL``或者`isNull(posts.deletedAt)`，效果一样，选你觉得顺眼的就行。
+
+## 当 Drizzle API 不够用：sql 模板标签
+
+前面已经用到了几次 `sql` 标签，这里正式介绍一下。Drizzle 的 API 覆盖了 90% 的日常查询，但有些场景它确实没有对应的函数，比如：
+
+```typescript
+import { sql } from "drizzle-orm";
+
+// PostgreSQL 全文搜索——Drizzle 没有内置 API
+const searchResults = await db
+  .select()
+  .from(posts)
+  .where(
+    sql`to_tsvector('simple', ${posts.title} || ' ' || ${posts.content})
+        @@ to_tsquery('simple', ${searchTerm})`
+  );
+
+// 类型安全的计算字段
+const postWithReadingTime = await db
+  .select({
+    id: posts.id,
+    title: posts.title,
+    readingTime: sql<number>`ceil(length(${posts.content}) / 1500)`.as(
+      "reading_time"
+    ),
+  })
+  .from(posts);
+```
+
+`sql` 标签会自动处理参数绑定（防止 SQL 注入），同时让 Drizzle 知道返回值的类型。`sql<number>` 告诉 TypeScript 这个表达式的结果是 number。
+
+这个逃生舱的存在很重要——它意味着你不会遇到"Drizzle 做不到，只能换回原始 SQL 驱动"的窘境。任何 PostgreSQL 能做的查询，你都能通过 `sql` 标签在 Drizzle 里写。
+
+## Prepared Statements：复用查询计划
+
+如果你的接口被高频调用（比如文章列表），每次都让数据库解析 SQL、生成执行计划是浪费。Prepared Statements 让数据库缓存查询计划，只替换参数值。
+
+```typescript
+// 定义预编译查询
+const getPostsByStatus = db
+  .select({
+    id: posts.id,
+    title: posts.title,
+    publishedAt: posts.publishedAt,
+  })
+  .from(posts)
+  .where(eq(posts.status, sql.placeholder("status")))
+  .orderBy(desc(posts.publishedAt))
+  .limit(10)
+  .prepare("get_posts_by_status");
+
+// 使用时传入参数
+const published = await getPostsByStatus.execute({ status: "PUBLISHED" });
+const drafts = await getPostsByStatus.execute({ status: "DRAFT" });
+```
+
+`prepare("name")` 创建一个预编译语句，`sql.placeholder("status")` 标记参数位置。后续调用 `execute()` 只传参数，数据库不需要重新解析 SQL。
+
+在 Serverless 环境（比如 Vercel Edge Functions）里，每个请求都是新的连接，Prepared Statements 的优势不那么明显。但在长连接场景（传统服务器、PM2 集群）下，效果显著。
+
+## 查询构建器风格 vs 关系查询风格
+
+到目前为止我们用的都是查询构建器风格——`db.select().from(posts).where(...)`。Drizzle 还有一种关系查询风格，用 `with` API 直接获取关联数据：
+
+```typescript
+// 查询构建器风格（本篇用的）
 const result = await db
   .select({
-    id: users.id,
-    name: users.name,
+    postId: posts.id,
+    authorName: users.name,
   })
-  .from(users);
+  .from(posts)
+  .innerJoin(users, eq(posts.authorId, users.id));
 
-// result 类型：{ id: number; name: string }[]
-
-// ❌ 不推荐：select() * 返回所有字段
-const result = await db.select().from(users);
-// 性能较差，类型复杂
-```
-
-### 7.2 事务处理
-
-```typescript
-// 原子操作：创建用户和默认文章
-await db.transaction(async (tx) => {
-  const [user] = await tx
-    .insert(users)
-    .values({ email: "test@example.com", name: "Test" })
-    .returning();
-
-  await tx.insert(posts).values({
-    title: "Welcome",
-    content: "Your first post",
-    authorId: user.id,
-  });
+// 关系查询风格（下一篇重点讲）
+const result = await db.query.posts.findMany({
+  with: {
+    author: true,
+    tags: true,
+  },
 });
 ```
 
-### 7.3 错误处理
+关系查询风格的代码更简洁，但需要在 Schema 里定义 `relations`（上一篇已经定义了）。它的底层实现不是魔法——Drizzle 会自动帮你处理 JOIN 和数据组装，甚至解决了 N+1 查询问题。具体怎么做到的，下一篇细说。
 
-```typescript
-async function getUser(id: number) {
-  try {
-    const [user] = await db
-      .select()
-      .from(users)
-      .where(eq(users.id, id))
-      .limit(1);
+## Trade-off 分析
 
-    if (!user) {
-      throw new Error(`User ${id} not found`);
-    }
+Drizzle 的 CRUD API 有几个值得权衡的设计决策：
 
-    return user;
-  } catch (error) {
-    console.error("Database error:", error);
-    throw error;
-  }
-}
-```
+**查询构建器 vs 关系查询。** 查询构建器给你完全的控制力——你写的每一段 SQL 都在你脑子里。关系查询（`db.query`）更简洁，但当查询出问题时，调试难度更高，因为你看到的不是你写的。建议：简单关联用关系查询，复杂报表用查询构建器加 `sql` 标签。
 
-### 7.4 性能优化
+**`sql` 模板标签的代价。** 它是逃生舱，也是技术债。过度使用 `sql` 标签意味着你在绕过 Drizzle 的类型系统，TypeScript 对嵌入的 SQL 片段几乎无能为力。一个项目中如果到处都是 `sql` 片段，你可能需要重新评估是否应该用 Drizzle。正确用法是：90% 用 Drizzle API，10% 用 `sql` 标签处理特殊需求。
 
-```typescript
-// ✅ 使用索引字段查询
-await db.select().from(users).where(eq(users.email, "test@example.com"));
+**Prepared Statements 的适用场景。** 它不是银弹。在 Serverless 环境下连接本身就不复用，预编译的优势为零。在连接池模式下才有实际收益。不要盲目对所有查询都 prepare——只对高频、参数化、结构固定的查询使用。
 
-// ❌ 避免 LIKE 前缀通配符（无法使用索引）
-await db.select().from(users).where(like(users.email, "%@example.com"));
-
-// ✅ 限制返回字段
-await db
-  .select({
-    id: users.id,
-    name: users.name,
-  })
-  .from(users);
-
-// ❌ 避免返回大字段
-await db.select().from(posts); // 包含 content（可能很大）
-```
+**不带 `where` 的 update/delete。** Drizzle 允许你不加 where 就执行 update 或 delete，这会操作整张表。有些 ORM 默认阻止这种操作。Drizzle 的立场是"开发者知道自己在做什么"。如果你担心误操作，可以在应用层封装一个 `safeDelete` 函数，强制要求传 where 条件。
 
 ---
 
-## 八、总结
-
-**本文我们学习了**：
-
-✅ **Create** - insert() + values() + returning()
-✅ **Read** - select() + where() + orderBy() + limit() + offset()
-✅ **Update** - update() + set() + where()
-✅ **Delete** - delete() + where()
-
-**核心运算符**：
-
-- `eq()` - 等于
-- `ne()` - 不等于
-- `and()` / `or()` - 逻辑运算
-- `gt()` / `gte()` / `lt()` / `lte()` - 比较
-- `like()` / `ilike()` - 模糊匹配
-- `desc()` / `asc()` - 排序
-
-**下一步**：
-
-在下一篇文章《关系查询和联表操作》中，我们将学习：
-
-- 一对一、一对多、多对多关系
-- JOIN 操作
-- 关系查询优化
-- 聚合查询
-
----
-
-**相关代码**：[03-crud-queries](https://github.com/yourname/drizzle-examples/tree/03-crud-queries)
+下一篇我们就来啃关系查询这块硬骨头——"查某篇文章的作者信息和所有评论"、"查某个用户的所有文章及其标签"——这些跨表关联查询，看看 Drizzle 的 `with` API 是怎么用一条查询替代 N+1 的。

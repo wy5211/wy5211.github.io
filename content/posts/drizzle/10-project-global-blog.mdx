@@ -1,197 +1,190 @@
 ---
-title: "10. 实战项目 - 全球博客系统"
+title: "10. 实战项目 - 从零搭建完整博客系统"
 date: "2026-03-31"
-summary: "综合运用 Drizzle ORM 的全部知识，构建一个基于 Cloudflare Workers 的全球分布式博客系统，实现边缘计算的最佳实践。"
-tags: ["Drizzle ORM", "Cloudflare Workers", "实战项目", "边缘计算", "博客系统"]
+summary: "把前九篇的知识整合成一个可部署的完整博客系统：monorepo 架构、共享 Schema、前后端实现、从开发到生产的全流程，以及系列回顾和进阶方向。"
+tags: ["Drizzle ORM", "TypeScript"]
 category: "drizzle"
 draft: false
 series: "Drizzle ORM 类型安全的数据库访问实战"
 seriesOrder: 10
 ---
 
-## 前言
+前九篇我们学了 Drizzle 的方方面面——从 Schema 到 CRUD，从关联查询到事务迁移，从 tRPC 集成到 Edge 部署，最后是性能优化。今天把所有知识整合到一个完整的项目里。
 
-欢迎来到 Drizzle ORM 系列的**最后一篇文章**！
+这是系列最后一篇，我们会从架构设计开始，把博客系统从开发环境一路推到生产环境。
 
-我们将综合运用前面学到的所有知识，构建一个**全球分布式博客系统**，展示 Drizzle ORM 在边缘计算环境中的强大能力。
+## 先想清楚架构再动手
 
----
+很多人拿到需求就开始写代码，写到一半发现 Schema 要改、API 结构不合理、前后端类型对不上。这次我们换个思路——先花半小时想清楚整体架构，省下的可能是几天的返工时间。
 
-## 项目概述
+博客系统的核心需求：用户可以注册登录、写文章、给文章打标签、互相评论。管理后台可以审核评论、管理用户。前端要 SSR 做好 SEO，API 要类型安全。
 
-### 技术栈
-
-```
-前端：Next.js 14 + TailwindCSS + tRPC
-后端：Cloudflare Workers + Drizzle ORM
-数据库：Cloudflare D1（SQLite at Edge）
-缓存：Cloudflare KV
-存储：Cloudflare R2
-API：tRPC
-```
-
-### 核心功能
-
-- ✅ 文章管理（CRUD、发布、草稿）
-- ✅ 用户系统（注册、登录、资料）
-- ✅ 评论系统（实时、审核）
-- ✅ 标签分类
-- ✅ 图片上传（R2）
-- ✅ 搜索功能
-- ✅ SEO 优化
-
----
-
-## 一、项目结构
+架构上我选 monorepo，原因很简单：Schema 定义、API 类型、工具函数这些前后端都要用的东西，放在一个仓库里共享最方便。用 pnpm workspace 管理，结构如下：
 
 ```
-global-blog/
+blog/
 ├── apps/
-│   ├── web/                          # Next.js 前端
+│   ├── web/                    # Next.js 前端
 │   │   ├── app/
-│   │   │   ├── (main)/
-│   │   │   │   ├── page.tsx          # 首页
-│   │   │   │   ├── blog/
-│   │   │   │   │   └── [slug]/
-│   │   │   │   │       └── page.tsx  # 文章详情
-│   │   │   │   └── layout.tsx
+│   │   │   ├── page.tsx        # 首页（SSR）
+│   │   │   ├── blog/
+│   │   │   │   └── [slug]/
+│   │   │   │       └── page.tsx  # 文章详情（SSR）
 │   │   │   └── api/
 │   │   │       └── trpc/
-│   │   │           └── [...trpc]/
+│   │   │           └── [trpc]/
 │   │   │               └── route.ts
-│   │   ├── components/
-│   │   │   ├── blog-card.tsx
-│   │   │   ├── comment-form.tsx
-│   │   │   └── markdown.tsx
 │   │   └── lib/
-│   │       ├── trpc/
-│   │       │   └── client.ts
-│   │       └── utils.ts
-│   │
-│   └── worker/                       # Cloudflare Workers
+│   │       └── trpc-client.ts
+│   └── api/                    # Hono API（可部署到 Edge）
 │       ├── src/
-│       │   ├── db/
-│       │   │   ├── schema/
-│       │   │   │   ├── users.ts
-│       │   │   │   ├── posts.ts
-│       │   │   │   ├── comments.ts
-│       │   │   │   └── index.ts
-│       │   │   └── migrations/
+│       │   ├── db.ts
 │       │   ├── routers/
 │       │   │   ├── posts.ts
 │       │   │   ├── comments.ts
-│       │   │   └── index.ts
-│       │   ├── middleware/
-│       │   │   ├── auth.ts
-│       │   │   └── cache.ts
+│       │   │   └── auth.ts
 │       │   └── index.ts
 │       └── wrangler.toml
-│
 ├── packages/
-│   ├── database/                     # 共享数据库 Schema
-│   ├── trpc/                         # 共享 tRPC 定义
-│   └── ui/                           # 共享 UI 组件
-│
-├── package.json
+│   ├── database/               # 共享 Schema + 迁移
+│   │   ├── src/
+│   │   │   ├── schema/
+│   │   │   │   ├── users.ts
+│   │   │   │   ├── posts.ts
+│   │   │   │   ├── comments.ts
+│   │   │   │   ├── tags.ts
+│   │   │   │   └── index.ts
+│   │   │   └── client.ts
+│   │   ├── drizzle.config.ts
+│   │   └── migrations/
+│   ├── trpc/                   # 共享 tRPC Router 类型
+│   └── shared/                 # 工具函数、常量
 ├── pnpm-workspace.yaml
-└── turbo.json
+└── package.json
 ```
 
----
+关键设计决策：`packages/database` 是独立的包，前端和 API 都引用它。Schema 只在一个地方定义，前后端共享同一套类型，不会出现"前端猜后端返回什么"的问题。这个思路来自第 2 篇的 Schema 设计和第 6 篇的 tRPC 集成。
 
-## 二、数据库 Schema
+## Schema：五张表撑起整个博客
 
-### 2.1 用户表
+在第 2 篇和第 4 篇里我们详细讲过 Schema 设计和关系建模。这里把完整的 Schema 整合出来：
 
 ```typescript
 // packages/database/src/schema/users.ts
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { pgTable, serial, varchar, text, timestamp } from "drizzle-orm/pg-core";
 
-export const users = sqliteTable("users", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  email: text("email").notNull().unique(),
-  username: text("username").notNull().unique(),
+export const users = pgTable("users", {
+  id: serial("id").primaryKey(),
+  email: varchar("email", { length: 255 }).notNull().unique(),
+  username: varchar("username", { length: 50 }).notNull().unique(),
   name: text("name"),
-  bio: text("bio"),
   avatar: text("avatar"),
-  role: text("role", { enum: ["admin", "author", "reader"] }).default("reader"),
-  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
-  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
+  bio: text("bio"),
+  passwordHash: text("password_hash").notNull(),
+  role: varchar("role", { length: 20 }).default("reader").notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .defaultNow()
+    .notNull(),
 });
 
 export type User = typeof users.$inferSelect;
 export type NewUser = typeof users.$inferInsert;
 ```
 
-### 2.2 文章表
-
 ```typescript
 // packages/database/src/schema/posts.ts
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import {
+  pgTable,
+  serial,
+  text,
+  integer,
+  boolean,
+  timestamp,
+  index,
+} from "drizzle-orm/pg-core";
 import { users } from "./users";
 
-export const posts = sqliteTable("posts", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  title: text("title").notNull(),
-  slug: text("slug").notNull().unique(),
-  content: text("content").notNull(),
-  excerpt: text("excerpt"),
-  coverImage: text("cover_image"),
-  published: integer("published", { mode: "boolean" }).default(false),
-  authorId: integer("author_id")
-    .references(() => users.id, { onDelete: "cascade" })
-    .notNull(),
-  viewCount: integer("view_count").default(0),
-  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
-  updatedAt: integer("updated_at", { mode: "timestamp" }).notNull(),
-  publishedAt: integer("published_at", { mode: "timestamp" }),
-});
-
-export type Post = typeof posts.$inferSelect;
-export type NewPost = typeof posts.$inferInsert;
+export const posts = pgTable(
+  "posts",
+  {
+    id: serial("id").primaryKey(),
+    title: text("title").notNull(),
+    slug: text("slug").notNull().unique(),
+    content: text("content").notNull(),
+    excerpt: text("excerpt"),
+    coverImage: text("cover_image"),
+    published: boolean("published").default(false).notNull(),
+    authorId: integer("author_id")
+      .references(() => users.id, { onDelete: "cascade" })
+      .notNull(),
+    viewCount: integer("view_count").default(0).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
+  },
+  (table) => ({
+    publishedCreatedIdx: index("posts_published_created_idx").on(
+      table.published,
+      table.createdAt.desc()
+    ),
+    authorIdx: index("posts_author_idx").on(table.authorId),
+  })
+);
 ```
-
-### 2.3 评论表
 
 ```typescript
 // packages/database/src/schema/comments.ts
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import {
+  pgTable,
+  serial,
+  text,
+  integer,
+  varchar,
+  timestamp,
+  index,
+} from "drizzle-orm/pg-core";
 import { users } from "./users";
 import { posts } from "./posts";
 
-export const comments = sqliteTable("comments", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  content: text("content").notNull(),
-  authorId: integer("author_id")
-    .references(() => users.id, { onDelete: "cascade" })
-    .notNull(),
-  postId: integer("post_id")
-    .references(() => posts.id, { onDelete: "cascade" })
-    .notNull(),
-  parentId: integer("parent_id"), // 回复评论
-  status: text("status", { enum: ["pending", "approved", "rejected"] }).default(
-    "pending"
-  ),
-  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
-});
-
-export type Comment = typeof comments.$inferSelect;
+export const comments = pgTable(
+  "comments",
+  {
+    id: serial("id").primaryKey(),
+    content: text("content").notNull(),
+    authorId: integer("author_id")
+      .references(() => users.id, { onDelete: "cascade" })
+      .notNull(),
+    postId: integer("post_id")
+      .references(() => posts.id, { onDelete: "cascade" })
+      .notNull(),
+    parentId: integer("parent_id"),
+    status: varchar("status", { length: 20 }).default("pending").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+  },
+  (table) => ({
+    postIdx: index("comments_post_idx").on(table.postId),
+  })
+);
 ```
-
-### 2.4 标签和关联表
 
 ```typescript
 // packages/database/src/schema/tags.ts
-import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+import { pgTable, serial, text, integer } from "drizzle-orm/pg-core";
 import { posts } from "./posts";
 
-export const tags = sqliteTable("tags", {
-  id: integer("id").primaryKey({ autoIncrement: true }),
-  name: text("name").notNull().unique(),
+export const tags = pgTable("tags", {
+  id: serial("id").primaryKey(),
+  name: text("name").notNull(),
   slug: text("slug").notNull().unique(),
 });
 
-export const postsToTags = sqliteTable("posts_to_tags", {
+export const postsToTags = pgTable("posts_to_tags", {
   postId: integer("post_id")
     .references(() => posts.id, { onDelete: "cascade" })
     .notNull(),
@@ -199,439 +192,236 @@ export const postsToTags = sqliteTable("posts_to_tags", {
     .references(() => tags.id, { onDelete: "cascade" })
     .notNull(),
 });
-
-export type Tag = typeof tags.$inferSelect;
 ```
 
----
+五张表的关系：users 一对多 posts，posts 一对多 comments，comments 自引用（parentId）实现嵌套回复，posts 和 tags 通过 postsToTags 多对多关联。索引策略来自第 9 篇的性能优化经验——给高频查询的排序字段和过滤字段加索引。
 
-## 三、Cloudflare Workers API
+## 数据库客户端：按环境切换驱动
 
-### 3.1 主入口
-
-```typescript
-// apps/worker/src/index.ts
-import { Hono } from "hono";
-import { cors } from "hono/cors";
-import { trpcServer } from "@hono/trpc-server";
-import { appRouter } from "./routers";
-import { createContext } from "./context";
-
-interface Env {
-  DB: D1Database;
-  CACHE: KVNamespace;
-  STORAGE: R2Bucket;
-  JWT_SECRET: string;
-}
-
-const app = new Hono<{ Bindings: Env }>();
-
-// CORS
-app.use(
-  "*",
-  cors({
-    origin: "*",
-    allowMethods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-  })
-);
-
-// tRPC
-app.use(
-  "/trpc/*",
-  trpcServer({
-    router: appRouter,
-    createContext: async (c, next) => {
-      return createContext(c.env, c.req.raw);
-    },
-  })
-);
-
-// 健康检查
-app.get("/health", (c) => {
-  return c.json({ status: "ok", timestamp: Date.now() });
-});
-
-export default app;
-```
-
-### 3.2 Context 创建
+第 8 篇我们讨论过 Edge 环境的特殊性。数据库客户端需要根据运行环境选择不同的驱动：
 
 ```typescript
-// apps/worker/src/context.ts
-import { drizzle } from "drizzle-orm/d1";
-import { eq } from "drizzle-orm";
-import { users } from "@global-blog/database";
-import { verifyJwt } from "./lib/jwt";
+// packages/database/src/client.ts
+import * as schema from "./schema";
 
-export interface Context {
-  db: ReturnType<typeof drizzle>;
-  cache: KVNamespace;
-  storage: R2Bucket;
-  userId?: number;
-  user?: User;
-}
-
-export async function createContext(
-  env: Env,
-  request: Request
-): Promise<Context> {
-  const db = drizzle(env.DB, { schema });
-
-  // 获取用户信息
-  let userId: number | undefined;
-  let user: User | undefined;
-
-  try {
-    const authHeader = request.headers.get("Authorization");
-    if (authHeader?.startsWith("Bearer ")) {
-      const token = authHeader.slice(7);
-      const payload = verifyJwt(token, env.JWT_SECRET);
-      userId = payload.userId;
-
-      if (userId) {
-        const [userRecord] = await db
-          .select()
-          .from(users)
-          .where(eq(users.id, userId))
-          .limit(1);
-
-        user = userRecord;
-      }
-    }
-  } catch {
-    // 忽略认证错误
+function createDb() {
+  // Edge 环境（Cloudflare Workers、Vercel Edge）
+  if (process.env.DATABASE_DRIVER === "neon-http") {
+    const { drizzle } = require("drizzle-orm/neon-http");
+    const { neon } = require("@neondatabase/serverless");
+    return drizzle(neon(process.env.DATABASE_URL!), { schema });
   }
 
-  return {
-    db,
-    cache: env.CACHE,
-    storage: env.STORAGE,
-    userId,
-    user,
-  };
+  // Node.js 环境（Next.js SSR、传统服务器）
+  const { drizzle } = require("drizzle-orm/node-postgres");
+  const { Pool } = require("pg");
+  const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    max: 10,
+    idleTimeoutMillis: 20000,
+  });
+  return drizzle(pool, { schema });
 }
+
+export const db = createDb();
+export { schema };
 ```
 
-### 3.3 文章 Router
+这里用条件导入区分环境。Edge 环境用 neon-http 无状态连接（第 8 篇详细讲过），Node.js 环境用 pg 连接池（第 9 篇调过参数）。
+
+## tRPC Router：把 Schema 变成类型安全的 API
+
+第 6 篇我们搭建了 tRPC + Drizzle 的类型安全管道。这里把它应用到博客系统的核心 API 上。
+
+文章 Router 是最复杂的部分，涵盖列表查询（分页+过滤）、详情查询（关联作者和标签）、创建（事务写入多张表）、更新和删除：
 
 ```typescript
-// apps/worker/src/routers/posts.ts
+// apps/api/src/routers/posts.ts
 import { z } from "zod";
-import { eq, desc, sql } from "drizzle-orm";
-import { posts, users, tags, postsToTags } from "@global-blog/database";
+import { eq, desc, and, sql } from "drizzle-orm";
+import { posts, users, tags, postsToTags, comments } from "@blog/database";
 import { t } from "../trpc";
-import { invalidateCache } from "../lib/cache";
 
 export const postsRouter = t.router({
-  // 获取文章列表（分页）
+  // 首页文章列表——只查需要的字段，走索引
   list: t.procedure
     .input(
       z.object({
         page: z.number().min(1).default(1),
-        limit: z.number().min(1).max(100).default(10),
-        published: z.boolean().optional(),
+        limit: z.number().min(1).max(50).default(10),
         tag: z.string().optional(),
       })
     )
     .query(async ({ input, ctx }) => {
-      const { page, limit, published, tag } = input;
+      const { page, limit, tag } = input;
 
-      // 尝试从缓存读取
-      const cacheKey = `posts:${page}:${limit}:${published}:${tag || "all"}`;
-      const cached = await ctx.cache.get(cacheKey, "json");
-      if (cached) {
-        return cached;
-      }
-
-      // 构建查询
-      const where = [];
-
-      if (published !== undefined) {
-        where.push(sql`${posts.published} = ${published ? 1 : 0}`);
-      }
-
-      if (tag) {
-        where.push(
-          sql`${posts.id} IN (SELECT post_id FROM posts_to_tags WHERE tag_id = (SELECT id FROM tags WHERE slug = ${tag}))`
-        );
-      }
-
-      // 查询文章
-      const items = await ctx.db
+      // 基础查询：只查列表需要的字段
+      const baseQuery = ctx.db
         .select({
           id: posts.id,
           title: posts.title,
           slug: posts.slug,
           excerpt: posts.excerpt,
           coverImage: posts.coverImage,
-          published: posts.published,
-          viewCount: posts.viewCount,
           createdAt: posts.createdAt,
-          author: {
-            id: users.id,
-            name: users.name,
-            username: users.username,
-            avatar: users.avatar,
-          },
+          author: { id: users.id, name: users.name, avatar: users.avatar },
         })
         .from(posts)
         .innerJoin(users, eq(posts.authorId, users.id))
-        .where(
-          where.length > 0 ? sql`${sql.join(where, sql` AND `)}` : undefined
-        )
+        .where(eq(posts.published, true));
+
+      // 标签过滤
+      if (tag) {
+        const [tagRecord] = await ctx.db
+          .select({ id: tags.id })
+          .from(tags)
+          .where(eq(tags.slug, tag))
+          .limit(1);
+
+        if (!tagRecord)
+          return { items: [], total: 0, page, limit, totalPages: 0 };
+      }
+
+      const items = await baseQuery
         .orderBy(desc(posts.createdAt))
         .limit(limit)
         .offset((page - 1) * limit);
 
-      // 查询总数
-      const [totalResult] = await ctx.db
-        .select({ count: sql<number>`count(*)` })
-        .from(posts)
-        .where(
-          where.length > 0 ? sql`${sql.join(where, sql` AND `)}` : undefined
-        );
+      // 用 "多查一条" 代替 COUNT 查询（第 9 篇的技巧）
+      const countCheck = await baseQuery
+        .limit(limit + 1)
+        .offset((page - 1) * limit);
+      const hasMore = countCheck.length > limit;
 
-      const result = {
-        items,
-        total: totalResult?.count || 0,
+      return {
+        items: items.slice(0, limit),
+        hasMore,
         page,
         limit,
-        totalPages: Math.ceil((totalResult?.count || 0) / limit),
       };
-
-      // 写入缓存（5 分钟）
-      await ctx.cache.put(cacheKey, JSON.stringify(result), {
-        expirationTtl: 300,
-      });
-
-      return result;
     }),
 
-  // 根据 slug 获取文章
+  // 文章详情——关联作者、标签、评论
   bySlug: t.procedure
     .input(z.object({ slug: z.string() }))
     .query(async ({ input, ctx }) => {
-      const { slug } = input;
-
-      // 尝试从缓存读取
-      const cached = await ctx.cache.get(`post:${slug}`, "json");
-      if (cached) {
-        // 增加浏览量（异步）
-        ctx.db
-          .update(posts)
-          .set({ viewCount: sql`${posts.viewCount} + 1` })
-          .where(eq(posts.slug, slug))
-          .run();
-
-        return cached;
-      }
-
-      // 查询文章
       const [post] = await ctx.db
         .select({
           id: posts.id,
           title: posts.title,
-          slug: posts.slug,
           content: posts.content,
-          excerpt: posts.excerpt,
           coverImage: posts.coverImage,
-          published: posts.published,
-          viewCount: posts.viewCount,
           createdAt: posts.createdAt,
-          updatedAt: posts.updatedAt,
           publishedAt: posts.publishedAt,
           author: {
             id: users.id,
             name: users.name,
-            username: users.username,
             avatar: users.avatar,
             bio: users.bio,
           },
         })
         .from(posts)
         .innerJoin(users, eq(posts.authorId, users.id))
-        .where(eq(posts.slug, slug))
+        .where(and(eq(posts.slug, input.slug), eq(posts.published, true)))
         .limit(1);
 
-      if (!post) {
-        throw new Error("Post not found");
-      }
+      if (!post) return null;
 
-      // 查询标签
+      // 标签
       const postTags = await ctx.db
-        .select({
-          id: tags.id,
-          name: tags.name,
-          slug: tags.slug,
-        })
+        .select({ id: tags.id, name: tags.name, slug: tags.slug })
         .from(tags)
         .innerJoin(postsToTags, eq(tags.id, postsToTags.tagId))
         .where(eq(postsToTags.postId, post.id));
 
-      const result = { ...post, tags: postTags };
+      // 评论（带作者，避免 N+1）
+      const postComments = await ctx.db
+        .select({
+          id: comments.id,
+          content: comments.content,
+          createdAt: comments.createdAt,
+          parentId: comments.parentId,
+          author: { id: users.id, name: users.name, avatar: users.avatar },
+        })
+        .from(comments)
+        .innerJoin(users, eq(comments.authorId, users.id))
+        .where(
+          and(eq(comments.postId, post.id), eq(comments.status, "approved"))
+        )
+        .orderBy(desc(comments.createdAt));
 
-      // 写入缓存（10 分钟）
-      await ctx.cache.put(`post:${slug}`, JSON.stringify(result), {
-        expirationTtl: 600,
-      });
-
-      // 增加浏览量
-      await ctx.db
+      // 异步增加浏览量，不阻塞响应
+      ctx.db
         .update(posts)
         .set({ viewCount: sql`${posts.viewCount} + 1` })
-        .where(eq(posts.slug, slug))
-        .run();
+        .where(eq(posts.id, post.id))
+        .then(() => {})
+        .catch(() => {});
 
-      return result;
+      return { ...post, tags: postTags, comments: postComments };
     }),
 
-  // 创建文章
+  // 创建文章——事务保证原子性
   create: t.procedure
     .input(
       z.object({
-        title: z.string().min(1),
+        title: z.string().min(1).max(200),
         content: z.string().min(1),
-        excerpt: z.string().optional(),
-        coverImage: z.string().optional(),
+        excerpt: z.string().max(500).optional(),
         tagIds: z.array(z.number()).optional(),
       })
     )
     .mutation(async ({ input, ctx }) => {
-      if (!ctx.userId) {
-        throw new Error("Unauthorized");
-      }
+      if (!ctx.userId) throw new Error("未登录");
 
       const slug = input.title
         .toLowerCase()
+        .replace(/[^\w\s-]/g, "")
         .replace(/\s+/g, "-")
-        .replace(/[^\w-]+/g, "");
+        .slice(0, 100);
 
-      // 创建文章
-      const [post] = await ctx.db
-        .insert(posts)
-        .values({
-          ...input,
-          slug,
-          authorId: ctx.userId,
-          published: false,
-          createdAt: new Date(),
-          updatedAt: new Date(),
-        })
-        .returning();
+      return ctx.db.transaction(async (tx) => {
+        // 第一步：插入文章
+        const [post] = await tx
+          .insert(posts)
+          .values({
+            title: input.title,
+            slug,
+            content: input.content,
+            excerpt: input.excerpt,
+            authorId: ctx.userId,
+          })
+          .returning();
 
-      // 关联标签
-      if (input.tagIds && input.tagIds.length > 0) {
-        await ctx.db.insert(postsToTags).values(
-          input.tagIds.map((tagId) => ({
-            postId: post.id,
-            tagId,
-          }))
-        );
-      }
+        // 第二步：关联标签
+        if (input.tagIds?.length) {
+          await tx
+            .insert(postsToTags)
+            .values(input.tagIds.map((tagId) => ({ postId: post.id, tagId })));
+        }
 
-      // 删除缓存
-      await invalidateCache(ctx.cache, "posts");
-
-      return post;
-    }),
-
-  // 更新文章
-  update: t.procedure
-    .input(
-      z.object({
-        id: z.number(),
-        title: z.string().min(1).optional(),
-        content: z.string().min(1).optional(),
-        excerpt: z.string().optional(),
-        coverImage: z.string().optional(),
-        published: z.boolean().optional(),
-      })
-    )
-    .mutation(async ({ input, ctx }) => {
-      const { id, ...data } = input;
-
-      // 检查权限
-      const [post] = await ctx.db
-        .select()
-        .from(posts)
-        .where(eq(posts.id, id))
-        .limit(1);
-
-      if (!post) {
-        throw new Error("Post not found");
-      }
-
-      if (post.authorId !== ctx.userId && ctx.user?.role !== "admin") {
-        throw new Error("Forbidden");
-      }
-
-      // 更新文章
-      const [updated] = await ctx.db
-        .update(posts)
-        .set({
-          ...data,
-          updatedAt: new Date(),
-          publishedAt: data.published ? new Date() : post.publishedAt,
-        })
-        .where(eq(posts.id, id))
-        .returning();
-
-      // 删除缓存
-      await invalidateCache(ctx.cache, "posts");
-      await ctx.cache.delete(`post:${post.slug}`);
-
-      return updated;
-    }),
-
-  // 删除文章
-  delete: t.procedure
-    .input(z.object({ id: z.number() }))
-    .mutation(async ({ input, ctx }) => {
-      const { id } = input;
-
-      // 检查权限
-      const [post] = await ctx.db
-        .select()
-        .from(posts)
-        .where(eq(posts.id, id))
-        .limit(1);
-
-      if (!post) {
-        throw new Error("Post not found");
-      }
-
-      if (post.authorId !== ctx.userId && ctx.user?.role !== "admin") {
-        throw new Error("Forbidden");
-      }
-
-      // 删除文章
-      await ctx.db.delete(posts).where(eq(posts.id, id));
-
-      // 删除缓存
-      await invalidateCache(ctx.cache, "posts");
-      await ctx.cache.delete(`post:${post.slug}`);
-
-      return { success: true };
+        return post;
+      });
     }),
 });
 ```
 
----
+注意几个细节：列表查询只取需要的字段（不用 `SELECT *`），评论查询用 JOIN 避免 N+1（第 9 篇的经验），创建文章用事务包裹（第 5 篇的原子操作），浏览量更新是异步的不阻塞响应。
 
-## 四、Next.js 前端
+## 前端：Next.js App Router + Server Components
 
-### 4.1 文章列表页
+第 7 篇我们讲过 Next.js 和 Drizzle 的集成。博客前端充分利用 Server Components，首页和文章详情在服务端渲染，SEO 友好且首屏快。
 
 ```typescript
-// apps/web/src/app/(main)/blog/page.tsx
-import { db } from '@/lib/db';
-import { posts, users } from '@/lib/db/schema';
-import { eq, desc } from 'drizzle-orm';
-import { BlogCard } from '@/components/blog-card';
+// apps/web/app/page.tsx
+import { db } from "@blog/database/client";
+import { posts, users } from "@blog/database";
+import { eq, desc } from "drizzle-orm";
+import Link from "next/link";
 
-export const revalidate = 300; // 5 分钟
+export const revalidate = 300; // ISR：5 分钟重新验证
 
-export default async function BlogPage() {
+export default async function HomePage() {
   const latestPosts = await db
     .select({
       id: posts.id,
@@ -640,10 +430,7 @@ export default async function BlogPage() {
       excerpt: posts.excerpt,
       coverImage: posts.coverImage,
       createdAt: posts.createdAt,
-      author: {
-        name: users.name,
-        avatar: users.avatar,
-      },
+      author: { name: users.name, avatar: users.avatar },
     })
     .from(posts)
     .innerJoin(users, eq(posts.authorId, users.id))
@@ -652,293 +439,163 @@ export default async function BlogPage() {
     .limit(12);
 
   return (
-    <div className="container mx-auto py-12">
-      <h1 className="text-4xl font-bold mb-8">Blog</h1>
-
-      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
-        {latestPosts.map((post) => (
-          <BlogCard key={post.id} post={post} />
-        ))}
-      </div>
-    </div>
+    <main>
+      <section>
+        <h1>Blog</h1>
+        <div>
+          {latestPosts.map((post) => (
+            <article key={post.id}>
+              {post.coverImage && <img src={post.coverImage} alt={post.title} />}
+              <h2>
+                <Link href={`/blog/${post.slug}`}>{post.title}</Link>
+              </h2>
+              <p>{post.excerpt}</p>
+              <span>{post.author.name}</span>
+              <time>{post.createdAt.toLocaleDateString("zh-CN")}</time>
+            </article>
+          ))}
+        </div>
+      </section>
+    </main>
   );
 }
 ```
 
-### 4.2 文章详情页
+`export const revalidate = 300` 让 Next.js 做 ISR（增量静态再生），首页每 5 分钟重新生成一次。结合第 9 篇的缓存策略，大部分请求不会打到数据库。
+
+文章详情页类似，多一步查标签和评论：
 
 ```typescript
-// apps/web/src/app/(main)/blog/[slug]/page.tsx
-import { notFound } from 'next/navigation';
-import { db } from '@/lib/db';
-import { posts, users, tags, postsToTags } from '@/lib/db/schema';
-import { eq } from 'drizzle-orm';
-import { Markdown } from '@/components/markdown';
-import { CommentSection } from '@/components/comment-section';
+// apps/web/app/blog/[slug]/page.tsx
+import { db } from "@blog/database/client";
+import { posts, users, tags, postsToTags } from "@blog/database";
+import { eq } from "drizzle-orm";
+import { notFound } from "next/navigation";
 
-export default async function PostPage({
-  params,
-}: {
-  params: { slug: string }
-}) {
-  // 获取文章
+export default async function PostPage({ params }: { params: { slug: string } }) {
   const [post] = await db
     .select({
       id: posts.id,
       title: posts.title,
       content: posts.content,
-      excerpt: posts.excerpt,
-      coverImage: posts.coverImage,
       createdAt: posts.createdAt,
-      author: {
-        id: users.id,
-        name: users.name,
-        avatar: users.avatar,
-        bio: users.bio,
-      },
+      author: { id: users.id, name: users.name, avatar: users.avatar, bio: users.bio },
     })
     .from(posts)
     .innerJoin(users, eq(posts.authorId, users.id))
     .where(eq(posts.slug, params.slug))
     .limit(1);
 
-  if (!post) {
-    notFound();
-  }
+  if (!post) notFound();
 
-  // 获取标签
   const postTags = await db
-    .select({
-      id: tags.id,
-      name: tags.name,
-      slug: tags.slug,
-    })
+    .select({ name: tags.name, slug: tags.slug })
     .from(tags)
     .innerJoin(postsToTags, eq(tags.id, postsToTags.tagId))
     .where(eq(postsToTags.postId, post.id));
 
   return (
-    <article className="max-w-4xl mx-auto py-12">
-      {post.coverImage && (
-        <img
-          src={post.coverImage}
-          alt={post.title}
-          className="w-full h-96 object-cover rounded-xl mb-8"
-        />
-      )}
-
-      <h1 className="text-5xl font-bold mb-4">{post.title}</h1>
-
-      <div className="flex items-center gap-4 mb-8">
-        <img
-          src={post.author.avatar || '/default-avatar.png'}
-          alt={post.author.name || ''}
-          className="w-12 h-12 rounded-full"
-        />
-        <div>
-          <p className="font-semibold">{post.author.name}</p>
-          <p className="text-gray-500">
-            {post.createdAt.toLocaleDateString()}
-          </p>
-        </div>
+    <article>
+      <h1>{post.title}</h1>
+      <div>
+        <img src={post.author.avatar} alt={post.author.name} />
+        <span>{post.author.name}</span>
+        <time>{post.createdAt.toLocaleDateString("zh-CN")}</time>
       </div>
-
-      <div className="flex gap-2 mb-8">
-        {postTags.map((tag) => (
-          <span
-            key={tag.id}
-            className="px-3 py-1 bg-gray-100 rounded-full text-sm"
-          >
-            {tag.name}
-          </span>
+      <div>
+        {postTags.map((t) => (
+          <span key={t.slug}>{t.name}</span>
         ))}
       </div>
-
-      <Markdown content={post.content} />
-
-      <CommentSection postId={post.id} />
+      <div dangerouslySetInnerHTML={{ __html: post.content }} />
     </article>
   );
 }
 ```
 
-### 4.3 tRPC 集成
+评论部分用客户端组件，通过 tRPC 发起交互请求（登录、发表评论）。
 
-```typescript
-// apps/web/src/lib/trpc/server.ts
-import { createTRPCReact } from "@trpc/react-query";
-import type { AppRouter } from "@global-blog/worker";
+## 部署：从开发到生产
 
-export const trpc = createTRPCReact<AppRouter>();
-```
+开发阶段用 Docker Compose 跑 PostgreSQL，`pnpm dev` 启动前后端。生产部署有两种主流方案。
 
-```typescript
-// apps/web/src/app/providers.tsx
-'use client';
+### 方案一：Vercel + Neon（推荐新手）
 
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { httpBatchLink } from '@trpc/client';
-import { useState } from 'react';
-import { trpc } from '@/lib/trpc/server';
-
-export function Providers({ children }: { children: React.ReactNode }) {
-  const [queryClient] = useState(() => new QueryClient());
-  const [trpcClient] = useState(() =>
-    trpc.createClient({
-      links: [
-        httpBatchLink({
-          url: '/api/trpc',
-        }),
-      ],
-    })
-  );
-
-  return (
-    <trpc.Provider client={trpcClient} queryClient={queryClient}>
-      <QueryClientProvider client={queryClient}>
-        {children}
-      </QueryClientProvider>
-    </trpc.Provider>
-  );
-}
-```
-
----
-
-## 五、部署配置
-
-### 5.1 wrangler.toml
-
-```toml
-name = "global-blog-api"
-main = "src/index.ts"
-compatibility_date = "2024-01-01"
-
-# D1 数据库
-[[d1_databases]]
-binding = "DB"
-database_name = "global-blog"
-database_id = "your-database-id"
-
-# KV 缓存
-[[kv_namespaces]]
-binding = "CACHE"
-id = "your-kv-id"
-
-# R2 存储
-[[r2_buckets]]
-binding = "STORAGE"
-bucket_name = "global-blog-images"
-
-# 环境变量
-[vars]
-ENVIRONMENT = "production"
-
-# 密钥（使用 wrangler secret 设置）
-# wrangler secret put JWT_SECRET
-```
-
-### 5.2 部署步骤
+前端部署到 Vercel，数据库用 Neon（Serverless PostgreSQL）。好处是零运维、自动扩缩容。Drizzle 通过 `neon-http` 驱动连接 Neon，每次请求是无状态的 HTTP 调用，天然适配 Serverless。
 
 ```bash
-# 1. 创建 D1 数据库
-wrangler d1 create global-blog
+# 构建和部署
+pnpm build
+vercel deploy --prod
+```
 
-# 2. 创建 KV 命名空间
-wrangler kv:namespace create CACHE
+数据库迁移：
 
-# 3. 创建 R2 存储
-wrangler r2 bucket create global-blog-images
+```bash
+cd packages/database
+npx drizzle-kit generate    # 生成迁移文件
+npx drizzle-kit migrate     # 应用到 Neon
+```
 
-# 4. 设置密钥
-wrangler secret put JWT_SECRET
+### 方案二：Cloudflare Workers + D1（适合 Edge 场景）
 
-# 5. 运行迁移
-wrangler d1 execute global-blog --file=./drizzle/0001.sql
+如果追求全球低延迟，API 部署到 Cloudflare Workers，数据库用 D1（SQLite at Edge）。第 8 篇详细讲过这个方案。
 
-# 6. 部署 Worker
+```bash
+# 部署 Worker
+cd apps/api
+wrangler d1 migrations apply blog-db
 wrangler deploy
-
-# 7. 部署 Next.js（到 Vercel）
-vercel --prod
 ```
 
----
+前端继续部署到 Vercel，API 调用指向 Workers 的域名。这种混合架构在全球范围都能做到 50ms 以内的响应。
 
-## 六、性能指标
+### 方案对比
 
-### 6.1 目标指标
+Vercel + Neon 更简单，适合个人博客和小团队。Workers + D1 性能上限更高，但需要处理 SQLite 的兼容性问题（比如 D1 不支持完整的外键约束）。选哪个取决于你的流量预期和运维能力。
 
-```
-全球延迟：< 50ms（95%）
-冷启动：< 10ms
-并发请求：10000+ QPS
-缓存命中率：> 80%
-Bundle 大小：~100KB
-成本：$5-10/月
-```
+## 从开发到生产的检查清单
 
-### 6.2 监控
+上线前过一遍这些点：
 
-```typescript
-// apps/worker/src/middleware/analytics.ts
-export async function analytics(c: Context, next: Next) {
-  const start = Date.now();
+数据库方面：Schema 里该加的索引都加了（第 9 篇），连接池参数按生产环境调了（第 9 篇），迁移脚本在 staging 环境验证过（第 5 篇）。
 
-  await next();
+API 方面：所有写操作用事务包裹了（第 5 篇），N+1 查询都改成 JOIN 了（第 4 篇和第 9 篇），高频查询用了 Prepared Statements（第 9 篇），错误处理覆盖了唯一约束冲突等常见场景（第 3 篇）。
 
-  const duration = Date.now() - start;
+前端方面：Server Components 做好了 SSR 和 SEO（第 7 篇），缓存策略配了 ISR 和 HTTP 缓存（第 9 篇），客户端交互通过 tRPC 保持类型安全（第 6 篇）。
 
-  // 发送到分析服务
-  await c.env.CACHE.put(
-    `analytics:${Date.now()}`,
-    JSON.stringify({
-      path: c.req.path,
-      method: c.req.method,
-      duration,
-      status: c.res.status,
-    }),
-    {
-      expirationTtl: 60 * 60 * 24 * 7, // 7 天
-    }
-  );
-}
-```
+安全方面：密码用 bcrypt 哈希存储，JWT 密钥通过环境变量注入不用硬编码，API 路由做了权限校验（只有作者和管理员能编辑/删除文章）。
 
----
+## 系列回顾
 
-## 七、总结
+十篇文章，我们从零开始搭建了一个完整的博客系统。回顾一下每篇解决的核心问题：
 
-**恭喜你完成了 Drizzle ORM 系列的全部学习！**
+第一篇介绍了 Drizzle ORM 是什么、为什么选它——轻量、类型安全、Edge 友好。第二篇用纯 TypeScript 定义了 users、posts、comments、tags 五张表的 Schema。第三篇掌握了 CRUD 操作和查询构建器。第四篇解决了表之间的关联查询——JOIN、一对一、一对多、多对多。第五篇用事务保证多步操作的原子性，用 Drizzle Kit 管理数据库迁移。第六篇把 Drizzle 和 tRPC 结合起来，实现了从数据库到前端的端到端类型安全。第七篇深入 Next.js 和 Nuxt 的集成，用 Server Components 做 SSR。第八篇探索了 Edge Computing 环境——Cloudflare Workers、D1、Neon。第九篇从真实性能问题出发，解决了 N+1 查询、索引优化、连接池调优、缓存策略。今天这篇把所有知识整合成了一个可部署的完整项目。
 
-### 你已经掌握了：
+一条线串下来就是：定义数据模型 -> 操作数据 -> 关联查询 -> 保证一致性 -> 类型安全 API -> 前端渲染 -> Edge 部署 -> 性能优化 -> 项目整合。
 
-✅ **Drizzle ORM 基础** - Schema 定义、CRUD 操作
-✅ **关系查询** - JOIN、关联、聚合
-✅ **事务迁移** - 数据完整性、版本管理
-✅ **tRPC 集成** - 端到端类型安全
-✅ **框架集成** - Next.js、Nuxt、Server Components
-✅ **边缘计算** - Cloudflare Workers、D1、KV
-✅ **性能优化** - 索引、缓存、批量操作
-✅ **实战项目** - 全球分布式博客系统
+## 进阶方向
 
-### 下一步建议：
+这个系列覆盖了 Drizzle ORM 的核心用法，但还有一些值得深入的方向：
 
-1. **深入学习 PostgreSQL** - 索引优化、查询计划
-2. **学习 GraphQL** - 与 Drizzle 结合使用
-3. **探索微服务** - Drizzle 在微服务中的应用
-4. **性能调优** - 更深入的性能优化技巧
-5. **监控告警** - 完善的监控体系
+**Drizzle Studio** 是 Drizzle 官方的数据库管理 GUI，类似 pgAdmin 但更轻量。直接在浏览器里查看和编辑数据，开发调试时很方便。用 `npx drizzle-kit studio` 就能启动。
 
-### 继续学习：
+**Drizzle Kit 高级用法**：除了 `generate` 和 `migrate`，Drizzle Kit 还支持 `push`（直接推送 Schema 变更到数据库，跳过迁移文件）、`check`（检查迁移文件是否有冲突）、`up`（重放迁移）。生产环境建议走 `generate + migrate` 的正规流程，`push` 只在开发原型阶段用。
 
-- [Drizzle ORM 官方文档](https://orm.drizzle.team/)
-- [Cloudflare Workers 文档](https://developers.cloudflare.com/workers/)
-- [tRPC 文档](https://trpc.io/)
-- [Next.js 文档](https://nextjs.org/docs)
+**多数据库支持**：我们这个系列主要用 PostgreSQL，但 Drizzle 的 API 是数据库无关的。同样的 Schema 定义，换个驱动就能跑在 MySQL、SQLite、Turso（libSQL）、PlanetScale（MySQL 兼容）上。迁移到 Supabase 也很自然——Supabase 底层就是 PostgreSQL，Drizzle 可以直接连。
 
-**感谢你的学习！祝你在开发之路上越走越远！🚀**
+**从 Prisma 迁移**：如果你有现成的 Prisma 项目，Drizzle 官方提供了 `prisma-generator-drizzle` 工具，可以自动把 Prisma Schema 转成 Drizzle Schema。但迁移后需要重新审视查询方式——Prisma 的 `include` 和 Drizzle 的 `with`（Relational Query API）语义不同，不是一一对应的。
 
----
+**实时订阅**：Drizzle 本身不支持实时订阅（类似 Prisma Pulse 或 Supabase Realtime），但可以结合 PostgreSQL 的 LISTEN/NOTIFY 机制自己实现。或者用 Neon 的 WebSocket 实时功能。
 
-**相关代码**：[10-project-global-blog](https://github.com/yourname/drizzle-examples/tree/10-project-global-blog)
+## Trade-off 分析
+
+**Monorepo vs 多仓库**：Monorepo 共享类型方便，但构建配置更复杂。如果你的团队只有 2-3 个人、项目不复杂，Monorepo 的收益远大于成本。如果团队大了、CI 时间变长，可以考虑用 Turborepo 或 Nx 优化构建。
+
+**Serverless vs 传统服务器**：Serverless（Vercel + Neon）运维成本低，按请求付费，但冷启动和数据库连接是永远的痛点。传统服务器（VPS + PostgreSQL）性能更稳定，但需要自己管运维。博客系统流量波动大（白天高峰、夜间低谷），Serverless 的弹性扩缩容优势明显。
+
+**SQLite (D1) vs PostgreSQL (Neon)**：SQLite 简单、快、零运维，但不支持完整的关系型特性（比如复杂 JOIN 优化、窗口函数）。PostgreSQL 功能完整但运维成本更高。选哪个取决于你的数据模型复杂度。博客系统的 Schema 不算复杂，D1 完全够用；但如果要做复杂的数据分析（比如用户行为统计），PostgreSQL 更合适。
+
+**类型安全 vs 开发速度**：Drizzle + tRPC 的类型安全管道前期搭建成本高（定义 Schema、写 Router、配置类型），但后期维护成本低——改一个字段类型，编译器会在所有引用处报错。如果你的项目是一次性的或者需要快速验证想法，可以先用简单方案，等模型稳定了再补类型安全。
+
+这个系列到这里就结束了。希望你能把这套思路应用到自己的项目里——不只是博客系统，任何需要数据库访问的 TypeScript 项目，Drizzle 都是一个值得认真考虑的选择。

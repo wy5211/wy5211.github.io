@@ -1,614 +1,70 @@
 ---
-title: "02. Schema 定义和数据建模"
+title: "02. 博客系统 Schema 设计实战"
 date: "2026-03-23"
-summary: "深入学习 Drizzle ORM 的 Schema 定义，掌握 PostgreSQL 数据类型映射、表关系、索引和约束，构建类型安全的数据模型。"
-tags: ["Drizzle ORM", "数据建模", "PostgreSQL", "Schema", "类型系统"]
+summary: "从零设计博客系统的完整数据库 Schema：users、posts、comments、tags 五张表，讲清楚字段类型选择、索引策略、外键约束和 relations API。"
+tags: ["Drizzle ORM", "TypeScript"]
 category: "drizzle"
+cover: ""
 draft: false
 series: "Drizzle ORM 类型安全的数据库访问实战"
 seriesOrder: 2
 ---
 
-## 前言
+上一篇我们搞清楚了为什么选 Drizzle，跑通了第一个查询——插入一条用户记录，再按 email 查出来。但那张 users 表只有五个字段，真实项目的表要复杂得多。字段类型怎么选、默认值怎么设、索引加在哪里、多对多关联怎么建——这些决策直接影响查询性能和数据一致性，搞错了后期改起来代价很大。
 
-数据模型是应用的基石。Drizzle ORM 使用**纯 TypeScript** 定义 Schema，提供了完整的类型安全和开发体验。
+今天我们来为博客系统设计完整的数据库 Schema。这个案例会贯穿后续所有文章：用户注册、发布文章、评论互动、标签分类，后面讲 CRUD、关联查询、事务迁移的时候都会用这套表结构。
 
-**核心优势**：
+## 从需求推导表结构
 
-- ✅ **原生 TypeScript**：无需学习 DSL，直接使用 TS
-- ✅ **完整类型推断**：自动推断表结构
-- ✅ **代码提示友好**：IDE 自动补全
-- ✅ **无代码生成**：定义即类型
-- ✅ **数据库无关**：PostgreSQL、MySQL、SQLite 一套 API
+先想清楚博客系统有哪些核心实体：
 
-今天，我们将深入学习 Drizzle ORM 的 Schema 定义系统。
+- **用户（users）**：注册、登录、发文章、写评论
+- **文章（posts）**：标题、内容、发布状态、浏览量
+- **评论（comments）**：支持嵌套回复（评论下面可以再回复评论）
+- **标签（tags）**：一篇文章可以有多个标签，一个标签可以归属多篇文章——典型的多对多关系
+- **文章-标签关联表（posts_to_tags）**：多对多的中间表
 
----
+五张表，关系不算复杂，但已经包含了你会遇到的大部分建模问题：枚举类型、自引用外键（评论的嵌套）、多对多关联、复合索引。
 
-## Schema 基础
+## 先把枚举定义好
 
-### 什么是 Schema？
-
-在 Drizzle ORM 中，Schema 是用 TypeScript 定义的表结构描述：
+PostgreSQL 的枚举类型很适合表示固定的状态值。Drizzle 用 `pgEnum` 来定义，和 SQL 的 `CREATE TYPE ... AS ENUM (...)` 一一对应：
 
 ```typescript
-// ❌ 传统 Prisma：使用 DSL（领域特定语言）
-// schema.prisma:
-model User {
-  id    Int    @id
-  email String @unique
-  name  String?
-}
-
-// ✅ Drizzle ORM：使用原生 TypeScript
-import { pgTable, serial, varchar, text } from 'drizzle-orm/pg-core';
-
-export const users = pgTable('users', {
-  id: serial('id').primaryKey(),
-  email: varchar('email', { length: 255 }).notNull().unique(),
-  name: text('name'),
-});
-```
-
-### Schema 的作用
-
-```typescript
-// 1. 类型定义
-export const users = pgTable("users", {
-  id: serial("id").primaryKey(),
-  email: varchar("email", { length: 255 }).notNull(),
-});
-
-// users.id 的类型：PgSerial<number>
-// users.email 的类型：PgVarchar<255>
-
-// 2. 查询类型推断
-const result = await db.select().from(users);
-// result 类型：{ id: number; email: string }[]
-
-// 3. 插入类型验证
-await db.insert(users).values({
-  email: "test@example.com", // ✅ 类型正确
-  // email: 123  // ❌ 类型错误：不能将 number 赋给 string
-});
-
-// 4. 生成 SQL
-// 自动生成：CREATE TABLE users (id SERIAL PRIMARY KEY, email VARCHAR(255) NOT NULL, ...);
-```
-
----
-
-## PostgreSQL 数据类型映射
-
-### 1. 整数类型
-
-```typescript
-import {
-  pgTable,
-  serial,
-  bigserial,
-  integer,
-  bigint,
-} from "drizzle-orm/pg-core";
-
-export const numbers = pgTable("numbers", {
-  // serial：自增整数（4 字节）
-  id: serial("id").primaryKey(),
-  // SQL：id SERIAL PRIMARY KEY
-
-  // bigserial：自增大整数（8 字节）
-  bigId: bigserial("big_id").primaryKey(),
-  // SQL：big_id BIGSERIAL PRIMARY KEY
-
-  // integer：普通整数（4 字节，-2^31 到 2^31-1）
-  count: integer("count"),
-  // SQL：count INTEGER
-
-  // bigint：大整数（8 字节）
-  balance: bigint("balance", { mode: "number" }),
-  // SQL：balance BIGINT
-
-  // smallint：小整数（2 字节）
-  age: integer("age"),
-  // SQL：age INTEGER
-});
-```
-
-**使用场景：**
-
-- `serial`：主键 ID
-- `bigserial`：高并发主键
-- `integer`：计数、数量
-- `bigint`：金额、余额
-
-### 2. 字符串类型
-
-```typescript
-import { pgTable, varchar, text, char } from "drizzle-orm/pg-core";
-
-export const strings = pgTable("strings", {
-  // varchar(n)：变长字符串，最大长度 n
-  email: varchar("email", { length: 255 }).notNull(),
-  // SQL：email VARCHAR(255) NOT NULL
-
-  // text：无限长度字符串
-  content: text("content"),
-  // SQL：content TEXT
-
-  // char(n)：定长字符串，不足补空格
-  code: char("code", { length: 10 }),
-  // SQL：code CHAR(10)
-});
-```
-
-**使用场景：**
-
-- `varchar(255)`：邮箱、用户名
-- `text`：文章内容、评论
-- `char(10)`：固定格式代码
-
-### 3. 布尔类型
-
-```typescript
-import { pgTable, boolean } from "drizzle-orm/pg-core";
-
-export const flags = pgTable("flags", {
-  isActive: boolean("is_active").default(false),
-  // SQL：is_active BOOLEAN DEFAULT FALSE
-
-  isVerified: boolean("is_verified").notNull(),
-  // SQL：is_verified BOOLEAN NOT NULL
-});
-```
-
-### 4. 时间类型
-
-```typescript
-import { pgTable, timestamp, date, time, interval } from "drizzle-orm/pg-core";
-
-export const times = pgTable("times", {
-  // timestamp：日期和时间
-  createdAt: timestamp("created_at").defaultNow(),
-  // SQL：created_at TIMESTAMP DEFAULT NOW()
-
-  // 带时区
-  updatedAt: timestamp("updated_at", { withTimezone: true, mode: "date" }),
-  // SQL：updated_at TIMESTAMPTZ
-
-  // date：只有日期
-  birthDate: date("birth_date"),
-  // SQL：birth_date DATE
-
-  // time：只有时间
-  workTime: time("work_time"),
-  // SQL：work_time TIME
-
-  // interval：时间间隔
-  duration: interval("duration"),
-  // SQL：duration INTERVAL
-});
-```
-
-**timestamp 的 mode 参数：**
-
-```typescript
-// mode: 'string'（默认）
-timestamp("created_at", { mode: "string" });
-// TypeScript 类型：string
-// SQL 值：'2024-01-01 12:00:00'
-
-// mode: 'date'
-timestamp("created_at", { mode: "date" });
-// TypeScript 类型：Date
-// SQL 值：'2024-01-01 12:00:00'
-
-// mode: 'number'
-timestamp("created_at", { mode: "number" });
-// TypeScript 类型：number（Unix 时间戳）
-// SQL 值：1704067200
-```
-
-### 5. 数值类型
-
-```typescript
-import {
-  pgTable,
-  decimal,
-  numeric,
-  real,
-  doublePrecision,
-} from "drizzle-orm/pg-core";
-
-export const decimals = pgTable("decimals", {
-  // decimal：精确的小数（推荐用于金额）
-  price: decimal("price", { precision: 10, scale: 2 }),
-  // SQL：price DECIMAL(10, 2)
-  // 存储：总共 10 位，小数点后 2 位
-  // 范围：-99999999.99 到 99999999.99
-
-  // numeric：decimal 的别名
-  balance: numeric("balance", { precision: 15, scale: 2 }),
-  // SQL：balance NUMERIC(15, 2)
-
-  // real：单精度浮点数（6 位精度）
-  temperature: real("temperature"),
-  // SQL：temperature REAL
-
-  // doublePrecision：双精度浮点数（15 位精度）
-  weight: doublePrecision("weight"),
-  // SQL：weight DOUBLE PRECISION
-});
-```
-
-**使用场景：**
-
-- `decimal(10, 2)`：商品价格、金额
-- `real`：温度、湿度
-- `doublePrecision`：体重、身高
-
-### 6. JSON 类型
-
-```typescript
-import { pgTable, json, jsonb } from "drizzle-orm/pg-core";
-
-export const jsons = pgTable("jsons", {
-  // json：存储为文本，查询慢
-  metadata: json("metadata"),
-  // SQL：metadata JSON
-  // TypeScript 类型：unknown
-
-  // jsonb：二进制存储，查询快（推荐）
-  settings: jsonb("settings").$type<{
-    theme: "light" | "dark";
-    notifications: boolean;
-  }>(),
-  // SQL：settings JSONB
-  // TypeScript 类型：{ theme: 'light' | 'dark'; notifications: boolean }
-});
-```
-
-**使用场景：**
-
-- `jsonb`：用户设置、配置文件
-- `json`：历史数据、不需要查询的 JSON
-
-### 7. 数组类型
-
-```typescript
-import { pgTable, array, varchar } from "drizzle-orm/pg-core";
-
-export const arrays = pgTable("arrays", {
-  // 字符串数组
-  tags: array("tags", varchar("tag", { length: 50 })),
-  // SQL：tags VARCHAR(50)[]
-
-  // 整数数组
-  scores: array("scores", integer("score")),
-  // SQL：scores INTEGER[]
-
-  // 带默认值
-  categories: array("categories", varchar("category", { length: 50 })).default(
-    sql`'[]'`
-  ),
-  // SQL：categories VARCHAR(50)[] DEFAULT '[]'
-});
-```
-
-**使用场景：**
-
-- 文章标签
-- 商品分类
-- 用户权限列表
-
-### 8. 二进制类型
-
-```typescript
-import { pgTable, bytea } from "drizzle-orm/pg-core";
-
-export const binaries = pgTable("binaries", {
-  // bytea：二进制数据
-  avatar: bytea("avatar"),
-  // SQL：avatar BYTEA
-
-  // 存储图片、文件等
-  file: bytea("file"),
-  // SQL：file BYTEA
-});
-```
-
-### 9. 枚举类型
-
-```typescript
-import { pgTable, pgEnum } from "drizzle-orm/pg-core";
-
-// 1. 定义枚举
-export const roleEnum = pgEnum("role", ["USER", "ADMIN", "MODERATOR"]);
-// SQL：CREATE TYPE role AS ENUM ('USER', 'ADMIN', 'MODERATOR');
-
-// 2. 使用枚举
-export const users = pgTable("users", {
-  id: serial("id").primaryKey(),
-  role: roleEnum("role").default("USER"),
-  // SQL：role ROLE DEFAULT 'USER'
-});
-
-// TypeScript 类型自动推断为：'USER' | 'ADMIN' | 'MODERATOR'
-
-// 使用示例
-await db.insert(users).values({
-  role: "ADMIN", // ✅ 类型正确
-  // role: 'INVALID'  // ❌ 类型错误
-});
-```
-
-### 10. UUID 类型
-
-```typescript
-import { pgTable, uuid } from "drizzle-orm/pg-core";
-
-export const uuids = pgTable("uuids", {
-  // uuid：通用唯一标识符
-  id: uuid("id").defaultRandom(),
-  // SQL：id UUID DEFAULT gen_random_uuid()
-
-  // 或使用 v4 UUID
-  apiKey: uuid("api_key").default(sql`gen_random_uuid()`),
-  // SQL：api_key UUID DEFAULT gen_random_uuid()
-});
-```
-
----
-
-## 表关系定义
-
-### 1. 一对一关系
-
-```typescript
-import { pgTable, serial, integer, text } from "drizzle-orm/pg-core";
-
-export const users = pgTable("users", {
-  id: serial("id").primaryKey(),
-  name: text("name").notNull(),
-});
-
-export const profiles = pgTable("profiles", {
-  id: serial("id").primaryKey(),
-  userId: integer("user_id").references(() => users.id, {
-    onDelete: "cascade",
-  }),
-  bio: text("bio"),
-});
-
-// SQL：
-// CREATE TABLE profiles (
-//   id SERIAL PRIMARY KEY,
-//   user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-//   bio TEXT
-// );
-
-// 查询关联数据
-const result = await db
-  .select()
-  .from(users)
-  .leftJoin(profiles, eq(users.id, profiles.userId));
-```
-
-**外键约束选项：**
-
-```typescript
-.references(() => users.id, {
-  onDelete: 'cascade',    // 删除用户时，同时删除 profile
-  // onDelete: 'set null',  // 删除用户时，profile.user_id 设为 NULL
-  // onDelete: 'restrict',  // 删除用户时，如果有 profile 则禁止删除
-  // onDelete: 'no action', // 不采取任何动作
-  onUpdate: 'cascade'     // 更新用户 ID 时，同时更新 profile.user_id
-})
-```
-
-### 2. 一对多关系
-
-```typescript
-export const authors = pgTable("authors", {
-  id: serial("id").primaryKey(),
-  name: text("name").notNull(),
-});
-
-export const posts = pgTable("posts", {
-  id: serial("id").primaryKey(),
-  title: text("title").notNull(),
-  authorId: integer("author_id").references(() => authors.id),
-  content: text("content"),
-});
-
-// 查询作者及其文章
-const authorsWithPosts = await db
-  .select()
-  .from(authors)
-  .leftJoin(posts, eq(authors.id, posts.authorId));
-
-// 结果：
-// [
-//   { author: { id: 1, name: 'Alice' }, post: { id: 1, title: 'Hello' } },
-//   { author: { id: 1, name: 'Alice' }, post: { id: 2, title: 'World' } },
-//   { author: { id: 2, name: 'Bob' }, post: null }
-// ]
-```
-
-### 3. 多对多关系
-
-```typescript
-export const posts = pgTable("posts", {
-  id: serial("id").primaryKey(),
-  title: text("title").notNull(),
-});
-
-export const tags = pgTable("tags", {
-  id: serial("id").primaryKey(),
-  name: text("name").notNull().unique(),
-});
-
-// 中间表（关联表）
-export const postsToTags = pgTable("posts_to_tags", {
-  postId: integer("post_id").references(() => posts.id, {
-    onDelete: "cascade",
-  }),
-  tagId: integer("tag_id").references(() => tags.id, { onDelete: "cascade" }),
-});
-
-// 复合主键
-export const postsToTagsPk = pgTable(
-  "posts_to_tags_pk",
-  {
-    postId: integer("post_id").references(() => posts.id, {
-      onDelete: "cascade",
-    }),
-    tagId: integer("tag_id").references(() => tags.id, { onDelete: "cascade" }),
-  },
-  (table) => ({
-    pk: primaryKey({ columns: [table.postId, table.tagId] }),
-  })
-);
-
-// 查询文章及其标签
-const postsWithTags = await db
-  .select()
-  .from(posts)
-  .innerJoin(postsToTags, eq(posts.id, postsToTags.postId))
-  .innerJoin(tags, eq(postsToTags.tagId, tags.id));
-```
-
----
-
-## 索引和约束
-
-### 1. 单列索引
-
-```typescript
-import { pgTable, serial, varchar, index } from "drizzle-orm/pg-core";
-
-export const users = pgTable(
-  "users",
-  {
-    id: serial("id").primaryKey(),
-    email: varchar("email", { length: 255 }).notNull().unique(),
-    name: varchar("name", { length: 100 }),
-  },
-  (table) => ({
-    // 创建索引
-    nameIdx: index("name_idx").on(table.name),
-    // SQL：CREATE INDEX name_idx ON users(name)
-  })
-);
-```
-
-### 2. 复合索引
-
-```typescript
-export const posts = pgTable(
-  "posts",
-  {
-    id: serial("id").primaryKey(),
-    title: varchar("title", { length: 255 }),
-    authorId: integer("author_id"),
-    createdAt: timestamp("created_at").defaultNow(),
-  },
-  (table) => ({
-    // 复合索引
-    authorCreatedAtIdx: index("author_created_at_idx").on(
-      table.authorId,
-      table.createdAt
-    ),
-    // SQL：CREATE INDEX author_created_at_idx ON posts(author_id, created_at)
-  })
-);
-```
-
-### 3. 唯一索引
-
-```typescript
-export const users = pgTable(
-  "users",
-  {
-    id: serial("id").primaryKey(),
-    email: varchar("email", { length: 255 }).notNull(),
-  },
-  (table) => ({
-    // 唯一索引
-    emailUnique: unique("email_unique").on(table.email),
-    // SQL：CREATE UNIQUE INDEX email_unique ON users(email)
-  })
-);
-```
-
-### 4. 全文搜索索引
-
-```typescript
-import { pgTable, serial, text, index } from "drizzle-orm/pg-core";
-
-export const articles = pgTable(
-  "articles",
-  {
-    id: serial("id").primaryKey(),
-    title: text("title").notNull(),
-    content: text("content").notNull(),
-  },
-  (table) => ({
-    // 全文搜索索引
-    titleContentIdx: index("title_content_idx").using(
-      "gin",
-      sql`to_tsvector('english', ${table.title} || ' ' || ${table.content})`
-    ),
-    // SQL：CREATE INDEX title_content_idx ON articles USING gin(to_tsvector('english', title || ' ' || content))
-  })
-);
-
-// 使用全文搜索
-const results = await db
-  .select()
-  .from(articles)
-  .where(
-    sql`to_tsvector('english', ${articles.title} || ' ' || ${articles.content}) @@ to_tsquery('english', 'search')`
-  );
-```
-
----
-
-## 实战：博客系统数据模型
-
-让我们构建一个完整的博客系统数据模型。
-
-### 完整 Schema 定义
-
-```typescript
-// src/schema.ts
-
-import {
-  pgTable,
-  serial,
-  varchar,
-  text,
-  integer,
-  timestamp,
-  boolean,
-  pgEnum,
-} from "drizzle-orm/pg-core";
-import { relations } from "drizzle-orm";
-import { index, unique } from "drizzle-orm/pg-core";
-
-// ========== 枚举定义 ==========
+// src/schema/enums.ts
+import { pgEnum } from "drizzle-orm/pg-core";
 
 export const postStatusEnum = pgEnum("post_status", [
   "DRAFT",
   "PUBLISHED",
   "ARCHIVED",
 ]);
+
 export const commentStatusEnum = pgEnum("comment_status", [
   "PENDING",
   "APPROVED",
   "SPAM",
 ]);
+```
 
-// ========== 用户表 ==========
+这里有个设计选择的问题：为什么用 `pgEnum` 而不是 TypeScript 的 `union` 类型加 `varchar` 字段？因为 `pgEnum` 在数据库层面就约束了合法值，你不可能往 `post_status` 列里插入一个 `"DELETED"` 除非先修改枚举定义。而 `varchar` 加 union 类型只在 TypeScript 编译时有效，运行时写错值数据库不会拦你。
+
+但 `pgEnum` 也有个麻烦的地方：PostgreSQL 的枚举类型修改起来比较笨重，加一个值需要 `ALTER TYPE ... ADD VALUE`，不能在事务里执行。如果你的状态值经常变动，用 `varchar` 加应用层校验可能更灵活。博客系统的文章状态基本是固定的，所以这里用 `pgEnum` 没问题。
+
+## 用户表：选对字段类型比你想象的重要
+
+```typescript
+// src/schema/users.ts
+import {
+  pgTable,
+  serial,
+  varchar,
+  text,
+  boolean,
+  timestamp,
+  index,
+} from "drizzle-orm/pg-core";
+
 export const users = pgTable(
   "users",
   {
@@ -616,93 +72,196 @@ export const users = pgTable(
     email: varchar("email", { length: 255 }).notNull().unique(),
     username: varchar("username", { length: 50 }).notNull().unique(),
     passwordHash: varchar("password_hash", { length: 255 }).notNull(),
-    name: varchar("name", { length: 100 }),
+    displayName: varchar("display_name", { length: 100 }),
     bio: text("bio"),
-    avatar: varchar("avatar", { length: 500 }),
-    isActive: boolean("is_active").default(true),
-    createdAt: timestamp("created_at").defaultNow(),
-    updatedAt: timestamp("updated_at").defaultNow(),
+    avatarUrl: varchar("avatar_url", { length: 500 }),
+    isActive: boolean("is_active").default(true).notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
   },
   (table) => ({
-    emailIdx: index("user_email_idx").on(table.email),
-    usernameIdx: index("user_username_idx").on(table.username),
+    emailIdx: index("users_email_idx").on(table.email),
+    usernameIdx: index("users_username_idx").on(table.username),
   })
 );
+```
 
-// ========== 文章表 ==========
+几个值得解释的选择：
+
+**为什么 `email` 用 `varchar(255)` 而不是 `text`？** 技术上 `text` 和 `varchar` 在 PostgreSQL 里性能几乎一样（PostgreSQL 不会真的按长度预分配空间）。但 `varchar(255)` 有两个好处：一是在应用层做校验时有个明确的长度边界，二是某些 ORM 和迁移工具在比较 schema 差异时对 `text` 处理不够好。255 是邮箱的标准上限，不是随便拍脑袋的数字。
+
+**为什么 `bio` 用 `text` 不设长度？** 个人简介可长可短，设一个硬上限没什么意义。PostgreSQL 的 `text` 类型最大可以存 1GB，完全够用。
+
+**为什么单独存 `passwordHash` 而不是叫 `password`？** 命名即文档。叫 `password` 容易让人误以为存的是明文（虽然你肯定不会这么做）。叫 `passwordHash` 一眼就知道这是哈希值，新同事接手代码时不会产生误解。
+
+**为什么 `createdAt` 和 `updatedAt` 都加了 `notNull()`？** `defaultNow()` 确保了插入时自动填入时间，但它不阻止你显式传 `null`。加上 `notNull()` 才能在数据库层面彻底杜绝空值。`updatedAt` 也设了 `defaultNow()`，这样插入记录时它也有初始值，后续更新时你手动 `.set({ updatedAt: new Date() })` 就行。
+
+**索引策略：** `email` 和 `username` 都加了索引。这两个字段是登录和用户主页查询的高频条件，不建索引的话，用户量一上去，登录接口就会变慢。注意 `unique()` 约束本身会创建唯一索引，所以额外加的 `emailIdx` 其实是冗余的——这里保留它是为了演示索引语法，生产环境你可以省掉。
+
+## 文章表：索引要跟着查询走
+
+```typescript
+// src/schema/posts.ts
+import {
+  pgTable,
+  serial,
+  varchar,
+  text,
+  integer,
+  boolean,
+  timestamp,
+  index,
+  unique,
+} from "drizzle-orm/pg-core";
+import { postStatusEnum } from "./enums";
+import { users } from "./users";
+
 export const posts = pgTable(
   "posts",
   {
     id: serial("id").primaryKey(),
     title: varchar("title", { length: 255 }).notNull(),
-    slug: varchar("slug", { length: 255 }).notNull().unique(),
+    slug: varchar("slug", { length: 255 }).notNull(),
     excerpt: varchar("excerpt", { length: 500 }),
     content: text("content").notNull(),
-    coverImage: varchar("cover_image", { length: 500 }),
-    authorId: integer("author_id").references(() => users.id, {
-      onDelete: "cascade",
-    }),
-    categoryId: integer("category_id").references(() => categories.id),
-    status: postStatusEnum("status").default("DRAFT"),
-    viewCount: integer("view_count").default(0),
-    isFeatured: boolean("is_featured").default(false),
-    publishedAt: timestamp("published_at"),
-    createdAt: timestamp("created_at").defaultNow(),
-    updatedAt: timestamp("updated_at").defaultNow(),
+    coverImageUrl: varchar("cover_image_url", { length: 500 }),
+    authorId: integer("author_id")
+      .notNull()
+      .references(() => users.id, { onDelete: "cascade" }),
+    status: postStatusEnum("status").default("DRAFT").notNull(),
+    viewCount: integer("view_count").default(0).notNull(),
+    isFeatured: boolean("is_featured").default(false).notNull(),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
   },
   (table) => ({
-    slugIdx: unique("post_slug_unique").on(table.slug),
-    authorIdx: index("post_author_idx").on(table.authorId),
-    categoryIdx: index("post_category_idx").on(table.categoryId),
-    statusIdx: index("post_status_idx").on(table.status),
-    publishedAtIdx: index("post_published_at_idx").on(table.publishedAt),
-    authorStatusIdx: index("post_author_status_idx").on(
+    slugIdx: unique("posts_slug_unique").on(table.slug),
+    authorIdx: index("posts_author_idx").on(table.authorId),
+    statusIdx: index("posts_status_idx").on(table.status),
+    publishedAtIdx: index("posts_published_at_idx").on(table.publishedAt),
+    authorStatusIdx: index("posts_author_status_idx").on(
       table.authorId,
       table.status
     ),
   })
 );
+```
 
-// ========== 分类表 ==========
-export const categories = pgTable(
-  "categories",
+**slug 为什么用 `unique` 约束而不是普通索引？** 文章的 URL 通常是 `/posts/how-to-use-drizzle`，slug 就是 URL 的一部分。如果两条记录有相同的 slug，URL 路由就会冲突。`unique` 约束在数据库层面保证不会出现重复，比应用层校验可靠得多。
+
+**为什么 `authorId` 的外键设了 `onDelete: "cascade"`？** 这意味着删除用户时，该用户的所有文章也会被自动删除。对于博客系统来说这是合理的——用户注销了，文章也没理由留着。但如果你做的是论坛或者内容平台，你可能需要 `onDelete: "set null"` 来保留文章（把作者设为"已注销"），或者 `onDelete: "restrict"` 来阻止删除还有文章的用户。
+
+**复合索引 `authorStatusIdx` 是干什么的？** 博客后台最常见的查询之一是"获取某作者的所有已发布文章"：`WHERE author_id = ? AND status = 'PUBLISHED'`。单独的 `authorIdx` 或 `statusIdx` 都不是最优解，复合索引 `(author_id, status)` 才能让这个查询走索引覆盖。
+
+这里有个坑：复合索引的列顺序很重要。`(author_id, status)` 和 `(status, author_id)` 是不同的索引。原则是"选择性高的列放前面"。如果某个作者有 1000 篇文章，但只有 10% 是 PUBLISHED 状态，那 `(author_id, status)` 更好——先通过 author_id 缩小范围，再在结果里过滤 status。
+
+## 评论表：自引用外键实现嵌套回复
+
+```typescript
+// src/schema/comments.ts
+import {
+  pgTable,
+  serial,
+  text,
+  integer,
+  timestamp,
+  index,
+} from "drizzle-orm/pg-core";
+import { commentStatusEnum } from "./enums";
+import { users } from "./users";
+import { posts } from "./posts";
+
+export const comments = pgTable(
+  "comments",
   {
     id: serial("id").primaryKey(),
-    name: varchar("name", { length: 100 }).notNull().unique(),
-    slug: varchar("slug", { length: 100 }).notNull().unique(),
-    description: text("description"),
-    parentId: integer("parent_id").references(() => categories.id),
-    createdAt: timestamp("created_at").defaultNow(),
+    postId: integer("post_id")
+      .notNull()
+      .references(() => posts.id, { onDelete: "cascade" }),
+    authorId: integer("author_id").references(() => users.id, {
+      onDelete: "set null",
+    }),
+    parentId: integer("parent_id").references((): any => comments.id, {
+      onDelete: "cascade",
+    }),
+    content: text("content").notNull(),
+    status: commentStatusEnum("status").default("PENDING").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
   },
   (table) => ({
-    slugIdx: unique("category_slug_unique").on(table.slug),
-    parentIdIdx: index("category_parent_idx").on(table.parentId),
+    postIdx: index("comments_post_idx").on(table.postId),
+    authorIdx: index("comments_author_idx").on(table.authorId),
+    parentIdx: index("comments_parent_idx").on(table.parentId),
   })
 );
+```
 
-// ========== 标签表 ==========
-export const tags = pgTable(
-  "tags",
-  {
-    id: serial("id").primaryKey(),
-    name: varchar("name", { length: 50 }).notNull().unique(),
-    slug: varchar("slug", { length: 50 }).notNull().unique(),
-    createdAt: timestamp("created_at").defaultNow(),
-  },
-  (table) => ({
-    slugUnique: unique("tag_slug_unique").on(table.slug),
-  })
-);
+这张表有两个值得细说的设计决策。
 
-// ========== 文章-标签关联表 ==========
+**自引用外键 `parentId`：** `parentId` 引用的是同一张表的 `id`，这是实现嵌套评论的标准做法。顶级评论的 `parentId` 为 `null`，回复的 `parentId` 指向被回复的评论。查某条评论的所有回复就是 `WHERE parent_id = ?`，简单直接。
+
+这里有个取舍：自引用外键只支持单层父子关系。如果你需要更复杂的树形结构（比如 Reddit 那样的无限嵌套），可以考虑 PostgreSQL 的 `ltree` 扩展或者单独的闭包表。但对于博客评论来说，一两层嵌套足够了，自引用外键是最简单的方案。
+
+**`authorId` 的 `onDelete: "set null"`：** 和文章表不同，评论的作者被删除时，我们选择保留评论但把 `authorId` 设为 `null`。前端显示时如果 `authorId` 为 null，展示"已注销用户"就行。这样做保留了文章的讨论上下文——你肯定见过论坛里"此用户已注销"的评论，就是这个逻辑。
+
+## 标签和关联表：多对多关系
+
+```typescript
+// src/schema/tags.ts
+import { pgTable, serial, varchar, timestamp } from "drizzle-orm/pg-core";
+
+export const tags = pgTable("tags", {
+  id: serial("id").primaryKey(),
+  name: varchar("name", { length: 50 }).notNull(),
+  slug: varchar("slug", { length: 50 }).notNull(),
+  createdAt: timestamp("created_at", { withTimezone: true })
+    .defaultNow()
+    .notNull(),
+});
+```
+
+标签表很简单。`name` 存显示名（"TypeScript"），`slug` 存 URL 友好的标识（"typescript"）。
+
+接下来是关键的多对多关联表：
+
+```typescript
+// src/schema/posts-to-tags.ts
+import {
+  pgTable,
+  integer,
+  timestamp,
+  primaryKey,
+  index,
+} from "drizzle-orm/pg-core";
+import { posts } from "./posts";
+import { tags } from "./tags";
+
 export const postsToTags = pgTable(
   "posts_to_tags",
   {
-    postId: integer("post_id").references(() => posts.id, {
-      onDelete: "cascade",
-    }),
-    tagId: integer("tag_id").references(() => tags.id, { onDelete: "cascade" }),
-    createdAt: timestamp("created_at").defaultNow(),
+    postId: integer("post_id")
+      .notNull()
+      .references(() => posts.id, { onDelete: "cascade" }),
+    tagId: integer("tag_id")
+      .notNull()
+      .references(() => tags.id, { onDelete: "cascade" }),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
   },
   (table) => ({
     pk: primaryKey({ columns: [table.postId, table.tagId] }),
@@ -710,35 +269,29 @@ export const postsToTags = pgTable(
     tagIdIdx: index("posts_to_tags_tag_idx").on(table.tagId),
   })
 );
+```
 
-// ========== 评论表 ==========
-export const comments = pgTable(
-  "comments",
-  {
-    id: serial("id").primaryKey(),
-    postId: integer("post_id").references(() => posts.id, {
-      onDelete: "cascade",
-    }),
-    authorId: integer("author_id").references(() => users.id, {
-      onDelete: "set null",
-    }),
-    parentId: integer("parent_id").references(() => comments.id, {
-      onDelete: "cascade",
-    }),
-    content: text("content").notNull(),
-    status: commentStatusEnum("status").default("PENDING"),
-    createdAt: timestamp("created_at").defaultNow(),
-    updatedAt: timestamp("updated_at").defaultNow(),
-  },
-  (table) => ({
-    postIdIdx: index("comment_post_idx").on(table.postId),
-    authorIdIdx: index("comment_author_idx").on(table.authorId),
-    parentIdIdx: index("comment_parent_idx").on(table.parentId),
-    statusIdx: index("comment_status_idx").on(table.status),
-  })
-);
+这里有几个设计要点：
 
-// ========== Drizzle Relations（可选）==========
+**复合主键而不是自增 ID：** 关联表不需要单独的自增 ID。`(post_id, tag_id)` 的组合就是天然的主键——同一篇文章不能重复打同一个标签。用 `primaryKey()` 定义复合主键，在数据库层面就保证了这个约束。
+
+**两边都设了 `onDelete: "cascade"`：** 删除文章时，自动清除关联记录；删除标签时，也是。标签被删了，文章还留着，只是少了那个标签。
+
+**为什么加 `createdAt`？** 多对多关联表加时间戳不是必须的，但知道"这篇文章是什么时候被打上这个标签的"有时候有用——比如做"最近添加的标签"推荐。不加也可以，看你有没有这个需求。
+
+## Drizzle 的 Relations API：让关联查询更自然
+
+到目前为止我们定义的都是表的物理结构（字段、类型、索引、外键）。Drizzle 还有一套 `relations` API，用来描述表之间的逻辑关系。它不影响数据库结构，但能让查询写起来更方便。
+
+```typescript
+// src/schema/relations.ts
+import { relations } from "drizzle-orm";
+import { users } from "./users";
+import { posts } from "./posts";
+import { comments } from "./comments";
+import { tags } from "./tags";
+import { postsToTags } from "./posts-to-tags";
+
 export const usersRelations = relations(users, ({ many }) => ({
   posts: many(posts),
   comments: many(comments),
@@ -748,257 +301,91 @@ export const postsRelations = relations(posts, ({ one, many }) => ({
   author: one(users, {
     fields: [posts.authorId],
     references: [users.id],
-  }),
-  category: one(categories, {
-    fields: [posts.categoryId],
-    references: [categories.id],
+    relationName: "postAuthor",
   }),
   comments: many(comments),
-  tags: many(postsToTags),
+  postsToTags: many(postsToTags),
+}));
+
+export const commentsRelations = relations(comments, ({ one }) => ({
+  post: one(posts, {
+    fields: [comments.postId],
+    references: [posts.id],
+    relationName: "postComments",
+  }),
+  author: one(users, {
+    fields: [comments.authorId],
+    references: [users.id],
+    relationName: "commentAuthor",
+  }),
+  parent: one(comments, {
+    fields: [comments.parentId],
+    references: [comments.id],
+    relationName: "commentReplies",
+  }),
+}));
+
+export const tagsRelations = relations(tags, ({ many }) => ({
+  postsToTags: many(postsToTags),
+}));
+
+export const postsToTagsRelations = relations(postsToTags, ({ one }) => ({
+  post: one(posts, {
+    fields: [postsToTags.postId],
+    references: [posts.id],
+  }),
+  tag: one(tags, {
+    fields: [postsToTags.tagId],
+    references: [tags.id],
+  }),
 }));
 ```
 
-### 类型自动推断
+这里最容易搞混的是 `relationName` 参数。什么时候需要它？当两张表之间有多个关系的时候。比如 `users` 和 `posts` 之间是"作者"关系，`users` 和 `comments` 之间也是"作者"关系——虽然语义不同，但外键都指向 `users.id`。Drizzle 需要你用 `relationName` 来区分"这是文章的作者"还是"评论的作者"。不加的话，Drizzle 会报关系歧义的错误。
+
+定义了 relations 之后，你就可以用 relational query API 了：
 
 ```typescript
-// 1. 表类型
-// users 表的类型：
-interface User {
-  id: number;
-  email: string;
-  username: string;
-  passwordHash: string;
-  name: string | null;
-  bio: string | null;
-  avatar: string | null;
-  isActive: boolean;
-  createdAt: Date;
-  updatedAt: Date;
-}
-
-// 2. 查询类型
-const userList = await db.select().from(users);
-// userList 的类型：User[]
-
-// 3. 插入类型
-await db.insert(users).values({
-  email: "test@example.com", // ✅ 必需
-  username: "testuser", // ✅ 必需
-  passwordHash: "hash", // ✅ 必需
-  name: "Test", // ✅ 可选
-  // invalidField: 'xxx'       // ❌ 类型错误
-});
-
-// 4. 枚举类型
-const post = await db.select().from(posts).limit(1);
-// post[0].status 的类型：'DRAFT' | 'PUBLISHED' | 'ARCHIVED'
-```
-
----
-
-## 高级技巧
-
-### 1. 生成列（Generated Columns）
-
-```typescript
-import { pgTable, serial, varchar, text, integer } from "drizzle-orm/pg-core";
-
-export const users = pgTable("users", {
-  id: serial("id").primaryKey(),
-  firstName: varchar("first_name", { length: 50 }).notNull(),
-  lastName: varchar("last_name", { length: 50 }).notNull(),
-  fullName: text("full_name").generatedAlwaysAs(
-    sql`${users.firstName} || ' ' || ${users.lastName}`
-  ),
-  // SQL：full_name TEXT GENERATED ALWAYS AS (first_name || ' ' || last_name) STORED
-});
-
-// fullName 是虚拟列，自动计算，无需手动设置
-```
-
-### 2. 默认值表达式
-
-```typescript
-export const posts = pgTable("posts", {
-  id: serial("id").primaryKey(),
-  title: varchar("title", { length: 255 }).notNull(),
-  slug: varchar("slug", { length: 255 })
-    .notNull()
-    .default(sql`lower(replace(title, ' ', '-'))`),
-  // SQL：slug VARCHAR(255) NOT NULL DEFAULT lower(replace(title, ' ', '-'))
-});
-```
-
-### 3. 检查约束
-
-```typescript
-export const users = pgTable(
-  "users",
-  {
-    id: serial("id").primaryKey(),
-    age: integer("age"),
-    email: varchar("email", { length: 255 }).notNull(),
+// 查文章时顺便带出作者和评论
+const result = await db.query.posts.findMany({
+  with: {
+    author: true,
+    comments: true,
   },
-  (table) => ({
-    // 年龄必须大于 0
-    ageCheck: check("age_check", sql`${table.age} > 0`),
-    // SQL：CHECK (age > 0)
-
-    // 邮箱格式验证
-    emailCheck: check(
-      "email_check",
-      sql`${table.email} ~ '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'`
-    ),
-  })
-);
+  where: eq(posts.status, "PUBLISHED"),
+  limit: 10,
+});
 ```
 
-### 4. 表级约束
+这种写法类似 Prisma 的 `include`，比手动 `leftJoin` 省事很多。后面讲关联查询的文章会深入讲这个 API。
+
+## 汇总：把所有 Schema 组装到一起
+
+实际项目中，你可以把每张表放在单独的文件里（上面已经这么做了），然后通过一个 `index.ts` 统一导出：
 
 ```typescript
-export const products = pgTable(
-  "products",
-  {
-    id: serial("id").primaryKey(),
-    name: varchar("name", { length: 255 }).notNull(),
-    price: integer("price").notNull(),
-    stock: integer("stock").notNull(),
-  },
-  (table) => ({
-    // 价格必须大于 0
-    priceCheck: check("price_check", sql`${table.price} > 0`),
-
-    // 库存必须大于等于 0
-    stockCheck: check("stock_check", sql`${table.stock} >= 0`),
-  })
-);
+// src/schema/index.ts
+export * from "./enums";
+export * from "./users";
+export * from "./posts";
+export * from "./comments";
+export * from "./tags";
+export * from "./posts-to-tags";
+export * from "./relations";
 ```
+
+这样在 `db.ts` 里就可以 `import * as schema from "./schema"` 一行搞定。
+
+## Schema 设计的几个实践经验
+
+**列名和属性名要一致地命名。** Drizzle 允许你把数据库列名和 TypeScript 属性名设成不同的（`displayName: text("display_name")`），这很好。但要在整个项目里保持同一个惯例——列名 `snake_case`，属性名 `camelCase`。不要有的表混着用，有的表又全用 `camelCase`，后面维护的人会疯掉。
+
+**索引不要贪多。** 每个索引都会占用额外的存储空间，并且会在插入和更新时拖慢写入速度。只给真正频繁出现在 `WHERE`、`JOIN`、`ORDER BY` 里的列加索引。上面博客系统的索引策略就是按"跟着查询走"原则设计的。
+
+**`notNull()` 尽可能加上。** JavaScript 里的 `null` 和 `undefined` 已经够让人头疼了，不要让数据库也加入这场混乱。能确定一个字段一定有值的，就加上 `notNull()`。需要允许为空的字段（比如评论的 `parentId`、用户的 `bio`）才不加。
+
+**时间戳用 `withTimezone: true`。** 除非你的应用只在一个时区运行，否则始终存带时区的时间。PostgreSQL 的 `timestamptz` 会自动把时间转成 UTC 存储，查询时按客户端时区返回。不加 `withTimezone` 的 `timestamp` 存的是"本地时间"，跨时区部署时容易出 bug。
 
 ---
 
-## 最佳实践
-
-### 1. 命名规范
-
-```typescript
-// ✅ 推荐：使用 snake_case（数据库命名）
-export const users = pgTable("users", {
-  userId: serial("user_id").primaryKey(), // ❌ 不一致
-  id: serial("id").primaryKey(), // ✅ 一致
-  firstName: varchar("first_name", { length: 50 }).notNull(), // ✅
-  createdAt: timestamp("created_at").defaultNow(), // ✅
-});
-
-// ❌ 避免：使用 camelCase（数据库命名）
-export const users = pgTable("users", {
-  firstName: varchar("firstName", { length: 50 }), // 数据库列名是 firstName
-  // SQL：firstName VARCHAR(50) -- 不是标准 SQL 命名
-});
-```
-
-### 2. 字段长度
-
-```typescript
-// ✅ 推荐：根据实际需求设置长度
-export const users = pgTable("users", {
-  email: varchar("email", { length: 255 }), // ✅ 标准邮箱长度
-  username: varchar("username", { length: 50 }), // ✅ 用户名通常较短
-  bio: text("bio"), // ✅ 不确定长度用 text
-});
-
-// ❌ 避免：过长或不设置长度
-export const users = pgTable("users", {
-  email: varchar("email", { length: 10000 }), // ❌ 过度
-  username: varchar("username"), // ❌ PostgreSQL varchar 必须指定长度
-});
-```
-
-### 3. 索引策略
-
-```typescript
-// ✅ 推荐：只为经常查询的字段创建索引
-export const posts = pgTable(
-  "posts",
-  {
-    id: serial("id").primaryKey(),
-    title: varchar("title", { length: 255 }),
-    authorId: integer("author_id"),
-    viewCount: integer("view_count"),
-  },
-  (table) => ({
-    // 经常查询的字段
-    authorIdIdx: index("author_idx").on(table.authorId), // ✅
-    // 复合查询
-    authorViewIdx: index("author_view_idx").on(table.authorId, table.viewCount), // ✅
-
-    // ❌ 不要为每个字段都创建索引
-    // viewCountIdx: index('view_count_idx').on(table.viewCount),  // 不必要
-  })
-);
-```
-
-### 4. 外键约束
-
-```typescript
-// ✅ 推荐：设置合适的 onDelete 行为
-export const posts = pgTable("posts", {
-  id: serial("id").primaryKey(),
-  authorId: integer("author_id").references(() => users.id, {
-    onDelete: "cascade", // ✅ 删除用户时，同时删除文章
-  }),
-  categoryId: integer("category_id").references(() => categories.id, {
-    onDelete: "restrict", // ✅ 有关联文章时，禁止删除分类
-  }),
-});
-```
-
----
-
-## 总结
-
-### 核心要点
-
-1. **PostgreSQL 类型映射**
-   - 整数：serial、integer、bigint
-   - 字符串：varchar、text、char
-   - 时间：timestamp、date、time
-   - JSON：json、jsonb
-   - 数组：array()
-
-2. **表关系**
-   - 一对一：外键 + unique
-   - 一对多：外键
-   - 多对多：中间表
-
-3. **索引和约束**
-   - 单列索引
-   - 复合索引
-   - 唯一索引
-   - 检查约束
-
-4. **最佳实践**
-   - snake_case 命名
-   - 合理的字段长度
-   - 适当的索引策略
-   - 正确的外键约束
-
-### 下一步
-
-在下一篇文章中，我们将学习：
-
-- **CRUD 操作和查询构建器**
-- Create、Read、Update、Delete
-- 查询过滤、排序、分页
-- 复杂查询和聚合
-
-敬请期待！🚀
-
----
-
-## 参考资源
-
-- [Drizzle ORM Schema 文档](https://orm.drizzle.team/docs/schema)
-- [PostgreSQL 数据类型](https://www.postgresql.org/docs/current/datatype.html)
-- [数据库索引最佳实践](https://www.postgresql.org/docs/current/indexes.html)
-
----
+现在我们有了完整的博客数据库 Schema。五张表，从用户注册到文章发布到评论互动到标签分类，该有的都有了。下一篇我们要在这个 schema 基础上开始写真正的查询——CRUD 操作、条件过滤、排序分页，这些是日常开发里用得最多的操作。

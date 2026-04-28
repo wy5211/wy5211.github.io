@@ -1,6 +1,7 @@
 ---
 title: "07 事务与锁机制"
 date: "2026-03-23"
+summary: "从电商下单流程出发，理解 ACID、四种隔离级别、InnoDB 的行锁和间隙锁，以及乐观锁和悲观锁的选择。"
 tags: ["MySQL"]
 category: "mysql"
 cover: ""
@@ -9,419 +10,250 @@ series: "MySQL 渐进式学习指南"
 seriesOrder: 7
 ---
 
-## 前言
+上一篇我们用索引解决了查询慢的问题。但想象一个场景：MacBook Pro 库存只剩最后 1 件，两个用户同时点击"立即购买"。两个请求几乎同时到达后端，各自检查库存发现都够，各自扣减库存——结果库存变成了 -1。
 
-事务和锁是数据库并发控制的核心。理解事务的 ACID 特性和锁机制，对于保证数据一致性和提升并发性能至关重要。
+这不是查询优化能解决的问题，而是**并发写入时的数据一致性**问题。事务和锁就是 MySQL 用来解决这类问题的机制。
 
-本文将系统讲解 MySQL 的事务机制和锁策略。
+主线场景：电商系统的下单流程。用户点击"下单"后，系统需要依次完成三件事：扣减库存 → 创建订单 → 记录支付流水。这三步要么全部成功，要么全部回滚。中间任何一步失败，之前做的操作都要撤销。
 
-## 事务 ACID 特性
+## 事务：要么全做，要么全不做
 
-### Atomicity - 原子性
+### ACID 四个特性
 
-事务中的操作要么全部成功，要么全部失败。
+用下单场景来理解 ACID：
 
 ```sql
--- 转账示例
 START TRANSACTION;
 
-UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
-UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
+-- 第 1 步：扣减库存
+UPDATE products SET stock = stock - 1 WHERE id = 101 AND stock >= 1;
+
+-- 第 2 步：创建订单
+INSERT INTO orders (user_id, total_amount, status) VALUES (1, 14999.00, 2);
+
+-- 第 3 步：记录支付流水
+INSERT INTO payments (order_id, amount, channel) VALUES (LAST_INSERT_ID(), 14999.00, 'alipay');
 
 COMMIT;
--- 如果任何一条失败，全部回滚
 ```
 
-### Consistency - 一致性
+**原子性（Atomicity）**：三步操作是一个不可分割的整体。如果第 3 步插入支付流水时失败了（比如支付宝接口超时），前两步的操作也会被撤销——库存恢复，订单消失。用 `ROLLBACK` 替代 `COMMIT` 就能做到。
 
-事务前后数据库状态一致。
+**一致性（Consistency）**：事务执行前后，数据库从一个合法状态变成另一个合法状态。库存不会变成负数，订单金额和支付金额必须一致。一致性是由原子性 + 应用层的约束（比如 `stock >= 1`）共同保证的。
 
-```sql
--- 转账前后总金额不变
-SELECT SUM(balance) FROM accounts;
--- 事务前：10000
-START TRANSACTION;
-UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
-UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
-COMMIT;
-SELECT SUM(balance) FROM accounts;
--- 事务后：10000（一致）
-```
+**隔离性（Isolation）**：两个用户同时下单，各自的事务互不干扰。但"互不干扰"有不同的程度——这就是隔离级别的概念。
 
-### Isolation - 隔离性
+**持久性（Durability）**：一旦 COMMIT，数据就不会丢。即使 MySQL 崩溃、服务器断电，重启后数据仍然在。InnoDB 通过 redo log 实现这一点——数据修改先写入 redo log（顺序写，很快），再写入数据文件（随机写，较慢）。COMMIT 时保证 redo log 已刷盘，崩溃后可以靠 redo log 恢复。
 
-事务之间相互隔离，互不干扰。
-
-### Durability - 持久性
-
-事务一旦提交，数据永久保存。
-
-## 事务控制语句
+### 事务控制语句
 
 ```sql
--- 开始事务
-START TRANSACTION;
--- 或
-BEGIN;
+-- 开启事务
+START TRANSACTION;  -- 或 BEGIN
 
--- 提交事务
-COMMIT;
-
--- 回滚事务
+-- 回滚到事务开始前的状态
 ROLLBACK;
 
--- 保存点
-SAVEPOINT sp1;
-ROLLBACK TO sp1;
-RELEASE SAVEPOINT sp1;
-```
-
-## 事务隔离级别
-
-### 四种隔离级别
-
-```sql
--- 查看当前隔离级别
-SELECT @@transaction_isolation;
-
--- 设置隔离级别
-SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
-SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
-SET TRANSACTION ISOLATION LEVEL REPEATABLE READ;
-SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
-```
-
-### 隔离级别对比
-
-| 隔离级别         | 脏读 | 不可重复读 | 幻读 | 性能 |
-| ---------------- | ---- | ---------- | ---- | ---- |
-| READ UNCOMMITTED | ✓    | ✓          | ✓    | 高   |
-| READ COMMITTED   | ✗    | ✓          | ✓    | 中   |
-| REPEATABLE READ  | ✗    | ✗          | ✓    | 中   |
-| SERIALIZABLE     | ✗    | ✗          | ✗    | 低   |
-
-### 默认级别：REPEATABLE READ
-
-```sql
--- MySQL 默认隔离级别
-SELECT @@transaction_isolation;
--- REPEATABLE READ
-
--- 特点：
--- - 防止脏读
--- - 防止不可重复读
--- - 可能发生幻读（MySQL InnoDB 通过 MVCC 已解决）
-```
-
-## 锁机制
-
-### 锁类型
-
-```sql
--- 全局锁：锁定整个数据库
-FLUSH TABLES WITH READ LOCK;
-UNLOCK TABLES;
-
--- 表级锁
-LOCK TABLES users READ;
-LOCK TABLES users WRITE;
-UNLOCK TABLES;
-
--- 行级锁（自动）
--- InnoDB 自动管理，无需手动控制
-```
-
-### 共享锁（S锁）
-
-```sql
--- 共享锁：允许其他事务也加共享锁
-START TRANSACTION;
-SELECT * FROM users WHERE id = 1 LOCK IN SHARE MODE;
+-- 提交事务，所有修改永久生效
 COMMIT;
 
--- 特点：
--- - 多个事务可以同时持有共享锁
--- - 阻止其他事务获取排他锁
+-- 保存点：可以在事务中设一个"书签"
+SAVEPOINT after_stock_update;
+-- 如果后续操作失败，可以只回滚到这个保存点
+ROLLBACK TO after_stock_update;
+-- 而不是回滚整个事务
 ```
 
-### 排他锁（X锁）
+SAVEPOINT 在复杂事务中有用——比如下单流程中，如果支付失败，你可能想保留扣库存和创建订单（改状态为"待支付"），只回滚支付那一步。不过实际开发中更常见的做法是把事务拆小，而不是用一个超大事务加 SAVEPOINT。
 
-```sql
--- 排他锁：独占锁
-START TRANSACTION;
-SELECT * FROM users WHERE id = 1 FOR UPDATE;
+## 隔离级别：并发时能看到什么
+
+MySQL 支持四种隔离级别，从低到高：READ UNCOMMITTED → READ COMMITTED → REPEATABLE READ → SERIALIZABLE。InnoDB 默认使用 **REPEATABLE READ**。
+
+用两个并发会话来演示它们的区别：
+
+### READ UNCOMMITTED：能读到别人还没提交的数据
+
+```
+会话 A                              会话 B
+BEGIN;
+UPDATE products SET stock = 0 WHERE id = 101;
+                                    BEGIN;
+                                    SELECT stock FROM products WHERE id = 101;
+                                    -- 结果：0（但会话 A 还没 COMMIT！）
+ROLLBACK;  -- 会话 A 回滚了，库存应该是 1
+```
+
+会话 B 读到了会话 A 还没提交的数据（stock = 0），这叫**脏读**。如果会话 B 基于这个"0"做了业务决策（比如告诉用户"已售罄"），而会话 A 回滚了库存恢复成 1，会话 B 的决策就是基于错误数据做的。这个隔离级别几乎没人用。
+
+### READ COMMITTED：只能读到已提交的数据
+
+```
+会话 A                              会话 B
+BEGIN;
+SELECT stock FROM products;          BEGIN;
+-- stock = 1
+                                    SELECT stock FROM products;
+UPDATE products SET stock = 0;       -- 结果：1（读已提交的值）
 COMMIT;
-
--- 特点：
--- - 只有一个事务能持有排他锁
--- - 阻止其他事务获取共享锁或排他锁
+                                    SELECT stock FROM products;
+                                    -- 结果：0（A 已提交，B 能看到了）
 ```
 
-## 意向锁
+脏读解决了，但同一个事务里两次 SELECT 同一行数据结果不同——这叫**不可重复读**。如果你在事务里需要基于一致性快照做计算（比如统计库存总额），两次读取结果不一致会导致计算错误。
 
-表级锁，用于快速判断是否可以对表加锁。
+### REPEATABLE READ：同一事务内读取结果一致（MySQL 默认）
 
-```sql
--- 意向共享锁（IS）
--- 事务准备给某些行加共享锁
-
--- 意向排他锁（IX）
--- 事务准备给某些行加排他锁
-
--- 自动管理，无需手动控制
+```
+会话 A                              会话 B
+BEGIN;
+SELECT stock FROM products;          BEGIN;
+-- stock = 1
+                                    SELECT stock FROM products;
+UPDATE products SET stock = 0;       -- 结果：1（和第一次一样）
+COMMIT;
+                                    SELECT stock FROM products;
+                                    -- 结果：1（仍然一样！即使 A 已提交）
+                                    COMMIT;
+                                    BEGIN;
+                                    SELECT stock FROM products;
+                                    -- 结果：0（新事务才能看到最新值）
 ```
 
-## 行锁算法
+InnoDB 通过 **MVCC（多版本并发控制）** 实现了可重复读：事务开始时拍一个"快照"，后续读取都基于这个快照。这解决了不可重复读的问题。
 
-### Record Lock - 记录锁
+但 REPEATABLE READ 在理论上仍然存在**幻读**的可能——事务 A 读了某范围的数据，事务 B 在这个范围内插入了新行，事务 A 再次读取会多出"幻影"行。InnoDB 通过**间隙锁（Gap Lock）** 在 REPEATABLE READ 级别下也防止了幻读。
 
-```sql
--- 锁定单行记录
-SELECT * FROM users WHERE id = 1 FOR UPDATE;
--- 只锁定 id = 1 的记录
-```
+### SERIALIZABLE：完全串行化
 
-### Gap Lock - 间隙锁
+所有事务排队执行，并发性能最差，一般不用。
 
-```sql
--- 锁定索引记录之间的间隙
-SELECT * FROM users WHERE id BETWEEN 1 AND 10 FOR UPDATE;
--- 锁定 (1, 10) 之间的间隙，防止幻读
-```
+| 隔离级别         | 脏读 | 不可重复读 | 幻读           | 性能 |
+| ---------------- | ---- | ---------- | -------------- | ---- |
+| READ UNCOMMITTED | 可能 | 可能       | 可能           | 最高 |
+| READ COMMITTED   | 不会 | 可能       | 可能           | 高   |
+| REPEATABLE READ  | 不会 | 不会       | 不会（InnoDB） | 中   |
+| SERIALIZABLE     | 不会 | 不会       | 不会           | 最低 |
 
-### Next-Key Lock - 临键锁
+实际选择：绝大多数场景用默认的 REPEATABLE READ 就够了。少数需要"读最新已提交数据"的场景（比如库存实时查询），可以切换到 READ COMMITTED。
 
-```sql
--- Record Lock + Gap Lock
--- MySQL 默认的行锁算法
-SELECT * FROM users WHERE id > 1 FOR UPDATE;
--- 锁定 (1, +∞) 的范围
-```
+## 锁：InnoDB 怎么防止冲突
 
-## 死锁
+### 行锁：锁住特定行
 
-### 死锁示例
+两个事务同时修改同一行数据，InnoDB 会用行锁让后到的事务等待：
 
 ```sql
 -- 事务 A
-START TRANSACTION;
-UPDATE users SET balance = balance - 100 WHERE id = 1;
--- 等待 B 释放 id = 2 的锁
-UPDATE users SET balance = balance + 100 WHERE id = 2;
+BEGIN;
+UPDATE orders SET status = 3 WHERE id = 1001;  -- 给 id=1001 这一行加锁
+-- 还没 COMMIT...
+
+-- 事务 B（另一个连接）
+BEGIN;
+UPDATE orders SET status = 5 WHERE id = 1001;  -- 被阻塞！等事务 A 释放锁
+```
+
+InnoDB 的行锁是加在**索引**上的，不是加在数据行上。这意味着如果你 UPDATE 时没有命中索引（比如 `WHERE total_amount = 14999` 而 total_amount 没有索引），InnoDB 无法精确定位到行，只能锁住整张表——这就是所谓的"没有索引行锁变表锁"。
+
+### 间隙锁：防止幻读
+
+REPEATABLE READ 级别下，InnoDB 除了锁住已有的行，还会锁住行之间的"间隙"：
+
+```sql
+-- 事务 A
+BEGIN;
+SELECT * FROM orders WHERE id BETWEEN 1000 AND 1020 FOR UPDATE;
+-- 锁住 id=1000 到 id=1020 的所有行，以及它们之间的间隙
 
 -- 事务 B
-START TRANSACTION;
-UPDATE users SET balance = balance - 100 WHERE id = 2;
--- 等待 A 释放 id = 1 的锁
-UPDATE users SET balance = balance + 100 WHERE id = 1;
-
--- 死锁！A 等 B，B 等 A
--- MySQL 自动检测并回滚其中一个事务
+INSERT INTO orders (id, ...) VALUES (1005, ...);
+-- 被阻塞！1005 落在 1000-1020 的间隙内
 ```
 
-### 死锁预防
+间隙锁的目的是防止事务 A 在范围查询期间，事务 B 在范围内插入新行导致幻读。这是一个比较高级的特性，大多数时候你不需要主动关心它——但在排查死锁时，间隙锁经常是"嫌疑人"。
+
+### 死锁：两个事务互相等对方
 
 ```sql
--- 1. 统一访问顺序
--- ✅ 好：按 id 顺序
-UPDATE users SET balance = balance - 100 WHERE id = 1;
-UPDATE users SET balance = balance + 100 WHERE id = 2;
+-- 事务 A                    -- 事务 B
+BEGIN;                       BEGIN;
+UPDATE orders SET status=3   UPDATE orders SET status=5
+  WHERE id=1001;               WHERE id=1002;
+  -- 锁住 1001                 -- 锁住 1002
 
--- ❌ 差：不同顺序
-UPDATE users SET balance = balance - 100 WHERE id = 2;
-UPDATE users SET balance = balance + 100 WHERE id = 1;
-
--- 2. 减小事务范围
--- ✅ 好：小事务
-START TRANSACTION;
-UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
-UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
-COMMIT;
-
--- ❌ 差：大事务
-START TRANSACTION;
-UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
--- 大量其他操作
-UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
-COMMIT;
-
--- 3. 添加索引
--- 减少锁定的行数
-CREATE INDEX idx_id ON accounts(id);
+UPDATE orders SET status=5   UPDATE orders SET status=3
+  WHERE id=1002;               WHERE id=1001;
+  -- 等待 B 释放 1002          -- 等待 A 释放 1001
+  -- 死锁！                    -- 死锁！
 ```
 
-## 乐观锁 vs 悲观锁
+事务 A 等事务 B 释放 1002 的锁，事务 B 等事务 A 释放 1001 的锁。InnoDB 检测到死锁后，会自动回滚其中一个事务（通常是修改数据量少的那个），让另一个继续执行。
 
-### 悲观锁
+排查死锁的方法：
 
 ```sql
--- 假设会发生冲突，先加锁
-START TRANSACTION;
-SELECT * FROM products WHERE id = 1 FOR UPDATE;
--- 检查库存
-UPDATE products SET stock = stock - 1 WHERE id = 1;
-COMMIT;
+-- 查看最近一次死锁信息
+SHOW ENGINE INNODB STATUS;
+-- 在 LATEST DETECTED DEADLOCK 部分能看到两个事务各持有什么锁、等什么锁
 ```
 
-### 乐观锁
+预防死锁的经验：
+
+- **按固定顺序操作**：比如总是先更新订单再更新库存，不要一个事务先订单后库存、另一个先库存后订单。
+- **保持事务简短**：事务越短，持锁时间越短，冲突概率越低。
+- **给查询加合适的索引**：避免行锁升级成表锁。
+
+## 乐观锁 vs 悲观锁：两种并发策略
+
+回到库存扣减的问题。两种常见的解决方案：
+
+### 悲观锁：先锁再改
 
 ```sql
--- 假设不会发生冲突，使用版本号
-CREATE TABLE products (
-  id INT PRIMARY KEY,
-  name VARCHAR(100),
-  stock INT,
-  version INT DEFAULT 1  -- 版本号
-);
+BEGIN;
+-- 先锁住这行，其他事务不能修改
+SELECT stock FROM products WHERE id = 101 FOR UPDATE;
+-- stock = 1，确认库存够
 
--- 更新时检查版本
+UPDATE products SET stock = stock - 1 WHERE id = 101;
+INSERT INTO orders (...) VALUES (...);
+COMMIT;  -- 释放锁
+```
+
+`FOR UPDATE` 在读取时就加上了排他锁，其他事务想修改同一行必须等待。这叫"悲观"——假定冲突一定会发生，提前锁住。
+
+### 乐观锁：先改再检查
+
+```sql
+-- products 表有一个 version 字段
+ALTER TABLE products ADD COLUMN version INT UNSIGNED DEFAULT 0;
+
+-- 不加锁，直接更新，带上版本号条件
 UPDATE products
-SET stock = stock - 1,
-    version = version + 1
-WHERE id = 1 AND version = 5;
-
--- 检查 affected_rows
--- 如果为 0，说明版本冲突，需要重试
+SET stock = stock - 1, version = version + 1
+WHERE id = 101 AND stock >= 1 AND version = 5;
+-- 如果影响行数为 0，说明被其他事务改过了，需要重试
 ```
 
-## 实战案例
+乐观锁不加数据库锁，而是通过版本号（或时间戳）在 UPDATE 时检查数据是否被改过。如果 `ROW_COUNT()` 返回 0，说明 version 已经变了——有其他事务先修改了，当前操作需要重试。
 
-### 转账事务
+### 怎么选
 
-```sql
--- 完整的转账事务
-START TRANSACTION;
+**悲观锁**适合写冲突频繁的场景（比如秒杀——大量请求抢同一个商品）。冲突确实会发生，提前加锁更直接。
 
--- 1. 检查账户余额
-SELECT balance INTO @balance1 FROM accounts WHERE id = 1 FOR UPDATE;
-SELECT balance INTO @balance2 FROM accounts WHERE id = 2 FOR UPDATE;
+**乐观锁**适合读多写少的场景（比如编辑个人资料——两个人同时编辑同一份资料的概率很低）。不加锁提高了读性能，只在更新时做检查。
 
--- 2. 验证余额
-IF @balance1 < 1000 THEN
-  ROLLBACK;
-  SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '余额不足';
-END IF;
+在应用层，乐观锁的重试逻辑需要自己实现（检测到冲突后重新读取 → 重新计算 → 再次尝试更新），代码复杂度比悲观锁高。但乐观锁不占用数据库锁资源，在并发量大的系统中扩展性更好。
 
--- 3. 执行转账
-UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
-UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
+## Trade-off：事务与锁的取舍
 
--- 4. 记录日志
-INSERT INTO transaction_logs (from_account, to_account, amount)
-VALUES (1, 2, 1000);
+**事务大小**：事务太大（一次操作几千行、持续几秒）会长时间持锁，阻塞其他事务。事务太小（每个操作独立一个事务）又无法保证一致性。实际建议：一个事务只包含逻辑上必须原子的操作，不要在事务里做网络请求、文件读写等慢操作。
 
-COMMIT;
-```
+**隔离级别**：REPEATABLE READ 是安全的选择，适合绝大多数场景。READ COMMITTED 在某些高并发场景下性能稍好（锁的持有时间更短），但需要你自行处理不可重复读的问题。不要为了性能降级到 READ UNCOMMITTED。
 
-### 库存扣减
+**悲观锁 vs 乐观锁**：写冲突多用悲观锁（数据库层面直接排队），写冲突少用乐观锁（应用层重试）。如果不确定，先从乐观锁开始（实现简单，不加数据库锁），遇到性能问题再评估是否需要切换。
 
-```sql
--- 防止超卖
-START TRANSACTION;
+**避免大事务中的用户交互**：事务开启后不要等用户输入。事务应该在代码里自动完成，从 BEGIN 到 COMMIT 尽可能在几十毫秒内结束。如果需要用户确认，先在事务外完成用户交互，准备好所有数据后，再开启事务一次性提交。
 
--- 方式 1：悲观锁
-SELECT stock INTO @stock FROM products WHERE id = 1 FOR UPDATE;
-
-IF @stock < 1 THEN
-  ROLLBACK;
-  SELECT '库存不足' AS result;
-ELSE
-  UPDATE products SET stock = stock - 1 WHERE id = 1;
-  INSERT INTO orders (product_id, quantity) VALUES (1, 1);
-  COMMIT;
-  SELECT '购买成功' AS result;
-END IF;
-
--- 方式 2：乐观锁（推荐）
-UPDATE products
-SET stock = stock - 1
-WHERE id = 1 AND stock > 0;
-
--- 检查 affected_rows
--- 如果为 1，成功；如果为 0，库存不足
-```
-
-## 最佳实践
-
-### 1. 事务尽量小
-
-```sql
--- ✅ 好：小事务
-START TRANSACTION;
-UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
-UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
-COMMIT;
-
--- ❌ 差：大事务
-START TRANSACTION;
-UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
--- 大量其他操作
-UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
-COMMIT;
-```
-
-### 2. 避免长事务
-
-```sql
--- ❌ 避免：事务中有耗时操作
-START TRANSACTION;
-UPDATE users SET status = 1 WHERE id = 1;
--- 调用外部 API（可能很慢）
--- 发送邮件
--- 其他耗时操作
-COMMIT;
-
--- ✅ 推荐：事务只做数据库操作
-START TRANSACTION;
-UPDATE users SET status = 1 WHERE id = 1;
-COMMIT;
--- 再执行耗时操作
-```
-
-### 3. 合理选择隔离级别
-
-```sql
--- 默认 REPEATABLE READ 适用于大多数场景
-
--- 读多写少：可以考虑 READ COMMITTED
-SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED;
-
--- 强一致性：SERIALIZABLE
-SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE;
-```
-
-## 总结
-
-本文介绍了事务与锁机制，主要内容：
-
-**事务特性**：
-
-- ✅ ACID：原子性、一致性、隔离性、持久性
-- ✅ 四种隔离级别
-- ✅ 默认 REPEATABLE READ
-
-**锁机制**：
-
-- ✅ 共享锁、排他锁
-- ✅ 行锁算法
-- ✅ 死锁处理
-
-**并发控制**：
-
-- ✅ 悲观锁、乐观锁
-- ✅ 死锁预防
-- ✅ 事务设计原则
-
-掌握事务和锁后，就能正确处理并发问题了。接下来我们将学习数据库设计原则。
-
-## 下一步
-
-在下一篇文章《12 数据库设计原则》中，我们将学习：
-
-- 数据库设计三范式
-- 表关系设计（1:1、1:N、M:N）
-- 反规范化技巧
-- ER 图设计
-- 电商数据库设计案例
-
----
+上一篇我们用索引解决了查询性能问题，这一篇解决了并发写入时的一致性问题。下一篇，当索引加好了、事务也用对了，但查询还是慢——我们来看看怎么用 EXPLAIN 深入诊断慢查询，做真正的查询优化。

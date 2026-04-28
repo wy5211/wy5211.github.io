@@ -1,6 +1,7 @@
 ---
 title: "12 性能调优综合实战"
 date: "2026-03-23"
+summary: "电商大促 QPS 从 100 暴涨到 10000 时的数据库急救全流程：性能分析工具、InnoDB 参数调优、连接管理、表结构优化、SQL 优化技巧，以及监控体系搭建。附系列整体回顾与进阶方向建议。"
 tags: ["MySQL"]
 category: "mysql"
 cover: ""
@@ -9,497 +10,590 @@ series: "MySQL 渐进式学习指南"
 seriesOrder: 12
 ---
 
-## 前言
+## 大促零点：数据库的生死时刻
 
-性能调优是数据库管理的核心技能。本文将综合运用前面学到的知识，通过实战案例全面讲解 MySQL 性能优化。
+凌晨零点，电商系统的限时秒杀活动正式开始。前十分钟一切正常，然后告警开始炸了——数据库 CPU 100%，连接数打满，接口超时率飙升到 30%。你登录服务器一看：日常 QPS 只有 100 的数据库，此刻承载了 10000 的查询压力。慢查询日志在疯狂滚动，`SHOW PROCESSLIST` 里堆满了 `Sending data` 状态的线程。
 
-## 性能监控工具
+这不是假设。这是每年双十一、618 都在上演的真实场景。区别在于，有人花了一个通宵才恢复，有人半小时就稳住了。差距在哪？在于你有没有一套系统的性能调优方法论，以及平时有没有把该做的配置、索引、监控准备好。
 
-### SHOW STATUS
+> 上一篇我们搭建了备份恢复和主从复制体系，解决了"数据丢了能找回来"和"主库挂了能切换"的问题。但高可用只保证服务不断，不保证服务不慢。这一篇，我们聚焦另一个维度：**性能**。这是本系列的最后一篇，会从配置、SQL、架构三个层面综合调优，并在文末做系列回顾。
 
-```sql
--- 查看 MySQL 运行状态
-SHOW STATUS;
+贯穿全文的场景：电商系统 `shop` 数据库，日常 QPS 100，大促期间 QPS 飙升到 10000。你的任务是在有限的时间内，把数据库的性能压榨到极限。
 
--- 关键指标
-SHOW STATUS LIKE 'Questions';           -- 总查询数
-SHOW STATUS LIKE 'Threads_connected';   -- 当前连接数
-SHOW STATUS LIKE 'Threads_running';     -- 正在执行的查询
-SHOW STATUS LIKE 'Qcache%';            -- 查询缓存（MySQL 8.0 已移除）
-SHOW STATUS LIKE 'Innodb%';            -- InnoDB 状态
+---
 
--- 计算每秒查询数
-SHOW GLOBAL STATUS LIKE 'Questions';
--- 结合 uptime 计算 QPS
+## 一、先诊断再动手：性能分析工具
+
+调优的第一条原则：不要靠猜。所有优化都应该基于数据，而不是"我觉得这个查询慢"。
+
+### 慢查询日志：找到真正的罪魁祸首
+
+慢查询日志是性能调优的起点。它记录所有执行时间超过阈值的 SQL，告诉你系统里到底哪些查询在拖后腿。
+
+```ini
+# my.cnf 开启慢查询日志
+[mysqld]
+slow_query_log = ON
+slow_query_log_file = /var/log/mysql/slow.log
+long_query_time = 1          -- 执行超过 1 秒的查询被记录
+log_queries_not_using_indexes = ON  -- 没用索引的查询也记录
 ```
 
-### SHOW PROCESSLIST
+开启后，大促期间日志会迅速增长。用 `mysqldumpslow` 快速汇总最慢的查询：
 
-```sql
--- 查看当前执行的进程
-SHOW PROCESSLIST;
-SHOW FULL PROCESSLIST;
+```bash
+# 按总查询时间排序，显示前 10 条
+mysqldumpslow -s t -t 10 /var/log/mysql/slow.log
 
--- 关键列：
--- Id：进程 ID
--- User：用户
--- Host：主机
--- db：数据库
--- Command：命令类型
--- Time：执行时间
--- State：状态
--- Info：执行的 SQL
-
--- 杀掉长时间查询
-KILL 123;
+# 按平均查询时间排序
+mysqldumpslow -s at -t 10 /var/log/mysql/slow.log
 ```
 
-### Performance Schema（MySQL 5.7+）
+大促场景下，你很可能会看到类似这样的结果：一条统计订单的复杂 JOIN 查询出现了 5000 次，每次平均耗时 3 秒。这就是头号目标。
+
+**为什么需要关注它**：很多人一上来就开始调参数、改索引，但根本不知道瓶颈在哪。慢查询日志帮你找到投入产出比最高的优化目标——一条占用了 80% 执行时间的 SQL，优化它比调 10 个参数都有效。
+
+### Performance Schema：MySQL 内部的性能透视镜
+
+MySQL 5.7 及以上版本内置了 Performance Schema，它记录了 MySQL 内部几乎所有的等待事件、文件 IO、锁争用等信息。如果说慢查询日志告诉你"哪个查询慢"，Performance Schema 告诉你"它慢在哪里"。
 
 ```sql
--- 启用 Performance Schema
-UPDATE performance_schema.setup_instruments
-SET ENABLED = 'YES', TIMED = 'YES'
-WHERE NAME LIKE '%statement%';
-
--- 查看最慢的 SQL
+-- 查看执行次数最多、耗时最长的 SQL 语句
 SELECT
-  DIGEST_TEXT,
+  DIGEST_TEXT AS query_pattern,
   COUNT_STAR AS exec_count,
-  AVG_TIMER_WAIT/1000000000000 AS avg_sec,
-  SUM_TIMER_WAIT/1000000000000 AS total_sec
+  ROUND(AVG_TIMER_WAIT / 1000000000000, 3) AS avg_sec,
+  ROUND(SUM_TIMER_WAIT / 1000000000000, 3) AS total_sec
 FROM performance_schema.events_statements_summary_by_digest
 ORDER BY SUM_TIMER_WAIT DESC
 LIMIT 10;
+```
 
--- 查看表 IO 统计
+大促期间你可能会发现：某条看似简单的 `SELECT * FROM products WHERE name LIKE '%手机%'` 出现了 20000 次，总耗时 600 秒。`%手机%` 的前缀通配符导致索引无法使用，这比任何参数调优都重要。
+
+Performance Schema 还能看到表级别的 IO 热点：
+
+```sql
+-- 哪张表的 IO 压力最大
 SELECT
-  object_schema,
-  object_name,
+  object_schema AS db_name,
+  object_name AS table_name,
   count_fetch,
   count_insert,
   count_update,
   count_delete
 FROM performance_schema.table_io_waits_summary_by_table
+WHERE object_schema = 'shop'
 ORDER BY sum_timer_wait DESC
-LIMIT 10;
+LIMIT 5;
 ```
 
-## 配置参数优化
+**为什么需要关注它**：大促期间数据库的瓶颈可能是 IO、锁、网络、CPU 中的任何一个。Performance Schema 能精确定位瓶颈类型，避免你对着错误的方向优化。
 
-### InnoDB 缓冲池
+### SHOW PROFILE：单条查询的逐阶段分析
 
-```sql
--- 查看 InnoDB 缓冲池大小
-SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
-
--- 查看 InnoDB 缓冲池命中率
-SHOW STATUS LIKE 'Innodb_buffer_pool_read%';
-
--- 命中率计算：
--- Innodb_buffer_pool_read_requests -- 总请求数
--- Innodb_buffer_pool_reads -- 从磁盘读取数
--- 命中率 = 1 - (Innodb_buffer_pool_reads / Innodb_buffer_pool_read_requests)
--- 应该 > 99%
-
--- 优化建议
--- innodb_buffer_pool_size = 物理内存的 50-70%
--- 示例：16GB 内存，设置为 8-12GB
-SET GLOBAL innodb_buffer_pool_size = 8589934592;  -- 8GB
-```
-
-### 连接数
+当你用慢查询日志和 Performance Schema 锁定了问题 SQL 后，下一步是用 SHOW PROFILE 分析这条 SQL 具体卡在哪个阶段。
 
 ```sql
--- 查看最大连接数
-SHOW VARIABLES LIKE 'max_connections';
+-- 先开启 profiling
+SET profiling = 1;
 
--- 查看当前连接数
-SHOW STATUS LIKE 'Threads_connected';
-
--- 查看历史最大连接数
-SHOW STATUS LIKE 'Max_used_connections';
-
--- 优化建议
--- max_connections = (活跃连接数 * 2)
--- 避免设置过大，占用内存
-SET GLOBAL max_connections = 500;
-```
-
-### 其他重要参数
-
-```sql
--- InnoDB 刷盘策略
--- 1: 每秒刷盘（默认，平衡性能和安全）
--- 0: 不刷盘（最快，可能丢数据）
--- 2: 每次提交刷盘（最慢，最安全）
-SET GLOBAL innodb_flush_log_at_trx_commit = 1;
-
--- InnoDB IO 容量
--- 限制 InnoDB 写入速度，避免磁盘打满
-SET GLOBAL innodb_io_capacity = 2000;
-SET GLOBAL innodb_io_capacity_max = 4000;
-
--- 临时表大小
-SET GLOBAL tmp_table_size = 268435456;      -- 256MB
-SET GLOBAL max_heap_table_size = 268435456;  -- 256MB
-
--- 表定义缓存
-SET GLOBAL table_definition_cache = 2000;
-SET GLOBAL table_open_cache = 4000;
-```
-
-## SQL 优化实战
-
-### 案例 1：慢查询优化
-
-```sql
--- 原始查询（3秒）
-SELECT
-  u.username,
-  o.order_no,
-  oi.product_name,
-  oi.quantity
+-- 执行问题查询
+SELECT u.username, o.order_no, oi.product_name
 FROM users u
 INNER JOIN orders o ON u.id = o.user_id
 INNER JOIN order_items oi ON o.id = oi.order_id
-WHERE u.city = '北京'
-  AND o.status = 'completed'
-  AND o.created_at >= '2024-01-01';
+WHERE u.city = '北京' AND o.status = 'completed';
 
--- EXPLAIN 分析
--- type: ALL（全表扫描）
--- rows: 1000000
-
--- 优化方案：
--- 1. 添加索引
-CREATE INDEX idx_city ON users(city);
-CREATE INDEX idx_status_created ON orders(status, created_at);
-
--- 2. 优化查询
-SELECT
-  u.username,
-  o.order_no,
-  oi.product_name,
-  oi.quantity
-FROM users u
-INNER JOIN orders o
-  ON u.id = o.user_id
-  AND o.status = 'completed'
-  AND o.created_at >= '2024-01-01'
-INNER JOIN order_items oi ON o.id = oi.order_id
-WHERE u.city = '北京';
-
--- 结果：0.05秒（提升60倍）
+-- 查看这条查询的各阶段耗时
+SHOW PROFILE FOR QUERY 1;
 ```
 
-### 案例 2：子查询优化
+输出会告诉你这条查询在 `Sending data`（数据传输）、`Sorting result`（排序）、`Waiting for table metadata lock`（等锁）等阶段各花了多少时间。如果 80% 的时间花在 `Sending data`，说明查询返回的数据量太大或者缺少索引；如果花在 `Waiting for lock`，说明有锁争用。
+
+**为什么需要关注它**：一条慢查询可能有十种优化方案，但只有知道它慢在哪个阶段，才能选对方案。排序慢就加索引或减少排序字段，锁等待就优化事务范围，IO 慢就考虑加内存或拆表。
+
+---
+
+## 二、InnoDB 核心参数：把硬件用满
+
+定位了问题之后，第一步不是改 SQL，而是检查 MySQL 配置。很多人的 MySQL 跑着默认配置——相当于买了一辆跑车，用一档开。以下几个参数对性能影响最大。
+
+### innodb_buffer_pool_size：最重要的一个参数
+
+InnoDB 缓冲池是 MySQL 性能的命脉。它缓存了表数据和索引数据，查询如果能从内存中找到数据（命中），就不需要读磁盘。磁盘 IO 是数据库性能的最大瓶颈，缓冲池的核心目标就是把磁盘 IO 降到最低。
 
 ```sql
--- 原始查询（相关子查询）
-SELECT
-  u.username,
-  (SELECT COUNT(*) FROM orders o WHERE o.user_id = u.id) AS order_count,
-  (SELECT SUM(total_amount) FROM orders o WHERE o.user_id = u.id) AS total_amount
+-- 查看当前缓冲池大小
+SHOW VARIABLES LIKE 'innodb_buffer_pool_size';
+
+-- 查看缓冲池命中率
+SHOW STATUS LIKE 'Innodb_buffer_pool_read%';
+-- Innodb_buffer_pool_read_requests：总逻辑读请求
+-- Innodb_buffer_pool_reads：不得不从磁盘读取的次数
+
+-- 命中率 = 1 - (reads / read_requests)
+-- 目标：> 99%
+-- 如果低于 95%，说明缓冲池太小，需要加大
+```
+
+生产环境的经验值：专用 MySQL 服务器上，缓冲池设置为物理内存的 50-70%。如果服务器有 32GB 内存，缓冲池设置 16-22GB。
+
+```ini
+# my.cnf
+[mysqld]
+innodb_buffer_pool_size = 20G   -- 32GB 内存的机器，分配 20GB 给缓冲池
+```
+
+大促场景下，缓冲池命中率如果从 99% 掉到了 85%，说明热数据已经放不下了。这时候最有效的手段不是调参数（内存已经用到极限了），而是减少热数据的量——比如把不参与大促的历史订单归档到冷数据表。
+
+**为什么需要关注它**：缓冲池命中率每下降 1 个百分点，查询延迟可能翻倍。磁盘随机读一次大约 10ms，内存读一次大约 0.01ms，差了 1000 倍。这是性能调优中杠杆最高的一个参数。
+
+### innodb_log_file_size：影响写入速度的关键
+
+InnoDB 的写操作先写入 redo log（重做日志），再异步刷到数据文件。redo log 的大小直接影响写入性能：日志太小会导致频繁的 checkpoint（检查点），把脏页大量刷回磁盘，造成写入卡顿。
+
+```ini
+# my.cnf
+[mysqld]
+innodb_log_file_size = 1G       -- 默认 48MB，生产环境建议 1-4GB
+innodb_log_files_in_group = 2   -- 两个日志文件轮替使用
+```
+
+如何判断日志是否够大？看 `Innodb_os_log_written` 的增长速度。如果在一分钟内写了超过日志总大小的 50%，说明日志太小了。大促期间写入量暴增，日志设置不当会导致周期性的写入卡顿——每隔几秒所有写入都暂停一下。
+
+**为什么需要关注它**：大促的写压力可能是日常的 100 倍。如果 redo log 太小，InnoDB 来不及刷盘就要做 checkpoint，导致写入性能断崖式下跌。这个参数必须在事前配好，不能临时改（修改需要重启 MySQL）。
+
+### innodb_flush_log_at_trx_commit：安全与性能的取舍
+
+这个参数控制事务提交时 redo log 的刷盘策略，是数据安全和写入性能之间最关键的权衡点。
+
+```
+值 = 1（默认，最安全）：每次事务提交都刷盘。断电不丢数据，但每次提交多一次磁盘 IO。
+值 = 2（折中）：每次提交写入 OS 缓存，每秒刷盘。MySQL 崩溃不丢数据，OS 崩溃丢 1 秒数据。
+值 = 0（最快）：写入 OS 缓存，每秒刷盘。MySQL 崩溃可能丢 1 秒数据。
+```
+
+大促期间的实践：
+
+```ini
+# 大促前调整为 2，大促结束后改回 1
+SET GLOBAL innodb_flush_log_at_trx_commit = 2;
+```
+
+对于电商订单，丢 1 秒数据意味着可能丢失几十到几百笔订单。是否接受这个风险，取决于业务容忍度。如果主从复制已经搭好了（上一篇的内容），从库可以作为数据安全的兜底。
+
+**为什么需要关注它**：从 1 改到 2，写入性能通常能提升 2-5 倍。对于大促这种短时高压场景，这是一个值得认真评估的选项。
+
+---
+
+## 三、连接管理：别让连接泄漏拖垮数据库
+
+大促期间，`Too many connections` 是最常见的崩溃原因之一。连接数打满后，所有新的数据库请求都会被拒绝，表现为全站 500 错误。
+
+### max_connections 与连接泄漏
+
+```sql
+-- 查看当前最大连接数
+SHOW VARIABLES LIKE 'max_connections';           -- 默认 151
+
+-- 当前连接数
+SHOW STATUS LIKE 'Threads_connected';
+
+-- 历史最高连接数
+SHOW STATUS LIKE 'Max_used_connections';
+
+-- 连接失败次数（如果大于 0，说明连接数不够用了）
+SHOW STATUS LIKE 'Connection_errors_max_connections';
+```
+
+生产环境的 max_connections 建议设置为预期峰值的 2-3 倍，但不要无限制地调大。每个连接大约消耗 1-3MB 内存（取决于 `sort_buffer_size`、`join_buffer_size` 等参数），10000 个连接就要吃掉 10-30GB 内存。
+
+```ini
+# my.cnf
+[mysqld]
+max_connections = 1000          -- 根据实际需要调整
+```
+
+比调大 max_connections 更重要的是**排查连接泄漏**。应用代码中忘记关闭数据库连接是最常见的问题：
+
+```sql
+-- 查看哪些连接挂在那里不动
+SHOW FULL PROCESSLIST;
+
+-- 重点关注 Sleep 状态且 Time 值很大的连接
+-- 正常的 Sleep 连接应该在几秒内被连接池回收
+-- 如果看到大量 Sleep 几百秒的连接，就是泄漏了
+```
+
+```ini
+# 自动清理空闲连接，防止泄漏连接占坑
+[mysqld]
+wait_timeout = 600              -- 非交互连接空闲 10 分钟后断开
+interactive_timeout = 600       -- 交互连接同样处理
+```
+
+### 连接池：应用端的必选项
+
+直连模式下，每次查询都建立 TCP 连接、认证、执行 SQL、断开连接。大促时每秒建立上千个连接的开销不可忽视。连接池维护一组长连接，查询时从池中取用，用完归还。
+
+以 Java 的 HikariCP 为例：
+
+```yaml
+# application.yml
+spring:
+  datasource:
+    hikari:
+      maximum-pool-size: 50 # 最大连接数，不要超过 max_connections / 应用实例数
+      minimum-idle: 10 # 最小空闲连接
+      connection-timeout: 3000 # 获取连接超时时间 3 秒
+      idle-timeout: 600000 # 空闲连接存活时间 10 分钟
+      max-lifetime: 1800000 # 连接最大存活时间 30 分钟
+      leak-detection-threshold: 60000 # 连接泄漏检测阈值 60 秒
+```
+
+`leak-detection-threshold` 是一个容易被忽略但非常重要的参数。如果某个连接被借出超过 60 秒没有归还，HikariCP 会打印一条 WARN 日志，记录是哪段代码没有关闭连接。大促前一定要开启这个配置。
+
+**为什么需要关注它**：连接泄漏是一个温水煮青蛙的问题。日常 QPS 低的时候不会暴露，因为连接池足够大。大促一到，泄漏的连接把池子占满了，正常的查询拿不到连接。提前设置 `wait_timeout` 和泄漏检测，是防止这种问题的最有效手段。
+
+---
+
+## 四、表结构优化：从源头减少压力
+
+当配置和连接都调好了，如果性能还是上不去，问题往往出在表结构上。好的表结构设计能让查询天然高效，差的设计会让任何优化手段都事倍功半。
+
+### 字段类型选择：用最小的空间存数据
+
+InnoDB 以页（默认 16KB）为单位管理数据。一页能放下的行数越多，一次 IO 能读取的行数就越多。选择合适的字段类型直接影响了数据密度和查询效率。
+
+电商系统中的常见问题：
+
+```sql
+-- 不好的设计
+CREATE TABLE products (
+  id VARCHAR(50) PRIMARY KEY,          -- 用 UUID 字符串做主键，占 50 字节
+  price VARCHAR(20),                    -- 价格用字符串，无法数学运算
+  description TEXT,                     -- 商品详情，可能几十 KB
+  status VARCHAR(20),                   -- 状态用字符串，'active'/'inactive'
+  created_at VARCHAR(30)                -- 时间用字符串
+);
+
+-- 好的设计
+CREATE TABLE products (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,  -- 自增整数主键，占 8 字节
+  price DECIMAL(10, 2) NOT NULL,                   -- 精确存储金额
+  status TINYINT NOT NULL DEFAULT 1,               -- 用数字表示状态 1/0
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+几个关键原则：
+
+- 主键用自增整数。UUID 做主键会导致页分裂（随机插入），写入性能差，而且二级索引要存储主键值，字符串主键会让所有索引变大。
+- 金额用 `DECIMAL`，不要用 `FLOAT` 或 `DOUBLE`（浮点数有精度丢失）。
+- 状态、枚举值用 `TINYINT` 或 `SMALLINT`，不要用字符串。
+
+### 大字段分离：把 TEXT 和 BLOB 拆出去
+
+InnoDB 的数据页只有 16KB。如果一行数据里有几个 TEXT/BLOB 字段（比如商品描述、商品图片），这一行可能占几百 KB，一条记录就要跨越几十个页。查询时即使只 SELECT 其中几个字段，也可能触发大量的页读取。
+
+```sql
+-- 不好的设计：所有字段放一张表
+CREATE TABLE products (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(200),
+  price DECIMAL(10, 2),
+  description TEXT,        -- 商品详情，平均 30KB
+  specifications TEXT,     -- 规格参数，平均 10KB
+  INDEX idx_name (name)
+);
+
+-- 好的设计：大字段分离到扩展表
+CREATE TABLE products (
+  id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  name VARCHAR(200),
+  price DECIMAL(10, 2),
+  INDEX idx_name (name)
+);
+
+CREATE TABLE product_details (
+  product_id BIGINT UNSIGNED PRIMARY KEY,
+  description TEXT,
+  specifications TEXT,
+  FOREIGN KEY (product_id) REFERENCES products(id)
+);
+```
+
+分离之后，列表页查询 `SELECT id, name, price FROM products` 不再加载大字段，一页能放下的行数从几十条变成几百条。商品详情页查询时再 JOIN 扩展表。
+
+### 分区表：按时间切割历史数据
+
+电商系统的订单表是增长最快的表之一。三年积累下来，订单表可能有上亿行。即使索引设计得当，单表的维护成本（索引重建、备份时间、查询优化器分析）也会越来越大。分区表把数据按规则分散到不同的物理文件中，查询时只扫描相关的分区。
+
+```sql
+-- 按月分区
+CREATE TABLE orders (
+  id BIGINT UNSIGNED AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL,
+  total_amount DECIMAL(10, 2),
+  status VARCHAR(20),
+  created_at DATETIME NOT NULL,
+  PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (TO_DAYS(created_at)) (
+  PARTITION p202501 VALUES LESS THAN (TO_DAYS('2025-02-01')),
+  PARTITION p202502 VALUES LESS THAN (TO_DAYS('2025-03-01')),
+  PARTITION p202503 VALUES LESS THAN (TO_DAYS('2025-04-01')),
+  PARTITION p_future VALUES LESS THAN MAXVALUE
+);
+```
+
+查询 2025 年 3 月的订单时，MySQL 只扫描 `p202503` 分区，而不是全表：
+
+```sql
+-- 分区裁剪：只扫描 3 月份的分区
+SELECT * FROM orders
+WHERE created_at >= '2025-03-01' AND created_at < '2025-04-01';
+
+-- 归档历史数据：直接删除旧分区（比 DELETE 快得多）
+ALTER TABLE orders DROP PARTITION p202501;
+```
+
+分区表的局限：分区键必须包含在主键和所有唯一索引中，跨分区的查询不会比单表更快，而且分区数量上限是 8192。对于大多数场景，分区表解决的是数据管理和维护的问题，而不是查询性能的问题。
+
+**为什么需要关注它**：大促期间热数据的访问量是平时的 100 倍。如果表结构里有 TEXT 大字段、字符串主键、不合适的数据类型，这些"技术债"会在高压下放大。表结构优化是投入产出比最高的优化之一，但改动成本也最高（需要迁移数据），所以应该在日常就做好。
+
+---
+
+## 五、SQL 优化技巧汇总
+
+表结构和参数调好之后，日常开发中影响性能最多的就是 SQL 写法。以下是大促前必须检查的几个典型场景。
+
+### 分页优化：深分页是性能杀手
+
+后台管理系统翻到第 5 万页时，`LIMIT 500000, 20` 实际上扫描了 500020 行然后丢掉前 50 万行。大促期间这种查询会严重拖慢数据库。
+
+```sql
+-- 慢：深分页扫描 100 万行
+SELECT * FROM orders ORDER BY created_at DESC LIMIT 1000000, 20;
+
+-- 方案一：游标分页（适合连续翻页场景）
+SELECT * FROM orders
+WHERE id < 上次查询的最小_id
+ORDER BY id DESC LIMIT 20;
+
+-- 方案二：延迟关联（适合跳页场景）
+SELECT o.* FROM orders o
+INNER JOIN (
+  SELECT id FROM orders ORDER BY created_at DESC LIMIT 1000000, 20
+) tmp ON o.id = tmp.id;
+```
+
+延迟关联的原理：子查询只走索引（`id` 在索引里），不需要回表取整行数据，所以很快。拿到 20 个 id 后，再用 id 去查完整数据。
+
+### 子查询改写为 JOIN
+
+MySQL 对相关子查询的优化能力有限。每扫描一行外部表，子查询都要执行一次，相当于 N+1 查询。
+
+```sql
+-- 慢：相关子查询
+SELECT u.username,
+  (SELECT COUNT(*) FROM orders WHERE user_id = u.id) AS order_count,
+  (SELECT SUM(total_amount) FROM orders WHERE user_id = u.id) AS total
 FROM users u;
 
--- 优化：使用 JOIN
-SELECT
-  u.username,
+-- 快：改写为 JOIN + GROUP BY
+SELECT u.username,
   COUNT(o.id) AS order_count,
-  SUM(o.total_amount) AS total_amount
+  COALESCE(SUM(o.total_amount), 0) AS total
 FROM users u
 LEFT JOIN orders o ON u.id = o.user_id
 GROUP BY u.id, u.username;
 ```
 
-### 案例 3：分页优化
+### 避免索引失效的常见陷阱
+
+索引加了对不对是一回事，SQL 写法能不能命中索引是另一回事。以下是大促前必须排查的模式：
 
 ```sql
--- 深分页问题
-SELECT * FROM orders
-ORDER BY created_at DESC
-LIMIT 1000000, 20;  -- 10秒
+-- 1. 索引列上使用函数导致索引失效
+-- 慢
+SELECT * FROM orders WHERE DATE(created_at) = '2025-03-15';
+-- 快：改写为范围查询
+SELECT * FROM orders WHERE created_at >= '2025-03-15' AND created_at < '2025-03-16';
 
--- 优化方案1：使用上次最大ID
-SELECT * FROM orders
-WHERE id > 1000000
-ORDER BY id ASC
-LIMIT 20;  -- 0.01秒
+-- 2. 隐式类型转换导致索引失效
+-- 如果 user_id 是 BIGINT，传入字符串会导致隐式转换
+-- 慢（框架层容易犯的错）
+SELECT * FROM orders WHERE user_id = '123';
+-- 快
+SELECT * FROM orders WHERE user_id = 123;
 
--- 优化方案2：延迟关联
-SELECT o.* FROM orders o
-INNER JOIN (
-  SELECT id FROM orders
-  ORDER BY created_at DESC
-  LIMIT 1000000, 20
-) tmp ON o.id = tmp.id;  -- 0.1秒
+-- 3. OR 条件中有未索引列导致全表扫描
+-- 慢
+SELECT * FROM products WHERE name = '手机' OR description LIKE '%手机%';
+-- 快：拆成两条查询，或者在 name 和 description 上分别建索引后用 UNION
+SELECT * FROM products WHERE name = '手机'
+UNION
+SELECT * FROM products WHERE description LIKE '%手机%';
 ```
 
-## 索引优化实战
+### 批量操作代替逐条操作
 
-### 案例 1：复合索引优化
+大促期间批量导入商品数据或批量更新价格时，逐条操作是灾难级的性能杀手。
 
 ```sql
--- 原始查询
-SELECT * FROM orders
-WHERE user_id = 1
-  AND status = 'completed'
-ORDER BY created_at DESC;
+-- 慢：循环执行 10000 次
+INSERT INTO products (name, price) VALUES ('商品A', 99.00);
+INSERT INTO products (name, price) VALUES ('商品B', 199.00);
+-- ...重复 10000 次
 
--- 添加复合索引（注意字段顺序）
-CREATE INDEX idx_user_status_created ON orders(user_id, status, created_at DESC);
+-- 快：一条批量插入
+INSERT INTO products (name, price) VALUES
+  ('商品A', 99.00), ('商品B', 199.00);  -- 一次插入 1000 行
 
--- 验证
-EXPLAIN SELECT * FROM orders
-WHERE user_id = 1 AND status = 'completed'
-ORDER BY created_at DESC;
--- type: ref（使用了索引）
+-- 批量更新用 CASE WHEN
+UPDATE products SET price = CASE id
+  WHEN 1 THEN 99.00
+  WHEN 2 THEN 199.00
+  WHEN 3 THEN 299.00
+END
+WHERE id IN (1, 2, 3);
 ```
 
-### 案例 2：覆盖索引优化
-
-```sql
--- 原始查询
-SELECT status, created_at, total_amount
-FROM orders
-WHERE user_id = 1
-ORDER BY created_at DESC;
-
--- 创建覆盖索引
-CREATE INDEX idx_user_status_created_total ON orders(user_id, status, created_at, total_amount);
-
--- 验证
-EXPLAIN SELECT status, created_at, total_amount
-FROM orders
-WHERE user_id = 1
-ORDER BY created_at DESC;
--- Extra: Using index（使用了覆盖索引，无需回表）
-```
-
-## 系统级优化
-
-### 操作系统优化
-
-```bash
-# 1. 调整文件描述符限制
-# /etc/security/limits.conf
-mysql soft nofile 65535
-mysql hard nofile 65535
-
-# 2. 禁用 swap
-# /etc/fstab
-# 注释掉 swap 行
-
-# 3. 调整 I/O 调度器
-# SSD 使用 noop 或 deadline
-echo noop > /sys/block/sda/queue/scheduler
-
-# 4. 调整 vm.swappiness
-# /etc/sysctl.conf
-vm.swappiness = 1
-```
-
-### 硬件优化
-
-```
-1. CPU
-   - 多核、高主频
-   - InnoDB 利用多核
-
-2. 内存
-   - 大内存（64GB+）
-   - InnoDB 缓冲池利用
-
-3. 磁盘
-   - SSD 优于 HDD
-   - RAID 10（性能+冗余）
-   - NVMe 更好
-
-4. 网络
-   - 千兆网络
-   - 减少网络延迟
-```
-
-## 性能测试
-
-### 基准测试
-
-```bash
-# 使用 sysbench
-# 安装
-sudo apt install sysbench
-
-# 准备测试数据
-sysbench /usr/share/sysbench/oltp_read_write.lua \
-  --mysql-host=localhost \
-  --mysql-user=root \
-  --mysql-password=root123 \
-  --mysql-db=shop \
-  --tables=10 \
-  --table-size=100000 \
-  prepare
-
-# 执行测试
-sysbench /usr/share/sysbench/oltp_read_write.lua \
-  --mysql-host=localhost \
-  --mysql-user=root \
-  --mysql-password=root123 \
-  --mysql-db=shop \
-  --tables=10 \
-  --table-size=100000 \
-  --threads=8 \
-  --time=300 \
-  run
-
-# 清理
-sysbench /usr/share/sysbench/oltp_read_write.lua \
-  --mysql-host=localhost \
-  --mysql-user=root \
-  --mysql-password=root123 \
-  --mysql-db=shop \
-  cleanup
-```
-
-### 压力测试
-
-```bash
-# 模拟并发查询
-for i in {1..100}; do
-  mysql -uroot -proot123 -e "SELECT * FROM shop.users LIMIT 1000" &
-done
-wait
-```
-
-## 调优流程
-
-### 系统化调优步骤
-
-```
-1. 监控分析
-   - 慢查询日志
-   - Performance Schema
-   - SHOW STATUS
-
-2. 定位瓶颈
-   - SQL 问题
-   - 索引问题
-   - 配置问题
-   - 硬件问题
-
-3. 优化实施
-   - SQL 优化
-   - 索引优化
-   - 参数调整
-   - 硬件升级
-
-4. 效果验证
-   - 基准测试
-   - 性能对比
-   - 持续监控
-```
-
-## 最佳实践总结
-
-### 1. 监控优先
-
-```sql
--- ✅ 建立监控体系
--- - 慢查询日志
--- - Performance Schema
--- - 定期 SHOW STATUS
--- - 第三方监控工具（Prometheus、Grafana）
-```
-
-### 2. 索引优化
-
-```sql
--- ✅ 索引设计原则
--- - 为 WHERE、JOIN、ORDER BY 字段建索引
--- - 使用复合索引
--- - 避免过多索引
--- - 定期维护索引
-```
-
-### 3. SQL 优化
-
-```sql
--- ✅ SQL 编写原则
--- - 避免 SELECT *
--- - 避免 SELECT DISTINCT
--- - 优化子查询为 JOIN
--- - 使用 LIMIT
--- - 避免在索引列上使用函数
-```
-
-### 4. 配置优化
-
-```sql
--- ✅ 参数调优原则
--- - innodb_buffer_pool_size：最重要
--- - max_connections：合理设置
--- - 不要盲目调优
--- - 监控效果
-```
-
-## 总结
-
-本文综合讲解了 MySQL 性能调优，主要内容：
-
-**监控工具**：
-
-- ✅ SHOW STATUS / SHOW PROCESSLIST
-- ✅ Performance Schema
-- ✅ 慢查询日志
-
-**配置优化**：
-
-- ✅ InnoDB 缓冲池
-- ✅ 连接数
-- ✅ IO 容量
-
-**优化实战**：
-
-- ✅ SQL 优化案例
-- ✅ 索引优化案例
-- ✅ 系统级优化
-
-**调优流程**：
-
-- ✅ 监控分析 → 定位瓶颈 → 优化实施 → 效果验证
+**为什么需要关注它**：SQL 优化不需要改表结构、不需要改配置、不需要重启服务，风险最低，见效最快。大促前一天做一次 SQL 审查，把深分页、相关子查询、索引失效的查询修一遍，往往能顶住比预期高得多的流量。
 
 ---
 
-## 恭喜完成 MySQL 系列学习！
+## 六、监控体系：让问题可见
 
-你已经掌握了：
+调优不是一次性的事。今天调好的参数，明天数据量翻倍后可能又不够了。一套持续运行的监控体系，能让问题在变成故障之前暴露出来。
 
-- ✅ MySQL 环境搭建和基础操作
-- ✅ 表设计和数据类型选择
-- ✅ 增删改查和高级查询
-- ✅ 索引设计和优化策略
-- ✅ 事务和锁机制
-- ✅ 数据库设计原则
-- ✅ 视图、存储过程、触发器
-- ✅ 用户管理和安全
-- ✅ 备份恢复策略
-- ✅ 主从复制和高可用
-- ✅ 性能调优实战
+### 核心监控指标
 
-现在你已经具备了：
+监控不需要面面俱到，抓住以下五个指标就能覆盖大部分问题：
 
-- 独立搭建 MySQL 数据库的能力
-- 设计规范数据库结构的能力
-- 优化查询性能的能力
-- 保证数据安全的能力
-- 构建高可用架构的能力
+| 指标         | 含义                      | 告警阈值               | 说明                                       |
+| ------------ | ------------------------- | ---------------------- | ------------------------------------------ |
+| QPS / TPS    | 每秒查询数 / 每秒事务数   | 基线值的 5 倍          | 突增通常意味着异常流量或爬虫               |
+| 活跃连接数   | 当前正在使用的连接        | max_connections 的 80% | 接近上限说明连接泄漏或并发过高             |
+| 缓冲池命中率 | InnoDB 从内存读数据的比例 | 低于 95%               | 命中率下降说明热数据放不下了               |
+| 慢查询数量   | 每分钟新增慢查询数        | 大于 0（根据业务调整） | 新增慢查询意味着有查询需要优化             |
+| 复制延迟     | 从库落后主库的秒数        | 大于 5 秒              | 延迟过大说明从库扛不住了（参考上一篇内容） |
 
-继续实践和深入学习，你将成为 MySQL 专家！
+```sql
+-- 计算当前 QPS
+-- 两次执行以下语句，用差值除以间隔秒数
+SHOW GLOBAL STATUS LIKE 'Questions';
 
-**学习资源**：
+-- 计算当前 TPS（事务提交 + 回滚）
+SHOW GLOBAL STATUS LIKE 'Com_commit';
+SHOW GLOBAL STATUS LIKE 'Com_rollback';
 
-- MySQL 官方文档：https://dev.mysql.com/doc/
-- 《高性能 MySQL》- Baron Schwartz
-- 《MySQL 技术内幕：InnoDB 存储引擎》- 姜宇
+-- 缓冲池命中率
+SHOW STATUS LIKE 'Innodb_buffer_pool_read%';
+-- 命中率 = 1 - (Innodb_buffer_pool_reads / Innodb_buffer_pool_read_requests)
+```
+
+### Prometheus + Grafana：最主流的监控方案
+
+手动执行 SQL 看指标只能用于排查，无法持续监控。Prometheus + Grafana 是目前最主流的数据库监控方案。
+
+架构如下：
+
+```
+MySQL → mysqld_exporter → Prometheus → Grafana
+                    （采集指标）     （存储+查询）   （可视化+告警）
+```
+
+部署步骤的核心思路：
+
+```yaml
+# Prometheus 配置（prometheus.yml）
+scrape_configs:
+  - job_name: "mysql"
+    static_configs:
+      - targets: ["192.168.1.100:9104"] # mysqld_exporter 的地址
+```
+
+```bash
+# 启动 mysqld_exporter（需要提前创建一个只读监控账号）
+mysqld_exporter \
+  --config.my-cnf=/etc/mysql/exporter.cnf \
+  --web.listen-address=0.0.0.0:9104
+```
+
+Grafana 有现成的 MySQL 监控仪表盘模板（搜索 Grafana Labs 上的 "MySQL Overview"），导入后可以直接使用，不需要自己从零搭建面板。
+
+告警规则示例：
+
+```yaml
+# Prometheus 告警规则
+groups:
+  - name: mysql_alerts
+    rules:
+      - alert: HighConnectionUsage
+        expr: mysql_global_status_threads_connected / mysql_global_variables_max_connections > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "MySQL 连接数使用率超过 80%"
+
+      - alert: LowBufferPoolHitRate
+        expr: rate(mysql_global_status_innodb_buffer_pool_read_requests[5m])
+          / (rate(mysql_global_status_innodb_buffer_pool_read_requests[5m])
+          + rate(mysql_global_status_innodb_buffer_pool_reads[5m])) < 0.95
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "InnoDB 缓冲池命中率低于 95%"
+```
+
+**为什么需要关注它**：调优是一个持续的过程，不是一次性工程。监控体系让你看到每次变更的效果——加了索引后 QPS 提升了多少，调了参数后缓冲池命中率提高了多少。没有监控的调优是盲人摸象。
 
 ---
+
+## 权衡与选择
+
+性能调优没有银弹，每一个优化决策都是在不同目标之间做取舍。
+
+**配置调优 vs SQL 调优 vs 架构调优**：优先级应该是 SQL > 配置 > 架构。SQL 优化的风险最低、见效最快（改一条查询，性能提升 10 倍很常见）。配置调优需要对业务负载有准确的理解，参数调错可能导致数据丢失（比如 `innodb_flush_log_at_trx_commit`）。架构调优（读写分离、分库分表）效果最好，但成本最高，改动周期长。
+
+**安全 vs 性能**：`innodb_flush_log_at_trx_commit = 1` 最安全但最慢，`= 0` 最快但可能丢数据。大促期间可以临时设为 2，配合主从复制做兜底，大促结束改回 1。不要为了性能长期牺牲安全性——性能问题可以用钱解决（加机器），数据丢失不可逆。
+
+**分区表 vs 分库分表**：分区表适合按时间维度管理和归档数据，但查询性能提升有限。真正的性能瓶颈需要分库分表（将不同用户的订单分散到不同的 MySQL 实例）。分区表的改造成本低，分库分表的改造成本高（需要引入 ShardingSphere 或 Vitess 中间件）。先尝试分区表，到了单机确实扛不住再考虑分库分表。
+
+**自建监控 vs 云服务**：Prometheus + Grafana 的功能完全够用，但需要运维人力。如果用的是云厂商 RDS，它们自带的监控和告警功能已经覆盖了大部分场景，不需要自己搭。小团队优先用云服务，把精力放在业务上。
+
+---
+
+## 系列回顾与进阶方向
+
+### 这 12 篇文章，你学到了什么
+
+这是一个渐进式的学习路径，每一篇都在前一篇的基础上扩展。回顾一下：
+
+**基础篇（01-05）**：从零搭建 MySQL 环境，理解数据类型和表设计，掌握增删改查、多表 JOIN、聚合函数和窗口函数。这些是每天都会用到的基本功。
+
+**索引与事务（06-07）**：理解 B+ 树索引原理、复合索引设计、EXPLAIN 执行计划分析。掌握事务的 ACID 特性、隔离级别、锁机制和死锁排查。这两篇解决的是"数据量大了查询变慢"和"并发高了数据出错"的问题。
+
+**设计与编程（08-10）**：查询优化技巧、数据库设计范式与反范式、视图/存储过程/触发器、用户权限管理。这一段解决的是"怎么写出高质量的 SQL"和"怎么设计可持续演进的数据库结构"的问题。
+
+**运维与高可用（11-12）**：备份恢复、主从复制、读写分离、高可用方案，以及这一篇的性能调优。这些解决的是"数据丢了能找回来"、"服务挂了能快速恢复"、"系统慢了能定位和优化"的问题。
+
+贯穿整个系列的核心观点：数据库技术不是孤立的。表设计影响索引效率，索引设计影响查询性能，事务隔离级别影响并发能力，主从复制架构影响读写分离的策略。每一步决策都要考虑它对上下游的影响。
+
+### 进阶方向
+
+如果你已经掌握了这 12 篇的内容，以下方向可以继续深入：
+
+**数据库内核**：理解 InnoDB 的 Buffer Pool 管理、Page 结构、B+ 树的分裂与合并机制、MVCC 的实现细节。这些知识在排查疑难问题时非常有价值。推荐阅读《MySQL 技术内幕：InnoDB 存储引擎》。
+
+**分布式数据库**：当单机 MySQL 真的扛不住时，分库分表（ShardingSphere）、NewSQL（TiDB、CockroachDB）、云原生数据库（Aurora、PolarDB）是下一步。核心思路是把数据分散到多台机器上，同时保持 SQL 兼容性。
+
+**其他数据库选型**：MySQL 不是所有场景的最佳选择。时序数据用 TimescaleDB 或 InfluxDB，全文搜索用 Elasticsearch，缓存用 Redis，图关系用 Neo4j。理解每种数据库的设计目标和局限性，在合适的场景选择合适的工具。
+
+**数据库管理与运维**：如果你在生产环境中管理 MySQL，还需要学习：参数调优的自动化工具（MySQL Tuner）、在线 DDL 工具（gh-ost、pt-online-schema-change）、数据库版本升级策略、合规与审计。推荐阅读《高性能 MySQL》。
+
+写这个系列的过程也是我自己重新梳理 MySQL 知识体系的过程。数据库领域很广，12 篇文章只能覆盖核心。希望这个系列能帮你建立系统的认知框架，在实际工作中遇到具体问题时，知道该往哪个方向深挖。

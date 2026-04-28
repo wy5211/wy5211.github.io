@@ -1,6 +1,7 @@
 ---
-title: "09 数据库设计原则"
+title: "09 数据库设计：范式、反范式和真实业务的折中"
 date: "2026-03-23"
+summary: "从电商系统半年来累积的设计债务出发，重新审视数据库设计——三范式解决了什么问题、什么时候该反范式、外键要不要加、SPU 和 SKU 怎么拆、订单状态机怎么建模，以及大表什么时候该拆。"
 tags: ["MySQL"]
 category: "mysql"
 cover: ""
@@ -9,477 +10,519 @@ series: "MySQL 渐进式学习指南"
 seriesOrder: 9
 ---
 
-## 前言
+## 半年积累的设计债务
 
-良好的数据库设计是系统成功的基石。合理的设计可以避免数据冗余、保证数据完整性、提升查询性能。
+上一篇我们用 EXPLAIN 和索引解决了查询性能问题。但有个问题优化不了：查询再快，如果表结构本身就不合理，你依然会面临 JOIN 嵌套、数据冗余、改一个字段牵动三张表这些结构性问题。
 
-本文将系统讲解数据库设计的核心原则和实战技巧。
+电商系统跑了半年，技术债开始集中爆发。订单表从最初的 8 个字段膨胀到了 23 个——收货人姓名、收货地址、手机号、快递单号、物流公司、退款状态、退款金额……需求来一个加一列。商品表更混乱，一开始只有"商品"这一个概念，后来运营说要区分"颜色"和"尺寸"的库存，开发就在商品表上加了 color、size、stock_by_sku 这些字段。结果 iPhone 15 一个商品就要插好几行，价格和描述改一处要改 N 处。
 
-## 数据库设计三范式
+你决定重新审视整个数据库设计。这次不只是加字段、加索引，而是从数据建模开始，搞清楚一张表应该包含哪些字段、表和表之间的关系该怎么表达，以及在真实业务中，教科书上的范式理论和实际性能需求之间，到底该怎么取舍。
 
-### 第一范式（1NF）
+## 三范式解决了什么问题
 
-**定义**：每个字段都是不可分割的最小数据单位。
+数据库范式是上世纪 70 年代的关系理论产物。听起来很学术，但它要解决的是非常实际的问题：数据冗余导致的不一致。
+
+### 第一范式（1NF）：字段不可再分
+
+1NF 的要求很简单——每个字段只能存储一个原子值。不要在一个字段里塞多个信息。
+
+你可能觉得这谁会犯？但看看订单表半年来的实际演化：
 
 ```sql
--- ❌ 违反 1NF
-CREATE TABLE users (
-  id INT,
-  name VARCHAR(100),  -- 包含姓和名
-  address VARCHAR(200)  -- 包含省市区街道
-);
-
--- ✅ 符合 1NF
-CREATE TABLE users (
-  id INT,
-  first_name VARCHAR(50),
-  last_name VARCHAR(50),
-  province VARCHAR(50),
-  city VARCHAR(50),
-  district VARCHAR(50),
-  street VARCHAR(100)
-);
+-- 跑了半年之后的订单表，address 字段里塞了完整地址
+SELECT address FROM orders LIMIT 3;
+-- "浙江省杭州市西湖区文三路 168 号"
+-- "北京市朝阳区望京 SOHO T3-1205"
+-- "上海市浦东新区陆家嘴环路 1000 号"
 ```
 
-### 第二范式（2NF）
+运营说"给我按城市统计订单量"，你就得用字符串截取或者 LIKE 来猜城市在哪一段。更麻烦的是，"杭州市"和"杭州"是同一个城市，但你没法直接 GROUP BY。
 
-**定义**：在满足 1NF 的基础上，非主键字段完全依赖于主键。
+按 1NF 拆分后：
 
 ```sql
--- ❌ 违反 2NF（部分依赖）
+ALTER TABLE orders
+  ADD COLUMN receiver_province VARCHAR(20),
+  ADD COLUMN receiver_city VARCHAR(20),
+  ADD COLUMN receiver_district VARCHAR(20),
+  ADD COLUMN receiver_address VARCHAR(200);
+```
+
+现在 `GROUP BY receiver_city` 就能直接用了。1NF 看似简单，但它解决的核心问题是：**如果你不能直接定位和操作某个数据片段，那它在查询和维护上就一定会出问题**。
+
+### 第二范式（2NF）：消除部分依赖
+
+2NF 要求：在联合主键的表中，所有非主键字段必须完全依赖于整个主键，不能只依赖主键的一部分。
+
+来看一个典型的问题表——早期版本的 order_items：
+
+```sql
+-- 早期的订单明细表，用 (order_id, product_id) 做联合主键
 CREATE TABLE order_items (
-  order_id INT,
-  product_id INT,
-  product_name VARCHAR(100),  -- 依赖 product_id
-  price DECIMAL(10, 2),       -- 依赖 product_id
+  order_id BIGINT,
+  product_id BIGINT,
+  product_name VARCHAR(200),   -- 只依赖 product_id
+  category_name VARCHAR(100),  -- 只依赖 product_id
+  price DECIMAL(10, 2),        -- 只依赖 product_id
   quantity INT,
   PRIMARY KEY (order_id, product_id)
 );
+```
 
--- ✅ 符合 2NF（拆分表）
+问题出在哪？`product_name`、`category_name`、`price` 这三个字段，其实只依赖 `product_id`，跟 `order_id` 没有关系。这就是"部分依赖"。
+
+实际影响：iPhone 15 卖了 5000 单，`product_name = "iPhone 15 128G"` 就在表里存了 5000 份。某天苹果改名为 "iPhone 15 (128GB)"，你得更新 5000 行。如果漏更新了几行，同一商品在历史订单里就会出现不同的名字。
+
+拆分后：
+
+```sql
+-- 订单明细只保留真正的关联信息和数量
 CREATE TABLE order_items (
-  order_id INT,
-  product_id INT,
-  quantity INT,
-  PRIMARY KEY (order_id, product_id)
-);
-
-CREATE TABLE products (
-  product_id INT PRIMARY KEY,
-  product_name VARCHAR(100),
-  price DECIMAL(10, 2)
-);
-```
-
-### 第三范式（3NF）
-
-**定义**：在满足 2NF 的基础上，非主键字段不传递依赖于主键。
-
-```sql
--- ❌ 违反 3NF（传递依赖）
-CREATE TABLE orders (
-  order_id INT PRIMARY KEY,
-  user_id INT,
-  user_name VARCHAR(50),    -- 依赖 user_id
-  user_email VARCHAR(100),  -- 依赖 user_id
-  total_amount DECIMAL(10, 2)
-);
-
--- ✅ 符合 3NF（拆分表）
-CREATE TABLE orders (
-  order_id INT PRIMARY KEY,
-  user_id INT,
-  total_amount DECIMAL(10, 2)
-);
-
-CREATE TABLE users (
-  user_id INT PRIMARY KEY,
-  user_name VARCHAR(50),
-  user_email VARCHAR(100)
-);
-```
-
-## 表关系设计
-
-### 一对一（1:1）
-
-```sql
--- 一个用户对应一个详细资料
-CREATE TABLE users (
-  user_id INT PRIMARY KEY,
-  username VARCHAR(50)
-);
-
-CREATE TABLE user_profiles (
-  profile_id INT PRIMARY KEY,
-  user_id INT UNIQUE,  -- 唯一约束
-  real_name VARCHAR(50),
-  id_card VARCHAR(18),
-  phone VARCHAR(20),
-  FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
-
--- 或者在主表中添加外键
-CREATE TABLE users (
-  user_id INT PRIMARY KEY,
-  username VARCHAR(50),
-  profile_id INT UNIQUE,
-  FOREIGN KEY (profile_id) REFERENCES user_profiles(profile_id)
-);
-```
-
-### 一对多（1:N）
-
-```sql
--- 一个用户有多个订单
-CREATE TABLE users (
-  user_id INT PRIMARY KEY,
-  username VARCHAR(50)
-);
-
-CREATE TABLE orders (
-  order_id INT PRIMARY KEY,
-  user_id INT,  -- 外键
-  order_no VARCHAR(50),
-  total_amount DECIMAL(10, 2),
-  FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
-
--- 查询用户的所有订单
-SELECT u.*, o.*
-FROM users u
-LEFT JOIN orders o ON u.user_id = o.user_id;
-```
-
-### 多对多（M:N）
-
-```sql
--- 一个学生可以选多门课，一门课有多个学生
-CREATE TABLE students (
-  student_id INT PRIMARY KEY,
-  student_name VARCHAR(50)
-);
-
-CREATE TABLE courses (
-  course_id INT PRIMARY KEY,
-  course_name VARCHAR(100)
-);
-
--- 中间表（关联表）
-CREATE TABLE student_courses (
-  student_id INT,
-  course_id INT,
-  enroll_date DATE,
-  score DECIMAL(5, 2),
-  PRIMARY KEY (student_id, course_id),  -- 联合主键
-  FOREIGN KEY (student_id) REFERENCES students(student_id),
-  FOREIGN KEY (course_id) REFERENCES courses(course_id)
-);
-
--- 查询学生的选课
-SELECT s.student_name, c.course_name, sc.score
-FROM students s
-INNER JOIN student_courses sc ON s.student_id = sc.student_id
-INNER JOIN courses c ON sc.course_id = c.course_id;
-```
-
-## 外键约束
-
-```sql
--- 创建外键
-CREATE TABLE orders (
-  order_id INT PRIMARY KEY,
-  user_id INT,
-  total_amount DECIMAL(10, 2),
-  FOREIGN KEY (user_id)
-    REFERENCES users(user_id)
-    ON DELETE RESTRICT  -- 删除限制
-    ON UPDATE CASCADE   -- 更新级联
-);
-
--- 级联操作选项：
--- ON DELETE RESTRICT  - 有子记录时不允许删除（默认）
--- ON DELETE CASCADE   - 删除父记录时，子记录也删除
--- ON DELETE SET NULL  - 删除父记录时，子记录的外键设为 NULL
--- ON DELETE NO ACTION - 与 RESTRICT 相同
-
--- 实际应用示例
-CREATE TABLE orders (
-  order_id INT PRIMARY KEY,
-  user_id INT,
-  product_id INT,
-  FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
-  FOREIGN KEY (product_id) REFERENCES products(product_id) ON DELETE RESTRICT
-);
--- 删除用户时，订单也删除
--- 有订单时，不允许删除商品
-```
-
-## 反规范化
-
-为了性能而适度违反范式。
-
-### 何时反规范化
-
-```sql
--- ✅ 适合反规范化的场景：
--- 1. 读多写少
--- 2. 查询频繁
--- 3. 性能要求高
-
--- 示例：在订单表中冗余用户名
--- 规范化：需要 JOIN
-SELECT o.order_no, u.username
-FROM orders o
-INNER JOIN users u ON o.user_id = u.user_id;
-
--- 反规范化：添加冗余字段
-CREATE TABLE orders (
-  order_id INT PRIMARY KEY,
-  user_id INT,
-  username VARCHAR(50),  -- 冗余字段
-  order_no VARCHAR(50),
-  total_amount DECIMAL(10, 2)
-);
-
--- 查询时无需 JOIN
-SELECT order_no, username FROM orders;
--- 性能提升，但需要维护冗余字段一致性
-```
-
-### 冗余字段设计
-
-```sql
--- 示例：订单表冗余商品信息
-CREATE TABLE order_items (
-  item_id INT PRIMARY KEY,
-  order_id INT,
-  product_id INT,
-  product_name VARCHAR(100),   -- 冗余
-  price DECIMAL(10, 2),         -- 冗余（快照）
-  quantity INT,
-  subtotal DECIMAL(10, 2)
-);
-
--- 好处：
--- 1. 查询订单明细时无需 JOIN products 表
--- 2. 保存历史价格（商品价格可能变化）
-
--- 代价：
--- 需要在插入时复制数据
-```
-
-### 计数器表
-
-```sql
--- ❌ 差：每次查询 COUNT
-SELECT COUNT(*) FROM comments WHERE post_id = 1;
-
--- ✅ 好：冗余计数字段
-CREATE TABLE posts (
-  post_id INT PRIMARY KEY,
-  title VARCHAR(200),
-  comment_count INT DEFAULT 0  -- 冗余
-);
-
--- 插入评论时更新
-INSERT INTO comments (post_id, content) VALUES (1, '...');
-UPDATE posts SET comment_count = comment_count + 1 WHERE post_id = 1;
-```
-
-## ER 图设计
-
-### 实体关系
-
-```
-用户 ──< 订单 ──< 订单明细 >── 商品
- 1              1            N            N
-
-用户 ──< 地址
- 1              N
-
-分类 >── 商品
- 1            N
-
-标签 >──< 商品（多对多）
- N            N
-```
-
-### 设计流程
-
-```sql
--- 1. 识别实体
--- 用户、商品、订单、分类
-
--- 2. 确定关系
--- 用户 1:N 订单
--- 分类 1:N 商品
--- 订单 1:N 订单明细
--- 商品 1:N 订单明细
-
--- 3. 设计表结构
--- 4. 添加约束和索引
--- 5. 考虑反规范化
-```
-
-## 电商数据库设计
-
-### 核心表
-
-```sql
--- 用户表
-CREATE TABLE users (
-  user_id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-  username VARCHAR(50) NOT NULL UNIQUE,
-  email VARCHAR(100) NOT NULL UNIQUE,
-  password_hash VARCHAR(255) NOT NULL,
-  status TINYINT UNSIGNED DEFAULT 1,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-  INDEX idx_email (email),
-  INDEX idx_status (status)
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  order_id BIGINT UNSIGNED NOT NULL,
+  product_id BIGINT UNSIGNED NOT NULL,
+  quantity INT UNSIGNED NOT NULL,
+  unit_price DECIMAL(10, 2) NOT NULL,  -- 注意这个，后面会解释
+  INDEX idx_order (order_id)
 ) ENGINE=InnoDB;
 
--- 分类表
-CREATE TABLE categories (
-  category_id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-  parent_id BIGINT UNSIGNED,
-  name VARCHAR(100) NOT NULL,
-  level TINYINT UNSIGNED DEFAULT 1,
-  sort_order INT UNSIGNED DEFAULT 0,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (parent_id) REFERENCES categories(category_id) ON DELETE SET NULL,
-  INDEX idx_parent (parent_id),
-  INDEX idx_level (level)
-) ENGINE=InnoDB;
-
--- 商品表
+-- 商品信息只存一份
 CREATE TABLE products (
-  product_id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-  category_id BIGINT UNSIGNED NOT NULL,
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   name VARCHAR(200) NOT NULL,
-  description TEXT,
-  price DECIMAL(10, 2) NOT NULL,
-  stock INT UNSIGNED DEFAULT 0,
-  sales INT UNSIGNED DEFAULT 0,
-  status TINYINT UNSIGNED DEFAULT 1,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (category_id) REFERENCES categories(category_id),
-  INDEX idx_category (category_id),
-  INDEX idx_price (price),
-  INDEX idx_status_sales (status, sales DESC)
+  category_id BIGINT UNSIGNED,
+  price DECIMAL(10, 2) NOT NULL
 ) ENGINE=InnoDB;
+```
 
--- 订单表
+你可能注意到 `order_items` 里保留了 `unit_price`——这不就是冗余吗？没错，但这里有特殊的业务原因，后面反范式章节会解释。
+
+### 第三范式（3NF）：消除传递依赖
+
+3NF 要求：非主键字段之间不能有依赖关系。A 依赖主键，B 依赖 A，这就是传递依赖，要拆掉。
+
+订单表里有一堆从用户表带过来的字段：
+
+```sql
+-- 违反 3NF 的订单表
 CREATE TABLE orders (
-  order_id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  id BIGINT PRIMARY KEY,
+  user_id BIGINT,
+  username VARCHAR(50),       -- 依赖 user_id
+  user_email VARCHAR(100),    -- 依赖 user_id
+  user_phone VARCHAR(20),     -- 依赖 user_id
+  total_amount DECIMAL(10, 2),
+  status VARCHAR(20)
+);
+```
+
+`username`、`user_email`、`user_phone` 都是通过 `user_id` 传递依赖过来的。用户改了邮箱，你得在订单表里同步更新所有历史记录。如果不同步，用户看到的订单详情里邮箱就和他当前邮箱对不上。
+
+3NF 的拆法很简单——把不属于自己的字段赶回它该待的表：
+
+```sql
+-- 订单表只保留关联关系
+CREATE TABLE orders (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   user_id BIGINT UNSIGNED NOT NULL,
   order_no VARCHAR(50) NOT NULL UNIQUE,
   total_amount DECIMAL(10, 2) NOT NULL,
-  status ENUM('pending', 'paid', 'shipped', 'completed', 'cancelled') DEFAULT 'pending',
+  status VARCHAR(20) NOT NULL DEFAULT 'pending',
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY (user_id) REFERENCES users(user_id),
   INDEX idx_user (user_id),
-  INDEX idx_order_no (order_no),
-  INDEX idx_status (status),
-  INDEX idx_created (created_at DESC)
+  INDEX idx_status_created (status, created_at DESC)
 ) ENGINE=InnoDB;
 
--- 订单明细表
+-- 用户信息留在用户表
+CREATE TABLE users (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  username VARCHAR(50) NOT NULL UNIQUE,
+  email VARCHAR(100) NOT NULL UNIQUE,
+  phone VARCHAR(20),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+```
+
+三范式的核心逻辑是一脉相承的：**1NF 保证字段是最小单位，2NF 消除部分依赖，3NF 消除传递依赖**。每一层都在回答同一个问题——"这个字段真的属于这张表吗？"
+
+## 范式与性能的权衡
+
+如果把三范式严格执行到底，电商系统的订单查询会变成什么样？
+
+```sql
+-- 完全范式化：查一个订单要 JOIN 四张表
+SELECT o.order_no, o.total_amount, o.status,
+       u.username, u.email,
+       oi.quantity, oi.unit_price,
+       p.name AS product_name
+FROM orders o
+JOIN users u ON o.user_id = u.id
+JOIN order_items oi ON o.id = oi.order_id
+JOIN products p ON oi.product_id = p.id
+WHERE o.id = 10086;
+```
+
+四表 JOIN，每次查订单详情都要走一遍。在数据量小的时候问题不大，但在高并发场景下，这些 JOIN 会占用大量的 CPU 和内存资源。
+
+### 适度反范式的典型场景
+
+这就是为什么生产环境经常需要**适度反范式**——用可控的冗余换取查询效率。
+
+**场景一：订单中的商品快照**
+
+上面提到 `order_items` 里保留了 `unit_price`。严格按 3NF，价格应该从 products 表查。但商品价格是会变的。用户 3 月买的 iPhone 是 5999，4 月涨到 6299，如果你不存快照，用户回看历史订单时看到的价格就不对了。这不是冗余，这是业务快照：
+
+```sql
 CREATE TABLE order_items (
-  item_id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
   order_id BIGINT UNSIGNED NOT NULL,
   product_id BIGINT UNSIGNED NOT NULL,
-  product_name VARCHAR(200),   -- 冗余
-  price DECIMAL(10, 2),         -- 冗余
+  product_name VARCHAR(200) NOT NULL,   -- 下单时的商品名称快照
+  unit_price DECIMAL(10, 2) NOT NULL,   -- 下单时的单价快照
   quantity INT UNSIGNED NOT NULL,
-  subtotal DECIMAL(10, 2),
-  FOREIGN KEY (order_id) REFERENCES orders(order_id) ON DELETE CASCADE,
-  FOREIGN KEY (product_id) REFERENCES products(product_id),
+  subtotal DECIMAL(10, 2) NOT NULL      -- unit_price * quantity
+) ENGINE=InnoDB;
+```
+
+**场景二：高频统计字段**
+
+商品表里的 `sales`（总销量）字段，严格来说可以通过 SUM(order_items.quantity) 算出来。但如果每次访问商品详情页都要聚合计算，100 万日 PV 的商品列表页数据库扛不住：
+
+```sql
+-- 商品表冗余销量字段
+ALTER TABLE products ADD COLUMN sales INT UNSIGNED DEFAULT 0;
+
+-- 下单时同步更新
+UPDATE products SET sales = sales + 2 WHERE id = 101;
+```
+
+这种冗余的代价是：更新时要保证一致性。如果下单成功但销量没更新，数据就出现了偏差。实际操作中通常在订单完成后异步更新，接受短时间的最终一致。
+
+**反范式的原则**：读远多于写的数据、计算成本高的聚合值、需要保留历史状态的快照数据，这三种情况适合冗余。其他情况尽量遵循范式。冗余不是偷懒，而是有意识地做 trade-off。
+
+## ER 图：从需求到表结构的桥梁
+
+范式理论告诉我们怎么检查已有的表是否合理，但没告诉我们怎么从零开始设计。ER 图（Entity-Relationship Diagram）就是干这件事的。
+
+### 实体和属性
+
+实体是业务中独立存在的事物，属性是描述实体的特征。在我们的电商系统里，核心实体有这些：
+
+```
+用户（users）     - 属性：用户名、邮箱、手机号、注册时间
+商品（products）  - 属性：名称、描述、价格、库存
+分类（categories） - 属性：名称、层级、排序
+订单（orders）    - 属性：订单号、金额、状态、创建时间
+订单明细（order_items） - 属性：数量、单价、小计
+```
+
+怎么判断一个东西是实体还是属性？如果它在业务中有独立的生命周期，需要被单独引用和操作，那就是实体。如果它只是用来描述另一个东西，不独立存在，那就是属性。比如"收货地址"——用户可以有多个地址，地址需要独立管理和复用，所以它应该是实体，而不是订单表里的几个字段。
+
+### 关系的三种类型
+
+实体之间的关系有三种基本模式，在数据库里用外键来表达。
+
+**一对多（1:N）**：最常见的关系。一个用户有多个订单，一个分类下有多个商品。外键放在"多"的那一边：
+
+```sql
+-- 用户的多个订单：orders 表持有 user_id
+CREATE TABLE orders (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL,  -- 外键指向用户表
+  -- ...
+);
+
+-- 分类的多个商品：products 表持有 category_id
+CREATE TABLE products (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  category_id BIGINT UNSIGNED NOT NULL,  -- 外键指向分类表
+  -- ...
+);
+```
+
+**多对多（M:N）**：商品和标签的关系。一个商品可以有多个标签（"新品"、"促销"、"包邮"），一个标签也可以关联多个商品。多对多不能直接用外键表达，必须建一张中间表：
+
+```sql
+CREATE TABLE tags (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  name VARCHAR(50) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+
+-- 中间表：把 M:N 拆成两个 1:N
+CREATE TABLE product_tags (
+  product_id BIGINT UNSIGNED NOT NULL,
+  tag_id BIGINT UNSIGNED NOT NULL,
+  PRIMARY KEY (product_id, tag_id),  -- 联合主键防止重复关联
+  INDEX idx_tag (tag_id)             -- 反向查询：通过标签找商品
+) ENGINE=InnoDB;
+```
+
+**一对一（1:1）**：相对少见。一个用户对应一个实名认证信息。一对一通常有两种做法：放在同一张表里（最简单），或者拆成两张表用外键关联（当其中一方的字段很多、或者访问频率差异很大时）：
+
+```sql
+-- 用户核心信息（高频访问）
+CREATE TABLE users (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  username VARCHAR(50) NOT NULL UNIQUE,
+  email VARCHAR(100) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+
+-- 实名认证信息（低频访问，字段多）
+CREATE TABLE user_identities (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL UNIQUE,  -- UNIQUE 保证一对一
+  real_name VARCHAR(50) NOT NULL,
+  id_card VARCHAR(18) NOT NULL,
+  verified_at TIMESTAMP NULL
+) ENGINE=InnoDB;
+```
+
+电商系统的整体 ER 关系可以画成这样：
+
+```
+users ──1:N── orders ──1:N── order_items ──N:1── products
+  │                      │                             │
+  └──1:1── user_identities                    N:M ── product_tags
+                                              │         │
+categories ──1:N── products ──────────────────┘    tags
+```
+
+画 ER 图的习惯值得培养。不需要工具，纸上画也行。关键是在写 CREATE TABLE 之前，先把实体和关系理清楚，避免写到一半发现"分类应该支持多级"然后回过头改表结构。
+
+## 外键约束：要不要加？
+
+上面的建表语句里，我故意没有写 FOREIGN KEY。这不是疏忽——外键约束在生产环境是一个有争议的话题。
+
+### 两种观点
+
+**支持加外键的人认为**：数据库应该保证引用完整性。订单的 `user_id` 必须指向一个真实存在的用户，商品的 `category_id` 必须指向一个真实存在的分类。如果不加外键，应用层的一个 bug 就可能插入一条 user_id = 99999 的订单，而 99999 这个用户根本不存在。
+
+```sql
+-- 加外键的写法
+ALTER TABLE orders
+  ADD CONSTRAINT fk_orders_user
+  FOREIGN KEY (user_id) REFERENCES users(id)
+  ON DELETE RESTRICT;  -- 有订单的用户不允许删除
+```
+
+**反对加外键的人认为**：外键在大型系统中弊大于利。原因是：
+
+- **性能开销**：每次 INSERT/UPDATE/DELETE 都要检查外键约束，高并发写入时这个开销不可忽视。
+- **锁竞争**：外键检查会锁定父表的行。大量订单并发写入时，users 表上被外键锁定的行会成为瓶颈。
+- **运维困难**：删一个用户前要先删所有关联的订单、订单明细、支付记录……级联删除在生产环境是非常危险的操作。批量导入数据时，外键检查也会大幅降低导入速度。
+- **分库分表的障碍**：一旦订单和用户不在同一个数据库实例上，外键就完全不适用了。
+
+### 实际做法
+
+中小型项目（单库、数据量百万级以下）可以加外键，它确实能帮你挡住应用层的数据一致性问题。
+
+大型项目（千万级以上、有分库分表需求）通常不在数据库层加外键，而是：
+
+- 在应用层做数据校验（下单时先查用户是否存在）
+- 用定时任务做数据一致性巡检（找出 user_id 不存在的订单）
+- 在代码层面做级联操作（删用户时由应用层负责清理关联数据）
+
+这个选择本质上是把数据完整性的保障从数据库层移到了应用层。如果你的团队有足够的工程规范和测试覆盖，应用层保障是更灵活的选择。
+
+## 商品模型：SPU 和 SKU 的拆分
+
+回到开头提到的问题：商品表到底该怎么设计？运营说 iPhone 15 有 128G、256G、512G 三个版本，每个版本有黑色、白色、蓝色三种颜色。如果一行代表一个可售卖的 SKU，iPhone 15 就有 9 行数据。名称、描述、图片都是重复的。
+
+这里需要引入电商中两个核心概念：
+
+- **SPU（Standard Product Unit）**：标准化产品单元。iPhone 15 就是一个 SPU，代表一类商品，包含这类商品共有的属性。
+- **SKU（Stock Keeping Unit）**：库存量单元。iPhone 15 256G 黑色就是一个 SKU，是实际可售卖、有独立库存和价格的最小单位。
+
+```sql
+-- SPU 表：商品共有信息
+CREATE TABLE products (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  category_id BIGINT UNSIGNED NOT NULL,
+  name VARCHAR(200) NOT NULL,           -- "iPhone 15"
+  description TEXT,
+  main_image VARCHAR(500),
+  status TINYINT UNSIGNED DEFAULT 1,     -- 上下架
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_category (category_id)
+) ENGINE=InnoDB;
+
+-- SKU 表：可售卖的具体规格
+CREATE TABLE product_skus (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  product_id BIGINT UNSIGNED NOT NULL,    -- 关联 SPU
+  sku_code VARCHAR(50) NOT NULL UNIQUE,   -- "IPHONE15-256-BLACK"
+  attributes JSON NOT NULL,               -- {"storage":"256G","color":"黑色"}
+  price DECIMAL(10, 2) NOT NULL,          -- 这个 SKU 的售价
+  stock INT UNSIGNED DEFAULT 0,           -- 这个 SKU 的独立库存
+  INDEX idx_product (product_id)
+) ENGINE=InnoDB;
+```
+
+`attributes` 用 JSON 类型存储规格属性。MySQL 8.0 支持对 JSON 字段建虚拟列索引，所以如果你经常按颜色筛选，可以这样做：
+
+```sql
+ALTER TABLE product_skus
+  ADD COLUMN color VARCHAR(50)
+    GENERATED ALWAYS AS (JSON_UNQUOTE(attributes->'$.color')) STORED,
+  ADD INDEX idx_color (color);
+```
+
+这种设计的好处是：改 SPU 的描述只改一行；调某个 SKU 的价格和库存不影响其他 SKU；前端展示商品列表查 SPU，用户选规格后查 SKU。分得清，改得动。
+
+## 订单状态机：用数据库还是用代码？
+
+订单状态是电商系统里最容易出问题的地方之一。半年来你可能见过这样的订单表：
+
+```sql
+-- 状态用 ENUM 或者 TINYINT
+status ENUM('pending', 'paid', 'shipped', 'completed', 'cancelled',
+            'refunding', 'refunded', 'closed')
+```
+
+问题不在于用了多少个状态，而在于状态之间的流转规则。一个"已发货"的订单可以被标记为"已完成"，但绝不应该能退回到"待支付"。一个"已取消"的订单不应该再被改成任何状态。这些规则写在哪里？
+
+**方案一：数据库 ENUM + 应用层校验**
+
+这是最常见的做法。状态存在数据库里，流转规则写在应用代码中：
+
+```sql
+-- 数据库只存当前状态
+ALTER TABLE orders
+  MODIFY COLUMN status VARCHAR(20) NOT NULL DEFAULT 'pending';
+```
+
+应用层的代码负责校验状态流转是否合法：
+
+```python
+# 伪代码：订单状态机
+VALID_TRANSITIONS = {
+    'pending':   ['paid', 'cancelled'],
+    'paid':      ['shipped', 'refunding', 'cancelled'],
+    'shipped':   ['completed', 'refunding'],
+    'refunding': ['refunded', 'paid'],
+    'completed': ['refunding'],
+    'refunded':  [],
+    'cancelled': [],
+}
+
+def transition_order(order_id, from_status, to_status):
+    if to_status not in VALID_TRANSITIONS.get(from_status, []):
+        raise InvalidTransition(f"Cannot go from {from_status} to {to_status}")
+    # 原子更新，防止并发问题
+    rows = db.execute(
+        "UPDATE orders SET status = %s WHERE id = %s AND status = %s",
+        (to_status, order_id, from_status)
+    )
+    if rows == 0:
+        raise ConcurrentModification("Order status changed by another request")
+```
+
+注意 UPDATE 语句带了 `AND status = %s` 条件，这是乐观锁的思路——如果状态已经被别的请求改了，更新行数为 0，应用层就知道发生了并发冲突。
+
+**方案二：数据库存储完整状态流转历史**
+
+对于对状态变更要求严格的业务（比如需要审计追踪），可以加一张状态变更日志表：
+
+```sql
+CREATE TABLE order_status_log (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  order_id BIGINT UNSIGNED NOT NULL,
+  from_status VARCHAR(20) NOT NULL,
+  to_status VARCHAR(20) NOT NULL,
+  operator VARCHAR(50),            -- 操作人
+  remark VARCHAR(500),             -- 备注
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   INDEX idx_order (order_id)
 ) ENGINE=InnoDB;
 ```
 
-## 最佳实践
+这样不仅能看到当前状态，还能回溯每一步状态变更的完整历史。
 
-### 1. 适度范式化
+实际选择上，小团队用方案一就够了，状态流转规则在代码里维护即可。当业务复杂到有客服系统、财务对账、合规审计需求时，方案二的价值就体现出来了。
 
-```sql
--- ✅ 推荐：核心业务表遵循 3NF
--- ✅ 推荐：报表、统计表适当反规范化
--- ✅ 推荐：根据查询频率决定是否冗余
-```
+## 大表拆分：什么时候该考虑
 
-### 2. 命名规范
+电商系统跑了一两年，orders 表可能已经几千万甚至上亿行。这时候你可能会听到"分库分表"这个词。但拆表不是一上来就要做的事，它有明确的前置条件。
 
-```sql
--- ✅ 表名：小写、下划线、复数
-users, orders, order_items
+### 先试其他手段
 
--- ✅ 主键：表名_id
-user_id, order_id
+在考虑拆表之前，先确认你已经做了这些：
 
--- ✅ 外键：关联表_id
-user_id, product_id
+- 给高频查询字段加了合适的索引（第 06 篇的内容）
+- 查询语句用 EXPLAIN 验证过执行计划（第 08 篇的内容）
+- 历史数据做了归档（比如把一年前的订单移到历史表）
+- 读写分离（主库写、从库读）
 
--- ✅ 索引：idx_字段名
-idx_email, idx_status_created
+如果这些都做了还是扛不住，再考虑拆表。
 
--- ✅ 唯一索引：uk_字段名
-uk_username, uk_order_no
-```
+### 垂直拆分
 
-### 3. 字段设计
+垂直拆分是按列拆——把一张宽表拆成多张窄表，每张表负责一部分字段。判断依据是字段的访问频率。
 
 ```sql
--- ✅ 必须有主键
-PRIMARY KEY (id)
+-- 拆之前：订单表 23 个字段
+-- 拆之后：
+-- 订单核心表（高频访问：列表页、状态查询）
+CREATE TABLE orders (
+  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
+  user_id BIGINT UNSIGNED NOT NULL,
+  order_no VARCHAR(50) NOT NULL UNIQUE,
+  total_amount DECIMAL(10, 2) NOT NULL,
+  status VARCHAR(20) NOT NULL DEFAULT 'pending',
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  INDEX idx_user (user_id),
+  INDEX idx_status_created (status, created_at DESC)
+) ENGINE=InnoDB;
 
--- ✅ 关键字段 NOT NULL
-username VARCHAR(50) NOT NULL
-
--- ✅ 添加默认值
-status TINYINT UNSIGNED DEFAULT 1
-
--- ✅ 添加注释
-COMMENT '用户表'
+-- 订单扩展信息（低频访问：只有订单详情页才需要）
+CREATE TABLE order_extras (
+  order_id BIGINT UNSIGNED PRIMARY KEY,
+  receiver_name VARCHAR(50),
+  receiver_phone VARCHAR(20),
+  receiver_province VARCHAR(20),
+  receiver_city VARCHAR(20),
+  receiver_district VARCHAR(20),
+  receiver_address VARCHAR(200),
+  buyer_remark VARCHAR(500),
+  admin_remark VARCHAR(500)
+) ENGINE=InnoDB;
 ```
 
-## 总结
+这样做的好处是：订单列表页只需要核心表 6 个字段，查询和排序都快得多。收货地址这些大字段不会占用缓冲池空间。垂直拆分适合单表字段多、但不是所有字段都会一起访问的场景。
 
-本文介绍了数据库设计原则，主要内容：
+### 水平拆分
 
-**三范式**：
+水平拆分是按行拆——把一张表的数据分散到多张结构相同的表中。通常按某个维度来路由：
 
-- ✅ 1NF：字段不可分割
-- ✅ 2NF：完全依赖主键
-- ✅ 3NF：无传递依赖
+```
+-- 按用户 ID 取模拆分：每个用户的订单在同一个表里
+-- orders_0: user_id % 4 = 0
+-- orders_1: user_id % 4 = 1
+-- orders_2: user_id % 4 = 2
+-- orders_3: user_id % 4 = 3
 
-**表关系**：
+-- 按时间范围拆分：每年的订单在单独的表里
+-- orders_2024
+-- orders_2025
+-- orders_2026
+```
 
-- ✅ 一对一、一对多、多对多
-- ✅ 外键约束
+水平拆分的代价很大：跨表查询变复杂（查某个商品的所有订单可能要扫 4 张表）、JOIN 变得更困难、分布式事务、数据迁移……所以只有当单表数据量真的到了影响查询和写入性能的程度（通常千万级以上），且其他优化手段已经用尽，才应该考虑水平拆分。
 
-**反规范化**：
+很多团队在数据量还不大的情况下就提前做了分库分表，结果开发的复杂度急剧上升，而性能瓶颈其实根本不在数据库。这是过度设计，不是架构能力。
 
-- ✅ 性能优先时适度冗余
-- ✅ 读多写少的场景
+## 设计没有标准答案
 
-**实战设计**：
+数据库设计最有趣的地方在于，几乎没有哪个决策是"绝对正确"的。每个选择都是在不同约束之间做权衡：
 
-- ✅ ER 图设计
-- ✅ 电商数据库案例
+**范式 vs 反范式**：范式减少冗余、保证一致性，但查询需要更多 JOIN；反范式用冗余换查询性能，但增加了维护成本。读多写少的场景（商品展示、报表）倾向反范式；写多读少、对一致性要求高的场景（账户余额、库存）倾向严格范式。
 
-掌握数据库设计后，就能构建规范高效的数据库了。接下来我们将学习视图和存储过程。
+**外键 vs 应用层校验**：外键让数据库成为数据完整性的最后一道防线，但在高并发和分布式场景下会成为瓶颈。小系统用外键省心，大系统用应用层校验更灵活。
 
-## 下一步
+**SPU/SKY 一体 vs 拆分**：商品规格少（比如只有几个尺码）可以不拆，用一个 attributes JSON 字段就够了。规格维度多、每个 SKU 有独立价格和库存管理需求时，拆开是更合理的选择。
 
-在下一篇文章《13 视图与存储过程》中，我们将学习：
+**拆表 vs 不拆**：数据量百万级以内，索引和查询优化能解决大部分问题。千万级以上、且确认瓶颈在单表上，再考虑垂直拆分，最后才考虑水平拆分。
 
-- 视图的创建和使用
-- 存储过程和存储函数
-- 流程控制语句
-- 变量和参数
-- 实际应用案例
+这些决策没有唯一正确答案，但有明确的判断框架：**先搞清楚你的数据规模、访问模式、一致性要求，然后在对应的方案中选择复杂度最低的那个**。
 
----
+数据库设计不是一次性的事。好的设计是随着业务增长不断演进的——今天"够用"的方案，半年后可能需要重新审视。下一篇要聊的用户管理与安全也是类似的：不是上线前配一次就行，而是需要在整个系统生命周期里持续维护和调整。

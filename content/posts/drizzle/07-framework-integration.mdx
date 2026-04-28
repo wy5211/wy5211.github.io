@@ -1,82 +1,33 @@
 ---
-title: "07. 与 Next.js/Nuxt 深度集成"
-date: "2026-03-28"
-summary: "深入掌握 Drizzle ORM 与现代前端框架的深度集成，学习 Next.js App Router、Server Components、Server Actions 等最佳实践。"
-tags: ["Drizzle ORM", "Next.js", "Nuxt", "Server Components", "全栈开发"]
+title: "07. Drizzle 遇上 Next.js App Router"
+date: "2026-04-28"
+summary: "把 Drizzle ORM 接入 Next.js App Router，解决连接管理、热重载泄漏、Serverless 冷启动等真实问题，用博客系统串起 Server Components、Server Actions 和缓存策略的完整实践。"
+tags: ["Drizzle ORM", "TypeScript"]
 category: "drizzle"
 draft: false
 series: "Drizzle ORM 类型安全的数据库访问实战"
 seriesOrder: 7
 ---
 
-## 前言
+前六篇我们把 Drizzle 的核心能力过了一遍——Schema 建模、CRUD、联表、事务迁移，还接上了 tRPC 做端到端类型安全。但这些都还停留在"库"的层面，你总得有个框架来承载它们。这一篇我们专注 Next.js App Router，因为它是 Drizzle 最常见的搭档，也是踩坑最多的地方。
 
-Drizzle ORM 与现代前端框架的**无缝集成**是其一大优势。无论是 Next.js 的 Server Components，还是 Nuxt 的 Server Routes，Drizzle 都能完美适配。
+我会用一个博客系统贯穿全文：首页加载文章列表（Server Component）、文章详情页带评论（关联查询）、评论提交（Server Action）、管理后台的 CRUD。过程中你会看到连接管理的各种坑——热重载泄漏连接、Vercel 冷启动耗尽连接池——以及怎么逐一解决。
 
-**本文核心内容**：
+## 博客系统的 Schema 回顾
 
-- ✅ Next.js App Router 集成
-- ✅ Server Components 中的 Drizzle
-- ✅ Server Actions 使用
-- ✅ Client Components 数据获取
-- ✅ Nuxt 3 集成
-- ✅ 连接池管理
-- ✅ 环境变量配置
-
----
-
-## 一、Next.js 14 集成
-
-### 1.1 项目初始化
-
-```bash
-# 创建 Next.js 项目
-pnpm create next-app@latest my-app --typescript --tailwind --app
-
-cd my-app
-
-# 安装 Drizzle
-pnpm add drizzle-orm postgres
-pnpm add -D drizzle-kit @types/pg
-
-# 初始化数据库
-mkdir -p src/lib/db
-```
-
-### 1.2 数据库连接配置
-
-**src/lib/db/index.ts**：
+后面所有例子都基于这组表，如果你跟过前面的文章应该很熟悉了。这里快速列一下，确保我们在同一页上。
 
 ```typescript
-import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
-
-const connectionString = process.env.POSTGRES_URL!;
-
-// 创建连接池
-let client: postgres.Sql<{}>;
-
-if (process.env.NODE_ENV === "production") {
-  // 生产环境：连接池
-  client = postgres(connectionString, {
-    max: 10,
-    idle_timeout: 20,
-    connect_timeout: 10,
-  });
-} else {
-  // 开发环境：单连接（避免热重载问题）
-  client = postgres(connectionString);
-}
-
-export const db = drizzle(client, { schema });
-```
-
-### 1.3 Schema 定义
-
-**src/lib/db/schema/users.ts**：
-
-```typescript
-import { pgTable, serial, varchar, text, timestamp } from "drizzle-orm/pg-core";
+// src/lib/db/schema.ts
+import {
+  pgTable,
+  serial,
+  varchar,
+  text,
+  integer,
+  timestamp,
+  boolean,
+} from "drizzle-orm/pg-core";
 
 export const users = pgTable("users", {
   id: serial("id").primaryKey(),
@@ -84,651 +35,126 @@ export const users = pgTable("users", {
   name: text("name"),
   createdAt: timestamp("created_at").defaultNow(),
 });
-```
 
-**src/lib/db/schema/index.ts**：
-
-```typescript
-export * from "./users";
-```
-
----
-
-## 二、Server Components
-
-### 2.1 基础 Server Component
-
-```typescript
-// src/app/users/page.tsx
-import { db } from '@/lib/db';
-import { users } from '@/lib/db/schema';
-import { eq } from 'drizzle-orm';
-import Link from 'next/link';
-
-// Server Component：直接在服务器端查询数据库
-export default async function UsersPage() {
-  // 在服务器端执行查询
-  const allUsers = await db.select().from(users);
-
-  return (
-    <div className="container mx-auto py-8">
-      <h1 className="text-3xl font-bold mb-6">Users</h1>
-
-      <ul className="space-y-2">
-        {allUsers.map((user) => (
-          <li key={user.id}>
-            <Link href={`/users/${user.id}`}>
-              {user.name || user.email}
-            </Link>
-          </li>
-        ))}
-      </ul>
-    </div>
-  );
-}
-```
-
-### 2.2 动态路由 Server Component
-
-```typescript
-// src/app/users/[id]/page.tsx
-import { db } from '@/lib/db';
-import { users } from '@/lib/db/schema';
-import { eq } from 'drizzle-orm';
-import { notFound } from 'next/navigation';
-
-export default async function UserPage({
-  params,
-}: {
-  params: { id: string }
-}) {
-  const userId = parseInt(params.id);
-
-  const [user] = await db
-    .select()
-    .from(users)
-    .where(eq(users.id, userId))
-    .limit(1);
-
-  if (!user) {
-    notFound();
-  }
-
-  return (
-    <div className="container mx-auto py-8">
-      <h1 className="text-3xl font-bold">{user.name}</h1>
-      <p className="text-gray-600">{user.email}</p>
-    </div>
-  );
-}
-```
-
-### 2.3 带关联查询的 Server Component
-
-```typescript
-// src/app/posts/[slug]/page.tsx
-import { db } from '@/lib/db';
-import { posts, users, comments } from '@/lib/db/schema';
-import { eq } from 'drizzle-orm';
-import { notFound } from 'next/navigation';
-
-export default async function PostPage({
-  params,
-}: {
-  params: { slug: string }
-}) {
-  // 获取文章和作者
-  const [post] = await db
-    .select({
-      id: posts.id,
-      title: posts.title,
-      content: posts.content,
-      createdAt: posts.createdAt,
-      author: {
-        id: users.id,
-        name: users.name,
-        email: users.email,
-      },
-    })
-    .from(posts)
-    .innerJoin(users, eq(posts.authorId, users.id))
-    .where(eq(posts.slug, params.slug))
-    .limit(1);
-
-  if (!post) {
-    notFound();
-  }
-
-  // 获取评论
-  const postComments = await db
-    .select({
-      id: comments.id,
-      content: comments.content,
-      author: {
-        name: users.name,
-      },
-    })
-    .from(comments)
-    .innerJoin(users, eq(comments.authorId, users.id))
-    .where(eq(comments.postId, post.id));
-
-  return (
-    <article className="max-w-4xl mx-auto py-8">
-      <h1 className="text-4xl font-bold mb-4">{post.title}</h1>
-      <p className="text-gray-500 mb-8">
-        By {post.author.name} · {post.createdAt.toLocaleDateString()}
-      </p>
-
-      <div className="prose max-w-none">
-        {post.content}
-      </div>
-
-      <section className="mt-12">
-        <h2 className="text-2xl font-bold mb-4">Comments</h2>
-        <ul className="space-y-4">
-          {postComments.map((comment) => (
-            <li key={comment.id}>
-              <span className="font-semibold">{comment.author.name}: </span>
-              {comment.content}
-            </li>
-          ))}
-        </ul>
-      </section>
-    </article>
-  );
-}
-```
-
----
-
-## 三、Server Actions
-
-### 3.1 定义 Server Actions
-
-```typescript
-// src/app/actions/users.ts
-"use server";
-
-import { db } from "@/lib/db";
-import { users } from "@/lib/db/schema";
-import { eq } from "drizzle-orm";
-import { revalidatePath } from "next/cache";
-import { redirect } from "next/navigation";
-
-export async function createUser(formData: FormData) {
-  const email = formData.get("email") as string;
-  const name = formData.get("name") as string;
-
-  // 验证
-  if (!email || !name) {
-    return { error: "Email and name are required" };
-  }
-
-  try {
-    const [user] = await db.insert(users).values({ email, name }).returning();
-
-    // 重新验证缓存
-    revalidatePath("/users");
-
-    return { success: true, user };
-  } catch (error) {
-    return { error: "Failed to create user" };
-  }
-}
-
-export async function updateUser(userId: number, formData: FormData) {
-  const name = formData.get("name") as string;
-
-  await db.update(users).set({ name }).where(eq(users.id, userId));
-
-  revalidatePath(`/users/${userId}`);
-  redirect(`/users/${userId}`);
-}
-
-export async function deleteUser(userId: number) {
-  await db.delete(users).where(eq(users.id, userId));
-
-  revalidatePath("/users");
-  redirect("/users");
-}
-```
-
-### 3.2 使用 Server Actions
-
-```typescript
-// src/app/users/create/page.tsx
-import { createUser } from '@/app/actions/users';
-
-export default function CreateUserPage() {
-  return (
-    <form action={createUser}>
-      <div className="space-y-4">
-        <div>
-          <label htmlFor="email">Email</label>
-          <input
-            id="email"
-            name="email"
-            type="email"
-            required
-            className="block w-full border rounded px-3 py-2"
-          />
-        </div>
-
-        <div>
-          <label htmlFor="name">Name</label>
-          <input
-            id="name"
-            name="name"
-            type="text"
-            required
-            className="block w-full border rounded px-3 py-2"
-          />
-        </div>
-
-        <button
-          type="submit"
-          className="bg-blue-500 text-white px-4 py-2 rounded"
-        >
-          Create User
-        </button>
-      </div>
-    </form>
-  );
-}
-```
-
-### 3.3 带错误处理的 Server Actions
-
-```typescript
-// src/app/actions/posts.ts
-"use server";
-
-import { db } from "@/lib/db";
-import { posts } from "@/lib/db/schema";
-import { revalidatePath } from "next/cache";
-
-export async function createPost(prevState: any, formData: FormData) {
-  const title = formData.get("title") as string;
-  const content = formData.get("content") as string;
-
-  // 验证
-  if (!title || title.length < 3) {
-    return {
-      success: false,
-      error: "Title must be at least 3 characters",
-    };
-  }
-
-  if (!content || content.length < 10) {
-    return {
-      success: false,
-      error: "Content must be at least 10 characters",
-    };
-  }
-
-  try {
-    const [post] = await db
-      .insert(posts)
-      .values({
-        title,
-        content,
-        slug: title.toLowerCase().replace(/\s+/g, "-"),
-        published: false,
-      })
-      .returning();
-
-    revalidatePath("/posts");
-    revalidatePath("/drafts");
-
-    return {
-      success: true,
-      post,
-    };
-  } catch (error) {
-    return {
-      success: false,
-      error: "Failed to create post",
-    };
-  }
-}
-```
-
-```typescript
-// 使用 useActionState
-'use client';
-
-import { useActionState } from 'react';
-import { createPost } from '@/app/actions/posts';
-
-export function CreatePostForm() {
-  const [state, formAction, isPending] = useActionState(createPost, null);
-
-  return (
-    <form action={formAction}>
-      <input name="title" placeholder="Title" />
-      <textarea name="content" placeholder="Content" />
-
-      {state?.error && (
-        <p className="text-red-500">{state.error}</p>
-      )}
-
-      <button disabled={isPending}>
-        {isPending ? 'Creating...' : 'Create Post'}
-      </button>
-    </form>
-  );
-}
-```
-
----
-
-## 四、Client Components 数据获取
-
-### 4.1 使用 Route Handlers
-
-```typescript
-// src/app/api/users/route.ts
-import { NextResponse } from "next/server";
-import { db } from "@/lib/db";
-import { users } from "@/lib/db/schema";
-
-export async function GET() {
-  const allUsers = await db.select().from(users);
-
-  return NextResponse.json(allUsers);
-}
-
-export async function POST(request: Request) {
-  const body = await request.json();
-
-  const [user] = await db.insert(users).values(body).returning();
-
-  return NextResponse.json(user, { status: 201 });
-}
-```
-
-```typescript
-// src/app/api/users/[id]/route.ts
-import { NextResponse } from "next/server";
-import { db } from "@/lib/db";
-import { users } from "@/lib/db/schema";
-import { eq } from "drizzle-orm";
-
-export async function GET(
-  request: Request,
-  { params }: { params: { id: string } }
-) {
-  const userId = parseInt(params.id);
-
-  const [user] = await db
-    .select()
-    .from(users)
-    .where(eq(users.id, userId))
-    .limit(1);
-
-  if (!user) {
-    return NextResponse.json({ error: "Not found" }, { status: 404 });
-  }
-
-  return NextResponse.json(user);
-}
-```
-
-### 4.2 Client Component 调用
-
-```typescript
-// src/components/users-list.tsx
-'use client';
-
-import { useEffect, useState } from 'react';
-
-interface User {
-  id: number;
-  email: string;
-  name: string | null;
-}
-
-export function UsersList() {
-  const [users, setUsers] = useState<User[]>([]);
-  const [loading, setLoading] = useState(true);
-
-  useEffect(() => {
-    async function fetchUsers() {
-      try {
-        const response = await fetch('/api/users');
-        const data = await response.json();
-        setUsers(data);
-      } catch (error) {
-        console.error('Failed to fetch users:', error);
-      } finally {
-        setLoading(false);
-      }
-    }
-
-    fetchUsers();
-  }, []);
-
-  if (loading) return <div>Loading...</div>;
-
-  return (
-    <ul>
-      {users.map((user) => (
-        <li key={user.id}>{user.name || user.email}</li>
-      ))}
-    </ul>
-  );
-}
-```
-
-### 4.3 使用 SWR 或 React Query
-
-```typescript
-// src/lib/hooks/use-users.ts
-import useSWR from 'swr';
-
-const fetcher = (url: string) => fetch(url).then((r) => r.json());
-
-export function useUsers() {
-  const { data, error, isLoading } = useSWR<User[]>('/api/users', fetcher);
-
-  return {
-    users: data ?? [],
-    isLoading,
-    error,
-  };
-}
-
-// 使用
-import { useUsers } from '@/lib/hooks/use-users';
-
-export function UsersList() {
-  const { users, isLoading, error } = useUsers();
-
-  if (isLoading) return <div>Loading...</div>;
-  if (error) return <div>Error loading users</div>;
-
-  return <ul>{users.map((user) => <li key={user.id}>{user.name}</li>)}</ul>;
-}
-```
-
----
-
-## 五、Nuxt 3 集成
-
-### 5.1 项目初始化
-
-```bash
-# 创建 Nuxt 项目
-pnpm nuxi init my-nuxt-app
-cd my-nuxt-app
-
-# 安装 Drizzle
-pnpm add drizzle-orm postgres
-pnpm add -D drizzle-kit @types/pg
-```
-
-### 5.2 数据库连接
-
-```typescript
-// server/utils/db.ts
-import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
-import * as schema from "~/server/db/schema";
-
-const connectionString = process.env.DATABASE_URL!;
-
-const client = postgres(connectionString);
-
-export const db = drizzle(client, { schema });
-```
-
-### 5.3 Server Routes
-
-```typescript
-// server/api/users.get.ts
-import { db } from "~/server/utils/db";
-import { users } from "~/server/db/schema";
-
-export default defineEventHandler(async (event) => {
-  const allUsers = await db.select().from(users);
-
-  return allUsers;
+export const posts = pgTable("posts", {
+  id: serial("id").primaryKey(),
+  title: varchar("title", { length: 255 }).notNull(),
+  slug: varchar("slug", { length: 255 }).notNull().unique(),
+  content: text("content").notNull(),
+  excerpt: text("excerpt"),
+  published: boolean("published").default(false),
+  authorId: integer("author_id")
+    .references(() => users.id, { onDelete: "cascade" })
+    .notNull(),
+  createdAt: timestamp("created_at").defaultNow(),
+  updatedAt: timestamp("updated_at").defaultNow(),
+});
+
+export const comments = pgTable("comments", {
+  id: serial("id").primaryKey(),
+  content: text("content").notNull(),
+  postId: integer("post_id")
+    .references(() => posts.id, { onDelete: "cascade" })
+    .notNull(),
+  authorId: integer("author_id")
+    .references(() => users.id, { onDelete: "cascade" })
+    .notNull(),
+  createdAt: timestamp("created_at").defaultNow(),
+});
+
+export const tags = pgTable("tags", {
+  id: serial("id").primaryKey(),
+  name: varchar("name", { length: 100 }).notNull().unique(),
+});
+
+export const postToTags = pgTable("post_to_tags", {
+  postId: integer("post_id")
+    .references(() => posts.id, { onDelete: "cascade" })
+    .notNull(),
+  tagId: integer("tag_id")
+    .references(() => tags.id, { onDelete: "cascade" })
+    .notNull(),
 });
 ```
 
-```typescript
-// server/api/users/[id].get.ts
-import { db } from "~/server/utils/db";
-import { users } from "~/server/db/schema";
-import { eq } from "drizzle-orm";
+## 连接管理：第一个要搞对的事
 
-export default defineEventHandler(async (event) => {
-  const userId = parseInt(getRouterParam(event, "id")!);
+很多人上来就写查询，结果开发环境跑着跑着就报 "too many connections"。原因很简单——Next.js 的热重载（Fast Refresh）会反复重新执行模块级别的代码。如果你在模块顶层 `new postgres()`，每次热重载都会创建一个新的连接池，旧的不会被释放。
 
-  const [user] = await db
-    .select()
-    .from(users)
-    .where(eq(users.id, userId))
-    .limit(1);
-
-  if (!user) {
-    throw createError({
-      statusCode: 404,
-      message: "User not found",
-    });
-  }
-
-  return user;
-});
-```
-
-### 5.4 使用 Composables
-
-```typescript
-// composables/useUsers.ts
-export const useUsers = () => {
-  const users = ref<User[]>([]);
-  const loading = ref(false);
-  const error = ref<string | null>(null);
-
-  async function fetchUsers() {
-    loading.value = true;
-    error.value = null;
-
-    try {
-      const data = await $fetch<User[]>("/api/users");
-      users.value = data;
-    } catch (e) {
-      error.value = "Failed to fetch users";
-    } finally {
-      loading.value = false;
-    }
-  }
-
-  return {
-    users,
-    loading,
-    error,
-    fetchUsers,
-  };
-};
-```
-
----
-
-## 六、连接池管理
-
-### 6.1 生产环境配置
+### 开发环境：单例保护
 
 ```typescript
 // src/lib/db/index.ts
 import { drizzle } from "drizzle-orm/postgres-js";
 import postgres from "postgres";
+import * as schema from "./schema";
 
-const connectionString = process.env.POSTGRES_URL!;
+function getConnectionString() {
+  const url = process.env.DATABASE_URL;
+  if (!url) throw new Error("DATABASE_URL is not set");
+  return url;
+}
 
-export const db = drizzle(
-  postgres(connectionString, {
-    // 最大连接数
-    max: 10,
+// 开发环境用 globalThis 保证单例
+const globalForDb = globalThis as unknown as {
+  client: postgres.Sql<{}> | undefined;
+};
 
-    // 空闲连接超时（秒）
+const client =
+  globalForDb.client ??
+  postgres(getConnectionString(), {
+    max: 1, // 开发环境只开一个连接，方便观察问题
     idle_timeout: 20,
-
-    // 连接超时（秒）
     connect_timeout: 10,
+  });
 
-    // 最大连接生命周期（秒）
-    max_lifetime: 60 * 30,
+if (process.env.NODE_ENV !== "production") {
+  globalForDb.client = client;
+}
 
-    // 启用 prepared statements
-    prepare: true,
-
-    // 连接空闲时发送 ping 检查
-    idle_in_transaction_session_timeout: 60,
-
-    // 命前缀（用于监控）
-    onnotice: (notice) => console.log(notice),
-  }),
-  { schema }
-);
+export const db = drizzle(client, { schema });
 ```
 
-### 6.2 Serverless 环境配置
+关键点是 `globalForDb` 这层缓存。Next.js 在开发模式下会对页面做 Fast Refresh，但 `globalThis` 不会被重置，所以连接池只创建一次。生产环境不需要这层——每次冷启动都是全新进程，模块级变量天然是单例。
+
+### 生产环境：连接池参数调优
 
 ```typescript
-// Vercel / Netlify 等无服务器环境
-import { drizzle } from "drizzle-orm/neon-http";
+// 生产环境直接用模块级变量，不需要 globalThis
+const client = postgres(getConnectionString(), {
+  max: 10, // 最大连接数
+  idle_timeout: 20, // 空闲 20 秒释放
+  connect_timeout: 10, // 连接超时 10 秒
+  max_lifetime: 60 * 30, // 连接最多活 30 分钟
+});
+```
+
+如果你部署在 Vercel 上，有个更隐蔽的坑：Serverless 函数是按需创建实例的，每个实例都会建立自己的连接池。如果你的 `max` 设成 10，同时有 5 个函数实例在跑，数据库那边就是 50 个连接。对于 Postgres 默认 100 个连接上限的免费套餐来说，很容易打满。
+
+解决方案有两个：
+
+- 用连接池代理（比如 Supabase 的 PgBouncer、Neon 的 pooler），把 `max` 调小到 2-3
+- 或者换成 HTTP 驱动（如 `@neondatabase/serverless`），走 HTTP 协议而不是 TCP，根本不存在连接池的概念
+
+```typescript
+// Vercel + Neon 的推荐方式：HTTP 驱动，无连接池问题
 import { neon } from "@neondatabase/serverless";
+import { drizzle } from "drizzle-orm/neon-http";
 
 const sql = neon(process.env.DATABASE_URL!);
 export const db = drizzle(sql, { schema });
 ```
 
----
+### 环境变量：启动时校验
 
-## 七、环境变量配置
-
-### 7.1 .env 文件
-
-```env
-# .env.local
-DATABASE_URL=postgresql://user:password@localhost:5432/mydb
-
-# 或者使用连接池
-POSTGRES_URL=postgresql://user:password@localhost:5432/mydb?pgbouncer=true
-POSTGRES_PRISMA_URL=postgresql://user:password@localhost:5432/mydb?pgbouncer=true
-POSTGRES_URL_NON_POOLING=postgresql://user:password@localhost:5432/mydb
-```
-
-### 7.2 环境变量验证
+别等到查询失败才发现 `DATABASE_URL` 没配。用 Zod 在启动时校验：
 
 ```typescript
 // src/lib/env.ts
 import { z } from "zod";
 
 const envSchema = z.object({
-  DATABASE_URL: z.string().url(),
+  DATABASE_URL: z.string().min(1),
   NODE_ENV: z
     .enum(["development", "production", "test"])
     .default("development"),
@@ -737,27 +163,349 @@ const envSchema = z.object({
 export const env = envSchema.parse(process.env);
 ```
 
-### 7.3 使用环境变量
+然后在 `db/index.ts` 里用 `env.DATABASE_URL` 替代 `process.env.DATABASE_URL`。如果缺了，应用直接启动失败，比运行时报错好排查得多。
+
+## Server Components：在组件里直接查数据库
+
+App Router 最大的变化是组件可以在服务端直接跑 async 函数。这意味着你不用写 API 路由，不用序列化/反序列化，直接在组件里 `await db.select()` 就行。
+
+### 首页：文章列表
 
 ```typescript
-// src/lib/db/index.ts
-import { env } from "@/lib/env";
-import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
+// src/app/page.tsx
+import { db } from "@/lib/db";
+import { posts, users } from "@/lib/db/schema";
+import { eq, desc } from "drizzle-orm";
+import Link from "next/link";
 
-export const db = drizzle(
-  postgres(env.DATABASE_URL, {
-    max: env.NODE_ENV === "production" ? 10 : 1,
-  }),
-  { schema }
-);
+export const revalidate = 60; // ISR：每 60 秒重新生成
+
+export default async function HomePage() {
+  const recentPosts = await db
+    .select({
+      id: posts.id,
+      title: posts.title,
+      slug: posts.slug,
+      excerpt: posts.excerpt,
+      createdAt: posts.createdAt,
+      authorName: users.name,
+    })
+    .from(posts)
+    .innerJoin(users, eq(posts.authorId, users.id))
+    .where(eq(posts.published, true))
+    .orderBy(desc(posts.createdAt))
+    .limit(10);
+
+  return (
+    <main>
+      <h1>最新文章</h1>
+      <ul>
+        {recentPosts.map((post) => (
+          <li key={post.id}>
+            <Link href={`/posts/${post.slug}`}>
+              <h2>{post.title}</h2>
+              <p>{post.excerpt}</p>
+              <span>{post.authorName} / {post.createdAt?.toLocaleDateString()}</span>
+            </Link>
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
 ```
 
----
+这里 `revalidate = 60` 让页面做 ISR（Incremental Static Regeneration）。用户第一次访问时渲染并缓存，之后的 60 秒内都返回缓存，60 秒后的下一次访问触发后台重新渲染。
 
-## 八、实战示例
+注意我们只 select 了需要的字段，而不是 `select()` 全部拿。这在字段多、有 text 大字段时差别明显。
 
-### 8.1 博客系统 API
+### 文章详情页：关联查询 + 评论
+
+```typescript
+// src/app/posts/[slug]/page.tsx
+import { db } from "@/lib/db";
+import { posts, users, comments, tags, postToTags } from "@/lib/db/schema";
+import { eq } from "drizzle-orm";
+import { notFound } from "next/navigation";
+import { CommentForm } from "./comment-form";
+
+export default async function PostPage({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params;
+
+  // 查文章 + 作者
+  const [post] = await db
+    .select({
+      id: posts.id,
+      title: posts.title,
+      content: posts.content,
+      createdAt: posts.createdAt,
+      authorId: users.id,
+      authorName: users.name,
+      authorEmail: users.email,
+    })
+    .from(posts)
+    .innerJoin(users, eq(posts.authorId, users.id))
+    .where(eq(posts.slug, slug))
+    .limit(1);
+
+  if (!post) notFound();
+
+  // 查标签
+  const postTags = await db
+    .select({ name: tags.name })
+    .from(postToTags)
+    .innerJoin(tags, eq(postToTags.tagId, tags.id))
+    .where(eq(postToTags.postId, post.id));
+
+  // 查评论（含评论者信息）
+  const postComments = await db
+    .select({
+      id: comments.id,
+      content: comments.content,
+      createdAt: comments.createdAt,
+      authorName: users.name,
+    })
+    .from(comments)
+    .innerJoin(users, eq(comments.authorId, users.id))
+    .where(eq(comments.postId, post.id))
+    .orderBy(comments.createdAt);
+
+  return (
+    <article>
+      <h1>{post.title}</h1>
+      <p>By {post.authorName} / {post.createdAt?.toLocaleDateString()}</p>
+      <div>{postTags.map((t) => t.name).join(", ")}</div>
+      <div>{post.content}</div>
+
+      <section>
+        <h2>评论 ({postComments.length})</h2>
+        {postComments.map((c) => (
+          <div key={c.id}>
+            <strong>{c.authorName}</strong>
+            <p>{c.content}</p>
+          </div>
+        ))}
+      </section>
+
+      <CommentForm postId={post.id} />
+    </article>
+  );
+}
+```
+
+这里发了三条查询。你可能会问为什么不用一个大的 join 把文章、标签、评论全查出来？因为那样会产生笛卡尔积——一篇有 10 条评论和 5 个标签的文章，join 结果是 50 行。分开查反而更清晰，类型推断也更干净。
+
+如果你觉得三次 await 有性能焦虑，可以用 `Promise.all` 并行化：
+
+```typescript
+const [postTags, postComments] = await Promise.all([
+  db
+    .select({ name: tags.name })
+    .from(postToTags)
+    .innerJoin(tags, eq(postToTags.tagId, tags.id))
+    .where(eq(postToTags.postId, post.id)),
+  db
+    .select({
+      id: comments.id,
+      content: comments.content,
+      createdAt: comments.createdAt,
+      authorName: users.name,
+    })
+    .from(comments)
+    .innerJoin(users, eq(comments.authorId, users.id))
+    .where(eq(comments.postId, post.id))
+    .orderBy(comments.createdAt),
+]);
+```
+
+## Server Actions：在服务端写数据
+
+Server Actions 是 App Router 里处理表单提交的推荐方式。它在服务端执行，不需要手动写 API 路由。
+
+### 提交评论
+
+```typescript
+// src/app/posts/[slug]/actions.ts
+"use server";
+
+import { db } from "@/lib/db";
+import { comments } from "@/lib/db/schema";
+import { revalidatePath } from "next/cache";
+import { z } from "zod";
+
+const commentSchema = z.object({
+  content: z.string().min(1, "评论不能为空").max(2000, "评论不超过 2000 字"),
+  postId: z.number().int().positive(),
+  authorId: z.number().int().positive(),
+});
+
+export async function submitComment(formData: FormData) {
+  const raw = {
+    content: formData.get("content") as string,
+    postId: Number(formData.get("postId")),
+    authorId: Number(formData.get("authorId")),
+  };
+
+  const parsed = commentSchema.safeParse(raw);
+  if (!parsed.success) {
+    return { error: parsed.error.flatten().fieldErrors };
+  }
+
+  await db.insert(comments).values(parsed.data);
+
+  // 刷新文章详情页的缓存，让新评论立即可见
+  revalidatePath(`/posts/${formData.get("slug")}`);
+
+  return { success: true };
+}
+```
+
+`revalidatePath` 是这里的关键。它告诉 Next.js："这个路径的缓存作废了，下次访问时重新渲染"。没有它，ISR 的缓存页面上看不到新评论。
+
+### 前端表单
+
+```typescript
+// src/app/posts/[slug]/comment-form.tsx
+"use client";
+
+import { useActionState } from "react";
+import { submitComment } from "./actions";
+
+export function CommentForm({ postId }: { postId: number }) {
+  const [state, formAction, isPending] = useActionState(submitComment, null);
+
+  return (
+    <form action={formAction}>
+      <input type="hidden" name="postId" value={postId} />
+      <input type="hidden" name="authorId" value={1} />
+      <textarea name="content" required placeholder="写下你的评论..." />
+      {state?.error && <p>{JSON.stringify(state.error)}</p>}
+      {state?.success && <p>评论已发布</p>}
+      <button type="submit" disabled={isPending}>
+        {isPending ? "提交中..." : "发表评论"}
+      </button>
+    </form>
+  );
+}
+```
+
+`useActionState` 是 React 19 的 API，用来管理 Server Action 的返回值和 pending 状态。比之前 `useFormState` 命名更清晰。
+
+### 管理后台：完整的 CRUD
+
+管理后台的增删改查比较常规，但有几个细节值得注意。
+
+```typescript
+// src/app/admin/actions.ts
+"use server";
+
+import { db } from "@/lib/db";
+import { posts, postToTags, tags } from "@/lib/db/schema";
+import { eq } from "drizzle-orm";
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+
+export async function createPost(formData: FormData) {
+  const title = formData.get("title") as string;
+  const content = formData.get("content") as string;
+  const tagNames = (formData.get("tags") as string)
+    .split(",")
+    .map((t) => t.trim())
+    .filter(Boolean);
+
+  if (!title || !content) {
+    return { error: "标题和内容不能为空" };
+  }
+
+  const slug = title
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^\w-]/g, "");
+
+  // 用事务保证一致性
+  const result = await db.transaction(async (tx) => {
+    const [post] = await tx
+      .insert(posts)
+      .values({ title, content, slug, authorId: 1, published: true })
+      .returning();
+
+    // 处理标签：已存在的复用，不存在的创建
+    if (tagNames.length > 0) {
+      for (const tagName of tagNames) {
+        const [tag] = await tx
+          .insert(tags)
+          .values({ name: tagName })
+          .onConflictDoNothing()
+          .returning();
+
+        const existingTag =
+          tag ??
+          (await tx
+            .select()
+            .from(tags)
+            .where(eq(tags.name, tagName))
+            .limit(1)
+            .then((r) => r[0]));
+
+        if (existingTag) {
+          await tx
+            .insert(postToTags)
+            .values({ postId: post.id, tagId: existingTag.id });
+        }
+      }
+    }
+
+    return post;
+  });
+
+  revalidatePath("/");
+  revalidatePath("/admin");
+  redirect(`/posts/${result.slug}`);
+}
+
+export async function deletePost(formData: FormData) {
+  const id = Number(formData.get("id"));
+  await db.delete(posts).where(eq(posts.id, id));
+  revalidatePath("/");
+  revalidatePath("/admin");
+  redirect("/admin");
+}
+```
+
+标签处理那个循环看起来有点啰嗦，但它解决了一个真实问题：标签名要唯一，用户输入的标签可能已经存在。`onConflictDoNothing` + 回查是 Drizzle 处理 "insert if not exists" 的标准写法。如果你用 Postgres 15+，也可以用 `ON CONFLICT ... DO UPDATE` 配合 CTE 来优化成单条语句，但大多数场景下这个循环性能够用。
+
+## ISR 和动态渲染：什么时候用哪个
+
+App Router 里页面的渲染策略由你导出的变量和函数决定：
+
+| 导出                                     | 行为                       | 适用场景       |
+| ---------------------------------------- | -------------------------- | -------------- |
+| 什么都不导出                             | 默认缓存（类似 SSG）       | 静态页面       |
+| `export const revalidate = 60`           | ISR，每 N 秒重新验证       | 首页、列表页   |
+| `export const dynamic = "force-dynamic"` | 每次请求都渲染（类似 SSR） | 实时数据页面   |
+| `cookies()` / `headers()` 调用           | 自动 opt-in 动态渲染       | 需要认证的页面 |
+
+博客首页适合 ISR——文章不会秒秒变，60 秒的延迟可以接受。管理后台适合动态渲染——作者需要看到最新状态。文章详情页看情况：如果评论量大且要求实时，用动态渲染；否则 ISR 就够了。
+
+```typescript
+// 管理后台：强制动态渲染
+export const dynamic = "force-dynamic";
+
+export default async function AdminPage() {
+  const allPosts = await db.select().from(posts).orderBy(desc(posts.createdAt));
+  // ...
+}
+```
+
+## 和传统 API Routes 的对比
+
+你可能会问：有了 Server Components 和 Server Actions，还需要 API Routes 吗？
+
+答案是"看场景"。
+
+Server Components 适合页面级的数据加载——组件渲染时自动获取数据，不需要额外的 API 端点。Server Actions 适合表单提交和简单的数据变更。
+
+但如果你需要给移动端 App 提供接口、或者要做 Webhook 接收、或者需要第三方 OAuth 回调，API Routes 还是不可替代的。Drizzle 在 API Routes 里用起来和普通 Node.js 服务没区别：
 
 ```typescript
 // src/app/api/posts/route.ts
@@ -766,157 +514,44 @@ import { db } from "@/lib/db";
 import { posts, users } from "@/lib/db/schema";
 import { eq, desc } from "drizzle-orm";
 
-export async function GET(request: Request) {
-  const { searchParams } = new URL(request.url);
-  const published = searchParams.get("published");
-
-  const query = db
+export async function GET() {
+  const result = await db
     .select({
       id: posts.id,
       title: posts.title,
       slug: posts.slug,
-      excerpt: posts.excerpt,
+      authorName: users.name,
       createdAt: posts.createdAt,
-      author: {
-        id: users.id,
-        name: users.name,
-      },
     })
     .from(posts)
-    .innerJoin(users, eq(posts.authorId, users.id));
+    .innerJoin(users, eq(posts.authorId, users.id))
+    .orderBy(desc(posts.createdAt))
+    .limit(20);
 
-  if (published === "true") {
-    query.where(eq(posts.published, true));
-  }
-
-  const items = await query.orderBy(desc(posts.createdAt)).limit(20);
-
-  return NextResponse.json(items);
+  return NextResponse.json(result);
 }
 ```
 
-### 8.2 文件上传处理
+简单说：页面展示优先用 Server Components，数据变更优先用 Server Actions，对外接口用 API Routes。不要混着用——同一个数据流不要一半走 Server Component 一半走 `fetch('/api/...')`，那样既多了一次网络往返，又丢失了类型推断。
 
-```typescript
-// src/app/api/upload/route.ts
-import { NextResponse } from "next/server";
-import { writeFile } from "fs/promises";
-import { db } from "@/lib/db";
-import { attachments } from "@/lib/db/schema";
+## Trade-off 分析
 
-export async function POST(request: Request) {
-  const formData = await request.formData();
-  const file = formData.get("file") as File;
-  const userId = parseInt(formData.get("userId") as string);
+**Server Components + Drizzle 的优势：**
 
-  // 保存文件
-  const bytes = await file.arrayBuffer();
-  const buffer = Buffer.from(bytes);
-  const filename = `${Date.now()}-${file.name}`;
-  await writeFile(`./public/uploads/${filename}`, buffer);
+- 零 API 样板代码，组件里直接 `await`，开发效率极高
+- 类型从数据库到组件全程推断，改一个字段编译器替你报错
+- ISR 做页面级缓存非常方便，一个 `revalidate = 60` 搞定
+- 不需要额外的数据获取层（React Query、SWR 等可以省掉）
 
-  // 保存记录到数据库
-  const [attachment] = await db
-    .insert(attachments)
-    .values({
-      filename,
-      originalName: file.name,
-      mimeType: file.type,
-      size: file.size,
-      uploadedById: userId,
-    })
-    .returning();
+**代价和限制：**
 
-  return NextResponse.json(attachment);
-}
-```
+- 和 Next.js 耦合深——Server Components 和 Server Actions 都是 Next.js 的 API，换框架要重写
+- 数据获取逻辑和 UI 组件混在一起，时间久了容易变成"上帝组件"，需要主动拆分（把查询逻辑抽到单独的 data 层函数里）
+- Server Actions 的错误处理比较原始——没有标准化的错误码机制，也没有中间件层，复杂场景不如 tRPC 灵活
+- `revalidatePath` 是全页面级别的失效，做不到"只刷新列表里某一条"这种精细控制
 
----
+**我的建议：**
 
-## 九、最佳实践
+如果你的项目就是 Next.js 全栈应用（不是给移动端提供 API），Server Components + Server Actions + Drizzle 是最高效的组合。但如果你需要服务多种客户端（Web + App + 小程序），还是在前一篇的 tRPC 架构上走更稳妥。
 
-### 9.1 Server vs Client 选择
-
-```typescript
-// ✅ 使用 Server Components：初始数据加载
-export default async function Page() {
-  const data = await db.select().from(users);
-  return <UsersList data={data} />;
-}
-
-// ✅ 使用 Client Components：交互功能
-'use client';
-export function UsersList({ data }: { data: User[] }) {
-  const [search, setSearch] = useState('');
-  // 交互逻辑
-}
-
-// ✅ 使用 Server Actions：表单提交
-'use server';
-export async function updateUser(formData: FormData) {
-  await db.update(users).set({ name: formData.get('name') });
-}
-```
-
-### 9.2 数据缓存
-
-```typescript
-// 使用 Next.js 缓存
-export const revalidate = 3600; // 1 小时
-
-export default async function Page() {
-  const users = await db.select().from(users());
-
-  return <div>{/* ... */}</div>;
-}
-```
-
-### 9.3 错误处理
-
-```typescript
-// src/lib/db/error-handler.ts
-export function handleDbError(error: unknown) {
-  if (error instanceof Error) {
-    // 记录错误
-    console.error("Database error:", error);
-
-    // 返回用户友好的消息
-    return {
-      error: "An error occurred while processing your request",
-    };
-  }
-
-  return { error: "Unknown error" };
-}
-```
-
----
-
-## 十、总结
-
-**本文我们学习了**：
-
-✅ **Next.js App Router** - Server Components、Server Actions
-✅ **Nuxt 3 集成** - Server Routes、Composables
-✅ **连接池管理** - 生产环境、Serverless 配置
-✅ **环境变量** - 配置、验证、使用
-
-**关键要点**：
-
-1. 优先使用 Server Components
-2. Server Actions 用于数据修改
-3. 配置合适的连接池大小
-4. 做好错误处理和日志
-
-**下一步**：
-
-在下一篇文章《Edge Computing 实战》中，我们将学习：
-
-- Cloudflare Workers + Drizzle
-- Cloudflare D1 数据库
-- 边缘性能优化
-- Deno Deploy、Bun 集成
-
----
-
-**相关代码**：[07-framework-integration](https://github.com/yourname/drizzle-examples/tree/07-framework-integration)
+下一篇我们聊一个更激进的部署方案——把整个博客系统搬到 Edge 上。你的用户遍布全球，Vercel 的 Serverless 函数跑在固定区域，亚洲用户访问美区的 API 要多几百毫秒。Cloudflare Workers 有 300+ 个全球节点，而 Drizzle 是少数在 Edge 上跑得好的 ORM。下一篇见。

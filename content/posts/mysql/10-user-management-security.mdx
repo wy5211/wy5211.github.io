@@ -1,6 +1,7 @@
 ---
 title: "10 用户管理与安全"
 date: "2026-03-23"
+summary: "从一次安全审计出发，为电商系统设计数据库账号体系——用户管理、权限分级、角色机制、密码策略、连接安全、SQL 注入防护和审计方案。"
 tags: ["MySQL"]
 category: "mysql"
 cover: ""
@@ -9,378 +10,466 @@ series: "MySQL 渐进式学习指南"
 seriesOrder: 10
 ---
 
-## 前言
+上一篇我们把电商系统的数据库结构从头到尾梳理了一遍——范式、反范式、ER 图、外键约束，把表设计这件事搞明白了。但有个问题一直被忽略：你的电商系统上线半年了，所有服务都在用 root 账号连数据库，密码是 root123。
 
-数据库安全是运维工作的重中之重。合理配置用户权限可以有效防止数据泄露和误操作。
+周一早上，安全团队发了一封审计报告，里面列了几个红色警告：root 账号远程开放、密码过弱、所有服务共用同一账号、没有任何操作审计。整改期限：两周。
 
-本文将系统讲解 MySQL 用户管理和安全策略。
+你盯着屏幕想——MySQL 的用户和权限，到底怎么搞才算规范？
 
-## 用户管理
+主线场景：你需要为电商系统设计一套完整的数据库账号体系。应用服务有自己的读写账号，报表查询有只读账号，运维 DBA 有管理账号，每个人只能做自己该做的事。我们来一步步搭建这套体系。
 
-### 创建用户
+## 第一步：搞清楚现在有多危险
 
-```sql
--- 基本语法
-CREATE USER 'username'@'host' IDENTIFIED BY 'password';
-
--- 示例
-CREATE USER 'app_user'@'localhost' IDENTIFIED BY 'SecurePass123!';
-CREATE USER 'app_user'@'%' IDENTIFIED BY 'SecurePass123!';
-CREATE USER 'app_user'@'192.168.1.%' IDENTIFIED BY 'SecurePass123!';
-
--- host 选项：
--- 'localhost'  - 只允许本地连接
--- '%'          - 允许任意主机连接
--- '192.168.1.%' - 允许特定网段
--- 'domain.com' - 允许特定域名
-```
-
-### 查看用户
+先看看当前的情况：
 
 ```sql
 -- 查看所有用户
-SELECT user, host FROM mysql.user;
+SELECT user, host, authentication_string FROM mysql.user;
+```
 
--- 查看当前用户
-SELECT USER();
+结果可能让你后背发凉——一个 root 账号，host 是 `%`（意味着任何 IP 都能连），密码是 root123。你的 Java 后端、Python 脚本、报表工具，甚至你同事用 DBeaver 调试，全都在用这个账号。
+
+这意味着什么？任何一个服务的代码里泄露了数据库密码，攻击者就能用 root 权限做任何事——删库、拖数据、建后门账号，随意操作。
+
+这就是我们要解决的核心问题：**让每个服务、每个人只能访问自己该访问的数据**。
+
+## 创建用户：不再用 root 干所有事
+
+### 基本语法
+
+```sql
+CREATE USER 'username'@'host' IDENTIFIED BY 'password';
+```
+
+这里的 `'host'` 很重要，它决定了这个用户能从哪里连接。几个常见的选择：
+
+| host 值       | 含义                   | 什么时候用            |
+| ------------- | ---------------------- | --------------------- |
+| `localhost`   | 只能本地连接           | 本机部署的服务        |
+| `127.0.0.1`   | 只能本地连接（走 TCP） | 和 localhost 略有区别 |
+| `192.168.1.%` | 允许该网段的所有 IP    | 内网应用服务器        |
+| `10.0.0.100`  | 只允许这一个 IP        | 特定服务器            |
+| `%`           | 允许任何 IP 连接       | 尽量不用              |
+
+为电商系统创建几个用户：
+
+```sql
+-- 应用服务账号：Java 后端用这个
+CREATE USER 'shop_app'@'10.0.1.%' IDENTIFIED BY 'Sh0p@App#2025!xK9m';
+
+-- 报表查询账号：数据分析师用这个
+CREATE USER 'shop_report'@'10.0.2.%' IDENTIFIED BY 'R3p0rt#Qr8z!2025';
+
+-- 运维 DBA 账号
+CREATE USER 'shop_dba'@'10.0.0.%' IDENTIFIED BY 'Db4@Dm1n#2025!pL3n';
+```
+
+你可能注意到了，密码长得很离谱。这是故意的——后面会说到密码策略。先别急着抱怨记不住，数据库密码是给程序用的，不是给人记的。
+
+### 修改和删除用户
+
+```sql
+-- 改密码
+ALTER USER 'shop_app'@'10.0.1.%' IDENTIFIED BY 'N3wP@ss#2025!wQ7r';
+
+-- 重命名
+RENAME USER 'shop_app'@'10.0.1.%' TO 'shop_api'@'10.0.1.%';
+
+-- 锁定账号（人离职了但暂时不删）
+ALTER USER 'shop_report'@'10.0.2.%' ACCOUNT LOCK;
+
+-- 解锁
+ALTER USER 'shop_report'@'10.0.2.%' ACCOUNT UNLOCK;
+
+-- 确认要删了
+DROP USER IF EXISTS 'old_service'@'10.0.1.50';
+```
+
+这里有个实践上的建议：员工离职时，先用 ACCOUNT LOCK 锁定账号，观察一周没问题再 DROP。因为有些账号可能在你看不到的脚本或定时任务里用着，直接删了可能出事。
+
+### 查看用户信息
+
+```sql
+-- 当前是谁在操作
 SELECT CURRENT_USER();
 
--- 查看用户权限
-SHOW GRANTS FOR 'app_user'@'localhost';
+-- 所有用户的基本信息
+SELECT user, host, account_locked, password_expired FROM mysql.user;
 ```
 
-### 修改用户
+## 权限管理：给每个人合适的钥匙
 
-```sql
--- 重命名用户
-RENAME USER 'old_name'@'localhost' TO 'new_name'@'localhost';
+用户创建好了，但他们现在什么也干不了——因为没有授权。MySQL 的权限是一个层级结构：
 
--- 修改密码
-ALTER USER 'app_user'@'localhost' IDENTIFIED BY 'NewSecurePass456!';
--- MySQL 5.7.6 及以下
-SET PASSWORD FOR 'app_user'@'localhost' = PASSWORD('NewSecurePass456!');
-
--- 修改用户属性
-ALTER USER 'app_user'@'localhost'
-  IDENTIFIED BY 'NewSecurePass456!'
-  PASSWORD EXPIRE INTERVAL 90 DAY
-  ACCOUNT LOCK;
+```
+全局权限 (*.*)
+  └── 数据库权限 (shop.*)
+        └── 表权限 (shop.orders)
+              └── 列权限 (shop.orders.id, shop.orders.status)
 ```
 
-### 删除用户
+层级越细，控制越精确。日常用得最多的是数据库权限和表权限。
+
+### 常用权限速查
+
+| 权限         | 说明               | 谁需要               |
+| ------------ | ------------------ | -------------------- |
+| SELECT       | 查询数据           | 几乎所有账号         |
+| INSERT       | 插入数据           | 应用服务             |
+| UPDATE       | 更新数据           | 应用服务             |
+| DELETE       | 删除数据           | 应用服务（谨慎授予） |
+| CREATE       | 创建表/数据库      | DBA                  |
+| ALTER        | 修改表结构         | DBA                  |
+| DROP         | 删除表/数据库      | DBA（非常危险）      |
+| INDEX        | 创建/删除索引      | DBA                  |
+| EXECUTE      | 执行存储过程       | 应用服务（如果用了） |
+| ALL          | 所有权限           | 只给 root            |
+| GRANT OPTION | 把自己的权限给别人 | 几乎不给             |
+
+### 为电商系统分配权限
 
 ```sql
--- 删除用户
-DROP USER 'app_user'@'localhost';
-DROP USER IF EXISTS 'old_user'@'localhost';
+-- 应用服务：日常增删改查
+GRANT SELECT, INSERT, UPDATE, DELETE ON shop.* TO 'shop_app'@'10.0.1.%';
 
--- 注意：会同时撤销该用户的所有权限
+-- 报表查询：只能读
+GRANT SELECT ON shop.* TO 'shop_report'@'10.0.2.%';
+
+-- 运维 DBA：管理权限
+GRANT CREATE, ALTER, INDEX, DROP ON shop.* TO 'shop_dba'@'10.0.0.%';
+
+-- 如果应用用了存储过程
+GRANT EXECUTE ON PROCEDURE shop.calculate_order_total TO 'shop_app'@'10.0.1.%';
 ```
 
-### 锁定/解锁用户
+你可能会问：为什么不给 shop_app 加个 CREATE 权限？万一要建临时表呢？
+
+答案是：**应用服务的建表操作应该走 migration 脚本，由 DBA 或 CI/CD 执行，不应该在运行时动态建表**。如果你确实需要临时表，考虑用内存里的数据结构或者 Redis 来解决。
+
+### 撤销权限
 
 ```sql
--- 锁定用户
-ALTER USER 'app_user'@'localhost' ACCOUNT LOCK;
+-- 发现报表账号不应该看到 users 表的密码字段
+REVOKE SELECT ON shop.users FROM 'shop_report'@'10.0.2.%';
 
--- 解锁用户
-ALTER USER 'app_user'@'localhost' ACCOUNT UNLOCK;
+-- 精确控制：只能查 users 表的非敏感字段
+GRANT SELECT (id, username, email, created_at) ON shop.users TO 'shop_report'@'10.0.2.%';
 
--- 查看用户状态
-SELECT user, host, account_locked FROM mysql.user;
+-- 收回 DBA 的 DROP 权限（防止误删表）
+REVOKE DROP ON shop.* FROM 'shop_dba'@'10.0.0.%';
 ```
 
-## 权限管理
+这里用到了列级别权限——shop_report 可以查 users 表，但只能看到 id、username、email、created_at，看不到 password_hash 和 phone 这种敏感字段。
 
-### 授予权限（GRANT）
-
-```sql
--- 基本语法
-GRANT privileges ON database.table TO 'user'@'host';
-
--- 全局权限
-GRANT ALL PRIVILEGES ON *.* TO 'admin'@'localhost' WITH GRANT OPTION;
-
--- 数据库权限
-GRANT ALL PRIVILEGES ON shop.* TO 'app_user'@'localhost';
-
--- 表权限
-GRANT SELECT, INSERT, UPDATE, DELETE ON shop.users TO 'app_user'@'localhost';
-
--- 列权限
-GRANT SELECT(id, username), UPDATE(username) ON shop.users TO 'app_user'@'localhost';
-
--- 刷新权限
-FLUSH PRIVILEGES;
-```
-
-### 常用权限
-
-| 权限         | 说明          |
-| ------------ | ------------- |
-| ALL          | 所有权限      |
-| CREATE       | 创建表/数据库 |
-| DROP         | 删除表/数据库 |
-| SELECT       | 查询          |
-| INSERT       | 插入          |
-| UPDATE       | 更新          |
-| DELETE       | 删除          |
-| EXECUTE      | 执行存储过程  |
-| INDEX        | 创建/删除索引 |
-| ALTER        | 修改表结构    |
-| GRANT OPTION | 授权权限      |
+### 检查权限
 
 ```sql
--- 只读权限
-GRANT SELECT ON shop.* TO 'readonly_user'@'%';
+-- 看某个用户有什么权限
+SHOW GRANTS FOR 'shop_app'@'10.0.1.%';
 
--- 读写权限
-GRANT SELECT, INSERT, UPDATE, DELETE ON shop.* TO 'app_user'@'%';
-
--- 开发权限
-GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, EXECUTE ON shop.* TO 'dev_user'@'%';
-```
-
-### 撤销权限（REVOKE）
-
-```sql
--- 基本语法
-REVOKE privileges ON database.table FROM 'user'@'host';
-
--- 撤销所有权限
-REVOKE ALL PRIVILEGES ON *.* FROM 'user'@'localhost';
-
--- 撤销特定权限
-REVOKE DELETE, DROP ON shop.* FROM 'app_user'@'localhost';
-
--- 撤销授权权限
-REVOKE GRANT OPTION ON *.* FROM 'admin'@'localhost';
-```
-
-### 查看权限
-
-```sql
--- 查看当前用户权限
-SHOW GRANTS;
+-- 看自己当前的权限
 SHOW GRANTS FOR CURRENT_USER();
-
--- 查看指定用户权限
-SHOW GRANTS FOR 'app_user'@'localhost';
 ```
 
-## 角色管理（MySQL 8.0+）
+## 角色：MySQL 8.0 的权限管理利器
 
-角色简化了权限管理。
+如果你有 20 个微服务、30 个账号，每个账号都要手动 GRANT 一遍，维护起来是噩梦。MySQL 8.0 引入了角色（Role），本质上就是"权限模板"——定义一次，分配多次。
 
-### 创建角色
+### 为电商系统设计角色
 
 ```sql
--- 创建角色
-CREATE ROLE 'app_read', 'app_write', 'app_admin';
+-- 创建三个角色
+CREATE ROLE 'shop_readonly', 'shop_readwrite', 'shop_dba_role';
 
--- 授予权限
-GRANT SELECT ON shop.* TO 'app_read';
-GRANT SELECT, INSERT, UPDATE ON shop.* TO 'app_write';
-GRANT ALL PRIVILEGES ON shop.* TO 'app_admin';
+-- 定义每个角色的权限
+GRANT SELECT ON shop.* TO 'shop_readonly';
+
+GRANT SELECT, INSERT, UPDATE, DELETE ON shop.* TO 'shop_readwrite';
+GRANT EXECUTE ON shop.* TO 'shop_readwrite';
+
+GRANT ALL PRIVILEGES ON shop.* TO 'shop_dba_role';
 ```
 
-### 分配角色
+### 把角色分配给用户
 
 ```sql
--- 将角色授予用户
-GRANT 'app_read' TO 'readonly_user'@'%';
-GRANT 'app_write' TO 'app_user'@'%';
-GRANT 'app_admin' TO 'admin'@'%';
+-- 给用户赋予角色
+GRANT 'shop_readwrite' TO 'shop_app'@'10.0.1.%';
+GRANT 'shop_readonly' TO 'shop_report'@'10.0.2.%';
+GRANT 'shop_dba_role' TO 'shop_dba'@'10.0.0.%';
 
--- 设置默认角色
-SET DEFAULT ROLE ALL TO 'app_user'@'%';
+-- 设置默认激活的角色（用户连接时自动生效）
+SET DEFAULT ROLE ALL TO 'shop_app'@'10.0.1.%';
+SET DEFAULT ROLE ALL TO 'shop_report'@'10.0.2.%';
 ```
 
-### 管理角色
+这里有个坑：如果你忘了执行 SET DEFAULT ROLE，用户登录后虽然有角色，但角色不会自动激活。用户需要手动执行 `SET ROLE shop_readwrite` 才能获得权限。这在排查"明明授权了但连不上"的问题时经常被忽略。
+
+### 角色的管理
 
 ```sql
--- 查看角色
+-- 查看角色和用户的对应关系
 SELECT * FROM mysql.role_edges;
 
--- 撤销角色
-REVOKE 'app_write' FROM 'app_user'@'%';
+-- 收回角色
+REVOKE 'shop_readwrite' FROM 'shop_app'@'10.0.1.%';
 
 -- 删除角色
-DROP ROLE 'app_read';
+DROP ROLE 'shop_readonly';
 ```
 
-## 密码策略
+角色的好处在于，当你需要调整权限时，只需要改角色的 GRANT，所有使用这个角色的用户自动生效。比如要给所有只读账号增加对 reviews 表的查询权限，一条 GRANT 就够了，不用逐个用户改。
 
-### 密码过期
+## 密码策略：别再让 123456 出现在生产环境
 
-```sql
--- 设置密码过期
-ALTER USER 'app_user'@'localhost' PASSWORD EXPIRE;
+安全审计里最刺眼的一条就是 root123。MySQL 8.0 提供了密码策略组件，可以强制执行密码复杂度要求。
 
--- 设置密码过期时间
-ALTER USER 'app_user'@'localhost' PASSWORD EXPIRE INTERVAL 90 DAY;
-
--- 永不过期
-ALTER USER 'app_user'@'localhost' PASSWORD EXPIRE NEVER;
-
--- 首次登录强制修改密码
-ALTER USER 'new_user'@'localhost' PASSWORD EXPIRE;
-```
-
-### 密码重用
+### 启用密码验证组件
 
 ```sql
--- 禁止重用最近 5 次的密码
-ALTER USER 'app_user'@'localhost'
-  PASSWORD HISTORY 5;
-
--- 禁止重用最近 365 天的密码
-ALTER USER 'app_user'@'localhost'
-  PASSWORD REUSE INTERVAL 365 DAY;
-```
-
-### 密码验证
-
-```sql
--- 密码复杂度策略
+-- 安装密码验证组件（只需执行一次）
 INSTALL COMPONENT 'file://component_validate_password';
 
--- 查看密码策略
+-- 查看当前密码策略
 SHOW VARIABLES LIKE 'validate_password%';
+```
 
--- 配置密码策略
-SET GLOBAL validate_password.policy = STRONG;
+### 配置密码策略
+
+```sql
+-- 设置密码强度为中等（要求长度、大小写、数字、特殊字符）
+SET GLOBAL validate_password.policy = 'MEDIUM';
 SET GLOBAL validate_password.length = 12;
+SET GLOBAL validate_password.mixed_case_count = 1;
+SET GLOBAL validate_password.number_count = 1;
+SET GLOBAL validate_password.special_char_count = 1;
 ```
 
-## 连接安全
-
-### SSL 连接
+设完之后，如果有人还尝试创建弱密码的账号：
 
 ```sql
--- 创建要求 SSL 的用户
-CREATE USER 'secure_user'@'%' REQUIRE SSL;
-
--- 创建指定证书的用户
-CREATE USER 'secure_user'@'%'
-REQUIRE X509
-AND SUBJECT '/CN=client'
-AND ISSUER '/CN=CA';
-
--- 查看用户 SSL 要求
-SELECT user, host, ssl_type FROM mysql.user;
+CREATE USER 'test_user'@'localhost' IDENTIFIED BY '123456';
+-- ERROR 1819 (HY000): Your password does not satisfy the current policy requirements
 ```
 
-### 限制连接数
+这就是你要的效果。
+
+### 密码过期和重用限制
 
 ```sql
--- 限制用户连接数
-GRANT USAGE ON *.* TO 'app_user'@'localhost' WITH MAX_CONNECTIONS_PER_HOUR 100;
+-- 每 90 天必须改一次密码
+ALTER USER 'shop_app'@'10.0.1.%' PASSWORD EXPIRE INTERVAL 90 DAY;
+
+-- 不能重用最近 5 次用过的密码
+ALTER USER 'shop_app'@'10.0.1.%' PASSWORD HISTORY 5;
+
+-- 新创建的用户首次登录必须改密码
+CREATE USER 'new_dba'@'10.0.0.50' IDENTIFIED BY 'T3mp#Pass2025!';
+ALTER USER 'new_dba'@'10.0.0.50' PASSWORD EXPIRE;
 ```
 
-## 安全最佳实践
+对于应用服务账号，密码过期可能会引起麻烦——因为应用不会自己改密码。你可以对服务账号设 PASSWORD EXPIRE NEVER，但前提是密码足够复杂且定期人工轮换。
 
-### 1. 最小权限原则
+### 登录失败锁定
+
+MySQL 8.0 支持登录失败次数限制：
 
 ```sql
--- ✅ 推荐：只授予必要权限
-GRANT SELECT ON shop.* TO 'readonly_user'@'%';
-
--- ❌ 避免：授予过多权限
-GRANT ALL PRIVILEGES ON *.* TO 'app_user'@'%';
+-- 连续失败 5 次后锁定账号，锁定 30 分钟
+ALTER USER 'shop_app'@'10.0.1.%'
+  FAILED_LOGIN_ATTEMPTS 5
+  PASSWORD_LOCK_TIME 30;
 ```
 
-### 2. 限制远程访问
+这个功能对防止暴力破解很有效。但你得注意监控——如果应用配置写错了（比如密码打错了），应用容器不停重试，5 次后账号就被锁了，所有依赖这个账号的服务都会挂。
+
+## 连接安全：堵住从网络进来的漏洞
+
+### 限制访问 IP
+
+回顾一下 CREATE USER 语法中的 host 部分——这是 MySQL 的第一道网络防线。
 
 ```sql
--- ✅ 推荐：限制特定 IP
-CREATE USER 'app_user'@'192.168.1.100' IDENTIFIED BY 'password';
-GRANT SELECT ON shop.* TO 'app_user'@'192.168.1.100';
+-- 差：任何 IP 都能尝试连接
+CREATE USER 'shop_app'@'%' IDENTIFIED BY '...';
 
--- ❌ 避免：允许任意 IP
-CREATE USER 'app_user'@'%' IDENTIFIED BY 'password';
+-- 好：只允许应用服务器的网段
+CREATE USER 'shop_app'@'10.0.1.%' IDENTIFIED BY '...';
+
+-- 更好：只允许特定 IP
+CREATE USER 'shop_app'@'10.0.1.20' IDENTIFIED BY '...';
 ```
 
-### 3. 强密码策略
+`%` 意味着全世界都能尝试连接你的数据库。虽然密码不对也连不上，但这给暴力破解留下了可能。限制 IP 后，直接从网络层拒绝了非法来源。
+
+如果你的应用和数据库在不同机房、通过公网通信，就必须考虑 SSL 了。
+
+### SSL 加密连接
 
 ```sql
--- ✅ 推荐：强密码
-CREATE USER 'app_user'@'localhost'
-IDENTIFIED BY 'Str0ng!Pass@word';
+-- 创建要求 SSL 连接的用户
+CREATE USER 'shop_app'@'10.0.1.%' IDENTIFIED BY '...'
+  REQUIRE SSL;
 
--- ❌ 避免：弱密码
-CREATE USER 'app_user'@'localhost'
-IDENTIFIED BY '123456';
+-- 更严格：要求客户端提供证书
+CREATE USER 'shop_dba'@'10.0.0.%' IDENTIFIED BY '...'
+  REQUIRE X509;
 ```
 
-### 4. 定期审查权限
+`REQUIRE SSL` 表示这个用户必须通过加密连接才能登录。即使攻击者拿到了密码，如果无法建立 SSL 连接，也登录不了。
+
+`REQUIRE X509` 更进一步，要求客户端提供数字证书才能连接。这相当于双重认证——你不仅需要知道密码，还需要拥有证书文件。
 
 ```sql
--- 定期检查用户权限
-SELECT user, host FROM mysql.user;
-SHOW GRANTS FOR 'app_user'@'localhost';
-
--- 删除不需要的用户
-DROP USER IF EXISTS 'old_user'@'localhost';
+-- 查看哪些用户要求 SSL
+SELECT user, host, ssl_type FROM mysql.user WHERE ssl_type != '';
 ```
 
-## 实战应用
+### 限制资源使用
 
-### 应用用户配置
+防止某个账号把连接数吃光：
 
 ```sql
--- 1. 只读用户（报表查询）
-CREATE USER 'report_user'@'%' IDENTIFIED BY 'ReportPass123!';
-GRANT SELECT ON shop.* TO 'report_user'@'%';
-
--- 2. 应用用户（增删改查）
-CREATE USER 'app_user'@'%' IDENTIFIED BY 'AppPass123!';
-GRANT SELECT, INSERT, UPDATE, DELETE ON shop.* TO 'app_user'@'%';
-GRANT EXECUTE ON PROCEDURE shop.* TO 'app_user'@'%';
-
--- 3. 管理员用户（全部权限）
-CREATE USER 'admin'@'localhost' IDENTIFIED BY 'AdminPass123!';
-GRANT ALL PRIVILEGES ON *.* TO 'admin'@'localhost' WITH GRANT OPTION;
+-- 限制每小时查询次数和同时连接数
+ALTER USER 'shop_report'@'10.0.2.%'
+  WITH MAX_QUERIES_PER_HOUR 1000
+       MAX_CONNECTIONS_PER_HOUR 50
+       MAX_USER_CONNECTIONS 5;
 ```
 
-## 总结
+报表查询账号设这个特别有用——有些分析师写了个死循环查询，或者同时开了一堆 DBeaver 窗口，不会把数据库连接打满。
 
-本文介绍了用户管理与安全，主要内容：
+## SQL 注入：不是权限管理能防的，但和你有关
 
-**用户管理**：
+权限做得再好，如果应用代码里存在 SQL 注入漏洞，攻击者可以用最低权限的账号拿到不该看的数据。
 
-- ✅ CREATE/ALTER/DROP USER
-- ✅ 用户锁定/解锁
-- ✅ 密码管理
+### 什么是 SQL 注入
 
-**权限管理**：
+假设你的电商系统有个搜索商品的接口，后端代码这么写的：
 
-- ✅ GRANT 授予权限
-- ✅ REVOKE 撤销权限
-- ✅ 最小权限原则
+```sql
+-- 这是应用代码拼接出来的 SQL
+SELECT * FROM products WHERE name LIKE '%用户输入的关键词%';
+```
 
-**角色管理**：
+如果用户输入的不是"MacBook"，而是 `' UNION SELECT id, username, password_hash, email, '' FROM users -- `，拼接后变成：
 
-- ✅ 角色创建和分配
-- ✅ 简化权限管理
+```sql
+SELECT * FROM products WHERE name LIKE '%' UNION SELECT id, username, password_hash, email, '' FROM users -- %';
+```
 
-**安全策略**：
+一条查询就把所有用户的密码哈希拖走了。
 
-- ✅ 密码策略
-- ✅ SSL 连接
-- ✅ 限制远程访问
+### 防护手段
 
-掌握用户管理后，就能安全地配置数据库访问了。接下来我们将学习备份与恢复。
+第一道防线：**永远用参数化查询**，不要拼接 SQL。
 
-## 下一步
+```sql
+-- 错误：字符串拼接
+-- query = "SELECT * FROM products WHERE name LIKE '%" + keyword + "%'"
 
-在下一篇文章《16 备份与恢复》中，我们将学习：
+-- 正确：参数化查询（以 Java 为例）
+-- PreparedStatement stmt = conn.prepareStatement(
+--     "SELECT * FROM products WHERE name LIKE ?"
+-- );
+-- stmt.setString(1, "%" + keyword + "%");
+```
 
-- mysqldump 备份工具
-- 完全备份和增量备份
-- 数据恢复方法
-- Binlog 恢复
-- 备份策略设计
-- 自动化备份方案
+参数化查询会把用户输入的任何内容都当作纯文本处理，`UNION`、`--` 这些都会被转义，不会变成 SQL 语法的一部分。
 
----
+第二道防线：**最小权限原则**——即使注入成功了，攻击者也拿不到更多数据。shop_app 没有 DROP 权限，注入再厉害也删不了表。shop_report 看不到 password_hash 列，注入成功也拿不到密码。
+
+这两道防线要同时存在。参数化查询是应用层的责任，最小权限是数据库层的兜底。
+
+## 审计：谁在什么时候做了什么
+
+安全团队审计报告的最后一条是"缺少操作审计"。MySQL 的企业版有 Enterprise Audit 插件，但要花钱。社区版怎么搞？
+
+### 开源方案：MariaDB Audit Plugin
+
+MariaDB Audit Plugin 可以在 MySQL 社区版上运行：
+
+```sql
+-- 安装审计插件（需要把 .so 文件放到 plugin 目录）
+INSTALL PLUGIN server_audit SONAME 'server_audit.so';
+
+-- 配置审计内容
+SET GLOBAL server_audit_events = 'CONNECT,QUERY,TABLE';
+SET GLOBAL server_audit_logging = 'ON';
+
+-- 审计日志记录到文件
+SET GLOBAL server_audit_file_path = '/var/log/mysql/audit.log';
+```
+
+配置之后，每次有人连接数据库、执行查询、操作表，都会被记录下来：
+
+```
+20250320 14:30:01,shop_app,10.0.1.20,101,0,QUERY,shop,'SELECT * FROM orders WHERE status = 2',0
+20250320 14:30:05,shop_report,10.0.2.15,102,0,QUERY,shop,'SELECT COUNT(*) FROM products',0
+20250320 14:31:00,root,192.168.1.100,103,0,QUERY,,'DROP TABLE orders',0
+```
+
+第三条日志看起来就很可疑——谁在用 root 从 192.168.1.100 删表？
+
+### 审计日志的实践建议
+
+审计日志会占用磁盘空间，也会对性能有轻微影响。建议：
+
+- 对生产环境开启审计，开发环境可以不开
+- 只审计关键操作（CONNECT + 关键表的 TABLE 操作），不全量审计
+- 定期归档和清理审计日志
+- 用 ELK 或类似工具集中收集和分析审计日志，别靠人肉 grep
+
+## 收尾：把 root 账号收起来
+
+做完上面所有的事情后，最后一步：
+
+```sql
+-- root 禁止远程连接，只允许本地
+DELETE FROM mysql.user WHERE user = 'root' AND host = '%';
+FLUSH PRIVILEGES;
+
+-- 确认 root 只能本地连
+SELECT user, host FROM mysql.user WHERE user = 'root';
+-- 应该只剩 root@localhost
+```
+
+然后记住 root 的密码，放到密码管理器里，日常操作用 shop_dba 账号。root 只在紧急情况下使用，比如数据库起不来了、所有 DBA 账号都被锁了。
+
+## 回顾：安全体系的层次
+
+回头看看我们做了什么。整个安全体系是一个分层的结构，每一层都在保护不同的东西：
+
+**网络层**：限制 IP 来源 + SSL 加密，确保只有合法的客户端能连上来。
+
+**认证层**：强密码策略 + 密码过期 + 登录失败锁定，确保连上来的人就是他声称的那个人。
+
+**授权层**：最小权限 + 角色管理，确保每个人只能做自己该做的事。
+
+**应用层**：参数化查询，确保应用代码不会被 SQL 注入攻破。
+
+**审计层**：操作日志，确保出了事能追溯。
+
+单独靠哪一层都不够。你可能听过"纵深防御"这个词，用在这里很合适——每一层都是其他层的备份。
+
+## 这套方案什么时候用，什么时候不用
+
+### 适合的场景
+
+这套严格的权限体系适合多团队协作的生产环境。你的电商系统有 5 个后端开发、2 个 DBA、3 个数据分析师，每个人需要不同级别的数据库访问权限——用角色 + 最小权限是正确的做法。
+
+需要合规审计的场景也必须这么搞。如果你的公司要做等保认证或者 ISO 27001，审计人员会逐条检查这些内容。
+
+### 可能过度的场景
+
+如果你是一个人做的个人项目或者创业初期只有两三个人的团队，这套体系可能太重了。一个人维护一个 root 账号和一两个应用账号就够了。但请至少做到：不用弱密码、root 不开远程、密码不放代码仓库里。
+
+### 对比其他数据库的权限管理
+
+PostgreSQL 的权限模型和 MySQL 类似，但粒度更细——可以控制到 schema 级别，还支持 Row Level Security（行级安全策略），可以让不同用户只能看到同一张表的不同行。如果你的业务有很强的数据隔离需求（比如多租户系统），PostgreSQL 的 RLS 比 MySQL 的列级权限更灵活。
+
+Redis 的安全模型就简单很多——只有一个密码（或者 ACL，6.0 之后），没有复杂的权限分层。因为 Redis 的定位是缓存，数据本身就应该是"丢了也没关系"的。
+
+MongoDB 的权限管理也很完善，支持基于角色的访问控制，还可以做到集合级别甚至文档级别的权限控制。
+
+下篇预告：安全体系搭好了，但如果数据丢了，权限做得再好也没用。下一篇我们进入实战篇的第一个主题——备份恢复与主从复制。想象一个场景：凌晨三点，运维同事误操作 DROP TABLE orders，线上订单数据全没了。你能不能在老板醒来之前把数据找回来？我们下篇见。

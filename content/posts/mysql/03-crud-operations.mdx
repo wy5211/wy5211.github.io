@@ -1,6 +1,7 @@
 ---
 title: "03 增删改查实战"
 date: "2026-03-23"
+summary: "在内容平台上做真正的 CRUD——批量导入文章、多条件筛选、分页查询、软删除，以及那些踩过才知道的坑。"
 tags: ["MySQL"]
 category: "mysql"
 cover: ""
@@ -9,786 +10,360 @@ series: "MySQL 渐进式学习指南"
 seriesOrder: 3
 ---
 
-## 前言
+上一篇我们花了整篇文章讨论数据类型的选型，最终设计出了一张用户表。你可能觉得"不就建个表嘛，至于这么讲究？"——至于。因为表结构定下来之后，你要在上面跑成千上万次增删改查，类型选错了，每次操作都在付出代价。
 
-CRUD（Create、Read、Update、Delete）是数据库操作的四大核心功能，也是日常开发中使用最频繁的语句。掌握 CRUD 是成为数据库高手的必经之路。
+今天我们在这张表上做真正的事。不是"INSERT 一条、SELECT 一下"的入门操作——而是你在日常开发中真正会遇到的需求：批量导入 1000 篇文章、多条件筛选文章列表、处理重复数据、分页查询在深分页时的优化、用软删除代替物理删除。
 
-本文将通过丰富的实战示例，带你系统掌握增删改查的各种技巧和最佳实践。
+主线场景：你的内容平台刚上线，运营同学给了你一个 Excel，里面有 500 篇历史文章要导入系统。导入完成后，还需要一个文章管理后台——按分类筛选、按时间排序、分页展示、支持搜索和软删除。
 
-## CREATE - 插入数据
+## INSERT：不只是插入一条那么简单
 
-### 基本语法
+### 批量插入：快几十倍不是夸张
+
+运营给了 500 篇文章，你打算怎么导入？一条一条 INSERT？
 
 ```sql
--- 插入完整数据（所有字段）
-INSERT INTO 表名 VALUES (值1, 值2, ...);
+-- 方式一：循环单条插入（慢）
+INSERT INTO articles (title, author_id, category, content, status)
+VALUES ('第一篇', 1, '技术', '内容...', 1);
 
--- 插入指定字段
-INSERT INTO 表名 (字段1, 字段2) VALUES (值1, 值2);
+INSERT INTO articles (title, author_id, category, content, status)
+VALUES ('第二篇', 1, '技术', '内容...', 1);
 
--- 插入多条数据
-INSERT INTO 表名 (字段1, 字段2) VALUES
-  (值1, 值2),
-  (值3, 值4),
-  (值5, 值6);
+-- 500 次 INSERT，每次都要解析 SQL、获取锁、写 binlog、刷盘
 ```
 
-### 单行插入
-
 ```sql
--- 准备测试表
-CREATE TABLE users (
-  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-  username VARCHAR(50) NOT NULL,
-  email VARCHAR(100) NOT NULL,
-  age TINYINT UNSIGNED DEFAULT 18,
-  status TINYINT UNSIGNED DEFAULT 1,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
--- 方式 1：指定字段（推荐）
-INSERT INTO users (username, email, age) VALUES ('张三', 'zhangsan@example.com', 25);
-
--- 方式 2：所有字段（需按表结构顺序，不推荐）
-INSERT INTO users VALUES (0, '李四', 'lisi@example.com', 30, 1, NOW());
--- 0 或 NULL 表示使用 AUTO_INCREMENT 的值
-
--- 方式 3：使用 SET 语法
-INSERT INTO users SET username='王五', email='wangwu@example.com', age=28;
-
--- 查看结果
-SELECT * FROM users;
+-- 方式二：批量插入（快）
+INSERT INTO articles (title, author_id, category, content, status) VALUES
+('深入理解 MySQL 索引', 1, '技术', '内容...', 1),
+('React 18 新特性解析', 2, '前端', '内容...', 1),
+('Docker 容器网络详解', 3, '运维', '内容...', 1),
+-- ... 一次插入 100-500 条
+('Go 并发编程实战', 1, '技术', '内容...', 1);
 ```
 
-### 批量插入（推荐）
+为什么批量插入快这么多？因为每次执行 SQL 语句，MySQL 都要走一遍"解析 SQL → 优化查询 → 获取锁 → 执行 → 写 binlog → 释放锁"的流程。批量插入只走一遍流程，数据是一条一条追加到数据文件里的。在实际测试中，1000 条数据，单条插入可能要 10 秒，批量插入只需要 0.3 秒。
+
+但批量插入也有上限：MySQL 的 `max_allowed_packet` 参数限制了单个 SQL 语句的大小（默认 4MB）。如果你一条 INSERT 塞 10000 条记录，每条内容 1KB，加起来就 10MB，超过了限制会报错。一般建议每次批量插入 500-1000 条。
+
+### 遇到重复数据怎么办
+
+500 篇文章里可能有重复的——运营从不同来源整理的，有些标题重复了。直接插入会报唯一键冲突：
 
 ```sql
--- 批量插入效率高
-INSERT INTO users (username, email, age) VALUES
-  ('user1', 'user1@example.com', 20),
-  ('user2', 'user2@example.com', 22),
-  ('user3', 'user3@example.com', 24),
-  ('user4', 'user4@example.com', 26),
-  ('user5', 'user5@example.com', 28);
-
--- 批量插入大量数据时性能更好
--- 1 次插入 1000 条 vs 1000 次插入 1 条
--- 前者速度是后者的几十倍
+INSERT INTO articles (title, author_id, category, content, status)
+VALUES ('深入理解 MySQL 索引', 1, '技术', '内容...', 1);
+-- 第二次执行报错：Duplicate entry '深入理解 MySQL 索引' for key 'idx_title'
 ```
 
-### INSERT IGNORE - 忽略冲突
+三种处理方式，适用于不同场景：
 
 ```sql
--- 创建有唯一约束的表
-CREATE TABLE users (
-  id INT PRIMARY KEY,
-  username VARCHAR(50) UNIQUE,
-  email VARCHAR(100) UNIQUE
-);
+-- 方式一：INSERT IGNORE —— 遇到重复就跳过
+INSERT IGNORE INTO articles (title, author_id, category, content, status)
+VALUES ('深入理解 MySQL 索引', 1, '技术', '更新后的内容...', 1);
+-- 已存在，静默跳过，不报错也不更新
 
--- 正常插入
-INSERT INTO users VALUES (1, 'user1', 'user1@example.com');
-
--- 再次插入会报错（Duplicate key error）
-INSERT INTO users VALUES (1, 'user2', 'user2@example.com');
--- ERROR 1062: Duplicate entry '1' for key 'PRIMARY'
-
--- 使用 IGNORE 忽略错误
-INSERT IGNORE INTO users VALUES (1, 'user2', 'user2@example.com');
--- 不报错，但不插入数据
-
--- 实际应用：去重插入
-INSERT IGNORE INTO users (id, username, email)
-VALUES (2, 'user2', 'user2@example.com');
-```
-
-### ON DUPLICATE KEY UPDATE - 冲突时更新
-
-```sql
--- 如果主键或唯一键冲突，则更新
-INSERT INTO users (id, username, email) VALUES
-  (1, 'user1_updated', 'user1_new@example.com')
+-- 方式二：ON DUPLICATE KEY UPDATE —— 遇到重复就更新
+INSERT INTO articles (title, author_id, category, content, status)
+VALUES ('深入理解 MySQL 索引', 1, '技术', '更新后的内容...', 1)
 ON DUPLICATE KEY UPDATE
-  username = VALUES(username),
-  email = VALUES(email);
+  content = VALUES(content),
+  updated_at = CURRENT_TIMESTAMP;
+-- 已存在，更新内容和更新时间
 
--- 逻辑：
--- 1. 尝试插入
--- 2. 如果 id=1 已存在，则更新 username 和 email
--- 3. VALUES(username) 指的是要插入的新值
-
--- 实际应用：统计数据
-CREATE TABLE page_views (
-  date DATE UNIQUE,
-  views INT UNSIGNED DEFAULT 0
-);
-
--- 每天统计访问量
-INSERT INTO page_views (date, views) VALUES (CURDATE(), 1)
-ON DUPLICATE KEY UPDATE views = views + 1;
-
--- 第一次执行：插入新记录，views=1
--- 第二次执行：更新记录，views=2
+-- 方式三：REPLACE —— 遇到重复就删掉旧的插入新的
+REPLACE INTO articles (title, author_id, category, content, status)
+VALUES ('深入理解 MySQL 索引', 1, '技术', '新内容...', 1);
+-- 先 DELETE 再 INSERT，自增 ID 会变
 ```
 
-### INSERT ... SELECT - 从查询插入
+**导入历史数据时用 INSERT IGNORE**（保留已有的、跳过重复的）。**实时更新数据时用 ON DUPLICATE KEY UPDATE**（有就更新，没有就插入，即 upsert）。**REPLACE 慎用**——它是先删后插，会导致自增 ID 变化，如果有其他表通过 ID 关联这条记录，关联关系就断了。
+
+### 从查询结果插入
+
+有时候你需要从一张表汇总数据到另一张表。比如统计每个作者的文章数：
 
 ```sql
--- 从查询结果插入
-CREATE TABLE users_backup (
-  id INT PRIMARY KEY,
-  username VARCHAR(50),
-  email VARCHAR(100)
-);
+-- 先创建统计表
+CREATE TABLE author_stats (
+  author_id     BIGINT UNSIGNED PRIMARY KEY COMMENT '作者ID',
+  article_count INT UNSIGNED DEFAULT 0 COMMENT '文章数',
+  latest_publish_time TIMESTAMP NULL COMMENT '最近发布时间'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
--- 从 users 表复制数据
-INSERT INTO users_backup (id, username, email)
-SELECT id, username, email FROM users WHERE age > 25;
-
--- 从其他表聚合数据
-CREATE TABLE user_stats (
-  user_id INT PRIMARY KEY,
-  total_orders INT,
-  total_spent DECIMAL(10, 2)
-);
-
-INSERT INTO user_stats (user_id, total_orders, total_spent)
-SELECT user_id, COUNT(*), SUM(total_amount)
-FROM orders
-GROUP BY user_id;
-```
-
-### REPLACE - 替换数据
-
-```sql
--- 如果存在则删除旧数据再插入（DELETE + INSERT）
-REPLACE INTO users (id, username, email) VALUES (1, 'new_user1', 'new1@example.com');
-
--- 与 ON DUPLICATE KEY UPDATE 的区别：
--- REPLACE: 先删除再插入，会重新生成 AUTO_INCREMENT
--- ON DUPLICATE KEY UPDATE: 直接更新，保持 AUTO_INCREMENT
-
--- ⚠️ 注意：REPLACE 会影响外键关联
--- 如果有子表引用，使用 ON DUPLICATE KEY UPDATE 更安全
-```
-
-## READ - 查询数据
-
-### 基本语法
-
-```sql
--- 基本结构
-SELECT 字段列表 FROM 表名 WHERE 条件;
-
--- 查询所有字段
-SELECT * FROM users;
-
--- 查询指定字段
-SELECT id, username, email FROM users;
-
--- 使用别名
+-- 从文章表聚合后直接插入统计表
+INSERT INTO author_stats (author_id, article_count, latest_publish_time)
 SELECT
-  id AS user_id,
-  username AS name,
-  email AS '邮箱地址'
-FROM users;
-```
-
-### WHERE 条件过滤
-
-```sql
--- 比较运算符
-SELECT * FROM users WHERE age = 25;
-SELECT * FROM users WHERE age > 25;
-SELECT * FROM users WHERE age >= 25;
-SELECT * FROM users WHERE age != 25;
-SELECT * FROM users WHERE age <> 25;  -- 不等于（另一种写法）
-
--- 逻辑运算符
-SELECT * FROM users WHERE age = 25 AND status = 1;
-SELECT * FROM users WHERE age = 25 OR age = 30;
-SELECT * FROM users WHERE NOT (status = 0);
-
--- 范围查询
-SELECT * FROM users WHERE age BETWEEN 20 AND 30;
-SELECT * FROM users WHERE age >= 20 AND age <= 30;  -- 等价写法
-
--- 集合查询
-SELECT * FROM users WHERE age IN (20, 25, 30);
-SELECT * FROM users WHERE age NOT IN (20, 25, 30);
-
--- 空值判断（注意不能用 =）
-SELECT * FROM users WHERE email IS NULL;
-SELECT * FROM users WHERE email IS NOT NULL;
-
--- 模糊查询
-SELECT * FROM users WHERE username LIKE 'user%';      -- user 开头
-SELECT * FROM users WHERE username LIKE '%user%';     -- 包含 user
-SELECT * FROM users WHERE username LIKE 'user_';      -- user 后一个字符
-SELECT * FROM users WHERE username LIKE 'user\%';     -- 转义，查找 user%
-```
-
-### ORDER BY 排序
-
-```sql
--- 单字段排序
-SELECT * FROM users ORDER BY age ASC;           -- 升序（默认）
-SELECT * FROM users ORDER BY age DESC;          -- 降序
-
--- 多字段排序
-SELECT * FROM users ORDER BY status DESC, age ASC;
--- 先按 status 降序，相同则按 age 升序
-
--- 使用字段位置排序（不推荐）
-SELECT id, username, age FROM users ORDER BY 3 DESC;
--- 3 表示第 3 个字段（age）
-
--- NULL 值排序
-SELECT * FROM users ORDER BY email ASC;         -- NULL 排在最前
-SELECT * FROM users ORDER BY email IS NULL, email;  -- NULL 排在最后
-```
-
-### LIMIT 分页
-
-```sql
--- 限制返回行数
-SELECT * FROM users LIMIT 5;                    -- 前 5 条
-SELECT * FROM users LIMIT 10;                   -- 前 10 条
-
--- 分页查询（偏移量 + 数量）
-SELECT * FROM users LIMIT 0, 5;                 -- 第 1 页（跳过 0 条，取 5 条）
-SELECT * FROM users LIMIT 5, 5;                 -- 第 2 页（跳过 5 条，取 5 条）
-SELECT * FROM users LIMIT 10, 5;                -- 第 3 页（跳过 10 条，取 5 条）
-
--- 标准语法（推荐）
-SELECT * FROM users LIMIT 5 OFFSET 0;           -- 第 1 页
-SELECT * FROM users LIMIT 5 OFFSET 5;           -- 第 2 页
-
--- 分页公式
--- page: 页码（从 1 开始）
--- pageSize: 每页数量
--- LIMIT pageSize OFFSET (page - 1) * pageSize
-```
-
-### DISTINCT 去重
-
-```sql
--- 去除重复行
-SELECT DISTINCT status FROM users;              -- 所有不同的状态值
-SELECT DISTINCT age FROM users WHERE age > 20;  -- 所有不同的年龄
-
--- 多字段去重（组合唯一）
-SELECT DISTINCT age, status FROM users;
-
--- 聚合去重
-SELECT COUNT(DISTINCT age) FROM users;          -- 有多少个不同的年龄
-SELECT COUNT(DISTINCT email) FROM users;        -- 有多少个不同的邮箱
-```
-
-## UPDATE - 更新数据
-
-### 基本语法
-
-```sql
--- 更新单个字段
-UPDATE users SET age = 26 WHERE id = 1;
-
--- 更新多个字段
-UPDATE users
-SET age = 26, status = 0
-WHERE id = 1;
-
--- ⚠️ 注意：一定要有 WHERE 条件！
--- 否则会更新所有行
-UPDATE users SET status = 0;  -- 危险！更新所有记录
-```
-
-### 条件更新
-
-```sql
--- 基于条件更新
-UPDATE users SET status = 0 WHERE age < 18;
-UPDATE users SET age = age + 1 WHERE id = 1;    -- 表达式
-
--- 基于查询更新
-UPDATE users
-SET status = 0
-WHERE id IN (SELECT user_id FROM orders WHERE total_amount > 10000);
-
--- 使用 CASE 条件更新
-UPDATE users
-SET status = CASE
-  WHEN age < 18 THEN 0
-  WHEN age BETWEEN 18 AND 60 THEN 1
-  ELSE 2
-END;
-```
-
-### UPDATE + JOIN
-
-```sql
--- 基于 JOIN 更新
-UPDATE users u
-JOIN orders o ON u.id = o.user_id
-SET u.status = 1
-WHERE o.total_amount > 1000;
-
--- 关联更新
-UPDATE users u
-LEFT JOIN user_profiles p ON u.id = p.user_id
-SET u.nickname = p.nickname
-WHERE u.nickname IS NULL AND p.nickname IS NOT NULL;
-```
-
-### 批量更新技巧
-
-```sql
--- 方式 1：CASE WHEN（适用于少量数据）
-UPDATE users
-SET age = CASE id
-  WHEN 1 THEN 25
-  WHEN 2 THEN 30
-  WHEN 3 THEN 35
-  ELSE age
-END
-WHERE id IN (1, 2, 3);
-
--- 方式 2：临时表 JOIN（适用于大量数据）
-CREATE TEMPORARY TABLE temp_updates (id INT, new_age INT);
-INSERT INTO temp_updates VALUES (1, 25), (2, 30), (3, 35);
-
-UPDATE users u
-JOIN temp_updates t ON u.id = t.id
-SET u.age = t.new_age;
-
-DROP TEMPORARY TABLE temp_updates;
-```
-
-## DELETE - 删除数据
-
-### 基本语法
-
-```sql
--- 删除指定行
-DELETE FROM users WHERE id = 1;
-
--- 基于条件删除
-DELETE FROM users WHERE age < 18;
-DELETE FROM users WHERE status = 0 AND created_at < '2023-01-01';
-
--- ⚠️ 注意：一定要有 WHERE 条件！
--- 否则会删除所有数据
-DELETE FROM users;  -- 危险！删除所有记录
-```
-
-### TRUNCATE - 清空表
-
-```sql
--- DELETE：逐行删除，可以回滚，不重置自增ID
-DELETE FROM users;
-
--- TRUNCATE：快速清空，不可回滚，重置自增ID
-TRUNCATE TABLE users;
-
--- 对比
-DELETE FROM users;      -- 慢，可回滚，AUTO_INCREMENT 不重置
-TRUNCATE TABLE users;   -- 快，不可回滚，AUTO_INCREMENT 重置为 1
-
--- 使用建议：
--- - 删除部分数据 → DELETE
--- - 清空整个表 → TRUNCATE
--- - 需要回滚 → DELETE（在事务中）
-```
-
-### 条件删除
-
-```sql
--- 基于查询删除
-DELETE FROM users
-WHERE id IN (SELECT user_id FROM banned_users);
-
--- 基于时间删除
-DELETE FROM logs WHERE created_at < DATE_SUB(NOW(), INTERVAL 30 DAY);
-
--- 删除重复数据（保留一条）
-DELETE t1 FROM users t1
-INNER JOIN users t2
-WHERE t1.id > t2.id AND t1.email = t2.email;
-```
-
-### DELETE + JOIN
-
-```sql
--- 基于 JOIN 删除
-DELETE users
-FROM users
-INNER JOIN user_profiles p ON users.id = p.user_id
-WHERE p.status = 0;
-
--- 删除关联数据
-DELETE users, user_profiles
-FROM users
-INNER JOIN user_profiles ON users.id = user_profiles.user_id
-WHERE users.status = 0;
-```
-
-## 综合实战
-
-### 用户管理系统
-
-```sql
--- 创建用户表
-CREATE TABLE users (
-  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-  username VARCHAR(50) NOT NULL UNIQUE,
-  email VARCHAR(100) NOT NULL UNIQUE,
-  password_hash VARCHAR(255) NOT NULL,
-  nickname VARCHAR(50),
-  avatar VARCHAR(500),
-  gender ENUM('male', 'female', 'other') DEFAULT 'other',
-  phone VARCHAR(20),
-  status TINYINT UNSIGNED DEFAULT 1 COMMENT '1:正常 0:禁用',
-  last_login_at TIMESTAMP NULL,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
-
--- 1. 用户注册（INSERT）
-INSERT INTO users (username, email, password_hash, nickname) VALUES
-  ('zhangsan', 'zhangsan@example.com', 'hash123...', '张三');
-
--- 2. 查询用户信息（SELECT）
-SELECT
-  id,
-  username,
-  nickname,
-  email,
-  gender,
-  status,
-  created_at
-FROM users
-WHERE username = 'zhangsan';
-
--- 3. 用户登录（SELECT + 更新登录时间）
-UPDATE users
-SET last_login_at = CURRENT_TIMESTAMP
-WHERE username = 'zhangsan' AND password_hash = 'hash123...';
-
--- 4. 更新用户资料（UPDATE）
-UPDATE users
-SET nickname = '张三同学',
-    gender = 'male',
-    phone = '13800138000'
-WHERE id = 1;
-
--- 5. 禁用用户（UPDATE）
-UPDATE users SET status = 0 WHERE id = 1;
-
--- 6. 删除用户（DELETE）
-DELETE FROM users WHERE id = 1;
-
--- 7. 批量导入用户（INSERT 批量）
-INSERT INTO users (username, email, password_hash, nickname) VALUES
-  ('user1', 'user1@example.com', 'hash1', '用户1'),
-  ('user2', 'user2@example.com', 'hash2', '用户2'),
-  ('user3', 'user3@example.com', 'hash3', '用户3');
-
--- 8. 分页查询用户（SELECT + LIMIT）
-SELECT
-  id, username, nickname, email, status, created_at
-FROM users
+  author_id,
+  COUNT(*) AS article_count,
+  MAX(created_at) AS latest_publish_time
+FROM articles
 WHERE status = 1
+GROUP BY author_id;
+```
+
+`INSERT ... SELECT` 的用途不限于同一数据库——你可以跨表、跨库（需要 FEDERATED 引擎或 ETL 工具）做数据迁移和同步。日常开发中最常见的场景就是定期把业务表的统计数据汇总到报表表。
+
+## SELECT：筛选、排序、分页
+
+数据导入完了，现在来写管理后台的查询接口。
+
+### 多条件组合筛选
+
+管理后台的筛选条件往往是"有就加上，没有就忽略"：
+
+```sql
+-- 需求：按分类、状态、关键词筛选文章列表
+SELECT id, title, category, status, created_at
+FROM articles
+WHERE category = '技术'              -- 有分类参数时
+  AND status = 1                      -- 有状态参数时
+  AND title LIKE '%MySQL%'            -- 有关键词时
 ORDER BY created_at DESC
-LIMIT 10 OFFSET 0;  -- 第 1 页
-
--- 9. 搜索用户（SELECT + LIKE）
-SELECT
-  id, username, nickname, email
-FROM users
-WHERE username LIKE '%zhang%' OR nickname LIKE '%zhang%';
-
--- 10. 统计用户（SELECT + 聚合）
-SELECT
-  COUNT(*) AS total_users,
-  COUNT(CASE WHEN status = 1 THEN 1 END) AS active_users,
-  COUNT(CASE WHEN status = 0 THEN 1 END) AS banned_users
-FROM users;
-```
-
-### 商品管理系统
-
-```sql
--- 创建商品表
-CREATE TABLE products (
-  id BIGINT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
-  category_id BIGINT UNSIGNED NOT NULL,
-  name VARCHAR(200) NOT NULL,
-  description TEXT,
-  price DECIMAL(10, 2) NOT NULL,
-  stock INT UNSIGNED DEFAULT 0,
-  sales INT UNSIGNED DEFAULT 0,
-  status TINYINT UNSIGNED DEFAULT 1 COMMENT '1:上架 0:下架',
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='商品表';
-
--- 1. 添加商品（INSERT）
-INSERT INTO products (category_id, name, description, price, stock) VALUES
-  (1, 'iPhone 15 Pro', '苹果最新旗舰手机', 7999.00, 100),
-  (1, 'MacBook Pro', '苹果笔记本电脑', 15999.00, 50);
-
--- 2. 查询商品列表（SELECT + WHERE + ORDER BY）
-SELECT
-  id, name, price, stock, sales, status
-FROM products
-WHERE status = 1 AND stock > 0
-ORDER BY sales DESC
 LIMIT 20;
-
--- 3. 商品详情（SELECT）
-SELECT * FROM products WHERE id = 1;
-
--- 4. 更新商品信息（UPDATE）
-UPDATE products
-SET description = '最新款 iPhone，A17 芯片',
-    price = 7799.00
-WHERE id = 1;
-
--- 5. 下架商品（UPDATE）
-UPDATE products SET status = 0 WHERE id = 1;
-
--- 6. 扣减库存（UPDATE + 表达式）
-UPDATE products
-SET stock = stock - 1,
-    sales = sales + 1
-WHERE id = 1 AND stock >= 1;
-
--- 7. 批量更新价格（UPDATE + CASE）
-UPDATE products
-SET price = CASE id
-  WHEN 1 THEN 7799.00
-  WHEN 2 THEN 15499.00
-  ELSE price
-END
-WHERE id IN (1, 2);
-
--- 8. 删除商品（DELETE）
-DELETE FROM products WHERE id = 1;
-
--- 9. 搜索商品（SELECT + LIKE）
-SELECT
-  id, name, price, stock
-FROM products
-WHERE name LIKE '%iPhone%' OR description LIKE '%iPhone%';
-
--- 10. 价格区间查询（SELECT + BETWEEN）
-SELECT
-  id, name, price
-FROM products
-WHERE price BETWEEN 5000 AND 10000
-ORDER BY price ASC;
 ```
 
-## 最佳实践
+`LIKE '%MySQL%'` 里的 `%` 是通配符——前面的 `%` 表示"MySQL 前面可以有任意字符"，后面的 `%` 表示"MySQL 后面可以有任意字符"。注意，**以 `%` 开头的 LIKE 无法使用索引**，因为 MySQL 不知道从 B+ 树的哪个位置开始查找。如果你的搜索功能是核心需求，后面讲索引和全文检索时会专门讲怎么做。
 
-### 1. 使用事务保护数据
+多个 `AND` / `OR` 组合时，注意优先级。`AND` 的优先级高于 `OR`，这会导致不符合预期的结果：
 
 ```sql
--- ✅ 推荐：关键操作使用事务
-START TRANSACTION;
+-- 需求：查"技术分类的已发布文章"或"前端分类的所有文章"
+SELECT * FROM articles
+WHERE category = '技术' AND status = 1
+   OR category = '前端';
 
-UPDATE accounts SET balance = balance - 1000 WHERE id = 1;
-UPDATE accounts SET balance = balance + 1000 WHERE id = 2;
+-- MySQL 理解为：(category = '技术' AND status = 1) OR category = '前端'
+-- 符合预期
 
-COMMIT;
--- 或 ROLLBACK; 回滚
+-- 但如果你写反了：
+SELECT * FROM articles
+WHERE category = '技术'
+   OR category = '前端' AND status = 1;
+
+-- MySQL 理解为：category = '技术' OR (category = '前端' AND status = 1)
+-- 技术分类的文章不管什么状态都出来了——不是你想要的
 ```
 
-### 2. 批量操作优化性能
+**养成习惯：混合使用 AND 和 OR 时，始终用括号明确优先级。**
+
+### 分页：深分页是个隐藏的性能杀手
+
+管理后台的分页查询，前几页通常没问题。但翻到第 1000 页时：
 
 ```sql
--- ✅ 推荐：批量插入
-INSERT INTO users (username, email) VALUES
-  ('user1', 'user1@example.com'),
-  ('user2', 'user2@example.com'),
-  ('user3', 'user3@example.com');
+-- 第 1 页：很快
+SELECT id, title, created_at FROM articles
+ORDER BY created_at DESC LIMIT 20 OFFSET 0;
 
--- ❌ 不推荐：循环单条插入
-INSERT INTO users (username, email) VALUES ('user1', 'user1@example.com');
-INSERT INTO users (username, email) VALUES ('user2', 'user2@example.com');
-INSERT INTO users (username, email) VALUES ('user3', 'user3@example.com');
+-- 第 1000 页：可能很慢
+SELECT id, title, created_at FROM articles
+ORDER BY created_at DESC LIMIT 20 OFFSET 19980;
 ```
 
-### 3. 避免 SELECT \*
+为什么慢？因为 `OFFSET 19980` 的意思是"跳过前 19980 条记录"。MySQL 不是真的跳过——它需要先扫描这 19980 条记录，然后丢弃它们，只返回后面的 20 条。数据量小的时候感觉不到，数据量一上去，第 N 页的响应时间会随 N 线性增长。
+
+一个简单的优化方案是**游标分页**（也叫 keyset pagination）：
 
 ```sql
--- ✅ 推荐：只查询需要的字段
-SELECT id, username, email FROM users;
+-- 第 1 页
+SELECT id, title, created_at FROM articles
+ORDER BY created_at DESC LIMIT 21;  -- 多取 1 条判断是否有下一页
 
--- ❌ 不推荐：查询所有字段
-SELECT * FROM users;
--- 缺点：
--- 1. 可能读取不需要的列，浪费 I/O
--- 2. 增加网络传输
--- 3. 增加内存占用
--- 4. 无法使用覆盖索引优化
+-- 第 2 页：用上一页最后一条记录的时间作为游标
+SELECT id, title, created_at FROM articles
+WHERE created_at < '2025-03-14 08:30:00'  -- 上一页最后一条的 created_at
+ORDER BY created_at DESC LIMIT 21;
 ```
 
-### 4. UPDATE 和 DELETE 时必须加 WHERE
+游标分页利用了索引的有序性——`WHERE created_at < 某个值` 可以直接通过 B+ 树定位到起始位置，不需要扫描和跳过前面的记录。无论翻到第几页，性能都一样。
+
+但游标分页有个限制：不支持跳页。用户不能直接跳到第 50 页，只能"下一页""上一页"地翻。对于管理后台和移动端无限滚动这种场景够用了，如果业务确实需要跳页，OFFSET 分页仍然是必要的——后续讲查询优化时会介绍深分页的更多优化手段。
+
+## UPDATE：一行忘写 WHERE 的代价
+
+文章管理后台有个"批量下架"功能，你写的 SQL 是这样的：
 
 ```sql
--- ✅ 推荐：先测试 WHERE 条件
-SELECT * FROM users WHERE age < 18;
+-- 需求：下架所有"待审核"状态的文章
+UPDATE articles SET status = 0 WHERE status = 2;
+```
+
+如果你忘了写 `WHERE status = 2`，会怎样？
+
+```sql
+UPDATE articles SET status = 0;
+-- 所有文章都被下架了。所有。
+```
+
+这不是在吓你。这种事故在真实的生产环境中发生过无数次。预防措施有几个：
+
+**1. 先 SELECT 验证，再 UPDATE**
+
+```sql
+-- 先看看会影响到哪些记录
+SELECT id, title, status FROM articles WHERE status = 2;
+
 -- 确认无误后再更新
-UPDATE users SET status = 0 WHERE age < 18;
-
--- ❌ 危险：没有 WHERE 条件
-UPDATE users SET status = 0;  -- 更新所有记录！
+UPDATE articles SET status = 0 WHERE status = 2;
 ```
 
-### 5. 使用 LIMIT 限制影响行数
+**2. 加 LIMIT 限制影响范围**
 
 ```sql
--- ✅ 推荐：不确定条件时加上 LIMIT
-UPDATE users SET status = 0 WHERE age < 18 LIMIT 100;
-DELETE FROM logs WHERE created_at < '2023-01-01' LIMIT 1000;
-
--- 分批执行，避免锁表太久
+UPDATE articles SET status = 0 WHERE status = 2 LIMIT 100;
+-- 最多影响 100 条，防止误操作波及全表
 ```
 
-### 6. 使用 EXPLAIN 分析查询
+**3. 在事务里操作**
 
 ```sql
--- 执行前分析查询计划
-EXPLAIN SELECT * FROM users WHERE email = 'user@example.com';
-
--- 查看是否使用了索引
--- type: ALL（全表扫描）、index（索引扫描）、ref（索引查找）
--- key: 实际使用的索引
--- rows: 预计扫描的行数
+START TRANSACTION;
+UPDATE articles SET status = 0 WHERE status = 2;
+-- 检查影响行数
+SELECT ROW_COUNT();  -- 返回受影响的行数
+-- 确认无误后提交
+COMMIT;
+-- 发现不对，回滚
+-- ROLLBACK;
 ```
 
-## 常见问题
+### CASE 表达式：在 UPDATE 里做条件判断
 
-### Q1: INSERT 数据时出现重复键错误怎么办？
-
-**A:** 使用 `INSERT IGNORE` 或 `ON DUPLICATE KEY UPDATE`。
+有时候不同条件的更新逻辑不一样——比如批量调整文章状态：已发布的保持不变，待审核的改为草稿，草稿的打上"待完善"标记。一条 UPDATE 搞定：
 
 ```sql
--- 方式 1：忽略重复
-INSERT IGNORE INTO users (id, username) VALUES (1, 'user1');
-
--- 方式 2：重复时更新
-INSERT INTO users (id, username) VALUES (1, 'user1')
-ON DUPLICATE KEY UPDATE username = VALUES(username);
+UPDATE articles
+SET status = CASE
+    WHEN status = 2 THEN 0        -- 待审核 → 草稿
+    WHEN status = 0 THEN 3        -- 草稿 → 待完善
+    ELSE status                    -- 其他不变
+END
+WHERE status IN (0, 2);
 ```
 
-### Q2: 如何高效更新大量数据？
-
-**A:** 分批更新，避免锁表太久。
+`CASE` 表达式在 SELECT 里也很有用——比如把状态码转成中文显示：
 
 ```sql
--- ✅ 推荐：分批更新
-UPDATE users SET status = 0 WHERE age < 18 LIMIT 1000;
--- 重复执行，直到影响行数为 0
-
--- ✅ 或使用临时表
-CREATE TEMPORARY TABLE temp_users AS SELECT id FROM users WHERE age < 18;
-UPDATE users u JOIN temp_users t ON u.id = t.id SET u.status = 0;
+SELECT
+  title,
+  CASE status
+    WHEN 0 THEN '草稿'
+    WHEN 1 THEN '已发布'
+    WHEN 2 THEN '待审核'
+    WHEN 3 THEN '待完善'
+    ELSE '未知'
+  END AS status_text,
+  created_at
+FROM articles
+ORDER BY created_at DESC LIMIT 10;
 ```
 
-### Q3: DELETE 后自增ID不连续怎么办？
+## DELETE：为什么生产环境很少用物理删除
 
-**A:** 这是正常现象，不需要处理。
+物理删除（DELETE）是从数据库里永久移除数据。但在大多数生产系统中，你看到的不是 DELETE，而是"软删除"——给表加一个 `deleted_at` 字段，删除时只更新这个字段：
 
 ```sql
--- ID 不连续不影响使用
--- 如果必须重置，可以使用：
-TRUNCATE TABLE users;  -- 清空并重置
+-- 软删除：不是真的删，而是标记为"已删除"
+ALTER TABLE articles ADD COLUMN deleted_at TIMESTAMP NULL COMMENT '软删除时间';
 
--- 或修改自增值
-ALTER TABLE users AUTO_INCREMENT = 1;
+UPDATE articles SET deleted_at = CURRENT_TIMESTAMP WHERE id = 42;
+
+-- 查询时过滤掉已删除的记录
+SELECT id, title, status FROM articles WHERE deleted_at IS NULL;
 ```
 
-### Q4: 如何查询第 N 条到第 M 条数据？
+为什么偏好软删除？
 
-**A:** 使用 LIMIT OFFSET。
+**数据可恢复**。误删了怎么办？物理删除后只能从备份恢复（如果有备份的话，恢复时间可能以小时计）。软删除只需要把 `deleted_at` 设回 NULL。
+
+**审计需要**。很多业务场景需要知道"谁在什么时候删了什么"。软删除天然保留了这些信息。
+
+**关联数据不受影响**。一篇文章可能有评论、点赞、收藏。物理删除文章后，关联数据要么级联删除（丢失用户数据），要么变成孤儿记录（指向一个不存在的文章 ID）。软删除不产生这个问题。
+
+软删除的代价是查询条件里永远要加 `WHERE deleted_at IS NULL`——容易忘，忘了就会查出已删除的数据。解决方案是在应用层封装（ORM 通常支持全局 scope），或者用视图：
 
 ```sql
--- 查询第 11-20 条（第 2 页）
-SELECT * FROM users LIMIT 10 OFFSET 10;
+CREATE VIEW active_articles AS
+SELECT * FROM articles WHERE deleted_at IS NULL;
 
--- 分页公式
--- pageSize = 10, page = 2
-SELECT * FROM users LIMIT 10 OFFSET (2 - 1) * 10;
+-- 之后查询视图就行
+SELECT * FROM active_articles WHERE category = '技术';
 ```
 
-### Q5: UPDATE 时如何处理字段为 NULL？
+### TRUNCATE vs DELETE
 
-**A:** 需要使用 IS NULL 或 IFNULL。
+清空整张表的数据有两个选择：
 
 ```sql
--- ✅ 正确方式
-UPDATE users SET nickname = NULL WHERE id = 1;
-UPDATE users SET nickname = '默认' WHERE nickname IS NULL;
-
--- ❌ 错误方式
-UPDATE users SET nickname = '默认' WHERE nickname = NULL;  -- 错误！
+DELETE FROM temp_import_log;   -- 逐行删除，可回滚（在事务中），不重置自增 ID
+TRUNCATE TABLE temp_import_log; -- 直接清空，不可回滚，重置自增 ID
 ```
 
-## 总结
+TRUNCATE 的本质是 DROP TABLE + CREATE TABLE，所以快得多，但不走事务。生产环境中，清空临时表、日志表用 TRUNCATE；需要条件删除或可能回滚的场景用 DELETE。
 
-本文系统介绍了 CRUD 操作的各种技巧，主要内容：
+## 一个完整的文章管理场景
 
-**INSERT - 插入数据**：
+把前面的知识串起来，模拟一次完整的内容导入和管理流程：
 
-- ✅ 单行插入、批量插入
-- ✅ INSERT IGNORE 忽略冲突
-- ✅ ON DUPLICATE KEY UPDATE 冲突更新
-- ✅ INSERT ... SELECT 从查询插入
-- ✅ REPLACE 替换数据
+```sql
+-- 1. 批量导入历史文章（遇到重复标题就跳过）
+INSERT IGNORE INTO articles (title, author_id, category, summary, status) VALUES
+('深入理解 MySQL 索引', 1, '技术', '从 B+ 树原理到索引设计实战', 1),
+('React 18 新特性解析', 2, '前端', 'Concurrent 模式和 Suspense 详解', 1),
+('Docker 网络模式对比', 3, '运维', 'bridge、host、overlay 三种网络模式', 1),
+('Go 并发编程实战', 1, '技术', 'goroutine 和 channel 的正确用法', 1),
+('前端性能优化指南', 2, '前端', '从加载到渲染的全链路优化', 1);
 
-**SELECT - 查询数据**：
+-- 2. 管理后台查询：按分类筛选，按时间倒序，分页
+SELECT id, title, category, status, created_at
+FROM articles
+WHERE category = '技术'
+  AND deleted_at IS NULL
+ORDER BY created_at DESC
+LIMIT 20 OFFSET 0;
 
-- ✅ WHERE 条件过滤
-- ✅ ORDER BY 排序
-- ✅ LIMIT 分页
-- ✅ DISTINCT 去重
-- ✅ 避免使用 SELECT \*
+-- 3. 搜索文章
+SELECT id, title, category
+FROM articles
+WHERE title LIKE '%MySQL%'
+  AND deleted_at IS NULL
+  AND status = 1;
 
-**UPDATE - 更新数据**：
+-- 4. 批量下架待审核文章
+UPDATE articles
+SET status = 0, updated_at = CURRENT_TIMESTAMP
+WHERE status = 2
+  AND deleted_at IS NULL;
 
-- ✅ 必须加 WHERE 条件
-- ✅ 多字段更新
-- ✅ CASE WHEN 条件更新
-- ✅ UPDATE + JOIN 关联更新
+-- 5. 软删除指定文章
+UPDATE articles SET deleted_at = CURRENT_TIMESTAMP WHERE id = 42;
 
-**DELETE - 删除数据**：
+-- 6. 统计各分类文章数
+SELECT
+  category,
+  COUNT(*) AS total,
+  SUM(CASE WHEN status = 1 THEN 1 ELSE 0 END) AS published,
+  SUM(CASE WHEN status = 0 THEN 1 ELSE 0 END) AS draft
+FROM articles
+WHERE deleted_at IS NULL
+GROUP BY category;
+```
 
-- ✅ 必须加 WHERE 条件
-- ✅ TRUNCATE 清空表
-- ✅ DELETE + JOIN 关联删除
+注意最后那个统计查询——`SUM(CASE WHEN ... THEN 1 ELSE 0 END)` 是一种常见的"条件计数"技巧，比写多条 WHERE 子查询高效得多。
 
-**最佳实践**：
+## Trade-off：CRUD 中的取舍
 
-- ✅ 使用事务保护关键操作
-- ✅ 批量操作提升性能
-- ✅ 避免 SELECT \*
-- ✅ 先 SELECT 测试 WHERE 条件
-- ✅ 大批量操作分批执行
-- ✅ 使用 EXPLAIN 分析查询
+**批量插入 vs 单条插入**：批量插入快几十倍，但单条 SQL 过大可能超过 `max_allowed_packet`。日常建议每次 500-1000 条。如果单条数据很大（比如含长文本），减少每次的批量数。
 
-掌握 CRUD 后，你已经能够完成大部分数据库操作了。接下来我们将学习更复杂的查询和连接操作。
+**INSERT IGNORE vs ON DUPLICATE KEY UPDATE**：IGNORE 遇到重复就跳过，什么都不改；upsert 遇到重复就更新。导入历史数据用 IGNORE（保留旧数据优先），实时同步用 upsert（保证数据最新）。
 
-## 下一步
+**OFFSET 分页 vs 游标分页**：OFFSET 支持跳页但深分页慢，游标分页性能稳定但不支持跳页。管理后台需要跳页时用 OFFSET，移动端和 API 无限滚动时用游标。
 
-在下一篇文章《05 高级查询与连接》中，我们将学习：
+**物理删除 vs 软删除**：物理删除节省存储、查询简单；软删除可恢复、可审计、不破坏关联。生产环境几乎一律软删除，只对临时数据和日志表用物理删除。
 
-- INNER JOIN、LEFT JOIN、RIGHT JOIN 的区别
-- 多表关联查询
-- UNION 合并查询
-- CASE 表达式
-- 字符串函数和日期函数
-- 复杂的实际应用场景
+**SELECT \* vs 指定列**：`SELECT *` 写起来方便，但会传输不需要的列（包括 TEXT 类型的大字段），浪费 I/O 和网络带宽，也无法利用覆盖索引。养成习惯只查需要的列。
 
----
+前两篇我们分别搞定了"建表"和"增删改查"，但所有操作都局限在一张表内。真实的内容平台不可能只有一张文章表——用户表、分类表、评论表、标签表……查"某个用户的文章列表及其评论数"需要跨多张表关联。下一篇我们来解决多表查询这个核心难题。

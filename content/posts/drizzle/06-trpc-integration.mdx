@@ -1,319 +1,484 @@
 ---
-title: "06. Drizzle + tRPC 完美结合"
-date: "2026-03-27"
-summary: "深入掌握 Drizzle ORM 与 tRPC 的完美结合，实现端到端的类型安全，构建全栈应用的最佳实践。"
-tags: ["Drizzle ORM", "tRPC", "TypeScript", "类型安全", "全栈开发"]
+title: "06. Drizzle + tRPC：端到端类型安全"
+date: "2026-04-28"
+summary: "数据库层类型安全了，但数据从数据库流到前端的过程中类型就断了——请求参数没校验、返回值手写类型、改了 Schema 前端不知道。Drizzle + tRPC 让类型从数据库一路穿透到组件。"
+tags: ["Drizzle ORM", "TypeScript"]
 category: "drizzle"
 draft: false
 series: "Drizzle ORM 类型安全的数据库访问实战"
 seriesOrder: 6
 ---
 
-## 前言
+上一篇我们搞定了事务和迁移，博客系统的数据库层已经完整了。但还有一个很现实的问题：**数据怎么从数据库流到前端？**
 
-**Drizzle + tRPC = 完美组合**！
+最直觉的做法是写 REST API 路由。但很快你就会发现几个痛点：请求参数用什么校验？返回值的类型谁来维护？数据库 Schema 加了个字段，后端返回了新数据，前端 TypeScript 还是旧类型——编译不报错，运行时拿不到新字段，排查半天才发现是类型没同步。
 
-两者都是**类型优先**的库，结合使用可以实现真正的**端到端类型安全**。从数据库到前端，全程类型检查，无需手动编写类型定义。
+Drizzle + tRPC 是目前 TypeScript 全栈开发中解决这类问题最干净的方案。Drizzle 在数据库层保证了类型安全，tRPC 在 API 层保证类型从后端穿透到前端。两者结合，改了数据库 Schema，类型错误会一路传递到组件 props。
 
-**本文核心内容**：
+## 为什么是 tRPC 而不是 REST
 
-- ✅ 为什么 Drizzle + tRPC 是绝配
-- ✅ 端到端类型安全流程
-- ✅ Monorepo 项目结构
-- ✅ 共享 Schema 定义
-- ✅ tRPC Router 集成
-- ✅ 输入验证（Zod）
-- ✅ 错误处理
+先说清楚 tRPC 不是什么——它不是 REST 的替代品，不是 GraphQL 的竞争者。它是一个 **TypeScript RPC 框架**，核心就一句话：**后端定义的函数签名，前端能直接推断出参数和返回值类型**。
 
----
+写 REST API 时的典型流程：
 
-## 一、为什么选择 Drizzle + tRPC？
+1. 后端定义路由 `GET /api/posts/:id`
+2. 手写 Zod schema 校验 query 参数
+3. 手写返回值类型 `interface PostResponse { ... }`
+4. 前端用 axios/fetch 调用，手写类型断言 `as PostResponse`
+5. 数据库 Schema 变了，上面四步全部要手动同步
 
-### 1.1 类型安全全景
+tRPC 的流程：
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    类型安全全链路                            │
-├─────────────────────────────────────────────────────────────┤
-│                                                               │
-│  数据库 schema (Drizzle)                                     │
-│       ↓ 类型推断                                              │
-│  数据库查询 (Drizzle ORM)                                    │
-│       ↓ 返回类型                                              │
-│  tRPC Router                                                │
-│       ↓ 自动生成 API 类型                                     │
-│  前端调用 (tRPC Client)                                      │
-│       ↓ 类型检查                                              │
-│  组件 props                                                 │
-│                                                               │
-│  修改任何一环，类型错误会立即在整个链路中显示！                │
-└─────────────────────────────────────────────────────────────┘
-```
+1. 后端写一个函数，参数和返回值的类型是 Drizzle 自动推断的
+2. 前端直接调用这个函数，TypeScript 自动知道参数和返回值
+3. 完了
 
-### 1.2 核心优势
+没有手写类型、没有类型断言、没有同步负担。
 
-| 特性          | 传统方案     | Drizzle + tRPC |
-| ------------- | ------------ | -------------- |
-| API 类型      | 手动定义     | 自动生成       |
-| 类型同步      | 需要手动更新 | 自动同步       |
-| 请求/响应验证 | 手动编写     | Zod 自动验证   |
-| 代码生成      | 需要         | 不需要         |
-| Bundle 大小   | 较大         | 极小           |
-| 开发体验      | 一般         | 极佳           |
+## 项目结构
 
----
-
-## 二、项目结构
-
-### 2.1 Monorepo 架构
+Drizzle + tRPC 的项目推荐用 monorepo，把共享的 Schema 和类型抽到独立包里。不过也不一定要用 turborepo 这种重型方案——简单的目录分层就够了。核心思路是**数据库 Schema 和 tRPC Router 在同一个 TypeScript 项目里**，类型通过 import 直接共享：
 
 ```
-my-monorepo/
-├── apps/
-│   ├── web/                    # Next.js 前端
-│   │   ├── src/
-│   │   │   ├── app/
-│   │   │   ├── components/
-│   │   │   └── lib/
-│   │   │       └── trpc/
-│   │   │           └── client.ts
-│   │   └── package.json
-│   │
-│   └── api/                    # 后端 API (tRPC)
-│       ├── src/
-│       │   ├── routers/
-│       │   │   ├── users.ts
-│       │   │   ├── posts.ts
-│       │   │   └── index.ts
-│       │   ├── context.ts
-│       │   └── index.ts
-│       └── package.json
-│
-├── packages/
-│   ├── database/               # 共享数据库层
-│   │   ├── src/
-│   │   │   ├── schema/
-│   │   │   │   ├── users.ts
-│   │   │   │   ├── posts.ts
-│   │   │   │   └── index.ts
-│   │   │   └── index.ts
-│   │   └── package.json
-│   │
-│   ├── trpc/                   # 共享 tRPC 类型
-│   │   ├── src/
-│   │   │   └── index.ts
-│   │   └── package.json
-│   │
-│   └── ui/                     # 共享 UI 组件
-│       └── package.json
-│
-├── package.json
-├── pnpm-workspace.yaml
-└── tsconfig.json
+src/
+  db/
+    schema/          # Drizzle Schema（第 2 篇定义的那些表）
+      users.ts
+      posts.ts
+      tags.ts
+      index.ts
+    index.ts         # db 实例
+  trpc/
+    context.ts       # tRPC 上下文（注入 db 和用户信息）
+    router.ts        # 合并所有子路由
+    trpc.ts          # tRPC 初始化
+  routers/
+    posts.ts         # 文章相关 API
+    comments.ts      # 评论相关 API
+    auth.ts          # 认证相关 API
 ```
 
-### 2.2 配置文件
+关键点：`db/schema/` 和 `routers/` 在同一个项目里，Router 可以直接 import Drizzle 的表定义和推断类型。不需要 monorepo 也能获得完整的类型安全。
 
-**pnpm-workspace.yaml**：
+## tRPC 后端搭建
 
-```yaml
-packages:
-  - "apps/*"
-  - "packages/*"
+### 初始化 tRPC 实例
+
+先装依赖：
+
+```bash
+pnpm add @trpc/server zod
 ```
 
-**package.json**（根目录）：
+然后创建 tRPC 实例。这里会把 Drizzle 的 db 实例注入到上下文里，这样每个 Router 都能通过 `ctx.db` 访问数据库：
 
-```json
-{
-  "name": "my-monorepo",
-  "private": true,
-  "scripts": {
-    "dev": "turbo run dev",
-    "build": "turbo run build",
-    "lint": "turbo run lint"
-  },
-  "devDependencies": {
-    "turbo": "^1.10.0",
-    "typescript": "^5.0.0"
+```typescript
+// src/trpc/trpc.ts
+import { initTRPC, TRPCError } from "@trpc/server";
+import { db } from "../db";
+
+// 上下文定义：每个请求都会携带这些信息
+export interface Context {
+  db: typeof db;
+  userId?: number; // 登录后才有
+}
+
+const t = initTRPC.context<Context>().create();
+
+export const router = t.router;
+export const publicProcedure = t.procedure;
+
+// 受认证保护的 procedure，未登录会直接报错
+export const protectedProcedure = t.procedure.use(async (opts) => {
+  if (!opts.ctx.userId) {
+    throw new TRPCError({ code: "UNAUTHORIZED" });
   }
+  return opts.next({ ctx: { ...opts.ctx, userId: opts.ctx.userId } });
+});
+```
+
+`publicProcedure` 是公开接口，`protectedProcedure` 要求用户必须登录。后面的 Router 直接用这两个来定义 API。
+
+### 创建上下文
+
+```typescript
+// src/trpc/context.ts
+import type { Context } from "./trpc";
+
+export async function createContext(opts: { req: Request }): Promise<Context> {
+  // 从请求头中提取 session token，验证后拿到 userId
+  const session = await verifySession(req.headers.get("cookie"));
+
+  return {
+    db, // Drizzle 实例，直接注入
+    userId: session?.userId,
+  };
 }
 ```
 
----
+在实际项目中，session 验证可能用 next-auth、lucia 或自己写的 JWT 中间件。核心就是从请求里拿到 userId，塞进 context。
 
-## 三、共享数据库 Schema
+### 从 Drizzle Schema 推导 Zod 验证
 
-### 3.1 数据库包结构
+这是 Drizzle + tRPC 最优雅的部分。Drizzle 的 `drizzle-zod` 包可以直接从表定义推导出 Zod schema，不需要手写：
 
-**packages/database/src/schema/users.ts**：
-
-```typescript
-import { pgTable, serial, varchar, text, timestamp } from "drizzle-orm/pg-core";
-
-export const users = pgTable("users", {
-  id: serial("id").primaryKey(),
-  email: varchar("email", { length: 255 }).notNull().unique(),
-  name: text("name"),
-  role: varchar("role", { length: 50 }).default("user"),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
-});
-
-// 类型导出
-export type User = typeof users.$inferSelect;
-export type NewUser = typeof users.$inferInsert;
+```bash
+pnpm add drizzle-zod
 ```
 
-**packages/database/src/schema/posts.ts**：
-
 ```typescript
-import {
-  pgTable,
-  serial,
-  varchar,
-  text,
-  integer,
-  timestamp,
-  boolean,
-} from "drizzle-orm/pg-core";
-import { users } from "./users";
-
-export const posts = pgTable("posts", {
-  id: serial("id").primaryKey(),
-  title: varchar("title", { length: 255 }).notNull(),
-  slug: varchar("slug", { length: 255 }).notNull().unique(),
-  content: text("content").notNull(),
-  excerpt: text("excerpt"),
-  published: boolean("published").default(false),
-  authorId: integer("author_id")
-    .references(() => users.id, { onDelete: "cascade" })
-    .notNull(),
-  createdAt: timestamp("created_at").defaultNow(),
-  updatedAt: timestamp("updated_at").defaultNow(),
-});
-
-export type Post = typeof posts.$inferSelect;
-export type NewPost = typeof posts.$inferInsert;
-```
-
-**packages/database/src/schema/index.ts**：
-
-```typescript
-export * from "./users";
-export * from "./posts";
-```
-
-**packages/database/src/index.ts**：
-
-```typescript
-import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
-import * as schema from "./schema";
-
-const query = postgres(process.env.DATABASE_URL!);
-
-export const db = drizzle(query, { schema });
-export * from "./schema";
-```
-
-### 3.2 使用共享 Schema
-
-**apps/api/src/routers/users.ts**：
-
-```typescript
+// src/routers/posts.ts
+import { createInsertSchema, createSelectSchema } from "drizzle-zod";
+import { posts, postsToTags, tags } from "../db/schema";
+import { router, publicProcedure, protectedProcedure } from "../trpc/trpc";
+import { eq, and, desc, sql } from "drizzle-orm";
 import { z } from "zod";
-import { eq } from "drizzle-orm";
-import { users, type User, type NewUser } from "@my-monorepo/database";
-import { t } from "../trpc";
 
-export const usersRouter = t.router({
-  // 查询所有用户
-  list: t.procedure.query(async ({ ctx }) => {
-    return await ctx.db.select().from(users);
-  }),
+// 从 Drizzle 表定义直接生成 Zod schema
+const insertPostSchema = createInsertSchema(posts);
 
-  // 根据 ID 查询用户
-  byId: t.procedure
+// 也可以覆盖某些字段的验证规则
+const publishPostSchema = createInsertSchema(posts, {
+  title: z.string().min(1).max(200),
+  content: z.string().min(10),
+});
+```
+
+`createInsertSchema(posts)` 会根据 `posts` 表的定义，自动生成一个 Zod schema——`title` 是必填的 string，`content` 是必填的 string，`id` 是自动生成的所以变成了 optional。你在 Schema 里定义的 `.notNull()`、`.default()` 约束，全部自动映射到 Zod 验证规则。
+
+### 实现文章 Router
+
+有了上面的基础设施，实现 CRUD 就很直接了：
+
+```typescript
+// src/routers/posts.ts（续）
+export const postsRouter = router({
+  // 获取文章列表（公开）
+  list: publicProcedure
+    .input(
+      z.object({
+        page: z.number().min(1).default(1),
+        limit: z.number().min(1).max(50).default(10),
+      })
+    )
+    .query(async ({ input, ctx }) => {
+      const { page, limit } = input;
+      const offset = (page - 1) * limit;
+
+      const [items, [{ count }]] = await Promise.all([
+        ctx.db
+          .select({
+            id: posts.id,
+            title: posts.title,
+            excerpt: posts.excerpt,
+            createdAt: posts.createdAt,
+            authorName: users.name,
+          })
+          .from(posts)
+          .innerJoin(users, eq(posts.authorId, users.id))
+          .orderBy(desc(posts.createdAt))
+          .limit(limit)
+          .offset(offset),
+        ctx.db.select({ count: sql<number>`count(*)` }).from(posts),
+      ]);
+
+      return { items, total: Number(count), page, limit };
+    }),
+
+  // 获取文章详情（公开）
+  byId: publicProcedure
     .input(z.object({ id: z.number() }))
     .query(async ({ input, ctx }) => {
-      const [user] = await ctx.db
+      const [post] = await ctx.db
         .select()
-        .from(users)
-        .where(eq(users.id, input.id));
+        .from(posts)
+        .where(eq(posts.id, input.id))
+        .limit(1);
 
-      return user; // 类型：User | undefined
+      if (!post) {
+        throw new TRPCError({ code: "NOT_FOUND", message: "文章不存在" });
+      }
+
+      // 获取关联的标签
+      const postTags = await ctx.db
+        .select({ id: tags.id, name: tags.name })
+        .from(postsToTags)
+        .innerJoin(tags, eq(postsToTags.tagId, tags.id))
+        .where(eq(postsToTags.postId, post.id));
+
+      return { ...post, tags: postTags };
     }),
 
-  // 创建用户
-  create: t.procedure
+  // 发布文章（需登录）——复用上一篇的事务逻辑
+  publish: protectedProcedure
     .input(
-      z.object({
-        email: z.string().email(),
-        name: z.string().min(1),
+      publishPostSchema.pick({ title: true, content: true }).extend({
+        tagNames: z.array(z.string()).min(1),
       })
     )
     .mutation(async ({ input, ctx }) => {
-      const [user] = await ctx.db
-        .insert(users)
-        .values(input) // 类型：NewUser
-        .returning();
+      return await ctx.db.transaction(async (tx) => {
+        const [post] = await tx
+          .insert(posts)
+          .values({
+            title: input.title,
+            content: input.content,
+            authorId: ctx.userId!,
+            slug: generateSlug(input.title),
+          })
+          .returning();
 
-      return user; // 类型：User
+        for (const tagName of input.tagNames) {
+          const [tag] = await tx
+            .insert(tags)
+            .values({ name: tagName, slug: generateSlug(tagName) })
+            .onConflictDoNothing()
+            .returning();
+
+          const actualTag =
+            tag ??
+            (
+              await tx
+                .select()
+                .from(tags)
+                .where(eq(tags.name, tagName))
+                .limit(1)
+            )[0];
+
+          await tx.insert(postsToTags).values({
+            postId: post.id,
+            tagId: actualTag.id,
+          });
+        }
+
+        return post;
+      });
     }),
 
-  // 更新用户
-  update: t.procedure
-    .input(
-      z.object({
-        id: z.number(),
-        email: z.string().email().optional(),
-        name: z.string().optional(),
-      })
-    )
-    .mutation(async ({ input, ctx }) => {
-      const { id, ...data } = input;
-
-      const [user] = await ctx.db
-        .update(users)
-        .set(data)
-        .where(eq(users.id, id))
-        .returning();
-
-      return user;
-    }),
-
-  // 删除用户
-  delete: t.procedure
+  // 删除文章（需登录，且是文章作者）
+  delete: protectedProcedure
     .input(z.object({ id: z.number() }))
     .mutation(async ({ input, ctx }) => {
-      await ctx.db.delete(users).where(eq(users.id, input.id));
+      const [post] = await ctx.db
+        .select({ authorId: posts.authorId })
+        .from(posts)
+        .where(eq(posts.id, input.id))
+        .limit(1);
 
+      if (!post) {
+        throw new TRPCError({ code: "NOT_FOUND" });
+      }
+      if (post.authorId !== ctx.userId) {
+        throw new TRPCError({
+          code: "FORBIDDEN",
+          message: "只能删除自己的文章",
+        });
+      }
+
+      await ctx.db.delete(posts).where(eq(posts.id, input.id));
       return { success: true };
     }),
 });
 ```
 
----
+注意几个设计点：
 
-## 四、tRPC 后端设置
+- `list` 和 `byId` 是 `.query()`——幂等查询，适合用 GET 缓存
+- `publish` 和 `delete` 是 `.mutation()`——有副作用的操作
+- `publish` 里复用了上一篇写的事务逻辑，直接从 tRPC mutation 调用
+- `publishPostSchema.pick()` 从 Drizzle 推导的 schema 中选取字段，再 `.extend()` 加上自定义的 `tagNames`——不需要从头写验证
 
-### 4.1 创建 tRPC 实例
+### 评论 Router
 
-**apps/api/src/trpc.ts**：
+评论的场景更简单，展示一下嵌套路由的基本模式：
 
 ```typescript
-import { initTRPC, TRPCError } from "@trpc/server";
-import { ZodError } from "zod";
-import { db } from "@my-monorepo/database";
+// src/routers/comments.ts
+export const commentsRouter = router({
+  // 获取某篇文章的评论（公开）
+  byPost: publicProcedure
+    .input(z.object({ postId: z.number() }))
+    .query(async ({ input, ctx }) => {
+      return await ctx.db
+        .select({
+          id: comments.id,
+          content: comments.content,
+          createdAt: comments.createdAt,
+          authorName: users.name,
+        })
+        .from(comments)
+        .innerJoin(users, eq(comments.authorId, users.id))
+        .where(eq(comments.postId, input.postId))
+        .orderBy(desc(comments.createdAt));
+    }),
 
-// 创建 Context 类型
-export interface Context {
-  db: typeof db;
-  userId?: number;
+  // 发表评论（需登录）
+  create: protectedProcedure
+    .input(
+      z.object({
+        postId: z.number(),
+        content: z.string().min(1).max(1000),
+      })
+    )
+    .mutation(async ({ input, ctx }) => {
+      const [comment] = await ctx.db
+        .insert(comments)
+        .values({
+          postId: input.postId,
+          authorId: ctx.userId!,
+          content: input.content,
+        })
+        .returning();
+
+      return comment;
+    }),
+});
+```
+
+### 合并路由
+
+```typescript
+// src/trpc/router.ts
+import { router } from "./trpc";
+import { postsRouter } from "../routers/posts";
+import { commentsRouter } from "../routers/comments";
+
+export const appRouter = router({
+  posts: postsRouter,
+  comments: commentsRouter,
+});
+
+// 这个类型是整个方案的核心——前端通过 import 它获得所有 API 的类型
+export type AppRouter = typeof appRouter;
+```
+
+`AppRouter` 这个类型导出是关键。前端拿到它之后，所有 tRPC 调用的参数和返回值都能自动推断。改了后端的任何返回值，前端的 TypeScript 立刻报错。
+
+### 挂载到 HTTP 服务
+
+如果你用 Next.js，这一步非常简单：
+
+```typescript
+// src/app/api/trpc/[trpc]/route.ts (App Router)
+import { fetchRequestHandler } from "@trpc/server/adapters/fetch";
+import { appRouter } from "@/trpc/router";
+import { createContext } from "@/trpc/context";
+
+export function GET(req: Request) {
+  return fetchRequestHandler({
+    endpoint: "/api/trpc",
+    req,
+    router: appRouter,
+    createContext,
+  });
 }
 
-// 创建 tRPC 实例
+export { GET as POST };
+```
+
+如果是独立 Node 服务（Hono、Express），也有对应的 adapter。
+
+## 前端：类型自动穿透
+
+### 创建 tRPC 客户端
+
+```bash
+pnpm add @trpc/client @trpc/react-query @tanstack/react-query
+```
+
+```typescript
+// src/lib/trpc.ts
+import { createTRPCReact } from "@trpc/react-query";
+import type { AppRouter } from "@/trpc/router";
+
+export const trpc = createTRPCReact<AppRouter>();
+```
+
+`AppRouter` 从后端 import 过来（monorepo 或者同一个 TypeScript 项目），`createTRPCReact` 会根据它生成一个完全类型安全的客户端。就这么一行，所有的类型推断就开始工作了。
+
+### 在组件里调用
+
+```typescript
+// 文章列表组件
+function PostList() {
+  const { data, isLoading } = trpc.posts.list.useQuery({ page: 1, limit: 10 });
+
+  if (isLoading) return <div>加载中...</div>;
+
+  return (
+    <ul>
+      {data?.items.map((post) => (
+        <li key={post.id}>
+          <h3>{post.title}</h3>
+          <span>by {post.authorName}</span>
+        </li>
+      ))}
+    </ul>
+  );
+}
+```
+
+`data.items` 的类型是后端 `posts.list` 返回值自动推断的。`post.title` 是 `string`，`post.authorName` 是 `string | null`——这些类型全部来自 Drizzle Schema 定义，经过 tRPC Router，直接到达 React 组件。中间没有任何手写类型。
+
+如果你在 Schema 里给 `users.name` 加了 `.notNull()`，Drizzle 推断的类型会变成 `string`，tRPC 自动把这个变更传递到前端，`post.authorName` 自动变成 `string`——你不需要改任何前端代码。
+
+### Mutation 调用
+
+```typescript
+function PublishPost() {
+  const utils = trpc.useUtils();
+
+  const publish = trpc.posts.publish.useMutation({
+    onSuccess: () => {
+      // 发布成功后刷新列表
+      utils.posts.list.invalidate();
+    },
+  });
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    publish.mutate({
+      title: "Drizzle + tRPC 实战",
+      content: "从数据库到前端，全程类型安全...",
+      tagNames: ["TypeScript", "tRPC"],
+    });
+  };
+
+  return <form onSubmit={handleSubmit}>...</form>;
+}
+```
+
+`publish.mutate()` 的参数类型来自 `publishPostSchema`——Drizzle 的表定义推导出来的 Zod schema。传错了字段名或类型，编辑器直接标红。
+
+## 错误处理
+
+tRPC 的错误处理有一个很好的设计：后端 throw 的 `TRPCError` 会带着结构化的错误码传到前端，前端可以根据 code 做不同的处理：
+
+```typescript
+// 后端
+if (!post) {
+  throw new TRPCError({ code: "NOT_FOUND", message: "文章不存在" });
+}
+if (post.authorId !== ctx.userId) {
+  throw new TRPCError({ code: "FORBIDDEN", message: "没有权限" });
+}
+
+// 前端
+const { data, error } = trpc.posts.byId.useQuery({ id: postId });
+
+if (error?.data?.code === "NOT_FOUND") {
+  return <div>文章不存在</div>;
+}
+if (error?.data?.code === "FORBIDDEN") {
+  return <div>没有权限查看</div>;
+}
+```
+
+Zod 验证失败也是结构化的。如果你在 tRPC 初始化时配置了 `errorFormatter`，前端能拿到完整的字段级错误信息：
+
+```typescript
+import { ZodError } from "zod";
+
 const t = initTRPC.context<Context>().create({
   errorFormatter({ shape, error }) {
     return {
@@ -326,649 +491,31 @@ const t = initTRPC.context<Context>().create({
     };
   },
 });
-
-export const t = t;
-
-// 创建中间件
-export const middleware = t.middleware;
-
-// 创建受保护的路由
-export const protectedProcedure = t.procedure.use(async (opts) => {
-  const { ctx } = opts;
-
-  if (!ctx.userId) {
-    throw new TRPCError({
-      code: "UNAUTHORIZED",
-      message: "You must be logged in",
-    });
-  }
-
-  return opts.next({
-    ctx: {
-      ...ctx,
-      userId: ctx.userId,
-    },
-  });
-});
 ```
 
-### 4.2 创建 Context
+前端拿到 `error.data.zodError`，就能精确知道哪个字段校验失败了，直接在表单上标红对应的输入框。
 
-**apps/api/src/context.ts**：
+## 和纯 REST API 的对比
 
-```typescript
-import { CreateNextContextOptions } from "@trpc/server/adapters/next";
-import { getSession } from "next-auth/react";
-import { db } from "@my-monorepo/database";
-import type { Context } from "./trpc";
+做完这些之后，回头看看如果用 REST API 写同样的功能：
 
-export async function createContext(
-  opts?: CreateNextContextOptions
-): Promise<Context> {
-  const session = await getSession(opts);
+| 方面            | REST + 手写类型                | Drizzle + tRPC                    |
+| --------------- | ------------------------------ | --------------------------------- |
+| 请求参数校验    | 手写 Zod schema 或手动校验     | `createInsertSchema` 从表定义推导 |
+| 返回值类型      | 手写 interface，容易和实际脱节 | Drizzle 自动推断，tRPC 自动传递   |
+| Schema 变更同步 | 手动更新后端类型 + 前端类型    | 改一处，全链路自动更新            |
+| 错误处理        | 自定义错误码和消息格式         | 结构化的 TRPCError + ZodError     |
+| 前端调用        | fetch/axios + 类型断言         | 类型安全的 hooks，零断言          |
+| Bundle 大小     | 取决于请求库                   | tRPC client 极小，无运行时开销    |
 
-  return {
-    db,
-    userId: session?.user?.id,
-  };
-}
-```
+代价是有的：tRPC 要求前后端都是 TypeScript。如果你的后端是 Go 或者前端要支持非 TS 项目，REST 仍然是更通用的选择。另外 tRPC 的学习曲线虽然不陡，但团队每个人都要理解它的概念。
 
-### 4.3 合并路由
+## Trade-off 分析
 
-**apps/api/src/routers/index.ts**：
+**Drizzle + tRPC 适合什么项目？** 前后端都用 TypeScript 的全栈项目，尤其是中小型团队——一个人维护前后端时，类型自动同步的价值最大。改了数据库 Schema，TypeScript 的类型错误会引导你修复所有受影响的地方。
 
-```typescript
-import { t } from "../trpc";
-import { usersRouter } from "./users";
-import { postsRouter } from "./posts";
+**不适合什么场景？** 后端不是 TypeScript（那就用不了 tRPC 的类型穿透）、需要公开 API 给第三方（REST 或 GraphQL 更合适）、团队对 tRPC 完全陌生且没有学习时间。
 
-export const appRouter = t.router({
-  users: usersRouter,
-  posts: postsRouter,
-});
+**drizzle-zod 的 schema 推导够用吗？** 简单的 CRUD 场景完全够用。但如果你有复杂的业务校验（比如"标题不能和已有文章重复"），还是需要手写 Zod schema。好消息是可以从 `createInsertSchema` 出发，用 `.extend()` 和 `.refine()` 叠加自定义逻辑，不用从头写。
 
-export type AppRouter = typeof appRouter;
-```
-
-### 4.4 Next.js API 路由
-
-**apps/api/src/pages/api/trpc/[trpc].ts**：
-
-```typescript
-import { createNextApiHandler } from "@trpc/server/adapters/next";
-import { appRouter } from "@/routers";
-import { createContext } from "@/context";
-
-export default createNextApiHandler({
-  router: appRouter,
-  createContext,
-});
-
-export type { AppRouter } from "@/routers";
-```
-
----
-
-## 五、tRPC 前端设置
-
-### 5.1 创建 tRPC Client
-
-**apps/web/src/lib/trpc/client.ts**：
-
-```typescript
-import { createTRPCReact } from "@trpc/react-query";
-import type { AppRouter } from "@my-monorepo/api";
-
-export const trpc = createTRPCReact<AppRouter>();
-```
-
-### 5.2 配置 Provider
-
-**apps/web/src/app/layout.tsx**：
-
-```typescript
-'use client';
-
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { httpBatchLink } from '@trpc/client';
-import { useState } from 'react';
-import { trpc } from '@/lib/trpc/client';
-
-export default function RootLayout({ children }: { children: React.ReactNode }) {
-  const [queryClient] = useState(() => new QueryClient());
-  const [trpcClient] = useState(() =>
-    trpc.createClient({
-      links: [
-        httpBatchLink({
-          url: 'http://localhost:3000/api/trpc',
-        }),
-      ],
-    })
-  );
-
-  return (
-    <trpc.Provider client={trpcClient} queryClient={queryClient}>
-      <QueryClientProvider client={queryClient}>
-        {children}
-      </QueryClientProvider>
-    </trpc.Provider>
-  );
-}
-```
-
----
-
-## 六、使用示例
-
-### 6.1 查询数据
-
-```typescript
-'use client';
-
-import { trpc } from '@/lib/trpc/client';
-
-export function UsersList() {
-  // 类型安全！users 是 User[]
-  const { data: users, isLoading } = trpc.users.list.useQuery();
-
-  if (isLoading) return <div>Loading...</div>;
-
-  return (
-    <ul>
-      {users?.map((user) => (
-        <li key={user.id}>
-          {user.name} ({user.email})
-        </li>
-      ))}
-    </ul>
-  );
-}
-```
-
-### 6.2 带参数的查询
-
-```typescript
-'use client';
-
-import { trpc } from '@/lib/trpc/client';
-import { useState } from 'react';
-
-export function UserDetail() {
-  const [userId, setUserId] = useState(1);
-
-  // input 类型：{ id: number }
-  // 返回类型：User | undefined
-  const { data: user } = trpc.users.byId.useQuery({ id: userId });
-
-  if (!user) return <div>User not found</div>;
-
-  return (
-    <div>
-      <h1>{user.name}</h1>
-      <p>{user.email}</p>
-      <button onClick={() => setUserId(userId + 1)}>
-        Next User
-      </button>
-    </div>
-  );
-}
-```
-
-### 6.3 创建数据
-
-```typescript
-'use client';
-
-import { trpc } from '@/lib/trpc/client';
-import { useState } from 'react';
-
-export function CreateUser() {
-  const [email, setEmail] = useState('');
-  const [name, setName] = useState('');
-
-  const utils = trpc.useContext();
-
-  // input 类型自动推断
-  const createUser = trpc.users.create.useMutation({
-    onSuccess: () => {
-      // 刷新列表
-      utils.users.list.invalidate();
-      setEmail('');
-      setName('');
-    },
-  });
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    createUser.mutate({ email, name });
-  };
-
-  return (
-    <form onSubmit={handleSubmit}>
-      <input
-        type="email"
-        value={email}
-        onChange={(e) => setEmail(e.target.value)}
-        placeholder="Email"
-        required
-      />
-      <input
-        type="text"
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-        placeholder="Name"
-        required
-      />
-      <button type="submit" disabled={createUser.isLoading}>
-        {createUser.isLoading ? 'Creating...' : 'Create User'}
-      </button>
-    </form>
-  );
-}
-```
-
-### 6.4 更新数据
-
-```typescript
-'use client';
-
-import { trpc } from '@/lib/trpc/client';
-import { useState } from 'react';
-
-export function EditUser({ userId }: { userId: number }) {
-  const { data: user } = trpc.users.byId.useQuery({ id: userId });
-  const [name, setName] = useState(user?.name || '');
-
-  const utils = trpc.useContext();
-
-  const updateUser = trpc.users.update.useMutation({
-    onSuccess: () => {
-      utils.users.byId.invalidate({ id: userId });
-    },
-  });
-
-  if (!user) return null;
-
-  const handleSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    updateUser.mutate({
-      id: userId,
-      name,
-    });
-  };
-
-  return (
-    <form onSubmit={handleSubmit}>
-      <input
-        type="text"
-        value={name}
-        onChange={(e) => setName(e.target.value)}
-      />
-      <button type="submit" disabled={updateUser.isLoading}>
-        Save
-      </button>
-    </form>
-  );
-}
-```
-
-### 6.5 删除数据
-
-```typescript
-'use client';
-
-import { trpc } from '@/lib/trpc/client';
-
-export function DeleteUserButton({ userId }: { userId: number }) {
-  const utils = trpc.useContext();
-
-  const deleteUser = trpc.users.delete.useMutation({
-    onSuccess: () => {
-      utils.users.list.invalidate();
-    },
-  });
-
-  return (
-    <button
-      onClick={() => deleteUser.mutate({ id: userId })}
-      disabled={deleteUser.isLoading}
-    >
-      {deleteUser.isLoading ? 'Deleting...' : 'Delete'}
-    </button>
-  );
-}
-```
-
----
-
-## 七、高级用法
-
-### 7.1 关系查询
-
-```typescript
-// apps/api/src/routers/posts.ts
-import { eq } from "drizzle-orm";
-import { posts, users, type Post } from "@my-monorepo/database";
-import { t } from "../trpc";
-
-export const postsRouter = t.router({
-  // 查询文章和作者
-  list: t.procedure.query(async ({ ctx }) => {
-    const result = await ctx.db
-      .select({
-        id: posts.id,
-        title: posts.title,
-        content: posts.content,
-        author: {
-          id: users.id,
-          name: users.name,
-          email: users.email,
-        },
-      })
-      .from(posts)
-      .innerJoin(users, eq(posts.authorId, users.id));
-
-    return result;
-    // 类型：{
-    //   id: number;
-    //   title: string;
-    //   content: string;
-    //   author: {
-    //     id: number;
-    //     name: string | null;
-    //     email: string;
-    //   };
-    // }[]
-  }),
-
-  // 根据 slug 查询文章（包含作者和标签）
-  bySlug: t.procedure
-    .input(z.object({ slug: z.string() }))
-    .query(async ({ input, ctx }) => {
-      const [post] = await ctx.db
-        .select()
-        .from(posts)
-        .where(eq(posts.slug, input.slug))
-        .limit(1);
-
-      if (!post) return null;
-
-      // 获取作者
-      const [author] = await ctx.db
-        .select()
-        .from(users)
-        .where(eq(users.id, post.authorId))
-        .limit(1);
-
-      // 获取标签
-      const tags = await ctx.db
-        .select()
-        .from(tags)
-        .innerJoin(postsToTags, eq(tags.id, postsToTags.tagId))
-        .where(eq(postsToTags.postId, post.id));
-
-      return {
-        ...post,
-        author,
-        tags: tags.map((t) => t.tags),
-      };
-    }),
-});
-```
-
-### 7.2 分页查询
-
-```typescript
-// apps/api/src/routers/posts.ts
-export const postsRouter = t.router({
-  paginated: t.procedure
-    .input(
-      z.object({
-        page: z.number().min(1).default(1),
-        limit: z.number().min(1).max(100).default(10),
-        published: z.boolean().optional(),
-      })
-    )
-    .query(async ({ input, ctx }) => {
-      const { page, limit, published } = input;
-      const offset = (page - 1) * limit;
-
-      const where =
-        published !== undefined ? eq(posts.published, published) : undefined;
-
-      const items = await ctx.db
-        .select()
-        .from(posts)
-        .where(where)
-        .orderBy(desc(posts.createdAt))
-        .limit(limit)
-        .offset(offset);
-
-      // 获取总数
-      const [totalResult] = await ctx.db
-        .select({ count: sql<number>`count(*)` })
-        .from(posts)
-        .where(where);
-
-      return {
-        items,
-        total: totalResult?.count || 0,
-        page,
-        limit,
-        totalPages: Math.ceil((totalResult?.count || 0) / limit),
-      };
-    }),
-});
-```
-
-### 7.3 受保护的路由
-
-```typescript
-import { protectedProcedure } from "../trpc";
-
-export const usersRouter = t.router({
-  // 公开路由
-  list: t.procedure.query(async ({ ctx }) => {
-    return await ctx.db.select().from(users);
-  }),
-
-  // 需要认证
-  me: protectedProcedure.query(async ({ ctx }) => {
-    const [user] = await ctx.db
-      .select()
-      .from(users)
-      .where(eq(users.id, ctx.userId!))
-      .limit(1);
-
-    return user;
-  }),
-
-  // 需要认证的 mutation
-  updateProfile: protectedProcedure
-    .input(
-      z.object({
-        name: z.string().optional(),
-        bio: z.string().optional(),
-      })
-    )
-    .mutation(async ({ input, ctx }) => {
-      const [user] = await ctx.db
-        .update(users)
-        .set(input)
-        .where(eq(users.id, ctx.userId!))
-        .returning();
-
-      return user;
-    }),
-});
-```
-
-### 7.4 错误处理
-
-```typescript
-export const usersRouter = t.router({
-  byId: t.procedure
-    .input(z.object({ id: z.number() }))
-    .query(async ({ input, ctx }) => {
-      const [user] = await ctx.db
-        .select()
-        .from(users)
-        .where(eq(users.id, input.id))
-        .limit(1);
-
-      if (!user) {
-        throw new TRPCError({
-          code: 'NOT_FOUND',
-          message: `User with id ${input.id} not found`,
-        });
-      }
-
-      return user;
-    }),
-});
-
-// 前端处理错误
-function UserDetail({ userId }: { userId: number }) {
-  const { data, error } = trpc.users.byId.useQuery({ id: userId });
-
-  if (error) {
-    if (error.data?.code === 'NOT_FOUND') {
-      return <div>User not found</div>;
-    }
-    return <div>Error: {error.message}</div>;
-  }
-
-  // ...
-}
-```
-
----
-
-## 八、最佳实践
-
-### 8.1 类型复用
-
-```typescript
-// ✅ 好的做法：使用 Drizzle 推断的类型
-import { type User, type NewUser } from "@my-monorepo/database";
-
-const createUser = t.procedure
-  .input(
-    z.object({
-      email: z.string().email(),
-      name: z.string().min(1),
-    })
-  )
-  .mutation(async ({ input, ctx }) => {
-    const [user] = await ctx.db
-      .insert(users)
-      .values(input) // 类型：NewUser
-      .returning();
-
-    return user; // 类型：User
-  });
-
-// ❌ 不好的做法：手动定义类型
-interface CreateUserInput {
-  email: string;
-  name: string;
-}
-
-interface UserResponse {
-  id: number;
-  email: string;
-  name: string | null;
-}
-```
-
-### 8.2 输入验证
-
-```typescript
-import { z } from "zod";
-
-// ✅ 使用 Zod 验证输入
-const createUser = t.procedure
-  .input(
-    z.object({
-      email: z.string().email("Invalid email format"),
-      name: z.string().min(2, "Name must be at least 2 characters"),
-      age: z.number().min(18, "Must be 18 or older").optional(),
-    })
-  )
-  .mutation(async ({ input }) => {
-    // input 已经是验证后的类型
-    // { email: string; name: string; age?: number }
-  });
-```
-
-### 8.3 数据转换
-
-```typescript
-// ✅ 在服务层转换数据
-const postsRouter = t.router({
-  list: t.procedure.query(async ({ ctx }) => {
-    const rawPosts = await ctx.db.select().from(posts);
-
-    // 转换为前端友好的格式
-    return rawPosts.map((post) => ({
-      ...post,
-      createdAt: post.createdAt.toISOString(),
-      updatedAt: post.updatedAt.toISOString(),
-    }));
-  }),
-});
-```
-
-### 8.4 缓存策略
-
-```typescript
-// 配置缓存时间
-const postsRouter = t.router({
-  list: t.procedure
-    .query(async ({ ctx }) => {
-      // ...
-    })
-    .meta({ cacheTime: 60 * 5 }), // 缓存 5 分钟
-});
-```
-
----
-
-## 九、总结
-
-**本文我们学习了**：
-
-✅ **Drizzle + tRPC 集成** - 端到端类型安全
-✅ **Monorepo 架构** - 共享数据库 Schema
-✅ **tRPC Router** - 类型安全的 API
-✅ **前端 Client** - 自动类型推断
-✅ **高级用法** - 关系查询、分页、认证
-
-**关键要点**：
-
-1. 使用 Monorepo 共享数据库 Schema
-2. 利用 Drizzle 的类型推断
-3. 使用 Zod 验证输入
-4. 保持 API 和数据库类型同步
-
-**优势总结**：
-
-- 🚀 **零手动类型定义**
-- 🔒 **完全类型安全**
-- ⚡ **自动代码补全**
-- 📦 **极小 Bundle**
-- 🛠️ **极佳开发体验**
-
-**下一步**：
-
-在下一篇文章《与 Next.js/Nuxt 深度集成》中，我们将学习：
-
-- Next.js Server Components 集成
-- Server Actions 使用
-- 连接池管理
-- 环境变量配置
-
----
-
-**相关代码**：[06-trpc-integration](https://github.com/yourname/drizzle-examples/tree/06-trpc-integration)
+下一篇我们离开 API 层，看看 Drizzle 怎么和 Next.js / Nuxt 等框架深度集成——Server Components、Server Actions、连接池管理，这些框架级的优化才是上生产前的最后一步。

@@ -1,840 +1,464 @@
 ---
 title: "09. 性能优化和最佳实践"
 date: "2026-03-30"
-summary: "深入掌握 Drizzle ORM 的性能优化技巧，学习索引策略、查询优化、缓存方案等生产级最佳实践。"
-tags: ["Drizzle ORM", "性能优化", "索引", "缓存", "监控"]
+summary: "从博客系统首页变慢的真实场景出发，逐步诊断和解决 N+1 查询、缺失索引、连接池爆满等生产环境性能问题。"
+tags: ["Drizzle ORM", "TypeScript"]
 category: "drizzle"
 draft: false
 series: "Drizzle ORM 类型安全的数据库访问实战"
 seriesOrder: 9
 ---
 
-## 前言
+前八篇我们从 Schema 设计到 Edge 部署，把博客系统从头搭了一遍。但"能跑"和"跑得快"是两回事——当文章数到 10 万、并发用户到 1000，你可能发现首页加载从 200ms 变成了 2 秒。
 
-在生产环境中，**性能优化**是确保应用流畅运行的关键。Drizzle ORM 提供了多种优化手段，让我们可以充分发挥数据库性能。
+今天不讲理论，我们直接从博客系统上线后遇到的真实性能问题出发，逐个诊断和解决。
 
-**本文核心内容**：
+## 首页文章列表为什么变慢了
 
-- ✅ 查询性能优化
-- ✅ 索引策略
-- ✅ 连接池配置
-- ✅ 预编译语句
-- ✅ 批量操作优化
-- ✅ 缓存策略
-- ✅ 监控和日志
-
----
-
-## 一、查询性能优化
-
-### 1.1 只查询需要的字段
+博客上线两个月，文章从 50 篇涨到了 5000 篇，首页加载从 200ms 慢到了 800ms。打开 Drizzle 的查询日志看了一眼：
 
 ```typescript
-// ❌ 不好的做法：查询所有字段
-const users = await db.select().from(users);
+// 开启 Drizzle 的 logger
+import { drizzle } from "drizzle-orm/node-postgres";
 
-// ✅ 好的做法：只查询需要的字段
-const users = await db
-  .select({
-    id: users.id,
-    name: users.name,
-  })
-  .from(users);
-
-// SQL：SELECT id, name FROM users
+export const db = drizzle(pool, {
+  schema,
+  logger: true, // 控制台打印每条 SQL
+});
 ```
 
-### 1.2 使用索引字段过滤
+日志显示首页加载触发了这条查询：
 
-```typescript
-// ❌ 不好的做法：在非索引字段上过滤
-const users = await db.select().from(users).where(ilike(users.name, "%John%")); // 无法使用索引
-
-// ✅ 好的做法：在索引字段上过滤
-const users = await db
-  .select()
-  .from(users)
-  .where(eq(users.email, "john@example.com")); // 使用索引
+```sql
+SELECT id, title, slug, content, excerpt, cover_image, author_id,
+       published, view_count, created_at, updated_at, published_at
+FROM posts
+ORDER BY created_at DESC
+LIMIT 20
 ```
 
-### 1.3 避免 SELECT \*
+两个问题一目了然：第一，`content` 字段被查出来了——文章正文动辄几千字，首页列表根本用不到；第二，`ORDER BY created_at DESC` 没有索引，5000 条数据做了全表排序。
+
+### 只查需要的字段
+
+Drizzle 的 `select()` 不传参数等同于 `SELECT *`。首页列表只需要标题、摘要、封面这几个字段：
 
 ```typescript
-// ❌ 不好的做法：SELECT *
-const posts = await db.select().from(posts);
-
-// ✅ 好的做法：明确字段
 const posts = await db
   .select({
-    id: posts.id,
-    title: posts.title,
-    slug: posts.slug,
+    id: postsTable.id,
+    title: postsTable.title,
+    slug: postsTable.slug,
+    excerpt: postsTable.excerpt,
+    coverImage: postsTable.coverImage,
+    createdAt: postsTable.createdAt,
   })
-  .from(posts);
-
-// 如果确实需要所有字段，至少排除大字段
-const posts = await db
-  .select({
-    id: posts.id,
-    title: posts.title,
-    // content 很大，不查询
-  })
-  .from(posts);
+  .from(postsTable)
+  .orderBy(desc(postsTable.createdAt))
+  .limit(20);
 ```
 
-### 1.4 使用 LIMIT
+光这一步，查询返回的数据量从每条约 5KB 降到了约 200 字节，网络传输时间直接砍掉 90%。
 
-```typescript
-// ✅ 好的做法：限制结果数量
-const users = await db.select().from(users).limit(100);
+### 给排序字段加索引
 
-// 分页
-const page = 1;
-const pageSize = 20;
-const users = await db
-  .select()
-  .from(users)
-  .limit(pageSize)
-  .offset((page - 1) * pageSize);
-```
-
----
-
-## 二、索引策略
-
-### 2.1 创建索引
+没有索引的 `ORDER BY created_at DESC` 迫使 PostgreSQL 对全表做排序。解决方案是在 Schema 里加上索引：
 
 ```typescript
 import {
   pgTable,
   serial,
-  varchar,
   text,
+  integer,
+  boolean,
+  timestamp,
   index,
-  uniqueIndex,
 } from "drizzle-orm/pg-core";
 
-export const users = pgTable(
-  "users",
-  {
-    id: serial("id").primaryKey(),
-    email: varchar("email", { length: 255 }).notNull(),
-    name: text("name"),
-    username: varchar("username", { length: 50 }).notNull(),
-    role: varchar("role", { length: 50 }),
-    status: varchar("status", { length: 50 }),
-    createdAt: timestamp("created_at").defaultNow(),
-  },
-  (table) => ({
-    // 单列索引
-    emailIdx: index("users_email_idx").on(table.email),
-    usernameIdx: uniqueIndex("users_username_idx").on(table.username),
-
-    // 复合索引
-    roleStatusIdx: index("users_role_status_idx").on(table.role, table.status),
-
-    // 用于排序的索引
-    createdAtIdx: index("users_created_at_idx").on(table.createdAt),
-  })
-);
-```
-
-### 2.2 索引类型选择
-
-```typescript
-import { pgTable, index, uniqueIndex, ginIndex } from 'drizzle-orm/pg-core';
-
-// B-tree 索引（默认）
-emailIdx: index('idx').on(table.email),
-
-// 唯一索引
-usernameIdx: uniqueIndex('idx').on(table.username),
-
-// GIN 索引（用于 JSONB）
-searchIdx: ginIndex('idx').on(table.metadata),
-
-// 复合索引（注意列顺序）
-// 查询时，第一列必须存在才能使用索引
-roleStatusIdx: index('idx').on(table.role, table.status),
-// ✅ WHERE role = 'admin'
-// ✅ WHERE role = 'admin' AND status = 'active'
-// ❌ WHERE status = 'active'（第一列不存在）
-```
-
-### 2.3 部分索引
-
-```typescript
-import { pgTable, index, sql } from "drizzle-orm/pg-core";
-
-export const orders = pgTable(
-  "orders",
-  {
-    id: serial("id").primaryKey(),
-    status: varchar("status", { length: 50 }).notNull(),
-    createdAt: timestamp("created_at").defaultNow(),
-  },
-  (table) => ({
-    // 只索引未完成的订单
-    activeOrdersIdx: index("active_orders_idx")
-      .on(table.createdAt)
-      .where(sql`${table.status} != 'completed'`),
-  })
-);
-```
-
-### 2.4 索引最佳实践
-
-```typescript
-// ✅ 好的做法：为 WHERE 子句创建索引
 export const posts = pgTable(
   "posts",
   {
-    authorId: integer("author_id"),
-    published: boolean("published"),
+    id: serial("id").primaryKey(),
+    title: text("title").notNull(),
+    slug: text("slug").notNull().unique(),
+    content: text("content").notNull(),
+    excerpt: text("excerpt"),
+    coverImage: text("cover_image"),
+    published: boolean("published").default(false),
+    authorId: integer("author_id")
+      .references(() => users.id)
+      .notNull(),
+    viewCount: integer("view_count").default(0),
+    createdAt: timestamp("created_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .defaultNow()
+      .notNull(),
+    publishedAt: timestamp("published_at", { withTimezone: true }),
   },
   (table) => ({
-    // 用于 WHERE authorId = ?
-    authorIdx: index("idx").on(table.authorId),
-
-    // 用于 WHERE authorId = ? AND published = ?
-    authorPublishedIdx: index("idx").on(table.authorId, table.published),
+    // 给 ORDER BY created_at DESC 加索引
+    createdAtIndex: index("posts_created_at_idx").on(table.createdAt.desc()),
+    // WHERE published = true 经常用到，和 created_at 组成复合索引
+    publishedCreatedIdx: index("posts_published_created_idx").on(
+      table.published,
+      table.createdAt.desc()
+    ),
   })
 );
+```
 
-// 查询
-await db
+修改 Schema 后运行迁移：
+
+```bash
+npx drizzle-kit generate
+npx drizzle-kit migrate
+```
+
+复合索引 `posts_published_created_idx` 的好处是，当你查询 `WHERE published = true ORDER BY created_at DESC` 时，PostgreSQL 可以直接走索引扫描，不需要回表排序。
+
+改完这两处，首页查询从 800ms 降到了 15ms。
+
+## 热门文章的评论出现了 N+1 问题
+
+博客有一篇阅读量 10 万的爆款文章，评论有 300 条。文章详情页的加载时间突然飙升到 1.5 秒。
+
+问题出在评论的嵌套展示逻辑上。原始代码是这样的：
+
+```typescript
+// 查询文章的所有评论
+const comments = await db
   .select()
-  .from(posts)
-  .where(and(eq(posts.authorId, 1), eq(posts.published, true)));
-// 使用 authorPublishedIdx 索引
-```
+  .from(commentsTable)
+  .where(eq(commentsTable.postId, postId));
 
-### 2.5 查看索引使用情况
-
-```sql
--- PostgreSQL 查看索引使用统计
-SELECT
-  schemaname,
-  tablename,
-  indexname,
-  idx_scan as index_scans,
-  idx_tup_read as tuples_read,
-  idx_tup_fetch as tuples_fetched
-FROM pg_stat_user_indexes
-WHERE tablename = 'users'
-ORDER BY idx_scan ASC;
-
--- 查看未使用的索引
-SELECT
-  schemaname,
-  tablename,
-  indexname
-FROM pg_stat_user_indexes
-WHERE idx_scan = 0
-  AND indexname NOT LIKE '%_pkey';
-```
-
----
-
-## 三、连接池配置
-
-### 3.1 生产环境配置
-
-```typescript
-import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
-
-export const db = drizzle(
-  postgres(process.env.DATABASE_URL!, {
-    // 最大连接数
-    max: 10,
-
-    // 空闲连接超时（秒）
-    idle_timeout: 20,
-
-    // 连接超时（秒）
-    connect_timeout: 10,
-
-    // 最大连接生命周期（秒，30 分钟）
-    max_lifetime: 60 * 30,
-
-    // 启用 prepared statements 缓存
-    prepare: true,
-
-    // 懒加载连接
-    lazy: true,
-
-    // 连接空闲时发送 ping
-    idle_in_transaction_session_timeout: 60,
-
-    // onnotice 回调
-    onnotice: (notice) => console.log("PostgreSQL notice:", notice),
-  }),
-  { schema }
-);
-```
-
-### 3.2 不同环境的配置
-
-```typescript
-const isDev = process.env.NODE_ENV === "development";
-const isTest = process.env.NODE_ENV === "test";
-const isProd = process.env.NODE_ENV === "production";
-
-export const db = drizzle(
-  postgres(process.env.DATABASE_URL!, {
-    // 开发环境：单连接（避免热重载问题）
-    max: isDev ? 1 : isProd ? 10 : 1,
-
-    // 测试环境：快速超时
-    idle_timeout: isTest ? 1 : 20,
-
-    // 生产环境：较长生命周期
-    max_lifetime: isProd ? 60 * 30 : 60 * 5,
-
-    // 是否 prepared statements
-    prepare: !isDev,
-  }),
-  { schema }
-);
-```
-
-### 3.3 Serverless 环境
-
-```typescript
-// Vercel / Netlify / Cloudflare Workers
-// 使用无状态连接
-import { drizzle } from "drizzle-orm/neon-http";
-import { neon } from "@neondatabase/serverless";
-
-const sql = neon(process.env.DATABASE_URL!);
-export const db = drizzle(sql, { schema });
-```
-
----
-
-## 四、预编译语句
-
-### 4.1 使用 Prepare
-
-```typescript
-// ✅ 好的做法：使用预编译语句
-const getUserById = db
-  .select()
-  .from(users)
-  .where(eq(users.id, sql.placeholder("id")))
-  .prepare();
-
-// 多次使用
-const user1 = await getUserById.execute({ id: 1 });
-const user2 = await getUserById.execute({ id: 2 });
-const user3 = await getUserById.execute({ id: 3 });
-
-// SQL 只编译一次，然后复用
-```
-
-### 4.2 带参数的预编译语句
-
-```typescript
-// 复杂查询预编译
-const getActiveUsers = db
-  .select({
-    id: users.id,
-    name: users.name,
-    email: users.email,
-  })
-  .from(users)
-  .where(
-    and(
-      eq(users.status, sql.placeholder("status")),
-      gt(users.createdAt, sql.placeholder("since"))
-    )
-  )
-  .orderBy(desc(users.createdAt))
-  .limit(sql.placeholder("limit"))
-  .prepare();
-
-// 使用
-const activeUsers = await getActiveUsers.execute({
-  status: "active",
-  since: new Date("2024-01-01"),
-  limit: 50,
-});
-```
-
-### 4.3 预编译语句缓存
-
-```typescript
-// 创建预编译语句缓存
-const statementCache = new Map<string, PreparedQuery>();
-
-function getCachedStatement(
-  db: DrizzleDB,
-  key: string,
-  builder: () => PreparedQuery
-) {
-  if (!statementCache.has(key)) {
-    statementCache.set(key, builder());
-  }
-  return statementCache.get(key)!;
-}
-
-// 使用
-const getUserStmt = getCachedStatement(db, "getUserById", () =>
-  db
-    .select()
+// 为每条评论查作者信息——这就是 N+1
+for (const comment of comments) {
+  const [author] = await db
+    .select({ id: users.id, name: users.name, avatar: users.avatar })
     .from(users)
-    .where(eq(users.id, sql.placeholder("id")))
-    .prepare()
-);
-```
+    .where(eq(users.id, comment.authorId))
+    .limit(1);
 
----
-
-## 五、批量操作优化
-
-### 5.1 批量插入
-
-```typescript
-// ❌ 不好的做法：循环插入
-for (const user of users) {
-  await db.insert(usersTable).values(user);
-}
-
-// ✅ 好的做法：批量插入
-await db.insert(usersTable).values(users);
-```
-
-### 5.2 批量更新
-
-```typescript
-import { sql } from "drizzle-orm";
-
-// ❌ 不好的做法：循环更新
-for (const user of users) {
-  await db
-    .update(usersTable)
-    .set({ lastLoginAt: new Date() })
-    .where(eq(usersTable.id, user.id));
-}
-
-// ✅ 好的做法 1：使用 CASE WHEN
-await db.execute(sql`
-  UPDATE users
-  SET last_login_at = CASE id
-    ${sql.join(
-      users.map((u) => sql`WHEN ${u.id} THEN ${new Date()}`),
-      sql` `
-    )}
-    ELSE last_login_at
-  END
-  WHERE id = ANY(${users.map((u) => u.id)})
-`);
-
-// ✅ 好的做法 2：使用事务批量更新
-await db.transaction(async (tx) => {
-  for (const user of users) {
-    await tx
-      .update(usersTable)
-      .set({ lastLoginAt: new Date() })
-      .where(eq(usersTable.id, user.id));
-  }
-});
-```
-
-### 5.3 批量删除
-
-```typescript
-// ❌ 不好的做法
-for (const id of ids) {
-  await db.delete(usersTable).where(eq(usersTable.id, id));
-}
-
-// ✅ 好的做法：使用 IN
-import { sql } from "drizzle-orm";
-
-await db.delete(usersTable).where(sql`${usersTable.id} = ANY(${ids})`);
-```
-
----
-
-## 六、缓存策略
-
-### 6.1 应用层缓存
-
-```typescript
-import Redis from "ioredis";
-
-const redis = new Redis(process.env.REDIS_URL!);
-
-export async function getCachedUser(id: number) {
-  // 1. 尝试从 Redis 读取
-  const cached = await redis.get(`user:${id}`);
-  if (cached) {
-    return JSON.parse(cached);
-  }
-
-  // 2. 从数据库查询
-  const [user] = await db.select().from(users).where(eq(users.id, id)).limit(1);
-
-  if (!user) {
-    return null;
-  }
-
-  // 3. 写入缓存（5 分钟）
-  await redis.setex(`user:${id}`, 300, JSON.stringify(user));
-
-  return user;
-}
-
-export async function invalidateUserCache(id: number) {
-  await redis.del(`user:${id}`);
-  await redis.del("users:all");
-  await redis.del("users:active");
+  comment.author = author;
 }
 ```
 
-### 6.2 查询结果缓存
+300 条评论意味着 301 次数据库查询（1 次查评论 + 300 次查作者）。这就是经典的 N+1 问题。
+
+### 用 JOIN 一次搞定
 
 ```typescript
-import LRUCache from "lru-cache";
-
-const queryCache = new LRUCache<string, any>({
-  max: 500, // 最大缓存数量
-  ttl: 1000 * 60 * 5, // 5 分钟过期
-});
-
-export async function getPopularPosts() {
-  const cacheKey = "posts:popular";
-
-  // 检查缓存
-  const cached = queryCache.get(cacheKey);
-  if (cached) {
-    return cached;
-  }
-
-  // 查询数据库
-  const posts = await db
-    .select()
-    .from(postsTable)
-    .where(eq(postsTable.published, true))
-    .orderBy(desc(postsTable.views))
-    .limit(10);
-
-  // 写入缓存
-  queryCache.set(cacheKey, posts);
-
-  return posts;
-}
-```
-
-### 6.3 HTTP 缓存
-
-```typescript
-// Next.js API 路由
-import { NextResponse } from "next/server";
-
-export async function GET() {
-  const posts = await db.select().from(postsTable);
-
-  return NextResponse.json(posts, {
-    headers: {
-      // 强缓存 5 分钟
-      "Cache-Control": "public, max-age=300, s-maxage=300",
-
-      // 协商缓存
-      ETag: JSON.stringify(posts).toString(),
+const commentsWithAuthors = await db
+  .select({
+    id: commentsTable.id,
+    content: commentsTable.content,
+    createdAt: commentsTable.createdAt,
+    parentId: commentsTable.parentId,
+    status: commentsTable.status,
+    author: {
+      id: users.id,
+      name: users.name,
+      avatar: users.avatar,
     },
+  })
+  .from(commentsTable)
+  .innerJoin(users, eq(commentsTable.authorId, users.id))
+  .where(eq(commentsTable.postId, postId))
+  .orderBy(desc(commentsTable.createdAt));
+```
+
+一次查询拿到所有评论和作者信息。查询次数从 301 降到 1，加载时间从 1.5 秒降到 50ms。
+
+识别 N+1 的方法很简单：如果你在循环里做数据库查询，大概率就是 N+1。解决办法就是 JOIN 或者批量 IN 查询。
+
+## 批量导入文章时连接数爆了
+
+运营团队需要把旧博客系统的 2000 篇文章迁移过来。同事写了个迁移脚本：
+
+```typescript
+// 危险操作：循环里逐条插入，每条都是独立的数据库连接
+for (const post of legacyPosts) {
+  await db.insert(postsTable).values({
+    title: post.title,
+    slug: post.slug,
+    content: post.content,
+    authorId: post.authorId,
+    createdAt: new Date(post.created_at),
+    updatedAt: new Date(),
   });
 }
 ```
 
----
+跑到 200 篇的时候，数据库报错 `too many connections`。
 
-## 七、监控和日志
+### 用批量插入替代循环单条
 
-### 7.1 查询日志
+Drizzle 的 `insert().values()` 支持传入数组，一次 SQL 插入多行：
 
 ```typescript
-import { drizzle } from "drizzle-orm/postgres-js";
-import postgres from "postgres";
+// 每批 100 条，避免单条 SQL 过长
+const BATCH_SIZE = 100;
 
-export const db = drizzle(
-  postgres(process.env.DATABASE_URL!, {
-    // 查询日志
-    onnotice: (notice) => {
-      console.log("PostgreSQL notice:", notice);
-    },
+for (let i = 0; i < legacyPosts.length; i += BATCH_SIZE) {
+  const batch = legacyPosts.slice(i, i + BATCH_SIZE);
 
-    // 连接日志
-    connect: () => {
-      console.log("New database connection established");
-    },
-
-    // 查询前日志
-    debug: (connection_id, query, params) => {
-      console.log("Query:", query, "Params:", params);
-    },
-  }),
-  { schema }
-);
+  await db.insert(postsTable).values(
+    batch.map((post) => ({
+      title: post.title,
+      slug: post.slug,
+      content: post.content,
+      authorId: post.authorId,
+      createdAt: new Date(post.created_at),
+      updatedAt: new Date(),
+    }))
+  );
+}
 ```
 
-### 7.2 性能监控
+2000 篇文章从 2000 次查询变成了 20 次，而且不再有连接数问题。
+
+如果批量操作涉及更新和删除，用事务包裹能进一步提升性能：
 
 ```typescript
+await db.transaction(async (tx) => {
+  // 事务内的所有操作共享同一个连接
+  for (let i = 0; i < legacyPosts.length; i += BATCH_SIZE) {
+    const batch = legacyPosts.slice(i, i + BATCH_SIZE);
+    await tx.insert(postsTable).values(batch.map(transformPost));
+  }
+});
+```
+
+事务的好处是所有操作在同一个连接上执行，而且要么全部成功、要么全部回滚。
+
+## 连接池参数调优
+
+解决批量导入的问题后，我们顺手调了一下连接池参数。博客系统用的是 `postgres.js` 驱动，连接池配置直接影响并发能力。
+
+```typescript
+import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
 
+const client = postgres(process.env.DATABASE_URL!, {
+  max: 10, // 最大连接数，根据数据库规格调整
+  idle_timeout: 20, // 空闲连接 20 秒后回收
+  connect_timeout: 10, // 建立连接超时 10 秒
+  max_lifetime: 60 * 30, // 连接最长存活 30 分钟，防止内存泄漏
+});
+
+export const db = drizzle(client, { schema });
+```
+
+几个参数的解释：
+
+- `max` 设多大取决于你的数据库能承受多少并发连接。PostgreSQL 默认最大 100 个连接，如果应用有多个实例（比如 5 个 Pod），每个实例 `max` 设 10 就占了 50 个连接，留些余量给运维工具和临时查询。
+- `idle_timeout` 太小会导致频繁建连接，太大则浪费数据库资源。20 秒是个比较安全的值。
+- `max_lifetime` 是个容易被忽略的参数。长时间复用同一个连接可能遇到数据库端的内存泄漏或状态异常，30 分钟重建一次是合理的折中。
+
+不同环境的配置思路不同：
+
+```typescript
+const isDev = process.env.NODE_ENV === "development";
+
+const client = postgres(process.env.DATABASE_URL!, {
+  max: isDev ? 1 : 10, // 开发环境单连接，避免热重载连接泄漏
+  idle_timeout: isDev ? 5 : 20,
+  prepare: !isDev, // 开发环境关闭 prepared statements，方便调试
+});
+```
+
+开发环境用单连接有个好处：每次 HMR 热重载不会创建新连接，避免开发时连接数疯涨。
+
+## Prepared Statements：预编译查询
+
+博客首页是访问量最大的页面，每次都编译同一条 SQL 有些浪费。Drizzle 支持 Prepared Statements，把 SQL 编译一次、多次执行：
+
+```typescript
+import { sql } from "drizzle-orm";
+
+// 定义预编译查询
+const getLatestPosts = db
+  .select({
+    id: postsTable.id,
+    title: postsTable.title,
+    slug: postsTable.slug,
+    excerpt: postsTable.excerpt,
+    coverImage: postsTable.coverImage,
+    createdAt: postsTable.createdAt,
+  })
+  .from(postsTable)
+  .where(eq(postsTable.published, sql.placeholder("published")))
+  .orderBy(desc(postsTable.createdAt))
+  .limit(sql.placeholder("limit"))
+  .prepare("getLatestPosts");
+
+// 每次请求直接执行，跳过 SQL 编译
+const posts = await getLatestPosts.execute({ published: true, limit: 20 });
+```
+
+`prepare("getLatestPosts")` 中的字符串是语句标识符，`postgres.js` 驱动会按这个标识符缓存编译结果。注意标识符要全局唯一，不同的 prepare 调用不能用相同的名字。
+
+Prepared Statements 最适合高频查询场景——首页列表、热门文章、用户信息查询这些每次请求都会触发的操作。对于只执行一次的管理后台查询，加了反而多余。
+
+## 慢查询监控和 Drizzle Logger
+
+优化做完了，但线上随时可能出现新的慢查询。我们需要一个持续运行的监控机制。
+
+Drizzle 的自定义 logger 可以捕获每条查询的执行时间：
+
+```typescript
 export const db = drizzle(client, {
   schema,
   logger: {
     logQuery: (query, params) => {
       const start = Date.now();
-
-      return async () => {
+      // 返回一个回调，查询执行完后调用
+      return () => {
         const duration = Date.now() - start;
-
-        // 记录慢查询
         if (duration > 100) {
-          console.warn(`Slow query (${duration}ms):`, query, params);
+          console.warn(`[Slow Query] ${duration}ms | ${query}`);
         }
-
-        // 发送到监控系统
-        // await metricsService.recordQuery({ query, duration, params });
       };
     },
   },
 });
 ```
 
-### 7.3 健康检查
+超过 100ms 的查询会被记录下来。你可以把 `console.warn` 替换成发送到监控系统（比如 Datadog、Grafana）的逻辑。
+
+这里有个容易踩的坑：Drizzle 的 `logger: true` 只是打印 SQL 语句，不包含执行时间。要拿到执行时间，必须用 `logQuery` 自定义 logger，像上面那样手动计时。
+
+一个实用的健康检查接口也值得加上：
 
 ```typescript
+import { sql } from "drizzle-orm";
+
 export async function healthCheck() {
-  try {
-    const start = Date.now();
+  const start = Date.now();
+  await db.execute(sql`SELECT 1`);
+  const latency = Date.now() - start;
 
-    await db.execute(sql`SELECT 1`);
-
-    const duration = Date.now() - start;
-
-    return {
-      status: "healthy",
-      database: {
-        connected: true,
-        latency: `${duration}ms`,
-      },
-    };
-  } catch (error) {
-    return {
-      status: "unhealthy",
-      database: {
-        connected: false,
-        error: error instanceof Error ? error.message : "Unknown error",
-      },
-    };
-  }
+  return {
+    database: { connected: true, latency: `${latency}ms` },
+    status: latency < 50 ? "healthy" : "degraded",
+  };
 }
+```
 
-// API 路由
-export async function GET() {
-  const health = await healthCheck();
+部署后把这个接口接到负载均衡器的健康检查上，数据库一慢就能第一时间知道。
 
-  return Response.json(health, {
-    status: health.status === "healthy" ? 200 : 503,
+## 缓存策略：别让每个请求都打到数据库
+
+热门文章每小时访问量 1000 次，每次都查数据库太浪费。引入缓存层可以大幅减少数据库压力。
+
+### 应用层内存缓存
+
+对于数据变化不频繁的内容，进程内 LRU 缓存最简单：
+
+```typescript
+import { LRUCache } from "lru-cache";
+
+const postCache = new LRUCache<string, any>({
+  max: 200, // 最多缓存 200 篇文章
+  ttl: 1000 * 60 * 5, // 5 分钟过期
+});
+
+async function getPostBySlug(slug: string) {
+  const cached = postCache.get(`post:${slug}`);
+  if (cached) return cached;
+
+  const [post] = await db
+    .select()
+    .from(postsTable)
+    .where(eq(postsTable.slug, slug))
+    .limit(1);
+
+  if (post) {
+    postCache.set(`post:${slug}`, post);
+  }
+  return post;
+}
+```
+
+注意内存缓存只适合单实例部署。如果你的应用跑多个 Pod，每个 Pod 的缓存是独立的，可能出现不一致。这种情况用 Redis 做共享缓存更合适。
+
+### HTTP 缓存
+
+对于公开内容（文章列表、文章详情），CDN 层的 HTTP 缓存比应用缓存更高效：
+
+```typescript
+// Next.js App Router 示例
+export async function GET(request: Request) {
+  const posts = await getLatestPosts.execute({ published: true, limit: 20 });
+
+  return Response.json(posts, {
+    headers: {
+      "Cache-Control": "public, s-maxage=300, stale-while-revalidate=60",
+    },
   });
 }
 ```
 
----
+`stale-while-revalidate=60` 的意思是：缓存过期后的 60 秒内，先返回旧数据，后台异步刷新。用户永远不会感受到缓存未命中。
 
-## 八、实战优化案例
-
-### 8.1 优化 N+1 查询
+缓存有个原则：写操作必须主动失效缓存，不能只靠 TTL 过期。文章更新或发布时，清除对应的缓存 key：
 
 ```typescript
-// ❌ N+1 问题
-const posts = await db.select().from(postsTable);
+async function publishPost(postId: number) {
+  const [post] = await db
+    .update(postsTable)
+    .set({ published: true, publishedAt: new Date() })
+    .where(eq(postsTable.id, postId))
+    .returning();
 
-for (const post of posts) {
-  const [author] = await db
-    .select()
-    .from(users)
-    .where(eq(users.id, post.authorId))
-    .limit(1);
+  // 清缓存
+  postCache.delete(`post:${post.slug}`);
+  postCache.delete("posts:latest");
 
-  post.author = author;
-}
-
-// ✅ 使用 JOIN
-const posts = await db
-  .select({
-    id: postsTable.id,
-    title: postsTable.title,
-    author: {
-      id: users.id,
-      name: users.name,
-      email: users.email,
-    },
-  })
-  .from(postsTable)
-  .innerJoin(users, eq(postsTable.authorId, users.id));
-```
-
-### 8.2 优化分页查询
-
-```typescript
-// ❌ 使用 OFFSET（慢）
-const page = 1000;
-const pageSize = 20;
-
-const posts = await db
-  .select()
-  .from(postsTable)
-  .limit(pageSize)
-  .offset((page - 1) * pageSize);
-// 需要扫描前 1000 + 20 条记录
-
-// ✅ 使用游标分页（快）
-const lastId = 20000; // 上一页最后一条记录的 ID
-
-const posts = await db
-  .select()
-  .from(postsTable)
-  .where(gt(postsTable.id, lastId))
-  .orderBy(postsTable.id)
-  .limit(pageSize);
-// 只扫描需要的记录
-```
-
-### 8.3 优化计数查询
-
-```typescript
-// ❌ 不好的做法：每次都查询计数
-const [countResult] = await db
-  .select({ count: sql<number>`count(*)` })
-  .from(postsTable);
-
-const posts = await db.select().from(postsTable).limit(20);
-
-// ✅ 好的做法：缓存计数或使用元数据
-const posts = await db.select().from(postsTable).limit(21); // 多查一条
-
-const hasMore = posts.length === 21;
-const items = posts.slice(0, 20);
-
-return { items, hasMore };
-```
-
----
-
-## 九、最佳实践清单
-
-### 9.1 查询优化
-
-```typescript
-// ✅ 只查询需要的字段
-await db.select({ id: users.id, name: users.name }).from(users);
-
-// ✅ 使用索引字段过滤
-await db.select().from(users).where(eq(users.email, "test@example.com"));
-
-// ✅ 使用 LIMIT
-await db.select().from(users).limit(100);
-
-// ✅ 使用预编译语句
-const stmt = db
-  .select()
-  .from(users)
-  .where(eq(users.id, sql.placeholder("id")))
-  .prepare();
-await stmt.execute({ id: 1 });
-```
-
-### 9.2 索引优化
-
-```typescript
-// ✅ 为常用查询条件创建索引
-export const users = pgTable(
-  "users",
-  {
-    email: varchar("email").notNull(),
-  },
-  (table) => ({
-    emailIdx: index("idx").on(table.email),
-  })
-);
-
-// ✅ 使用复合索引
-export const posts = pgTable(
-  "posts",
-  {
-    authorId: integer("author_id"),
-    published: boolean("published"),
-  },
-  (table) => ({
-    authorPublishedIdx: index("idx").on(table.authorId, table.published),
-  })
-);
-```
-
-### 9.3 缓存优化
-
-```typescript
-// ✅ 使用 Redis 缓存热点数据
-const cached = await redis.get("key");
-if (cached) return JSON.parse(cached);
-
-// ✅ 设置合理的过期时间
-await redis.setex("key", 300, value); // 5 分钟
-
-// ✅ 正确失效缓存
-await redis.del("key");
-```
-
-### 9.4 错误处理
-
-```typescript
-// ✅ 正确处理数据库错误
-try {
-  const user = await db.select().from(users).where(eq(users.id, id));
-} catch (error) {
-  if (error instanceof PostgresError) {
-    if (error.code === "23505") {
-      // 唯一约束冲突
-      throw new ConflictError("Email already exists");
-    }
-  }
-  throw error;
+  return post;
 }
 ```
 
----
+## 查看索引使用情况
 
-## 十、总结
+加了一堆索引之后，怎么知道哪些在用、哪些是摆设？PostgreSQL 自带了索引使用统计：
 
-**本文我们学习了**：
+```sql
+-- 查看每个索引的扫描次数
+SELECT indexname, idx_scan, idx_tup_read
+FROM pg_stat_user_indexes
+WHERE tablename = 'posts'
+ORDER BY idx_scan ASC;
+```
 
-✅ **查询优化** - 只查需要的字段、使用索引、LIMIT
-✅ **索引策略** - 单列、复合、部分、GIN 索引
-✅ **连接池配置** - 生产环境、Serverless 配置
-✅ **预编译语句** - Prepare、缓存
-✅ **批量操作** - 批量插入、更新、删除
-✅ **缓存策略** - Redis、LRU、HTTP 缓存
-✅ **监控日志** - 查询日志、性能监控、健康检查
+`idx_scan = 0` 的索引从来没被用过，不仅浪费存储空间，还会拖慢写入速度（每次 INSERT/UPDATE 都要维护索引）。找到没用过的索引，该删就删。
 
-**性能优化要点**：
+也可以用 `EXPLAIN ANALYZE` 看具体查询的执行计划：
 
-1. 始终只查询需要的字段
-2. 为常用查询条件创建索引
-3. 使用批量操作减少往返
-4. 合理使用缓存减少数据库压力
-5. 监控慢查询并优化
+```sql
+EXPLAIN ANALYZE
+SELECT id, title, slug FROM posts
+WHERE published = true
+ORDER BY created_at DESC
+LIMIT 20;
+```
 
-**下一步**：
+如果输出里有 `Seq Scan`（全表扫描）而不是 `Index Scan`，说明查询没走到索引，需要检查 WHERE 条件和索引定义是否匹配。
 
-在最后一篇文章《实战项目 - 全球博客系统》中，我们将综合运用所学知识，构建一个完整的边缘分布式博客系统。
+## Trade-off 分析
 
----
+性能优化没有银弹，每个方案都有代价：
 
-**相关代码**：[09-performance-best-practices](https://github.com/yourname/drizzle-examples/tree/09-performance-best-practices)
+**选字段查询 vs SELECT \***：选字段查询减少传输量，但如果业务经常需要切换展示字段，维护 select 列表会增加代码复杂度。折中方案是定义好几种常用的 select preset（列表用、详情用、后台管理用），按场景选用。
+
+**索引数量 vs 写入性能**：每个索引加速一种查询模式，但拖慢 INSERT 和 UPDATE。一篇博客系统的文章表，3-5 个索引是合理的（主键、slug 唯一索引、发布时间排序索引、作者索引、标签关联索引）。超过 10 个就该想想是不是在为不存在的查询模式建索引。
+
+**缓存 vs 数据一致性**：缓存越久性能越好，但数据越可能过期。文章内容可以缓存久一些（5-10 分钟），评论需要更短的 TTL（30 秒-1 分钟）。关键是用 `stale-while-revalidate` 让用户无感知地过渡。
+
+**Prepared Statements vs 灵活性**：预编译查询快，但参数必须是固定的结构。如果你的查询条件动态拼接（比如多条件筛选），prepared statements 反而不如动态查询灵活。对高频固定查询用 prepared statements，对低频动态查询用普通查询就好。
+
+**批量操作 vs 内存占用**：批量插入 1000 条比循环插入 1000 次快 10 倍以上，但如果单条数据很大（比如包含长文章内容），一批 1000 条可能占用大量内存。根据单条数据大小动态调整 batch size：小数据每批 500-1000 条，大数据每批 50-100 条。
+
+下一篇是系列的最后一篇，我们把前九篇的所有知识整合到一个完整的博客项目里——从架构设计到 Schema 到 API 到前端到部署，完整走一遍从开发到生产的全流程。
