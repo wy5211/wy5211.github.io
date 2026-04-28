@@ -1,0 +1,266 @@
+---
+title: "10 不只是搜索：日志分析、向量检索与选型建议"
+date: "2026-04-28"
+summary: "从搜索延伸到日志监控（ELK Stack）和 AI 语义搜索（向量检索），最后给出 Elasticsearch vs 其他方案的选型决策框架，为系列收尾。"
+tags: ["Elasticsearch", "搜索引擎", "ELK", "向量检索"]
+category: "elasticsearch"
+cover: ""
+draft: false
+series: "Elasticsearch 实战：从搜索原理到生产系统"
+seriesOrder: 10
+---
+
+上一篇我们把前八篇的内容整合成了一个完整的电商搜索系统。搜索这个场景算是讲透了。
+
+但 Elasticsearch 能做的事远不止搜索。它是构建在 Lucene 之上的分布式文档存储，倒排索引 + 列式存储（doc_values）的组合，让它同时擅长全文搜索和结构化分析。今天我们来看两个搜索之外的典型场景，然后给出一个选型决策框架，帮助你判断什么时候该用 ES，什么时候该用别的。
+
+## 场景一：日志分析（ELK Stack）
+
+### ELK 是什么
+
+ELK 是三个开源项目的缩写：
+
+- **Elasticsearch**：存储和搜索日志
+- **Logstash**：日志采集和处理的管道
+- **Kibana**：可视化仪表盘
+
+后来 Elastic 公司推出了 Beats（轻量级数据采集器），整套方案扩展成了 Elastic Stack。但大家还是习惯叫 ELK。
+
+### 日志管道
+
+一个典型的日志管道：
+
+```
+应用服务器 → Filebeat（采集日志）→ Logstash（处理/过滤）→ Elasticsearch（存储）→ Kibana（可视化）
+```
+
+**Filebeat**：部署在每台应用服务器上，实时读取日志文件（Nginx access.log、应用 error.log），转发给 Logstash。它很轻量，不做什么处理，只负责采集和传输。
+
+**Logstash**：接收 Filebeat 发来的原始日志，做格式化处理。比如把 Nginx 的 combined log format 解析成结构化字段（IP、时间戳、请求路径、状态码、响应时间），过滤掉不需要的行（健康检查），添加 geoip 信息（根据 IP 解析地理位置）。
+
+```ruby
+# Logstash 配置片段
+filter {
+  grok {
+    match => {
+      "message" => '%{IP:client_ip} - - \[%{HTTPDATE:timestamp}\] "%{WORD:method} %{URIPATHPARAM:path} HTTP/%{NUMBER:http_version}" %{NUMBER:status} %{NUMBER:bytes} %{NUMBER:response_time}'
+    }
+  }
+  geoip {
+    source => "client_ip"
+  }
+  mutate {
+    remove_field => ["message"]
+  }
+}
+```
+
+**Elasticsearch**：存储处理后的日志文档。日志索引通常按天分（`logs-2026.04.28`），配合 ILM 策略自动清理旧数据。
+
+**Kibana**：提供 Web 界面，让你用拖拽的方式创建仪表盘——按时间统计请求量、按状态码分组看错误率、按 response_time 看 P99 延迟。也支持直接写 ES 查询 DSL 做更复杂的分析。
+
+### ELK 的常见用法
+
+- **故障排查**：服务报错了，打开 Kibana 搜 error 日志，按时间和服务过滤，快速定位问题
+- **性能监控**：按分钟统计 API 响应时间的 P50/P95/P99，异常升高时告警
+- **安全审计**：分析异常 IP 的访问模式，检测潜在的攻击行为
+- **业务分析**：统计各地区的访问量、热门 API 路径、用户行为路径
+
+### ELK 的成本
+
+日志场景的数据量通常比搜索场景大得多（每天几十 GB 到几 TB）。一个中等规模的应用（日活百万），每天日志量在 10-50GB，需要 5-10 个 data 节点。可以考虑用冷热架构——热节点用 SSD 存最近 7 天的日志，冷节点用 HDD 存 30 天的日志，更早的自动删除或归档到对象存储。
+
+## 场景二：向量检索（AI 语义搜索）
+
+### 为什么需要向量检索
+
+全文搜索（BM25）是基于关键词匹配的——用户的搜索词必须出现在文档里。但很多时候，用户想搜的东西和文档里的表述不同：
+
+- 用户搜"穿着舒服的跑步鞋"，商品标题是"轻量透气慢跑鞋"
+- 用户搜"适合夏天的连衣裙"，商品描述里只有"清凉雪纺裙"
+
+这些场景下，BM25 的关键词匹配效果不好，因为用户的搜索词和文档没有字面上的重合。但语义上它们是相关的。
+
+向量检索的思路：用 AI 模型把文本转成高维向量（Embedding），语义相近的文本在向量空间里距离更近。搜索时把用户的查询也转成向量，找距离最近的文档。
+
+### ES 8.x 的向量检索能力
+
+ES 8.x 原生支持向量检索。在 Mapping 里定义 `dense_vector` 字段：
+
+```bash
+curl -X PUT "http://localhost:9200/products_vector" -H 'Content-Type: application/json' -d '
+{
+  "mappings": {
+    "properties": {
+      "name": { "type": "text", "analyzer": "ik_max_word" },
+      "name_vector": {
+        "type": "dense_vector",
+        "dims": 768,
+        "index": true,
+        "similarity": "cosine"
+      },
+      "price": { "type": "float" },
+      "brand": { "type": "keyword" }
+    }
+  }
+}'
+```
+
+`dims: 768` 是向量的维度（取决于你用的 Embedding 模型），`similarity: cosine` 用余弦相似度衡量距离。
+
+索引文档时，先用 Embedding 模型把商品名转成向量：
+
+```typescript
+// 伪代码：用 Embedding 模型生成向量
+const vector = await embeddingModel.encode("Cherry MX 机械式键盘 青轴");
+// vector 是一个 768 维的浮点数组
+
+await esClient.index({
+  index: "products_vector",
+  id: "1",
+  body: {
+    name: "Cherry MX 机械式键盘 青轴",
+    name_vector: vector,
+    price: 899,
+    brand: "Cherry",
+  },
+});
+```
+
+搜索时，把用户查询也转成向量，用 kNN 搜索：
+
+```typescript
+const queryVector = await embeddingModel.encode("打字手感好的键盘");
+
+const result = await esClient.search({
+  index: "products_vector",
+  body: {
+    knn: {
+      field: "name_vector",
+      query_vector: queryVector,
+      k: 10,
+      num_candidates: 100,
+    },
+  },
+});
+```
+
+`k: 10` 表示返回最相似的 10 个结果，`num_candidates: 100` 是近似搜索的候选数（越大越精确但越慢）。
+
+### 混合搜索：关键词 + 向量
+
+最佳实践是把全文搜索和向量检索结合起来——关键词搜索保证精确匹配，向量搜索补充语义相关：
+
+```json
+{
+  "query": {
+    "match": { "name": "手感好的键盘" }
+  },
+  "knn": {
+    "field": "name_vector",
+    "query_vector": [0.12, -0.34],
+    "k": 10,
+    "num_candidates": 100
+  },
+  "rank": {
+    "rrf": {}
+  }
+}
+```
+
+`rank.rrf`（Reciprocal Rank Fusion）把关键词搜索和向量搜索的结果合并排序，两种搜索方式互相补充。
+
+### ES 向量检索 vs 专用向量数据库
+
+ES 8.x 的向量检索能力已经能满足大多数场景。但如果你对向量检索有更高的要求（亿级向量、亚毫秒延迟），专用的向量数据库可能更合适：
+
+| 特性       | ES 8.x       | Milvus   | Pinecone  |
+| ---------- | ------------ | -------- | --------- |
+| 最大向量数 | 千万级       | 十亿级   | 十亿级    |
+| 延迟       | 10-50ms      | 1-10ms   | 5-20ms    |
+| 运维       | 需要 ES 集群 | 独立部署 | SaaS 托管 |
+| 全文搜索   | 支持         | 不支持   | 不支持    |
+| 混合搜索   | 原生支持     | 需要自建 | 有限支持  |
+
+如果你的项目已经在用 ES，向量数据量在千万级以内，直接用 ES 的 kNN 就够了。不需要再引入一套向量数据库增加运维负担。
+
+## 选型决策框架
+
+### ES vs OpenSearch
+
+OpenSearch 是 AWS 从 Elasticsearch 7.10 分叉出来的版本。两者的核心能力几乎一样（毕竟源于同一套代码）。选择建议：
+
+- **AWS 用户**：直接用 OpenSearch（AWS Managed OpenSearch），集成度高，运维省心
+- **非 AWS 环境**：两个都可以。ES 的商业版有更多高级功能（安全、告警、机器学习），OpenSearch 完全免费
+- **已有 ES 集群**：没必要迁移。两者的 API 高度兼容
+
+### ES vs Meilisearch / Typesense
+
+轻量级搜索引擎，近两年很火：
+
+| 特性       | Elasticsearch   | Meilisearch    | Typesense      |
+| ---------- | --------------- | -------------- | -------------- |
+| 部署复杂度 | 高（JVM、集群） | 低（单二进制） | 低（单二进制） |
+| 中文分词   | 需装插件（IK）  | 内置           | 内置           |
+| 聚合能力   | 强              | 基础           | 基础           |
+| 集群扩展   | 原生支持        | 需要付费版     | 支持           |
+| 学习曲线   | 陡              | 平缓           | 平缓           |
+| 适用数据量 | 百万~亿级       | 万~百万级      | 万~百万级      |
+
+选择逻辑：
+
+- **数据量百万以内、搜索逻辑不复杂**：优先考虑 Meilisearch 或 Typesense。开箱即用，十几分钟就能跑起来
+- **需要复杂聚合、多条件筛选面板**：ES 的聚合能力远超轻量方案
+- **需要中文分词 + 同义词 + 拼音**：ES + IK 插件最成熟
+- **团队没有 JVM/ES 运维经验**：轻量方案更友好
+
+### ES vs ClickHouse
+
+有时候人们会在"分析场景"上比较这两个。它们擅长的事完全不同：
+
+- **ES**：全文搜索 + 实时聚合。强项是"搜文本"和"看筛选面板"
+- **ClickHouse**：列式 OLAP 数据库。强项是"跑 SQL 统计报表"和"海量数据分析"
+
+商品搜索用 ES，销售报表用 ClickHouse。它们不是替代关系，而是互补。
+
+### 决策树
+
+```
+需要全文搜索吗？
+├── 不需要 → 用数据库自带的索引就够了
+└── 需要
+    ├── 数据量 < 10 万？
+    │   └── PostgreSQL tsvector 可能就够了
+    ├── 数据量 10-100 万，搜索逻辑简单？
+    │   └── Meilisearch / Typesense
+    └── 数据量 > 100 万，或需要复杂聚合/中文分词？
+        ├── 在 AWS 上？
+        │   └── OpenSearch
+        └── 其他云或自建？
+            └── Elasticsearch
+```
+
+核心原则：**用能解决问题的最简单方案**。不要因为"ES 很强大"就上 ES。如果你的搜索场景就是给几千条商品加个搜索框，Meilisearch 十分钟搞定的事，没必要搭一套 ES 集群。
+
+## 系列回顾
+
+十篇文章，我们走了一条从"为什么"到"怎么做"到"做得好"的完整路径：
+
+**入门篇（01-02）**：理解了倒排索引为什么比数据库 B+ 树更适合搜索，学会了手动设计 Mapping 而不是依赖自动推断。
+
+**核心篇（03-05）**：掌握了 bool 查询 + filter 的组合拳，搞定了搜索结果页的筛选面板，解决了中文搜索的分词/同义词/拼音三大难题。
+
+**进阶篇（06-08）**：用 CDC 把 MySQL 数据实时同步到 ES，把慢查询从 500ms 优化到 50ms，从单节点扩展到了多节点集群。
+
+**实践篇（09-10）**：把散落的零件拼成了完整的电商搜索系统，看到了 ES 在日志和向量检索上的扩展能力，建立了选型决策的全局视野。
+
+## 接下来做什么
+
+如果你学完了这个系列，想继续深入 ES，几个方向：
+
+- **搜索质量优化**：A/B 测试不同的排序策略、搜索词纠错（did you mean）、个性化搜索结果
+- **ES 内部原理**：Lucene 的 segment 合并机制、translog 的写入流程、fielddata vs doc_values 的取舍
+- **ELK 深入**：日志场景的完整实践，包括 Alerting（告警）、APM（应用性能监控）
+- **向量检索深入**：Embedding 模型的选择、混合搜索的调优、向量数据库的对比
+
+但最重要的还是：**动手做一个真实项目**。本系列的所有示例都可以在本地 Docker 环境跑起来。把数据灌进去，写查询，看结果，调参数。搜索引擎的很多"感觉"只有自己试过才能建立。

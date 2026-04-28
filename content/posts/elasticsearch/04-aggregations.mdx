@@ -1,0 +1,301 @@
+---
+title: "04 聚合分析：从商品筛选到数据洞察"
+date: "2026-04-28"
+summary: "用电商搜索筛选面板作为主线场景，讲透 terms、range、嵌套聚合等核心聚合类型，以及桶聚合和指标聚合的区别。"
+tags: ["Elasticsearch", "搜索引擎"]
+category: "elasticsearch"
+cover: ""
+draft: false
+series: "Elasticsearch 实战：从搜索原理到生产系统"
+seriesOrder: 4
+---
+
+上一篇我们把查询 DSL 搞定了——bool 组合、filter 过滤、function_score 自定义排序。用户输入"键盘"能搜出相关商品了。
+
+但打开京东或淘宝的搜索页，光搜出来还不够。左边还有一排筛选条件：品牌（Cherry 12件、罗技 8件、达尔优 5件）、价格区间（0-200 元 5件、200-500 元 15件）、分类（键盘 25件、鼠标 10件）。这些统计数字不是查询能算出来的，它们需要遍历所有匹配文档做分组统计。
+
+这就是**聚合（Aggregation）** 干的事。
+
+## 两种聚合：桶和指标
+
+ES 的聚合分两大类：
+
+**桶聚合（Bucket Aggregation）**：按某种规则把文档分组，每组是一个"桶"。terms 聚合按字段值分组（品牌各有几个），range 聚合按数值范围分组（各价格区间各有几个），date_histogram 按时间分组（每月新增多少商品）。桶里可以嵌套桶，也可以嵌套指标。
+
+**指标聚合（Metric Aggregation）**：在一组文档上计算一个数值。avg（平均价格）、max（最高价格）、sum（总销量）、cardinality（有多少个不同的品牌）。
+
+一个常见的误区：把聚合当数据库的 `GROUP BY`。虽然功能上类似，但 ES 的聚合是在倒排索引上直接计算的，不需要像数据库那样扫描全表。配合 filter 缓存，聚合的性能通常比 SQL 的 GROUP BY + COUNT 好得多。
+
+## terms 聚合：统计品牌分布
+
+最常见的场景——搜完"键盘"后，看看都有哪些品牌、每个品牌几件商品：
+
+```bash
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "size": 0,
+  "query": {
+    "match": { "name": "键盘" }
+  },
+  "aggs": {
+    "brands": {
+      "terms": {
+        "field": "brand",
+        "size": 20
+      }
+    }
+  }
+}'
+```
+
+几个关键点：
+
+- `"size": 0`：不返回搜索结果，只返回聚合结果。因为你只需要筛选面板的统计数字，不需要商品列表。
+- `"aggs"`：聚合定义的开始。
+- `"brands"`：自定义的聚合名称，返回结果里用这个名字取值。
+- `"field": "brand"`：按 brand 字段分组。
+- `"size": 20`：最多返回 20 个桶（即排名前 20 的品牌）。
+
+返回结果：
+
+```json
+{
+  "aggregations": {
+    "brands": {
+      "buckets": [
+        { "key": "Cherry", "doc_count": 12 },
+        { "key": "Logitech", "doc_count": 8 },
+        { "key": "Daryou", "doc_count": 5 },
+        { "key": "Razer", "doc_count": 3 }
+      ]
+    }
+  }
+}
+```
+
+前端拿到这个数据，渲染成 `Cherry (12) | Logitech (8) | 达尔优 (5)` 的筛选列表就行了。
+
+### terms 聚合的 size 参数
+
+`size` 不是"每页几条"那个 size，而是"返回几个桶"。ES 的 terms 聚合有个底层机制：它会在每个分片上先取前 `size` 个桶，然后合并各分片的结果。这意味着返回的结果可能不完全准确——某个在全局排第 21 的品牌，可能在某个分片里排进了前 20。
+
+如果准确性要求高（比如财务报表），设 `size` 为一个较大的值，或者用 `shard_size` 参数控制每个分片返回的桶数。电商筛选面板的数据差一两个问题不大，默认配置就够了。
+
+## range 聚合：价格区间分布
+
+筛选面板的价格区间不是随意的，通常是固定的几档：0-200、200-500、500-1000、1000 以上。
+
+```bash
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "size": 0,
+  "query": {
+    "match": { "name": "键盘" }
+  },
+  "aggs": {
+    "price_ranges": {
+      "range": {
+        "field": "price",
+        "ranges": [
+          { "key": "低价", "to": 200 },
+          { "key": "中端", "from": 200, "to": 500 },
+          { "key": "高端", "from": 500, "to": 1000 },
+          { "key": "旗舰", "from": 1000 }
+        ]
+      }
+    }
+  }
+}'
+```
+
+返回：
+
+```json
+{
+  "price_ranges": {
+    "buckets": [
+      { "key": "低价", "to": 200, "doc_count": 5 },
+      { "key": "中端", "from": 200, "to": 500, "doc_count": 15 },
+      { "key": "高端", "from": 500, "to": 1000, "doc_count": 8 },
+      { "key": "旗舰", "from": 1000, "doc_count": 3 }
+    ]
+  }
+}
+```
+
+`key` 是你自定义的标签，`from` 是左闭，`to` 是右开（不包含 to 的值）。
+
+## 嵌套聚合：品牌下再看平均价格
+
+桶聚合可以嵌套。比如你想在品牌分组的基础上，再看每个品牌的平均价格：
+
+```bash
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "size": 0,
+  "aggs": {
+    "brands": {
+      "terms": { "field": "brand", "size": 10 },
+      "aggs": {
+        "avg_price": {
+          "avg": { "field": "price" }
+        }
+      }
+    }
+  }
+}'
+```
+
+注意结构：`brands` 是一个桶聚合，它内部又嵌套了一个 `avg_price` 指标聚合。ES 先按品牌分桶，然后在每个桶内计算平均价格。
+
+返回：
+
+```json
+{
+  "brands": {
+    "buckets": [
+      {
+        "key": "Cherry",
+        "doc_count": 12,
+        "avg_price": { "value": 756.5 }
+      },
+      {
+        "key": "Logitech",
+        "doc_count": 8,
+        "avg_price": { "value": 423.1 }
+      }
+    ]
+  }
+}
+```
+
+嵌套聚合的层数理论上没有限制，但层数越多性能越差。实际项目中 2-3 层嵌套是常见上限。
+
+## filter 聚合：在聚合中加条件
+
+有时候你想在聚合里加个过滤条件，但不影响外层的查询。比如搜索"键盘"，统计品牌分布，但只统计有库存的商品：
+
+```bash
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "size": 0,
+  "query": {
+    "match": { "name": "键盘" }
+  },
+  "aggs": {
+    "in_stock_brands": {
+      "filter": {
+        "range": { "stock": { "gt": 0 } }
+      },
+      "aggs": {
+        "brands": {
+          "terms": { "field": "brand", "size": 10 }
+        }
+      }
+    }
+  }
+}'
+```
+
+`filter` 聚合先缩小范围到有库存的商品，然后在这个范围内做品牌统计。外层的 `query` 还是搜"键盘"的所有商品——如果你同时需要"全部商品的品牌分布"和"有库存商品的品牌分布"，可以在同一个请求里放两个平行的聚合。
+
+## 一次请求搞定搜索 + 筛选面板
+
+到目前为止我们把搜索和聚合分开看了。但生产环境里，搜索结果和筛选面板是一次请求返回的：
+
+```bash
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "name": "键盘" } }
+      ],
+      "filter": [
+        { "terms": { "brand": ["Cherry"] } },
+        { "range": { "price": { "gte": 200, "lte": 500 } } }
+      ]
+    }
+  },
+  "size": 10,
+  "_source": ["name", "price", "brand", "sales", "tags"],
+  "highlight": {
+    "fields": { "name": {} }
+  },
+  "aggs": {
+    "brands": {
+      "terms": { "field": "brand", "size": 20 }
+    },
+    "price_ranges": {
+      "range": {
+        "field": "price",
+        "ranges": [
+          { "key": "0-200", "to": 200 },
+          { "key": "200-500", "from": 200, "to": 500 },
+          { "key": "500-1000", "from": 500, "to": 1000 },
+          { "key": "1000+", "from": 1000 }
+        ]
+      }
+    },
+    "categories": {
+      "terms": { "field": "category", "size": 10 }
+    }
+  }
+}'
+```
+
+这一个请求返回：
+
+- 匹配的商品列表（分页 + 高亮）
+- 品牌筛选列表（每品牌多少件）
+- 价格区间筛选
+- 分类筛选
+
+一次请求，一个 JSON，前端拿到所有数据。这比先查商品列表再查筛选面板省一次网络往返。
+
+### 聚合的 scope：基于查询结果还是全量
+
+有个细节值得注意：上面的聚合是基于查询结果的——只统计搜"键盘"且品牌为 Cherry、价格 200-500 的商品。这意味着品牌筛选面板显示的数字是"在当前搜索条件下的分布"，不是"全站所有商品的分布"。
+
+但筛选面板有个常见需求：显示所有可选的品牌，包括当前没被选中的。用 `global` 聚合可以做到：
+
+```json
+"aggs": {
+  "all_brands": {
+    "global": {},
+    "aggs": {
+      "brands": {
+        "terms": { "field": "brand", "size": 20 }
+      }
+    }
+  }
+}
+```
+
+`global: {}` 忽略所有查询条件，在全量数据上做聚合。这样你可以在一个请求里同时拿到"筛选后的品牌分布"和"全量品牌列表"。
+
+## 聚合的性能注意事项
+
+聚合是 ES 里最容易出性能问题的地方。几个需要警惕的点：
+
+**高基数（High Cardinality）**：如果 brand 字段有 1000 个不同的值，terms 聚合要维护 1000 个桶。如果是 user_id 这种有几百万不同值的字段，terms 聚合可能直接把内存吃满。对于高基数字段，用 `cardinality` 聚合（估算去重数量）代替 terms。
+
+**嵌套层数**：每多一层嵌套，计算量翻倍。3 层以上的嵌套聚合要认真评估必要性。
+
+**聚合 + 深分页**：聚合本身和分页是独立的。`from: 990, size: 10` 的分页 + 复杂聚合，两个慢操作叠加，性能会很差。
+
+**`size: 0`**：如果只需要聚合结果不需要搜索结果，设 `size: 0`。这能省掉搜索结果的构建和传输开销。
+
+## 什么时候用 ES 聚合 vs 应用层计算
+
+简单的分组统计（品牌列表、价格区间）用 ES 聚合又快又方便。但有些场景不适合在 ES 里做：
+
+- 需要跨多个索引联合统计的——ES 聚合只能在一个索引内
+- 统计逻辑复杂，需要多步骤计算的（比如环比增长率）——在应用层拿原始数据算更灵活
+- 对准确性要求极高的财务数据——ES 的 terms 聚合是近似值
+
+原则：**能用 ES 聚合解决的就用，搞不定或准确性要求高的回应用层**。
+
+---
+
+搜索和筛选都搞定了。但如果你试过在搜索框里输入中文，会发现效果不太好——搜"机械键盘"可能搜不到"机械式键盘"，因为 standard 分词器把中文拆成了单个字。下一篇我们专门解决中文搜索的问题：IK 分词器、同义词、拼音搜索，全面提升中文搜索体验。

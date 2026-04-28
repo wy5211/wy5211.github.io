@@ -1,0 +1,272 @@
+---
+title: "07 性能优化与调优"
+date: "2026-04-28"
+summary: "从电商大促搜索接口 P99 飙升的场景出发，讲透查询 profiling、慢查询日志、mapping 优化、bulk API、routing、缓存机制和 JVM 调优基础。"
+tags: ["Elasticsearch", "搜索引擎", "性能优化"]
+category: "elasticsearch"
+cover: ""
+draft: false
+series: "Elasticsearch 实战：从搜索原理到生产系统"
+seriesOrder: 7
+---
+
+数据从 MySQL 同步到 ES 的管道搭好了。上线跑了两天，运营反馈大促期间搜索接口偶尔超时。你查了下监控：平时 P99 在 50ms 左右，大促流量高峰飙到了 500ms。
+
+50ms 到 500ms，差了 10 倍。数据量没变（还是那几十万条商品），查询也没改，为什么突然慢了？
+
+性能问题的排查没有银弹，但 ES 提供了一整套诊断工具。今天我们从定位慢查询开始，一个一个优化，把 P99 压回 50ms。
+
+## 第一步：找到慢在哪里
+
+### 查询 Profile API
+
+ES 的 `_search` 接口支持 `profile` 参数，能告诉你查询的每一步花了多少时间：
+
+```bash
+curl -X GET "http://localhost:9200/products/_search?profile=true" -H 'Content-Type: application/json' -d '
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "name": "键盘" } }
+      ],
+      "filter": [
+        { "terms": { "brand": ["Cherry", "Logitech", "Razer"] } },
+        { "range": { "price": { "gte": 200, "lte": 500 } } }
+      ]
+    }
+  },
+  "aggs": {
+    "brands": { "terms": { "field": "brand" } }
+  },
+  "size": 20
+}'
+```
+
+返回的 `profile.shards` 里会详细列出每个查询阶段的耗时：
+
+```json
+{
+  "profile": {
+    "shards": [
+      {
+        "searches": [
+          {
+            "query": [
+              {
+                "type": "BooleanQuery",
+                "time_in_nanos": 2450000,
+                "breakdown": {
+                  "create_weight": 120000,
+                  "build_scorer": 850000,
+                  "next_doc": 320000,
+                  "score": 180000
+                }
+              }
+            ],
+            "aggregation": [
+              {
+                "type": "TermsAggregator",
+                "time_in_nanos": 8900000
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+从这个结果能看到：聚合花了 8.9ms，查询花了 2.45ms。聚合是瓶颈。
+
+Profile API 的开销不小（本身会增加 10-20% 的查询耗时），不要在生产环境一直开着。只在排查问题时用。
+
+### 慢查询日志
+
+更实用的方式是配置慢查询日志。ES 会自动记录超过阈值的查询：
+
+```bash
+curl -X PUT "http://localhost:9200/products/_settings" -H 'Content-Type: application/json' -d '
+{
+  "index.search.slowlog.threshold.query.warn": "5s",
+  "index.search.slowlog.threshold.query.info": "2s",
+  "index.search.slowlog.threshold.query.debug": "1s",
+  "index.search.slowlog.threshold.fetch.warn": "1s",
+  "index.search.slowlog.threshold.fetch.info": "500ms"
+}'
+```
+
+超过 5 秒的查询记为 WARN 级别，超过 2 秒记为 INFO。日志会输出到 ES 的慢查询日志文件，包含完整的查询 JSON，方便你拿去复现和优化。
+
+## Mapping 优化：从结构上提速
+
+很多性能问题可以在 Mapping 层面预防。
+
+### 关闭不需要的功能
+
+ES 默认对每个字段都开启了很多功能。你用不到的应该显式关掉：
+
+```json
+{
+  "description": {
+    "type": "text",
+    "analyzer": "ik_max_word",
+    "search_analyzer": "ik_smart",
+    "doc_values": false,
+    "norms": false
+  }
+}
+```
+
+- **`"doc_values": false`**：doc_values 是列式存储，用于排序、聚合、脚本访问。如果你的 text 字段不需要这些操作（比如商品描述永远不会用来排序），关掉它能省磁盘空间和索引时间
+- **`"norms": false`**：norms 用于评分时考虑字段长度（短字段匹配权重更高）。如果你不需要这个字段参与评分排序，关掉它省内存
+
+**反过来**，keyword 和数字字段默认开启 doc_values。如果你需要聚合或排序这些字段（品牌列表、价格范围），保持 doc_values 开启。
+
+### 禁用 \_source 的陷阱
+
+有些优化文章建议禁用 `_source`（不存储原始文档 JSON）来省空间。`_source` 占用确实大，但禁用后你：
+
+- 不能用高亮（highlight 依赖 \_source）
+- 不能用 update / update_by_query（需要读取原始文档再合并更新）
+- 不能做 reindex（数据迁移需要读取原始文档）
+
+除非你非常确定不需要这些功能（比如纯日志场景），否则别禁用 `_source`。可以用 `_source` 的 includes/excludes 过滤掉不需要的大字段：
+
+```json
+{
+  "_source": {
+    "excludes": ["description"]
+  }
+}
+```
+
+这样 description 不会被存储，但其他字段还在。高亮的时候 description 就不能用了，但 name 的高亮不受影响。
+
+## Bulk API：批量写入的效率翻倍
+
+同步数据到 ES 时，逐条 `index` 效率很低。每次都是一个独立的 HTTP 请求，有网络开销、JSON 解析开销、索引刷新开销。
+
+bulk API 把多次操作合并成一个请求：
+
+```bash
+curl -X POST "http://localhost:9200/_bulk" -H 'Content-Type: application/json' -d '
+{"index":{"_index":"products","_id":"1"}}
+{"name":"Cherry MX 机械式键盘","price":899,"brand":"Cherry","sales":3842}
+{"index":{"_index":"products","_id":"2"}}
+{"name":"罗技 G502 游戏鼠标","price":349,"brand":"Logitech","sales":12050}
+{"update":{"_index":"products","_id":"3"}}
+{"doc":{"price":259,"sales":5670}}
+'
+```
+
+bulk 的请求体格式有点特别：每两行为一组——第一行是操作指令（index/update/delete），第二行是数据。
+
+性能对比：
+
+| 方式                 | 10000 条数据写入耗时 |
+| -------------------- | -------------------- |
+| 逐条 index           | ~30s                 |
+| bulk（每批 1000 条） | ~3s                  |
+| bulk（每批 5000 条） | ~2s                  |
+
+批量大小不是越大越好。超过 5-10MB 一个请求，网络传输和 JSON 解析的收益就递减了。经验值：每批 1000-5000 条，或者请求体 5-15MB。
+
+## Routing：让查询少扫分片
+
+ES 默认用文档 ID 的哈希值来决定文档存到哪个分片。这意味着一个查询需要发送到所有分片执行，然后合并结果。
+
+如果你总是按某个维度查询，可以用 custom routing 把相关文档集中到同一个分片：
+
+```bash
+# 索引时指定 routing
+curl -X PUT "http://localhost:9200/products/_doc/1?routing=keyboard" -H 'Content-Type: application/json' -d '
+{
+  "name": "Cherry MX 机械式键盘",
+  "category": "keyboard",
+  "price": 899
+}'
+
+# 查询时指定 routing——ES 只查一个分片
+curl -X GET "http://localhost:9200/products/_search?routing=keyboard" -H 'Content-Type: application/json' -d '
+{
+  "query": {
+    "match": { "name": "键盘" }
+  }
+}'
+```
+
+指定 `routing=keyboard` 后，ES 只会查对应的分片，跳过其他分片。分片数越多，加速效果越明显。
+
+routing 的代价是数据分布可能不均匀——如果某个分类的商品特别多，对应的分片会变成热点。适合数据分布相对均匀的维度。
+
+## 缓存机制：让重复查询更快
+
+ES 有多层缓存，理解它们能帮你减少不必要的计算。
+
+### Query Cache
+
+缓存 filter 查询的结果。当你多次执行相同的 filter 条件时（比如品牌筛选 `terms: {brand: ["Cherry"]}`），第二次直接从缓存拿结果。
+
+Query Cache 是自动的，不需要你做任何配置。但只有 filter 查询会被缓存，must/match 这种需要计算分数的 query 不会。
+
+### Request Cache
+
+缓存整个搜索请求的结果（包括聚合）。当你执行完全相同的查询时（请求体一模一样），ES 直接返回缓存结果。
+
+```bash
+curl -X PUT "http://localhost:9200/products/_settings" -H 'Content-Type: application/json' -d '
+{
+  "index.requests.cache.enable": true
+}'
+```
+
+Request Cache 适合"筛选面板"这种场景——用户翻页时，筛选面板的数据不变，重复的聚合查询可以直接走缓存。注意只有 `size: 0` 的请求（不返回搜索结果，只返回聚合）才会被缓存。
+
+缓存在索引有新数据写入时会自动失效。所以高写入频率的索引缓存命中率低，读多写少的索引缓存效果好。
+
+## JVM 调优基础
+
+ES 跑在 JVM 上，JVM 的配置直接影响 ES 的性能。
+
+### 堆内存设置
+
+最重要的配置。ES 的 `jvm.options` 文件里有两个参数：
+
+```
+-Xms4g
+-Xmx4g
+```
+
+`-Xms`（初始堆大小）和 `-Xmx`（最大堆大小）**必须设成一样的值**，避免运行时动态调整堆大小导致的停顿。
+
+堆大小的经验值：
+
+- 不超过物理内存的 50%。ES 需要大量内存给文件系统缓存（Lucene 依赖操作系统缓存来加速搜索），堆内存太多反而挤占了文件系统缓存
+- 不超过 32GB。JVM 在堆内存超过 32GB 时会切换到不同的对象指针压缩模式，实际可用内存反而变少。通常 26-31g 是最佳区间
+- 最少 4GB。低于 4GB 容易频繁 GC
+
+### GC 日志
+
+开启 GC 日志帮助排查性能抖动：
+
+```
+-Xlog:gc*=info:file=gc.log:time,uptime,level,tags:filecount=5,filesize=10m
+```
+
+如果你看到频繁的 Full GC（每隔几秒一次），说明堆内存不够了——要么加内存，要么检查是否有内存泄漏。
+
+## 优化路径总结
+
+把一个 500ms 的查询优化到 50ms，通常经过这几步：
+
+1. **Profile 找瓶颈**：慢在查询还是聚合？哪个字段？
+2. **Mapping 瘦身**：关掉不需要的 doc_values、norms
+3. **filter 替代 query**：不需要评分的条件一律放 filter
+4. **聚合优化**：减少嵌套层数、控制 terms 聚合的 size、用 size:0 只取聚合
+5. **缓存利用**：开启 request cache，让重复查询走缓存
+6. **批量操作**：索引数据用 bulk API
+7. **JVM 调优**：堆内存设对、监控 GC
+
+如果这些都做了还是慢，问题可能在分片和节点层面——单节点的计算能力有天花板。下一篇我们讲集群架构，从单节点扩展到多节点，用水平扩展解决单机性能瓶颈。

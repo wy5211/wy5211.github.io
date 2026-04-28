@@ -1,0 +1,294 @@
+---
+title: "06 数据同步：保持 ES 与数据库一致"
+date: "2026-04-28"
+summary: "对比应用层双写、消息队列、Logstash、Canal/Debezium CDC 四种同步方案的优劣，解决商品数据从 MySQL 实时同步到 Elasticsearch 的问题。"
+tags: ["Elasticsearch", "搜索引擎", "数据同步"]
+category: "elasticsearch"
+cover: ""
+draft: false
+series: "Elasticsearch 实战：从搜索原理到生产系统"
+seriesOrder: 6
+---
+
+前五篇里，我们往 ES 插入测试数据都是手动 curl 的。这在学习和调试阶段没问题，但真实项目不可能这么干。商品数据存在 MySQL 里，运营人员在后台改了个价格，用户搜索的时候得能看到最新的价格。数据从 MySQL 到 ES 这一步，需要一个自动化的同步机制。
+
+数据同步是 Elasticsearch 生产落地的第一个拦路虎。不是因为技术多难，而是因为方案太多，各有取舍。今天我们把四种主流方案过一遍，讲清楚每种方案的适用场景和坑。
+
+## 为什么不能只用 ES
+
+你可能会问：既然 ES 这么好，为什么不直接把数据存在 ES 里，非要搞 MySQL + ES 双写？
+
+因为 ES 不是数据库。它不支持事务，不适合频繁的单条更新（每次更新都要重建倒排索引），没有完善的主键约束和外键约束。电商系统的核心操作——下单、扣库存、改价格——这些需要事务保障的操作必须在关系型数据库里完成。ES 只负责搜索这一件事。
+
+所以架构永远是：**MySQL 是主数据源（Source of Truth），ES 是搜索副本**。所有写操作先写 MySQL，再同步到 ES。
+
+## 方案一：应用层双写
+
+最直觉的做法：在写 MySQL 的代码旁边，加一段写 ES 的代码。
+
+```typescript
+// 商品服务：更新价格
+async function updateProductPrice(productId: number, newPrice: number) {
+  // 1. 写 MySQL
+  await db.query(
+    "UPDATE products SET price = ?, updated_at = NOW() WHERE id = ?",
+    [newPrice, productId]
+  );
+
+  // 2. 写 ES
+  try {
+    await esClient.update({
+      index: "products",
+      id: String(productId),
+      doc: { price: newPrice, updatedAt: new Date().toISOString() },
+    });
+  } catch (err) {
+    logger.error("ES 同步失败", { productId, err });
+    // 不回滚 MySQL，只记日志
+  }
+}
+```
+
+**优点**：简单直观，不需要额外的中间件，延迟几乎为零（同一次请求里完成）。
+
+**缺点**：
+
+- **不一致风险**：MySQL 写成功了但 ES 写失败了。用户看到的价格还是旧的。上面的代码只是打了个日志就过了，搜索结果已经不一致了
+- **代码耦合**：每个写 MySQL 的地方都要加一段写 ES 的代码。漏了任何一个地方，ES 数据就是旧的。商品改价、上架、下架、改标题、改描述……每个接口都得加
+- **性能影响**：每次写操作多了一次 ES 的网络请求，接口延迟增加
+
+适用场景：项目初期、数据量小、对一致性要求不高。
+
+## 方案二：异步消息队列
+
+把双写改成异步。写完 MySQL 后发一条消息到消息队列（RabbitMQ、Kafka），消费者拿到消息后写 ES。
+
+```typescript
+// 生产者：写完 MySQL 后发消息
+async function updateProductPrice(productId: number, newPrice: number) {
+  await db.query(
+    "UPDATE products SET price = ?, updated_at = NOW() WHERE id = ?",
+    [newPrice, productId]
+  );
+
+  await mq.publish("product.updated", {
+    productId,
+    fields: { price: newPrice },
+    timestamp: Date.now(),
+  });
+}
+
+// 消费者：异步同步到 ES
+async function handleProductUpdated(message: ProductUpdateMessage) {
+  // 从 MySQL 重新查一次最新数据（不信任消息里的部分字段）
+  const product = await db.query("SELECT * FROM products WHERE id = ?", [
+    message.productId,
+  ]);
+
+  await esClient.index({
+    index: "products",
+    id: String(product.id),
+    document: product,
+  });
+}
+```
+
+消费者为什么要重新查 MySQL 而不是直接用消息里的数据？因为消息可能在队列里排队，排队期间数据可能又被改了。用消息里的 `productId` 去查最新的完整数据，保证 ES 拿到的是当前最新的。
+
+**优点**：
+
+- 写操作和 ES 同步解耦，接口不受 ES 性能影响
+- ES 写入失败可以重试（消息队列支持重试机制）
+- 比双写更可靠
+
+**缺点**：
+
+- 增加了消息队列中间件的运维成本
+- 有延迟（通常 100ms 到几秒，取决于消息队列的吞吐量）
+- 需要处理消息重复消费的问题（ES 写入操作要做幂等）
+
+适用场景：中等规模项目，团队有消息队列运维经验。
+
+## 方案三：Logstash JDBC Input
+
+Logstash 是 Elastic 官方的数据处理管道。它有一个 JDBC Input 插件，可以定时从 MySQL 拉数据推到 ES。
+
+```ruby
+# logstash.conf
+input {
+  jdbc {
+    jdbc_driver_library => "/path/to/mysql-connector-java.jar"
+    jdbc_driver_class => "com.mysql.cj.jdbc.Driver"
+    jdbc_connection_string => "jdbc:mysql://mysql:3306/ecommerce"
+    jdbc_user => "root"
+    jdbc_password => "password"
+    schedule => "*/30 * * * * *"   # 每 30 秒执行一次
+    statement => "
+      SELECT id, name, brand, category, price, stock, status, updated_at
+      FROM products
+      WHERE updated_at > :sql_last_value
+      ORDER BY updated_at ASC
+    "
+    use_column_value => true
+    tracking_column => "updated_at"
+    tracking_column_type => "timestamp"
+    last_run_metadata_path => "/tmp/logstash_jdbc_last_run"
+  }
+}
+
+output {
+  elasticsearch {
+    hosts => ["http://elasticsearch:9200"]
+    index => "products"
+    document_id => "%{id}"
+  }
+}
+```
+
+工作原理：Logstash 每 30 秒执行一次 SQL，查出 `updated_at` 大于上次同步时间的数据，推到 ES。`sql_last_value` 自动记录上次同步到的时间戳。
+
+**优点**：
+
+- 不需要改应用代码，对业务层完全透明
+- 配置简单，Logstash 原生支持 ES 输出
+- 支持全量同步和增量同步
+
+**缺点**：
+
+- **延迟固定在轮询间隔**：30 秒同步一次意味着最坏情况下数据有 30 秒延迟。大促期间改了价格要等 30 秒才能在搜索结果里看到
+- **没有变更检测**：靠 `updated_at` 字段做增量。如果有人绕过应用层直接改数据库（比如 DBA 执行 SQL），`updated_at` 没更新，这条变更就丢了
+- **Logstash 本身的资源消耗**：JRuby 运行时，吃内存
+
+适用场景：对实时性要求不高（几分钟延迟可以接受），不想改应用代码。
+
+## 方案四：Canal / Debezium CDC
+
+CDC（Change Data Capture）是数据同步的终极方案。它监听 MySQL 的 binlog（二进制日志），实时捕获每一行数据的变更（INSERT、UPDATE、DELETE），转发到 ES。
+
+### Canal 方案
+
+Canal 是阿里巴巴开源的 MySQL binlog 增量订阅组件。它伪装成 MySQL 的从节点（slave），接收 binlog 事件。
+
+```
+MySQL → binlog → Canal Server → Canal Client → ES
+```
+
+部署步骤（简化版）：
+
+1. MySQL 开启 binlog（`log-bin=mysql-bin`，`binlog-format=ROW`）
+2. 部署 Canal Server，配置监听的数据库和表
+3. Canal Client 消费变更事件，写入 ES
+
+```java
+// Canal Client 伪代码
+CanalConnector connector = CanalConnectors.newSingleConnector(
+    new InetSocketAddress("canal-server", 11111), "example", "", ""
+);
+
+while (true) {
+    Message message = connector.getWithoutAck(1000);
+    for (Entry entry : message.getEntries()) {
+        if (entry.getEntryType() == EntryType.ROWDATA) {
+            RowChange rowChange = RowChange.parseFrom(entry.getStoreValue());
+            for (RowData rowData : rowChange.getRowDatasList()) {
+                syncToElasticsearch(rowData, rowChange.getEventType());
+            }
+        }
+    }
+    connector.ack(message.getId());
+}
+```
+
+### Debezium 方案
+
+Debezium 是 Red Hat 开源的 CDC 平台，基于 Kafka Connect。架构比 Canal 更复杂但更成熟：
+
+```
+MySQL → binlog → Debezium Source Connector → Kafka → Sink Connector → ES
+```
+
+**优点**：
+
+- **延迟极低**：binlog 是实时的，从 MySQL 写入到 ES 可达秒级甚至亚秒级
+- **不丢变更**：只要 binlog 没被清理，所有变更都能捕获
+- **不需要改应用代码**：对业务层完全透明
+- **支持断点续传**：记录 binlog position，重启后从上次的位置继续
+
+**缺点**：
+
+- **运维成本高**：Canal/Debezium 本身就是一套独立的服务，需要监控和维护
+- **MySQL 配置要求**：必须开启 ROW 格式的 binlog，binlog 保留时间要足够长
+- **架构复杂**：引入了新的组件和新的故障点
+
+适用场景：大规模项目、对数据一致性要求高、团队有 CDC 运维能力。
+
+## 增量 vs 全量同步
+
+四种方案讲的都是增量同步——只同步变更的数据。但有些场景需要全量同步：
+
+- **首次上线**：MySQL 里有 50 万条商品，ES 是空的，需要全量导入
+- **索引重建**：改了 Mapping（比如换了分词器），需要把数据全部重新索引
+- **数据修复**：怀疑 ES 和 MySQL 数据不一致，全量刷新一次
+
+ES 提供了 `_reindex` API 做索引间的数据迁移。但 MySQL 到 ES 的全量同步需要自己写脚本，或者用 Logstash 的 JDBC Input 不带 `WHERE` 条件跑一次：
+
+```bash
+# 全量同步：不带时间过滤
+statement => "SELECT * FROM products"
+```
+
+全量同步的注意事项：
+
+- 数据量大的时候分批执行，别一次性查 50 万条灌进 ES
+- 用 bulk API 批量写入，别逐条 index
+- 全量期间 ES 的搜索性能会下降，建议在低峰期执行
+
+## 版本号与冲突处理
+
+并发场景下，MySQL 和 ES 之间可能出现数据冲突。比如：
+
+1. 运营改了价格从 899 到 799（消息 A）
+2. 一秒后又改回 899（消息 B）
+3. 消息 B 先到达 ES，价格更新为 899
+4. 消息 A 后到达 ES，价格被错误地更新为 799
+
+ES 提供了 `version` 机制解决这个问题。每次更新时带上版本号，ES 只接受版本号比当前更大的更新：
+
+```bash
+# 索引文档时指定 external version（用 MySQL 的 updated_at 时间戳作为版本号）
+curl -X PUT "http://localhost:9200/products/_doc/1?version=1703980800000&version_type=external" \
+  -H 'Content-Type: application/json' -d '{ "price": 799 }'
+
+# 如果后续有 updated_at 更小的更新到达，ES 会拒绝（版本号过低）
+```
+
+`version_type=external` 表示版本号由外部系统管理（你的应用），不是 ES 内部的版本号。用 MySQL 的 `updated_at` 毫秒时间戳作为版本号，天然保证了时序正确性。
+
+## 同步延迟监控
+
+不管用哪种方案，你都需要知道同步有没有延迟。简单的监控方式：
+
+在 MySQL 里维护一张 `sync_checkpoint` 表，记录最后一次同步的时间戳。定时脚本检查这个时间戳和当前时间的差距，超过阈值就报警。
+
+对于 CDC 方案，监控 binlog 的消费 position 和当前 position 的差距。Canal 和 Debezium 都提供了内置的监控指标。
+
+## 怎么选
+
+| 方案          | 延迟   | 一致性 | 运维成本 | 适用规模         |
+| ------------- | ------ | ------ | -------- | ---------------- |
+| 应用双写      | 毫秒级 | 弱     | 低       | 小项目           |
+| 消息队列      | 秒级   | 中     | 中       | 中等项目         |
+| Logstash JDBC | 分钟级 | 中     | 低       | 对实时性要求不高 |
+| CDC           | 秒级   | 强     | 高       | 大项目           |
+
+选择逻辑：
+
+- **日活不到 1 万、商品几千条**：应用双写或 Logstash JDBC，够用就行
+- **日活 1-10 万、商品几万到几十万**：消息队列方案，平衡了实时性和可靠性
+- **日活 10 万以上、商品几十万以上**：CDC 方案，实时性和一致性都有保障
+
+别过度设计。一个日活几百的内部系统上 CDC 是杀鸡用牛刀——运维 CDC 的成本比开发整个系统还高。
+
+---
+
+数据能从 MySQL 同步到 ES 了。但同步上线后你可能发现另一个问题：搜索接口变慢了。数据量从测试时的几百条变成几十万条，查询耗时从几十毫秒飙升到几百毫秒。下一篇我们专门讲性能优化——怎么把 ES 查询从 500ms 优化到 50ms。

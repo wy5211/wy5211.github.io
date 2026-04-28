@@ -1,0 +1,288 @@
+---
+title: "08 集群架构与运维"
+date: "2026-04-28"
+summary: "从单节点到生产集群的演进——讲透分片策略、节点角色、集群健康状态、扩缩容、备份恢复和 Index Lifecycle Management。"
+tags: ["Elasticsearch", "搜索引擎", "运维"]
+category: "elasticsearch"
+cover: ""
+draft: false
+series: "Elasticsearch 实战：从搜索原理到生产系统"
+seriesOrder: 8
+---
+
+前七篇我们一直用的单节点 ES。性能调优做到头了，大促期间单机还是扛不住——CPU 打满、GC 频繁、查询超时。这时候就得从垂直扩展（加内存加 CPU）转向水平扩展（加机器）。
+
+ES 天生为分布式设计，加节点比加内存简单得多。但"能加"和"加得好"是两码事。分片数怎么定、节点角色怎么分配、数据怎么自动均衡——这些决策一旦做错，改起来代价很大。
+
+## 分片：ES 分布式的基础
+
+分片（Shard）是 ES 分布式的最小单元。一个索引被切成多个分片，分布在不同节点上。
+
+### 主分片和副本分片
+
+**主分片（Primary Shard）**：存储原始数据，处理读写请求。一个索引的主分片数在创建时确定，**创建后不能改**。
+
+**副本分片（Replica Shard）**：主分片的完整拷贝。提供两个能力：读负载均衡（搜索请求可以打到副本上）和高可用（主分片挂了，副本自动提升为主）。
+
+```bash
+curl -X PUT "http://localhost:9200/products" -H 'Content-Type: application/json' -d '
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1
+  }
+}'
+```
+
+这会创建 3 个主分片 + 3 个副本分片，总共 6 个分片。如果集群有 3 个节点，每个节点上放 2 个分片（1 主 1 副）。
+
+### 分片数怎么定
+
+这是 ES 集群规划里最常见的问题。没有一个万能公式，但有几个参考原则：
+
+**分片大小**：每个分片的数据量建议在 10-50GB 之间。太小了浪费资源（每个分片有固定的内存开销），太大了影响恢复速度（一个分片挂了，恢复 50GB 数据比恢复 10GB 慢得多）。
+
+**分片数不超过节点数的 3 倍**（经验值）。如果你有 3 个节点，分片数控制在 9 个以内。分片太多意味着查询时要协调更多分片，coordinating 节点的开销增大。
+
+**搜索场景的分片数倾向少而大**。电商商品搜索通常百万级数据，3-5 个主分片够了。日志场景（每天几十 GB）可以用按天分索引，每个索引 1-2 个分片。
+
+### 一个常见的坑：分片数创建后不能改
+
+```bash
+# 尝试修改主分片数——会报错
+curl -X PUT "http://localhost:9200/products/_settings" -H 'Content-Type: application/json' -d '
+{
+  "number_of_shards": 5
+}'
+
+# 返回：Can't update non dynamic settings [[index.number_of_shards]]
+```
+
+如果你发现分片数设错了，唯一的办法是创建一个新索引（设置正确的分片数），用 `_reindex` 迁移数据，然后用别名切换。这也是为什么第 2 篇建议用索引别名管理的原因——给未来留了后路。
+
+副本分片数可以随时改：
+
+```bash
+curl -X PUT "http://localhost:9200/products/_settings" -H 'Content-Type: application/json' -d '
+{
+  "number_of_replicas": 2
+}'
+```
+
+从 1 个副本改到 2 个，ES 自动复制新的副本分片。
+
+## 节点角色
+
+生产环境的 ES 集群通常把节点按角色分开：
+
+### Master 节点
+
+管理集群状态——哪个索引有哪些分片、哪些节点在线、分片怎么分配。不存储数据，不参与搜索。
+
+```yaml
+# elasticsearch.yml
+node.roles: [master]
+```
+
+建议至少 3 个 master 节点（2 个也可以，但 3 个更安全）。只允许其中一个作为 elected master，其他作为 standby。当 master 挂了，standby 自动接管。
+
+### Data 节点
+
+存储数据和执行搜索。这是集群的干活主力。
+
+```yaml
+node.roles: [data]
+```
+
+数据节点的数量根据数据量和查询压力决定。每个节点建议配置 SSD 磁盘和足够的内存（堆内存 + 文件系统缓存各占 50%）。
+
+### Coordinating 节点
+
+不存储数据，不做 master，只负责接收用户的搜索请求、分发到各分片、合并结果返回。相当于负载均衡器。
+
+```yaml
+node.roles: []
+```
+
+把协调职责从 data 节点剥离出来，让 data 节点专心做搜索和存储。当查询复杂（多分片 + 聚合）时，coordinating 节点的 CPU 和内存消耗不小，独立部署避免影响 data 节点。
+
+### 最小集群规划
+
+一个三节点的最小生产集群：
+
+```
+节点 1：master + data（2GB 堆 + 4GB 机器）
+节点 2：master + data（2GB 堆 + 4GB 机器）
+节点 3：master + data（2GB 堆 + 4GB 机器）
+```
+
+三个节点各兼 master 和 data。允许挂掉一个节点，集群还能工作。适合小规模项目（数据 100GB 以内）。
+
+中等规模集群（数据 100GB-1TB）：
+
+```
+3 x master 节点（4GB 机器，2GB 堆）
+3 x data 节点（16GB 机器，8GB 堆，SSD）
+1 x coordinating 节点（8GB 机器，4GB 堆）
+```
+
+## 集群健康状态
+
+ES 用三种颜色表示集群健康：
+
+- **Green**：所有主分片和副本分片都正常
+- **Yellow**：所有主分片正常，但有副本分片未分配（单节点集群永远是 yellow，因为没有地方放副本）
+- **Red**：有主分片未分配，部分数据不可访问
+
+```bash
+curl http://localhost:9200/_cluster/health?pretty
+
+{
+  "status": "green",
+  "number_of_nodes": 3,
+  "active_primary_shards": 3,
+  "active_shards": 6,
+  "relocating_shards": 0,
+  "unassigned_shards": 0
+}
+```
+
+监控集群健康是运维的第一优先级。Red 状态意味着有数据搜不到了，必须立即处理。
+
+## 扩缩容
+
+### 扩容：加节点
+
+ES 的扩容非常简单——启动一个新节点，指向同一个集群名，它自动加入集群：
+
+```yaml
+# 新节点的 elasticsearch.yml
+cluster.name: ecommerce-search
+discovery.seed_hosts: ["node1:9300", "node2:9300", "node3:9300"]
+node.roles: [data]
+```
+
+新节点加入后，ES 自动把部分分片迁移到新节点上（rebalance）。这个过程在后台进行，不影响搜索。但迁移期间磁盘和网络 IO 会增加，建议在低峰期扩容。
+
+加了新节点后，**主分片数不会自动增加**。如果你的数据量增长到需要更多分片，需要创建新索引（更多分片）然后用别名切换。
+
+### 缩容：下线节点
+
+不能直接关机——上面的分片会变成 unassigned，集群变 Red。正确做法：
+
+```bash
+# 告诉 ES 不要在某个节点上分配新分片
+curl -X PUT "http://localhost:9200/_cluster/settings" -H 'Content-Type: application/json' -d '
+{
+  "transient": {
+    "cluster.routing.allocation.exclude._ip": "192.168.1.100"
+  }
+}'
+
+# ES 自动把该节点上的分片迁移到其他节点
+# 等迁移完成（检查 _cluster/health），再关闭节点
+```
+
+## 备份与恢复
+
+ES 的备份叫 Snapshot。备份不是拷贝数据文件，而是记录每个分片的 Lucene segment 引用。增量备份只记录变化的部分。
+
+### 创建备份仓库
+
+```bash
+# 先在所有节点的 elasticsearch.yml 中配置 path.repo
+# path.repo: ["/data/es-backups"]
+
+# 注册备份仓库
+curl -X PUT "http://localhost:9200/_snapshot/ecommerce_backup" -H 'Content-Type: application/json' -d '
+{
+  "type": "fs",
+  "settings": {
+    "location": "/data/es-backups"
+  }
+}'
+```
+
+### 创建快照
+
+```bash
+curl -X PUT "http://localhost:9200/_snapshot/ecommerce_backup/snapshot_20260428" -H 'Content-Type: application/json' -d '
+{
+  "indices": "products",
+  "ignore_unavailable": true,
+  "include_global_state": false
+}'
+```
+
+### 恢复
+
+```bash
+curl -X POST "http://localhost:9200/products/_close"
+
+curl -X POST "http://localhost:9200/_snapshot/ecommerce_backup/snapshot_20260428/_restore" -H 'Content-Type: application/json' -d '
+{
+  "indices": "products"
+}'
+```
+
+建议用定时任务每天凌晨做一次增量快照。快照不影响搜索性能，可以在线执行。
+
+## Index Lifecycle Management：自动管理索引
+
+日志、监控这类时间序列数据，每天都在产生新索引。你可以用 ILM 自动管理索引的生命周期：
+
+```bash
+curl -X PUT "http://localhost:9200/_ilm/policy/logs_policy" -H 'Content-Type: application/json' -d '
+{
+  "policy": {
+    "phases": {
+      "hot": {
+        "min_age": "0ms",
+        "actions": {
+          "rollover": {
+            "max_age": "1d",
+            "max_primary_shard_size": "50gb"
+          }
+        }
+      },
+      "warm": {
+        "min_age": "7d",
+        "actions": {
+          "shrink": { "number_of_shards": 1 },
+          "forcemerge": { "max_num_segments": 1 }
+        }
+      },
+      "delete": {
+        "min_age": "30d",
+        "actions": {
+          "delete": {}
+        }
+      }
+    }
+  }
+}'
+```
+
+这个策略的意思：
+
+- **hot 阶段**：索引活跃，每天或达到 50GB 自动滚动到新索引
+- **warm 阶段**：7 天后，缩小分片数（从多分片缩到 1 个），合并 segment 减少资源占用
+- **delete 阶段**：30 天后自动删除
+
+ILM 对商品索引用得不多（商品索引不会按时间过期），但对搜索日志、访问日志这类数据非常有用。
+
+## 集群规划 Checklist
+
+上线前的关键检查项：
+
+- 每个分片数据量在 10-50GB
+- 至少 3 个 master 节点（防脑裂）
+- data 节点堆内存不超过物理内存 50%
+- 磁盘用 SSD（机械磁盘的随机 IO 是 ES 的性能杀手）
+- 开启慢查询日志
+- 配置定时快照备份
+- 集群健康监控（Red 告警）
+
+---
+
+集群架构搞定了，搜索系统能扛住大规模流量了。下一篇我们把前八篇的所有内容整合成一个完整的电商搜索系统——从架构设计到代码实现，一个可运行的项目。这是整个系列的集大成之作。

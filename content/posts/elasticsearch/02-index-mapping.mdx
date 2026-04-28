@@ -1,0 +1,426 @@
+---
+title: "02 索引设计与 Mapping"
+date: "2026-04-28"
+summary: "为电商商品搜索设计完整的索引 Mapping——讲清楚 text/keyword/integer/nested 等字段类型的区别、analyzer 分词器的工作流程、dynamic mapping 的坑，以及索引别名和模板的实际用途。"
+tags: ["Elasticsearch", "搜索引擎"]
+category: "elasticsearch"
+cover: ""
+draft: false
+series: "Elasticsearch 实战：从搜索原理到生产系统"
+seriesOrder: 2
+---
+
+上一篇我们用 ES 的默认配置索引了几条商品文档，搜索"机械键盘"的效果已经比数据库好很多了。但你可能注意到了一些不对劲的地方：商品价格 899 被存成了字符串还是数字？品牌 "Cherry" 能不能用来做精确筛选？tags 数组里的标签怎么处理？
+
+这些问题的答案都在 **Mapping** 里。Mapping 是 ES 对索引结构的定义，类似于数据库的 DDL（`CREATE TABLE ...`）。它告诉 ES：这个字段是什么类型、要不要建倒排索引、用什么分词器、能不能排序和聚合。
+
+上一篇我们靠 dynamic mapping 自动推断，方便但不靠谱。今天我们为电商搜索系统手动设计一份完整的商品索引 Mapping。
+
+## 先搞清楚最核心的区别：text vs keyword
+
+ES 里的字符串字段有两种基本类型，这是理解 Mapping 的关键：
+
+**text**：会被分词。适合全文搜索。
+
+```
+"name": "Cherry MX 机械式键盘 青轴"
+→ 分词后：["cherry", "mx", "机械", "式", "键盘", "青轴"]
+→ 搜"键盘"能匹配
+```
+
+**keyword**：不分词，整体作为一个 token。适合精确匹配、排序、聚合。
+
+```
+"brand": "Cherry"
+→ 不分词，整个就是 ["Cherry"]
+→ 搜"Cherry"精确匹配，但搜"cher"匹配不到
+```
+
+一个常见的坑：dynamic mapping 把字符串字段同时定义为 text 和 keyword（存在 `.keyword` 子字段里）。这意味着同一个字段存了两份倒排索引——一份分词的（用于搜索），一份不分词的（用于精确匹配和聚合）。磁盘占用翻倍，索引速度也慢一些。
+
+生产环境建议手动指定。需要全文搜索的字段用 text，需要精确匹配/聚合的字段用 keyword，别偷懒让 ES 替你决定。
+
+## 为商品索引设计 Mapping
+
+我们的电商商品需要支持这些操作：
+
+- 按商品名和描述全文搜索（需要 text + 分词）
+- 按品牌、分类精确筛选（需要 keyword）
+- 按价格范围过滤和排序（需要数字类型）
+- 按标签筛选（需要数组 + keyword）
+- 按规格参数筛选（键值对结构，如"颜色:黑色"、"尺寸:87键"）
+
+逐个来看字段设计。
+
+### 基本信息字段
+
+```bash
+curl -X PUT "http://localhost:9200/products" -H 'Content-Type: application/json' -d '
+{
+  "mappings": {
+    "properties": {
+      "name": {
+        "type": "text",
+        "analyzer": "standard",
+        "fields": {
+          "keyword": {
+            "type": "keyword"
+          }
+        }
+      },
+      "brand": {
+        "type": "keyword"
+      },
+      "category": {
+        "type": "keyword"
+      },
+      "price": {
+        "type": "float"
+      },
+      "originalPrice": {
+        "type": "float"
+      },
+      "sales": {
+        "type": "integer"
+      },
+      "stock": {
+        "type": "integer"
+      }
+    }
+  }
+}'
+```
+
+逐个解释设计决策：
+
+**name 字段**：主类型是 `text`（支持全文搜索），同时通过 `fields` 加了一个 `keyword` 子字段。这样 `name` 用于搜索，`name.keyword` 用于排序和聚合。这是 text 字段的常见模式——你需要搜索它，偶尔也需要按名称排序或分组。
+
+**brand 和 category**：用 `keyword` 而不是 `text`。品牌和分类是枚举值，用户筛选时选的是"品牌=Cherry"，而不是搜"品牌包含 Cherry"。keyword 精确匹配，聚合效率也高。
+
+**price、originalPrice**：`float` 类型。ES 支持 `float`（32位）和 `double`（64位）。电商价格精确到分，float 的精度完全够用，没必要用 double 浪费空间。如果对精度有极端要求（比如金融场景），可以用 `scaled_float` 配合 `scaling_factor`。
+
+**sales、stock**：`integer` 类型。销量和库存都是整数，直接用 integer。
+
+### 描述字段：只搜不排
+
+```json
+"description": {
+  "type": "text",
+  "analyzer": "standard"
+}
+```
+
+商品描述只有搜索需求，没有排序和聚合需求，所以不用加 `.keyword` 子字段。纯 text 就够了。
+
+这个字段通常比较长（几十到几百字），加上 keyword 子字段意味着存一整个不分词的长字符串，浪费空间。
+
+### 标签字段：数组就是多值 keyword
+
+```json
+"tags": {
+  "type": "keyword"
+}
+```
+
+ES 里没有专门的"数组类型"。任何字段都可以存多个值——你传 `["机械键盘", "青轴"]` 进去，ES 自动当成多值处理。对于 tags 来说，用 keyword 类型：搜"机械键盘"是精确匹配 tags 数组中的某个元素，不是全文搜索。
+
+如果你需要 tags 也支持模糊搜索（比如搜"键盘"能匹配"机械键盘"），那就用 text 类型。但通常标签筛选是精确匹配，keyword 更合适。
+
+### 规格参数：用 nested 处理键值对
+
+商品的规格参数是个比较麻烦的结构。它是一组键值对：
+
+```json
+{
+  "specs": [
+    { "key": "轴体", "value": "青轴" },
+    { "key": "键数", "value": "104键" },
+    { "key": "背光", "value": "RGB" }
+  ]
+}
+```
+
+你可能会想用 object 类型：
+
+```json
+"specs": {
+  "properties": {
+    "key": { "type": "keyword" },
+    "value": { "type": "keyword" }
+  }
+}
+```
+
+但这有个陷阱。ES 会把 object 数组"扁平化"存储：
+
+```
+specs.key:   ["轴体", "键数", "背光"]
+specs.value: ["青轴", "104键", "RGB"]
+```
+
+查询 `specs.key = "轴体" AND specs.value = "104键"` 会匹配到这条文档——因为 ES 不维护 key 和 value 之间的对应关系。你以为在查"轴体=104键"，ES 觉得 key 里有"轴体"且 value 里有"104键"就满足了。
+
+**nested 类型** 解决了这个问题：
+
+```json
+"specs": {
+  "type": "nested",
+  "properties": {
+    "key": { "type": "keyword" },
+    "value": { "type": "keyword" }
+  }
+}
+```
+
+nested 类型会为每个数组元素单独建一个独立的文档（Lucene 层面），保持 key 和 value 的对应关系。查询时用 `nested` 查询：
+
+```bash
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "query": {
+    "nested": {
+      "path": "specs",
+      "query": {
+        "bool": {
+          "must": [
+            { "term": { "specs.key": "轴体" } },
+            { "term": { "specs.value": "青轴" } }
+          ]
+        }
+      }
+    }
+  }
+}'
+```
+
+这样只会匹配到"轴体=青轴"的商品，不会误匹配。
+
+nested 的代价是查询和索引都稍慢一些（每个元素独立索引），但对规格参数这种数据量不大的场景完全没问题。
+
+### 完整的 Mapping
+
+把上面的设计合在一起，加上时间戳字段：
+
+```bash
+curl -X PUT "http://localhost:9200/products_v1" -H 'Content-Type: application/json' -d '
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0
+  },
+  "mappings": {
+    "properties": {
+      "name": {
+        "type": "text",
+        "analyzer": "standard",
+        "fields": {
+          "keyword": { "type": "keyword" }
+        }
+      },
+      "description": {
+        "type": "text",
+        "analyzer": "standard"
+      },
+      "brand": { "type": "keyword" },
+      "category": { "type": "keyword" },
+      "price": { "type": "float" },
+      "originalPrice": { "type": "float" },
+      "sales": { "type": "integer" },
+      "stock": { "type": "integer" },
+      "tags": { "type": "keyword" },
+      "specs": {
+        "type": "nested",
+        "properties": {
+          "key": { "type": "keyword" },
+          "value": { "type": "keyword" }
+        }
+      },
+      "status": { "type": "keyword" },
+      "createdAt": { "type": "date" },
+      "updatedAt": { "type": "date" }
+    }
+  }
+}'
+```
+
+`settings` 部分暂时用最小配置：1 个分片，0 个副本。这在单节点开发环境够用。第 8 篇讲集群的时候会详细讲分片和副本怎么配。
+
+注意索引名用了 `products_v1` 而不是 `products`。这是为了配合接下来要讲的索引别名。
+
+## Analyzer：分词器怎么工作
+
+前面 Mapping 里每个 text 字段都指定了 `"analyzer": "standard"`。analyzer 是 ES 分词的核心组件，它决定了一段文本怎么被拆成一个个 token。
+
+analyzer 的工作流程分三步：
+
+```
+"Cherry MX 机械式键盘 青轴"
+   ↓ 1. Character Filters（字符过滤器）
+   ↓ 去掉 HTML 标签、替换特殊字符等
+"Cherry MX 机械式键盘 青轴"
+   ↓ 2. Tokenizer（分词器）
+   ↓ 按规则拆分成 token
+["Cherry", "MX", "机械", "式", "键盘", "青轴"]
+   ↓ 3. Token Filters（token 过滤器）
+   ↓ 转小写、去停用词、同义词替换等
+["cherry", "mx", "机械", "式", "键盘", "青轴"]
+```
+
+standard analyzer 是 ES 的默认分词器，对英文按空格和标点分词，对中文基本是逐字分词（"机械式"会变成"机"、"械"、"式"三个单字）。这对中文搜索来说效果很差——用户搜"机械"搜不到"机械式键盘"。
+
+这就是为什么第 5 篇要专门讲中文分词。现在先用 standard analyzer，后面会换成 IK 分词器。分词器的选择对搜索效果影响极大，但 Mapping 的其他部分（字段类型、nested、keyword）跟分词器无关，先把骨架搭好。
+
+## Dynamic Mapping 的坑
+
+ES 默认开启 dynamic mapping（`"dynamic": true`）。这意味着如果你往索引里插入一个 Mapping 里没有定义的字段，ES 会自动帮你加上。
+
+这看起来很方便，但有几个坑：
+
+**类型推断可能出错。** 第一条数据的某个字段是 `"123"`（字符串），ES 推断为 text。后面你想存数字 456，ES 报错——字段类型一旦确定不能改。整个索引得重建。
+
+**字段会无限增长。** 如果上游数据格式不稳定，时不时冒出一个新字段，ES 会照单全收。不知不觉索引里多了几十个你根本用不到的字段，浪费磁盘和内存。
+
+生产环境建议关闭 dynamic mapping：
+
+```json
+{
+  "mappings": {
+    "dynamic": "strict",
+    "properties": { ... }
+  }
+}
+```
+
+设成 `strict` 后，插入未定义的字段会直接报错，强制你显式管理 Mapping。`"dynamic": false` 则是静默忽略未定义字段——不报错也不索引。
+
+开发阶段可以用 `true` 快速迭代，上线前改成 `strict`。
+
+## 索引别名：零停机换 Mapping
+
+为什么前面索引名用 `products_v1`？因为 ES 的 Mapping 一旦创建，字段类型不能改。如果你发现 price 应该用 `scaled_float` 而不是 `float`，你没法在原索引上改，只能建一个新索引。
+
+但你的应用代码里查的是 `products` 这个名字。怎么让应用无感知地切换到新索引？
+
+**索引别名（Alias）** 就是干这个的：
+
+```bash
+# 给 products_v1 创建别名 products
+curl -X POST "http://localhost:9200/_aliases" -H 'Content-Type: application/json' -d '
+{
+  "actions": [
+    { "add": { "index": "products_v1", "alias": "products" } }
+  ]
+}'
+```
+
+现在应用代码读写 `products`，ES 自动路由到 `products_v1`。
+
+需要改 Mapping 的时候：
+
+```bash
+# 1. 创建新索引 products_v2，修改后的 Mapping
+# 2. 把数据从 products_v1 迁移到 products_v2（用 _reindex API）
+# 3. 原子切换别名
+
+curl -X POST "http://localhost:9200/_aliases" -H 'Content-Type: application/json' -d '
+{
+  "actions": [
+    { "remove": { "index": "products_v1", "alias": "products" } },
+    { "add": { "index": "products_v2", "alias": "products" } }
+  ]
+}'
+```
+
+别名切换是原子操作，应用完全无感知。这是 ES 管理索引变更的标准做法。
+
+## 索引模板：批量管理同类索引
+
+如果你的日志索引按天分（`logs-2026-04-28`、`logs-2026-04-29`），每个新索引都需要相同的 Mapping 和 settings。手动创建不现实。
+
+索引模板（Index Template）解决这个问题：
+
+```bash
+curl -X PUT "http://localhost:9200/_index_template/products_template" -H 'Content-Type: application/json' -d '
+{
+  "index_patterns": ["products_*"],
+  "template": {
+    "settings": {
+      "number_of_shards": 1,
+      "number_of_replicas": 0
+    },
+    "mappings": {
+      "dynamic": "strict",
+      "properties": {
+        "name": { "type": "text", "analyzer": "standard" },
+        "price": { "type": "float" }
+      }
+    }
+  }
+}'
+```
+
+所有匹配 `products_*` 模式的新索引，自动应用这个模板的 settings 和 mappings。对于电商商品搜索，模板主要用于管理版本迭代（products_v1、products_v2...）。
+
+## 插入数据验证 Mapping
+
+用完整的 Mapping 创建索引后，插入一条带规格参数的商品：
+
+```bash
+curl -X POST "http://localhost:9200/products/_doc" -H 'Content-Type: application/json' -d '
+{
+  "name": "Cherry MX 机械式键盘 青轴 104键",
+  "description": "德国原厂机械键盘，MX青轴，段落感强烈，适合长时间打字办公",
+  "brand": "Cherry",
+  "category": "键盘",
+  "price": 899.00,
+  "originalPrice": 1299.00,
+  "sales": 3842,
+  "stock": 156,
+  "tags": ["机械键盘", "青轴", "办公", "104键"],
+  "specs": [
+    { "key": "轴体", "value": "青轴" },
+    { "key": "键数", "value": "104键" },
+    { "key": "背光", "value": "白色" },
+    { "key": "连接方式", "value": "有线" }
+  ],
+  "status": "on_sale",
+  "createdAt": "2025-12-01T10:30:00Z",
+  "updatedAt": "2026-01-15T09:20:00Z"
+}'
+```
+
+验证一下 Mapping 是否生效：
+
+```bash
+curl http://localhost:9200/products/_mapping | python3 -m json.tool
+```
+
+你会看到每个字段的类型定义和我们设计的一致。试试插入一个未定义的字段（如果 dynamic 设成了 strict）：
+
+```bash
+curl -X POST "http://localhost:9200/products/_doc" -H 'Content-Type: application/json' -d '
+{
+  "name": "测试商品",
+  "unknownField": "should fail"
+}'
+
+# 返回 400 错误：strict_dynamic_mapping_exception
+```
+
+strict 模式下，未定义字段直接被拒绝。
+
+## 设计 Mapping 的核心思路
+
+回顾一下我们做决策的过程：
+
+1. **需要全文搜索吗？** 需要 → text。不需要 → keyword 或数字类型
+2. **需要精确匹配/聚合/排序吗？** 需要 → keyword（字符串）或适当的数字类型
+3. **两者都要？** text + `.keyword` 子字段
+4. **是键值对数组吗？** nested 类型，保持元素间的对应关系
+5. **分词器选什么？** 英文用 standard，中文用 IK（第 5 篇详细讲），开发阶段先用 standard
+
+这个思路适用于任何业务的索引设计，不只是电商。核心原则：**根据查询需求倒推字段类型，而不是根据数据格式正推**。先想清楚你要怎么查，再决定怎么存。
+
+---
+
+Mapping 设计好了，索引里也有数据了。下一篇该解决最核心的问题：怎么写出搜得准的查询。我们会从 `match` 查询开始，一路讲到 `bool` 组合查询、filter 过滤、function_score 自定义排序，还有搜索结果高亮和分页。这些查询语法覆盖了日常搜索 80% 的场景。

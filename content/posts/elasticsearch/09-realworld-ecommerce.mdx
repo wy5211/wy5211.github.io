@@ -1,0 +1,435 @@
+---
+title: "09 实战：电商搜索系统"
+date: "2026-04-28"
+summary: "把前八篇整合成可运行的电商搜索系统——完整的商品索引 Mapping、搜索 API、筛选聚合、搜索建议、热门搜索，用 Node.js + Elasticsearch 实现。"
+tags: ["Elasticsearch", "搜索引擎", "Node.js"]
+category: "elasticsearch"
+cover: ""
+draft: false
+series: "Elasticsearch 实战：从搜索原理到生产系统"
+seriesOrder: 9
+---
+
+前八篇我们把 Elasticsearch 的核心能力过了一遍：倒排索引原理、Mapping 设计、查询 DSL、聚合分析、中文分词、数据同步、性能优化、集群架构。每一篇都在解决一个具体问题，但它们是散落的零件。
+
+今天我们把零件拼成一辆完整的车。
+
+## 系统架构
+
+电商搜索系统的整体架构：
+
+```
+用户 → 搜索 API（Node.js）→ Elasticsearch
+                          ← MySQL（数据源）
+                               ↓
+                          Canal/Debezium（数据同步）
+```
+
+核心数据流：
+
+1. 运营在后台管理系统操作商品（上架、改价、改标题），数据写入 MySQL
+2. CDC 组件监听 MySQL binlog，实时同步到 ES
+3. 用户在搜索页输入关键词，前端调搜索 API
+4. 搜索 API 查询 ES，返回商品列表 + 筛选面板 + 搜索建议
+
+今天重点实现第 3-4 步：搜索 API 的完整逻辑。
+
+## 完整的商品索引 Mapping
+
+整合第 2 篇的 Mapping 和第 5 篇的中文分词配置：
+
+```bash
+curl -X PUT "http://localhost:9200/products" -H 'Content-Type: application/json' -d '
+{
+  "settings": {
+    "number_of_shards": 3,
+    "number_of_replicas": 1,
+    "analysis": {
+      "filter": {
+        "synonym_filter": {
+          "type": "synonym",
+          "synonyms_path": "analysis/synonyms.txt"
+        }
+      },
+      "analyzer": {
+        "ik_synonym": {
+          "type": "custom",
+          "tokenizer": "ik_max_word",
+          "filter": ["synonym_filter", "lowercase"]
+        },
+        "ik_synonym_smart": {
+          "type": "custom",
+          "tokenizer": "ik_smart",
+          "filter": ["synonym_filter", "lowercase"]
+        },
+        "pinyin_analyzer": {
+          "type": "custom",
+          "tokenizer": "pinyin"
+        }
+      },
+      "tokenizer": {
+        "pinyin": {
+          "type": "pinyin",
+          "keep_full_pinyin": true,
+          "keep_first_letter": true,
+          "remove_duplicated_term": true
+        }
+      }
+    }
+  },
+  "mappings": {
+    "dynamic": "strict",
+    "properties": {
+      "name": {
+        "type": "text",
+        "analyzer": "ik_max_word",
+        "search_analyzer": "ik_smart",
+        "fields": {
+          "keyword": { "type": "keyword" },
+          "synonym": {
+            "type": "text",
+            "analyzer": "ik_synonym",
+            "search_analyzer": "ik_synonym_smart"
+          },
+          "pinyin": {
+            "type": "text",
+            "analyzer": "pinyin_analyzer"
+          },
+          "completion": {
+            "type": "completion",
+            "analyzer": "ik_max_word"
+          }
+        }
+      },
+      "description": {
+        "type": "text",
+        "analyzer": "ik_max_word",
+        "search_analyzer": "ik_smart",
+        "doc_values": false
+      },
+      "brand": { "type": "keyword" },
+      "category": { "type": "keyword" },
+      "price": { "type": "float" },
+      "originalPrice": { "type": "float" },
+      "sales": { "type": "integer" },
+      "stock": { "type": "integer" },
+      "tags": { "type": "keyword" },
+      "coverUrl": {
+        "type": "keyword",
+        "index": false,
+        "doc_values": false
+      },
+      "specs": {
+        "type": "nested",
+        "properties": {
+          "key": { "type": "keyword" },
+          "value": { "type": "keyword" }
+        }
+      },
+      "status": { "type": "keyword" },
+      "createdAt": { "type": "date" },
+      "updatedAt": { "type": "date" }
+    }
+  }
+}'
+```
+
+相比之前版本的几个改进：
+
+- `coverUrl`：商品封面图 URL，不需要搜索和聚合（`index: false, doc_values: false`）
+- `name.completion`：用于搜索建议的 completion 类型
+- `dynamic: "strict"`：防止未知字段写入
+- `description` 的 `doc_values: false`：不需要排序和聚合
+
+## 搜索 API 实现
+
+用 Node.js 的 `@elastic/elasticsearch` 客户端实现搜索服务。
+
+### 初始化客户端
+
+```typescript
+import { Client } from "@elastic/elasticsearch";
+
+const esClient = new Client({
+  node: process.env.ES_URL || "http://localhost:9200",
+});
+
+export { esClient };
+```
+
+### 搜索接口：商品列表 + 筛选面板
+
+一个接口同时返回搜索结果和筛选面板数据：
+
+```typescript
+interface SearchParams {
+  keyword: string;
+  brand?: string[];
+  category?: string;
+  priceMin?: number;
+  priceMax?: number;
+  page?: number;
+  pageSize?: number;
+  sortBy?: "relevance" | "price_asc" | "price_desc" | "sales";
+}
+
+async function searchProducts(params: SearchParams) {
+  const {
+    keyword,
+    brand,
+    category,
+    priceMin,
+    priceMax,
+    page = 1,
+    pageSize = 20,
+    sortBy = "relevance",
+  } = params;
+
+  const from = (page - 1) * pageSize;
+
+  const must: any[] = [];
+  const filter: any[] = [{ term: { status: "on_sale" } }];
+
+  if (keyword) {
+    must.push({
+      multi_match: {
+        query: keyword,
+        fields: ["name^3", "name.synonym^2", "name.pinyin", "description"],
+        type: "best_fields",
+      },
+    });
+  }
+
+  if (brand?.length) {
+    filter.push({ terms: { brand } });
+  }
+  if (category) {
+    filter.push({ term: { category } });
+  }
+  if (priceMin !== undefined || priceMax !== undefined) {
+    const range: any = {};
+    if (priceMin !== undefined) range.gte = priceMin;
+    if (priceMax !== undefined) range.lte = priceMax;
+    filter.push({ range: { price: range } });
+  }
+
+  let sort: any[];
+  if (sortBy === "relevance" && keyword) {
+    sort = [{ _score: "desc" }, { sales: "desc" }];
+  } else if (sortBy === "relevance") {
+    sort = [{ sales: "desc" }];
+  } else if (sortBy === "price_asc") {
+    sort = [{ price: "asc" }];
+  } else if (sortBy === "price_desc") {
+    sort = [{ price: "desc" }];
+  } else {
+    sort = [{ sales: "desc" }];
+  }
+
+  const result = await esClient.search({
+    index: "products",
+    body: {
+      query: { bool: { must, filter } },
+      from,
+      size: pageSize,
+      sort,
+      _source: [
+        "name",
+        "price",
+        "originalPrice",
+        "brand",
+        "category",
+        "sales",
+        "coverUrl",
+        "tags",
+      ],
+      highlight: {
+        pre_tags: ["<em>"],
+        post_tags: ["</em>"],
+        fields: { name: {} },
+      },
+      aggs: {
+        brands: { terms: { field: "brand", size: 20 } },
+        categories: { terms: { field: "category", size: 10 } },
+        price_ranges: {
+          range: {
+            field: "price",
+            ranges: [
+              { key: "0-200", to: 200 },
+              { key: "200-500", from: 200, to: 500 },
+              { key: "500-1000", from: 500, to: 1000 },
+              { key: "1000+", from: 1000 },
+            ],
+          },
+        },
+      },
+    },
+  });
+
+  return {
+    total: result.hits.total.value,
+    products: result.hits.hits.map((hit: any) => ({
+      id: hit._id,
+      ...hit._source,
+      highlight: hit.highlight?.name?.[0],
+    })),
+    aggregations: {
+      brands: result.aggregations.brands.buckets.map((b: any) => ({
+        name: b.key,
+        count: b.doc_count,
+      })),
+      categories: result.aggregations.categories.buckets.map((b: any) => ({
+        name: b.key,
+        count: b.doc_count,
+      })),
+      priceRanges: result.aggregations.price_ranges.buckets.map((b: any) => ({
+        range: b.key,
+        count: b.doc_count,
+      })),
+    },
+    page,
+    pageSize,
+  };
+}
+```
+
+### 搜索建议：自动补全
+
+用户在搜索框输入时，实时显示补全建议：
+
+```typescript
+async function suggestProducts(prefix: string) {
+  const result = await esClient.search({
+    index: "products",
+    body: {
+      suggest: {
+        product_suggest: {
+          prefix,
+          completion: {
+            field: "name.completion",
+            size: 8,
+            skip_duplicates: true,
+          },
+        },
+      },
+    },
+  });
+
+  return result.suggest.product_suggest[0].options.map(
+    (opt: any) => opt._source.name
+  );
+}
+```
+
+completion suggester 底层是 FST 数据结构，前缀匹配非常快。但它只支持前缀匹配——输入"机械"能匹配"机械键盘"，但输入"键盘"匹配不到"机械键盘"。如果需要中缀匹配，用 `match_phrase_prefix` 查询作为补充。
+
+### 热门搜索词
+
+基于搜索日志统计热门搜索。搜索日志存在 ES 的另一个索引里：
+
+```typescript
+// 记录搜索日志
+async function logSearch(keyword: string, resultCount: number) {
+  await esClient.index({
+    index: "search_logs",
+    body: {
+      keyword,
+      resultCount,
+      timestamp: new Date().toISOString(),
+    },
+  });
+}
+
+// 统计热门搜索词（最近 7 天）
+async function getHotKeywords() {
+  const result = await esClient.search({
+    index: "search_logs",
+    body: {
+      query: {
+        range: { timestamp: { gte: "now-7d" } },
+      },
+      size: 0,
+      aggs: {
+        hot_keywords: {
+          terms: { field: "keyword", size: 10 },
+        },
+      },
+    },
+  });
+
+  return result.aggregations.hot_keywords.buckets.map((b: any) => ({
+    keyword: b.key,
+    count: b.doc_count,
+  }));
+}
+```
+
+搜索日志索引配上 ILM 策略，自动清理 30 天以前的数据。
+
+### Express 路由
+
+```typescript
+import express from "express";
+const app = express();
+
+app.get("/api/search", async (req, res) => {
+  try {
+    const { q, brand, category, price_min, price_max, page, size, sort } =
+      req.query;
+
+    const result = await searchProducts({
+      keyword: q as string,
+      brand: brand ? (brand as string).split(",") : undefined,
+      category: category as string,
+      priceMin: price_min ? Number(price_min) : undefined,
+      priceMax: price_max ? Number(price_max) : undefined,
+      page: page ? Number(page) : 1,
+      pageSize: size ? Number(size) : 20,
+      sortBy: sort as any,
+    });
+
+    if (q) logSearch(q as string, result.total).catch(() => {});
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: "搜索服务异常" });
+  }
+});
+
+app.get("/api/suggest", async (req, res) => {
+  const { q } = req.query;
+  if (!q) return res.json([]);
+  res.json(await suggestProducts(q as string));
+});
+
+app.get("/api/hot-keywords", async (_req, res) => {
+  res.json(await getHotKeywords());
+});
+
+app.listen(3000);
+```
+
+## 上线前检查清单
+
+**ES 集群**：至少 3 个节点，集群健康 Green，快照备份已配置
+
+**数据同步**：MySQL → ES 管道跑通，延迟在可接受范围，同步失败有告警
+
+**搜索质量**：核心关键词搜索结果人工验证过，中文分词效果达标
+
+**性能**：压测 P99 < 200ms，filter 缓存命中率合理
+
+## 系统的整体成本
+
+引入 ES 搜索系统的代价：
+
+- **硬件**：最少 3 台服务器（ES 集群），加上 CDC 组件的服务器
+- **运维**：ES 集群监控、数据同步管道维护、分片管理、版本升级
+- **开发**：Mapping 设计、查询逻辑、数据同步、搜索优化，大约 2-4 周
+
+换来的是：搜索体验从数据库 LIKE 级别提升到专业搜索引擎级别，支持中文分词、同义词、拼音搜索，筛选面板一个请求搞定，水平扩展数据量从十万到千万不需要改架构。
+
+值不值？取决于搜索在你产品里的重要程度。如果是电商，搜索直接影响转化率，这笔投入几乎总是值得的。
+
+---
+
+下一篇是系列的最后一篇。我们来看看 ES 不只是搜索——日志分析（ELK Stack）、AI 语义搜索（向量检索），以及 ES 和其他方案的选型对比。

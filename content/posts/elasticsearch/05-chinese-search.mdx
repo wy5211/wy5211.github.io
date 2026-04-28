@@ -1,0 +1,449 @@
+---
+title: "05 中文搜索实战：分词、同义词、拼音"
+date: "2026-04-28"
+summary: "解决中文搜索的三大难题——分词不准、同义词搜不到、拼音输入找不到，用 IK 分词器、同义词过滤器和拼音分词器全面提升中文搜索体验。"
+tags: ["Elasticsearch", "搜索引擎", "中文搜索"]
+category: "elasticsearch"
+cover: ""
+draft: false
+series: "Elasticsearch 实战：从搜索原理到生产系统"
+seriesOrder: 5
+---
+
+前四篇用 standard 分词器跑通了搜索、筛选、聚合。但你肯定发现了一个问题：搜"机械键盘"的时候，分词效果很糟糕。
+
+用 `_analyze` API 看看 standard 分词器怎么处理中文：
+
+```bash
+curl -X POST "http://localhost:9200/_analyze" -H 'Content-Type: application/json' -d '
+{
+  "analyzer": "standard",
+  "text": "机械式键盘红轴"
+}'
+
+# 返回：["机", "械", "式", "键", "盘", "红", "轴"]
+```
+
+逐字拆分。这意味着搜"机械"，ES 拿到"机"和"械"两个单字，去倒排索引里找包含这两个字的文档。结果？几乎所有包含"机"或"械"的文档都匹配了——"手机壳"、"机械硬盘"、"机遇"全都跑出来了。
+
+中文搜索有三个老大难问题：
+
+1. **分词不准**："机械键盘"应该是一个整体词，不应该拆成单字
+2. **同义词搜不到**：搜"苹果"找不到"Apple"，搜"手机"找不到"phone"
+3. **拼音找不到**：用户输入"ji pan"，搜不到"机械键盘"
+
+一个一个解决。
+
+## IK 分词器：让中文搜索变聪明
+
+IK Analyzer 是 Elasticsearch 最常用的中文分词插件。它内置了一个中文词典，能识别常见的中文词汇。
+
+### 安装 IK 分词器
+
+```bash
+# 进入 ES 容器安装插件
+docker exec -it elasticsearch bash -c \
+  "elasticsearch-plugin install https://github.com/infinilabs/analysis-ik/releases/download/v8.12.0/elasticsearch-analysis-ik-8.12.0.zip"
+
+# 重启 ES
+docker restart elasticsearch
+```
+
+版本号要和你的 ES 版本一致。装完重启后验证：
+
+```bash
+curl -X POST "http://localhost:9200/_analyze" -H 'Content-Type: application/json' -d '
+{
+  "analyzer": "ik_max_word",
+  "text": "机械式键盘红轴"
+}'
+
+# 返回：["机械", "式", "键盘", "红轴"]
+```
+
+对比 standard 的逐字拆分，IK 把"机械"、"键盘"、"红轴"识别成了独立的词。搜"机械键盘"，ES 拿到"机械"和"键盘"两个有意义的词，匹配精度大幅提升。
+
+### ik_max_word vs ik_smart
+
+IK 提供两种分词模式：
+
+**ik_max_word**：最细粒度切分，尽可能多地切出词。用在**索引时**，确保文档被各种搜索词命中。
+
+```
+"中华人民共和国" → ["中华人民共和国", "中华人民", "中华", "华人", "人民共和国", "人民", "共和国", "共和", "国"]
+```
+
+**ik_smart**：智能切分，只切最合理的分词。用在**搜索时**，避免搜索词被过度拆分导致结果过多。
+
+```
+"中华人民共和国" → ["中华人民共和国"]
+```
+
+常见的搭配：索引时用 `ik_max_word`（让文档容易被搜到），搜索时用 `ik_smart`（让搜索意图更精准）。
+
+### 自定义词典
+
+IK 的内置词典覆盖了常用词汇，但电商领域的专有名词它不认识：
+
+```bash
+curl -X POST "http://localhost:9200/_analyze" -H 'Content-Type: application/json' -d '
+{
+  "analyzer": "ik_max_word",
+  "text": "机械键盘红轴87键"
+}'
+
+# 可能返回：["机械", "键盘", "红轴", "87", "键"]
+# "机械键盘"被拆成了"机械"和"键盘"，而不是一个整体
+```
+
+如果你希望"机械键盘"被当成一个词，需要加自定义词典。
+
+在 ES 配置目录下创建自定义词典文件（`config/analysis-ik/custom.dic`），每行一个词：
+
+```
+机械键盘
+游戏键盘
+机械硬盘
+```
+
+然后在 IK 的配置文件 `IKAnalyzer.cfg.xml` 中引入：
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE properties SYSTEM "http://java.sun.com/dtd/properties.dtd">
+<properties>
+  <comment>IK Analyzer 扩展配置</comment>
+  <entry key="ext_dict">custom.dic</entry>
+</properties>
+```
+
+重启后，"机械键盘"会被识别为一个整体词。Docker 环境下需要把词典文件挂载到容器里。
+
+### 更新 Mapping 使用 IK
+
+创建索引时指定 IK 分词器：
+
+```bash
+curl -X PUT "http://localhost:9200/products_v2" -H 'Content-Type: application/json' -d '
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0
+  },
+  "mappings": {
+    "properties": {
+      "name": {
+        "type": "text",
+        "analyzer": "ik_max_word",
+        "search_analyzer": "ik_smart",
+        "fields": {
+          "keyword": { "type": "keyword" }
+        }
+      },
+      "description": {
+        "type": "text",
+        "analyzer": "ik_max_word",
+        "search_analyzer": "ik_smart"
+      }
+    }
+  }
+}'
+```
+
+注意两个字段都设了 `analyzer` 和 `search_analyzer`：
+
+- `analyzer`：索引时用的分词器（ik_max_word，切得细）
+- `search_analyzer`：搜索时用的分词器（ik_smart，切得粗）
+
+如果你不设 `search_analyzer`，搜索时也会用 `analyzer`（ik_max_word），这会导致搜索词被过度拆分——用户搜"机械键盘"，被拆成"机械"、"键盘"两个词做 OR 查询，匹配结果太多了。
+
+## 同义词过滤器：搜"苹果"找到"Apple"
+
+电商场景里，同一个东西有很多种叫法。用户搜"苹果"应该找到 Apple 品牌的商品，搜"手机"应该找到"智能手机"分类。
+
+ES 的同义词过滤器在 analyzer 层面解决这个问题：
+
+```bash
+curl -X PUT "http://localhost:9200/products_v2/_close"
+
+curl -X PUT "http://localhost:9200/products_v2/_settings" -H 'Content-Type: application/json' -d '
+{
+  "settings": {
+    "analysis": {
+      "filter": {
+        "synonym_filter": {
+          "type": "synonym",
+          "synonyms": [
+            "苹果,apple,Apple",
+            "手机,phone,telephone",
+            "笔记本,laptop",
+            "机械键盘,mechanical keyboard"
+          ]
+        }
+      },
+      "analyzer": {
+        "ik_synonym": {
+          "type": "custom",
+          "tokenizer": "ik_max_word",
+          "filter": ["synonym_filter", "lowercase"]
+        }
+      }
+    }
+  }
+}'
+
+curl -X PUT "http://localhost:9200/products_v2/_open"
+```
+
+这段配置做了什么：
+
+1. 定义了一个 `synonym_filter`，里面配置了同义词映射。逗号分隔的词互为同义词
+2. 创建了一个新的 analyzer `ik_synonym`，先用 IK 分词，再用同义词过滤器扩展
+3. 索引需要先 close 再 open 才能更新 settings
+
+验证一下：
+
+```bash
+curl -X POST "http://localhost:9200/products_v2/_analyze" -H 'Content-Type: application/json' -d '
+{
+  "analyzer": "ik_synonym",
+  "text": "苹果手机"
+}'
+
+# 返回：["苹果", "apple", "手机", "phone", "telephone"]
+```
+
+"苹果"被扩展成了"苹果"和"apple"，"手机"被扩展成了"手机"、"phone"、"telephone"。索引时用这个 analyzer，文档里只要有"Apple"这个词，搜"苹果"也能命中。
+
+### 同义词的两种格式
+
+```json
+"苹果,apple,Apple"          // 双向同义词：搜任何一个都能匹配其他
+"iphone => 苹果手机"         // 单向同义词：搜 iphone 会扩展为"苹果手机"，但搜"苹果手机"不会匹配 iphone
+```
+
+单向同义词适合"用户习惯用词 → 标准用词"的映射。比如用户搜"耳塞"应该找到"耳机"，但搜"耳机"不需要额外匹配"耳塞"。
+
+## 拼音分词器：搜"ji pan"找到"机械键盘"
+
+移动端用户经常用拼音输入，有时候直接提交了拼音就搜索了。ES 有一个 pinyin 分词插件，能把中文转成拼音建立索引。
+
+### 安装拼音分词器
+
+```bash
+docker exec -it elasticsearch bash -c \
+  "elasticsearch-plugin install https://github.com/infinilabs/analysis-pinyin/releases/download/v8.12.0/elasticsearch-analysis-pinyin-8.12.0.zip"
+
+docker restart elasticsearch
+```
+
+### 配置拼音分词器
+
+```bash
+curl -X PUT "http://localhost:9200/products_v2/_close"
+
+curl -X PUT "http://localhost:9200/products_v2/_settings" -H 'Content-Type: application/json' -d '
+{
+  "settings": {
+    "analysis": {
+      "analyzer": {
+        "pinyin_analyzer": {
+          "type": "custom",
+          "tokenizer": "pinyin"
+        }
+      },
+      "tokenizer": {
+        "pinyin": {
+          "type": "pinyin",
+          "keep_first_letter": true,
+          "keep_full_pinyin": true,
+          "keep_original": false,
+          "limit_first_letter_length": 16,
+          "remove_duplicated_term": true
+        }
+      }
+    }
+  }
+}'
+
+curl -X PUT "http://localhost:9200/products_v2/_open"
+```
+
+验证：
+
+```bash
+curl -X POST "http://localhost:9200/products_v2/_analyze" -H 'Content-Type: application/json' -d '
+{
+  "analyzer": "pinyin_analyzer",
+  "text": "机械键盘"
+}'
+
+# 返回：["ji", "xie", "jian", "pan", "jxjp"]
+```
+
+每个字被转成了拼音，同时生成了首字母缩写"jxjp"。搜"ji pan"能匹配到。
+
+## 多字段多分词器策略
+
+现在我们有了三种分词能力：IK（中文分词）、同义词扩展、拼音。怎么把它们整合到一个索引里？
+
+答案是**多字段（multi-fields）**——同一个字段用不同的 analyzer 建立多个子字段：
+
+```bash
+curl -X PUT "http://localhost:9200/products_v3" -H 'Content-Type: application/json' -d '
+{
+  "settings": {
+    "number_of_shards": 1,
+    "number_of_replicas": 0,
+    "analysis": {
+      "filter": {
+        "synonym_filter": {
+          "type": "synonym",
+          "synonyms": [
+            "苹果,apple",
+            "手机,phone",
+            "笔记本,laptop",
+            "机械键盘,mechanical keyboard"
+          ]
+        }
+      },
+      "analyzer": {
+        "ik_synonym": {
+          "type": "custom",
+          "tokenizer": "ik_max_word",
+          "filter": ["synonym_filter", "lowercase"]
+        },
+        "ik_synonym_smart": {
+          "type": "custom",
+          "tokenizer": "ik_smart",
+          "filter": ["synonym_filter", "lowercase"]
+        },
+        "pinyin_analyzer": {
+          "type": "custom",
+          "tokenizer": "pinyin"
+        }
+      },
+      "tokenizer": {
+        "pinyin": {
+          "type": "pinyin",
+          "keep_full_pinyin": true,
+          "keep_first_letter": true,
+          "remove_duplicated_term": true
+        }
+      }
+    }
+  },
+  "mappings": {
+    "properties": {
+      "name": {
+        "type": "text",
+        "analyzer": "ik_max_word",
+        "search_analyzer": "ik_smart",
+        "fields": {
+          "keyword": { "type": "keyword" },
+          "synonym": {
+            "type": "text",
+            "analyzer": "ik_synonym",
+            "search_analyzer": "ik_synonym_smart"
+          },
+          "pinyin": {
+            "type": "text",
+            "analyzer": "pinyin_analyzer"
+          }
+        }
+      },
+      "description": {
+        "type": "text",
+        "analyzer": "ik_max_word",
+        "search_analyzer": "ik_smart"
+      },
+      "brand": { "type": "keyword" },
+      "category": { "type": "keyword" },
+      "price": { "type": "float" },
+      "originalPrice": { "type": "float" },
+      "sales": { "type": "integer" },
+      "stock": { "type": "integer" },
+      "tags": { "type": "keyword" },
+      "specs": {
+        "type": "nested",
+        "properties": {
+          "key": { "type": "keyword" },
+          "value": { "type": "keyword" }
+        }
+      },
+      "status": { "type": "keyword" },
+      "createdAt": { "type": "date" },
+      "updatedAt": { "type": "date" }
+    }
+  }
+}'
+```
+
+name 字段现在有三个子字段：
+
+- `name`（默认）：用 IK 分词，常规中文搜索
+- `name.synonym`：带同义词扩展的 IK 分词
+- `name.pinyin`：拼音分词
+
+### 搜索时怎么用
+
+搜索时用 `multi_match` 同时查多个子字段：
+
+```bash
+curl -X GET "http://localhost:9200/products_v3/_search" -H 'Content-Type: application/json' -d '
+{
+  "query": {
+    "multi_match": {
+      "query": "苹果手机",
+      "fields": ["name^3", "name.synonym^2", "name.pinyin"],
+      "type": "best_fields"
+    }
+  }
+}'
+```
+
+权重设计：
+
+- `name^3`：IK 分词匹配权重最高（最精准的中文搜索）
+- `name.synonym^2`：同义词匹配次之（搜"苹果"找到"Apple"）
+- `name.pinyin`：拼音匹配最低（兜底，防止拼音搜不到）
+
+这种多字段多分词器的策略是中文搜索的标准做法。代价是索引体积增大——每个子字段都会建独立的倒排索引。对于商品名这种短文本，增加的体积可以接受。
+
+## 索引时 vs 搜索时分词
+
+这个概念在中文搜索里特别重要，再强调一遍：
+
+- **索引时（analyzer）**：文档写入 ES 时用的分词器。决定文档被拆成哪些 token 存入倒排索引
+- **搜索时（search_analyzer）**：搜索请求里的关键词用的分词器。决定搜索词被拆成哪些 token 去匹配
+
+两者可以用不同的分词器。常见搭配：
+
+| 索引时      | 搜索时           | 效果                                                 |
+| ----------- | ---------------- | ---------------------------------------------------- |
+| ik_max_word | ik_smart         | 文档切得细，搜索切得粗，兼顾召回率和精度             |
+| ik_synonym  | ik_synonym_smart | 索引时扩展同义词，搜索时也扩展                       |
+| pinyin      | standard         | 索引时存拼音，搜索时用户输入拼音用 standard 分词即可 |
+
+同义词配置有个选择：索引时扩展 vs 搜索时扩展。
+
+- **索引时扩展**：文档写入时就把"苹果"扩展为"苹果,apple"。搜索"苹果"或"apple"都能命中。但改了同义词配置后需要**重建索引**才能生效
+- **搜索时扩展**：搜索时把用户的"苹果"扩展为"苹果,apple"去匹配。改了配置立即生效，不需要重建索引。但如果索引里"Apple"没有同时被索引为"苹果"，可能匹配不到
+
+对于电商场景，同义词表相对稳定，用索引时扩展更可靠。如果同义词经常变，用搜索时扩展更灵活。也可以两者都用——索引时扩展保底，搜索时扩展保证时效性。
+
+## 多分词器的代价
+
+多字段多分词器不是免费的：
+
+- **索引体积增大**：每个子字段都有独立的倒排索引。name 字段三套分词器，索引体积大约是单分词器的 2.5-3 倍
+- **索引速度变慢**：每条文档要过三遍分词器
+- **查询复杂度增加**：multi_match 查多个字段，比单字段 match 慢
+
+对于商品名这种短文本（通常不超过 50 个字），这些代价可以接受。如果是长文本（文章内容、日志），要慎重评估是否需要多分词器。
+
+核心原则：**为高频搜索场景优化，不为所有可能的场景增加复杂度**。如果你的用户几乎不用拼音搜索，拼音分词器可以不上。
+
+---
+
+中文搜索的问题解决了。但有个更基础的问题一直被我们忽略了：前五篇里所有测试数据都是手动用 curl 插入的。真实项目中商品数据在 MySQL 里，几万到几百万条，手动插入不现实。下一篇我们来解决数据同步的问题——怎么把 MySQL 里的商品数据实时同步到 Elasticsearch，保持两边一致。

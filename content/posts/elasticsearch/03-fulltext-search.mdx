@@ -1,0 +1,339 @@
+---
+title: "03 全文搜索与查询 DSL"
+date: "2026-04-28"
+summary: "从 match 查询开始，讲透 bool 组合查询、filter 过滤、function_score 自定义排序、高亮显示和分页策略，覆盖日常搜索 80% 的场景。"
+tags: ["Elasticsearch", "搜索引擎"]
+category: "elasticsearch"
+cover: ""
+draft: false
+series: "Elasticsearch 实战：从搜索原理到生产系统"
+seriesOrder: 3
+---
+
+上一篇我们设计好了商品索引的 Mapping——name 用 text 搜索、brand 用 keyword 精确匹配、specs 用 nested 保存键值对。索引结构就位了，接下来要做的事情很明显：往里面塞查询条件，把最相关的商品搜出来。
+
+Elasticsearch 的查询用 JSON 描述，叫查询 DSL（Domain Specific Language）。刚接触的时候你会觉得它比 SQL 啰嗦得多——明明一句 `SELECT * FROM products WHERE name LIKE '%键盘%'` 就搞定的事，ES 要写十几行 JSON。但当你需要控制搜索精度、组合多种条件、给不同字段设不同权重的时候，就会体会到 JSON 描述查询的灵活性。
+
+## match：最基础的全文搜索
+
+上一篇已经用过 `match` 了，但没展开讲它的行为。先把这个最常用的查询搞清楚：
+
+```bash
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "query": {
+    "match": {
+      "name": "机械键盘"
+    }
+  }
+}'
+```
+
+ES 收到这个查询后的处理过程：
+
+1. 把"机械键盘"交给 name 字段的 analyzer 分词（当前用 standard，会拆成"机械"和"键盘"两个词）
+2. 拿着这两个词去倒排索引里查
+3. 默认用 **OR** 逻辑——包含"机械"**或**"键盘"的文档都算匹配
+4. 用 BM25 算法计算每条匹配文档的相关度得分
+5. 按得分降序返回
+
+OR 逻辑意味着搜"机械键盘"，一条只包含"键盘"的商品也会出现在结果里。如果你希望两个词都出现才匹配，加个 `operator`：
+
+```bash
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "query": {
+    "match": {
+      "name": {
+        "query": "机械键盘",
+        "operator": "and"
+      }
+    }
+  }
+}'
+```
+
+现在只有同时包含"机械"**和**"键盘"的文档才会返回。
+
+但 AND 太严格了——用户搜"机械键盘 红轴"，如果某个商品标题只有"机械键盘"没有"红轴"，用 AND 就搜不到。ES 提供了一个折中方案 `minimum_should_match`：
+
+```json
+"match": {
+  "name": {
+    "query": "机械键盘 红轴 87键",
+    "minimum_should_match": "75%"
+  }
+}
+```
+
+4 个词里至少匹配 75%（即 3 个），既保证了一定的搜索精度，又不会太严格。
+
+## multi_match：跨字段搜索
+
+商品名搜不到的时候，描述里可能有。用户搜"游戏"，商品名叫"达尔优 机械键盘"，但描述里有"游戏键盘"——你应该同时搜 name 和 description 两个字段。
+
+```bash
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "query": {
+    "multi_match": {
+      "query": "游戏",
+      "fields": ["name", "description"]
+    }
+  }
+}'
+```
+
+`multi_match` 默认会把两个字段的得分加起来。这意味着一个在 name 和 description 里都包含"游戏"的商品，比只在 name 里包含的得分更高。
+
+你还可以给不同字段设权重：
+
+```json
+"multi_match": {
+  "query": "游戏",
+  "fields": ["name^3", "description"],
+  "type": "best_fields"
+}
+```
+
+`name^3` 表示 name 字段的权重是 description 的 3 倍。商品名里出现"游戏"比描述里出现更有意义，权重应该更高。`type: "best_fields"` 表示取得分最高的那个字段作为最终得分（而不是相加）。
+
+## bool：组合查询的核心
+
+实际搜索场景很少有单一条件的。用户搜"键盘"，还要限定品牌是 Cherry，价格在 200-500 之间——多个条件怎么组合？
+
+`bool` 查询是答案。它有四个分支：
+
+```json
+{
+  "query": {
+    "bool": {
+      "must": [],
+      "should": [],
+      "must_not": [],
+      "filter": []
+    }
+  }
+}
+```
+
+- **must**：必须匹配，参与评分
+- **should**：至少匹配一个（当 must 存在时，should 是加分项；当只有 should 时，至少要匹配一个）
+- **must_not**：必须不匹配，不参与评分
+- **filter**：必须匹配，**不参与评分**（这是和 must 的关键区别）
+
+来一个完整的例子：搜"键盘"，品牌是 Cherry 或 Logitech，价格 200-500，排除已下架的商品。
+
+```bash
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "query": {
+    "bool": {
+      "must": [
+        { "match": { "name": "键盘" } }
+      ],
+      "filter": [
+        { "terms": { "brand": ["Cherry", "Logitech"] } },
+        { "range": { "price": { "gte": 200, "lte": 500 } } }
+      ],
+      "must_not": [
+        { "term": { "status": "off_shelf" } }
+      ]
+    }
+  }
+}'
+```
+
+几个细节：
+
+- `term` 查询：精确匹配，不分词。适合 keyword 字段。`terms` 是 term 的多值版本（SQL 里的 `IN`）。
+- `range` 查询：范围过滤。`gte` 是大于等于，`lte` 是小于等于。
+- 品牌和价格放在 `filter` 而不是 `must` 里。这是性能优化的关键。
+
+### query 和 filter 的区别
+
+这是 ES 查询最重要的概念之一：
+
+**query（must/should）**：计算相关度得分（`_score`）。适合"搜多搜少"的模糊匹配。
+
+**filter**：不计算得分，只判断匹配/不匹配。适合精确的条件过滤。
+
+filter 有两个巨大的优势：
+
+1. **不评分 = 更快**。省掉了 BM25 计算的开销
+2. **有缓存**。ES 会自动缓存 filter 的结果，相同的 filter 条件第二次查询直接走缓存
+
+所以一个原则：**能用 filter 的地方别用 query**。品牌精确匹配、价格范围、状态筛选这些不需要相关度的条件，一律放 filter。只有全文搜索（match）这种需要"哪个更相关"的才放 must。
+
+## function_score：让销量高的排在前面
+
+默认的排序是按 BM25 相关度。但电商搜索通常有业务逻辑：销量高的商品应该排在更前面，即使它的相关度不是最高的。
+
+`function_score` 让你自定义评分逻辑：
+
+```bash
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "query": {
+    "function_score": {
+      "query": {
+        "match": { "name": "键盘" }
+      },
+      "field_value_factor": {
+        "field": "sales",
+        "factor": 0.1,
+        "modifier": "log1p",
+        "missing": 0
+      },
+      "boost_mode": "multiply"
+    }
+  }
+}'
+```
+
+这段查询的意思：
+
+1. 先用 `match` 搜"键盘"，算出 BM25 得分
+2. 再取 `sales` 字段的值，做 `log1p(sales * 0.1)` 变换
+3. 最终得分 = BM25 得分 _ log1p(sales _ 0.1)
+
+为什么用 `log1p` 而不是直接乘 sales？因为销量差距可能很大（有的卖 10 件，有的卖 10000 件），直接乘会让销量完全主导排序，相关度变得无关紧要。`log1p` 把数值压缩到一个合理的范围，让销量成为"加分项"而不是"决定项"。
+
+`modifier` 的选择：
+
+- `none`：直接用原始值，适合值域小且均匀的字段
+- `log1p`：`log(1 + x)`，适合值域跨度大的字段（销量、浏览量）
+- `square`：`x^2`，放大差异
+- `sqrt`：`sqrt(x)`，缩小差异
+
+`boost_mode` 决定怎么组合原始得分和函数值：
+
+- `multiply`：相乘（最常用）
+- `replace`：完全替换原始得分
+- `sum`：相加
+
+## 高亮显示：标记匹配的文本
+
+搜索结果里通常要把匹配的关键词标红：
+
+```bash
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "query": {
+    "match": { "name": "键盘" }
+  },
+  "highlight": {
+    "pre_tags": ["<em>"],
+    "post_tags": ["</em>"],
+    "fields": {
+      "name": {},
+      "description": {}
+    }
+  }
+}'
+```
+
+返回结果里每个匹配的文档会多一个 `highlight` 字段：
+
+```json
+{
+  "_id": "1",
+  "_source": { "name": "Cherry MX 机械式键盘 青轴" },
+  "highlight": {
+    "name": ["Cherry MX 机械式<em>键盘</em> 青轴"]
+  }
+}
+```
+
+前端拿到 `<em>键盘</em>` 这个 HTML 片段，直接渲染就是高亮效果。`pre_tags` 和 `post_tags` 可以换成任何你想要的标签。
+
+## 分页：from/size 和 search_after
+
+最简单的分页用 `from` + `size`：
+
+```json
+{
+  "query": { "match": { "name": "键盘" } },
+  "from": 20,
+  "size": 10
+}
+```
+
+`from` 是偏移量（跳过前 20 条），`size` 是每页条数。对应 SQL 的 `LIMIT 10 OFFSET 20`。
+
+这个方案有个硬限制：`from + size` 不能超过 10000（由 `index.max_result_window` 控制）。因为 ES 要在 coordinating 节点上对 `from + size` 条数据做全局排序，`from` 越大，内存消耗越大。翻到第 1000 页的时候，ES 要对 10000 条数据排序然后扔掉前 9990 条。
+
+深度分页用 `search_after`：
+
+```bash
+# 第一页
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "query": { "match": { "name": "键盘" } },
+  "size": 10,
+  "sort": [
+    { "_score": "desc" },
+    { "_id": "asc" }
+  ]
+}'
+
+# 返回的最后一条数据：
+# "sort": [0.754, "3"]
+
+# 第二页：用上一页最后一条的 sort 值
+curl -X GET "http://localhost:9200/products/_search" -H 'Content-Type: application/json' -d '
+{
+  "query": { "match": { "name": "键盘" } },
+  "size": 10,
+  "sort": [
+    { "_score": "desc" },
+    { "_id": "asc" }
+  ],
+  "search_after": [0.754, "3"]
+}'
+```
+
+`search_after` 的思路类似于"记住上次读到哪了"，下一页从那个位置继续读。没有 `from` 的全局排序开销，性能稳定。缺点是不能跳页——用户只能点"下一页"，不能直接跳到第 50 页。
+
+大多数电商搜索的前几页流量占 95% 以上，用 `from/size` 足够了。如果确实有深度翻页的需求，再上 `search_after`。
+
+## source filtering：只返回需要的字段
+
+默认情况下 ES 返回完整的 `_source`（整个文档）。如果文档很大（比如 description 有几千字），但你只需要 id、name、price，传完整文档白白浪费带宽：
+
+```json
+{
+  "query": { "match": { "name": "键盘" } },
+  "_source": ["name", "price", "brand", "sales"]
+}
+```
+
+返回结果只包含这四个字段。也可以用 `includes` 和 `excludes` 做更细粒度的控制：
+
+```json
+{
+  "_source": {
+    "includes": ["name", "price"],
+    "excludes": ["description"]
+  }
+}
+```
+
+## 查询设计的核心原则
+
+回顾一下本篇的查询演进路径：
+
+1. `match`：搜一个字段，最基础
+2. `multi_match`：搜多个字段，加权
+3. `bool`：组合多种条件
+4. 在 bool 里区分 query（must/should）和 filter
+5. `function_score`：自定义排序权重
+6. 加上高亮、分页、字段过滤这些辅助能力
+
+日常搜索 80% 的场景，一个 bool 查询 + filter + 高亮 + 分页就搞定了。`function_score` 是锦上添花，适合搜索结果排序有明确业务规则的情况。
+
+核心原则：**全文搜索放 must，精确过滤放 filter**。前者算相关度，后者走缓存。搞反了性能差，搜索结果也不准。
+
+---
+
+现在我们能让用户搜到想要的商品了。但真实电商搜索不只是"搜出来"——搜索结果页左侧还有筛选面板：按品牌分组、按价格区间统计、按分类树展开。这些统计数字不是靠查询能做到的，它们需要"聚合"。下一篇我们就来解决搜索结果页的筛选面板怎么做。
