@@ -223,7 +223,7 @@ export function getNextPost(
       date: data.date,
       summary: data.summary,
       tags: data.tags || [],
-      category: data.category,
+      category: dirName,
       cover: data.cover,
       draft: data.draft || false,
     };
