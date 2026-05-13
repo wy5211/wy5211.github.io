@@ -69,6 +69,10 @@ export function getAllPosts(): PostMeta[] {
     const fileContents = fs.readFileSync(fullPath, "utf8");
     const { data } = matter(fileContents);
 
+    // 提取文件序号用于排序
+    const orderMatch = baseName.match(/^(\d+)-/);
+    const order = orderMatch ? parseInt(orderMatch[1], 10) : 0;
+
     return {
       slug,
       title: data.title,
@@ -78,18 +82,15 @@ export function getAllPosts(): PostMeta[] {
       category: categoryFromDir, // 使用从目录名映射得到的分类
       cover: data.cover,
       draft: data.draft || false,
+      order,
     };
   });
 
-  // 过滤掉 draft 并按日期排序
+  // 过滤掉 draft 并按文件序号排序
   return allPostsData
     .filter((post) => !post.draft)
     .sort((a, b) => {
-      if (a.date < b.date) {
-        return 1;
-      } else {
-        return -1;
-      }
+      return (a as { order: number }).order - (b as { order: number }).order;
     });
 }
 
