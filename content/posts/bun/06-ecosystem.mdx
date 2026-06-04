@@ -1,0 +1,383 @@
+---
+title: "06 生态系统与迁移指南"
+date: "2026-06-04"
+summary: "评估 Bun 的生态成熟度——主流框架支持、数据库驱动兼容性、Docker 和 CI/CD 集成，以及一个渐进式迁移策略，帮你决定什么时候该用 Bun。"
+tags: ["Bun", "生态系统", "Next.js", "Docker", "迁移策略", "CI/CD"]
+category: "bun"
+cover: ""
+draft: false
+series: "Bun vs Node.js 对比指南"
+seriesOrder: 6
+---
+
+前五篇我们分别看了 Bun 的设计理念、性能、工具链、兼容性和原生 API。这篇把视角拉远，看看整个生态系统——Bun 能不能撑起一个生产项目？主流框架和数据库驱动能不能用？怎么安全地迁移？
+
+## 框架支持现状
+
+### Next.js
+
+Next.js 是 Bun 生态中兼容性投入最大的框架之一。Bun 官方有专门的集成测试。
+
+```bash
+# 用 Bun 创建 Next.js 项目
+bunx create-next-app@latest my-app
+cd my-app
+bun run dev
+```
+
+目前的兼容情况：
+
+- **Pages Router**：几乎完全兼容
+- **App Router**：大部分功能兼容，少数边缘场景（比如特定的 Server Actions 用法）可能有问题
+- **API Routes**：兼容良好
+- **Middleware**：兼容
+- **Static Export**：兼容
+
+实际体验上，用 Bun 跑 Next.js 开发服务器启动更快（`bun run dev` 比 `npm run dev` 快），但生产构建（`next build`）还是用 Node.js 跑更稳。Bun 作为 Next.js 的运行时（而不是构建工具）已经可以正常工作。
+
+### Remix
+
+Remix 对 Bun 的支持很好，因为 Remix 的设计本身就不深度依赖 Node.js 特定的 API：
+
+```bash
+bunx create-remix@latest my-app
+cd my-app
+bun install
+bun run dev
+```
+
+Remix 默认生成的项目可以直接用 Bun 运行，不需要任何修改。
+
+### Astro
+
+Astro 从 2.0 开始官方支持 Bun：
+
+```bash
+bunx create-astro@latest my-app
+cd my-app
+bun run dev
+```
+
+Astro 的 SSG 和 SSR 模式都可以用 Bun 跑。
+
+### Hono
+
+Hono 是一个多运行时的 Web 框架，原生支持 Bun：
+
+```typescript
+import { Hono } from "hono";
+
+const app = new Hono();
+app.get("/", (c) => c.text("Hello from Hono + Bun"));
+
+export default {
+  port: 3000,
+  fetch: app.fetch,
+};
+```
+
+```bash
+bun run server.ts
+```
+
+Hono + Bun 的组合是目前 Bun 原生开发体验最好的选择。Hono 不依赖 Node.js 的 `http` 模块，直接用 `Bun.serve()` 的接口，性能和兼容性都是最优的。
+
+### Elysia
+
+Elysia 是专门为 Bun 设计的 Web 框架，充分利用了 Bun 的特性：
+
+```typescript
+import { Elysia } from "elysia";
+
+const app = new Elysia()
+  .get("/users/:id", ({ params: { id } }) => ({ id, name: "张三" }))
+  .post("/users", ({ body }) => createUser(body))
+  .ws("/chat", {
+    message(ws, message) {
+      ws.publish("chat", message);
+    },
+  })
+  .listen(3000);
+```
+
+Elysia 的特色是**端到端类型安全**和**极高的性能**——它用 Bun 的 JIT 编译做路由匹配，benchmark 显示比 Express 快 20 倍以上。
+
+### 框架兼容性速查
+
+| 框架    | Bun 兼容性                  | 推荐程度             |
+| ------- | --------------------------- | -------------------- |
+| Hono    | 完美                        | 强烈推荐             |
+| Elysia  | 完美（专为 Bun 设计）       | 强烈推荐（新项目）   |
+| Astro   | 良好                        | 推荐                 |
+| Remix   | 良好                        | 推荐                 |
+| Next.js | 大部分兼容                  | 可以用，注意边缘场景 |
+| Nuxt    | 部分兼容                    | 实验性使用           |
+| NestJS  | 基本兼容                    | 可以用，需要测试     |
+| Express | 兼容（通过 Node.js 兼容层） | 能跑，但不是最优选择 |
+
+## 数据库驱动兼容性
+
+### Prisma
+
+Prisma 从 5.x 开始改善了对 Bun 的支持。目前：
+
+```bash
+bun install
+bunx prisma generate
+bunx prisma migrate dev
+bun run src/index.ts
+```
+
+大部分 Prisma 功能都能用。少数已知问题：
+
+- Prisma 的 `prisma studio` 在 Bun 上偶尔有渲染问题
+- 大规模数据迁移时（百万行级别），Bun 下的 Prisma 性能特征可能和 Node.js 下有差异
+
+### Drizzle ORM
+
+Drizzle 是一个轻量级 ORM，对 Bun 的兼容性非常好。Drizzle 本身就是用 TypeScript 写的，不依赖原生模块：
+
+```typescript
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+
+const users = sqliteTable("users", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  name: text("name").notNull(),
+  email: text("email").notNull().unique(),
+});
+
+const db = drizzle("sqlite.db");
+const allUsers = await db.select().from(users);
+```
+
+Drizzle 还专门提供了 `drizzle-orm/bun-sqlite` 适配器，直接用 Bun 内置的 SQLite 支持（不需要 better-sqlite3）。
+
+### 原生数据库驱动
+
+| 驱动                  | Bun 兼容性 | 备注            |
+| --------------------- | ---------- | --------------- |
+| `mysql2`              | ✅ 良好    | 纯 JS 实现      |
+| `pg`（node-postgres） | ✅ 良好    | 纯 JS 模式      |
+| `better-sqlite3`      | ✅ 支持    | napi 模块       |
+| `bun:sqlite`          | ✅ 原生    | Bun 内置 SQLite |
+| `mongodb`（mongoose） | ✅ 良好    | 纯 JS 实现      |
+| `ioredis`             | ✅ 良好    | 纯 JS 实现      |
+| `redis`               | ✅ 良好    | 纯 JS 实现      |
+| `pg-native`           | ⚠️ 有限    | 依赖 C++ 绑定   |
+
+Bun 内置了 SQLite 支持（`bun:sqlite`），不需要装任何驱动：
+
+```typescript
+import { Database } from "bun:sqlite";
+
+const db = new Database("mydb.sqlite");
+
+// 创建表
+db.run("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, name TEXT)");
+
+// 插入数据
+db.run("INSERT INTO users (name) VALUES (?)", ["张三"]);
+
+// 查询
+const users = db.query("SELECT * FROM users").all();
+```
+
+这对小型项目和原型开发特别方便——不需要装数据库服务，一个文件就是一个数据库。
+
+## Docker 和部署
+
+### Docker 镜像
+
+Bun 有官方 Docker 镜像：
+
+```dockerfile
+FROM oven/bun:1 AS base
+WORKDIR /app
+
+# 安装依赖
+COPY package.json bun.lockb ./
+RUN bun install --frozen-lockfile
+
+# 复制源码
+COPY . .
+
+# 运行
+EXPOSE 3000
+CMD ["bun", "run", "src/index.ts"]
+```
+
+对比 Node.js 的 Docker 镜像：
+
+```dockerfile
+FROM node:22-slim AS base
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY . .
+
+EXPOSE 3000
+CMD ["node", "src/index.js"]
+```
+
+Bun 镜像的优势：
+
+- 基础镜像更小（`oven/bun:1` 约 150MB vs `node:22-slim` 约 250MB）
+- 安装依赖更快（`bun install` vs `npm ci`）
+- 如果用 `bun build --compile`，甚至可以用 `scratch` 镜像（0 依赖）
+
+### 多阶段构建优化
+
+```dockerfile
+# 阶段 1：构建
+FROM oven/bun:1 AS build
+WORKDIR /app
+COPY . .
+RUN bun install --frozen-lockfile
+RUN bun build ./src/index.ts --compile --outfile server
+
+# 阶段 2：运行（最小镜像）
+FROM scratch
+COPY --from=build /app/server /server
+EXPOSE 3000
+ENTRYPOINT ["/server"]
+```
+
+最终镜像只包含一个编译好的二进制文件，没有任何多余的依赖。镜像大小可能只有 50-80MB。
+
+### CI/CD 集成
+
+GitHub Actions 中使用 Bun：
+
+```yaml
+# .github/workflows/ci.yml
+name: CI
+on: [push]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - run: bun test
+      - run: bun run build
+```
+
+对比 Node.js 版本，主要区别是 `setup-bun` 替代了 `setup-node`，`bun install/test` 替代了 `npm ci/test`。在 CI 环境中，Bun 的安装和依赖安装速度优势非常明显——整个流水线可以快 30-50%。
+
+## 渐进式迁移策略
+
+如果你有一个现有的 Node.js 项目，不建议一夜之间全部切换到 Bun。更安全的做法是渐进式迁移。
+
+### 阶段 1：用 Bun 跑测试
+
+这是风险最低的切入点。测试本身不直接影响生产环境，用 Bun 跑可以验证兼容性：
+
+```bash
+# 先跑测试，看哪些通过哪些失败
+bun test
+```
+
+如果测试全部通过，说明你的代码和 Bun 的兼容性很好。如果有失败，失败的地方就是你需要关注的兼容性问题。
+
+### 阶段 2：用 bun install 替代 npm install
+
+```bash
+# 开发环境中试试 bun install
+bun install
+```
+
+这一步不需要改任何代码。`bun install` 读取 `package.json`，兼容 `package-lock.json`。如果安装成功且项目正常运行，说明包管理层面没有问题。
+
+### 阶段 3：开发环境用 Bun，生产环境保持 Node.js
+
+```json
+// package.json
+{
+  "scripts": {
+    "dev": "bun run --hot src/index.ts",
+    "build": "node build.js",
+    "start": "node dist/index.js",
+    "test": "bun test"
+  }
+}
+```
+
+开发时用 `bun run dev`（享受热重载和快速启动），生产构建和运行继续用 Node.js。这样既能在开发中积累 Bun 的使用经验，又不影响生产稳定性。
+
+### 阶段 4：生产环境灰度切换
+
+准备两个 Docker 镜像，一个基于 Node.js，一个基于 Bun，通过负载均衡做灰度：
+
+```bash
+# 构建 Node.js 版本
+docker build -f Dockerfile.node -t myapp:node .
+
+# 构建 Bun 版本
+docker build -f Dockerfile.bun -t myapp:bun .
+```
+
+先用 10% 的流量跑 Bun 版本，观察错误率和延迟。如果没有问题，逐步提高比例。
+
+### 阶段 5：全面切换
+
+当灰度验证通过后，把生产环境完全切换到 Bun。同时保留 Node.js 版本的回滚方案，至少保留一个月。
+
+## 什么时候该用 Bun，什么时候该继续用 Node.js
+
+### 适合用 Bun 的场景
+
+- **新项目**——没有历史包袱，从零开始用 Bun 成本最低
+- **CLI 工具**——启动速度优势最明显，还可以用 `bun build --compile` 生成单文件可执行程序
+- **API 服务**——特别是配合 Hono 或 Elysia 这类 Bun 原生框架
+- **测试密集型项目**——大量测试用例，Bun 的测试执行速度优势很大
+- **Serverless / Edge 函数**——冷启动速度直接决定响应时间
+- **Monorepo**——`bun install` 的 workspace 支持和硬链接策略让依赖管理更高效
+
+### 应该继续用 Node.js 的场景
+
+- **重度依赖原生模块的项目**——特别是 node-gyp 编译的老模块
+- **用 `cluster` 做多进程的项目**——Bun 不支持
+- **企业级长期维护项目**——Node.js 有 15 年的稳定性和社区支持
+- **团队对 Node.js 有深度定制**——自定义的 V8 flags、性能分析工具链、APM 集成等
+- **需要 Windows 原生支持**——Bun 的 Windows 支持还不完善
+
+### 一个决策框架
+
+```
+                    新项目？
+                   /       \
+                 是          否
+                /             \
+          有原生模块？      测试覆盖率 > 80%？
+          /       \          /           \
+        否        是       是             否
+        |          |       |              |
+      用 Bun    评估替代  试迁移         先补测试
+                          方案
+```
+
+## 社区和版本迭代
+
+Bun 的迭代速度非常快——平均每周发一个小版本，每月一个功能更新。这是好事，但也有隐患：
+
+**好处**：问题修复快，新功能多，兼容性持续改善
+
+**风险**：升级可能引入意外行为变化；生产环境需要锁定版本
+
+建议做法：
+
+- `package.json` 中锁定 Bun 的精确版本
+- CI/CD 中用固定版本号，不用 `latest`
+- 关注 Bun 的 changelog，特别是 "Breaking Changes" 部分
+- 升级前在测试环境中验证
+
+Bun 的 GitHub 仓库有超过 70k 的 star，社区活跃度很高。遇到问题在 GitHub Issues 或 Discord 中通常能找到解决方案或者得到回复。
+
+下一篇是系列的最后一篇——用一个完整的实战项目把前面所有知识串起来。我们用 Bun + Hono + Drizzle 从零搭建一个短链接服务，体验完整的开发流程。

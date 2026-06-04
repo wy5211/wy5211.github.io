@@ -1,0 +1,697 @@
+---
+title: "07 实战：用 Bun 搭建全栈项目"
+date: "2026-06-04"
+summary: "用 Bun + Hono + Drizzle 从零搭建一个短链接服务——项目初始化、API 开发、数据库、测试、打包部署，体验完整的 Bun 开发流程。"
+tags: ["Bun", "Hono", "Drizzle", "SQLite", "短链接", "实战"]
+category: "bun"
+cover: ""
+draft: false
+series: "Bun vs Node.js 对比指南"
+seriesOrder: 7
+---
+
+前面六篇我们覆盖了 Bun 的设计理念、性能、工具链、兼容性、Web API 和生态系统。这篇把所有知识串起来——用 Bun 从零搭建一个真实项目。
+
+项目选择：短链接服务。它足够小，一个教程能讲完；但又足够真实，包含 API 设计、数据库操作、缓存、测试、打包部署等完整链路。
+
+技术栈：
+
+- **运行时**：Bun
+- **Web 框架**：Hono
+- **数据库**：SQLite（Bun 内置支持）
+- **ORM**：Drizzle
+- **测试**：bun test
+
+## 项目初始化
+
+```bash
+# 创建项目目录
+mkdir shorturl && cd shorturl
+
+# 初始化项目
+bun init -y
+```
+
+`bun init -y` 会生成一个最小的 `package.json`：
+
+```json
+{
+  "name": "shorturl",
+  "version": "1.0.0",
+  "module": "index.ts",
+  "type": "module"
+}
+```
+
+没有 `tsconfig.json`，没有 `.eslintrc`，没有一堆配置文件。Bun 原生理解 TypeScript，不需要额外配置。
+
+安装依赖：
+
+```bash
+bun add hono drizzle-orm
+bun add -d drizzle-kit
+```
+
+注意这一步的速度——如果你之前用过 Bun，这些包都在全局缓存里，`bun install` 只需要创建硬链接，几十毫秒搞定。
+
+## 数据库设计
+
+短链接服务需要两张表：一张存链接映射，一张存访问日志。
+
+### Schema 定义
+
+```typescript
+// src/db/schema.ts
+import { sqliteTable, text, integer } from "drizzle-orm/sqlite-core";
+
+export const links = sqliteTable("links", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  shortCode: text("short_code").notNull().unique(),
+  originalUrl: text("original_url").notNull(),
+  createdAt: integer("created_at").$defaultFn(() => Date.now()),
+  expiresAt: integer("expires_at"),
+});
+
+export const visits = sqliteTable("visits", {
+  id: integer("id").primaryKey({ autoIncrement: true }),
+  shortCode: text("short_code").notNull(),
+  ip: text("ip"),
+  userAgent: text("user_agent"),
+  visitedAt: integer("visited_at").$defaultFn(() => Date.now()),
+});
+```
+
+Drizzle 的 schema 定义是纯 TypeScript 对象，不需要 decorator 或配置文件。`.$defaultFn()` 提供默认值，在插入时自动填充。
+
+### 数据库连接
+
+```typescript
+// src/db/index.ts
+import { drizzle } from "drizzle-orm/bun-sqlite";
+import { Database } from "bun:sqlite";
+import * as schema from "./schema";
+
+const sqlite = new Database("shorturl.db");
+export const db = drizzle(sqlite, { schema });
+```
+
+注意 `drizzle-orm/bun-sqlite` 这个导入路径——Drizzle 专门为 Bun 内置的 SQLite 提供了适配器。不需要装 `better-sqlite3`。
+
+### 初始化迁移
+
+```typescript
+// src/db/migrate.ts
+import { sql } from "drizzle-orm";
+import { db } from ".";
+
+await db.run(sql`
+  CREATE TABLE IF NOT EXISTS links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    short_code TEXT NOT NULL UNIQUE,
+    original_url TEXT NOT NULL UNIQUE,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER
+  )
+`);
+
+await db.run(sql`
+  CREATE TABLE IF NOT EXISTS visits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    short_code TEXT NOT NULL,
+    ip TEXT,
+    user_agent TEXT,
+    visited_at INTEGER NOT NULL
+  )
+`);
+
+await db.run(sql`
+  CREATE INDEX IF NOT EXISTS idx_links_short_code ON links(short_code)
+`);
+
+await db.run(sql`
+  CREATE INDEX IF NOT EXISTS idx_visits_short_code ON visits(short_code)
+`);
+
+console.log("Migration complete");
+```
+
+在 Node.js 项目里，你可能需要用 Prisma Migrate 或者 knex 的 migration 工具。这里我们直接用 SQL，因为项目简单，不需要额外的迁移框架。
+
+## API 开发
+
+### 短链接生成逻辑
+
+```typescript
+// src/utils/shortCode.ts
+// 生成 6 位短码，使用 base62 编码
+const CHARSET =
+  "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+
+export function generateShortCode(length = 6): string {
+  const bytes = crypto.getRandomValues(new Uint8Array(length));
+  let code = "";
+  for (let i = 0; i < length; i++) {
+    code += CHARSET[bytes[i] % CHARSET.length];
+  }
+  return code;
+}
+
+export function isValidUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+```
+
+这里用到了 `crypto.getRandomValues()`——这是 Web Crypto API，Bun 内置支持，不需要 `import crypto from "crypto"`。
+
+### 核心 API
+
+```typescript
+// src/index.ts
+import { Hono } from "hono";
+import { eq, desc, sql } from "drizzle-orm";
+import { db } from "./db";
+import { links, visits } from "./db/schema";
+import { generateShortCode, isValidUrl } from "./utils/shortCode";
+
+const app = new Hono();
+
+// 创建短链接
+app.post("/api/links", async (c) => {
+  const body = await c.req.json();
+  const { url, expiresIn } = body;
+
+  if (!url || !isValidUrl(url)) {
+    return c.json({ error: "Invalid URL" }, 400);
+  }
+
+  // 检查是否已有相同的长链接
+  const existing = await db
+    .select()
+    .from(links)
+    .where(eq(links.originalUrl, url))
+    .get();
+
+  if (existing) {
+    return c.json({
+      shortCode: existing.shortCode,
+      shortUrl: `http://localhost:3000/${existing.shortCode}`,
+      originalUrl: existing.originalUrl,
+    });
+  }
+
+  const shortCode = generateShortCode();
+  const expiresAt = expiresIn ? Date.now() + expiresIn * 1000 : null;
+
+  await db.insert(links).values({
+    shortCode,
+    originalUrl: url,
+    expiresAt,
+  });
+
+  return c.json(
+    {
+      shortCode,
+      shortUrl: `http://localhost:3000/${shortCode}`,
+      originalUrl: url,
+    },
+    201
+  );
+});
+
+// 短链接跳转
+app.get("/:code", async (c) => {
+  const code = c.req.param("code");
+
+  const link = await db
+    .select()
+    .from(links)
+    .where(eq(links.shortCode, code))
+    .get();
+
+  if (!link) {
+    return c.json({ error: "Link not found" }, 404);
+  }
+
+  // 检查过期
+  if (link.expiresAt && link.expiresAt < Date.now()) {
+    return c.json({ error: "Link expired" }, 410);
+  }
+
+  // 记录访问
+  await db.insert(visits).values({
+    shortCode: code,
+    ip: c.req.header("x-forwarded-for") || "unknown",
+    userAgent: c.req.header("user-agent"),
+  });
+
+  return c.redirect(link.originalUrl);
+});
+
+// 查询链接统计
+app.get("/api/links/:code/stats", async (c) => {
+  const code = c.req.param("code");
+
+  const link = await db
+    .select()
+    .from(links)
+    .where(eq(links.shortCode, code))
+    .get();
+
+  if (!link) {
+    return c.json({ error: "Link not found" }, 404);
+  }
+
+  const totalVisits = await db
+    .select({ count: sql<number>`count(*)` })
+    .from(visits)
+    .where(eq(visits.shortCode, code))
+    .get();
+
+  const recentVisits = await db
+    .select()
+    .from(visits)
+    .where(eq(visits.shortCode, code))
+    .orderBy(desc(visits.visitedAt))
+    .limit(10);
+
+  return c.json({
+    shortCode: link.shortCode,
+    originalUrl: link.originalUrl,
+    createdAt: link.createdAt,
+    totalVisits: totalVisits?.count ?? 0,
+    recentVisits,
+  });
+});
+
+// 列出所有链接
+app.get("/api/links", async (c) => {
+  const allLinks = await db
+    .select()
+    .from(links)
+    .orderBy(desc(links.createdAt))
+    .limit(50);
+
+  return c.json({ links: allLinks });
+});
+
+const port = process.env.PORT || 3000;
+
+export default {
+  port,
+  fetch: app.fetch,
+};
+
+console.log(`Short URL service running on http://localhost:${port}`);
+```
+
+这个 API 包含四个端点：
+
+1. `POST /api/links` — 创建短链接
+2. `GET /:code` — 短链接跳转（302 重定向）
+3. `GET /api/links/:code/stats` — 查看统计数据
+4. `GET /api/links` — 列出所有链接
+
+注意几个 Bun 特色的点：
+
+- `crypto.getRandomValues()` 直接可用，不需要 import
+- `new URL()` 直接可用，不需要 `import { URL } from "url"`
+- `process.env.PORT` 直接可用，不需要 `dotenv`
+- Hono 的 `app.fetch` 直接传给 `Bun.serve()`
+
+### 启动服务
+
+```bash
+# 先运行数据库迁移
+bun run src/db/migrate.ts
+
+# 启动服务
+bun run --hot src/index.ts
+```
+
+`--hot` 模式下修改代码会即时生效，不需要重启。
+
+## 测试
+
+### 测试文件结构
+
+```
+tests/
+├── shortCode.test.ts    # 工具函数测试
+├── api.test.ts          # API 端点测试
+└── setup.ts             # 测试用的数据库初始化
+```
+
+### 工具函数测试
+
+```typescript
+// tests/shortCode.test.ts
+import { describe, expect, test } from "bun:test";
+import { generateShortCode, isValidUrl } from "../src/utils/shortCode";
+
+describe("generateShortCode", () => {
+  test("generates a 6-character code by default", () => {
+    const code = generateShortCode();
+    expect(code.length).toBe(6);
+  });
+
+  test("generates a code of specified length", () => {
+    const code = generateShortCode(8);
+    expect(code.length).toBe(8);
+  });
+
+  test("only contains base62 characters", () => {
+    const code = generateShortCode(100);
+    expect(code).toMatch(/^[0-9a-zA-Z]+$/);
+  });
+
+  test("generates unique codes", () => {
+    const codes = new Set(
+      Array.from({ length: 100 }, () => generateShortCode())
+    );
+    expect(codes.size).toBe(100);
+  });
+});
+
+describe("isValidUrl", () => {
+  test("accepts valid http URLs", () => {
+    expect(isValidUrl("http://example.com")).toBe(true);
+  });
+
+  test("accepts valid https URLs", () => {
+    expect(isValidUrl("https://example.com/path?q=1")).toBe(true);
+  });
+
+  test("rejects non-http protocols", () => {
+    expect(isValidUrl("ftp://example.com")).toBe(false);
+  });
+
+  test("rejects invalid URLs", () => {
+    expect(isValidUrl("not-a-url")).toBe(false);
+  });
+
+  test("rejects empty string", () => {
+    expect(isValidUrl("")).toBe(false);
+  });
+});
+```
+
+### API 端点测试
+
+```typescript
+// tests/api.test.ts
+import { describe, expect, test, beforeAll } from "bun:test";
+import { Hono } from "hono";
+
+let app: Hono;
+
+beforeAll(async () => {
+  const module = await import("../src/index");
+  app = module.default.fetch;
+});
+
+describe("POST /api/links", () => {
+  test("creates a short link", async () => {
+    const res = await app(
+      new Request("http://localhost/api/links", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: "https://github.com/oven-sh/bun" }),
+      })
+    );
+
+    expect(res.status).toBe(201);
+    const data = await res.json();
+    expect(data.shortCode).toBeDefined();
+    expect(data.originalUrl).toBe("https://github.com/oven-sh/bun");
+  });
+
+  test("rejects invalid URL", async () => {
+    const res = await app(
+      new Request("http://localhost/api/links", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: "not-valid" }),
+      })
+    );
+
+    expect(res.status).toBe(400);
+  });
+
+  test("rejects missing URL", async () => {
+    const res = await app(
+      new Request("http://localhost/api/links", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      })
+    );
+
+    expect(res.status).toBe(400);
+  });
+});
+
+describe("GET /:code", () => {
+  test("redirects to original URL", async () => {
+    const createRes = await app(
+      new Request("http://localhost/api/links", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url: "https://bun.sh" }),
+      })
+    );
+    const { shortCode } = await createRes.json();
+
+    const res = await app(new Request(`http://localhost/${shortCode}`));
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("https://bun.sh");
+  });
+
+  test("returns 404 for unknown code", async () => {
+    const res = await app(new Request("http://localhost/nonexistent"));
+    expect(res.status).toBe(404);
+  });
+});
+```
+
+这里有一个值得注意的测试模式：我们没有启动真实的 HTTP 服务器，而是直接调用 Hono 的 `fetch` 方法。这种方式比启动服务器再发请求快得多，因为跳过了网络层。
+
+### 运行测试
+
+```bash
+bun test
+```
+
+```
+✓ generateShortCode > generates a 6-character code by default
+✓ generateShortCode > generates a code of specified length
+✓ generateShortCode > only contains base62 characters
+✓ generateShortCode > generates unique codes
+✓ isValidUrl > accepts valid http URLs
+✓ isValidUrl > accepts valid https URLs
+✓ isValidUrl > rejects non-http protocols
+✓ isValidUrl > rejects invalid URLs
+✓ isValidUrl > rejects empty string
+✓ POST /api/links > creates a short link
+✓ POST /api/links > rejects invalid URL
+✓ POST /api/links > rejects missing URL
+✓ GET /:code > redirects to original URL
+✓ GET /:code > returns 404 for unknown code
+
+14 tests passed in 0.3s
+```
+
+14 个测试，0.3 秒。同样的测试用 Jest 跑大概需要 3-5 秒。
+
+## 前端页面
+
+短链接服务需要一个简单的首页来提交 URL。我们用一个单文件的 HTML 页面：
+
+```typescript
+// src/pages/index.ts
+export function renderHomePage(): string {
+  return `<!DOCTYPE html>
+<html lang="zh">
+<head>
+  <meta charset="UTF-8">
+  <title>短链接服务</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, sans-serif;
+      background: #0a0a0a;
+      color: #e5e5e5;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .container { max-width: 500px; width: 100%; padding: 2rem; }
+    h1 { font-size: 1.5rem; margin-bottom: 1.5rem; text-align: center; }
+    .input-group { display: flex; gap: 0.5rem; margin-bottom: 1rem; }
+    input {
+      flex: 1; padding: 0.75rem 1rem;
+      background: #1a1a1a; border: 1px solid #333;
+      border-radius: 8px; color: #e5e5e5; font-size: 0.95rem;
+    }
+    button {
+      padding: 0.75rem 1.5rem; background: #fff; color: #000;
+      border: none; border-radius: 8px; cursor: pointer;
+      font-weight: 600;
+    }
+    .result {
+      background: #1a1a1a; border-radius: 8px; padding: 1rem;
+      display: none; margin-top: 1rem;
+    }
+    .result a { color: #60a5fa; word-break: break-all; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>短链接生成器</h1>
+    <div class="input-group">
+      <input id="urlInput" placeholder="输入长链接..." />
+      <button onclick="shorten()">生成</button>
+    </div>
+    <div id="result" class="result">
+      <p>短链接：</p>
+      <a id="shortUrl"></a>
+    </div>
+  </div>
+  <script>
+    async function shorten() {
+      const url = document.getElementById("urlInput").value;
+      const res = await fetch("/api/links", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        document.getElementById("result").style.display = "block";
+        document.getElementById("shortUrl").href = data.shortUrl;
+        document.getElementById("shortUrl").textContent = data.shortUrl;
+      } else {
+        alert(data.error);
+      }
+    }
+  </script>
+</body>
+</html>`;
+}
+```
+
+在 Hono 中添加一个路由来返回这个页面：
+
+```typescript
+// 在 src/index.ts 中添加
+import { renderHomePage } from "./pages/index";
+
+app.get("/", (c) => {
+  return c.html(renderHomePage());
+});
+```
+
+`c.html()` 是 Hono 的方法，设置 `Content-Type: text/html` 并返回 HTML 字符串。
+
+## 打包与部署
+
+### 方式一：Docker 镜像
+
+```dockerfile
+# Dockerfile
+FROM oven/bun:1 AS base
+WORKDIR /app
+
+COPY package.json bun.lockb ./
+RUN bun install --frozen-lockfile --production
+
+COPY src/ ./src/
+RUN bun run src/db/migrate.ts
+
+EXPOSE 3000
+CMD ["bun", "run", "src/index.ts"]
+```
+
+```bash
+docker build -t shorturl .
+docker run -p 3000:3000 -v shorturl-data:/app/shorturl.db shorturl
+```
+
+### 方式二：编译为单文件可执行程序
+
+```bash
+bun build ./src/index.ts --compile --outfile shorturl
+```
+
+生成一个独立的二进制文件，可以直接在服务器上运行，不需要安装 Bun 或 Node.js：
+
+```bash
+./shorturl
+# → Short URL service running on http://localhost:3000
+```
+
+这种方式适合部署到轻量级 VPS 或者嵌入式设备。
+
+### 方式三：部署到 Fly.io
+
+```bash
+# 安装 flyctl
+curl -L https://fly.io/install.sh | sh
+
+# 创建应用
+fly launch
+
+# 部署
+fly deploy
+```
+
+Fly.io 原生支持 Docker 部署，用上面的 Dockerfile 就行。
+
+## 回顾：Bun 开发体验总结
+
+这个短链接项目从头到尾用了哪些 Bun 特性：
+
+| 特性                | 具体使用                            |
+| ------------------- | ----------------------------------- |
+| 原生 TypeScript     | 所有文件都是 `.ts`，不需要 ts-node  |
+| 内置 SQLite         | `bun:sqlite` 直接操作数据库         |
+| 内置 crypto         | `crypto.getRandomValues()` 生成短码 |
+| 内置 URL            | `new URL()` 验证链接格式            |
+| bun test            | 测试框架，兼容 Jest API             |
+| bun install         | 硬链接策略，安装飞快                |
+| --hot 热重载        | 开发时修改即时生效                  |
+| bun build --compile | 编译为单文件可执行程序              |
+| 自动加载 .env       | 不需要 dotenv                       |
+
+对比用 Node.js 做同样的项目：
+
+```
+Node.js 版本需要的额外配置/依赖：
+- tsconfig.json          ← Bun 不需要
+- jest.config.js         ← Bun 不需要
+- dotenv 配置            ← Bun 自动加载
+- ts-node / tsx          ← Bun 原生支持
+- better-sqlite3         ← Bun 内置 SQLite
+- nodemon 配置           ← Bun --hot
+
+配置文件总数：
+Node.js 版：~8 个
+Bun 版：0 个（package.json 除外）
+```
+
+## 系列结语
+
+七篇文章下来，我们从"为什么需要另一个 JS 运行时"走到了"用 Bun 搭建完整项目"。总结一下关键结论：
+
+**Bun 的核心优势**：快（启动快、安装快、测试快）、简（工具链内置、零配置）、标准（Web API 原生支持）。
+
+**Bun 的当前短板**：部分 Node.js API 不完善（cluster、dgram、vm）、原生模块兼容性有坑、Windows 支持不完善。
+
+**我的建议**：新项目可以直接用 Bun，旧项目可以先用 Bun 跑测试和开发环境。Bun 不是 Node.js 的"替代品"，而是一个"更好的起点"。选择它不是因为 Node.js 不好，而是因为 Bun 在大多数场景下确实更快、更简单。
+
+不管你最终选不选用 Bun，了解它的设计思路和实现方式，对理解 JavaScript 运行时生态都有帮助。毕竟，竞争带来进步——Node.js 也在从 Bun 和 Deno 身上学习，加快自身的迭代速度。

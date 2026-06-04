@@ -1,0 +1,192 @@
+---
+title: "01 Bun 是什么，为什么需要另一个 JS 运行时"
+date: "2026-06-04"
+summary: "从 Node.js 的历史包袱出发，理解 Bun 的设计哲学——用 JavaScriptCore 引擎、Zig 语言和内置工具链，重新定义 JavaScript 开发体验。"
+tags: ["Bun", "Node.js", "JavaScript 运行时", "JavaScriptCore"]
+category: "bun"
+cover: ""
+draft: false
+series: "Bun vs Node.js 对比指南"
+seriesOrder: 1
+---
+
+上周我在新机器上 clone 了一个老项目，`npm install` 跑了三分钟。等它装完，我又装了 Jest、Webpack、ESLint、Prettier、ts-node……等整个工具链配好，半天过去了。我开始想：这些东西，能不能开箱即用？
+
+Bun 就是冲着这个问题来的。
+
+## Node.js 的 15 年包袱
+
+2009 年 Ryan Dahl 把 V8 引擎包了一层 C++ 绑定，Node.js 就这么诞生了。那时候 JavaScript 没有模块系统（ES Module 是 2015 年的事），没有 async/await，连 Promise 都没有。Node.js 用 CommonJS 做模块化，用回调函数处理异步。
+
+后来 JavaScript 进化了，但 Node.js 不能把旧东西一刀切掉。结果就是：
+
+**模块系统双轨制**。你的项目里可能同时存在 `require()` 和 `import`，Node.js 两套都支持，但混用的时候各种坑。`package.json` 里要写 `"type": "module"`，有些包只支持 CJS，有些只支持 ESM，有些两个都导出但行为不一样。
+
+**工具链碎片化**。Node.js 只提供运行时，剩下的你自己拼：
+
+```
+包管理 → npm / yarn / pnpm
+打包   → webpack / vite / esbuild / rollup
+测试   → jest / vitest / mocha
+代码检查 → eslint
+格式化 → prettier
+TS 执行 → ts-node / tsx
+```
+
+每个工具都有自己的配置文件。一个正经的 Node.js 项目根目录，`package.json` 旁边往往还躺着 `webpack.config.js`、`jest.config.js`、`.eslintrc.js`、`.prettierrc`、`tsconfig.json`……这些配置之间还有依赖关系，升级一个可能带动一片。
+
+**性能天花板**。V8 引擎很强，但 Node.js 的很多标准库是用 JavaScript 实现的，不是原生代码。比如 `node:fs` 的一部分逻辑跑在 JS 层，`node:http` 解析请求头也是在 JS 里做的。每多一层 JavaScript 调用，就多一点开销。
+
+Ryan Dahl 本人在 2018 年的演讲中公开承认了 Node.js 的设计失误，这就是后来 Deno 的起源。
+
+## Deno 试了一轮，但没解决问题
+
+Deno 做对了一些事——原生支持 TypeScript、用 Rust 重写、内置格式化和测试。但它在实践中遇到了一个尴尬的问题：**生态兼容性**。
+
+Deno 早期的模块系统是基于 URL import 的，不和 npm 兼容。后来虽然加上了 npm 兼容层，但这个"先革命再妥协"的路径让早期采用者踩了不少坑。
+
+Deno 更像是一个"更好的 Node.js 设计"，而不是一个"更好用的 Node.js 替代品"。这两个目标看起来相似，实际执行路径差别很大。
+
+## Bun 的思路：全部重写，全面兼容
+
+Bun 的创始人 Jarred Sumner 走了另一条路。他的思路可以总结为：
+
+> 与其修补旧系统，不如从零构建一个新系统，同时保证和旧系统兼容。
+
+这个思路体现在三个关键决策上：
+
+### 1. JavaScriptCore 而不是 V8
+
+Bun 用的是 WebKit 的 JavaScriptCore（JSC）引擎，而不是 Chrome 的 V8。
+
+为什么？JSC 启动更快。Safari 打开一个网页比 Chrome 快，很大一部分原因就是 JSC 的启动时间更短。JSC 的 JIT 编译器在短生命周期的任务（比如跑一个脚本、执行一次测试）上表现更好。
+
+V8 的优势在于长时间运行的优化——一个跑了几天的服务端进程，V8 的即时编译会越跑越快。但对于"启动、执行、退出"这种 CLI 场景，JSC 的冷启动速度是更优的选择。
+
+```
+冷启动速度对比（运行 console.log("hello")）
+
+Node.js (V8):       ~40ms
+Bun (JavaScriptCore): ~10ms
+```
+
+差了 4 倍。看起来毫不起眼，但当你跑 1000 个测试文件的时候，这个差距就变成几秒 vs 几十秒。
+
+### 2. Zig 语言编写
+
+Bun 的运行时本体是用 Zig 语言写的，不是 C++ 也不是 Rust。
+
+Zig 有几个特性特别适合写运行时：
+
+- **没有隐式控制流**——没有隐藏的异常、没有隐式的析构函数调用，代码的行为完全可预测
+- **comptime**——编译期计算，可以在编译时生成和优化代码，相当于零成本的抽象
+- **手动内存管理**——对运行时这种需要精确控制内存的场景，比 GC 语言更高效
+- **C 语言互操作性**——直接 include C 头文件就能调用，不需要写 binding
+
+这使得 Bun 的标准库实现可以非常高效。Node.js 的 `fs.readFile` 要从 C++ 绑定跳到 JavaScript 层，Bun 的对应实现全程在 Zig 里跑完，少了中间层的开销。
+
+### 3. 内置一切
+
+这是 Bun 最直观的改变。一个 `bun` 命令干完了 Node.js 生态里六七个工具的活：
+
+```bash
+# Node.js 生态
+npm install          # 包管理
+npx jest             # 测试
+npx webpack          # 打包
+node --loader tsx    # 运行 TypeScript
+npm run dev          # 运行脚本
+
+# Bun —— 一个命令搞定
+bun install          # 包管理（比 npm 快 30 倍）
+bun test             # 测试（兼容 Jest API）
+bun build            # 打包（基于 esbuild）
+bun run index.ts     # 原生 TypeScript 支持
+bun run dev          # 运行脚本（比 npm run 快）
+```
+
+不需要 `ts-node`，Bun 原生理解 TypeScript。不需要 `tsconfig.json` 里的 `esModuleInterop` 配置，Bun 自动处理。不需要 `jest.config.js`，测试文件放那就行。
+
+## 五分钟上手
+
+安装 Bun 就一行命令：
+
+```bash
+curl -fsSL https://bun.sh/install | bash
+```
+
+装完之后试试：
+
+```bash
+# 创建一个 TypeScript 文件
+echo 'const greeting: string = "Hello from Bun!"
+console.log(greeting)' > hello.ts
+
+# 直接运行，不需要编译
+bun run hello.ts
+# → Hello from Bun!
+```
+
+没有 `tsc --init`，没有 `ts-node` 安装，没有 `tsconfig.json` 配置。写完 `.ts` 文件直接跑。
+
+再看一个更有感觉的例子——一个 HTTP 服务器：
+
+```typescript
+const server = Bun.serve({
+  port: 3000,
+  fetch(req) {
+    return new Response("Hello from Bun!");
+  },
+});
+
+console.log(`Listening on http://localhost:${server.port}`);
+```
+
+```bash
+bun run server.ts
+```
+
+注意几件事：
+
+- 不需要 `npm init`、不需要 `package.json`
+- 不需要 `import` 任何第三方库
+- `fetch` 处理函数返回的是标准的 `Response` 对象——和浏览器里的 Fetch API 一样的接口
+- `Bun.serve()` 是内置的，不需要 Express 或 Fastify
+
+同样的功能在 Node.js 里需要这样写：
+
+```javascript
+const http = require("http");
+
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Hello from Node.js!");
+});
+
+server.listen(3000, () => {
+  console.log("Listening on http://localhost:3000");
+});
+```
+
+API 风格的差异反映了设计哲学的不同：Node.js 用的是传统的请求/响应回调模式（`req`, `res`），Bun 用的是 Web 标准的 `Request`/`Response` 模式。
+
+## "全家桶" vs "组合拼装"
+
+这两种理念没有绝对的对错：
+
+**Node.js 的"组合拼装"**给了你最大的自由度。你可以选 pnpm 而不是 npm，选 Vitest 而不是 Jest，选 esbuild 而不是 webpack。但这种自由的代价是配置成本——每个项目都要做一遍技术选型和配置。
+
+**Bun 的"全家桶"**帮你做了选择。包管理、打包、测试、TypeScript 支持，全内置。你不需要选，不需要配。代价是灵活性——如果你就是想用 webpack 而不是 Bun 的打包器，那就用不了 Bun 的这一块。
+
+从实际体验看，大多数项目其实不需要"选"——标准方案就够了。Bun 把标准方案内化了，省掉了选和配的时间。
+
+## 该关注 Bun 的信号
+
+如果你一直在用 Node.js，可能不需要明天就迁移。但有几个信号值得你开始关注 Bun：
+
+1. **新项目启动**——当你开始一个新项目，不用纠结工具链配置，`bun init` 一键搞定
+2. **测试执行速度**——Jest 跑 500 个测试要 20 秒，Bun 跑同样的测试可能只要 3 秒
+3. **Docker 镜像构建**——不用装一整套 Node.js + npm + 工具链，Bun 一个二进制文件搞定
+4. **CI/CD 流水线**——`bun install` 比 `npm ci` 快几倍到几十倍，直接缩短 CI 时间
+
+下一篇我们用实际的 benchmark 来看 Bun 和 Node.js 的性能差距到底有多大，以及差距来自哪里。

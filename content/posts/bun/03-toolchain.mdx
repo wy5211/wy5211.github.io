@@ -1,0 +1,296 @@
+---
+title: "03 内置工具链：一个 bun 命令搞定一切"
+date: "2026-06-04"
+summary: "从包管理到测试、打包、脚本运行，Bun 用一个二进制文件替代了 Node.js 生态里的六七个工具。逐个对比看它能不能真的替掉你手上那一套。"
+tags: ["Bun", "npm", "Jest", "esbuild", "Webpack", "工具链"]
+category: "bun"
+cover: ""
+draft: false
+series: "Bun vs Node.js 对比指南"
+seriesOrder: 3
+---
+
+上一篇我们用数据看到了 Bun 的性能优势。但性能只是 Bun 的一部分故事。另一部分——也可能是对日常开发影响更大的部分——是它的内置工具链。
+
+如果你用 Node.js 做过正经项目，应该对这种体验不陌生：新项目启动，先装 npm（或者 yarn、pnpm），再装 Jest 做测试，再装 Webpack 或者 Vite 做打包，再装 ESLint 做代码检查，再装 ts-node 跑 TypeScript……每个工具一个配置文件，互相之间还有依赖关系。
+
+Bun 的做法是把这些全部内建到一个二进制文件里。
+
+## bun install：不只是"更快的 npm"
+
+上一篇我们已经看到了 `bun install` 的速度优势。现在来看它作为包管理器到底能不能替代 npm。
+
+### 硬链接策略
+
+这是 `bun install` 的核心机制。当你执行 `bun install` 时：
+
+```
+1. 解析 package.json 和 lockfile
+2. 对比全局缓存（~/.bun/install/cache/）
+3. 缺失的包：下载并存入全局缓存
+4. 已缓存的包：直接硬链接到 node_modules/
+```
+
+硬链接意味着同一个包在磁盘上只存一份。如果你有 10 个项目都用 React 18，React 18 的文件在磁盘上只占一份空间。npm 的方式是每个项目各复制一份。
+
+实际效果：一个有 5 个 Node.js 项目的开发环境，切换到 Bun 后 `node_modules` 总占用从 2.3GB 降到了 400MB（大部分是硬链接，不重复占空间）。
+
+### lockfile 兼容性
+
+Bun 生成自己的 `bun.lockb` 文件（二进制格式，解析更快），但它也**读取** `package-lock.json` 和 `yarn.lock`。这意味着：
+
+- 现有项目可以直接 `bun install`，不需要重新生成 lockfile
+- 团队里有人用 npm、有人用 Bun，lockfile 不会冲突
+- 但如果你完全切到 Bun，建议用 `bun.lockb` 以获得最佳性能
+
+### workspace 支持
+
+monorepo 场景下，Bun 支持 npm 的 workspace 格式：
+
+```json
+// package.json
+{
+  "workspaces": ["packages/*"]
+}
+```
+
+子包之间可以互相依赖，`bun install` 会自动链接。这和 pnpm workspace 的体验类似，但不需要额外安装 pnpm。
+
+### 什么时候不能替代 npm
+
+`bun install` 不支持：
+
+- npm 的 `preinstall`/`postinstall` 生命周期脚本中用到的一些边缘场景（比如依赖 `node-gyp` 编译的原生模块，部分可以工作，部分还有问题）
+- npm 的 `overrides` 字段的某些复杂用法
+- 一些依赖 npm 特有行为的私有的内部 registry 配置
+
+对于大多数使用公共 registry 的项目，`bun install` 可以直接替代 npm。
+
+## bun test：Jest 的 API，Bun 的速度
+
+如果你用 Jest 写过测试，`bun test` 的 API 几乎一模一样：
+
+```typescript
+// math.test.ts
+import { describe, expect, test } from "bun:test";
+import { add, multiply } from "./math";
+
+describe("math", () => {
+  test("adds two numbers", () => {
+    expect(add(2, 3)).toBe(5);
+  });
+
+  test("multiplies two numbers", () => {
+    expect(multiply(4, 5)).toBe(20);
+  });
+
+  test("handles edge cases", () => {
+    expect(add(0, 0)).toBe(0);
+    expect(multiply(-1, 5)).toBe(-5);
+  });
+});
+```
+
+### 和 Jest 的 API 差异
+
+大部分 Jest API 都兼容，但有一些差异需要注意：
+
+| 功能                         | Jest             | Bun             |
+| ---------------------------- | ---------------- | --------------- |
+| `describe` / `test` / `it`   | ✅               | ✅              |
+| `expect().toBe()`            | ✅               | ✅              |
+| `expect().toMatchSnapshot()` | ✅               | ✅              |
+| `jest.mock()`                | ✅               | `mock.module()` |
+| `jest.fn()`                  | ✅               | `mock.fn()`     |
+| `jest.spyOn()`               | ✅               | `mock.spyOn()`  |
+| `beforeEach` / `afterEach`   | ✅               | ✅              |
+| `test.skip` / `test.only`    | ✅               | ✅              |
+| Coverage                     | 内置（Istanbul） | 内置            |
+| 并行执行                     | 需要配置         | 默认并行        |
+
+最大的差异在 mock 系统：Bun 的 mock API 是 `bun:test` 里的 `mock` 对象，不是全局的 `jest` 对象。如果你的测试代码大量用了 `jest.mock()`，需要改成 `mock.module()`。
+
+```typescript
+// Jest 写法
+jest.mock("./database", () => ({
+  query: jest.fn().mockResolvedValue([{ id: 1, name: "test" }]),
+}));
+
+// Bun 写法
+import { mock } from "bun:test";
+
+mock.module("./database", () => ({
+  query: mock.fn().mockResolvedValue([{ id: 1, name: "test" }]),
+}));
+```
+
+### 速度对比
+
+跑 100 个测试文件：
+
+```
+Jest (ts-jest):    12s
+Jest (esbuild):     5s
+Bun test:         1.8s
+```
+
+Bun 的优势来自两点：启动快（上一篇讲过的 JSC 优势），以及不需要在运行前编译 TypeScript——Bun 原生理解 TS。
+
+## bun build：打包器
+
+`bun build` 是一个基于 JavaScript 的打包器，设计目标是速度。
+
+### 基本用法
+
+打包一个入口文件：
+
+```bash
+bun build ./src/index.ts --outdir ./dist
+```
+
+打包结果会输出到 `./dist/index.js`。
+
+### 和 esbuild / Webpack 的定位对比
+
+```
+Webpack：功能最全，插件生态最丰富，速度最慢
+esbuild：极快，功能够用，插件系统有限
+Vite：开发时用 esbuild，生产打包用 Rollup
+Bun：极快（底层用的 esbuild 的 Go 核心思路），功能够用
+```
+
+`bun build` 的定位和 esbuild 很像——追求极致的打包速度，功能上覆盖 90% 的常见场景。不追求 Webpack 那样的全功能覆盖。
+
+### 实际使用场景
+
+```bash
+# 打包一个 CLI 工具为单文件可执行程序
+bun build ./cli.ts --compile --outfile my-cli
+
+# 打包前端库
+bun build ./src/index.ts --outdir ./dist --target browser
+
+# 打包 Node.js 服务
+bun build ./server.ts --outdir ./dist --target bun
+```
+
+`--compile` 是个很有意思的参数——它把你的代码和 Bun 运行时一起编译成一个独立的可执行文件。用户不需要装 Bun 也不需要装 Node.js，直接运行：
+
+```bash
+bun build ./cli.ts --compile --outfile deploy-tool
+./deploy-tool  # 直接运行，无需任何运行时
+```
+
+这对分发 CLI 工具特别有用，不需要用户装任何依赖。
+
+### 什么时候还是需要 Webpack/Vite
+
+如果你的项目依赖这些功能，`bun build` 目前还替代不了：
+
+- 复杂的自定义 loader 链（Webpack 的强项）
+- HMR（热模块替换）——开发模式还是用 Vite 更好
+- 复杂的代码分割策略
+- 需要特定 Webpack 插件的场景（比如 `webpack-bundle-analyzer`）
+
+## bun run：脚本运行器
+
+```bash
+# 运行 package.json 中的脚本
+bun run dev
+bun run build
+
+# 直接运行文件
+bun run index.ts
+bun run server.js
+```
+
+### 和 npm run 的区别
+
+`npm run dev` 的实际执行过程：
+
+```
+启动 Node.js → 解析 package.json → 找到 "dev" 脚本
+→ 创建子进程 → 执行脚本命令
+```
+
+`bun run dev` 的过程：
+
+```
+启动 Bun → 解析 package.json → 直接执行脚本命令
+```
+
+Bun 省掉了子进程创建的开销。对于简单的脚本（比如 `echo "hello"`），`npm run` 要 300ms，`bun run` 只要 10ms。
+
+### 原生 TypeScript
+
+这是 `bun run` 最舒服的地方。不需要 ts-node、不需要 tsx、不需要配置 `tsconfig.json`：
+
+```bash
+# Node.js：需要先装 tsx
+npx tsx script.ts
+
+# 或者用 ts-node + tsconfig 配置
+npx ts-node script.ts
+
+# Bun：直接跑
+bun run script.ts
+```
+
+Bun 用自己的 TypeScript 转译器（用 Zig 写的），不经过 `tsc` 编译。转译速度比 `ts-node` 快一个数量级。注意这里是"转译"不是"类型检查"——Bun 只剥除类型语法，不做类型校验。类型检查还是需要跑 `tsc --noEmit`。
+
+### .env 文件自动加载
+
+Bun 运行脚本时自动读取 `.env` 文件，不需要 `dotenv` 库：
+
+```bash
+# .env
+DATABASE_URL=postgresql://localhost:5432/mydb
+API_KEY=sk_test_abc123
+```
+
+```typescript
+// config.ts — 不需要 import dotenv
+console.log(process.env.DATABASE_URL);
+// → postgresql://localhost:5432/mydb
+```
+
+Node.js 里你得先装 `dotenv`，然后在入口文件里 `require("dotenv").config()`。Bun 默认就支持，还支持 `.env.local`、`.env.production` 等多环境文件。
+
+## bunx：直接运行 npm 包
+
+和 `npx` 类似，直接运行 npm 包里的命令，不需要全局安装：
+
+```bash
+# 不需要先 npm install -g create-next-app
+bunx create-next-app@latest my-app
+
+# 直接运行某个包的 CLI
+bunx prisma studio
+bunx tsup ./src/index.ts
+```
+
+`bunx` 比 `npx` 快的地方是：如果包已经全局缓存过，直接硬链接执行，不需要重新下载。
+
+## 对比总结
+
+把 Bun 的工具链和 Node.js 生态做一个完整的对照：
+
+| 功能         | Node.js 生态             | Bun            |
+| ------------ | ------------------------ | -------------- |
+| 包管理       | npm / yarn / pnpm        | `bun install`  |
+| 测试         | Jest / Vitest / Mocha    | `bun test`     |
+| 打包         | Webpack / Vite / esbuild | `bun build`    |
+| TS 运行      | ts-node / tsx            | 原生支持       |
+| 脚本运行     | npm run / yarn run       | `bun run`      |
+| 包执行       | npx                      | `bunx`         |
+| 环境变量     | dotenv                   | 自动加载       |
+| Monorepo     | pnpm workspace           | 内置 workspace |
+| 配置文件数量 | 5-8 个                   | 0-1 个         |
+
+### 适用场景
+
+**Bun 工具链适合：** 新项目、小型到中型项目、CLI 工具、对启动速度敏感的场景、想减少配置噪音的团队。
+
+**继续用 Node.js 工具链的情况：** 复杂的 Webpack 插件依赖、需要 Vite HMR 的前端开发、团队已有成熟的工具链配置且运行良好、某些原生模块（node-gyp）编译有问题的项目。
+
+上一篇我们确认了 Bun 的性能优势，这一篇看到了它的工具链体验。但性能和工具链都只是前提——真正的问题是：现有的 Node.js 项目能不能直接跑在 Bun 上？下一篇就来直面这个核心问题。

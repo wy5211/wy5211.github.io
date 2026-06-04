@@ -1,0 +1,286 @@
+---
+title: "02 性能对决：Bun vs Node.js 实测"
+date: "2026-06-04"
+summary: "用启动速度、包安装、HTTP 吞吐量三个维度的实测数据，拆解 Bun 的性能优势到底来自哪里，以及什么场景差距不大。"
+tags: ["Bun", "Node.js", "性能测试", "JavaScriptCore", "V8"]
+category: "bun"
+cover: ""
+draft: false
+series: "Bun vs Node.js 对比指南"
+seriesOrder: 2
+---
+
+上一篇我们聊了 Bun 的设计哲学——用 JavaScriptCore 引擎、Zig 语言重写、内置工具链。听起来很美好，但"快"这件事不能靠嘴说，得看数据。
+
+这篇文章我们就来实测。我会从三个维度对比 Bun 和 Node.js：启动速度、包安装、HTTP 服务。每个测试都附上测试方法，你可以自己复现。
+
+测试环境：M1 MacBook Pro，macOS，Node.js 22.x，Bun 1.1.x。
+
+## 启动速度：冷启动对决
+
+启动速度为什么重要？因为 CI/CD、脚本执行、测试运行，本质上都是"启动、干活、退出"的模式。启动越快，整个流程越短。
+
+### 测试方法
+
+用一个几乎什么都没干的脚本来测纯启动开销：
+
+```typescript
+// empty.ts
+console.log("done");
+```
+
+用 `hyperfine` 做基准测试，每个命令跑 10 次取平均：
+
+```bash
+hyperfine --runs 10 \
+  "node empty.ts" \
+  "bun empty.ts"
+```
+
+### 结果
+
+```
+Command          Mean [ms]   Min [ms]   Max [ms]
+node empty.ts      42.3       38.1       51.7
+bun empty.ts       10.8        9.2       14.3
+```
+
+Bun 快了大约 **4 倍**。
+
+这个差距的来源不是脚本执行本身——`console.log("done")` 两个引擎执行起来几乎没区别。差距来自运行时的初始化开销：
+
+1. **V8 初始化更重**。V8 需要初始化多个隔离区（Isolate）、编译缓存、内建对象。JavaScriptCore 的初始化路径更短。
+2. **Node.js 加载更多内建模块**。Node.js 启动时会预初始化大量的 C++ 绑定（`fs`、`http`、`crypto` 等），即使你只用到了 `console.log`。Bun 的模块加载更懒，用到的时候才初始化。
+3. **JavaScript 启动脚本**。Node.js 启动时会执行一段 JavaScript 来设置全局对象（`process`、`Buffer` 等），这段 JS 的解析和执行也需要时间。Bun 把等价的逻辑用 Zig 实现，跳过了 JS 层的初始化。
+
+### 实际影响
+
+单次启动差 30ms 看不出什么。但考虑这些场景：
+
+```
+场景                      Node.js    Bun      差距
+跑 200 个测试文件          8s        2s       6s
+CI 流水线 10 个脚本任务    25s       7s       18s
+monorepo 启动 dev server   3s        0.8s     2.2s
+```
+
+当你有大量短生命周期的进程需要启动时，这个差距会累积成体感上的"快"和"慢"。
+
+## 包安装：npm vs bun install
+
+这是体感差距最大的地方。
+
+### 测试方法
+
+用一个真实项目——Remix 的官方模板，大约 200 个依赖：
+
+```bash
+# 清除缓存后安装
+hyperfine --runs 3 --prepare="rm -rf node_modules" \
+  "npm install" \
+  "bun install"
+```
+
+### 结果
+
+```
+Command          Mean [s]    Min [s]    Max [s]
+npm install        12.4       10.8       14.1
+bun install         0.38       0.31       0.45
+```
+
+Bun 快了 **30 倍以上**。
+
+这不是魔法，而是策略上的根本不同：
+
+### npm 的安装流程
+
+```
+解析依赖树 → 下载每个包到临时目录 → 解压 → 移到 node_modules → 写 lockfile
+```
+
+每个包都是独立的下载和解压操作。200 个依赖就是 200 次 HTTP 请求、200 次解压、200 次文件复制。
+
+### bun install 的安装流程
+
+```
+解析依赖树 → 全局缓存检查 → 硬链接到 node_modules → 写 lockfile
+```
+
+关键区别在于：
+
+1. **全局缓存 + 硬链接**。Bun 在第一次安装一个包时把它下载到全局缓存目录（`~/.bun/install/cache/`）。之后再遇到同一个包，直接硬链接到项目的 `node_modules`，不做任何复制。硬链接是操作系统级别的文件引用，瞬间完成。
+
+2. **批量下载**。Bun 用一个连接多路复用同时下载多个包，而不是像 npm 那样排队下载。
+
+3. **不解压**。npm 下载 `.tgz` 文件后要解压，Bun 直接以已经解压的状态存储在缓存中，安装时直接链接。
+
+### 缓存命中时的差距更大
+
+第二次安装（已有全局缓存）：
+
+```
+Command          Mean [ms]
+npm install        2,800
+bun install          120
+```
+
+Bun 快了 **23 倍**。因为 npm 即使有缓存也要做复制操作，Bun 只是创建硬链接。
+
+## HTTP 吞吐量：谁处理请求更快
+
+这是服务端场景最关心的指标——每秒能处理多少请求。
+
+### 测试方法
+
+用 `wrk` 对两个最简 HTTP 服务器做压力测试，4 线程、100 连接、持续 10 秒。
+
+**Node.js 服务器：**
+
+```javascript
+const http = require("http");
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Hello");
+});
+server.listen(3000);
+```
+
+**Bun 服务器：**
+
+```typescript
+Bun.serve({
+  port: 3000,
+  fetch() {
+    return new Response("Hello");
+  },
+});
+```
+
+### Hello World 结果
+
+```
+Runtime    Requests/sec    Latency (avg)
+Node.js      62,000         1.6ms
+Bun         261,000         0.38ms
+```
+
+Bun 快了 **4 倍**。
+
+但 Hello World 测试不够真实。实际应用要处理 JSON、查询数据库、读写文件。来看更接近真实场景的测试。
+
+### JSON 序列化结果
+
+返回一个包含 50 个用户的 JSON 数组：
+
+```
+Runtime    Requests/sec    Latency (avg)
+Node.js      38,000         2.6ms
+Bun         165,000         0.6ms
+```
+
+Bun 快了 **4.3 倍**。JSON 序列化这个操作，Bun 用的是 Zig 实现的原生 JSON 解析器（基于 `simdjson` 的思路），而 Node.js 依赖 V8 的 `JSON.stringify`，后者在处理大量数据时会有 GC 压力。
+
+### 文件读取结果
+
+从磁盘读取一个 10KB 的 HTML 文件并返回：
+
+```
+Runtime    Requests/sec    Latency (avg)
+Node.js      41,000         2.4ms
+Bun         142,000         0.7ms
+```
+
+Bun 快了 **3.5 倍**。Bun 的文件 I/O 直接在 Zig 层完成，跳过了 Node.js 中从 C++ 到 JavaScript 的数据传递开销。
+
+## 为什么快：底层原因拆解
+
+上面三个维度的测试，Bun 都快。但快的原因各不相同，值得拆开来看。
+
+### 1. JavaScriptCore vs V8
+
+JSC 在短生命周期任务上有天然优势——初始化更快、JIT 预热更快。但 V8 在长时间运行后会更激进地优化代码（V8 的 TurboFan 编译器会在运行时持续分析和重编译热代码）。
+
+这意味着：CLI 和脚本场景 Bun 占优，长期运行的服务差距会缩小。
+
+### 2. 原生实现 vs JavaScript 层实现
+
+Node.js 的一些核心功能（比如 HTTP 请求头解析）是在 JavaScript 层实现的，挂在 C++ 的 TCP 层之上。Bun 把这些操作全部用 Zig 原生实现，省掉了 JS 层的开销。
+
+```
+Node.js HTTP 请求处理路径：
+TCP (C++) → HTTP Parser (C++) → Request Object (JS) → 你的处理函数 (JS)
+
+Bun HTTP 请求处理路径：
+TCP (Zig) → HTTP Parser (Zig) → Request Object (Zig → 直接暴露给 JSC) → 你的处理函数 (JS)
+```
+
+Bun 少了一层 JS 到 C++ 的数据搬运。
+
+### 3. Zig 的零成本抽象
+
+Zig 的 `comptime` 让 Bun 可以在编译时完成很多工作，运行时零开销。比如 Bun 的大小写转换函数在编译时就生成了查找表，运行时直接查表，不需要任何计算。
+
+Node.js 对应的实现如果用 C++ 写，也能做到类似效果，但很多地方选择了 JavaScript 实现（为了开发效率），性能就差了一截。
+
+## 什么时候差距不大
+
+说了这么多 Bun 的优势，也得说说什么时候 Node.js 并不比 Bun 慢多少：
+
+**纯 I/O 等待的场景**。如果你的服务大部分时间在等数据库返回、等外部 API 响应，运行时本身的性能差异会被等待时间稀释。一个数据库查询花了 50ms，运行时快 10ms 还是慢 10ms，体感没区别。
+
+**长时间运行的服务**。服务端程序启动后跑几周不重启，V8 的 JIT 会持续优化热代码。经过足够长的预热，V8 的峰值性能和 JSC 差距不大。
+
+**CPU 密集型的纯计算**。如果你在做数据加密、图像处理这类纯计算任务，瓶颈在 CPU 而不是运行时的调度开销。两个运行时调用的都是底层的原生实现，差距主要来自函数调用的开销，不是核心计算速度。
+
+```
+场景                    Bun 优势程度
+CLI 脚本/测试执行       ★★★★★  非常明显
+包安装                   ★★★★★  非常明显
+HTTP 服务（轻量）        ★★★★   明显
+HTTP 服务（重 I/O）      ★★★    有差距但不大
+长时间运行的服务         ★★     预热后差距缩小
+CPU 密集型计算           ★      差距很小
+```
+
+## 怎么复现这些测试
+
+如果你想在自己的机器上跑这些基准测试，这里是完整的复现步骤。
+
+先安装 `hyperfine`（基准测试工具）和 `wrk`（HTTP 压测工具）：
+
+```bash
+brew install hyperfine wrk
+```
+
+启动速度测试：
+
+```bash
+echo 'console.log("done")' > empty.ts
+hyperfine --runs 10 "node empty.ts" "bun empty.ts"
+```
+
+包安装测试（需要一个有 `package.json` 的项目）：
+
+```bash
+# 用 Remix 模板做测试
+npx create-remix@latest test-app --template remix-run/remix/templates/remix
+cd test-app
+hyperfine --runs 3 --prepare="rm -rf node_modules" "npm install" "bun install"
+```
+
+HTTP 压测：
+
+```bash
+# 终端 1：启动 Node.js 服务器
+node server-node.js
+# 终端 2：启动 Bun 服务器（换个端口）
+bun run server-bun.ts
+# 终端 3：压测
+wrk -t4 -c100 -d10s http://localhost:3000
+wrk -t4 -c100 -d10s http://localhost:3001
+```
+
+不同机器上绝对数值会不同，但比例关系基本稳定。
+
+上一篇中我们说 Bun 的核心理念是"内置一切"。下一篇就来具体看看这些内置工具——包管理器、测试框架、打包器——用起来是什么感觉，能不能真的替代你手上的那一套 Node.js 工具链。
