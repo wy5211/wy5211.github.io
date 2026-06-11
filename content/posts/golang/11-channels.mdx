@@ -10,15 +10,19 @@ series: "Go 语言渐进式学习"
 seriesOrder: 11
 ---
 
-## 前言
+## 为什么要用 channel？
 
-channel 是 Go 语言并发模型的核心，提供了一种安全的方式在 goroutine 之间传递数据。
+在构建任务队列 API 时，你遇到一个棘手的问题：多个 goroutine 需要安全地共享数据。比如，主 goroutine 接收任务，worker goroutine 处理任务，处理结果需要传回主 goroutine。如果直接用共享变量加锁，代码会变得复杂且容易出错。
+
+Go 提供了一个更优雅的解决方案：channel（通道）。channel 是 goroutine 之间通信的管道，它让你不用锁也能安全地传递数据。Go 的名言就是："不要通过共享内存来通信，而要通过通信来共享内存。"
 
 ---
 
 ## channel 基础
 
-### 创建和使用 channel
+### 创建和发送接收
+
+channel 是类型安全的管道，创建时需要指定元素类型：
 
 ```go
 package main
@@ -26,21 +30,28 @@ package main
 import "fmt"
 
 func main() {
-    // 创建 channel
+    // 创建一个传递 int 类型数据的 channel
+    // make(chan T) 创建无缓冲 channel，发送和接收会阻塞直到对方准备好
     ch := make(chan int)
 
-    // 发送数据
+    // 在新 goroutine 中发送数据
+    // ch <- value 是发送操作，会阻塞直到有接收者
     go func() {
-        ch <- 42
+        ch <- 42  // 发送 42 到 channel
     }()
 
-    // 接收数据
+    // 在主 goroutine 中接收数据
+    // <-ch 是接收操作，会阻塞直到有数据
     val := <-ch
     fmt.Println("接收到的值:", val)
 }
 ```
 
+**为什么需要阻塞？** 这保证了同步。如果发送方和接收方没有同时准备好，先到的一方会等待，避免数据丢失或死锁。
+
 ### 缓冲 channel
+
+无缓冲 channel 强制同步，但有时你需要异步能力。缓冲 channel 可以存储一定数量的值：
 
 ```go
 package main
@@ -48,69 +59,150 @@ package main
 import "fmt"
 
 func main() {
-    // 缓冲 channel（容量为 3）
+    // 创建容量为 3 的缓冲 channel
+    // 缓冲 channel 可以存储最多 3 个值而不阻塞
     ch := make(chan int, 3)
 
-    ch <- 1  // 不会阻塞
+    // 连续发送 3 个值，不会阻塞（因为缓冲未满）
+    ch <- 1
     ch <- 2
     ch <- 3
 
-    fmt.Println(<-ch)
-    fmt.Println(<-ch)
-    fmt.Println(<-ch)
+    fmt.Println(<-ch)  // 1
+    fmt.Println(<-ch)  // 2
+    fmt.Println(<-ch)  // 3
 }
 ```
+
+**缓冲 vs 无缓冲的选择**：
+
+- 无缓冲：保证数据被立即处理，适合任务分发
+- 缓冲：解耦发送和接收速度，适合结果收集
 
 ---
 
-## channel 操作
+## 在任务队列中使用 channel
 
-### 关闭 channel
+### 任务分发器
+
+下面是一个简单的任务队列，使用 channel 在主 goroutine 和 worker 之间传递任务：
 
 ```go
 package main
 
-import "fmt"
+import (
+    "fmt"
+    "time"
+)
+
+// Task 表示一个任务
+type Task struct {
+    ID   int
+    Data string
+}
+
+// Result 表示任务处理结果
+type Result struct {
+    TaskID int
+    Output string
+}
 
 func main() {
-    ch := make(chan int, 2)
+    // 创建任务 channel 和结果 channel
+    // 使用缓冲 channel 可以让发送方不用等待接收方立即就绪
+    tasks := make(chan Task, 10)    // 任务队列
+    results := make(chan Result, 10) // 结果队列
 
-    ch <- 1
-    ch <- 2
-    close(ch)
-
-    // 可以继续接收
-    for val := range ch {
-        fmt.Println(val)
+    // 启动 3 个 worker goroutine
+    for i := 1; i <= 3; i++ {
+        go worker(i, tasks, results)
     }
 
-    // 检查是否关闭
-    val, ok := <-ch
-    fmt.Printf("值: %d, 关闭: %t\n", val, ok)
+    // 发送 5 个任务
+    for j := 1; j <= 5; j++ {
+        task := Task{
+            ID:   j,
+            Data: fmt.Sprintf("任务数据 %d", j),
+        }
+        fmt.Printf("发送任务 %d\n", j)
+        tasks <- task  // 发送任务到 channel
+    }
+    close(tasks)  // 关闭 tasks channel，通知 worker 没有更多任务
+
+    // 收集所有结果
+    for i := 0; i < 5; i++ {
+        result := <-results
+        fmt.Printf("收到结果: 任务 %d -> %s\n", result.TaskID, result.Output)
+    }
+}
+
+// worker 从 tasks channel 接收任务，处理后将结果发送到 results channel
+func worker(id int, tasks <-chan Task, results chan<- Result) {
+    // 使用 range 遍历 channel，当 channel 被关闭且所有数据被接收后，循环会自动结束
+    for task := range tasks {
+        fmt.Printf("Worker %d 开始处理任务 %d\n", id, task.ID)
+
+        // 模拟处理任务
+        time.Sleep(100 * time.Millisecond)
+
+        // 发送结果
+        result := Result{
+            TaskID: task.ID,
+            Output: fmt.Sprintf("Worker %d 处理完成: %s", id, task.Data),
+        }
+        results <- result
+    }
+    fmt.Printf("Worker %d 退出\n", id)
 }
 ```
 
-### 单向 channel
+这个程序展示了 channel 的几个关键特性：
+
+1. **多个 goroutine 安全地从同一个 channel 接收**：Go 会自动调度，确保每个任务只被一个 worker 接收
+2. **关闭 channel**：`close(tasks)` 通知所有接收者没有更多数据
+3. **range 遍历**：`for task := range tasks` 会在 channel 关闭后自动退出
+
+---
+
+## 单向 channel
+
+上面的代码中，worker 函数的参数使用了单向 channel：
+
+```go
+func worker(id int, tasks <-chan Task, results chan<- Result)
+```
+
+- `<-chan Task`：只接收 channel，只能从 channel 读取数据
+- `chan<- Result`：只发送 channel，只能向 channel 写入数据
+
+**为什么要限制方向？**
+
+1. **类型安全**：防止意外地向只读 channel 写入，或从只写 channel 读取
+2. **代码清晰**：函数签名明确表达了函数的行为
+3. **编译时检查**：如果误用，编译器会报错
 
 ```go
 package main
 
 import "fmt"
 
-// 只发送 channel
+// sender 只能向 channel 发送数据
 func sender(ch chan<- int) {
     ch <- 42
+    // ch <- <-ch  // 编译错误：不能从只发送 channel 接收
 }
 
-// 只接收 channel
+// receiver 只能从 channel 接收数据
 func receiver(ch <-chan int) {
     val := <-ch
     fmt.Println("接收:", val)
+    // ch <- 1  // 编译错误：不能向只接收 channel 发送
 }
 
 func main() {
     ch := make(chan int)
 
+    // 双向 channel 可以隐式转换为单向 channel
     go sender(ch)
     receiver(ch)
 }
@@ -118,9 +210,11 @@ func main() {
 
 ---
 
-## select 语句
+## select：多 channel 复用
 
-### 多 channel 选择
+在任务队列中，你可能需要同时监听多个 channel，比如处理任务和响应取消信号。select 语句让你可以同时等待多个 channel 操作：
+
+### 基本 select
 
 ```go
 package main
@@ -136,26 +230,30 @@ func main() {
 
     go func() {
         time.Sleep(100 * time.Millisecond)
-        ch1 <- "one"
+        ch1 <- "来自 ch1 的消息"
     }()
 
     go func() {
         time.Sleep(200 * time.Millisecond)
-        ch2 <- "two"
+        ch2 <- "来自 ch2 的消息"
     }()
 
+    // select 会阻塞，直到某个 case 可以执行
+    // 如果多个 case 同时就绪，随机选择一个执行
     for i := 0; i < 2; i++ {
         select {
         case msg1 := <-ch1:
-            fmt.Println("从 ch1 接收:", msg1)
+            fmt.Println("接收到:", msg1)
         case msg2 := <-ch2:
-            fmt.Println("从 ch2 接收:", msg2)
+            fmt.Println("接收到:", msg2)
         }
     }
 }
 ```
 
-### 超时处理
+### 超时控制
+
+select 最常见的用途是实现超时：
 
 ```go
 package main
@@ -169,95 +267,345 @@ func main() {
     ch := make(chan string)
 
     go func() {
+        // 模拟长时间运行的任务
         time.Sleep(2 * time.Second)
-        ch <- "结果"
+        ch <- "完成"
     }()
 
     select {
     case result := <-ch:
-        fmt.Println("接收到:", result)
+        fmt.Println("任务完成:", result)
     case <-time.After(1 * time.Second):
-        fmt.Println("超时")
+        // time.After 返回一个 channel，1 秒后会发送当前时间
+        fmt.Println("任务超时")
+    }
+}
+```
+
+### 非阻塞操作
+
+使用 `default` case 可以实现非阻塞的发送或接收：
+
+```go
+package main
+
+import "fmt"
+
+func main() {
+    ch := make(chan int)
+
+    // 非阻塞接收
+    select {
+    case val := <-ch:
+        fmt.Println("接收到:", val)
+    default:
+        fmt.Println("channel 为空，没有数据可接收")
+    }
+
+    // 非阻塞发送
+    ch2 := make(chan int, 1)
+    select {
+    case ch2 <- 42:
+        fmt.Println("发送成功")
+    default:
+        fmt.Println("channel 已满，无法发送")
     }
 }
 ```
 
 ---
 
-## channel 模式
+## 在任务队列中应用 select
 
-### 生产者-消费者模式
-
-```go
-package main
-
-import "fmt"
-
-func producer(ch chan<- int) {
-    for i := 1; i <= 5; i++ {
-        ch <- i
-    }
-    close(ch)
-}
-
-func consumer(ch <-chan int) {
-    for val := range ch {
-        fmt.Println("消费:", val)
-    }
-}
-
-func main() {
-    ch := make(chan int)
-
-    go producer(ch)
-    consumer(ch)
-}
-```
-
-### Fan-Out 模式
+让我们改进之前的任务队列，添加超时和优雅关闭功能：
 
 ```go
 package main
 
-import "fmt"
+import (
+    "context"
+    "fmt"
+    "time"
+)
 
-func worker(id int, jobs <-chan int, results chan<- int) {
-    for job := range jobs {
-        fmt.Printf("Worker %d 处理任务 %d\n", id, job)
-        results <- job * 2
-    }
+type Task struct {
+    ID   int
+    Data string
+}
+
+type Result struct {
+    TaskID int
+    Output string
+    Err    error
 }
 
 func main() {
-    jobs := make(chan int, 100)
-    results := make(chan int, 100)
+    tasks := make(chan Task, 10)
+    results := make(chan Result, 10)
 
-    // 启动多个 worker
-    for w := 1; w <= 3; w++ {
-        go worker(w, jobs, results)
+    // 创建一个可以取消的 context
+    ctx, cancel := context.WithCancel(context.Background())
+    defer cancel()
+
+    // 启动 worker
+    for i := 1; i <= 3; i++ {
+        go workerWithContext(ctx, i, tasks, results)
     }
 
     // 发送任务
-    for j := 1; j <= 5; j++ {
-        jobs <- j
-    }
-    close(jobs)
+    go func() {
+        for j := 1; j <= 5; j++ {
+            tasks <- Task{
+                ID:   j,
+                Data: fmt.Sprintf("任务数据 %d", j),
+            }
+        }
+        close(tasks)
+    }()
 
-    // 收集结果
-    for r := 1; r <= 5; r++ {
-        <-results
+    // 收集结果，带有超时控制
+    timeout := time.After(5 * time.Second)
+    completedTasks := 0
+
+    for {
+        select {
+        case result, ok := <-results:
+            // 检查 channel 是否已关闭
+            if !ok {
+                fmt.Println("结果 channel 已关闭")
+                return
+            }
+
+            if result.Err != nil {
+                fmt.Printf("任务 %d 失败: %v\n", result.TaskID, result.Err)
+            } else {
+                fmt.Printf("任务 %d 完成: %s\n", result.TaskID, result.Output)
+            }
+
+            completedTasks++
+            if completedTasks == 5 {
+                fmt.Println("所有任务完成")
+                return
+            }
+
+        case <-timeout:
+            fmt.Println("等待结果超时，取消所有 worker")
+            cancel()  // 发送取消信号
+            // 继续等待剩余结果
+            for result := range results {
+                fmt.Printf("剩余结果: 任务 %d\n", result.TaskID)
+            }
+            return
+        }
+    }
+}
+
+func workerWithContext(ctx context.Context, id int, tasks <-chan Task, results chan<- Result) {
+    for {
+        select {
+        case <-ctx.Done():
+            // 收到取消信号
+            fmt.Printf("Worker %d 收到取消信号，退出\n", id)
+            return
+
+        case task, ok := <-tasks:
+            if !ok {
+                // tasks channel 已关闭
+                fmt.Printf("Worker %d 发现任务 channel 关闭，退出\n", id)
+                return
+            }
+
+            // 处理任务
+            time.Sleep(100 * time.Millisecond)
+
+            results <- Result{
+                TaskID: task.ID,
+                Output: fmt.Sprintf("Worker %d 处理: %s", id, task.Data),
+                Err:    nil,
+            }
+        }
     }
 }
 ```
+
+这个改进版本展示了几个重要特性：
+
+1. **context 取消**：当超时发生时，通过 `cancel()` 通知所有 worker 退出
+2. **检查 channel 关闭**：通过 `ok` 模式判断 channel 是否已关闭
+3. **多个信号源**：select 同时监听结果、超时和取消信号
+
+---
+
+## 常见陷阱和最佳实践
+
+### 1. 关闭 channel
+
+只有发送方应该关闭 channel，接收方不应该关闭：
+
+```go
+// ✅ 正确：发送方关闭
+func producer(ch chan<- int) {
+    for i := 0; i < 10; i++ {
+        ch <- i
+    }
+    close(ch)  // 发送完毕后关闭
+}
+
+// ❌ 错误：接收方关闭
+func consumer(ch <-chan int) {
+    for val := range ch {
+        fmt.Println(val)
+    }
+    // close(ch)  // 编译错误：不能关闭只接收 channel
+}
+```
+
+### 2. 检测 channel 关闭
+
+使用逗号 ok 模式：
+
+```go
+val, ok := <-ch
+if !ok {
+    // channel 已关闭且没有数据
+}
+```
+
+或者使用 range（推荐）：
+
+```go
+for val := range ch {
+    // 处理 val
+}
+// 循环结束时，channel 已关闭
+```
+
+### 3. 避免死锁
+
+死锁的常见原因：
+
+```go
+// ❌ 死锁：无缓冲 channel，没有接收者
+ch := make(chan int)
+ch <- 42  // 永久阻塞
+
+// ✅ 解决：在另一个 goroutine 中接收
+ch := make(chan int)
+go func() {
+    ch <- 42
+}()
+<-ch
+
+// ❌ 死锁：等待自己发送
+ch := make(chan int)
+ch <- <-ch  // 永久阻塞
+
+// ❌ 死锁：所有 goroutine 都在等待，没有主程序在运行
+ch := make(chan int)
+<-ch  // 主 goroutine 阻塞，没有其他 goroutine 在运行
+```
+
+### 4. panic: close of closed channel
+
+重复关闭 channel 会导致 panic：
+
+```go
+ch := make(chan int)
+close(ch)
+// close(ch)  // panic: close of closed channel
+
+// 安全的关闭方式
+func safeClose(ch chan int) {
+    defer func() {
+        if r := recover(); r != nil {
+            fmt.Println("恢复 panic:", r)
+        }
+    }()
+    close(ch)
+}
+```
+
+更好的做法是使用 sync.Once 确保只关闭一次：
+
+```go
+import "sync"
+
+type ChannelManager struct {
+    ch    chan int
+    once  sync.Once
+}
+
+func (cm *ChannelManager) Close() {
+    cm.once.Do(func() {
+        close(cm.ch)
+    })
+}
+```
+
+### 5. 向已关闭的 channel 发送
+
+向已关闭的 channel 发送会导致 panic：
+
+```go
+ch := make(chan int, 1)
+close(ch)
+// ch <- 1  // panic: send on closed channel
+
+// 必须由发送方负责关闭，且关闭后不再发送
+```
+
+---
+
+## Trade-off 分析
+
+### channel vs 共享内存+锁
+
+**channel 的优势**：
+
+1. **更安全**：编译时类型检查，避免数据竞争
+2. **更清晰**：数据流向明确，通过函数签名就能看出
+3. **更简单**：不需要考虑锁的获取和释放顺序
+
+**channel 的劣势**：
+
+1. **性能开销**：channel 内部有锁和调度开销
+2. **内存拷贝**：数据通过 channel 传递时会被拷贝
+3. **学习曲线**：需要理解阻塞、同步等概念
+
+**何时用 channel**：
+
+- goroutine 之间需要传递数据
+- 需要协调多个 goroutine 的执行
+- 构建流水线或任务队列
+
+**何时用锁**：
+
+- 保护复杂的共享数据结构（如 map 的复合操作）
+- 性能敏感的代码，channel 开销不可接受
+- 需要细粒度的并发控制
+
+### 缓冲 vs 无缓冲 channel
+
+**无缓冲 channel**：
+
+- 强制同步，保证数据被立即处理
+- 适合任务分发场景
+- 更容易发现死锁问题
+
+**缓冲 channel**：
+
+- 解耦发送和接收速度
+- 可以平滑突发流量
+- 缓冲大小需要仔细设计
 
 ---
 
 ## 总结
 
-本文学习了：
+channel 是 Go 并发的核心机制，它让 goroutine 之间的通信变得简单安全。在任务队列 API 中，channel 用于：
 
-- channel 创建和使用
-- 缓冲 channel
-- 单向 channel
-- select 语句
-- 常见并发模式
+- 分发任务给多个 worker
+- 收集处理结果
+- 实现超时和取消控制
+
+理解 channel 的阻塞特性和 select 的多路复用，是编写高效并发程序的关键。记住：Go 的并发模型不是为了最高性能，而是为了编写正确、可维护的并发代码。

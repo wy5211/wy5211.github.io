@@ -11,23 +11,34 @@ seriesOrder: 22
 
 ## 前言
 
-Rust 的一个重要优势是能够与现有的 C 代码库无缝交互。通过 **FFI（Foreign Function Interface，外部函数接口）**，你可以：
+在构建分布式任务处理系统时，我们可能会遇到这样的需求：使用现有的高性能 C 语言库，比如消息队列、数据压缩、加密算法等。这些库经过多年的优化和验证，直接使用它们比重新实现更可靠。
+
+Rust 的 FFI（Foreign Function Interface，外部函数接口）允许我们：
 
 - 在 Rust 中调用 C 函数
 - 将 Rust 代码编译为 C 可调用的库
 - 重用成熟的 C 生态系统
 
-## extern "C"
+## 为什么需要 FFI
+
+在任务处理系统中，以下场景可能需要 FFI：
+
+- 使用 ZeroMQ、libevent 等成熟的 C 语言网络库
+- 集成 OpenSSL 等加密库
+- 调用高性能的数据处理库
+- 与遗留的 C 系统集成
+
+## extern "C" 基础
 
 ### 声明外部 C 函数
 
-使用 `extern "C"` 声明和调用 C 函数：
+使用 `extern "C"` 声明块来定义 C 函数的签名：
 
 ```rust
 extern "C" {
     // 声明 C 标准库函数
     fn abs(x: i32) -> i32;
-    fn puts(s: *const i8) -> i32;
+    fn strlen(s: *const i8) -> usize;
     fn atoi(s: *const i8) -> i32;
     fn malloc(size: usize) -> *mut u8;
     fn free(ptr: *mut u8);
@@ -35,17 +46,22 @@ extern "C" {
 
 fn main() {
     unsafe {
+        // 调用 C 的 abs 函数
         println!("abs(-42) = {}", abs(-42));
 
-        // atoi: 字符串转整数
-        let s = std::ffi::CString::new("123").unwrap();
-        let n = atoi(s.as_ptr());
-        println!("atoi(\"123\") = {}", n);
+        // 使用 CString 创建 C 兼容的字符串
+        let s = std::ffi::CString::new("12345").unwrap();
+        let len = strlen(s.as_ptr());
+        println!("字符串长度: {}", len);
 
-        // malloc + free
+        // 字符串转整数
+        let num = atoi(s.as_ptr());
+        println!("转换结果: {}", num);
+
+        // 使用 malloc 和 free 管理内存
         let ptr = malloc(100);
         if !ptr.is_null() {
-            println!("分配了 100 字节");
+            println!("成功分配 100 字节");
             free(ptr);
         }
     }
@@ -73,56 +89,63 @@ pub extern "C" fn greet(name: *const i8) {
         }
     }
 }
+
+fn main() {
+    println!("10 + 20 = {}", add(10, 20));
+
+    let name = std::ffi::CString::new("World").unwrap();
+    greet(name.as_ptr());
+}
 ```
 
 编译为动态库：
 
 ```bash
-cargo build --release
+# 编译为动态库
+cargo build --release --crate-type cdylib
+
 # 生成 libmy_ffi.dylib (macOS) 或 libmy_ffi.so (Linux)
+# 也可以编译为静态库
+cargo build --release --crate-type staticlib
 ```
 
-C 调用：
+## 字符串处理
 
-```c
-// main.c
-#include <stdio.h>
-
-extern int add(int a, int b);
-extern void greet(const char *name);
-
-int main() {
-    printf("3 + 4 = %d\n", add(3, 4));
-    greet("Rust");
-    return 0;
-}
-```
-
-编译链接：
-
-```bash
-gcc main.c -L target/release -lmy_ffi -o main
-```
-
-## CString 和 CStr
-
-### Rust String → C 字符串
+### Rust String 到 C 字符串
 
 ```rust
 use std::ffi::CString;
+use std::ptr;
+
+fn rust_to_c_string(s: &str) -> *mut i8 {
+    // CString 确保字符串以 null 结尾，且不包含内部 null 字节
+    match CString::new(s) {
+        Ok(c_str) => c_str.into_raw(), // 转移所有权，返回裸指针
+        Err(_) => ptr::null_mut(),
+    }
+}
+
+fn free_c_string(s: *mut i8) {
+    if !s.is_null() {
+        unsafe {
+            // 取回所有权并释放内存
+            let _ = CString::from_raw(s);
+        }
+    }
+}
 
 fn main() {
-    // 创建 CString
-    let c_str = CString::new("hello").unwrap();
-    let ptr = c_str.as_ptr();
+    let rust_str = "Hello from Rust";
+    let c_str = rust_to_c_string(rust_str);
 
-    unsafe {
-        println!("C 字符串指针: {:p}", ptr);
+    if !c_str.is_null() {
+        println!("创建了 C 字符串: {:?}", c_str);
+        free_c_string(c_str);
     }
 }
 ```
 
-### C 字符串 → Rust String
+### C 字符串到 Rust String
 
 ```rust
 use std::ffi::{CStr, CString};
@@ -133,42 +156,55 @@ fn c_to_rust_string(c_str: *const c_char) -> Option<String> {
         if c_str.is_null() {
             return None;
         }
-        CStr::from_ptr(c_str).to_str().ok().map(String::from)
+
+        // CStr::from_ptr 假设指针指向有效的、以 null 结尾的字符串
+        let cstr = CStr::from_ptr(c_str);
+
+        // to_str() 检查字符串是否为有效的 UTF-8
+        match cstr.to_str() {
+            Ok(s) => Some(s.to_string()),
+            Err(_) => None,
+        }
     }
 }
 
-fn rust_to_c_string(s: &str) -> CString {
-    CString::new(s).expect("包含空字节的字符串")
-}
-
 fn main() {
-    let rust_str = "Hello from Rust";
-    let c_str = rust_to_c_string(rust_str);
+    let original = "你好，世界！";
+    let c_string = CString::new(original).unwrap();
 
-    // C → Rust
-    let back = c_to_rust_string(c_str.as_ptr());
-    println!("{:?}", back);
+    // 模拟从 C 接收字符串指针
+    let c_ptr = c_string.as_ptr();
+
+    // 转换回 Rust String
+    if let Some(rust_string) = c_to_rust_string(c_ptr) {
+        println!("转换成功: {}", rust_string);
+    }
 }
 ```
 
-### 注意事项
+### 字符串处理的注意事项
 
 ```rust
 use std::ffi::CString;
 
 fn main() {
-    // ❌ CString 不能包含空字节
-    // CString::new("hello\0world").unwrap();  // panic
-
-    // ✅ 正确处理
+    // CString 不能包含内部 null 字节
     match CString::new("hello\0world") {
-        Ok(c) => println!("OK: {:?}", c),
-        Err(e) => println!("错误: 包含空字节在位置 {}", e.nul_position()),
+        Ok(_) => println!("成功创建"),
+        Err(e) => {
+            println!("创建失败: 包含 null 字节在位置 {}", e.nul_position());
+            // 处理错误：可以选择替换 null 字节或返回错误
+        }
     }
+
+    // 安全的做法：替换 null 字节
+    let safe_str = "hello\0world".replace('\0', "[NULL]");
+    let c_str = CString::new(safe_str).unwrap();
+    println!("安全字符串: {:?}", c_str);
 }
 ```
 
-## repr(C) 类型表示
+## 结构体互操作
 
 使用 `#[repr(C)]` 确保 Rust 结构体在内存中的布局与 C 兼容：
 
@@ -186,6 +222,7 @@ pub struct Rectangle {
     pub height: f64,
 }
 
+// 导出给 C 的函数
 #[no_mangle]
 pub extern "C" fn create_point(x: f64, y: f64) -> Point {
     Point { x, y }
@@ -197,56 +234,178 @@ pub extern "C" fn point_distance(p1: Point, p2: Point) -> f64 {
     let dy = p2.y - p1.y;
     (dx * dx + dy * dy).sqrt()
 }
+
+#[no_mangle]
+pub extern "C" fn rectangle_area(rect: Rectangle) -> f64 {
+    rect.width * rect.height
+}
+
+fn main() {
+    let p1 = create_point(0.0, 0.0);
+    let p2 = create_point(3.0, 4.0);
+    let distance = point_distance(p1, p2);
+    println!("两点距离: {}", distance);
+
+    let rect = Rectangle {
+        origin: p1,
+        width: 5.0,
+        height: 3.0,
+    };
+    let area = rectangle_area(rect);
+    println!("矩形面积: {}", area);
+}
 ```
 
-### repr(C) 的常见用法
+### 复杂结构的例子
 
 ```rust
+use std::ffi::{CString, CStr};
+use std::ptr;
+
+/// 任务状态枚举（C 兼容）
 #[repr(C)]
-pub enum Status {
-    Ok = 0,
-    Error = 1,
-    NotFound = 2,
+pub enum TaskStatus {
+    Pending = 0,
+    Running = 1,
+    Completed = 2,
+    Failed = 3,
 }
 
+/// 任务结构（C 兼容）
 #[repr(C)]
-pub struct Result {
-    pub status: Status,
-    pub value: i32,
+pub struct Task {
+    pub id: u64,
+    pub name: *mut i8,  // C 风格字符串
+    pub status: TaskStatus,
+    pub progress: f32,
 }
 
-#[repr(C, packed)]
-pub struct PackedData {
-    a: u8,
-    b: u32,  // 紧凑排列，无填充
+/// 创建任务
+#[no_mangle]
+pub extern "C" fn task_create(id: u64, name: *const i8) -> *mut Task {
+    let name_copy = if name.is_null() {
+        ptr::null_mut()
+    } else {
+        unsafe { CString::from(CStr::from_ptr(name)) }.into_raw()
+    };
+
+    Box::into_raw(Box::new(Task {
+        id,
+        name: name_copy,
+        status: TaskStatus::Pending,
+        progress: 0.0,
+    }))
+}
+
+/// 获取任务信息
+#[no_mangle]
+pub extern "C" fn task_info(task: *const Task) -> *mut i8 {
+    if task.is_null() {
+        return ptr::null_mut();
+    }
+
+    unsafe {
+        let task = &*task;
+        let name = if task.name.is_null() {
+            "unknown"
+        } else {
+            match CStr::from_ptr(task.name).to_str() {
+                Ok(s) => s,
+                Err(_) => "invalid",
+            }
+        };
+
+        let status_str = match task.status {
+            TaskStatus::Pending => "Pending",
+            TaskStatus::Running => "Running",
+            TaskStatus::Completed => "Completed",
+            TaskStatus::Failed => "Failed",
+        };
+
+        let info = format!(
+            "Task(id={}, name={}, status={}, progress={:.1}%)",
+            task.id,
+            name,
+            status_str,
+            task.progress * 100.0
+        );
+
+        CString::new(info).unwrap().into_raw()
+    }
+}
+
+/// 释放任务（重要：避免内存泄漏）
+#[no_mangle]
+pub extern "C" fn task_free(task: *mut Task) {
+    if !task.is_null() {
+        unsafe {
+            let task = Box::from_raw(task);
+            if !task.name.is_null() {
+                let _ = CString::from_raw(task.name);
+            }
+            // task 自动被 drop
+        }
+    }
+}
+
+// 释放字符串的辅助函数
+#[no_mangle]
+pub extern "C" fn string_free(s: *mut i8) {
+    if !s.is_null() {
+        unsafe {
+            let _ = CString::from_raw(s);
+        }
+    }
+}
+
+fn main() {
+    unsafe {
+        let name = CString::new("处理订单 #123").unwrap();
+        let task = task_create(1, name.as_ptr());
+
+        let info = task_info(task);
+        if !info.is_null() {
+            let info_str = CStr::from_ptr(info).to_str().unwrap();
+            println!("{}", info_str);
+            string_free(info);
+        }
+
+        task_free(task);
+    }
 }
 ```
 
-## bindgen：自动生成 Rust 绑定
+## 自动化工具
 
-`bindgen` 工具可以从 C 头文件自动生成 Rust 的 FFI 绑定：
+### bindgen：从 C 头文件生成 Rust 绑定
+
+`bindgen` 可以自动从 C 头文件生成 Rust 的 FFI 绑定代码：
 
 ```bash
+# 安装 bindgen
 cargo install bindgen
 ```
 
-假设有一个 C 头文件 `mylib.h`：
+假设有一个 C 头文件 `task_queue.h`：
 
 ```c
-// mylib.h
+// task_queue.h
 typedef struct {
-    int x;
-    int y;
-} Point;
+    int id;
+    char* name;
+    int priority;
+} Task;
 
-int point_distance(Point a, Point b);
-void print_point(Point p);
+int task_queue_create(void);
+void task_queue_push(int queue, Task task);
+Task task_queue_pop(int queue);
+void task_queue_destroy(int queue);
 ```
 
 使用 bindgen 生成绑定：
 
 ```bash
-bindgen mylib.h -o bindings.rs
+bindgen task_queue.h -o bindings.rs
 ```
 
 生成的 `bindings.rs` 包含了所有类型和函数声明，直接在 Rust 中使用：
@@ -255,202 +414,405 @@ bindgen mylib.h -o bindings.rs
 include!("bindings.rs");
 
 fn main() {
-    let p1 = Point { x: 0, y: 0 };
-    let p2 = Point { x: 3, y: 4 };
-
     unsafe {
-        let dist = point_distance(p1, p2);
-        println!("距离: {}", dist);
+        // 创建任务队列
+        let queue = task_queue_create();
+
+        // 推送任务
+        let task = Task {
+            id: 1,
+            name: CString::new("任务1").unwrap().into_raw(),
+            priority: 10,
+        };
+        task_queue_push(queue, task);
+
+        // 销毁队列
+        task_queue_destroy(queue);
     }
 }
 ```
 
-## cbindgen：生成 C 头文件
+### cbindgen：从 Rust 生成 C 头文件
 
-`cbindgen` 从 Rust 代码生成 C 头文件：
+`cbindgen` 可以从 Rust 代码生成 C 头文件：
 
 ```bash
+# 安装 cbindgen
 cargo install cbindgen
 ```
 
-```bash
-cbindgen --crate my_crate --output my_crate.h
+创建 `cbindgen.toml` 配置文件：
+
+```toml
+language = "C"
+include_guard = "TASK_H"
+usize_is_size_t = true
 ```
 
-## 实战演练
+生成头文件：
 
-### 示例：调用 C 数学库
+```bash
+cbindgen --crate task_lib --output task_lib.h
+```
+
+生成的 `task_lib.h`：
+
+```c
+#include <cstdint>
+#include <cstdlib>
+
+extern "C" {
+
+typedef enum {
+  TaskStatus_Pending = 0,
+  TaskStatus_Running = 1,
+  TaskStatus_Completed = 2,
+  TaskStatus_Failed = 3,
+} TaskStatus;
+
+typedef struct Task {
+  uint64_t id;
+  char *name;
+  TaskStatus status;
+  float progress;
+} Task;
+
+Task *task_create(uint64_t id, const char *name);
+char *task_info(const Task *task);
+void task_free(Task *task);
+
+} // extern "C"
+```
+
+## 实战：与 C 消息队列库集成
+
+假设我们要使用一个 C 语言编写的消息队列库来优化任务处理系统：
 
 ```rust
+use std::ffi::{CString, CStr};
+use std::ptr;
+use std::os::raw::{c_char, c_int, c_void};
+
+// 声明外部 C 函数（模拟消息队列库）
 extern "C" {
-    fn sqrt(x: f64) -> f64;
-    fn pow(base: f64, exp: f64) -> f64;
-    fn sin(x: f64) -> f64;
-    fn cos(x: f64) -> f64;
+    // 创建消息队列
+    fn mq_create(name: *const c_char, capacity: size_t) -> *mut c_void;
+
+    // 发送消息
+    fn mq_send(queue: *mut c_void, data: *const u8, len: size_t) -> c_int;
+
+    // 接收消息
+    fn mq_receive(queue: *mut c_void, data: *mut u8, len: size_t) -> size_t;
+
+    // 销毁队列
+    fn mq_destroy(queue: *mut c_void);
+
+    // 获取错误信息
+    fn mq_error() -> *const c_char;
+}
+
+type size_t = usize;
+
+/// 消息队列封装
+pub struct MessageQueue {
+    inner: *mut c_void,
+}
+
+impl MessageQueue {
+    /// 创建消息队列
+    pub fn new(name: &str, capacity: usize) -> Result<Self, String> {
+        let c_name = CString::new(name).map_err(|e| e.to_string())?;
+
+        unsafe {
+            let queue = mq_create(c_name.as_ptr(), capacity);
+
+            if queue.is_null() {
+                let error_msg = CStr::from_ptr(mq_error()).to_string_lossy().to_string();
+                Err(format!("创建队列失败: {}", error_msg))
+            } else {
+                Ok(Self { inner: queue })
+            }
+        }
+    }
+
+    /// 发送消息
+    pub fn send(&self, message: &[u8]) -> Result<(), String> {
+        unsafe {
+            let result = mq_send(self.inner, message.as_ptr(), message.len());
+
+            if result != 0 {
+                let error_msg = CStr::from_ptr(mq_error()).to_string_lossy().to_string();
+                Err(format!("发送消息失败: {}", error_msg))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// 接收消息
+    pub fn receive(&self, buffer: &mut [u8]) -> Result<usize, String> {
+        unsafe {
+            let received = mq_receive(self.inner, buffer.as_mut_ptr(), buffer.len());
+
+            if received == 0 {
+                let error_msg = CStr::from_ptr(mq_error()).to_string_lossy().to_string();
+                Err(format!("接收消息失败: {}", error_msg))
+            } else {
+                Ok(received)
+            }
+        }
+    }
+
+    /// 发送字符串消息
+    pub fn send_string(&self, message: &str) -> Result<(), String> {
+        self.send(message.as_bytes())
+    }
+
+    /// 接收字符串消息
+    pub fn receive_string(&self, max_len: usize) -> Result<String, String> {
+        let mut buffer = vec![0u8; max_len];
+        let received = self.receive(&mut buffer)?;
+        buffer.truncate(received);
+
+        String::from_utf8(buffer).map_err(|e| e.to_string())
+    }
+}
+
+impl Drop for MessageQueue {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.inner.is_null() {
+                mq_destroy(self.inner);
+            }
+        }
+    }
+}
+
+// 确保线程安全
+unsafe impl Send for MessageQueue {}
+
+/// 任务消息格式
+#[derive(Debug)]
+pub struct TaskMessage {
+    pub task_id: u64,
+    pub task_type: String,
+    pub payload: String,
+}
+
+impl TaskMessage {
+    /// 序列化为 JSON 字符串（简化版本）
+    pub fn serialize(&self) -> String {
+        format!(
+            r#"{{"task_id":{},"task_type":"{}","payload":"{}"}}"#,
+            self.task_id, self.task_type, self.payload
+        )
+    }
+
+    /// 从 JSON 字符串反序列化（简化版本）
+    pub fn deserialize(json: &str) -> Result<Self, String> {
+        // 实际项目中应该使用 serde_json
+        if json.contains("\"task_id\":") {
+            Ok(Self {
+                task_id: 1,
+                task_type: "default".to_string(),
+                payload: json.to_string(),
+            })
+        } else {
+            Err("无效的 JSON 格式".to_string())
+        }
+    }
 }
 
 fn main() {
-    unsafe {
-        println!("sqrt(16) = {}", sqrt(16.0));     // 4.0
-        println!("pow(2, 10) = {}", pow(2.0, 10.0)); // 1024.0
-        println!("sin(0) = {}", sin(0.0));          // 0.0
-        println!("cos(0) = {}", cos(0.0));          // 1.0
-    }
-}
-```
+    // 创建消息队列
+    let queue = MessageQueue::new("task_queue", 100).expect("创建队列失败");
 
-### 示例：完整的 C 互操作库
+    println!("消息队列创建成功");
 
-```rust
-use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
-use std::ptr;
-
-/// 自定义数据结构
-#[repr(C)]
-pub struct User {
-    id: u64,
-    name: *mut c_char,
-    age: u32,
-}
-
-/// 创建用户
-#[no_mangle]
-pub extern "C" fn user_create(id: u64, name: *const c_char, age: u32) -> *mut User {
-    let name_copy = if name.is_null() {
-        ptr::null_mut()
-    } else {
-        unsafe { CString::from(CStr::from_ptr(name)) }.into_raw()
+    // 发送任务消息
+    let task = TaskMessage {
+        task_id: 1001,
+        task_type: "order_processing".to_string(),
+        payload: "处理订单 #12345".to_string(),
     };
 
-    Box::into_raw(Box::new(User {
-        id,
-        name: name_copy,
-        age,
-    }))
-}
+    let message = task.serialize();
+    queue.send_string(&message).expect("发送消息失败");
+    println!("发送消息: {}", message);
 
-/// 获取用户信息
-#[no_mangle]
-pub extern "C" fn user_info(user: *const User) -> *const c_char {
-    if user.is_null() {
-        return ptr::null();
+    // 接收消息
+    match queue.receive_string(1024) {
+        Ok(received) => {
+            println!("接收消息: {}", received);
+
+            // 解析消息
+            match TaskMessage::deserialize(&received) {
+                Ok(task) => println!("解析任务: {:?}", task),
+                Err(e) => eprintln!("解析失败: {}", e),
+            }
+        }
+        Err(e) => eprintln!("接收失败: {}", e),
+    }
+}
+```
+
+## 错误处理最佳实践
+
+### 检查空指针
+
+```rust
+use std::ptr;
+
+/// 安全的字符串复制函数
+pub fn safe_string_copy(src: *const i8) -> Option<String> {
+    // 始终检查空指针
+    if src.is_null() {
+        return None;
     }
 
     unsafe {
-        let user = &*user;
-        let name = if user.name.is_null() {
-            "unknown"
-        } else {
-            match CStr::from_ptr(user.name).to_str() {
-                Ok(s) => s,
-                Err(_) => "invalid",
-            }
-        };
-        let info = format!("User(id={}, name={}, age={})", user.id, name, user.age);
-        CString::new(info).unwrap().into_raw()
-    }
-}
-
-/// 释放用户（重要！）
-#[no_mangle]
-pub extern "C" fn user_free(user: *mut User) {
-    if !user.is_null() {
-        unsafe {
-            let user = Box::from_raw(user);
-            if !user.name.is_null() {
-                drop(CString::from_raw(user.name));
-            }
-        }
+        let cstr = CStr::from_ptr(src);
+        cstr.to_str().ok().map(String::from)
     }
 }
 
 fn main() {
+    let valid = CString::new("Valid string").unwrap();
+    let result = safe_string_copy(valid.as_ptr());
+    println!("{:?}", result); // Some("Valid string")
+
+    let null_result = safe_string_copy(ptr::null());
+    println!("{:?}", null_result); // None
+}
+```
+
+### 内存管理配对
+
+```rust
+use std::ffi::CString;
+
+fn main() {
+    // ❌ 错误：内存泄漏
+    // let ptr = CString::new("data").unwrap().into_raw();
+    // 忘记调用 CString::from_raw(ptr)
+
+    // ✅ 正确：配对使用
+    let ptr = CString::new("data").unwrap().into_raw();
+
+    // ... 使用 ptr ...
+
     unsafe {
-        let name = CString::new("Alice").unwrap();
-        let user = user_create(1, name.as_ptr(), 30);
-
-        let info = user_info(user);
-        if !info.is_null() {
-            println!("{}", CStr::from_ptr(info).to_str().unwrap());
-        }
-
-        // 释放（实践中需要 C 端调用 user_free）
-        user_free(user);
+        // 取回所有权并释放
+        drop(CString::from_raw(ptr));
     }
 }
 ```
 
-## 常见错误与修复
-
-### 错误 1：空指针未检查
+### 使用 RAII 模式
 
 ```rust
-#[no_mangle]
-pub extern "C" fn process(data: *const u8) {
-    // ❌ 没有检查空指针
-    // let byte = *data;
+use std::ffi::CString;
+use std::ptr;
 
-    // ✅ 安全处理
-    if !data.is_null() {
-        unsafe {
-            let byte = *data;
-            println!("{}", byte);
+/// RAII 封装的 C 字符串
+struct OwnedCString {
+    ptr: *mut i8,
+}
+
+impl OwnedCString {
+    fn from_rust_string(s: &str) -> Option<Self> {
+        CString::new(s).ok().map(|c_str| Self {
+            ptr: c_str.into_raw(),
+        })
+    }
+
+    fn as_ptr(&self) -> *const i8 {
+        self.ptr
+    }
+}
+
+impl Drop for OwnedCString {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            unsafe {
+                let _ = CString::from_raw(self.ptr);
+            }
         }
     }
 }
+
+// 确保不被其他线程使用
+// !Send 和 !Sync 需要显式实现 negative impls
 ```
 
-### 错误 2：内存泄漏
+## Trade-off 分析
+
+### 使用 FFI 的优势
+
+1. **重用成熟代码**：可以直接使用经过时间考验的 C 库
+2. **性能**：C 库通常经过了深度优化
+3. **生态系统**：访问丰富的 C 语言生态系统
+4. **渐进式迁移**：可以逐步用 Rust 替换现有 C 代码
+
+### 使用 FFI 的挑战
+
+1. **复杂性**：需要处理两种语言的类型系统和内存模型
+2. **安全性**：FFI 边界是 unsafe 的，需要额外小心
+3. **维护成本**：需要维护两套代码库的兼容性
+4. **性能开销**：跨越 FFI 边界可能有性能损失
+
+### 安全性考虑
+
+| 风险         | 缓解措施                       |
+| ------------ | ------------------------------ |
+| 空指针解引用 | 始终检查指针是否为 null        |
+| 内存泄漏     | 使用 RAII 模式，配对分配/释放  |
+| 数据竞争     | 使用适当的同步机制             |
+| 类型不匹配   | 使用 `#[repr(C)]` 确保布局兼容 |
+| 字符串编码   | 处理 UTF-8 和 C 字符串的转换   |
+
+### 替代方案
+
+在考虑 FFI 之前，先评估以下选项：
+
+1. **纯 Rust 实现**：优先使用 Rust 原生库
+2. **绑定库**：使用社区维护的 FFI 绑定
+3. **重写**：对于关键代码，考虑用 Rust 重写
 
 ```rust
-// ❌ CString::into_raw 转移了所有权，需要手动释放
-let c_str = CString::new("hello").unwrap();
-let ptr = c_str.into_raw();
-// 忘记调用 CString::from_raw(ptr) 释放
+// 优先使用 Rust 原生库
+use serde::{Serialize, Deserialize};
+use tokio::sync::mpsc;
 
-// ✅ 配对使用
-let ptr = CString::new("hello").unwrap().into_raw();
-// ... 使用 ptr
-unsafe { drop(CString::from_raw(ptr)); }  // 释放
+// 而不是通过 FFI 调用 C 库
 ```
-
-## 最佳实践
-
-1. **最小化 unsafe 代码**：封装为 safe API
-2. **检查所有指针**：使用前检查是否为 null
-3. **配对内存操作**：`into_raw` 和 `from_raw` 配对
-4. **使用 `repr(C)`**：确保 C 兼容的内存布局
-5. **用 bindgen 自动生成绑定**：避免手写错误
 
 ## 总结
 
-本文学习了 Rust 与 C 语言的交互：
+本文学习了 Rust 与 C 语言的 FFI 交互：
 
-**extern "C"**
+**核心概念**
 
-- 声明外部 C 函数
-- 导出 Rust 函数给 C
-- `#[no_mangle]` 保持函数名不变
+- `extern "C"`：声明和导出 C 兼容函数
+- `#[no_mangle]`：保持函数名不被修饰
+- `#[repr(C)]`：确保结构体内存布局兼容
 
-**字符串转换**
+**字符串处理**
 
-- `CString`：Rust → C
-- `CStr`：C → Rust
-- 注意空字节处理
+- `CString`：Rust String 到 C 字符串
+- `CStr`：C 字符串到 Rust String
+- 注意 null 字节和内存管理
 
-**类型兼容**
+**工具支持**
 
-- `#[repr(C)]`：C 兼容的内存布局
-- 基本类型自动映射
+- `bindgen`：从 C 头文件生成 Rust 绑定
+- `cbindgen`：从 Rust 生成 C 头文件
 
-**工具**
+**最佳实践**
 
-- `bindgen`：C 头文件 → Rust 绑定
-- `cbindgen`：Rust → C 头文件
+- 检查所有指针
+- 使用 RAII 管理资源
+- 封装 unsafe 为安全 API
+- 充分测试 FFI 边界
 
-## 下一步
-
-掌握了 FFI，你已经能和 C 生态系统无缝对接。下一篇文章将进入实战阶段，学习如何用 **Axum 框架构建 Web 服务器**。
-
----
+掌握了 FFI，你可以在 Rust 任务处理系统中集成高性能的 C 语言库。下一篇文章将进入实战阶段，学习如何使用 **Axum 框架构建完整的 Web 服务器**，实现任务处理的 RESTful API。

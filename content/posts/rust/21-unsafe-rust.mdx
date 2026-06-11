@@ -11,27 +11,54 @@ seriesOrder: 21
 
 ## 前言
 
-Rust 的安全保证非常强大，但有些场景下你确实需要绕过编译器的检查：与 C 语言交互、实现某些数据结构、极致性能优化等。
+在构建分布式任务处理系统时，我们可能会遇到这样的场景：需要与高性能的 C 库交互，或者为了极致性能优化而绕过借用检查器。这时，Rust 的 `unsafe` 关键字就显得尤为重要。
 
-`unsafe` 不是关闭安全检查的开关，而是告诉编译器："**我知道我在做什么，请信任我。**" 它有五个超能力，本文将逐一介绍。
+`unsafe` 不是关闭安全检查的开关，而是告诉编译器："我知道我在做什么，请信任我。"它允许我们在必要时绕过 Rust 的安全保证，但同时也要求我们承担起保证内存安全的责任。
+
+## 为什么需要 unsafe
+
+在任务处理系统中，以下场景可能需要 unsafe：
+
+- 与 C 语言编写的消息队列库交互
+- 实现自定义的内存池以提高任务分配性能
+- 构建无锁数据结构用于高并发场景
+- 访问硬件特定功能或系统调用
 
 ## unsafe 的五个超能力
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                unsafe 的五个超能力                            │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  1. 解引用裸指针                                            │
-│  2. 调用 unsafe 函数或方法                                   │
-│  3. 访问或修改可变静态变量                                    │
-│  4. 实现 unsafe trait                                       │
-│  5. 访问 union 的字段                                       │
-│                                                             │
-│  注意：unsafe 只作用于标记的代码块                            │
-│  不影响块外的安全检查                                        │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+`unsafe` 块允许你执行五种操作，这些操作在安全 Rust 中是被禁止的：
+
+```rust
+fn main() {
+    let mut num = 42;
+
+    unsafe {
+        // 1. 解引用裸指针
+        let raw = &num as *const i32;
+        println!("值: {}", *raw);
+
+        // 2. 调用 unsafe 函数
+        dangerous_function();
+
+        // 3. 访问或修改可变静态变量
+        STATIC_COUNTER += 1;
+
+        // 4. 访问 union 的字段
+        let u = MyUnion { i: 10 };
+        println!("Union 值: {}", u.i);
+    }
+}
+
+unsafe fn dangerous_function() {
+    println!("这是 unsafe 函数");
+}
+
+static mut STATIC_COUNTER: i32 = 0;
+
+union MyUnion {
+    i: i32,
+    f: f32,
+}
 ```
 
 ## 裸指针
@@ -44,18 +71,19 @@ Rust 的安全保证非常强大，但有些场景下你确实需要绕过编译
 fn main() {
     let mut num = 5;
 
-    // 不可变裸指针 *const T
+    // 不可变裸指针 *const T - 类似于不可变引用
     let r1 = &num as *const i32;
 
-    // 可变裸指针 *mut T
+    // 可变裸指针 *mut T - 类似于可变引用
     let r2 = &mut num as *mut i32;
 
-    // 创建裸指针是安全的（在 unsafe 外）
-    // 但解引用裸指针需要 unsafe
+    // 创建裸指针本身是安全的，不需要 unsafe 块
 }
 ```
 
 ### 解引用裸指针
+
+解引用裸指针需要 unsafe 块，因为编译器无法保证指针指向的内存是有效的：
 
 ```rust
 fn main() {
@@ -65,43 +93,124 @@ fn main() {
     let r2 = &mut num as *mut i32;
 
     unsafe {
-        println!("r1: {}", *r1);  // 5
+        // 解引用裸指针获取值
+        println!("r1 指向的值: {}", *r1);  // 输出: 5
+
+        // 通过可变裸指针修改值
         *r2 = 10;
-        println!("r1: {}", *r1);  // 10
+        println!("修改后的值: {}", *r1);   // 输出: 10
     }
 }
 ```
 
-### 基于地址的裸指针
+### 在任务处理中的应用
+
+假设我们需要实现一个高性能的任务队列，使用裸指针直接操作内存：
 
 ```rust
-fn main() {
-    let values: [i32; 5] = [10, 20, 30, 40, 50];
-
-    unsafe {
-        let pointer = values.as_ptr();
-        println!("第一个: {}", *pointer);           // 10
-        println!("第二个: {}", *pointer.add(1));    // 20
-        println!("第三个: {}", *pointer.offset(2)); // 30
-    }
+/// 高性能任务队列节点
+struct TaskNode<T> {
+    data: T,
+    // 使用裸指针实现链表结构
+    next: *mut TaskNode<T>,
 }
-```
 
-### 空指针和悬垂指针
-
-```rust
-fn main() {
-    let raw: *const i32 = std::ptr::null();
-    let dangling: *const i32 = std::ptr::dangling();
-
-    unsafe {
-        // 空指针检查
-        if !raw.is_null() {
-            println!("{}", *raw);
-        } else {
-            println!("空指针");
+impl<T> TaskNode<T> {
+    /// 创建新节点
+    fn new(data: T) -> Self {
+        Self {
+            data,
+            next: std::ptr::null_mut(),
         }
     }
+
+    /// 设置下一个节点
+    unsafe fn set_next(&mut self, node: *mut TaskNode<T>) {
+        self.next = node;
+    }
+
+    /// 获取下一个节点
+    unsafe fn get_next(&self) -> *mut TaskNode<T> {
+        self.next
+    }
+}
+
+/// 简单的任务链表
+struct TaskList<T> {
+    head: *mut TaskNode<T>,
+    tail: *mut TaskNode<T>,
+}
+
+impl<T> TaskList<T> {
+    fn new() -> Self {
+        Self {
+            head: std::ptr::null_mut(),
+            tail: std::ptr::null_mut(),
+        }
+    }
+
+    /// 添加任务到链表尾部
+    fn push(&mut self, data: T) {
+        let mut node = Box::new(TaskNode::new(data));
+
+        unsafe {
+            let node_ptr = Box::into_raw(node);
+
+            if self.tail.is_null() {
+                // 链表为空，新节点成为头节点
+                self.head = node_ptr;
+                self.tail = node_ptr;
+            } else {
+                // 将新节点链接到尾部
+                (*self.tail).set_next(node_ptr);
+                self.tail = node_ptr;
+            }
+        }
+    }
+
+    /// 遍历链表中的所有任务
+    fn for_each<F>(&self, mut f: F)
+    where
+        F: FnMut(&T),
+    {
+        let mut current = self.head;
+
+        unsafe {
+            while !current.is_null() {
+                f(&(*current).data);
+                current = (*current).get_next();
+            }
+        }
+    }
+}
+
+impl<T> Drop for TaskList<T> {
+    fn drop(&mut self) {
+        let mut current = self.head;
+
+        unsafe {
+            while !current.is_null() {
+                let next = (*current).get_next();
+                // 将裸指针转换回 Box，让 Rust 自动释放内存
+                drop(Box::from_raw(current));
+                current = next;
+            }
+        }
+    }
+}
+
+fn main() {
+    let mut task_list = TaskList::new();
+
+    // 添加任务
+    task_list.push("处理订单 #1");
+    task_list.push("处理订单 #2");
+    task_list.push("处理订单 #3");
+
+    // 遍历任务
+    task_list.for_each(|task| {
+        println!("执行任务: {}", task);
+    });
 }
 ```
 
@@ -109,238 +218,452 @@ fn main() {
 
 ### 调用 unsafe 函数
 
+unsafe 函数必须在 unsafe 块中调用：
+
 ```rust
-unsafe fn dangerous() {
-    println!("这是一个 unsafe 函数");
+/// 读取某个内存地址的值（示例）
+unsafe fn read_memory(address: usize) -> i32 {
+    let ptr = address as *const i32;
+    *ptr
 }
 
 fn main() {
+    // 创建一个变量并获取其地址
+    let value = 42;
+    let address = &value as *const i32 as usize;
+
     unsafe {
-        dangerous();  // 必须在 unsafe 块中调用
+        // 调用 unsafe 函数必须在 unsafe 块中
+        let result = read_memory(address);
+        println!("读取的值: {}", result);
     }
 }
 ```
 
-### 创建 safe 包装
+### 封装 unsafe 为 safe API
 
-最佳实践是将 unsafe 代码封装在 safe 函数中：
+最佳实践是将 unsafe 代码封装在 safe 函数中，对外提供安全的接口：
 
 ```rust
-/// 将字节切片分割为可变引用和剩余部分
-fn split_at_mut(values: &mut [i32], mid: usize) -> (&mut [i32], &mut [i32]) {
-    let len = values.len();
-    let ptr = values.as_mut_ptr();
+use std::slice;
 
-    assert!(mid <= len);
+/// 将切片分割为两个可变切片
+/// 这是标准库中 split_at_mut 的简化版本
+pub fn split_at_mut(slice: &mut [i32], mid: usize) -> (&mut [i32], &mut [i32]) {
+    let len = slice.len();
+    let ptr = slice.as_mut_ptr();
+
+    // 验证 mid 是否在有效范围内
+    assert!(mid <= len, "mid 超出切片范围");
 
     unsafe {
-        (
-            std::slice::from_raw_parts_mut(ptr, mid),
-            std::slice::from_raw_parts_mut(ptr.add(mid), len - mid),
-        )
+        // 从裸指针创建两个可变切片
+        // 这里需要确保两个切片不会重叠
+        let slice1 = slice::from_raw_parts_mut(ptr, mid);
+        let slice2 = slice::from_raw_mut(ptr.add(mid), len - mid);
+        (slice1, slice2)
     }
 }
 
 fn main() {
-    let mut v = vec![1, 2, 3, 4, 5];
-    let (left, right) = split_at_mut(&mut v, 2);
-    println!("左: {:?}, 右: {:?}", left, right);
+    let mut numbers = [1, 2, 3, 4, 5];
+
+    let (left, right) = split_at_mut(&mut numbers, 2);
+
+    println!("左半部分: {:?}", left);   // [1, 2]
+    println!("右半部分: {:?}", right);  // [3, 4, 5]
+
+    // 修改左半部分
+    left[0] = 10;
+    println!("修改后: {:?}", numbers);  // [10, 2, 3, 4, 5]
 }
 ```
 
 ## 可变静态变量
 
-```rust
-static mut COUNTER: u32 = 0;
+在多线程环境中，共享可变状态需要特别小心。在任务处理系统中，我们可能需要全局的任务计数器：
 
-fn increment() {
-    unsafe {
-        COUNTER += 1;
-    }
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// 全局任务计数器（使用原子类型，线程安全）
+static TASK_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// 获取下一个任务 ID
+fn next_task_id() -> u64 {
+    // 原子操作是线程安全的，不需要 unsafe
+    TASK_COUNTER.fetch_add(1, Ordering::SeqCst)
 }
 
-fn get_count() -> u32 {
-    unsafe { COUNTER }
+/// 可变静态变量（不安全，仅作示例）
+static mut UNSAFE_COUNTER: u64 = 0;
+
+/// 不安全地增加计数器（仅单线程环境）
+unsafe fn increment_unsafe_counter() -> u64 {
+    UNSAFE_COUNTER += 1;
+    UNSAFE_COUNTER
 }
 
 fn main() {
-    increment();
-    increment();
-    increment();
+    // 安全的方式：使用原子类型
+    for _ in 0..5 {
+        let id = next_task_id();
+        println!("任务 ID: {}", id);
+    }
 
+    // 不安全的方式：使用可变静态变量
+    // 注意：这在多线程环境下会导致数据竞争
     unsafe {
-        println!("计数: {}", COUNTER);  // 3
+        for _ in 0..5 {
+            let count = increment_unsafe_counter();
+            println!("不安全计数: {}", count);
+        }
     }
 }
 ```
 
-**注意**：访问可变静态变量是不安全的，因为可能存在数据竞争。多线程场景下应该使用 `Mutex` 或原子类型。
+## 实战：任务调度器的性能优化
 
-## 实现 unsafe trait
-
-某些 trait 是 unsafe 的，因为实现它们需要保证特定的安全条件：
+让我们实现一个使用 unsafe 的任务调度器优化版本，展示何时以及如何安全地使用 unsafe：
 
 ```rust
-// Send 和 Sync 是自动实现的
-// 但在某些情况下需要手动实现（需要 unsafe impl）
+use std::ptr;
+use std::sync::{Arc, Mutex};
 
-struct MyBox<T>(T);
-
-// 如果 T 是 Send，则 MyBox<T> 也是 Send（这通常自动推导）
-unsafe impl<T: Send> Send for MyBox<T> {}
-unsafe impl<T: Sync> Sync for MyBox<T> {}
-```
-
-## 实战演练
-
-### 示例 1：安全封装 unsafe 代码
-
-```rust
-/// 一个简易的缓冲区
-pub struct Buffer {
-    data: Vec<u8>,
-    position: usize,
+/// 任务状态
+#[derive(Debug, Clone, Copy)]
+enum TaskStatus {
+    Pending,
+    Running,
+    Completed,
+    Failed,
 }
 
-impl Buffer {
-    pub fn new(size: usize) -> Self {
+/// 任务结构
+struct Task {
+    id: u64,
+    name: String,
+    status: TaskStatus,
+    result: Option<String>,
+}
+
+impl Task {
+    fn new(id: u64, name: String) -> Self {
         Self {
-            data: vec![0; size],
-            position: 0,
-        }
-    }
-
-    /// 写入数据到缓冲区
-    pub fn write(&mut self, bytes: &[u8]) {
-        let remaining = &mut self.data[self.position..];
-        let len = bytes.len().min(remaining.len());
-        remaining[..len].copy_from_slice(&bytes[..len]);
-        self.position += len;
-    }
-
-    /// 从缓冲区读取到可变引用
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.data[..self.position]
-    }
-
-    /// 使用裸指针高效处理
-    pub fn process_with_ptr<F>(&mut self, f: F)
-    where
-        F: FnOnce(*mut u8, usize),
-    {
-        let ptr = self.data.as_mut_ptr();
-        let len = self.position;
-        unsafe {
-            f(ptr, len);
+            id,
+            name,
+            status: TaskStatus::Pending,
+            result: None,
         }
     }
 }
 
-fn main() {
-    let mut buf = Buffer::new(100);
-    buf.write(b"Hello, Rust!");
+/// 任务池 - 使用裸指针优化性能
+struct TaskPool {
+    // 使用原始指针数组而不是 Vec，减少间接寻址
+    tasks: *mut Task,
+    capacity: usize,
+    len: usize,
+}
 
-    println!("{:?}", String::from_utf8_lossy(buf.as_mut_slice()));
+impl TaskPool {
+    /// 创建新的任务池
+    fn new(capacity: usize) -> Self {
+        // 分配足够的内存空间
+        let tasks = unsafe {
+            // 分配未初始化的内存
+            let layout = std::alloc::Layout::array::<Task>(capacity).unwrap();
+            let ptr = std::alloc::alloc(layout) as *mut Task;
 
-    // 使用裸指针操作
-    buf.process_with_ptr(|ptr, len| {
-        unsafe {
-            for i in 0..len {
-                *ptr.add(i) = (*ptr.add(i)).to_ascii_uppercase();
+            if ptr.is_null() {
+                panic!("内存分配失败");
             }
-        }
-    });
 
-    println!("{:?}", String::from_utf8_lossy(buf.as_mut_slice()));
-}
-```
+            // 逐个构造 Task 对象
+            for i in 0..capacity {
+                // 使用 ptr::write 在未初始化内存上写入值
+                ptr::write(
+                    ptr.add(i),
+                    Task::new(i as u64, format!("任务-{}", i))
+                );
+            }
 
-### 示例 2：FFI 前置知识
+            ptr
+        };
 
-```rust
-use std::ffi::{CString, CStr};
-
-extern "C" {
-    /// C 标准库的 abs 函数
-    fn abs(x: i32) -> i32;
-
-    /// C 标准库的 strlen 函数
-    fn strlen(s: *const i8) -> usize;
-}
-
-fn main() {
-    unsafe {
-        // 调用 C 的 abs
-        println!("abs(-42) = {}", abs(-42));  // 42
-
-        // 调用 C 的 strlen
-        let c_str = CString::new("hello").unwrap();
-        let len = strlen(c_str.as_ptr());
-        println!("strlen(\"hello\") = {}", len);  // 5
-    }
-
-    // CStr → Rust String
-    let c_str = unsafe { CStr::from_ptr(CString::new("world").unwrap().as_ptr()) };
-    println!("{}", c_str.to_str().unwrap());
-}
-```
-
-## 常见错误与修复
-
-### 错误 1：忘记 unsafe 块
-
-```rust
-fn main() {
-    let raw: *const i32 = std::ptr::null();
-    // println!("{}", *raw);  // ❌ 解引用裸指针需要 unsafe
-
-    unsafe {
-        // ✅ 在 unsafe 块中
-        if !raw.is_null() {
-            println!("{}", *raw);
+        Self {
+            tasks,
+            capacity,
+            len: capacity,
         }
     }
+
+    /// 获取任务
+    fn get(&self, index: usize) -> Option<&Task> {
+        if index < self.len {
+            unsafe {
+                Some(&*self.tasks.add(index))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// 获取可变任务
+    fn get_mut(&mut self, index: usize) -> Option<&mut Task> {
+        if index < self.len {
+            unsafe {
+                Some(&mut *self.tasks.add(index))
+            }
+        } else {
+            None
+        }
+    }
+
+    /// 更新任务状态
+    fn update_status(&mut self, index: usize, status: TaskStatus) -> bool {
+        if let Some(task) = self.get_mut(index) {
+            task.status = status;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 迭代所有任务
+    fn iter(&self) -> TaskIterator {
+        TaskIterator {
+            pool: self,
+            current: 0,
+        }
+    }
 }
-```
 
-### 错误 2：数据竞争
+/// 任务迭代器
+struct TaskIterator<'a> {
+    pool: &'a TaskPool,
+    current: usize,
+}
 
-```rust
-use std::thread;
-use std::sync::atomic::{AtomicI32, Ordering};
+impl<'a> Iterator for TaskIterator<'a> {
+    type Item = &'a Task;
 
-static COUNTER: AtomicI32 = AtomicI32::new(0);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.current < self.pool.len {
+            let task = unsafe {
+                Some(&*self.pool.tasks.add(self.current))
+            };
+            self.current += 1;
+            task
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for TaskPool {
+    fn drop(&mut self) {
+        unsafe {
+            // 逐个销毁 Task 对象
+            for i in 0..self.len {
+                // 使用 ptr::read_and_drop 读取并销毁值
+                ptr::drop_in_place(self.tasks.add(i));
+            }
+
+            // 释放整个内存块
+            let layout = std::alloc::Layout::array::<Task>(self.capacity).unwrap();
+            std::alloc::dealloc(self.tasks as *mut u8, layout);
+        }
+    }
+}
+
+/// 任务调度器
+struct TaskScheduler {
+    pool: Arc<Mutex<TaskPool>>,
+}
+
+impl TaskScheduler {
+    fn new(capacity: usize) -> Self {
+        Self {
+            pool: Arc::new(Mutex::new(TaskPool::new(capacity))),
+        }
+    }
+
+    /// 执行任务
+    fn execute_task(&self, task_id: usize) -> Result<String, String> {
+        let mut pool = self.pool.lock().unwrap();
+
+        // 更新任务状态为运行中
+        pool.update_status(task_id, TaskStatus::Running);
+
+        if let Some(task) = pool.get(task_id) {
+            println!("执行任务: {}", task.name);
+
+            // 模拟任务执行
+            let result = format!("{} 完成", task.name);
+
+            // 更新任务状态
+            if let Some(task) = pool.get_mut(task_id) {
+                task.status = TaskStatus::Completed;
+                task.result = Some(result.clone());
+            }
+
+            Ok(result)
+        } else {
+            Err(format!("任务 {} 不存在", task_id))
+        }
+    }
+
+    /// 获取所有任务状态
+    fn get_all_status(&self) -> Vec<(u64, String, TaskStatus)> {
+        let pool = self.pool.lock().unwrap();
+        pool.iter()
+            .map(|task| (task.id, task.name.clone(), task.status))
+            .collect()
+    }
+}
 
 fn main() {
-    let mut handles = vec![];
+    let scheduler = TaskScheduler::new(10);
 
-    for _ in 0..10 {
-        let handle = thread::spawn(|| {
-            // ✅ 使用原子类型代替 unsafe 静态变量
-            COUNTER.fetch_add(1, Ordering::SeqCst);
-        });
-        handles.push(handle);
+    // 执行几个任务
+    for i in 0..5 {
+        match scheduler.execute_task(i) {
+            Ok(result) => println!("成功: {}", result),
+            Err(e) => eprintln!("错误: {}", e),
+        }
     }
 
-    for handle in handles {
-        handle.join().unwrap();
+    // 查看所有任务状态
+    println!("\n任务状态:");
+    for (id, name, status) in scheduler.get_all_status() {
+        println!("  任务 {}: {} - {:?}", id, name, status);
     }
-
-    println!("结果: {}", COUNTER.load(Ordering::SeqCst));
 }
 ```
 
-## 最佳实践
+## 安全封装 unsafe 的最佳实践
 
-1. **最小化 unsafe 范围**：只把必要的代码放在 unsafe 块中
-2. **封装为 safe API**：不要让 unsafe 泄漏到模块外部
-3. **充分注释**：解释为什么 unsafe 是安全的
-4. **优先使用 safe 替代方案**：原子类型、`Mutex` 等
-5. **审查 unsafe 代码**：确保不违反 Rust 的安全保证
+### 原则 1：最小化 unsafe 范围
+
+```rust
+// 不好：整个函数都是 unsafe
+unsafe fn bad_function(data: &mut [u8]) -> &mut [u8] {
+    let ptr = data.as_mut_ptr();
+    let len = data.len();
+    // ... 大量 unsafe 操作
+}
+
+// 好：只在必要的部分使用 unsafe
+fn good_function(data: &mut [u8]) -> &mut [u8] {
+    let len = data.len();
+    let ptr = data.as_mut_ptr();
+
+    // 安全的检查
+    assert!(len > 0, "数据不能为空");
+
+    unsafe {
+        // 只在必要时使用 unsafe
+        slice::from_raw_parts_mut(ptr, len)
+    }
+}
+```
+
+### 原则 2：提供安全的外部接口
+
+```rust
+/// 内部 unsafe 实现
+unsafe fn copy_memory_unsafe(src: *const u8, dst: *mut u8, count: usize) {
+    // 直接内存复制
+    for i in 0..count {
+        *dst.add(i) = *src.add(i);
+    }
+}
+
+/// 安全的外部接口
+pub fn copy_memory(src: &[u8], dst: &mut [u8]) -> bool {
+    if src.len() != dst.len() {
+        return false;
+    }
+
+    unsafe {
+        copy_memory_unsafe(src.as_ptr(), dst.as_mut_ptr(), src.len());
+    }
+
+    true
+}
+```
+
+### 原则 3：充分文档化不变量
+
+```rust
+/// 任务队列的实现
+///
+/// # 安全不变量
+///
+/// 1. `head` 和 `tail` 要么都为 null，要么都指向有效的节点
+/// 2. 所有节点的 `next` 指针最终形成单向链表
+/// 3. 链表不会出现循环
+///
+/// # 使用注意事项
+///
+/// - 不要在 Drop 实现外手动释放节点
+/// - 确保 push 和 pop 操作是线程安全的（需要外部加锁）
+struct TaskQueue {
+    head: *mut Node,
+    tail: *mut Node,
+}
+```
+
+## Trade-off 分析
+
+### 使用 unsafe 的优势
+
+1. **性能优化**：可以绕过借用检查器，减少运行时开销
+2. **底层控制**：直接操作内存布局，实现自定义数据结构
+3. **FFI 交互**：与 C 语言等外部代码库交互
+4. **实现不可能**：某些功能（如无锁数据结构）必须用 unsafe
+
+### 使用 unsafe 的风险
+
+1. **内存安全**：可能出现悬垂指针、双重释放等问题
+2. **数据竞争**：多线程环境下更容易出现竞态条件
+3. **维护困难**：unsafe 代码更难理解和维护
+4. **调试复杂**：内存错误往往难以定位
+
+### 何时使用 unsafe
+
+| 场景           | 建议                         |
+| -------------- | ---------------------------- |
+| 与 C 库交互    | 使用，并封装为安全 API       |
+| 性能关键路径   | 先尝试安全实现，测量后再优化 |
+| 实现标准库类型 | 使用，但需要充分测试         |
+| 学习目的       | 谨慎使用，理解每个操作的含义 |
+
+### 替代方案
+
+在大多数情况下，可以考虑以下安全替代方案：
+
+```rust
+// 1. 使用 Rc/Arc 代替裸指针
+use std::rc::Rc;
+use std::sync::Arc;
+
+// 2. 使用引用计数代替手动内存管理
+let shared_data = Arc::new(MyData::new());
+
+// 3. 使用 Vec/String 代替原始数组
+let mut data = Vec::with_capacity(100);
+
+// 4. 使用标准库的原子类型
+use std::sync::atomic::{AtomicUsize, Ordering};
+let counter = AtomicUsize::new(0);
+counter.fetch_add(1, Ordering::SeqCst);
+```
 
 ## 总结
 
-本文学习了 Unsafe Rust：
+本文学习了 Rust 的 unsafe 机制：
 
 **unsafe 的五个超能力**
 
@@ -348,16 +671,14 @@ fn main() {
 - 调用 unsafe 函数
 - 访问可变静态变量
 - 实现 unsafe trait
-- 访问 union 字段
+- 访问 union 的字段
 
 **最佳实践**
 
 - 最小化 unsafe 范围
-- 封装为 safe API
-- 优先使用 safe 替代方案
+- 封装为安全 API
+- 充分文档化不变量
+- 优先使用安全替代方案
+- 编写充分的测试
 
-## 下一步
-
-下一篇文章将学习**与 C 语言交互（FFI）**——更深入地了解 Rust 和 C 的互操作。
-
----
+在构建分布式任务处理系统时，我们可能需要与 C 语言编写的底层库交互。下一篇文章将学习 **FFI（Foreign Function Interface）**，了解如何安全地与 C 语言代码进行交互。

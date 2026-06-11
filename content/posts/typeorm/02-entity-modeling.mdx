@@ -9,844 +9,337 @@ series: "TypeORM 渐进式学习计划"
 seriesOrder: 2
 ---
 
-## 前言
+你用 Prisma 的 schema.prisma 文件定义过数据模型，但 TypeORM 用的是装饰器。装饰器能做的事情更多还是更少？字段类型、默认值、约束、索引……这些在 TypeORM 里怎么表达？
 
-在 TypeORM 中，**实体（Entity）**是数据库表的 TypeScript 映射。通过装饰器，我们可以用优雅的方式定义表结构、字段类型、约束和索引。
+今天我们为一个电商订单系统设计数据模型——Order（订单）、OrderItem（订单明细）、Payment（支付记录）。这个场景涉及金额、状态枚举、时间戳、JSON 字段等多种数据类型，正好覆盖 TypeORM 装饰器的大部分用法。
 
-**本篇你将学到**：
+## 为什么需要精确控制数据模型
 
-- `@Entity` 和 `@Column` 装饰器的完整用法
-- TypeScript 与 SQL 的数据类型映射
-- 主键策略（自增、UUID）
-- 索引和约束的定义
-- 软删除的实现方式
-- 实体监听器（生命周期钩子）
-- 嵌入式实体
+上一篇文章我们定义了一个简单的 Task 实体，用的都是最基本的 `@Column()` 装饰器。但实际业务中，你需要更精细的控制：
 
----
+金额字段应该用什么数据类型？PostgreSQL 的 `numeric` 类型能避免浮点数精度问题，但它在 TypeScript 中映射成 `string`，怎么处理？
 
-## @Entity 装饰器
+订单状态是固定的几个值，用枚举还是字符串？如何保证数据库只存储这些值？
 
-`@Entity` 装饰器用于将一个 TypeScript 类标记为数据库表。
+某些字段组合必须唯一，比如同一个订单不能有相同的商品，怎么定义复合唯一约束？
 
-### 基本用法
+有些字段是可选的，有些是必填的，有些有默认值。这些约束应该在数据库层面强制，还是只在应用层校验？
 
-```typescript
-import { Entity } from "typeorm";
-
-// 表名默认为类名的小写：user
-@Entity()
-export class User {}
-
-// 指定表名
-@Entity("users")
-export class User {}
-
-// 指定 schema
-@Entity("users", { schema: "public" })
-export class User {}
-
-// 指定数据库（多数据库场景）
-@Entity("users", { database: "secondary" })
-export class User {}
-```
-
-### 高级选项
-
-```typescript
-@Entity("users", {
-  // 表引擎（MySQL）
-  engine: "InnoDB",
-
-  // 数据库视图（只读）
-  // typeorm 会将此实体视为视图
-
-  // 自定义表名同步选项
-  synchronize: true, // 是否自动同步此表
-
-  // 表注释
-  comment: "用户信息表",
-})
-export class User {}
-```
-
----
+TypeORM 的装饰器让你在 TypeScript 类中定义这些规则，然后自动转换成正确的 SQL。你写一遍代码，TypeORM 帮你生成对应的表结构、索引、约束，既保证类型安全，又不失去数据库的控制力。
 
 ## @Column 装饰器详解
 
-`@Column` 装饰器用于定义表中的列，是最常用的装饰器。
-
-### 基本用法
+`@Column()` 是最常用的装饰器，它的选项控制着列的所有属性。先看一个完整的订单实体：
 
 ```typescript
 import { Entity, PrimaryGeneratedColumn, Column } from "typeorm";
 
-@Entity("users")
-export class User {
+@Entity("orders")
+export class Order {
   @PrimaryGeneratedColumn()
   id: number;
 
-  // 基本列
-  @Column()
-  name: string;
+  @Column({ length: 50 })
+  orderNumber: string;
 
-  // 指定类型和长度
-  @Column({ type: "varchar", length: 255 })
-  email: string;
+  @Column({
+    type: "enum",
+    enum: ["pending", "processing", "shipped", "delivered", "cancelled"],
+    default: "pending",
+  })
+  status: string;
 
-  // 可空字段
-  @Column({ nullable: true })
-  bio: string;
+  @Column({ type: "decimal", precision: 10, scale: 2 })
+  totalAmount: string;
 
-  // 带默认值
+  @Column({ type: "jsonb", nullable: true })
+  metadata: Record<string, any>;
+
   @Column({ default: true })
   isActive: boolean;
 
-  // 唯一约束
-  @Column({ unique: true })
-  email: string;
-
-  // 查询时默认不返回（如密码字段）
-  @Column({ select: false })
-  password: string;
-
-  // 列注释
-  @Column({ comment: "用户邮箱，唯一标识" })
-  email: string;
+  @Column({ nullable: true })
+  notes: string;
 }
 ```
 
-### 数据类型映射
+`type` 选项指定列的 SQL 类型。如果不提供，TypeORM 根据 TypeScript 类型自动推断：`string` 变成 `varchar(255)`，`number` 变成 `integer`，`Date` 变成 `timestamp`。
 
-TypeORM 将 TypeScript 类型自动映射为 SQL 类型：
+`length` 选项控制字符串列的长度。`varchar(255)` 是默认值，但对于订单编号这种固定格式的字段，50 个字符就够了。
 
-| TypeScript 类型 | SQL 类型（PostgreSQL） | 说明              |
-| --------------- | ---------------------- | ----------------- |
-| `string`        | `character varying`    | 默认 varchar(255) |
-| `number`        | `integer`              | 整数              |
-| `boolean`       | `boolean`              | 布尔              |
-| `Date`          | `timestamp`            | 时间戳            |
-| `Buffer`        | `bytea`                | 二进制            |
-| `Object`        | `json`                 | JSON              |
-| `any[]`         | `text[]`               | 数组              |
+`nullable` 控制字段是否允许为空。默认是 `false`，即必填字段。设置为 `true` 后，数据库列允许 NULL 值，TypeScript 类型也会变成 `string | undefined`。
 
-### 指定列类型
+`default` 设置数据库级别的默认值。当插入记录时没有提供这个字段，数据库会自动填充默认值。注意这和应用层设置默认值不同，数据库默认值即使绕过应用直接操作数据库也会生效。
+
+## 数据类型映射
+
+TypeScript 类型和 SQL 类型的映射关系需要特别注意，尤其是金额、日期、JSON 这些类型。
+
+### 金额类型
+
+金额应该用 `decimal` 类型，避免浮点数精度问题：
 
 ```typescript
-@Entity("products")
-export class Product {
-  @PrimaryGeneratedColumn()
-  id: number;
-
-  // 字符串类型
-  @Column({ type: "varchar", length: 100 })
-  name: string;
-
-  @Column({ type: "text" })
-  description: string;
-
-  @Column({ type: "char", length: 2 })
-  countryCode: string;
-
-  // 数值类型
-  @Column({ type: "integer" })
-  stock: number;
-
-  @Column({ type: "bigint" })
-  views: string; // bigint 在 JS 中是 string
-
-  @Column({ type: "float" })
-  weight: number;
-
-  @Column({ type: "decimal", precision: 10, scale: 2 })
-  price: string; // decimal 在 JS 中是 string
-
-  @Column({ type: "real" })
-  rating: number;
-
-  // 布尔类型
-  @Column({ type: "boolean", default: true })
-  isActive: boolean;
-
-  // 日期类型
-  @Column({ type: "date" })
-  publishDate: Date;
-
-  @Column({ type: "time" })
-  openTime: string;
-
-  @Column({ type: "timestamp" })
-  createdAt: Date;
-
-  @Column({ type: "timestamptz" }) // 带时区
-  updatedAt: Date;
-
-  // JSON 类型
-  @Column({ type: "json" })
-  metadata: object;
-
-  @Column({ type: "jsonb" }) // PostgreSQL 特有，查询更快
-  settings: object;
-
-  // 数组类型（PostgreSQL 特有）
-  @Column({ type: "text", array: true })
-  tags: string[];
-
-  @Column({ type: "integer", array: true })
-  scores: number[];
-
-  // 二进制类型
-  @Column({ type: "bytea" })
-  avatar: Buffer;
-
-  // 枚举类型
-  @Column({
-    type: "enum",
-    enum: ["DRAFT", "PUBLISHED", "ARCHIVED"],
-    default: "DRAFT",
-  })
-  status: "DRAFT" | "PUBLISHED" | "ARCHIVED";
-
-  // 简单 JSON 类型
-  @Column({ type: "simple-json" }) // 存储为字符串，自动序列化
-  preferences: { theme: string; language: string };
-
-  // 简单数组类型
-  @Column({ type: "simple-array" }) // 存储为逗号分隔字符串
-  categories: string[];
-
-  // UUID 类型
-  @Column({ type: "uuid" })
-  uuid: string;
-}
+@Column({ type: "decimal", precision: 10, scale: 2 })
+totalAmount: string
 ```
 
----
+`precision: 10, scale: 2` 表示总共 10 位数字，其中 2 位小数。能存储的最大值是 99999999.99。
 
-## 主键策略
+你可能疑惑为什么 TypeScript 类型是 `string` 而不是 `number`。这是 JavaScript 的限制：Number 类型的最大安全整数是 2^53 - 1，而 `decimal(10,2)` 能表示的范围超出了这个限制。用字符串存储不会有精度损失，TypeORM 会自动处理转换。
 
-### 自增主键
+计算金额时要小心：
 
 ```typescript
-import { PrimaryGeneratedColumn } from "typeorm";
+// 错误：直接相加会丢失精度
+const total = order1.totalAmount + order2.totalAmount;
 
-// 整数自增（最常用）
-@Entity()
-export class User {
-  @PrimaryGeneratedColumn()
-  id: number; // SERIAL PRIMARY KEY
-}
-
-// 指定自增策略
-@Entity()
-export class User {
-  @PrimaryGeneratedColumn({ type: "bigint" })
-  id: string; // BIGSERIAL PRIMARY KEY
-}
+// 正确：转换为 number 后计算
+const total = Number(order1.totalAmount) + Number(order2.totalAmount);
 ```
 
-### UUID 主键
+或者使用专门的货币计算库，比如 `dinero.js` 或 `currency.js`。
+
+### 枚举类型
+
+订单状态、支付方式这类字段，值是固定的几个选项，用枚举类型最合适：
 
 ```typescript
-import { PrimaryGeneratedColumn } from "typeorm";
-
-// 自动生成 UUID v4
-@Entity()
-export class User {
-  @PrimaryGeneratedColumn("uuid")
-  id: string; // UUID PRIMARY KEY DEFAULT gen_random_uuid()
-}
-
-// 自定义 UUID 生成策略
-@Entity()
-export class User {
-  @PrimaryGeneratedColumn("uuid", {
-    generated: "uuid", // 或 "identity"
-  })
-  id: string;
-}
+@Column({
+  type: "enum",
+  enum: ["pending", "processing", "shipped", "delivered", "cancelled"],
+  default: "pending"
+})
+status: string
 ```
 
-### 复合主键
+TypeORM 会创建一个 PostgreSQL 的 `enum` 类型，并在列上使用它。数据库层面会强制只能存储这些值，插入其他值会报错。
+
+也可以用 TypeScript 的 `enum`：
 
 ```typescript
-import { PrimaryColumn } from "typeorm";
-
-// 手动指定主键列
-@Entity()
-export class PostTag {
-  @PrimaryColumn()
-  postId: number;
-
-  @PrimaryColumn()
-  tagId: number;
+export enum OrderStatus {
+  PENDING = "pending",
+  PROCESSING = "processing",
+  SHIPPED = "shipped",
+  DELIVERED = "delivered",
+  CANCELLED = "cancelled"
 }
 
-// 复合主键 + 自动生成
-@Entity()
-export class User {
-  @PrimaryColumn({ type: "uuid", generated: "uuid" })
-  id: string;
-
-  @PrimaryColumn()
-  tenantId: number;
-}
+@Column({
+  type: "enum",
+  enum: OrderStatus,
+  default: OrderStatus.PENDING
+})
+status: OrderStatus
 ```
 
-### 无自增主键
+这样类型安全更好，IDE 会自动补全枚举值，重构时也更安全。
+
+### JSON 类型
+
+PostgreSQL 的 `jsonb` 类型适合存储结构化数据：
 
 ```typescript
-import { PrimaryColumn } from "typeorm";
-
-// 手动管理主键值
-@Entity()
-export class Country {
-  @PrimaryColumn({ type: "char", length: 2 })
-  code: string; // 如 "CN"、"US"
-}
+@Column({ type: "jsonb", nullable: true })
+metadata: Record<string, any>
 ```
 
----
+可以存储任意 JSON 对象：
 
-## 时间戳列
+```typescript
+order.metadata = {
+  customerNotes: "请周末配送",
+  giftWrap: true,
+  specialInstructions: ["轻放", "易碎"],
+};
+```
+
+`jsonb` 比 `json` 类型查询更快，支持索引，但写入稍慢。大多数场景下用 `jsonb` 是正确的选择。
+
+### 日期类型
 
 TypeORM 提供了三个便捷的时间戳装饰器：
 
 ```typescript
 import { CreateDateColumn, UpdateDateColumn, DeleteDateColumn } from "typeorm";
 
-@Entity("users")
-export class User {
-  @PrimaryGeneratedColumn()
-  id: number;
-
-  // 自动记录创建时间（只在 insert 时设置）
+@Entity()
+export class Order {
   @CreateDateColumn({ name: "created_at" })
   createdAt: Date;
 
-  // 自动记录更新时间（每次 update 时更新）
   @UpdateDateColumn({ name: "updated_at" })
   updatedAt: Date;
 
-  // 软删除时间（设置为 null 以外的值表示已删除）
   @DeleteDateColumn({ name: "deleted_at" })
   deletedAt: Date;
 }
 ```
 
-**生成的 SQL**：
+`@CreateDateColumn` 在插入时自动设置为当前时间，之后不会再改变。`@UpdateDateColumn` 在每次更新时自动刷新为当前时间。`@DeleteDateColumn` 用于软删除，设置为非 NULL 值表示记录已删除。
 
-```sql
-CREATE TABLE users (
-  id SERIAL PRIMARY KEY,
-  created_at TIMESTAMP NOT NULL DEFAULT now(),
-  updated_at TIMESTAMP NOT NULL DEFAULT now(),
-  deleted_at TIMESTAMP NULL
-);
-```
+这三个装饰器生成的 SQL 列默认不允许 NULL，但 `@DeleteDateColumn` 除外，它必须是 nullable 的。
 
----
-
-## 索引
-
-### 列级索引
+如果需要精确到日期（不含时间），用 `date` 类型：
 
 ```typescript
-import { Column, Index } from "typeorm";
-
-@Entity("users")
-export class User {
-  @Column()
-  @Index() // 单列索引
-  email: string;
-
-  @Column()
-  @Index({ unique: true }) // 唯一索引
-  username: string;
-}
+@Column({ type: "date" })
+orderDate: Date
 ```
 
-### 表级索引
+## 索引和约束
+
+索引能大幅提升查询性能，但会降低写入速度并占用存储空间。要在查询频繁的字段上建立索引。
+
+### 单列索引
 
 ```typescript
-import { Entity, Index } from "typeorm";
+import { Index } from "typeorm";
 
-@Entity("users")
-@Index(["firstName", "lastName"]) // 复合索引
-@Index(["email"], { unique: true }) // 唯一索引
-export class User {
+@Entity("orders")
+export class Order {
   @Column()
-  firstName: string;
-
-  @Column()
-  lastName: string;
-
-  @Column()
-  email: string;
+  @Index()
+  orderNumber: string;
 }
 ```
 
-### 高级索引选项
+`@Index()` 装饰器在 `orderNumber` 上创建索引。如果这个字段的值必须唯一，可以创建唯一索引：
 
 ```typescript
-@Entity("posts")
-@Index(["title", "content"], {
-  name: "post_fulltext_idx", // 自定义索引名
-  fulltext: true, // 全文索引（MySQL）
-  // PostgreSQL 使用 GIN 索引实现全文搜索
-})
-export class Post {
-  @Column()
-  title: string;
+@Column()
+@Index({ unique: true })
+orderNumber: string
+```
+
+唯一索引不仅提升查询性能，还保证数据完整性。尝试插入重复的订单号会报错。
+
+### 复合索引
+
+有些查询涉及多个字段，复合索引更有效：
+
+```typescript
+@Entity("orders")
+@Index(["customerId", "status"])
+@Index(["status", "createdAt"])
+export class Order {
+  @Column({ name: "customer_id" })
+  customerId: number;
 
   @Column()
-  content: string;
-}
+  status: string;
 
-// 条件索引（PostgreSQL）
-@Entity("users")
-@Index(["email"], {
-  where: "isActive = true", // 只索引活跃用户
-})
-export class User {
-  @Column()
-  email: string;
-
-  @Column()
-  isActive: boolean;
-}
-
-// 使用 synchronize: false 禁用特定索引的自动同步
-@Entity("users")
-@Index(["email"], { synchronize: false })
-export class User {
-  @Column()
-  email: string;
+  @CreateDateColumn({ name: "created_at" })
+  createdAt: Date;
 }
 ```
 
----
+第一个索引优化"查询某客户的所有订单"，第二个索引优化"查询某个状态范围的订单并按时间排序"。
 
-## 约束
+复合索引的字段顺序很重要。如果把 `createdAt` 放在 `status` 前面，优化效果会大打折扣。
 
 ### 唯一约束
 
+有些业务规则需要通过唯一约束保证：
+
 ```typescript
-import { Column, Unique } from "typeorm";
+@Entity("order_items")
+@Unique("UQ_order_product", ["orderId", "productId"])
+export class OrderItem {
+  @Column({ name: "order_id" })
+  orderId: number;
 
-// 列级唯一约束
-@Entity("users")
-export class User {
-  @Column({ unique: true })
-  email: string;
-}
-
-// 表级唯一约束
-@Entity("users")
-@Unique(["email"])
-export class User {
-  @Column()
-  email: string;
-}
-
-// 复合唯一约束
-@Entity("user_roles")
-@Unique("UQ_user_role", ["userId", "roleId"])
-export class UserRole {
-  @Column()
-  userId: number;
-
-  @Column()
-  roleId: number;
+  @Column({ name: "product_id" })
+  productId: number;
 }
 ```
 
-### 检查约束
+这个约束确保同一个订单不能包含重复的商品。
+
+## 实体监听器
+
+有时候需要在数据操作前后执行额外逻辑，比如自动计算订单总金额、记录操作日志。TypeORM 提供了实体监听器来实现这类需求。
+
+让我们为订单实体添加自动计算总金额的功能：
 
 ```typescript
-import { Check } from "typeorm";
+import { Entity, BeforeInsert, BeforeUpdate } from "typeorm";
+import { OrderItem } from "./OrderItem";
 
-@Entity("products")
-@Check(`"price" > 0`) // 价格必须大于 0
-@Check(`"stock" >= 0`) // 库存不能为负
-export class Product {
-  @Column({ type: "decimal" })
-  price: string;
+@Entity("orders")
+export class Order {
+  @PrimaryGeneratedColumn()
+  id: number;
 
-  @Column()
-  stock: number;
-}
+  @Column({ type: "decimal", precision: 10, scale: 2, default: "0.00" })
+  totalAmount: string;
 
-// 命名检查约束
-@Entity("users")
-@Check("age_check", `"age" >= 0 AND "age" <= 150`)
-export class User {
-  @Column()
-  age: number;
+  // 关联的订单明细，稍后会在关系映射章节详细讲解
+  items: OrderItem[];
+
+  @BeforeInsert()
+  @BeforeUpdate()
+  calculateTotal() {
+    // 在保存到数据库前自动计算总金额
+    this.totalAmount = this.items
+      .reduce((sum, item) => sum + Number(item.price) * item.quantity, 0)
+      .toFixed(2);
+  }
 }
 ```
 
-### 外键约束
+`@BeforeInsert()` 在插入前执行，`@BeforeUpdate()` 在更新前执行。这样无论通过什么方式创建或修改订单，总金额都会自动保持正确。
 
-```typescript
-import { ManyToOne } from "typeorm";
-
-@Entity("posts")
-export class Post {
-  @ManyToOne(() => User, (user) => user.posts, {
-    onDelete: "CASCADE", // 删除用户时，同时删除文章
-    onUpdate: "CASCADE", // 更新用户 ID 时，同时更新文章
-  })
-  author: User;
-}
-```
-
-外键行为选项：
-
-| 选项          | 说明                          |
-| ------------- | ----------------------------- |
-| `CASCADE`     | 级联操作（删除/更新关联记录） |
-| `SET NULL`    | 设为 NULL                     |
-| `RESTRICT`    | 拒绝操作（有关联记录时）      |
-| `NO ACTION`   | 类似 RESTRICT                 |
-| `SET DEFAULT` | 设为默认值                    |
-
----
+类似的监听器还有 `@AfterInsert`、`@AfterUpdate`、`@BeforeRemove`、`@AfterRemove`，分别在对应的数据库操作后执行。常见的用途是发送通知、清理缓存、记录日志。
 
 ## 软删除
 
-软删除不会真正从数据库删除记录，而是标记为"已删除"。
-
-### 使用 @DeleteDateColumn
+有些数据不应该真正删除，比如订单记录。客户可能会要求查询历史订单，财务审计也需要保留所有记录。软删除通过标记记录为"已删除"来解决这个问题：
 
 ```typescript
 import { DeleteDateColumn } from "typeorm";
 
-@Entity("users")
-export class User {
-  @PrimaryGeneratedColumn()
-  id: number;
-
-  @Column()
-  name: string;
-
+@Entity("orders")
+export class Order {
   @DeleteDateColumn({ name: "deleted_at" })
   deletedAt: Date;
 }
 ```
 
-### 软删除操作
+调用 `softRemove()` 或 `softDelete()` 会软删除记录：
 
 ```typescript
-const userRepo = dataSource.getRepository(User);
+await orderRepo.softDelete(orderId);
+// 等价于 UPDATE orders SET deleted_at = NOW() WHERE id = ?
 
-// 软删除（设置 deletedAt 字段）
-await userRepo.softDelete(1);
-// 或
-await userRepo.softRemove(user);
-
-// 恢复（清除 deletedAt 字段）
-await userRepo.restore(1);
-// 或
-await userRepo.recover(user);
-
-// 查询：默认排除软删除的记录
-const activeUsers = await userRepo.find();
-// SELECT * FROM users WHERE deleted_at IS NULL
-
-// 查询包含软删除的记录
-const allUsers = await userRepo.find({
-  withDeleted: true,
-});
-// SELECT * FROM users
+// 恢复软删除的记录
+await orderRepo.restore(orderId);
+// 等价于 UPDATE orders SET deleted_at = NULL WHERE id = ?
 ```
 
-### 使用 @Version 实现乐观锁
+普通查询会自动过滤掉软删除的记录：
 
 ```typescript
-import { VersionColumn } from "typeorm";
-
-@Entity("products")
-export class Product {
-  @PrimaryGeneratedColumn()
-  id: number;
-
-  @Column()
-  name: string;
-
-  @Column({ type: "decimal" })
-  price: string;
-
-  @VersionColumn()
-  version: number; // 每次更新自动 +1
-}
-
-// 使用乐观锁防止并发冲突
-const product = await productRepo.findOneBy({ id: 1 });
-product.price = "99.99";
-await productRepo.save(product);
-// UPDATE products SET price = '99.99', version = version + 1
-// WHERE id = 1 AND version = 旧版本号
-// 如果版本号不匹配，说明被其他操作修改过，会抛出 OptimisticLockVersionMismatchError
+const orders = await orderRepo.find();
+// SELECT * FROM orders WHERE deleted_at IS NULL
 ```
 
----
-
-## 实体监听器
-
-实体监听器是 TypeORM 提供的生命周期钩子，可以在特定事件发生时执行自定义逻辑。
-
-### 可用的监听器
+如果需要包含已删除的记录：
 
 ```typescript
-import {
-  Entity,
-  PrimaryGeneratedColumn,
-  Column,
-  BeforeInsert,
-  AfterInsert,
-  BeforeUpdate,
-  AfterUpdate,
-  BeforeRemove,
-  AfterRemove,
-  BeforeSoftRemove,
-  AfterSoftRemove,
-  AfterLoad,
-} from "typeorm";
-
-@Entity("users")
-export class User {
-  @PrimaryGeneratedColumn()
-  id: number;
-
-  @Column()
-  name: string;
-
-  @Column()
-  email: string;
-
-  @Column({ nullable: true })
-  passwordHash: string;
-
-  password: string; // 临时字段，不存储到数据库
-
-  // ========== Insert 监听器 ==========
-
-  @BeforeInsert()
-  beforeInsert() {
-    console.log(`即将插入用户：${this.name}`);
-    // 在这里可以设置默认值、加密密码等
-    if (this.password) {
-      this.passwordHash = hashPassword(this.password);
-    }
-  }
-
-  @AfterInsert()
-  afterInsert() {
-    console.log(`用户已创建，ID：${this.id}`);
-    // 可以发送欢迎邮件、记录日志等
-  }
-
-  // ========== Update 监听器 ==========
-
-  @BeforeUpdate()
-  beforeUpdate() {
-    console.log(`即将更新用户：${this.id}`);
-    if (this.password) {
-      this.passwordHash = hashPassword(this.password);
-    }
-  }
-
-  @AfterUpdate()
-  afterUpdate() {
-    console.log(`用户已更新：${this.id}`);
-  }
-
-  // ========== Remove 监听器 ==========
-
-  @BeforeRemove()
-  beforeRemove() {
-    console.log(`即将删除用户：${this.id}`);
-  }
-
-  @AfterRemove()
-  afterRemove() {
-    console.log(`用户已删除：${this.id}`);
-    // 清理关联资源
-  }
-
-  // ========== Soft Remove 监听器 ==========
-
-  @BeforeSoftRemove()
-  beforeSoftRemove() {
-    console.log(`即将软删除用户：${this.id}`);
-  }
-
-  @AfterSoftRemove()
-  afterSoftRemove() {
-    console.log(`用户已软删除：${this.id}`);
-  }
-
-  // ========== Load 监听器 ==========
-
-  @AfterLoad()
-  afterLoad() {
-    // 每次从数据库加载后执行
-    // 可以计算虚拟属性、格式化数据等
-    this.name = this.name?.trim();
-  }
-}
-
-function hashPassword(password: string): string {
-  // 实际项目中使用 bcrypt
-  return `hashed_${password}`;
-}
+const orders = await orderRepo.find({ withDeleted: true });
+// SELECT * FROM orders
 ```
 
-### 实战：自动密码加密
+软删除让数据可以恢复，查询行为也更符合业务逻辑。但它不是万能的，如果涉及隐私合规（如 GDPR 的"被遗忘权"），可能还是需要真正删除数据。
+
+## 完整的订单系统模型
+
+现在我们定义三个完整的实体：Order、OrderItem、Payment。关系映射会在下一篇文章详细讲解，这里先关注字段定义。
 
 ```typescript
-import * as bcrypt from "bcrypt";
-
-@Entity("users")
-export class User {
-  @Column({ select: false })
-  passwordHash: string;
-
-  // 临时属性，不映射到数据库
-  private _password: string;
-
-  set password(value: string) {
-    this._password = value;
-  }
-
-  @BeforeInsert()
-  @BeforeUpdate()
-  async hashPassword() {
-    if (this._password) {
-      this.passwordHash = await bcrypt.hash(this._password, 10);
-    }
-  }
-
-  // 验证密码
-  async validatePassword(password: string): Promise<boolean> {
-    return bcrypt.compare(password, this.passwordHash);
-  }
-}
-```
-
----
-
-## 嵌入式实体
-
-当一个数据结构在多个实体中重复使用时，可以使用嵌入式实体来复用。
-
-### 定义嵌入式实体
-
-```typescript
-import { Column, CreateDateColumn, UpdateDateColumn } from "typeorm";
-
-// 嵌入式实体：用户地址
-export class Address {
-  @Column({ name: "street" })
-  street: string;
-
-  @Column({ name: "city" })
-  city: string;
-
-  @Column({ name: "state" })
-  state: string;
-
-  @Column({ name: "zip_code" })
-  zipCode: string;
-
-  @Column({ name: "country" })
-  country: string;
-}
-
-// 嵌入式实体：审计字段
-export class AuditFields {
-  @Column({ name: "created_by", nullable: true })
-  createdBy: string;
-
-  @Column({ name: "updated_by", nullable: true })
-  updatedBy: string;
-
-  @CreateDateColumn({ name: "created_at" })
-  createdAt: Date;
-
-  @UpdateDateColumn({ name: "updated_at" })
-  updatedAt: Date;
-}
-```
-
-### 使用嵌入式实体
-
-```typescript
-import { Entity, PrimaryGeneratedColumn, Column } from "typeorm";
-import { Embedded } from "typeorm";
-import { Address, AuditFields } from "./embeddables";
-
-@Entity("users")
-export class User {
-  @PrimaryGeneratedColumn()
-  id: number;
-
-  @Column()
-  name: string;
-
-  // 嵌入地址
-  @Embedded(() => Address)
-  address: Address;
-
-  // 嵌入审计字段
-  @Embedded(() => AuditFields)
-  audit: AuditFields;
-}
-
-@Entity("companies")
-export class Company {
-  @PrimaryGeneratedColumn()
-  id: number;
-
-  @Column()
-  name: string;
-
-  // 嵌入地址（复用）
-  @Embedded(() => Address)
-  address: Address;
-
-  // 嵌入审计字段（复用）
-  @Embedded(() => AuditFields)
-  audit: AuditFields;
-}
-```
-
-### 嵌入式实体的前缀
-
-```typescript
-// 默认：列名为嵌入属性名 + 嵌入列名
-// 如：addressStreet, addressCity
-
-// 自定义前缀
-@Embedded(() => Address, { prefix: "addr_" })
-address: Address;
-// 列名：addr_street, addr_city
-
-// 无前缀
-@Embedded(() => Address, { prefix: false })
-address: Address;
-// 列名：street, city
-```
-
----
-
-## 实战：博客系统实体设计
-
-让我们用学到的知识，设计一个完整的博客系统数据模型。
-
-```typescript
-// src/entity/User.ts
+// src/entity/Order.ts
 import {
   Entity,
   PrimaryGeneratedColumn,
@@ -855,52 +348,60 @@ import {
   UpdateDateColumn,
   DeleteDateColumn,
   Index,
-  BeforeInsert,
-  BeforeUpdate,
 } from "typeorm";
-import * as bcrypt from "bcrypt";
 
-export enum UserRole {
-  ADMIN = "ADMIN",
-  EDITOR = "EDITOR",
-  AUTHOR = "AUTHOR",
-  READER = "READER",
+export enum OrderStatus {
+  PENDING = "pending",
+  PROCESSING = "processing",
+  SHIPPED = "shipped",
+  DELIVERED = "delivered",
+  CANCELLED = "cancelled",
 }
 
-@Entity("users")
-@Index(["email"], { unique: true })
-@Index(["username"], { unique: true })
-export class User {
+@Entity("orders")
+@Index(["customerId", "status"])
+@Index(["status", "createdAt"])
+export class Order {
   @PrimaryGeneratedColumn()
   id: number;
 
-  @Column({ length: 100 })
-  name: string;
+  @Column({ length: 50, unique: true })
+  orderNumber: string;
 
-  @Column({ unique: true, length: 50 })
-  username: string;
+  @Column({ name: "customer_id" })
+  customerId: number;
 
-  @Column({ unique: true, length: 255 })
-  email: string;
+  @Column({
+    type: "enum",
+    enum: OrderStatus,
+    default: OrderStatus.PENDING,
+  })
+  status: OrderStatus;
 
-  @Column({ name: "password_hash", select: false })
-  passwordHash: string;
+  @Column({ type: "decimal", precision: 10, scale: 2, default: "0.00" })
+  totalAmount: string;
 
-  @Column({ nullable: true, length: 500 })
-  avatar: string;
+  @Column({ type: "decimal", precision: 10, scale: 2, default: "0.00" })
+  discountAmount: string;
+
+  @Column({ type: "decimal", precision: 10, scale: 2, default: "0.00" })
+  taxAmount: string;
+
+  @Column({ type: "decimal", precision: 10, scale: 2, default: "0.00" })
+  shippingAmount: string;
+
+  @Column({ type: "decimal", precision: 10, scale: 2, nullable: true })
+  paidAmount: string;
+
+  @Column({ type: "jsonb", nullable: true })
+  metadata: {
+    customerNotes?: string;
+    giftWrap?: boolean;
+    specialInstructions?: string[];
+  };
 
   @Column({ type: "text", nullable: true })
-  bio: string;
-
-  @Column({
-    type: "enum",
-    enum: UserRole,
-    default: UserRole.READER,
-  })
-  role: UserRole;
-
-  @Column({ default: true })
-  isActive: boolean;
+  notes: string;
 
   @CreateDateColumn({ name: "created_at" })
   createdAt: Date;
@@ -910,223 +411,136 @@ export class User {
 
   @DeleteDateColumn({ name: "deleted_at" })
   deletedAt: Date;
-
-  // 临时属性
-  private _password: string;
-
-  set password(value: string) {
-    this._password = value;
-  }
-
-  @BeforeInsert()
-  @BeforeUpdate()
-  async hashPassword() {
-    if (this._password) {
-      this.passwordHash = await bcrypt.hash(this._password, 10);
-    }
-  }
-
-  async validatePassword(password: string): Promise<boolean> {
-    return bcrypt.compare(password, this.passwordHash);
-  }
 }
 ```
 
 ```typescript
-// src/entity/Post.ts
+// src/entity/OrderItem.ts
+import {
+  Entity,
+  PrimaryGeneratedColumn,
+  Column,
+  ManyToOne,
+  JoinColumn,
+  Unique,
+} from "typeorm";
+import { Order } from "./Order";
+
+@Entity("order_items")
+@Unique("UQ_order_product", ["orderId", "productId"])
+export class OrderItem {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column({ name: "order_id" })
+  orderId: number;
+
+  @ManyToOne(() => Order)
+  @JoinColumn({ name: "order_id" })
+  order: Order;
+
+  @Column({ name: "product_id" })
+  productId: number;
+
+  @Column({ length: 255 })
+  productName: string;
+
+  @Column({ type: "text", nullable: true })
+  productDescription: string;
+
+  @Column({ type: "decimal", precision: 10, scale: 2 })
+  price: string;
+
+  @Column({ type: "integer" })
+  quantity: number;
+
+  @Column({ type: "decimal", precision: 10, scale: 2 })
+  discount: string;
+}
+```
+
+```typescript
+// src/entity/Payment.ts
 import {
   Entity,
   PrimaryGeneratedColumn,
   Column,
   CreateDateColumn,
-  UpdateDateColumn,
-  DeleteDateColumn,
   Index,
-  ManyToOne,
-  JoinColumn,
 } from "typeorm";
-import { User } from "./User";
 
-export enum PostStatus {
-  DRAFT = "DRAFT",
-  PUBLISHED = "PUBLISHED",
-  ARCHIVED = "ARCHIVED",
+export enum PaymentStatus {
+  PENDING = "pending",
+  COMPLETED = "completed",
+  FAILED = "failed",
+  REFUNDED = "refunded",
 }
 
-@Entity("posts")
-@Index(["slug"], { unique: true })
-@Index(["authorId", "status"]) // 复合索引：按作者查询文章
-@Index(["status", "publishedAt"]) // 复合索引：按状态查询并排序
-export class Post {
+export enum PaymentMethod {
+  CREDIT_CARD = "credit_card",
+  DEBIT_CARD = "debit_card",
+  PAYPAL = "paypal",
+  BANK_TRANSFER = "bank_transfer",
+}
+
+@Entity("payments")
+@Index(["orderId"])
+@Index(["status", "createdAt"])
+export class Payment {
   @PrimaryGeneratedColumn()
   id: number;
 
-  @Column({ length: 255 })
-  title: string;
+  @Column({ name: "order_id" })
+  orderId: number;
 
-  @Column({ unique: true, length: 255 })
-  slug: string;
-
-  @Column({ nullable: true, length: 500 })
-  excerpt: string;
-
-  @Column({ type: "text" })
-  content: string;
-
-  @Column({ nullable: true, name: "cover_image", length: 500 })
-  coverImage: string;
-
-  @Column({ name: "author_id" })
-  authorId: number;
-
-  @ManyToOne(() => User)
-  @JoinColumn({ name: "author_id" })
-  author: User;
+  @Column({ length: 50, unique: true })
+  transactionId: string;
 
   @Column({
     type: "enum",
-    enum: PostStatus,
-    default: PostStatus.DRAFT,
+    enum: PaymentStatus,
+    default: PaymentStatus.PENDING,
   })
-  status: PostStatus;
+  status: PaymentStatus;
 
-  @Column({ default: 0, name: "view_count" })
-  viewCount: number;
+  @Column({
+    type: "enum",
+    enum: PaymentMethod,
+  })
+  method: PaymentMethod;
 
-  @Column({ default: false, name: "is_featured" })
-  isFeatured: boolean;
+  @Column({ type: "decimal", precision: 10, scale: 2 })
+  amount: string;
 
-  @Column({ nullable: true, name: "published_at", type: "timestamptz" })
-  publishedAt: Date;
+  @Column({ type: "jsonb", nullable: true })
+  metadata: {
+    cardLastFour?: string;
+    cardBrand?: string;
+    paypalEmail?: string;
+    bankAccount?: string;
+  };
+
+  @Column({ type: "text", nullable: true })
+  notes: string;
 
   @CreateDateColumn({ name: "created_at" })
   createdAt: Date;
 
-  @UpdateDateColumn({ name: "updated_at" })
-  updatedAt: Date;
-
-  @DeleteDateColumn({ name: "deleted_at" })
-  deletedAt: Date;
+  @Column({ type: "timestamp", nullable: true })
+  completedAt: Date;
 }
 ```
 
----
+这三个实体涵盖了电商订单系统的核心数据模型。Order 存储订单基本信息，OrderItem 存储订单明细，Payment 记录支付信息。它们之间的关系（一个订单有多个明细，一个订单可能有多次支付尝试）会在下一篇文章详细讲解。
 
-## 最佳实践
+## Trade-off
 
-### 1. 实体文件组织
+TypeORM 装饰器的优势是类型安全和开发效率。你在 TypeScript 类中定义数据模型，IDE 能提供完整的类型提示，重构时也很安全。而且实体定义和表结构在同一个地方，不需要同步维护两个文件。
 
-```typescript
-// ✅ 推荐：每个实体一个文件
-// src/entity/User.ts
-// src/entity/Post.ts
-// src/entity/Comment.ts
+但装饰器也有局限性。某些高级数据库特性（如部分索引、表达式索引、触发器）无法通过装饰器定义，只能手写迁移。如果你的项目大量依赖这些特性，可能需要考虑其他方案。
 
-// ✅ 推荐：使用 index.ts 统一导出
-// src/entity/index.ts
-export { User } from "./User";
-export { Post } from "./Post";
-export { Comment } from "./Comment";
-```
+另一个问题是学习曲线。`@Column` 的选项有几十个，每个数据库类型的支持程度也不同。新手容易在 `decimal` 类型的 TypeScript 映射、枚举类型的定义方式这些细节上卡住。
 
-### 2. 命名规范
+`synchronize: true` 在开发阶段很方便，但不要在生产环境使用。它通过比较实体定义和现有表结构来生成 ALTER 语句，但这种方式不够安全，可能删除重要数据。生产环境的数据库变更必须通过迁移来管理，这是下一篇文章的主题。
 
-```typescript
-// ✅ 推荐
-@Entity("users") // 表名：复数、snake_case
-export class User {
-  // 类名：单数、PascalCase
-  @Column({ name: "first_name" }) // 列名：snake_case
-  firstName: string; // 属性名：camelCase
-}
-
-// ❌ 不推荐
-@Entity("User") // 表名不应该用 PascalCase
-export class user {
-  // 类名不应该用小写
-  @Column({ name: "FirstName" }) // 列名不应该用 PascalCase
-  FirstName: string;
-}
-```
-
-### 3. 敏感字段保护
-
-```typescript
-@Entity("users")
-export class User {
-  // 密码不返回给前端
-  @Column({ select: false })
-  passwordHash: string;
-
-  // 使用 DTO 控制返回数据
-  // 不要直接返回实体对象
-}
-```
-
-### 4. 枚举使用
-
-```typescript
-// ✅ 推荐：使用 TypeScript 枚举
-export enum PostStatus {
-  DRAFT = "DRAFT",
-  PUBLISHED = "PUBLISHED",
-  ARCHIVED = "ARCHIVED",
-}
-
-@Column({ type: "enum", enum: PostStatus, default: PostStatus.DRAFT })
-status: PostStatus;
-
-// ❌ 不推荐：使用联合类型字符串
-@Column({ type: "enum", enum: ["DRAFT", "PUBLISHED", "ARCHIVED"] })
-status: string;
-```
-
----
-
-## 总结
-
-### 核心要点
-
-1. **装饰器体系**
-   - `@Entity`：定义表
-   - `@Column`：定义列
-   - `@PrimaryGeneratedColumn`：定义主键
-   - `@CreateDateColumn` / `@UpdateDateColumn`：时间戳
-
-2. **数据类型映射**
-   - TypeScript 类型自动映射到 SQL 类型
-   - 可以通过 `type` 选项显式指定
-   - 支持数组、JSON、枚举等 PostgreSQL 特有类型
-
-3. **主键策略**
-   - 自增：`@PrimaryGeneratedColumn()`
-   - UUID：`@PrimaryGeneratedColumn("uuid")`
-   - 复合主键：多个 `@PrimaryColumn()`
-
-4. **高级特性**
-   - 软删除：`@DeleteDateColumn`
-   - 乐观锁：`@VersionColumn`
-   - 实体监听器：`@BeforeInsert`、`@AfterLoad` 等
-   - 嵌入式实体：`@Embedded`
-
-### 下一步
-
-在下一篇文章中，我们将学习：
-
-- **关系映射**
-- 一对一关系（用户 ↔ 个人资料）
-- 一对多关系（文章 ↔ 评论）
-- 多对多关系（文章 ↔ 标签）
-- 级联操作和加载策略
-
-敬请期待！
-
----
-
-## 参考资源
-
-- [TypeORM 实体文档](https://typeorm.io/entities)
-- [TypeORM 装饰器参考](https://typeorm.io/decorator-reference)
-- [PostgreSQL 数据类型](https://www.postgresql.org/docs/current/datatype.html)
-
----
+现在我们已经掌握了单表的定义方式，但实际的业务模型很少是单表的。下一篇文章会讲解关系映射：如何用 `@OneToOne`、`@ManyToOne`、`@OneToMany`、`@ManyToMany` 连接多个实体，以及如何控制级联操作和加载策略。我们会为一个社交媒体系统设计 User、Post、Comment、Tag 四个实体的关系。

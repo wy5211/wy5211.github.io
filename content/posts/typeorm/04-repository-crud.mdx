@@ -9,736 +9,599 @@ series: "TypeORM 渐进式学习计划"
 seriesOrder: 4
 ---
 
-## 前言
+在上一篇文章中，我们学习了如何用关系装饰器把实体关联起来。现在你的数据模型已经建立好了，接下来要解决的问题就是：怎么对这些关联数据进行增删改查？
 
-Repository 是 TypeORM Data Mapper 模式的核心，它充当实体与数据库之间的桥梁。通过 Repository API，我们可以用类型安全的方式完成所有 CRUD 操作。
+Repository 是 TypeORM 中最常用的数据访问接口，它提供的 find、save、update、remove 等方法可以覆盖大部分 CRUD 场景。但当你遇到"查询进行中的任务，按优先级排序，带标签信息，分页返回"这种需求时，就需要深入了解 FindOptions 和 FindOperator 了。
 
-**本篇你将学到**：
+这篇文章会用我们正在构建的 SaaS 项目管理平台作为案例，实现 Task 的完整 CRUD 功能。你会学到如何灵活组合 find 选项、如何处理分页、以及 save/update/remove 之间的区别。
 
-- Repository 的基本和高级操作
-- `FindOptions` 详解（where、order、relations、select）
-- `FindOperator` 条件构建（Like、Between、In、IsNull 等）
-- 通用分页封装
-- 批量操作技巧
+## 从关系模型到 CRUD 操作
 
----
+在开始之前，让我们先回顾一下上一篇中定义的实体关系。我们的项目管理平台有这些核心实体：
 
-## Repository 基础
+- Workspace（工作空间）：包含多个 Project
+- Project（项目）：包含多个 Task
+- Task（任务）：指派给 User，关联多个 Tag
+- User（用户）：可以是被指派人
+- Tag（标签）：用于标记 Task
 
-### 获取 Repository
+这些关系通过 @ManyToOne、@OneToMany、@ManyToMany 装饰器已经定义好了。现在我们需要通过 Repository 来操作这些数据。
+
+## Repository 的获取方式
+
+在实际项目中，有三种常见方式获取 Repository：
 
 ```typescript
 import { DataSource, Repository } from "typeorm";
+import { Task } from "./entity/Task";
 
-// 方式 1：通过 DataSource 获取
-const userRepo = dataSource.getRepository(User);
+// 方式 1：通过 DataSource 获取（独立应用）
+const dataSource = new DataSource({
+  /* ... */
+});
+const taskRepo = dataSource.getRepository(Task);
 
-// 方式 2：通过依赖注入（NestJS）
+// 方式 2：在 NestJS 中通过依赖注入
 @Injectable()
-export class UserService {
+export class TaskService {
   constructor(
-    @InjectRepository(User)
-    private userRepo: Repository<User>
+    @InjectRepository(Task)
+    private taskRepo: Repository<Task>
   ) {}
-}
-```
 
-### 自定义 Repository
-
-```typescript
-import { Repository, DataSource } from "typeorm";
-import { EntityRepository } from "typeorm";
-
-// 方式 1：继承 Repository（推荐）
-@EntityRepository(User)
-export class UserRepository extends Repository<User> {
-  // 自定义方法
-  async findByName(name: string): Promise<User | null> {
-    return this.findOne({ where: { name } });
-  }
-
-  async findActiveUsers(): Promise<User[]> {
-    return this.find({ where: { isActive: true } });
+  async findTasks() {
+    return this.taskRepo.find();
   }
 }
 
-// 方式 2：使用 extends Repository
-export class UserRepository extends Repository<User> {
-  async findByName(name: string): Promise<User | null> {
-    return this.createQueryBuilder("user")
-      .where("user.name = :name", { name })
-      .getOne();
+// 方式 3：自定义 Repository（扩展功能）
+@EntityRepository(Task)
+export class TaskRepository extends Repository<Task> {
+  async findHighPriorityTasks() {
+    return this.find({ where: { priority: "URGENT" } });
   }
 }
 ```
 
----
+在 NestJS 项目中，方式 2 是最常用的。如果你的业务逻辑比较复杂，可以自定义 Repository 来封装特定领域的查询方法。
 
-## Create 创建
+## 创建任务：save vs insert
 
-### 单条创建
+创建任务时，我们通常会同时创建任务与标签的关联关系。这里就涉及到 save 和 insert 的区别。
 
 ```typescript
-const userRepo = dataSource.getRepository(User);
+import { Task, TaskStatus } from "./entity/Task";
+import { Tag } from "./entity/Tag";
 
-// 方式 1：create + save（两步操作）
-const user = userRepo.create({
-  name: "张三",
-  email: "zhangsan@example.com",
-  password: "hashed_password",
-});
-await userRepo.save(user);
+async function createTask(data: {
+  title: string;
+  description: string;
+  projectId: number;
+  assigneeId: number;
+  tagIds: number[];
+}) {
+  // 方式 1：使用 save（推荐）
+  const task = taskRepo.create({
+    title: data.title,
+    description: data.description,
+    project: { id: data.projectId },
+    assignee: { id: data.assigneeId },
+    status: TaskStatus.TODO,
+    tags: data.tagIds.map((id) => ({ id })), // 创建标签关联
+  });
 
-// 方式 2：直接 save（一步操作）
-const user = await userRepo.save({
-  name: "张三",
-  email: "zhangsan@example.com",
-  password: "hashed_password",
-});
-// 返回完整的实体对象（包含自动生成的 id、createdAt 等）
+  const savedTask = await taskRepo.save(task);
+  // save 返回完整的实体对象，包含自动生成的 id、createdAt 等字段
+  // 并且会级联保存 tags 关联关系
 
-// 方式 3：insert（只返回插入结果，不返回完整实体）
-const result = await userRepo.insert({
-  name: "张三",
-  email: "zhangsan@example.com",
-  password: "hashed_password",
+  return savedTask;
+}
+
+// 方式 2：使用 insert（更快，但不支持级联）
+const result = await taskRepo.insert({
+  title: data.title,
+  description: data.description,
+  projectId: data.projectId,
+  assigneeId: data.assigneeId,
 });
 // result.identifiers: [{ id: 1 }]
-// result.raw: INSERT 返回的原始数据
+// insert 只返回插入结果，不返回完整实体
+// 而且不会处理 tags 关联关系
 ```
 
-### 批量创建
+save 和 insert 的核心区别在于：save 会先检查实体是否已存在（通过 id 判断），如果存在就更新，不存在就插入；而 insert 只能插入新记录。更重要的是，save 支持级联操作，可以自动处理关联实体的保存。
+
+对于需要关联其他实体的场景（比如任务关联标签），应该使用 save。
+
+## 查询任务：FindOptions 详解
+
+Repository 的 find 方法接受一个 FindOptions 对象，这个对象比看起来要强大得多。
+
+### 基础查询
 
 ```typescript
-// 方式 1：save（逐条插入，支持级联）
-const users = await userRepo.save([
-  { name: "张三", email: "zhangsan@example.com", password: "hash1" },
-  { name: "李四", email: "lisi@example.com", password: "hash2" },
-  { name: "王五", email: "wangwu@example.com", password: "hash3" },
-]);
-// 返回完整的实体数组
-
-// 方式 2：insert（单条 INSERT 语句，性能更好）
-await userRepo.insert([
-  { name: "张三", email: "zhangsan@example.com", password: "hash1" },
-  { name: "李四", email: "lisi@example.com", password: "hash2" },
-]);
-// 一条 INSERT INTO ... VALUES (...), (...)
-
-// 方式 3：批量 save + 分块（大数据量）
-const batchSize = 100;
-for (let i = 0; i < largeArray.length; i += batchSize) {
-  const batch = largeArray.slice(i, i + batchSize);
-  await userRepo.save(batch);
-}
-```
-
-### save vs insert 对比
-
-| 特性       | `save()`        | `insert()`   |
-| ---------- | --------------- | ------------ |
-| 返回值     | 完整实体对象    | InsertResult |
-| 级联操作   | ✅ 支持         | ❌ 不支持    |
-| 更新已存在 | ✅ 有 id 则更新 | ❌ 报错      |
-| 性能       | 较慢（逐条）    | 较快（批量） |
-| 生命周期   | ✅ 触发监听器   | ❌ 不触发    |
-
----
-
-## Read 查询
-
-### 基本查询
-
-```typescript
-// 查询所有
-const allUsers = await userRepo.find();
+// 查询所有任务
+const allTasks = await taskRepo.find();
 
 // 条件查询
-const activeUsers = await userRepo.find({
-  where: { isActive: true },
+const todoTasks = await taskRepo.find({
+  where: { status: TaskStatus.TODO },
 });
 
 // 查询单条
-const user = await userRepo.findOne({
+const task = await taskRepo.findOne({
   where: { id: 1 },
 });
 
-// 通过 ID 查询
-const user = await userRepo.findOneBy({ id: 1 });
+// 通过 ID 查询（更简洁）
+const task = await taskRepo.findOneBy({ id: 1 });
 
 // 查询或抛出异常
-const user = await userRepo.findOneOrFail({
+const task = await taskRepo.findOneOrFail({
   where: { id: 1 },
 });
 // 找不到时抛出 EntityNotFoundError
+```
 
-// 查询数量
-const count = await userRepo.count({
-  where: { isActive: true },
+### 加载关联数据
+
+```typescript
+// 查询任务时加载指派人和标签
+const taskWithRelations = await taskRepo.findOne({
+  where: { id: 1 },
+  relations: {
+    assignee: true,
+    tags: true,
+    project: true,
+  },
 });
 
-// 查询数据和总数（分页常用）
-const [users, total] = await userRepo.findAndCount({
-  where: { isActive: true },
-  skip: 0,
-  take: 10,
+// 嵌套加载：查询任务时加载项目的所属工作空间
+const taskWithNestedRelations = await taskRepo.findOne({
+  where: { id: 1 },
+  relations: {
+    project: {
+      workspace: true,
+    },
+    assignee: true,
+  },
 });
 ```
 
-### FindOptions 详解
+### 选择特定字段
 
 ```typescript
-const users = await userRepo.find({
-  // 1. where：查询条件
-  where: {
-    isActive: true,
-    role: "AUTHOR",
-  },
-
-  // 2. relations：加载关联数据
-  relations: {
-    posts: true,
-    profile: true,
-  },
-
-  // 3. select：选择字段
+// 只查询需要的字段
+const tasks = await taskRepo.find({
   select: {
     id: true,
-    name: true,
-    email: true,
-    posts: {
+    title: true,
+    status: true,
+    assignee: {
       id: true,
-      title: true,
+      name: true,
+    },
+    tags: {
+      id: true,
+      name: true,
     },
   },
-
-  // 4. order：排序
-  order: {
-    createdAt: "DESC",
-    name: "ASC",
-  },
-
-  // 5. skip + take：分页
-  skip: 0, // 跳过多少条（offset）
-  take: 10, // 取多少条（limit）
-
-  // 6. withDeleted：包含软删除
-  withDeleted: false,
-
-  // 7. cache：查询缓存
-  cache: true, // 或 cache: { id: "users_list", milliseconds: 60000 }
-
-  // 8. lock：悲观锁
-  lock: { mode: "optimistic", version: 1 },
-
-  // 9. loadEagerRelations：覆盖 eager 设置
-  loadEagerRelations: false,
-
-  // 10. join：LEFT JOIN / INNER JOIN
-  join: {
-    alias: "user",
-    leftJoinAndSelect: {
-      posts: "user.posts",
-    },
+  relations: {
+    assignee: true,
+    tags: true,
   },
 });
 ```
 
-### 多条件查询（OR）
+### 排序和分页
 
 ```typescript
-import { FindOperator, Or } from "typeorm";
-
-// 方式 1：数组条件（OR 关系）
-const users = await userRepo.find({
-  where: [{ name: "张三" }, { name: "李四" }, { role: "ADMIN" }],
-});
-// WHERE name = '张三' OR name = '李四' OR role = 'ADMIN'
-
-// 方式 2：使用 FindOperator
-const users = await userRepo.find({
+const [tasks, total] = await taskRepo.findAndCount({
   where: {
-    isActive: true,
-    role: In(["ADMIN", "EDITOR"]),
+    status: TaskStatus.IN_PROGRESS,
   },
+  relations: {
+    assignee: true,
+    tags: true,
+  },
+  order: {
+    priority: "DESC", // 按优先级降序
+    createdAt: "ASC", // 同级按创建时间升序
+  },
+  skip: 0, // 跳过多少条（offset）
+  take: 10, // 取多少条（limit）
 });
-// WHERE is_active = true AND role IN ('ADMIN', 'EDITOR')
+
+// 返回值
+// {
+//   tasks: [...], // 10 条任务
+//   total: 45 // 总共 45 条记录
+// }
 ```
 
----
+findAndCount 是分页查询的最佳实践，它同时返回数据和总数，你只需要计算 totalPages = Math.ceil(total / take)。
 
-## FindOperator 条件构建器
+## 复杂条件：FindOperator
 
-FindOperator 是 TypeORM 提供的条件构建工具，支持丰富的查询条件。
+简单查询用 where 对象就够了，但复杂条件需要 FindOperator。TypeORM 提供了丰富的操作符来构建查询条件。
 
 ### 常用操作符
 
 ```typescript
 import {
-  Equal,
-  Not,
   Like,
   ILike,
   Between,
   In,
   IsNull,
+  Not,
   LessThan,
-  LessThanOrEqual,
   MoreThan,
-  MoreThanOrEqual,
-  Raw,
-  Any,
 } from "typeorm";
 
-// Equal：精确匹配
-await userRepo.find({
-  where: { name: Equal("张三") },
-});
-// WHERE name = '张三'
-
-// Not：取反
-await userRepo.find({
-  where: { role: Not("READER") },
-});
-// WHERE role != 'READER'
-
 // Like：模糊匹配（区分大小写）
-await userRepo.find({
-  where: { name: Like("%张%") },
+const tasks = await taskRepo.find({
+  where: {
+    title: Like("%导航栏%"), // 标题包含"导航栏"
+  },
 });
-// WHERE name LIKE '%张%'
 
 // ILike：模糊匹配（不区分大小写）
-await userRepo.find({
-  where: { email: ILike("%@GMAIL.COM") },
+const tasks = await taskRepo.find({
+  where: {
+    title: ILike("%BUG%"), // 标题包含"bug"（不区分大小写）
+  },
 });
-// WHERE email ILIKE '%@GMAIL.COM'
 
 // Between：范围查询
-await userRepo.find({
+const tasks = await taskRepo.find({
   where: {
     createdAt: Between(new Date("2026-01-01"), new Date("2026-12-31")),
   },
 });
-// WHERE created_at BETWEEN '2026-01-01' AND '2026-12-31'
 
 // In：包含于列表
-await userRepo.find({
-  where: { role: In(["ADMIN", "EDITOR", "AUTHOR"]) },
+const tasks = await taskRepo.find({
+  where: {
+    status: In([TaskStatus.TODO, TaskStatus.IN_PROGRESS]),
+  },
 });
-// WHERE role IN ('ADMIN', 'EDITOR', 'AUTHOR')
 
 // IsNull：为空
-await userRepo.find({
-  where: { deletedAt: IsNull() },
+const tasks = await taskRepo.find({
+  where: {
+    assignee: IsNull(), // 未分配的任务
+  },
 });
-// WHERE deleted_at IS NULL
+
+// Not：取反
+const tasks = await taskRepo.find({
+  where: {
+    status: Not(TaskStatus.COMPLETED),
+  },
+});
 
 // LessThan：小于
-await userRepo.find({
-  where: { age: LessThan(18) },
-});
-// WHERE age < 18
-
-// LessThanOrEqual：小于等于
-await userRepo.find({
-  where: { stock: LessThanOrEqual(0) },
-});
-// WHERE stock <= 0
-
-// MoreThan：大于
-await userRepo.find({
-  where: { viewCount: MoreThan(1000) },
-});
-// WHERE view_count > 1000
-
-// MoreThanOrEqual：大于等于
-await userRepo.find({
-  where: { score: MoreThanOrEqual(60) },
-});
-// WHERE score >= 60
-
-// Any：匹配数组中的任意值（PostgreSQL）
-await userRepo.find({
-  where: { tags: Any(["TypeScript", "Node.js"]) },
-});
-// WHERE tags && ARRAY['TypeScript', 'Node.js']
-
-// Raw：原始 SQL 条件
-await userRepo.find({
+const tasks = await taskRepo.find({
   where: {
-    name: Raw((alias) => `LENGTH(${alias}) > 3`),
+    priority: LessThan(3), // 优先级小于 3
   },
 });
-// WHERE LENGTH(name) > 3
-
-// Raw 带参数
-await userRepo.find({
-  where: {
-    createdAt: Raw((alias) => `${alias} > NOW() - INTERVAL '7 days'`),
-  },
-});
-// WHERE created_at > NOW() - INTERVAL '7 days'
 ```
 
 ### 组合条件
 
 ```typescript
-// AND：多个条件自动 AND
-await userRepo.find({
+// AND：多个条件同时满足
+const tasks = await taskRepo.find({
   where: {
-    isActive: true,
-    role: In(["ADMIN", "EDITOR"]),
-    createdAt: MoreThan(new Date("2026-01-01")),
+    status: TaskStatus.IN_PROGRESS,
+    assignee: { id: 1 },
+    priority: MoreThan(2),
   },
 });
-// WHERE is_active = true
-//   AND role IN ('ADMIN', 'EDITOR')
-//   AND created_at > '2026-01-01'
+// WHERE status = 'IN_PROGRESS'
+//   AND assignee_id = 1
+//   AND priority > 2
 
-// OR：使用数组
-await userRepo.find({
-  where: [{ role: "ADMIN" }, { role: "EDITOR", isActive: true }],
+// OR：满足任一条件（使用数组）
+const tasks = await taskRepo.find({
+  where: [
+    { status: TaskStatus.TODO },
+    { priority: 3 }, // 优先级为 3
+    { assignee: IsNull() }, // 未分配
+  ],
 });
-// WHERE role = 'ADMIN'
-//    OR (role = 'EDITOR' AND is_active = true)
-```
+// WHERE status = 'TODO'
+//    OR priority = 3
+//    OR assignee_id IS NULL
 
----
+// 复杂组合：使用 Brackets
+import { Brackets } from "typeorm";
 
-## Update 更新
-
-### 基本更新
-
-```typescript
-// 方式 1：查询后修改 + save
-const user = await userRepo.findOneBy({ id: 1 });
-if (user) {
-  user.name = "新名字";
-  user.bio = "新的个人简介";
-  await userRepo.save(user);
-  // 触发 @BeforeUpdate 监听器
-}
-
-// 方式 2：update（不查询，直接更新）
-await userRepo.update(1, {
-  name: "新名字",
-  bio: "新的个人简介",
+const tasks = await taskRepo.find({
+  where: {
+    project: { id: 1 },
+    ...new Brackets((qb) => {
+      qb.where({ status: TaskStatus.TODO }).orWhere({ assignee: IsNull() });
+    }),
+  },
 });
-// 不触发 @BeforeUpdate 监听器
-
-// 方式 3：条件更新
-await userRepo.update({ isActive: false }, { isActive: true });
-// UPDATE users SET is_active = true WHERE is_active = false
+// WHERE project_id = 1
+//   AND (status = 'TODO' OR assignee_id IS NULL)
 ```
 
-### save vs update 对比
-
-| 特性       | `save()`         | `update()`   |
-| ---------- | ---------------- | ------------ |
-| 需要先查询 | ✅ 通常需要      | ❌ 不需要    |
-| 触发监听器 | ✅ @BeforeUpdate | ❌ 不触发    |
-| 级联操作   | ✅ 支持          | ❌ 不支持    |
-| 返回值     | 完整实体         | UpdateResult |
-| 性能       | 较慢             | 较快         |
-
-### 批量更新
+### 在关联表上查询
 
 ```typescript
-// 更新所有匹配的记录
-await userRepo.update({ role: "READER" }, { isActive: true });
-
-// 使用 QueryBuilder 进行复杂更新
-await userRepo
-  .createQueryBuilder()
-  .update(User)
-  .set({ viewCount: () => "view_count + 1" })
-  .where("id = :id", { id: 1 })
-  .execute();
-// UPDATE users SET view_count = view_count + 1 WHERE id = 1
-```
-
----
-
-## Delete 删除
-
-### 基本删除
-
-```typescript
-// 方式 1：通过实体删除
-const user = await userRepo.findOneBy({ id: 1 });
-await userRepo.remove(user);
-// 触发 @BeforeRemove 和 @AfterRemove
-
-// 方式 2：通过 ID 删除
-await userRepo.delete(1);
-
-// 方式 3：条件删除
-await userRepo.delete({ isActive: false });
-
-// 方式 4：多个 ID
-await userRepo.delete([1, 2, 3]);
-```
-
-### 软删除
-
-```typescript
-// 软删除
-await userRepo.softDelete(1);
-// UPDATE users SET deleted_at = NOW() WHERE id = 1
-
-// 通过实体软删除
-const user = await userRepo.findOneBy({ id: 1 });
-await userRepo.softRemove(user);
-
-// 恢复
-await userRepo.restore(1);
-// UPDATE users SET deleted_at = NULL WHERE id = 1
-```
-
----
-
-## 通用分页封装
-
-分页是几乎所有应用都需要的通用功能，让我们封装一个可复用的分页工具。
-
-### 定义分页类型
-
-```typescript
-// src/common/pagination.ts
-import { FindManyOptions, FindOperator, Repository } from "typeorm";
-
-// 分页请求参数
-export interface PaginationParams {
-  page: number; // 当前页码（从 1 开始）
-  limit: number; // 每页条数
-  orderBy?: string; // 排序字段
-  orderDirection?: "ASC" | "DESC"; // 排序方向
-}
-
-// 分页响应结果
-export interface PaginationResult<T> {
-  data: T[]; // 数据列表
-  total: number; // 总记录数
-  page: number; // 当前页码
-  limit: number; // 每页条数
-  totalPages: number; // 总页数
-  hasNextPage: boolean; // 是否有下一页
-  hasPrevPage: boolean; // 是否有上一页
-}
-```
-
-### 分页方法封装
-
-```typescript
-// src/common/pagination.ts
-export async function paginate<T>(
-  repository: Repository<T>,
-  params: PaginationParams,
-  findOptions?: Omit<FindManyOptions<T>, "skip" | "take" | "order">
-): Promise<PaginationResult<T>> {
-  const {
-    page = 1,
-    limit = 10,
-    orderBy = "createdAt",
-    orderDirection = "DESC",
-  } = params;
-
-  // 计算跳过条数
-  const skip = (page - 1) * limit;
-
-  // 执行查询
-  const [data, total] = await repository.findAndCount({
-    ...findOptions,
-    skip,
-    take: limit,
-    order: {
-      [orderBy]: orderDirection,
-    } as any,
-  });
-
-  // 计算分页信息
-  const totalPages = Math.ceil(total / limit);
-
-  return {
-    data,
-    total,
-    page,
-    limit,
-    totalPages,
-    hasNextPage: page < totalPages,
-    hasPrevPage: page > 1,
-  };
-}
-```
-
-### 使用分页
-
-```typescript
-// 在 Service 中使用
-async function getPosts(params: PaginationParams) {
-  return paginate(postRepo, params, {
-    where: {
-      status: "PUBLISHED",
-    },
-    relations: {
-      author: true,
-      tags: true,
-    },
-    select: {
-      id: true,
-      title: true,
-      excerpt: true,
-      publishedAt: true,
-      author: {
-        id: true,
-        name: true,
-      },
-    },
-  });
-}
-
-// 调用
-const result = await getPosts({
-  page: 1,
-  limit: 10,
-  orderBy: "publishedAt",
-  orderDirection: "DESC",
+// 查询指派给特定用户的任务
+const tasks = await taskRepo.find({
+  where: {
+    assignee: { id: 1 },
+  },
+  relations: {
+    assignee: true,
+  },
 });
 
-console.log(result);
-// {
-//   data: [post1, post2, ...],
-//   total: 100,
-//   page: 1,
-//   limit: 10,
-//   totalPages: 10,
-//   hasNextPage: true,
-//   hasPrevPage: false
-// }
+// 查询有特定标签的任务
+const tasks = await taskRepo.find({
+  where: {
+    tags: {
+      id: In([1, 2, 3]), // 有标签 1 或 2 或 3
+    },
+  },
+  relations: {
+    tags: true,
+  },
+});
+
+// 查询特定项目下的任务
+const tasks = await taskRepo.find({
+  where: {
+    project: {
+      workspace: { id: 1 }, // 工作空间 1 下的任务
+    },
+  },
+  relations: {
+    project: true,
+  },
+});
 ```
 
-### 带搜索的分页
+## 更新任务：save vs update
+
+更新操作也有两种方式：save 和 update。它们的区别和创建时类似。
 
 ```typescript
-// 搜索用户
-async function searchUsers(params: PaginationParams, keyword: string) {
-  return paginate(userRepo, params, {
-    where: [
-      { name: ILike(`%${keyword}%`), isActive: true },
-      { email: ILike(`%${keyword}%`), isActive: true },
-    ],
-    select: {
-      id: true,
-      name: true,
-      email: true,
-      avatar: true,
-    },
-  });
+// 方式 1：查询后修改 + save（推荐用于复杂更新）
+const task = await taskRepo.findOneBy({ id: 1 });
+if (task) {
+  task.status = TaskStatus.COMPLETED;
+  task.completedAt = new Date();
+  await taskRepo.save(task);
+  // 会触发 @BeforeUpdate 和 @AfterUpdate 监听器
+}
+
+// 方式 2：直接 update（推荐用于简单更新）
+await taskRepo.update(1, {
+  status: TaskStatus.COMPLETED,
+  completedAt: new Date(),
+});
+// 不触发监听器，但性能更好
+
+// 方式 3：条件更新（批量）
+await taskRepo.update(
+  { status: TaskStatus.TODO }, // where 条件
+  { priority: 1 } // 更新的值
+);
+// UPDATE tasks SET priority = 1 WHERE status = 'TODO'
+```
+
+什么时候用哪个？如果更新逻辑复杂（比如更新多个字段、需要触发监听器、有业务逻辑校验），用 save。如果只是简单更新几个字段，用 update 更快。
+
+## 删除任务：remove vs delete vs softDelete
+
+删除是三种操作，对应不同的场景。
+
+```typescript
+// 方式 1：remove（通过实体删除）
+const task = await taskRepo.findOneBy({ id: 1 });
+await taskRepo.remove(task);
+// 会触发 @BeforeRemove 和 @AfterRemove 监听器
+
+// 方式 2：delete（直接删除）
+await taskRepo.delete(1);
+await taskRepo.delete([1, 2, 3]); // 批量删除
+await taskRepo.delete({ status: TaskStatus.CANCELLED }); // 条件删除
+// 不触发监听器
+
+// 方式 3：softDelete（软删除）
+await taskRepo.softDelete(1);
+// UPDATE tasks SET deleted_at = NOW() WHERE id = 1
+// 数据不会真正删除，只是标记为已删除
+
+// 恢复软删除
+await taskRepo.restore(1);
+// UPDATE tasks SET deleted_at = NULL WHERE id = 1
+```
+
+软删除需要在实体中定义 @DeleteDateColumn：
+
+```typescript
+@Entity("tasks")
+export class Task {
+  // ...
+
+  @DeleteDateColumn({ name: "deleted_at" })
+  deletedAt: Date;
 }
 ```
 
----
-
-## 实战：文章管理 Service
+使用软删除后，普通的 find 查询会自动过滤掉已删除的记录。如果要包含已删除的记录，使用 withDeleted: true。
 
 ```typescript
-// src/services/PostService.ts
-import { Repository, Like, In, Between } from "typeorm";
-import { Post, PostStatus } from "../entity/Post";
+// 查询时包含已删除的记录
+const tasks = await taskRepo.find({
+  where: { id: 1 },
+  withDeleted: true,
+});
+```
 
-export class PostService {
-  constructor(private postRepo: Repository<Post>) {}
+## 实战：任务管理 Service
 
-  // 创建文章
-  async create(data: {
-    title: string;
-    content: string;
-    authorId: number;
-    tagIds?: number[];
-  }) {
-    const post = this.postRepo.create({
-      title: data.title,
-      content: data.content,
-      author: { id: data.authorId },
-      status: PostStatus.DRAFT,
-      tags: data.tagIds?.map((id) => ({ id })),
+让我们把上面的知识点整合起来，实现一个完整的任务管理 Service。
+
+```typescript
+import { Injectable } from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { Repository, Like, In, Brackets } from "typeorm";
+import { Task, TaskStatus, TaskPriority } from "./entity/Task";
+import { User } from "./entity/User";
+import { Tag } from "./entity/Tag";
+
+interface CreateTaskDto {
+  title: string;
+  description: string;
+  projectId: number;
+  assigneeId?: number;
+  tagIds?: number[];
+  priority?: TaskPriority;
+}
+
+interface TaskQueryDto {
+  page: number;
+  limit: number;
+  status?: TaskStatus;
+  assigneeId?: number;
+  projectId?: number;
+  tagId?: number;
+  keyword?: string;
+}
+
+@Injectable()
+export class TaskService {
+  constructor(
+    @InjectRepository(Task)
+    private taskRepo: Repository<Task>
+  ) {}
+
+  async createTask(dto: CreateTaskDto) {
+    const task = this.taskRepo.create({
+      title: dto.title,
+      description: dto.description,
+      project: { id: dto.projectId },
+      assignee: dto.assigneeId ? { id: dto.assigneeId } : null,
+      tags: dto.tagIds?.map((id) => ({ id })) || [],
+      priority: dto.priority || TaskPriority.MEDIUM,
+      status: TaskStatus.TODO,
     });
-    return this.postRepo.save(post);
+
+    return this.taskRepo.save(task);
   }
 
-  // 更新文章
-  async update(
-    id: number,
-    data: Partial<Pick<Post, "title" | "content" | "status">>
-  ) {
-    const post = await this.postRepo.findOneBy({ id });
-    if (!post) throw new Error("文章不存在");
-
-    Object.assign(post, data);
-
-    // 如果发布，设置发布时间
-    if (data.status === PostStatus.PUBLISHED && !post.publishedAt) {
-      post.publishedAt = new Date();
-    }
-
-    return this.postRepo.save(post);
-  }
-
-  // 获取文章详情
-  async getById(id: number) {
-    return this.postRepo.findOne({
+  async updateTask(id: number, dto: Partial<CreateTaskDto>) {
+    const task = await this.taskRepo.findOne({
       where: { id },
       relations: {
-        author: true,
+        assignee: true,
         tags: true,
-        comments: {
-          author: true,
-        },
+      },
+    });
+
+    if (!task) {
+      throw new Error("任务不存在");
+    }
+
+    // 更新基本信息
+    if (dto.title) task.title = dto.title;
+    if (dto.description) task.description = dto.description;
+    if (dto.priority) task.priority = dto.priority;
+
+    // 更新指派人
+    if (dto.assigneeId !== undefined) {
+      task.assignee = dto.assigneeId ? ({ id: dto.assigneeId } as User) : null;
+    }
+
+    // 更新标签
+    if (dto.tagIds) {
+      task.tags = dto.tagIds.map((id) => ({ id })) as Tag[];
+    }
+
+    // 如果状态变为完成，设置完成时间
+    if (dto.status === TaskStatus.COMPLETED && !task.completedAt) {
+      task.status = TaskStatus.COMPLETED;
+      task.completedAt = new Date();
+    }
+
+    return this.taskRepo.save(task);
+  }
+
+  async getTask(id: number) {
+    return this.taskRepo.findOne({
+      where: { id },
+      relations: {
+        project: true,
+        assignee: true,
+        tags: true,
       },
     });
   }
 
-  // 获取文章列表（分页）
-  async list(params: {
-    page: number;
-    limit: number;
-    status?: PostStatus;
-    authorId?: number;
-    tagId?: number;
-  }) {
-    const { page, limit, status, authorId, tagId } = params;
+  async queryTasks(dto: TaskQueryDto) {
+    const { page, limit, status, assigneeId, projectId, tagId, keyword } = dto;
 
-    const qb = this.postRepo
-      .createQueryBuilder("post")
-      .leftJoinAndSelect("post.author", "author")
-      .leftJoinAndSelect("post.tags", "tag");
+    const queryBuilder = this.taskRepo
+      .createQueryBuilder("task")
+      .leftJoinAndSelect("task.assignee", "assignee")
+      .leftJoinAndSelect("task.tags", "tag")
+      .leftJoinAndSelect("task.project", "project");
 
+    // 状态筛选
     if (status) {
-      qb.andWhere("post.status = :status", { status });
+      queryBuilder.andWhere("task.status = :status", { status });
     }
 
-    if (authorId) {
-      qb.andWhere("post.authorId = :authorId", { authorId });
+    // 指派人筛选
+    if (assigneeId) {
+      queryBuilder.andWhere("task.assigneeId = :assigneeId", { assigneeId });
     }
 
+    // 项目筛选
+    if (projectId) {
+      queryBuilder.andWhere("task.projectId = :projectId", { projectId });
+    }
+
+    // 标签筛选
     if (tagId) {
-      qb.innerJoin(
-        "post_tags_post",
-        "pt",
-        "pt.postId = post.id AND pt.tagId = :tagId",
-        { tagId }
+      queryBuilder.andWhere("tag.id = :tagId", { tagId });
+    }
+
+    // 关键字搜索
+    if (keyword) {
+      queryBuilder.andWhere(
+        new Brackets((qb) => {
+          qb.where("task.title ILIKE :keyword", {
+            keyword: `%${keyword}%`,
+          }).orWhere("task.description ILIKE :keyword", {
+            keyword: `%${keyword}%`,
+          });
+        })
       );
     }
 
-    qb.orderBy("post.createdAt", "DESC")
-      .skip((page - 1) * limit)
-      .take(limit);
+    // 排序
+    queryBuilder
+      .orderBy("task.priority", "DESC")
+      .addOrderBy("task.createdAt", "DESC");
 
-    const [data, total] = await qb.getManyAndCount();
+    // 分页
+    queryBuilder.skip((page - 1) * limit).take(limit);
+
+    const [tasks, total] = await queryBuilder.getManyAndCount();
 
     return {
-      data,
+      data: tasks,
       total,
       page,
       limit,
@@ -746,129 +609,158 @@ export class PostService {
     };
   }
 
-  // 增加浏览量
-  async incrementViewCount(id: number) {
-    await this.postRepo.increment({ id }, "viewCount", 1);
+  async deleteTask(id: number) {
+    return this.taskRepo.softDelete(id);
   }
 
-  // 删除文章
-  async delete(id: number) {
-    return this.postRepo.softDelete(id);
+  async assignTask(id: number, assigneeId: number) {
+    return this.taskRepo.update(id, {
+      assignee: { id: assigneeId } as User,
+    });
+  }
+
+  async changeStatus(id: number, status: TaskStatus) {
+    const updateData: any = { status };
+
+    if (status === TaskStatus.COMPLETED) {
+      updateData.completedAt = new Date();
+    } else {
+      updateData.completedAt = null;
+    }
+
+    return this.taskRepo.update(id, updateData);
+  }
+
+  async getTaskStats(projectId: number) {
+    const stats = await this.taskRepo
+      .createQueryBuilder("task")
+      .select("task.status", "status")
+      .addSelect("COUNT(*)", "count")
+      .where("task.projectId = :projectId", { projectId })
+      .groupBy("task.status")
+      .getRawMany();
+
+    return stats.reduce(
+      (acc, item) => {
+        acc[item.status] = parseInt(item.count);
+        return acc;
+      },
+      {} as Record<string, number>
+    );
   }
 }
 ```
 
----
+这个 Service 包含了任务管理的核心功能：创建、更新、查询、删除、分配、状态变更、统计。其中 queryTasks 方法展示了如何组合多个查询条件：状态、指派人、项目、标签、关键字搜索，再加上排序和分页。
 
-## 最佳实践
+## DTO 与 Entity 的边界
 
-### 1. 选择合适的查询方法
-
-```typescript
-// ✅ 简单查询：使用 find/findOne
-const user = await userRepo.findOneBy({ id: 1 });
-
-// ✅ 复杂查询：使用 QueryBuilder
-const posts = await postRepo
-  .createQueryBuilder("post")
-  .leftJoinAndSelect("post.author", "author")
-  .where("post.status = :status", { status: "PUBLISHED" })
-  .orderBy("post.createdAt", "DESC")
-  .getMany();
-
-// ❌ 避免：过度使用 QueryBuilder 处理简单查询
-const users = await userRepo
-  .createQueryBuilder("user")
-  .where("user.id = :id", { id: 1 })
-  .getOne();
-// 使用 findOneBy 更简洁
-```
-
-### 2. 合理使用 select
+你可能注意到，在上面的 Service 中，我们没有直接把 Entity 返回给调用方。这是一个重要的最佳实践。
 
 ```typescript
-// ✅ 只查询需要的字段，减少数据传输
-const users = await userRepo.find({
-  select: {
-    id: true,
-    name: true,
-    email: true,
-  },
-});
-
-// ❌ 避免查询不需要的大字段
-const posts = await postRepo.find();
-// 如果列表页不需要 content，不要加载它
-```
-
-### 3. 使用事务处理关联操作
-
-```typescript
-// ✅ 创建文章和标签使用事务
-await dataSource.transaction(async (manager) => {
-  const post = manager.create(Post, {
-    title: "新文章",
-    content: "内容",
+// ❌ 不推荐：直接返回 Entity
+async getTask(id: number) {
+  return this.taskRepo.findOne({
+    where: { id },
+    relations: {
+      assignee: true,
+      tags: true,
+    },
   });
-  await manager.save(post);
+  // 返回的 Task 实体包含所有字段，包括敏感信息
+  // 而且 Entity 是数据库模型的直接映射，暴露给外部不合适
+}
 
-  // 创建标签关联
-  for (const tagId of tagIds) {
-    await manager.save(PostTag, { postId: post.id, tagId });
+// ✅ 推荐：返回 DTO
+async getTask(id: number) {
+  const task = await this.taskRepo.findOne({
+    where: { id },
+    relations: {
+      assignee: true,
+      tags: true,
+    },
+    select: {
+      id: true,
+      title: true,
+      description: true,
+      status: true,
+      priority: true,
+      createdAt: true,
+      assignee: {
+        id: true,
+        name: true,
+      },
+      tags: {
+        id: true,
+        name: true,
+      },
+    },
+  });
+
+  if (!task) {
+    return null;
   }
-});
+
+  return {
+    id: task.id,
+    title: task.title,
+    description: task.description,
+    status: task.status,
+    priority: task.priority,
+    createdAt: task.createdAt,
+    assignee: {
+      id: task.assignee.id,
+      name: task.assignee.name,
+    },
+    tags: task.tags.map(tag => ({
+      id: tag.id,
+      name: tag.name,
+    })),
+  };
+}
 ```
 
----
+为什么？因为 Entity 和 DTO 的职责不同：
+
+- Entity 是数据库模型的映射，服务于数据持久化
+- DTO 是 API 层的数据传输对象，服务于接口交互
+
+把它们混在一起会导致：1）敏感信息泄露；2）API 结构与数据库结构耦合；3）难以控制返回字段。
+
+正确的做法是：Service 层返回 DTO，Controller 层直接返回 DTO。可以用 class-transformer 的 instanceToPlain 方法简化转换。
+
+## Trade-off 分析
+
+Repository 和 QueryBuilder 如何选择？
+
+Repository 的 find 方法简单直观，适合大部分查询场景。但它的表达能力有限，比如难以实现"查询每个项目下未完成任务数大于 10 的项目"这种统计查询。
+
+QueryBuilder 提供了类似 SQL 的链式 API，可以构建任意复杂的查询，但代码会更冗长。对于简单查询，用 QueryBuilder 是过度设计。
+
+一个实用的经验法则：能用 find 解决的就用 find，find 写不出来的再用 QueryBuilder。下一篇文章我们会专门讲 QueryBuilder 的高级用法。
+
+save vs update 如何选择？
+
+save 会先检查实体是否存在，然后决定插入还是更新，而且支持级联操作和触发监听器。update 直接执行 UPDATE 语句，性能更好但功能有限。
+
+如果你需要更新关联实体、触发监听器、或者有复杂的业务逻辑，用 save。如果只是简单更新几个字段，用 update 更高效。
+
+remove vs delete vs softDelete 如何选择？
+
+remove 通过实体删除，会触发监听器，但需要先查询实体。delete 直接删除，不需要查询，但也不触发监听器。softDelete 是软删除，数据不会真正删除，只是标记为已删除。
+
+对于需要追溯的业务数据（比如任务、订单），推荐用 softDelete。对于日志、临时数据，可以用 delete。remove 很少使用，除非你明确需要触发监听器。
 
 ## 总结
 
-### 核心要点
+这篇文章我们深入了 Repository 的 CRUD 操作，从简单的 find 到复杂的 FindOperator，从 save/update 到 remove/delete/softDelete。我们还实现了一个完整的任务管理 Service，涵盖了创建、查询、更新、删除、统计等功能。
 
-1. **Repository API**
-   - `find` / `findOne` / `findOneBy`：查询
-   - `save` / `insert`：创建
-   - `update`：更新
-   - `remove` / `delete` / `softDelete`：删除
-   - `count` / `findAndCount`：计数
-
-2. **FindOptions**
-   - `where`：查询条件
-   - `relations`：加载关联
-   - `select`：选择字段
-   - `order`：排序
-   - `skip` / `take`：分页
-
-3. **FindOperator**
-   - `Like` / `ILike`：模糊匹配
-   - `Between`：范围查询
-   - `In`：包含于列表
-   - `IsNull`：空值判断
-   - `Raw`：原始 SQL
-
-4. **分页封装**
-   - 统一的 `PaginationParams` 和 `PaginationResult`
-   - 通用的 `paginate()` 函数
-   - 支持条件查询和关联加载
-
-### 下一步
-
-在下一篇文章中，我们将学习：
-
-- **QueryBuilder 高级查询**
-- 联表查询（INNER JOIN / LEFT JOIN）
-- 子查询
-- 分组聚合（GROUP BY / HAVING）
-- 搜索功能实现
-
-敬请期待！
+但 QueryBuilder 还没出场。当 find 方法无法满足你的查询需求时，比如需要 JOIN、GROUP BY、子查询，QueryBuilder 就会派上用场。下一篇文章我们会专门讲 QueryBuilder，它会让你感受到 TypeORM 查询的真正威力。
 
 ---
 
 ## 参考资源
 
-- [TypeORM Repository 文档](https://typeorm.io/repository)
-- [TypeORM FindOptions 文档](https://typeorm.io/find-options)
-- [TypeORM EntityManager 文档](https://typeorm.io/entity-manager-api)
-
----
+- [TypeORM Repository API](https://typeorm.io/repository-api)
+- [TypeORM FindOptions](https://typeorm.io/find-options)
+- [TypeORM Select Query Builder](https://typeorm.io/select-query-builder)

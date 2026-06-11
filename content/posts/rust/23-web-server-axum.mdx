@@ -1,8 +1,8 @@
 ---
 title: "23 实战：Web 服务器"
 date: "2026-03-30"
-summary: "使用 Axum 框架构建一个完整的 RESTful API 服务器，综合运用所学知识"
-tags: ["Rust", "Axum", "Web", "RESTful", "实战"]
+summary: "使用 Axum 框架构建一个完整的分布式任务处理 API 服务器"
+tags: ["Rust", "Axum", "Web", "RESTful", "实战", "分布式系统"]
 category: "rust"
 draft: false
 series: "Rust 渐进式学习"
@@ -11,377 +11,725 @@ seriesOrder: 23
 
 ## 前言
 
-学完了 Rust 的核心概念，是时候实战了！我们将使用 **Axum** 框架构建一个 RESTful API 服务器——一个简单的用户管理系统。
+在学习了 Rust 的所有权、并发、异步编程等核心概念后，我们将通过构建一个实际的分布式任务处理系统来综合运用这些知识。
 
-Axum 是 Tokio 团队开发的 Web 框架，具有以下特点：
+在实际的生产环境中，任务处理系统通常需要提供 HTTP API 供其他服务调用。比如，一个电商系统可能需要异步处理订单、发送通知、生成报表等耗时操作。如果这些操作都同步执行，会严重影响用户体验。
 
-- 类型安全：编译器帮你检查路由和参数
-- 高性能：基于 Tokio 和 Hyper
-- 简洁的 API：直观的路由定义
-- 生态丰富：与 Tower 中间件生态兼容
+本文将使用 **Axum** 框架构建一个 RESTful API 服务器，实现任务的提交、查询、取消等功能。
 
-## 项目搭建
+## 为什么选择 Axum
 
-### 创建项目
+在开始编码之前，我们需要理解为什么选择 Axum 而不是其他 Web 框架：
+
+- **类型安全**：路由参数、请求体、响应体都有强类型检查，编译时就能发现错误
+- **性能出色**：基于 Tokio 和 Hyper，与 Go 的 Gin、Java 的 Netty 性能相当
+- **生态兼容**：可以与 Tower 中间件生态无缝集成
+- **学习曲线平缓**：API 设计直观，符合 Rust 的惯用法
+
+## 项目结构
+
+首先创建一个新的 Rust 项目：
 
 ```bash
-cargo new user-api
-cd user-api
+cargo new task-api --name task_api
+cd task-api
 ```
 
-### 添加依赖
+配置 `Cargo.toml`：
 
 ```toml
-# Cargo.toml
+[package]
+name = "task_api"
+version = "0.1.0"
+edition = "2021"
+
 [dependencies]
 axum = "0.7"
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+tokio = { version = "1.35", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 ```
 
-## 基本服务器
+## 数据模型设计
+
+定义任务处理系统的核心数据结构：
 
 ```rust
-// src/main.rs
-use axum::{routing::get, Router};
-
-async fn hello() -> &'static str {
-    "Hello, Axum!"
-}
-
-#[tokio::main]
-async fn main() {
-    let app = Router::new()
-        .route("/", get(hello));
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("服务器运行在 http://localhost:3000");
-    axum::serve(listener, app).await.unwrap();
-}
-```
-
-运行：`cargo run`，访问 `http://localhost:3000`。
-
-## 路由和处理器
-
-### 定义路由
-
-```rust
-use axum::{
-    routing::{get, post, put, delete},
-    Router,
-};
-
-let app = Router::new()
-    .route("/", get(root))
-    .route("/users", get(list_users).post(create_user))
-    .route("/users/:id", get(get_user).put(update_user).delete(delete_user));
-```
-
-### 路径参数
-
-```rust
-use axum::extract::Path;
-
-async fn get_user(Path(id): Path<u64>) -> String {
-    format!("获取用户: {}", id)
-}
-```
-
-### 查询参数
-
-```rust
-use axum::extract::Query;
-use serde::Deserialize;
-
-#[derive(Deserialize)]
-struct Pagination {
-    page: Option<usize>,
-    per_page: Option<usize>,
-}
-
-async fn list_users(Query(pagination): Query<Pagination>) -> String {
-    let page = pagination.page.unwrap_or(1);
-    let per_page = pagination.per_page.unwrap_or(10);
-    format!("第 {} 页，每页 {} 条", page, per_page)
-}
-```
-
-## JSON 处理
-
-### 请求和响应
-
-```rust
-use axum::{Json, extract::State};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+use chrono::{DateTime, Utc};
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct User {
-    id: u64,
-    username: String,
-    email: String,
+/// 任务状态枚举
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskStatus {
+    /// 任务已创建，等待执行
+    Pending,
+    /// 任务正在执行
+    Running,
+    /// 任务执行成功
+    Completed,
+    /// 任务执行失败
+    Failed,
+    /// 任务被取消
+    Cancelled,
 }
 
-#[derive(Deserialize)]
-struct CreateUser {
-    username: String,
-    email: String,
+/// 任务优先级
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TaskPriority {
+    Low,
+    Normal,
+    High,
+    Urgent,
 }
 
-// 创建用户（JSON 请求体）
-async fn create_user(Json(input): Json<CreateUser>) -> Json<User> {
-    Json(User {
-        id: 1,
-        username: input.username,
-        email: input.email,
-    })
+/// 任务结构
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Task {
+    /// 任务唯一标识
+    pub id: Uuid,
+    /// 任务类型，用于路由到不同的处理器
+    pub task_type: String,
+    /// 任务描述
+    pub description: String,
+    /// 任务状态
+    pub status: TaskStatus,
+    /// 任务优先级
+    pub priority: TaskPriority,
+    /// 任务创建时间
+    pub created_at: DateTime<Utc>,
+    /// 任务开始执行时间
+    pub started_at: Option<DateTime<Utc>>,
+    /// 任务完成时间
+    pub completed_at: Option<DateTime<Utc>>,
+    /// 任务执行结果
+    pub result: Option<String>,
+    /// 错误信息
+    pub error: Option<String>,
+    /// 执行进度（0-100）
+    pub progress: u8,
 }
 
-// 获取用户列表（JSON 响应）
-async fn list_users() -> Json<Vec<User>> {
-    Json(vec![
-        User { id: 1, username: "alice".into(), email: "a@b.com".into() },
-        User { id: 2, username: "bob".into(), email: "b@c.com".into() },
-    ])
-}
-```
-
-## 状态共享
-
-使用 `State` 在处理器之间共享数据：
-
-```rust
-use axum::extract::State;
-use std::sync::{Arc, Mutex};
-
-type AppState = Arc<Mutex<Vec<User>>>;
-
-async fn list_users(State(state): State<AppState>) -> Json<Vec<User>> {
-    let users = state.lock().unwrap();
-    Json(users.clone())
+/// 创建任务请求
+#[derive(Debug, Deserialize)]
+pub struct CreateTaskRequest {
+    /// 任务类型
+    pub task_type: String,
+    /// 任务描述
+    pub description: String,
+    /// 任务优先级
+    #[serde(default)]
+    pub priority: TaskPriority,
 }
 
-async fn create_user(
-    State(state): State<AppState>,
-    Json(input): Json<CreateUser>,
-) -> Json<User> {
-    let mut users = state.lock().unwrap();
-    let id = users.len() as u64 + 1;
-    let user = User {
-        id,
-        username: input.username,
-        email: input.email,
-    };
-    users.push(user.clone());
-    Json(user)
+/// 更新任务请求
+#[derive(Debug, Deserialize)]
+pub struct UpdateTaskRequest {
+    /// 更新描述
+    pub description: Option<String>,
+    /// 更新优先级
+    pub priority: Option<TaskPriority>,
 }
 
-async fn delete_user(
-    State(state): State<AppState>,
-    Path(id): Path<u64>,
-) -> Result<Json<User>, StatusCode> {
-    let mut users = state.lock().unwrap();
-    let index = users.iter().position(|u| u.id == id);
+/// 任务查询参数
+#[derive(Debug, Deserialize)]
+pub struct TaskQuery {
+    /// 按状态过滤
+    pub status: Option<TaskStatus>,
+    /// 按类型过滤
+    pub task_type: Option<String>,
+    /// 按优先级过滤
+    pub priority: Option<TaskPriority>,
+    /// 分页：页码
+    #[serde(default = "default_page")]
+    pub page: usize,
+    /// 分页：每页数量
+    #[serde(default = "default_per_page")]
+    pub per_page: usize,
+}
 
-    match index {
-        Some(i) => {
-            let user = users.remove(i);
-            Ok(Json(user))
+fn default_page() -> usize { 1 }
+fn default_per_page() -> usize { 20 }
+
+/// API 响应包装
+#[derive(Debug, Serialize)]
+pub struct ApiResponse<T> {
+    pub success: bool,
+    pub data: Option<T>,
+    pub error: Option<String>,
+}
+
+impl<T> ApiResponse<T> {
+    pub fn ok(data: T) -> Self {
+        Self {
+            success: true,
+            data: Some(data),
+            error: None,
         }
-        None => Err(StatusCode::NOT_FOUND),
+    }
+
+    pub fn error(message: String) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error: Some(message),
+        }
     }
 }
 ```
 
-## 错误处理
+## 任务存储层
+
+实现一个基于内存的任务存储：
 
 ```rust
-use axum::{
-    http::StatusCode,
-    response::IntoResponse,
-    Json,
-};
-use serde_json::json;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use uuid::Uuid;
 
-enum AppError {
-    NotFound(String),
-    BadRequest(String),
+/// 任务存储接口
+pub trait TaskStore: Send + Sync {
+    fn create_task(&self, request: CreateTaskRequest) -> Result<Task, String>;
+    fn get_task(&self, id: Uuid) -> Result<Task, String>;
+    fn list_tasks(&self, query: TaskQuery) -> Result<Vec<Task>, String>;
+    fn update_task(&self, id: Uuid, request: UpdateTaskRequest) -> Result<Task, String>;
+    fn delete_task(&self, id: Uuid) -> Result<Task, String>;
+    fn update_status(&self, id: Uuid, status: TaskStatus) -> Result<Task, String>;
+    fn update_progress(&self, id: Uuid, progress: u8) -> Result<Task, String>;
 }
 
-impl IntoResponse for AppError {
-    fn into_response(self) -> axum::response::Response {
-        let (status, message) = match self {
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-            AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
+/// 内存任务存储实现
+pub struct InMemoryTaskStore {
+    tasks: Arc<Mutex<HashMap<Uuid, Task>>>,
+}
+
+impl InMemoryTaskStore {
+    pub fn new() -> Self {
+        Self {
+            tasks: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl Default for InMemoryTaskStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TaskStore for InMemoryTaskStore {
+    fn create_task(&self, request: CreateTaskRequest) -> Result<Task, String> {
+        let task = Task {
+            id: Uuid::new_v4(),
+            task_type: request.task_type,
+            description: request.description,
+            status: TaskStatus::Pending,
+            priority: request.priority,
+            created_at: Utc::now(),
+            started_at: None,
+            completed_at: None,
+            result: None,
+            error: None,
+            progress: 0,
         };
 
-        let body = Json(json!({ "error": message }));
-        (status, body).into_response()
+        let mut tasks = self.tasks.lock()
+            .map_err(|e| format!("获取锁失败: {}", e))?;
+
+        tasks.insert(task.id, task.clone());
+        Ok(task)
+    }
+
+    fn get_task(&self, id: Uuid) -> Result<Task, String> {
+        let tasks = self.tasks.lock()
+            .map_err(|e| format!("获取锁失败: {}", e))?;
+
+        tasks.get(&id)
+            .cloned()
+            .ok_or_else(|| format!("任务不存在: {}", id))
+    }
+
+    fn list_tasks(&self, query: TaskQuery) -> Result<Vec<Task>, String> {
+        let tasks = self.tasks.lock()
+            .map_err(|e| format!("获取锁失败: {}", e))?;
+
+        let mut filtered: Vec<Task> = tasks.values()
+            .filter(|task| {
+                if let Some(status) = query.status {
+                    if task.status != status {
+                        return false;
+                    }
+                }
+                if let Some(ref task_type) = query.task_type {
+                    if &task.task_type != task_type {
+                        return false;
+                    }
+                }
+                if let Some(priority) = query.priority {
+                    if task.priority != priority {
+                        return false;
+                    }
+                }
+                true
+            })
+            .cloned()
+            .collect();
+
+        // 按创建时间倒序排序
+        filtered.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+        // 分页
+        let start = (query.page - 1) * query.per_page;
+        let end = start + query.per_page;
+        let paginated = filtered.into_iter()
+            .skip(start)
+            .take(query.per_page)
+            .collect();
+
+        Ok(paginated)
+    }
+
+    fn update_task(&self, id: Uuid, request: UpdateTaskRequest) -> Result<Task, String> {
+        let mut tasks = self.tasks.lock()
+            .map_err(|e| format!("获取锁失败: {}", e))?;
+
+        let task = tasks.get_mut(&id)
+            .ok_or_else(|| format!("任务不存在: {}", id))?;
+
+        if let Some(description) = request.description {
+            task.description = description;
+        }
+        if let Some(priority) = request.priority {
+            task.priority = priority;
+        }
+
+        Ok(task.clone())
+    }
+
+    fn delete_task(&self, id: Uuid) -> Result<Task, String> {
+        let mut tasks = self.tasks.lock()
+            .map_err(|e| format!("获取锁失败: {}", e))?;
+
+        tasks.remove(&id)
+            .ok_or_else(|| format!("任务不存在: {}", id))
+    }
+
+    fn update_status(&self, id: Uuid, status: TaskStatus) -> Result<Task, String> {
+        let mut tasks = self.tasks.lock()
+            .map_err(|e| format!("获取锁失败: {}", e))?;
+
+        let task = tasks.get_mut(&id)
+            .ok_or_else(|| format!("任务不存在: {}", id))?;
+
+        task.status = status;
+
+        // 更新时间戳
+        match status {
+            TaskStatus::Running => {
+                if task.started_at.is_none() {
+                    task.started_at = Some(Utc::now());
+                }
+            }
+            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Cancelled => {
+                if task.completed_at.is_none() {
+                    task.completed_at = Some(Utc::now());
+                }
+            }
+            _ => {}
+        }
+
+        Ok(task.clone())
+    }
+
+    fn update_progress(&self, id: Uuid, progress: u8) -> Result<Task, String> {
+        let mut tasks = self.tasks.lock()
+            .map_err(|e| format!("获取锁失败: {}", e))?;
+
+        let task = tasks.get_mut(&id)
+            .ok_or_else(|| format!("任务不存在: {}", id))?;
+
+        task.progress = progress.min(100);
+
+        Ok(task.clone())
     }
 }
 ```
 
-## 完整示例：用户 CRUD API
+## API 路由和处理器
+
+实现 RESTful API 的路由和处理器：
 
 ```rust
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
-    routing::{delete, get, post, put},
+    routing::{get, post, put, delete},
     Json, Router,
 };
-use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
-struct User {
-    id: u64,
-    username: String,
-    email: String,
+/// 应用状态
+#[derive(Clone)]
+pub struct AppState {
+    pub store: Arc<dyn TaskStore>,
 }
 
-#[derive(Deserialize)]
-struct CreateUser {
-    username: String,
-    email: String,
-}
-
-#[derive(Deserialize)]
-struct UpdateUser {
-    username: Option<String>,
-    email: Option<String>,
-}
-
-type Db = Arc<Mutex<Vec<User>>>;
-
-async fn list_users(State(db): State<Db>) -> Json<Vec<User>> {
-    let users = db.lock().unwrap();
-    Json(users.clone())
-}
-
-async fn get_user(
-    State(db): State<Db>,
-    Path(id): Path<u64>,
-) -> Result<Json<User>, StatusCode> {
-    let users = db.lock().unwrap();
-    users.iter()
-        .find(|u| u.id == id)
-        .cloned()
-        .map(Json)
-        .ok_or(StatusCode::NOT_FOUND)
-}
-
-async fn create_user(
-    State(db): State<Db>,
-    Json(input): Json<CreateUser>,
-) -> (StatusCode, Json<User>) {
-    let mut users = db.lock().unwrap();
-    let id = users.last().map(|u| u.id + 1).unwrap_or(1);
-    let user = User {
-        id,
-        username: input.username,
-        email: input.email,
-    };
-    users.push(user.clone());
-    (StatusCode::CREATED, Json(user))
-}
-
-async fn update_user(
-    State(db): State<Db>,
-    Path(id): Path<u64>,
-    Json(input): Json<UpdateUser>,
-) -> Result<Json<User>, StatusCode> {
-    let mut users = db.lock().unwrap();
-    let user = users.iter_mut().find(|u| u.id == id).ok_or(StatusCode::NOT_FOUND)?;
-
-    if let Some(username) = input.username {
-        user.username = username;
-    }
-    if let Some(email) = input.email {
-        user.email = email;
+/// 创建任务
+async fn create_task(
+    State(state): State<AppState>,
+    Json(request): Json<CreateTaskRequest>,
+) -> Result<Json<ApiResponse<Task>>, (StatusCode, Json<ApiResponse<()>>)> {
+    // 验证输入
+    if request.task_type.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("任务类型不能为空".to_string())),
+        ));
     }
 
-    Ok(Json(user.clone()))
-}
+    if request.description.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ApiResponse::error("任务描述不能为空".to_string())),
+        ));
+    }
 
-async fn delete_user(
-    State(db): State<Db>,
-    Path(id): Path<u64>,
-) -> StatusCode {
-    let mut users = db.lock().unwrap();
-    if users.iter().any(|u| u.id == id) {
-        users.retain(|u| u.id != id);
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
+    // 创建任务
+    match state.store.create_task(request) {
+        Ok(task) => Ok(Json(ApiResponse::ok(task))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(e)),
+        )),
     }
 }
+
+/// 获取任务详情
+async fn get_task(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<Task>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.store.get_task(id) {
+        Ok(task) => Ok(Json(ApiResponse::ok(task))),
+        Err(e) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error(e)),
+        )),
+    }
+}
+
+/// 获取任务列表
+async fn list_tasks(
+    State(state): State<AppState>,
+    Query(query): Query<TaskQuery>,
+) -> Result<Json<ApiResponse<Vec<Task>>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.store.list_tasks(query) {
+        Ok(tasks) => Ok(Json(ApiResponse::ok(tasks))),
+        Err(e) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ApiResponse::error(e)),
+        )),
+    }
+}
+
+/// 更新任务
+async fn update_task(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Json(request): Json<UpdateTaskRequest>,
+) -> Result<Json<ApiResponse<Task>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.store.update_task(id, request) {
+        Ok(task) => Ok(Json(ApiResponse::ok(task))),
+        Err(e) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error(e)),
+        )),
+    }
+}
+
+/// 删除任务
+async fn delete_task(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.store.delete_task(id) {
+        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Err(e) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error(e)),
+        )),
+    }
+}
+
+/// 取消任务
+async fn cancel_task(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<Task>>, (StatusCode, Json<ApiResponse<()>>)> {
+    match state.store.update_status(id, TaskStatus::Cancelled) {
+        Ok(task) => Ok(Json(ApiResponse::ok(task))),
+        Err(e) => Err((
+            StatusCode::NOT_FOUND,
+            Json(ApiResponse::error(e)),
+        )),
+    }
+}
+
+/// 健康检查
+async fn health_check() -> &'static str {
+    "OK"
+}
+```
+
+## 应用启动
+
+创建应用并启动服务器：
+
+```rust
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[tokio::main]
-async fn main() {
-    let db: Db = Arc::new(Mutex::new(Vec::new()));
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 初始化日志
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "task_api=debug,tower_http=debug,axum=trace".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
 
+    // 创建任务存储
+    let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+
+    // 构建应用状态
+    let state = AppState { store };
+
+    // 构建路由
     let app = Router::new()
-        .route("/users", get(list_users).post(create_user))
-        .route("/users/:id", get(get_user).put(update_user).delete(delete_user))
-        .with_state(db);
+        // 健康检查
+        .route("/health", get(health_check))
+        // 任务路由
+        .route("/tasks", get(list_tasks).post(create_task))
+        .route("/tasks/:id", get(get_task).put(update_task).delete(delete_task))
+        .route("/tasks/:id/cancel", post(cancel_task))
+        .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-    println!("用户 API 运行在 http://localhost:3000");
-    axum::serve(listener, app).await.unwrap();
+    // 启动服务器
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+    tracing::info!("任务 API 服务器运行在 http://0.0.0.0:3000");
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
 }
 ```
 
-### 测试 API
+## 添加任务执行器
 
-```bash
-# 创建用户
-curl -X POST http://localhost:3000/users \
-  -H "Content-Type: application/json" \
-  -d '{"username": "alice", "email": "alice@example.com"}'
+为了使系统更加完整，我们添加一个简单的任务执行器：
 
-# 获取用户列表
-curl http://localhost:3000/users
+```rust
+use tokio::time::{sleep, Duration};
+use tracing::{info, error};
 
-# 获取单个用户
-curl http://localhost:3000/users/1
+/// 任务执行器
+pub struct TaskExecutor {
+    store: Arc<dyn TaskStore>,
+}
 
-# 更新用户
-curl -X PUT http://localhost:3000/users/1 \
-  -H "Content-Type: application/json" \
-  -d '{"email": "new@example.com"}'
+impl TaskExecutor {
+    pub fn new(store: Arc<dyn TaskStore>) -> Self {
+        Self { store }
+    }
 
-# 删除用户
-curl -X DELETE http://localhost:3000/users/1
+    /// 启动执行器
+    pub async fn start(&self) {
+        let store = self.store.clone();
+
+        // 定期检查待执行的任务
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+
+            loop {
+                interval.tick().await;
+
+                // 获取所有待执行的任务
+                let query = TaskQuery {
+                    status: Some(TaskStatus::Pending),
+                    task_type: None,
+                    priority: None,
+                    page: 1,
+                    per_page: 10,
+                };
+
+                if let Ok(tasks) = store.list_tasks(query) {
+                    for task in tasks {
+                        let store = store.clone();
+                        let task_id = task.id;
+
+                        // 异步执行任务
+                        tokio::spawn(async move {
+                            Self::execute_task(store, task_id).await;
+                        });
+                    }
+                }
+            }
+        });
+    }
+
+    /// 执行单个任务
+    async fn execute_task(store: Arc<dyn TaskStore>, task_id: Uuid) {
+        // 更新状态为运行中
+        if let Err(e) = store.update_status(task_id, TaskStatus::Running) {
+            error!("更新任务状态失败: {}", e);
+            return;
+        }
+
+        // 模拟任务执行
+        for progress in (0..=100).step_by(10) {
+            sleep(Duration::from_millis(500)).await;
+
+            if let Err(e) = store.update_progress(task_id, progress) {
+                error!("更新任务进度失败: {}", e);
+            }
+        }
+
+        // 标记任务完成
+        let result = format!("任务 {} 执行成功", task_id);
+        if let Err(e) = store.update_status(task_id, TaskStatus::Completed) {
+            error!("更新任务状态失败: {}", e);
+        } else {
+            info!("任务完成: {}", result);
+        }
+    }
+}
 ```
 
-## 最佳实践
+更新 `main` 函数以启动执行器：
 
-1. **使用 `State` 共享数据**：不要用全局变量
-2. **错误统一处理**：实现 `IntoResponse` trait
-3. **输入验证**：使用 `validator` crate
-4. **日志**：使用 `tracing` crate
-5. **配置管理**：使用 `config` crate
+```rust
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ... 日志初始化代码 ...
+
+    let store: Arc<dyn TaskStore> = Arc::new(InMemoryTaskStore::new());
+    let state = AppState { store: store.clone() };
+
+    // 启动任务执行器
+    let executor = TaskExecutor::new(store);
+    executor.start().await;
+
+    // ... 路由和服务器代码 ...
+
+    Ok(())
+}
+```
+
+## 测试 API
+
+使用 `curl` 测试 API：
+
+```bash
+# 健康检查
+curl http://localhost:3000/health
+
+# 创建任务
+curl -X POST http://localhost:3000/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task_type": "email",
+    "description": "发送欢迎邮件给用户 #12345",
+    "priority": "normal"
+  }'
+
+# 获取任务列表
+curl http://localhost:3000/tasks
+
+# 获取任务详情
+curl http://localhost:3000/tasks/{task_id}
+
+# 更新任务
+curl -X PUT http://localhost:3000/tasks/{task_id} \
+  -H "Content-Type: application/json" \
+  -d '{
+    "priority": "high"
+  }'
+
+# 取消任务
+curl -X POST http://localhost:3000/tasks/{task_id}/cancel
+
+# 删除任务
+curl -X DELETE http://localhost:3000/tasks/{task_id}
+
+# 按状态过滤
+curl "http://localhost:3000/tasks?status=running"
+
+# 分页查询
+curl "http://localhost:3000/tasks?page=1&per_page=10"
+```
+
+## Trade-off 分析
+
+### 使用内存存储的优势
+
+1. **简单快速**：无需配置数据库，适合原型开发
+2. **性能优异**：内存操作极快，适合低延迟场景
+3. **易于测试**：不需要外部依赖
+
+### 使用内存存储的局限
+
+1. **数据易失**：服务重启后数据丢失
+2. **扩展性差**：无法跨进程/机器共享
+3. **容量受限**：受限于单机内存
+
+### 生产环境改进
+
+在生产环境中，建议进行以下改进：
+
+1. **持久化存储**：使用 Redis 或 PostgreSQL 存储任务
+2. **分布式锁**：使用 Redis 实现跨实例的任务分配
+3. **消息队列**：使用 RabbitMQ 或 Kafka 进行任务分发
+4. **监控告警**：添加 Prometheus 指标和 Grafana 面板
+5. **限流熔断**：防止 API 被过度调用
+
+### 性能考虑
+
+| 优化方向   | 当前实现 | 改进方案             |
+| ---------- | -------- | -------------------- |
+| 并发处理   | 单机内存 | 分布式任务队列       |
+| 数据持久化 | 无       | Redis/PostgreSQL     |
+| 错误恢复   | 无       | 任务重试机制         |
+| 监控       | 日志     | Prometheus + Grafana |
 
 ## 总结
 
-本文通过实战学习了 Axum Web 框架：
+本文通过构建分布式任务处理系统的 API 服务器，综合运用了 Rust 的多项核心概念：
 
-**核心概念**
+**技术要点**
 
-- 路由定义：`Router::new().route()`
-- 处理器：异步函数 + 提取器
-- JSON 处理：`Json<T>` 提取器
-- 状态共享：`State<Arc<Mutex<T>>>`
+- Axum 框架：类型安全的 Web 框架
+- 异步编程：使用 `async/await` 处理并发请求
+- 状态管理：使用 `Arc` 和 `Mutex` 共享任务存储
+- 错误处理：使用 `Result` 类型处理错误
+- 数据序列化：使用 `serde` 处理 JSON
 
-**CRUD 实现**
+**架构设计**
 
-- 列表、创建、查询、更新、删除
-- 错误处理和状态码
+- 分层架构：存储层、业务层、API 层
+- RESTful API：标准的 CRUD 操作
+- 任务执行器：异步执行后台任务
 
-## 下一步
+**最佳实践**
 
-最后一篇文章将学习如何开发一个**命令行工具（CLI）**，完成 Rust 学习之旅！
+- 输入验证：在 API 层验证请求数据
+- 错误处理：返回合适的 HTTP 状态码
+- 日志记录：使用 `tracing` 记录关键操作
 
----
+这个 API 服务器为任务处理系统提供了基础的 Web 接口。在最后一篇文章中，我们将开发一个 **CLI 工具**来管理和监控任务，完成整个分布式任务处理系统的构建。

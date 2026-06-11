@@ -9,93 +9,125 @@ series: "Rust 渐进式学习"
 seriesOrder: 12
 ---
 
-## 前言
+## 问题引入
 
-大多数语言用异常（Exception）处理错误，但 Rust 不走寻常路——它**没有异常机制**。取而代之的是类型系统中的 `Result<T, E>` 和 `Option<T>`。
+在构建分布式任务处理系统时，错误无处不在：
 
-这种设计让错误处理显式化：你从函数签名就能知道可能出错的地方，编译器强制你处理错误。
+- worker 节点可能离线，任务分配失败
+- 配置文件可能损坏或不存在
+- 网络请求可能超时
+- 任务数据可能格式错误
 
-## Rust 错误处理的两大分类
+在 Java 或 Python 中，你习惯用 try-catch 捕获异常。但 Rust 没有异常机制——它通过类型系统强制你处理错误。这听起来很严格，但好处是：编译器会确保你不会忘记处理错误，让bug在编译时暴露，而不是运行时崩溃。
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    Rust 错误分类                              │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  不可恢复错误（Unrecoverable）                               │
-│  - 程序遇到 bug，无法继续运行                                │
-│  - 使用 panic! 宏                                           │
-│  - 例：数组越界、除以零、断言失败                            │
-│  - 程序默认会打印错误信息并退出                              │
-│                                                             │
-│  可恢复错误（Recoverable）                                   │
-│  - 预期中可能发生的错误，程序可以处理                        │
-│  - 使用 Result<T, E> 枚举                                   │
-│  - 例：文件不存在、网络超时、解析失败                        │
-│  - 函数返回 Result，调用者决定如何处理                       │
-│                                                             │
-│  其他语言对比：                                              │
-│  - Java: 不可恢复 → Error, 可恢复 → checked Exception       │
-│  - Go: 不可恢复 → panic, 可恢复 → error value               │
-│  - Rust: 不可恢复 → panic!, 可恢复 → Result<T, E>           │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
+Rust 将错误分为两类：
+
+- **不可恢复错误**：程序遇到 bug，无法继续（如数组越界、除以零）
+- **可恢复错误**：预期中可能发生的错误，程序可以处理（如文件不存在、网络超时）
+
+让我们在任务处理系统的场景中学习如何优雅地处理这些错误。
 
 ## panic!：不可恢复错误
 
-### 什么时候用 panic!
+### 什么时候用 panic
 
-`panic!` 表示程序遇到了无法处理的错误，会立即展开栈（默认）或中止（可配置）。
+`panic!` 表示程序遇到了无法处理的错误。当任务系统的核心不变量被违反时（这通常是 bug），应该 panic：
 
 ```rust
-fn main() {
-    panic!("程序崩溃了！");
+// 任务优先级枚举
+#[derive(Debug, Clone, Copy)]
+enum Priority {
+    Low = 0,
+    Medium = 1,
+    High = 2,
 }
-```
 
-### 常见的 panic 场景
-
-```rust
-fn main() {
-    let v = vec![1, 2, 3];
-
-    // 数组越界 → panic
-    // let x = v[99];
-
-    // 使用 get 安全访问
-    if let Some(x) = v.get(99) {
-        println!("{}", x);
-    } else {
-        println!("索引越界，安全退出");
+impl Priority {
+    // 从数字创建优先级
+    fn from_u8(value: u8) -> Self {
+        match value {
+            0 => Priority::Low,
+            1 => Priority::Medium,
+            2 => Priority::High,
+            // 收到无效值，这是 bug，应该 panic
+            _ => panic!("无效的优先级值: {}", value),
+        }
     }
 }
 ```
 
+**为什么这里用 panic**：`from_u8` 收到 0-2 之外的值是调用者的 bug（逻辑错误），不是可恢复的错误。panic 会终止程序并打印堆栈，帮助你快速定位 bug。
+
+### panic 的两种行为
+
+panic 时，Rust 默认会**展开栈**（unwind）：遍历调用栈，清理每个函数的局部变量。这需要额外的二进制大小支持。你也可以选择**中止**（abort）：直接终止程序，不清理。
+
+```toml
+# Cargo.toml
+[profile.release]
+panic = 'abort'  # 发布版本使用 abort，减小二进制大小
+```
+
 ### 断言宏
 
-断言宏在条件不满足时 panic：
+Rust 提供了几个断言宏，在条件不满足时 panic：
 
 ```rust
-fn main() {
-    let x = 5;
+struct TaskConfig {
+    max_workers: usize,
+    queue_size: usize,
+}
 
-    // 条件为 false 时 panic
-    assert!(x > 0, "x 必须大于 0");
+impl TaskConfig {
+    fn new(max_workers: usize, queue_size: usize) -> Self {
+        // assert!：条件为 false 时 panic
+        assert!(max_workers > 0, "worker 数量必须大于 0");
 
-    // 断言相等
-    assert_eq!(x, 5);
-    assert_ne!(x, 0, "x 不能为 0");
+        // assert_eq!：两个值不相等时 panic
+        assert_eq!(queue_size % max_workers, 0,
+            "队列大小应该是 worker 数量的倍数");
 
-    println!("所有断言通过");
+        Self { max_workers, queue_size }
+    }
 }
 ```
 
-断言在测试中特别常用（后面章节会详细讲）。
+**何时使用断言**：断言主要用于测试和检查不变量。在单元测试中，断言是核心工具；在生产代码中，断言用于检查"绝不应该发生"的情况。
+
+### unwrap 和 expect：快速但危险
+
+`unwrap` 和 `expect` 是 `Option` 和 `Result` 的快捷方法，在值为 `None` 或 `Err` 时 panic：
+
+```rust
+fn load_config_from_env() -> TaskConfig {
+    // unwrap：如果失败，panic 并显示默认信息
+    let max_workers = std::env::var("MAX_WORKERS")
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // expect：如果失败，panic 并显示自定义信息
+    let queue_size = std::env::var("QUEUE_SIZE")
+        .expect("缺少 QUEUE_SIZE 环境变量")
+        .parse()
+        .expect("QUEUE_SIZE 必须是数字");
+
+    TaskConfig::new(max_workers, queue_size)
+}
+```
+
+**何时使用 unwrap/expect**：
+
+- `unwrap`：原型代码、测试中
+- `expect`：确定不会失败、需要更好错误信息时
+
+**不要在生产代码中滥用 unwrap**：如果操作可能失败（如读取文件、网络请求），应该用 `?` 传播错误，而不是 unwrap。
 
 ## Result：可恢复错误
 
-### Result 枚举定义
+### Result 枚举
+
+`Result` 是表示可能失败的操作的标准方式：
 
 ```rust
 enum Result<T, E> {
@@ -104,186 +136,133 @@ enum Result<T, E> {
 }
 ```
 
-### 基本使用
+### 基本用法：从文件加载任务配置
 
 ```rust
 use std::fs;
 use std::io;
+use std::path::Path;
 
-fn read_username_from_file() -> Result<String, io::Error> {
-    let content = fs::read_to_string("username.txt")?;
+// 从文件加载任务配置
+fn load_task_config(path: &Path) -> Result<TaskConfig, io::Error> {
+    // fs::read_to_string 返回 Result<String, io::Error>
+    let content = fs::read_to_string(path)?;
 
-    Ok(content.trim().to_string())
+    // 解析配置
+    let config = parse_config(&content)?;
+
+    Ok(config)
+}
+
+// 简单的配置解析
+fn parse_config(content: &str) -> Result<TaskConfig, String> {
+    let lines: Vec<&str> = content.lines().collect();
+
+    if lines.len() < 2 {
+        return Err("配置文件至少需要 2 行".to_string());
+    }
+
+    let max_workers: usize = lines[0]
+        .parse()
+        .map_err(|e| format!("无效的 worker 数量: {}", e))?;
+
+    let queue_size: usize = lines[1]
+        .parse()
+        .map_err(|e| format!("无效的队列大小: {}", e))?;
+
+    Ok(TaskConfig::new(max_workers, queue_size))
 }
 
 fn main() {
-    match read_username_from_file() {
-        Ok(username) => println!("用户名: {}", username),
-        Err(e) => println!("读取失败: {}", e),
+    let path = Path::new("config.txt");
+    match load_task_config(path) {
+        Ok(config) => println!("配置加载成功: {:?}", config),
+        Err(e) => eprintln!("配置加载失败: {}", e),
     }
 }
 ```
 
-### unwrap 和 expect
-
-快速但危险的方式：
+**`?` 运算符的工作原理**：
 
 ```rust
-fn main() {
-    let content = fs::read_to_string("config.txt");
-
-    // unwrap：成功返回值，失败 panic
-    // let content = content.unwrap();  // ⚠️ 文件不存在时 panic
-
-    // expect：失败时显示自定义信息
-    let content = content.expect("无法读取配置文件，请检查 config.txt 是否存在");
-    println!("{}", content);
+// 使用 ? 的代码
+fn load_task_config(path: &Path) -> Result<TaskConfig, io::Error> {
+    let content = fs::read_to_string(path)?;
+    // ...
 }
-```
 
-**何时使用**：在确定不会出错的地方（如测试代码、程序启动时加载必要文件），可以用 `expect`。在可能出错的地方，应该用 `match` 或 `?`。
-
-### ? 运算符
-
-`?` 是 Rust 错误处理的语法糖，让错误传播变得极其简洁：
-
-```rust
-use std::fs;
-use std::io;
-
-// 不使用 ?：手动 match 传播错误
-fn read_config_v1() -> Result<String, io::Error> {
-    let content = match fs::read_to_string("config.txt") {
+// ? 等价于：
+fn load_task_config(path: &Path) -> Result<TaskConfig, io::Error> {
+    let content = match fs::read_to_string(path) {
         Ok(c) => c,
-        Err(e) => return Err(e),
+        Err(e) => return Err(e),  // 自动 return Err
     };
-    Ok(content)
-}
-
-// 使用 ?：自动传播错误
-fn read_config_v2() -> Result<String, io::Error> {
-    let content = fs::read_to_string("config.txt")?;
-    Ok(content)
-}
-
-// ? 可以链式使用
-fn read_and_process() -> Result<String, io::Error> {
-    let content = fs::read_to_string("config.txt")?;
-    let trimmed = content.trim();
-    let upper = trimmed.to_uppercase();
-    Ok(upper)
-}
-
-fn main() {
-    match read_and_process() {
-        Ok(result) => println!("结果: {}", result),
-        Err(e) => eprintln!("错误: {}", e),
-    }
+    // ...
 }
 ```
 
-### ? 运算符的工作原理
+`?` 运算符做了三件事：
 
-`?` 运算符做了以下事情：
+1. 如果是 `Ok(value)`，提取 `value`
+2. 如果是 `Err(e)`，自动 `return Err(e)`
+3. 自动转换错误类型（通过 `From` trait）
 
-1. 如果是 `Ok(value)`，返回 `value`
-2. 如果是 `Err(e)`，使用 `From` trait 转换错误类型，然后 `return Err(e)`
+### 错误转换
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                    ? 运算符流程                               │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  let result = some_operation()?;                            │
-│                                                             │
-│  等价于：                                                    │
-│                                                             │
-│  let result = match some_operation() {                      │
-│      Ok(value) => value,                                    │
-│      Err(e) => return Err(From::from(e)),                  │
-│  };                                                         │
-│                                                             │
-│  关键特性：                                                  │
-│  1. 自动解包 Ok                                             │
-│  2. 自动 return Err                                         │
-│  3. 自动转换错误类型（通过 From trait）                      │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-## 自定义错误类型
-
-### 定义错误枚举
+在任务系统中，不同层次的错误需要统一处理。`?` 会自动转换错误类型：
 
 ```rust
 use std::fmt;
 
-// 自定义错误类型
 #[derive(Debug)]
-enum AppError {
-    IoError(std::io::Error),
-    ParseError(String),
-    NotFound(String),
+enum TaskError {
+    Io(io::Error),
+    Parse(String),
+    Network(String),
 }
 
-// 实现 Display trait（错误消息）
-impl fmt::Display for AppError {
+// 实现 Display，提供用户友好的错误信息
+impl fmt::Display for TaskError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            AppError::IoError(e) => write!(f, "IO 错误: {}", e),
-            AppError::ParseError(msg) => write!(f, "解析错误: {}", msg),
-            AppError::NotFound(msg) => write!(f, "未找到: {}", msg),
+            TaskError::Io(e) => write!(f, "IO 错误: {}", e),
+            TaskError::Parse(msg) => write!(f, "解析错误: {}", msg),
+            TaskError::Network(msg) => write!(f, "网络错误: {}", msg),
         }
     }
 }
 
-// 实现 std::error::Error trait
-impl std::error::Error for AppError {
+// 实现 std::error::Error，使其可以作为错误类型
+impl std::error::Error for TaskError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            AppError::IoError(e) => Some(e),
+            TaskError::Io(e) => Some(e),
             _ => None,
         }
     }
 }
 
 // 从 io::Error 转换
-impl From<std::io::Error> for AppError {
-    fn from(e: std::io::Error) -> Self {
-        AppError::IoError(e)
+impl From<io::Error> for TaskError {
+    fn from(e: io::Error) -> Self {
+        TaskError::Io(e)
     }
+}
+
+// 现在可以在函数中混合使用不同错误类型
+fn load_and_validate_config(path: &Path) -> Result<TaskConfig, TaskError> {
+    let content = fs::read_to_string(path)?;  // io::Error 自动转换为 TaskError
+
+    let config: TaskConfig = parse_config(&content)
+        .map_err(|msg| TaskError::Parse(msg))?;  // String 转换为 TaskError
+
+    Ok(config)
 }
 ```
 
-### 使用自定义错误
+### thiserror：简化错误定义
 
-```rust
-fn read_config(path: &str) -> Result<String, AppError> {
-    let content = std::fs::read_to_string(path)?;  // 自动转换为 AppError
-
-    if content.trim().is_empty() {
-        return Err(AppError::ParseError("配置文件为空".to_string()));
-    }
-
-    Ok(content)
-}
-
-fn main() {
-    match read_config("config.txt") {
-        Ok(config) => println!("配置: {}", config),
-        Err(e) => {
-            eprintln!("错误: {}", e);
-            if let Some(source) = e.source() {
-                eprintln!("原因: {}", source);
-            }
-        }
-    }
-}
-```
-
-### thiserror 库
-
-手动实现错误类型比较繁琐，实际项目中推荐使用 `thiserror` 库：
+手动实现错误类型很繁琐。实际项目中推荐使用 `thiserror` 库：
 
 ```toml
 # Cargo.toml
@@ -295,157 +274,95 @@ thiserror = "1.0"
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-enum AppError {
-    #[error("IO 错误: {0}")]
-    IoError(#[from] std::io::Error),
+enum TaskError {
+    #[error("文件 IO 错误: {0}")]
+    Io(#[from] std::io::Error),
 
-    #[error("解析错误: {0}")]
-    ParseError(String),
+    #[error("配置解析错误: {0}")]
+    Parse(String),
 
-    #[error("未找到: {0}")]
-    NotFound(String),
+    #[error("网络错误: {0}")]
+    Network(String),
 
-    #[error("无效参数: {name} 不能为 {value}")]
-    InvalidParam { name: String, value: i32 },
+    #[error("任务 {id} 未找到")]
+    NotFound { id: u64 },
 }
 
-fn main() {
-    let err = AppError::InvalidParam {
-        name: "age".to_string(),
-        value: -1,
-    };
-    println!("{}", err);  // 无效参数: age 不能为 -1
-}
+// thiserror 自动实现了 Display 和 Error，以及 From<io::Error>
+// 你可以直接使用 ?，无需手动转换
 ```
 
-`thiserror` 自动实现了 `Display`、`Error` 和 `From`，大幅减少样板代码。
+**thiserror 的好处**：
 
-## Option 与错误处理
+- `#[from]` 自动实现 `From` trait
+- `#[error("...")]` 自动生成 `Display` 实现
+- 支持字段引用：`#[error("任务 {id} 未找到")]`
 
-`Option<T>` 也是错误处理的一部分，用于表示"值可能不存在"：
+## Option：值可能不存在
+
+### Option 枚举
+
+`Option` 表示值可能存在（`Some`）或不存在（`None`）：
 
 ```rust
-fn find_user(users: &[(&str, u32)], name: &str) -> Option<u32> {
-    users.iter()
-        .find(|&&(n, _)| n == name)
-        .map(|&(_, age)| age)
-}
-
-fn main() {
-    let users = [("Alice", 30), ("Bob", 25)];
-
-    match find_user(&users, "Alice") {
-        Some(age) => println!("Alice 的年龄: {}", age),
-        None => println!("未找到用户"),
-    }
-
-    // ? 也可以用于 Option（在返回 Option 的函数中）
+enum Option<T> {
+    Some(T),
+    None,
 }
 ```
 
-## 实战演练
-
-### 示例 1：安全的文件读取与处理
+### 在任务系统中使用 Option
 
 ```rust
-use std::fs;
-use std::io;
-use std::path::Path;
-
-fn count_words_in_file(path: &Path) -> Result<usize, io::Error> {
-    let content = fs::read_to_string(path)?;
-    let count = content.split_whitespace().count();
-    Ok(count)
+struct TaskStore {
+    tasks: HashMap<u64, Task>,
 }
 
-fn process_files(paths: &[&str]) -> Result<Vec<(String, usize)>, io::Error> {
-    let mut results = Vec::new();
-
-    for path_str in paths {
-        let path = Path::new(path_str);
-        let count = count_words_in_file(path)?;
-        results.push((path_str.to_string(), count));
+impl TaskStore {
+    // 通过 ID 查找任务，可能不存在
+    fn get(&self, id: u64) -> Option<&Task> {
+        self.tasks.get(&id)
     }
 
-    Ok(results)
+    // 获取下一个待处理任务，可能队列为空
+    fn pop_next(&mut self) -> Option<Task> {
+        // ...
+    }
 }
 
-fn main() {
-    let files = ["Cargo.toml", "README.md"];
+// 在 Result 中使用 Option
+fn get_task_status(store: &TaskStore, id: u64) -> Result<String, TaskError> {
+    let task = store.get(id)
+        .ok_or_else(|| TaskError::NotFound { id })?;  // Option -> Result
 
-    match process_files(&files) {
-        Ok(results) => {
-            for (file, count) in results {
-                println!("{}: {} 个单词", file, count);
-            }
-        }
-        Err(e) => eprintln!("处理失败: {}", e),
-    }
+    Ok(format!("任务: {}", task.name))
 }
 ```
 
-### 示例 2：配置解析器
+**`?` 也适用于 Option**：在返回 `Option` 的函数中，`?` 会自动处理 `None`。
+
+### combinator：链式处理 Option 和 Result
 
 ```rust
-use std::collections::HashMap;
-use std::io;
+// map: 在 Some/Ok 时转换值
+let id = Some(1);
+let doubled = id.map(|x| x * 2);  // Some(2)
 
-#[derive(Debug)]
-struct Config {
-    database_url: String,
-    port: u16,
-    debug: bool,
+// and_then: 在 Some/Ok 时链式调用可能失败的函数
+fn parse_task_id(s: &str) -> Option<u64> {
+    s.parse().ok()  // parse 返回 Result，ok() 转换为 Option
 }
 
-fn parse_config(content: &str) -> Result<Config, String> {
-    let mut map = HashMap::new();
+let id = parse_task_id("123")
+    .and_then(|id| if id > 0 { Some(id) } else { None });
 
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let parts: Vec<&str> = line.splitn(2, '=').collect();
-        if parts.len() != 2 {
-            return Err(format!("无效的配置行: {}", line));
-        }
-
-        map.insert(parts[0].trim(), parts[1].trim());
-    }
-
-    let database_url = map.get("database_url")
-        .ok_or("缺少 database_url 配置")?
-        .to_string();
-
-    let port: u16 = map.get("port")
-        .ok_or("缺少 port 配置")?
-        .parse()
-        .map_err(|e| format!("port 解析失败: {}", e))?;
-
-    let debug = map.get("debug")
-        .map(|v| v == "true")
-        .unwrap_or(false);
-
-    Ok(Config { database_url, port, debug })
-}
-
-fn main() {
-    let config_str = r#"
-        # 数据库配置
-        database_url=postgres://localhost/mydb
-        port=5432
-        debug=true
-    "#;
-
-    match parse_config(config_str) {
-        Ok(config) => println!("{:?}", config),
-        Err(e) => eprintln!("配置错误: {}", e),
-    }
-}
+// unwrap_or: 提供默认值
+let count = task_count.unwrap_or(0);
 ```
 
-### 示例 3：使用 thiserror 的完整示例
+## 完整案例：任务执行器
+
+让我们实现一个完整的任务执行流程，包含全面的错误处理：
 
 ```rust
 use std::fs;
@@ -453,153 +370,233 @@ use std::path::Path;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-enum DataError {
-    #[error("文件读取失败: {0}")]
-    Io(#[from] std::io::Error),
+enum TaskExecutionError {
+    #[error("任务加载失败: {0}")]
+    LoadError(#[from] std::io::Error),
 
-    #[error("格式无效: {0}")]
-    InvalidFormat(String),
+    #[error("任务验证失败: {0}")]
+    ValidationError(String),
 
-    #[error("数据缺失: 缺少 '{field}' 字段")]
-    MissingField { field: String },
+    #[error("任务执行失败: {0}")]
+    ExecutionError(String),
 }
 
-fn parse_csv_line(line: &str) -> Result<Vec<String>, DataError> {
-    let fields: Vec<String> = line.split(',').map(String::from).collect();
-
-    if fields.len() < 3 {
-        return Err(DataError::InvalidFormat(
-            format!("每行至少需要 3 个字段，实际有 {} 个", fields.len())
-        ));
-    }
-
-    Ok(fields)
+struct Task {
+    id: u64,
+    name: String,
+    payload: Vec<u8>,
 }
 
-fn load_data(path: &Path) -> Result<Vec<Vec<String>>, DataError> {
-    let content = fs::read_to_string(path)?;
-    let mut data = Vec::new();
+struct TaskExecutor {
+    data_dir: std::path::PathBuf,
+}
 
-    for (i, line) in content.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
+impl TaskExecutor {
+    fn new(data_dir: &str) -> Self {
+        Self {
+            data_dir: std::path::PathBuf::from(data_dir),
         }
-        let fields = parse_csv_line(line)
-            .map_err(|e| DataError::InvalidFormat(
-                format!("第 {} 行: {}", i + 1, e)
-            ))?;
-        data.push(fields);
     }
 
-    if data.is_empty() {
-        return Err(DataError::MissingField { field: "data".to_string() });
+    // 加载任务数据
+    fn load_task(&self, id: u64) -> Result<Task, TaskExecutionError> {
+        let file_path = self.data_dir.join(format!("task_{}.dat", id));
+        let content = fs::read(&file_path)?;
+
+        // 解析任务数据（简化）
+        if content.is_empty() {
+            return Err(TaskExecutionError::ValidationError(
+                "任务数据为空".to_string()
+            ));
+        }
+
+        Ok(Task {
+            id,
+            name: format!("Task-{}", id),
+            payload: content,
+        })
     }
 
-    Ok(data)
+    // 验证任务
+    fn validate_task(&self, task: &Task) -> Result<(), TaskExecutionError> {
+        if task.payload.len() > 1024 * 1024 {
+            return Err(TaskExecutionError::ValidationError(
+                "任务数据过大 (大于1MB)".to_string()
+            ));
+        }
+
+        // 其他验证逻辑...
+
+        Ok(())
+    }
+
+    // 执行任务
+    fn execute(&self, id: u64) -> Result<String, TaskExecutionError> {
+        // 加载
+        let task = self.load_task(id)?;
+
+        // 验证
+        self.validate_task(&task)?;
+
+        // 执行
+        let result = self.process_task(&task)?;
+
+        Ok(result)
+    }
+
+    // 处理任务
+    fn process_task(&self, task: &Task) -> Result<String, TaskExecutionError> {
+        // 实际的任务处理逻辑...
+        Ok(format!("任务 {} 执行成功", task.id))
+    }
 }
 
 fn main() {
-    match load_data(Path::new("data.csv")) {
-        Ok(data) => {
-            println!("加载了 {} 行数据", data.len());
-            for row in &data {
-                println!("{:?}", row);
-            }
+    let executor = TaskExecutor::new("./data");
+
+    match executor.execute(123) {
+        Ok(result) => println!("{}", result),
+        Err(e) => eprintln!("任务执行失败: {}", e),
+    }
+}
+```
+
+## 错误处理最佳实践
+
+### 1. 库代码返回 Result，让调用者决定
+
+```rust
+// 库函数：返回 Result
+fn parse_config(content: &str) -> Result<Config, ParseError> {
+    // ...
+}
+
+// 应用代码：决定如何处理错误
+fn load_app_config() -> Config {
+    match parse_config(&content) {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("配置错误: {}", e);
+            std::process::exit(1);
         }
-        Err(e) => eprintln!("错误: {}", e),
     }
 }
 ```
 
-## 常见错误与修复
-
-### 错误 1：用 unwrap 忽略错误
+### 2. 使用 ? 传播错误，保持代码简洁
 
 ```rust
-fn main() {
-    // ❌ 生产代码中不要这样做
-    // let content = fs::read_to_string("file.txt").unwrap();
-
-    // ✅ 正确处理错误
-    match fs::read_to_string("file.txt") {
-        Ok(content) => println!("{}", content),
-        Err(e) => eprintln!("读取失败: {}", e),
-    }
+// 不推荐：手动 match
+fn load_config() -> Result<Config, Error> {
+    let content = match fs::read_to_string("config.txt") {
+        Ok(c) => c,
+        Err(e) => return Err(e.into()),
+    };
+    // ...
 }
-```
 
-### 错误 2：? 运算符的返回类型不匹配
-
-```rust
-use std::fs;
-
-// ❌ 返回类型不包含 io::Error
-// fn read_file() -> String {
-//     let content = fs::read_to_string("file.txt")?;
-//     content
-// }
-
-// ✅ 返回 Result
-fn read_file() -> Result<String, std::io::Error> {
-    let content = fs::read_to_string("file.txt")?;
-    Ok(content)
-}
-```
-
-## 最佳实践
-
-1. **库代码返回 Result**：让调用者决定如何处理错误
-2. **应用入口处理所有错误**：`main` 函数中集中处理
-3. **使用 `?` 传播错误**：比手动 match 更简洁
-4. **用 `thiserror` 定义错误类型**：减少样板代码
-5. **`expect` 用于不可能失败的断言**：提供有意义的错误信息
-
-## 常见问题
-
-**Q: Rust 没有 try-catch 吗？**
-
-A: 没有。Rust 用 `Result` 和 `?` 运算符替代了异常机制。这种方式更安全，因为编译器强制你处理错误。
-
-**Q: 什么时候用 panic!?**
-
-A: 只在程序遇到 bug（不应该发生的情况）时使用。对于预期可能发生的错误，用 `Result`。
-
-**Q: ? 可以用在 main 函数里吗？**
-
-A: Rust 1.56+ 支持 `main` 返回 `Result`：
-
-```rust
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+// 推荐：使用 ?
+fn load_config() -> Result<Config, Error> {
     let content = fs::read_to_string("config.txt")?;
-    println!("{}", content);
+    // ...
+}
+```
+
+### 3. 提供有意义的错误信息
+
+```rust
+// 不推荐
+#[derive(Debug)]
+enum Error {
+    InvalidConfig,
+}
+
+// 推荐：错误信息包含上下文
+#[derive(Error, Debug)]
+enum Error {
+    #[error("配置文件 {path} 无效: {reason}")]
+    InvalidConfig { path: String, reason: String },
+}
+```
+
+### 4. 使用 thiserror 减少样板代码
+
+```rust
+// 不推荐：手动实现所有 trait
+impl fmt::Display for MyError { /* ... */ }
+impl std::error::Error for MyError { /* ... */ }
+impl From<io::Error> for MyError { /* ... */ }
+
+// 推荐：使用 thiserror
+#[derive(Error, Debug)]
+enum MyError {
+    #[error("IO 错误: {0}")]
+    Io(#[from] std::io::Error),
+}
+```
+
+## Trade-off 分析
+
+### panic vs Result
+
+**panic 优势**：
+
+- 快速终止 bug
+- 堆栈信息详细
+
+**panic 劣势**：
+
+- 程序崩溃，无法恢复
+- 无法在测试外捕获
+
+**Result 优势**：
+
+- 强制调用者处理错误
+- 错误可传播和组合
+
+**Result 劣势**：
+
+- 需要显式处理（这正是优点）
+- 样板代码较多（但 `?` 减轻了这个问题）
+
+### 自定义错误 vs 动态错误类型
+
+**自定义错误**：
+
+- 类型安全，编译时检查
+- 可以在不同错误分支中处理
+- 适合库代码
+
+**动态错误类型**：
+
+- 灵活，可以存储任何错误
+- 样板代码少
+- 适合应用代码
+
+```rust
+// 库代码：返回具体错误类型
+pub fn parse_config(s: &str) -> Result<Config, ParseError> {
+    // ...
+}
+
+// 应用代码：可以使用动态错误类型
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = fs::read_to_string("config.txt")?;
+    // ...
     Ok(())
 }
 ```
 
 ## 总结
 
-本文学习了 Rust 的错误处理机制：
+Rust 的错误处理通过类型系统确保错误不会被忽略：
 
-**两种错误**
+- **panic!**：不可恢复错误，用于 bug 和不变量违反
+- **Result**：可恢复错误，强制调用者处理
+- **Option**：值可能不存在
+- **`?` 运算符**：简洁的错误传播
+- **thiserror**：简化错误定义
 
-- `panic!`：不可恢复，程序终止
-- `Result<T, E>`：可恢复，返回错误给调用者
+在任务处理系统中，我们使用 `Result` 处理文件 IO、网络请求、数据解析等可恢复错误，只在遇到逻辑 bug（如无效的内部状态）时才 panic。这种设计让错误处理显式化、类型安全，编译器会确保你不会忘记处理错误。
 
-**Result 处理方式**
-
-- `match`：完整处理所有情况
-- `unwrap()`/`expect()`：快速但危险
-- `?` 运算符：简洁的错误传播
-
-**自定义错误**
-
-- 手动实现 `Display` + `Error` trait
-- 使用 `thiserror` 库简化
-
-**核心思想**：错误是值，通过类型系统处理，而不是通过控制流。
-
-## 下一步
-
-下一篇文章将学习**泛型**——如何编写不指定具体类型的代码，实现真正的代码复用。
-
----
+下一篇文章将学习**泛型**——如何编写不指定具体类型的代码，让我们的任务系统能够处理不同类型的任务和数据。

@@ -9,245 +9,234 @@ series: "TypeORM 渐进式学习计划"
 seriesOrder: 5
 ---
 
-## 前言
+在上一篇文章中，我们用 Repository 的 find 方法实现了任务的 CRUD 操作。find 方法配合 FindOptions 可以处理大部分查询场景，但当查询需求变得复杂时，比如"统计每个项目下各状态的任务数"或者"查询未完成任务数大于 10 的项目"，find 方法就不够用了。
 
-当 `Repository.find()` 无法满足复杂的查询需求时，**QueryBuilder** 就派上用场了。它提供了类似 SQL 的链式 API，让你可以构建任意复杂的查询，同时保持类型安全。
+这时就需要 QueryBuilder 出场了。QueryBuilder 提供了类似 SQL 的链式 API，让你可以构建任意复杂的查询，同时保持类型安全。这篇文章会带你深入了解 QueryBuilder 的各种用法，从基础的联表查询到复杂的统计聚合。
 
-**本篇你将学到**：
-
-- QueryBuilder 基础和链式调用
-- 联表查询（JOIN）
-- 子查询
-- 分组聚合（GROUP BY / HAVING）
-- 原始 SQL 查询
-- 搜索功能的实现
-
----
+我们的项目管理平台需要一个 Dashboard 来展示各种统计数据：每个工作空间的项目数、每个项目的任务完成率、各状态的任务数分布。这些查询都离不开 QueryBuilder。
 
 ## QueryBuilder 基础
+
+QueryBuilder 的 API 设计和 SQL 很像，如果你熟悉 SQL，上手会很快。
 
 ### 创建 QueryBuilder
 
 ```typescript
 import { DataSource } from "typeorm";
+import { Task } from "./entity/Task";
 
-// 方式 1：通过 Repository
-const qb = userRepo.createQueryBuilder("user");
+// 方式 1：通过 Repository 创建
+const qb = taskRepo.createQueryBuilder("task");
 
-// 方式 2：通过 DataSource
-const qb = dataSource.createQueryBuilder(User, "user");
+// 方式 2：通过 DataSource 创建
+const qb = dataSource.createQueryBuilder(Task, "task");
 
-// 方式 3：通过 EntityManager
-const qb = entityManager.createQueryBuilder(User, "user");
+// 方式 3：通过 EntityManager 创建
+const qb = entityManager.createQueryBuilder(Task, "task");
 ```
+
+参数 "task" 是表的别名，后续所有引用都要用这个别名。
 
 ### 基本查询
 
 ```typescript
 // SELECT 查询
-const users = await userRepo.createQueryBuilder("user").getMany();
-// SELECT * FROM users user
+const tasks = await taskRepo.createQueryBuilder("task").getMany();
+// SELECT * FROM tasks task
 
 // 查询单条
-const user = await userRepo
-  .createQueryBuilder("user")
-  .where("user.id = :id", { id: 1 })
+const task = await taskRepo
+  .createQueryBuilder("task")
+  .where("task.id = :id", { id: 1 })
   .getOne();
-// SELECT * FROM users user WHERE user.id = 1
+// SELECT * FROM tasks task WHERE task.id = 1
 
 // 查询数量
-const count = await userRepo
-  .createQueryBuilder("user")
-  .where("user.isActive = :active", { active: true })
+const count = await taskRepo
+  .createQueryBuilder("task")
+  .where("task.status = :status", { status: "TODO" })
   .getCount();
-// SELECT COUNT(*) FROM users user WHERE user.is_active = true
+// SELECT COUNT(*) FROM tasks task WHERE task.status = 'TODO'
 ```
 
 ### 选择字段
 
 ```typescript
 // 选择所有字段
-const users = await userRepo.createQueryBuilder("user").select().getMany();
+const tasks = await taskRepo.createQueryBuilder("task").select().getMany();
 
 // 选择指定字段
-const users = await userRepo
-  .createQueryBuilder("user")
-  .select(["user.id", "user.name", "user.email"])
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .select(["task.id", "task.title", "task.status"])
   .getMany();
-// SELECT user.id, user.name, user.email FROM users user
+// SELECT task.id, task.title, task.status FROM tasks task
 
 // 使用 addSelect 追加字段
-const users = await userRepo
-  .createQueryBuilder("user")
-  .select("user.id")
-  .addSelect("user.name")
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .select("task.id")
+  .addSelect("task.title")
   .getMany();
 
-// 使用别名
-const result = await userRepo
-  .createQueryBuilder("user")
-  .select("user.name", "userName")
-  .addSelect("user.email", "userEmail")
+// 使用别名（返回原始数据）
+const result = await taskRepo
+  .createQueryBuilder("task")
+  .select("task.title", "taskTitle")
+  .addSelect("task.status", "taskStatus")
   .getRawMany();
-// SELECT user.name AS "userName", user.email AS "userEmail" FROM users user
+// SELECT task.title AS "taskTitle", task.status AS "taskStatus" FROM tasks task
+// 返回: [{ taskTitle: '修复导航栏', taskStatus: 'TODO' }, ...]
 ```
 
 ### WHERE 条件
 
 ```typescript
 // 等值条件
-qb.where("user.id = :id", { id: 1 });
-// WHERE user.id = 1
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .where("task.id = :id", { id: 1 })
+  .getOne();
 
 // 多个条件（AND）
-qb.where("user.isActive = :active", { active: true }).andWhere(
-  "user.role = :role",
-  { role: "ADMIN" }
-);
-// WHERE user.is_active = true AND user.role = 'ADMIN'
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .where("task.status = :status", { status: "IN_PROGRESS" })
+  .andWhere("task.priority = :priority", { priority: "URGENT" })
+  .getMany();
+// WHERE task.status = 'IN_PROGRESS' AND task.priority = 'URGENT'
 
 // OR 条件
-qb.where("user.role = :admin", { admin: "ADMIN" }).orWhere(
-  "user.role = :editor",
-  { editor: "EDITOR" }
-);
-// WHERE user.role = 'ADMIN' OR user.role = 'EDITOR'
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .where("task.status = :status1", { status1: "TODO" })
+  .orWhere("task.status = :status2", { status2: "IN_PROGRESS" })
+  .getMany();
+// WHERE task.status = 'TODO' OR task.status = 'IN_PROGRESS'
 
-// 复杂条件组合
-qb.where(
-  new Brackets((qb) => {
-    qb.where("user.role = :admin", { admin: "ADMIN" }).orWhere(
-      "user.role = :editor",
-      { editor: "EDITOR" }
-    );
-  })
-).andWhere("user.isActive = :active", { active: true });
-// WHERE (user.role = 'ADMIN' OR user.role = 'EDITOR') AND user.is_active = true
+// 复杂条件组合（使用 Brackets）
+import { Brackets } from "typeorm";
+
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .where(
+    new Brackets((qb) => {
+      qb.where("task.status = :status", { status: "TODO" }).orWhere(
+        "task.assignee IS NULL"
+      );
+    })
+  )
+  .andWhere("task.priority = :priority", { priority: "URGENT" })
+  .getMany();
+// WHERE (task.status = 'TODO' OR task.assignee_id IS NULL)
+//   AND task.priority = 'URGENT'
 
 // IN 条件
-qb.where("user.role IN (:...roles)", { roles: ["ADMIN", "EDITOR"] });
-// WHERE user.role IN ('ADMIN', 'EDITOR')
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .where("task.status IN (:...statuses)", {
+    statuses: ["TODO", "IN_PROGRESS"],
+  })
+  .getMany();
 
 // LIKE 条件
-qb.where("user.name LIKE :name", { name: "%张%" });
-// WHERE user.name LIKE '%张%'
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .where("task.title LIKE :keyword", { keyword: "%导航栏%" })
+  .getMany();
 
 // BETWEEN 条件
-qb.where("user.createdAt BETWEEN :start AND :end", {
-  start: new Date("2026-01-01"),
-  end: new Date("2026-12-31"),
-});
-// WHERE user.created_at BETWEEN '2026-01-01' AND '2026-12-31'
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .where("task.createdAt BETWEEN :start AND :end", {
+    start: new Date("2026-01-01"),
+    end: new Date("2026-12-31"),
+  })
+  .getMany();
 
 // IS NULL
-qb.where("user.deletedAt IS NULL");
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .where("task.assignee IS NULL")
+  .getMany();
 ```
 
 ### 排序和分页
 
 ```typescript
-// 排序
-const users = await userRepo
-  .createQueryBuilder("user")
-  .orderBy("user.createdAt", "DESC")
-  .addOrderBy("user.name", "ASC")
-  .getMany();
-
-// 分页
-const users = await userRepo
-  .createQueryBuilder("user")
-  .skip(10) // 跳过 10 条
-  .take(10) // 取 10 条
-  .getMany();
-
-// 或使用 offset/limit
-const users = await userRepo
-  .createQueryBuilder("user")
-  .offset(10)
-  .limit(10)
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .where("task.projectId = :projectId", { projectId: 1 })
+  .orderBy("task.priority", "DESC") // 按优先级降序
+  .addOrderBy("task.createdAt", "ASC") // 同级按创建时间升序
+  .skip(0) // 跳过 0 条（offset）
+  .take(10) // 取 10 条（limit）
   .getMany();
 ```
-
-### 分组
-
-```typescript
-// GROUP BY
-const result = await userRepo
-  .createQueryBuilder("user")
-  .select("user.role", "role")
-  .addSelect("COUNT(*)", "count")
-  .groupBy("user.role")
-  .getRawMany();
-// SELECT user.role AS "role", COUNT(*) AS "count" FROM users user GROUP BY user.role
-// 结果：[{ role: 'ADMIN', count: '5' }, { role: 'EDITOR', count: '12' }]
-
-// HAVING
-const result = await userRepo
-  .createQueryBuilder("user")
-  .select("user.role", "role")
-  .addSelect("COUNT(*)", "count")
-  .groupBy("user.role")
-  .having("COUNT(*) > :min", { min: 5 })
-  .getRawMany();
-// SELECT user.role, COUNT(*) FROM users GROUP BY user.role HAVING COUNT(*) > 5
-```
-
----
 
 ## 联表查询（JOIN）
+
+联表查询是 QueryBuilder 最强大的功能之一。在项目管理平台中，我们经常需要关联查询任务、项目、用户、标签等多张表。
 
 ### LEFT JOIN
 
 ```typescript
-// 查询用户及其文章（左连接）
-const users = await userRepo
-  .createQueryBuilder("user")
-  .leftJoinAndSelect("user.posts", "post")
+// 查询任务及其指派人（左连接）
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .leftJoinAndSelect("task.assignee", "user") // 关联并加载用户数据
+  .where("task.projectId = :projectId", { projectId: 1 })
   .getMany();
-// SELECT user.*, post.* FROM users user
-// LEFT JOIN posts post ON post.author_id = user.id
-// 结果包含没有文章的用户（posts 为空数组）
+// SELECT task.*, user.* FROM tasks task
+// LEFT JOIN users user ON user.id = task.assignee_id
+// 结果包含没有指派人的任务（user 为 null）
 
-// 不 select 关联表数据（仅用于条件过滤）
-const users = await userRepo
-  .createQueryBuilder("user")
-  .leftJoin("user.posts", "post")
-  .where("post.status = :status", { status: "PUBLISHED" })
+// 只用于条件过滤，不加载关联数据
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .leftJoin("task.assignee", "user") // 不加 AndSelect
+  .where("user.name = :name", { name: "zhang_wei" })
   .getMany();
-// 只返回有已发布文章的用户，但不包含文章数据
+// 只返回指派给 zhang_wei 的任务，但不包含用户数据
 ```
 
 ### INNER JOIN
 
 ```typescript
 // 内连接：只返回有匹配记录的行
-const users = await userRepo
-  .createQueryBuilder("user")
-  .innerJoinAndSelect("user.posts", "post")
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .innerJoinAndSelect("task.assignee", "user")
+  .where("task.projectId = :projectId", { projectId: 1 })
   .getMany();
-// 只返回有文章的用户
+// 只返回有指派人的任务
 
 // 带条件的内连接
-const users = await userRepo
-  .createQueryBuilder("user")
-  .innerJoinAndSelect("user.posts", "post", "post.status = :status", {
-    status: "PUBLISHED",
-  })
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .innerJoinAndSelect(
+    "task.assignee",
+    "user",
+    "user.isActive = :active", // 连接条件
+    { active: true }
+  )
+  .where("task.projectId = :projectId", { projectId: 1 })
   .getMany();
-// 只返回有已发布文章的用户，且只加载已发布的文章
+// 只返回指派给活跃用户的任务
 ```
 
 ### 多表关联
 
 ```typescript
-// 三层关联：用户 → 文章 → 标签
-const users = await userRepo
-  .createQueryBuilder("user")
-  .leftJoinAndSelect("user.posts", "post")
-  .leftJoinAndSelect("post.tags", "tag")
-  .leftJoinAndSelect("post.comments", "comment")
-  .where("user.isActive = :active", { active: true })
-  .orderBy("post.createdAt", "DESC")
+// 查询任务及其所属项目、工作空间、指派人、标签
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .leftJoinAndSelect("task.project", "project")
+  .leftJoinAndSelect("project.workspace", "workspace")
+  .leftJoinAndSelect("task.assignee", "user")
+  .leftJoinAndSelect("task.tags", "tag")
+  .where("workspace.id = :workspaceId", { workspaceId: 1 })
+  .orderBy("task.priority", "DESC")
   .getMany();
 ```
 
@@ -255,667 +244,492 @@ const users = await userRepo
 
 ```typescript
 // 只选择关联表的部分字段
-const users = await userRepo
-  .createQueryBuilder("user")
-  .leftJoin("user.posts", "post")
-  .select(["user.id", "user.name", "post.id", "post.title"])
-  .getMany();
-// SELECT user.id, user.name, post.id, post.title FROM ...
+const tasks = await taskRepo
+  .createQueryBuilder("task")
+  .leftJoin("task.assignee", "user")
+  .leftJoin("task.tags", "tag")
+  .select([
+    "task.id",
+    "task.title",
+    "task.status",
+    "user.id",
+    "user.name",
+    "tag.id",
+    "tag.name",
+  ])
+  .where("task.projectId = :projectId", { projectId: 1 })
+  .getRawMany();
+// 返回原始数据: [{ task_id: 1, task_title: '...', user_name: '...', tag_name: '...' }, ...]
 ```
 
----
+## 分组聚合
+
+分组聚合查询是 Dashboard 统计的基础。
+
+### 基本聚合
+
+```typescript
+// 统计各状态的任务数
+const stats = await taskRepo
+  .createQueryBuilder("task")
+  .select("task.status", "status")
+  .addSelect("COUNT(*)", "count")
+  .where("task.projectId = :projectId", { projectId: 1 })
+  .groupBy("task.status")
+  .getRawMany();
+// SELECT task.status, COUNT(*) AS "count"
+// FROM tasks task
+// WHERE task.project_id = 1
+// GROUP BY task.status
+// 结果: [{ status: 'TODO', count: '15' }, { status: 'IN_PROGRESS', count: '8' }, ...]
+```
+
+### 多字段聚合
+
+```typescript
+// 统计每个项目各状态的任务数
+const stats = await taskRepo
+  .createQueryBuilder("task")
+  .leftJoin("task.project", "project")
+  .select("project.name", "projectName")
+  .addSelect("task.status", "status")
+  .addSelect("COUNT(*)", "count")
+  .groupBy("project.id, task.status")
+  .orderBy("project.name", "ASC")
+  .addOrderBy("task.status", "ASC")
+  .getRawMany();
+// 结果: [
+//   { projectName: '官网重构 v2.0', status: 'TODO', count: '5' },
+//   { projectName: '官网重构 v2.0', status: 'IN_PROGRESS', count: '3' },
+//   ...
+// ]
+```
+
+### HAVING 条件
+
+```typescript
+// 查询未完成任务数大于 10 的项目
+const projects = await taskRepo
+  .createQueryBuilder("task")
+  .leftJoin("task.project", "project")
+  .select("project.id", "projectId")
+  .addSelect("project.name", "projectName")
+  .addSelect("COUNT(*)", "taskCount")
+  .where("task.status != :status", { status: "COMPLETED" })
+  .groupBy("project.id")
+  .having("COUNT(*) > :min", { min: 10 })
+  .orderBy("taskCount", "DESC")
+  .getRawMany();
+// SELECT project.id, project.name, COUNT(*) AS "taskCount"
+// FROM tasks task
+// LEFT JOIN projects project ON project.id = task.project_id
+// WHERE task.status != 'COMPLETED'
+// GROUP BY project.id
+// HAVING COUNT(*) > 10
+// ORDER BY "taskCount" DESC
+```
+
+### 时间聚合
+
+```typescript
+// 统计每天的任务完成数
+import { Raw } from "typeorm";
+
+const dailyStats = await taskRepo
+  .createQueryBuilder("task")
+  .select("DATE(task.completed_at)", "date")
+  .addSelect("COUNT(*)", "count")
+  .where("task.status = :status", { status: "COMPLETED" })
+  .andWhere("task.completedAt IS NOT NULL")
+  .groupBy("DATE(task.completed_at)")
+  .orderBy("date", "DESC")
+  .limit(30)
+  .getRawMany();
+// 结果: [
+//   { date: '2026-03-15', count: '12' },
+//   { date: '2026-03-14', count: '8' },
+//   ...
+// ]
+```
 
 ## 子查询
 
-子查询在复杂查询中非常有用，例如"查询发布文章最多的用户"。
+子查询在复杂查询中非常有用，比如"查询有未完成任务的项目"。
 
 ### WHERE 中的子查询
 
 ```typescript
-// 查询有已发布文章的用户
-const users = await userRepo
-  .createQueryBuilder("user")
+// 查询有未完成任务的项目
+const projects = await projectRepo
+  .createQueryBuilder("project")
   .where((qb) => {
     const subQuery = qb
       .subQuery()
-      .select("post.authorId")
-      .from(Post, "post")
-      .where("post.status = :status")
+      .select("task.projectId")
+      .from(Task, "task")
+      .where("task.status != :status", { status: "COMPLETED" })
       .getQuery();
-    return "user.id IN " + subQuery;
+    return "project.id IN " + subQuery;
   })
-  .setParameter("status", "PUBLISHED")
   .getMany();
-// SELECT * FROM users user
-// WHERE user.id IN (
-//   SELECT post.author_id FROM posts post WHERE post.status = 'PUBLISHED'
+// SELECT * FROM projects project
+// WHERE project.id IN (
+//   SELECT task.project_id FROM tasks task WHERE task.status != 'COMPLETED'
 // )
 ```
 
 ### FROM 中的子查询
 
 ```typescript
-// 统计每个用户的文章数量
+// 统计每个项目的任务数，并按任务数排序
 const result = await dataSource
   .createQueryBuilder()
-  .select("summary.authorId", "authorId")
-  .addSelect("summary.postCount", "postCount")
-  .addSelect("user.name", "authorName")
+  .select("summary.projectId", "projectId")
+  .addSelect("summary.projectName", "projectName")
+  .addSelect("summary.taskCount", "taskCount")
   .from((subQuery) => {
     return subQuery
-      .select("post.authorId", "authorId")
-      .addSelect("COUNT(*)", "postCount")
-      .from(Post, "post")
-      .where("post.status = :status", { status: "PUBLISHED" })
-      .groupBy("post.authorId");
+      .select("project.id", "projectId")
+      .addSelect("project.name", "projectName")
+      .addSelect("COUNT(*)", "taskCount")
+      .from(Task, "task")
+      .leftJoin("task.project", "project")
+      .groupBy("project.id")
+      .getQuery();
   }, "summary")
-  .innerJoin(User, "user", "user.id = summary.authorId")
-  .orderBy("summary.postCount", "DESC")
+  .orderBy("summary.taskCount", "DESC")
   .getRawMany();
 ```
 
 ### SELECT 中的子查询
 
 ```typescript
-// 查询用户及其文章数量
-const users = await userRepo
-  .createQueryBuilder("user")
-  .leftJoin("user.posts", "post")
-  .select(["user.id", "user.name"])
-  .addSelect(
-    (subQuery) =>
-      subQuery.select("COUNT(*)").from(Post, "p").where("p.authorId = user.id"),
-    "postCount"
-  )
+// 查询项目及其任务数
+const projects = await projectRepo
+  .createQueryBuilder("project")
+  .leftJoinAndSelect("project.workspace", "workspace")
+  .select(["project.id", "project.name"])
+  .addSelect((subQuery) => {
+    return subQuery
+      .select("COUNT(*)")
+      .from(Task, "task")
+      .where("task.projectId = project.id")
+      .andWhere("task.status != :status", { status: "COMPLETED" });
+  }, "taskCount")
   .getRawMany();
-// SELECT user.id, user.name,
-//   (SELECT COUNT(*) FROM posts p WHERE p.author_id = user.id) AS "postCount"
-// FROM users user
+// SELECT project.id, project.name,
+//   (SELECT COUNT(*) FROM tasks task
+//    WHERE task.project_id = project.id
+//    AND task.status != 'COMPLETED') AS "taskCount"
+// FROM projects project
 ```
 
 ### EXISTS 子查询
 
 ```typescript
-// 查询有评论的用户
-const users = await userRepo
-  .createQueryBuilder("user")
+// 查询有紧急任务的项目
+const projects = await projectRepo
+  .createQueryBuilder("project")
   .where((qb) => {
     const subQuery = qb
       .subQuery()
       .select("1")
-      .from(Comment, "c")
-      .where("c.authorId = user.id")
+      .from(Task, "task")
+      .where("task.projectId = project.id")
+      .andWhere("task.priority = :priority", { priority: "URGENT" })
       .getQuery();
     return `EXISTS ${subQuery}`;
   })
   .getMany();
-// SELECT * FROM users user
-// WHERE EXISTS (SELECT 1 FROM comments c WHERE c.author_id = user.id)
+// SELECT * FROM projects project
+// WHERE EXISTS (
+//   SELECT 1 FROM tasks task
+//   WHERE task.project_id = project.id
+//   AND task.priority = 'URGENT'
+// )
 ```
 
----
+## 计数字段
 
-## 分组聚合
-
-### 基本聚合函数
+Query Builder 提供了一个便捷方法 loadRelationCountAndMap，用于计算关联关系的数量。
 
 ```typescript
-import { Raw } from "typeorm";
-
-// 统计各角色的用户数量
-const roleStats = await userRepo
-  .createQueryBuilder("user")
-  .select("user.role", "role")
-  .addSelect("COUNT(*)", "count")
-  .addSelect("MAX(user.createdAt)", "latestJoined")
-  .addSelect("MIN(user.createdAt)", "earliestJoined")
-  .groupBy("user.role")
-  .getRawMany();
-// 结果：[
-//   { role: 'ADMIN', count: '3', latestJoined: '...', earliestJoined: '...' },
-//   { role: 'EDITOR', count: '8', ... }
-// ]
-```
-
-### 文章统计
-
-```typescript
-// 每月文章发布统计
-const monthlyStats = await postRepo
-  .createQueryBuilder("post")
-  .select("DATE_TRUNC('month', post.publishedAt)", "month")
-  .addSelect("COUNT(*)", "postCount")
-  .addSelect("SUM(post.viewCount)", "totalViews")
-  .addSelect("AVG(post.viewCount)", "avgViews")
-  .where("post.status = :status", { status: "PUBLISHED" })
-  .groupBy("DATE_TRUNC('month', post.publishedAt)")
-  .having("COUNT(*) > :min", { min: 0 })
-  .orderBy("month", "DESC")
-  .getRawMany();
-// 结果：[
-//   { month: '2026-03-01', postCount: '15', totalViews: '12500', avgViews: '833' },
-//   { month: '2026-02-01', postCount: '12', ... }
-// ]
-```
-
-### 使用 loadRelationCountAndMap
-
-```typescript
-// 查询用户及其文章数量
-const users = await userRepo
-  .createQueryBuilder("user")
-  .leftJoin("user.posts", "post")
-  .loadRelationCountAndMap("user.postCount", "user.posts")
-  .loadRelationCountAndMap("user.publishedCount", "user.posts", "post", (qb) =>
-    qb.where("post.status = :status", { status: "PUBLISHED" })
+// 查询项目及其任务数
+const projects = await projectRepo
+  .createQueryBuilder("project")
+  .leftJoinAndSelect("project.workspace", "workspace")
+  .loadRelationCountAndMap("project.taskCount", "project.tasks")
+  .loadRelationCountAndMap(
+    "project.completedTaskCount",
+    "project.tasks",
+    "task",
+    (qb) => qb.where("task.status = :status", { status: "COMPLETED" })
   )
   .getMany();
-// 结果：[
-//   { id: 1, name: '张三', postCount: 5, publishedCount: 3 },
+// 结果: [
+//   {
+//     id: 1,
+//     name: '官网重构 v2.0',
+//     taskCount: 15,
+//     completedTaskCount: 8,
+//     workspace: { ... }
+//   },
 //   ...
 // ]
 ```
 
----
+这比子查询写法更简洁，而且性能也更好。
 
 ## 原始 SQL 查询
 
-### getRawMany / getRawOne
+当 QueryBuilder 也无法满足需求时，可以直接执行原始 SQL。
 
 ```typescript
-// 获取原始数据（不映射到实体）
-const rawUsers = await userRepo
-  .createQueryBuilder("user")
-  .select(["user.id", "user.name"])
-  .getRawMany();
-// 结果：[{ user_id: 1, user_name: '张三' }, ...]
-// 注意：字段名是 别名_列名 格式
-
-// 使用 AS 自定义字段名
-const result = await userRepo
-  .createQueryBuilder("user")
-  .select("user.name", "name")
-  .addSelect("user.email", "email")
-  .getRawMany();
-// 结果：[{ name: '张三', email: 'zhangsan@example.com' }, ...]
-```
-
-### 使用 DataSource 执行原始 SQL
-
-```typescript
-// 执行原始 SQL 查询
+// 执行原始 SQL
 const result = await dataSource.query(
-  "SELECT * FROM users WHERE is_active = $1",
-  [true]
-);
-
-// 执行原始 SQL（带类型）
-import { Raw } from "typeorm";
-
-const result = await dataSource
-  .createQueryBuilder()
-  .select("*")
-  .from(User, "user")
-  .where("user.isActive = :active", { active: true })
-  .getRawMany();
-
-// 使用 sql tag
-import { Sql } from "typeorm";
-
-const result = await dataSource.query(
-  `SELECT u.name, COUNT(p.id) as post_count
-   FROM users u
-   LEFT JOIN posts p ON p.author_id = u.id
-   GROUP BY u.name
-   HAVING COUNT(p.id) > $1`,
-  [5]
+  `SELECT
+    p.id,
+    p.name,
+    COUNT(t.id) as task_count,
+    COUNT(CASE WHEN t.status = 'COMPLETED' THEN 1 END) as completed_count
+  FROM projects p
+  LEFT JOIN tasks t ON t.project_id = p.id
+  WHERE p.workspace_id = $1
+  GROUP BY p.id
+  ORDER BY task_count DESC`,
+  [1]
 );
 ```
 
----
+但要注意，原始 SQL 失去了类型安全，而且容易引入 SQL 注入风险。只有在确实需要时才使用。
 
-## 搜索功能实现
+## 实战：Dashboard 查询服务
 
-### 基础搜索
-
-```typescript
-// 简单关键字搜索
-async function searchPosts(keyword: string) {
-  return postRepo
-    .createQueryBuilder("post")
-    .leftJoinAndSelect("post.author", "author")
-    .where("post.title ILIKE :keyword", { keyword: `%${keyword}%` })
-    .orWhere("post.content ILIKE :keyword", { keyword: `%${keyword}%` })
-    .orderBy("post.createdAt", "DESC")
-    .getMany();
-}
-```
-
-### 多字段搜索
+让我们整合上面的知识，实现一个 Dashboard 查询服务。
 
 ```typescript
-// 多字段加权搜索
-async function searchPostsWithScore(keyword: string) {
-  return postRepo
-    .createQueryBuilder("post")
-    .leftJoinAndSelect("post.author", "author")
-    .select([
-      "post.id",
-      "post.title",
-      "post.excerpt",
-      "post.publishedAt",
-      "author.id",
-      "author.name",
-    ])
-    .addSelect(
-      `
-      CASE
-        WHEN post.title ILIKE :keyword THEN 3
-        WHEN post.excerpt ILIKE :keyword THEN 2
-        WHEN post.content ILIKE :keyword THEN 1
-        ELSE 0
-      END`,
-      "searchScore"
-    )
-    .where(
-      new Brackets((qb) => {
-        qb.where("post.title ILIKE :keyword", { keyword: `%${keyword}%` })
-          .orWhere("post.excerpt ILIKE :keyword", { keyword: `%${keyword}%` })
-          .orWhere("post.content ILIKE :keyword", { keyword: `%${keyword}%` });
-      })
-    )
-    .andWhere("post.status = :status", { status: "PUBLISHED" })
-    .orderBy("searchScore", "DESC")
-    .addOrderBy("post.publishedAt", "DESC")
-    .limit(20)
-    .getRawMany();
-}
-```
+import { Injectable } from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { Repository, Brackets } from "typeorm";
+import { Task, TaskStatus } from "./entity/Task";
+import { Project } from "./entity/Project";
+import { Workspace } from "./entity/Workspace";
 
-### PostgreSQL 全文搜索
-
-```typescript
-// 使用 PostgreSQL 全文搜索
-async function fullTextSearch(keyword: string) {
-  return postRepo
-    .createQueryBuilder("post")
-    .select(["post.id", "post.title", "post.excerpt", "post.publishedAt"])
-    .addSelect(
-      `ts_headline('simple', post.content,
-        websearch_to_tsquery('simple', :keyword),
-        'MaxWords=50, MinWords=20')`,
-      "highlight"
-    )
-    .addSelect(
-      `ts_rank(
-        to_tsvector('simple', post.title || ' ' || post.content),
-        websearch_to_tsquery('simple', :keyword)
-      )`,
-      "rank"
-    )
-    .where(
-      `to_tsvector('simple', post.title || ' ' || post.content)
-       @@ websearch_to_tsquery('simple', :keyword)`
-    )
-    .andWhere("post.status = :status", { status: "PUBLISHED" })
-    .orderBy("rank", "DESC")
-    .limit(20)
-    .getRawMany();
-}
-```
-
----
-
-## INSERT / UPDATE / DELETE
-
-### INSERT
-
-```typescript
-// 使用 QueryBuilder 插入
-await dataSource
-  .createQueryBuilder()
-  .insert()
-  .into(User)
-  .values([
-    { name: "张三", email: "zhangsan@example.com" },
-    { name: "李四", email: "lisi@example.com" },
-  ])
-  .execute();
-
-// 带冲突处理（UPSERT）
-await dataSource
-  .createQueryBuilder()
-  .insert()
-  .into(User)
-  .values({ email: "test@example.com", name: "Test" })
-  .orUpdate(["name"], ["email"]) // 冲突时更新 name
-  .execute();
-// INSERT INTO users (email, name) VALUES (...)
-// ON CONFLICT (email) DO UPDATE SET name = EXCLUDED.name
-```
-
-### UPDATE
-
-```typescript
-// 使用 QueryBuilder 更新
-await dataSource
-  .createQueryBuilder()
-  .update(Post)
-  .set({ status: "PUBLISHED", publishedAt: new Date() })
-  .where("authorId = :authorId", { authorId: 1 })
-  .andWhere("status = :status", { status: "DRAFT" })
-  .execute();
-
-// 使用表达式更新
-await dataSource
-  .createQueryBuilder()
-  .update(Post)
-  .set({ viewCount: () => "view_count + 1" })
-  .where("id = :id", { id: 1 })
-  .execute();
-// UPDATE posts SET view_count = view_count + 1 WHERE id = 1
-```
-
-### DELETE
-
-```typescript
-// 使用 QueryBuilder 删除
-await dataSource
-  .createQueryBuilder()
-  .delete()
-  .from(Post)
-  .where("authorId = :authorId", { authorId: 1 })
-  .andWhere("status = :status", { status: "DRAFT" })
-  .execute();
-
-// 软删除
-await dataSource
-  .createQueryBuilder()
-  .softDelete()
-  .from(Post)
-  .where("id = :id", { id: 1 })
-  .execute();
-
-// 恢复
-await dataSource
-  .createQueryBuilder()
-  .restore()
-  .from(Post)
-  .where("id = :id", { id: 1 })
-  .execute();
-```
-
----
-
-## 查询结果映射
-
-### getMany vs getRawMany
-
-```typescript
-// getMany：映射到实体对象
-const users = await userRepo
-  .createQueryBuilder("user")
-  .leftJoinAndSelect("user.posts", "post")
-  .getMany();
-// [{ id: 1, name: '张三', posts: [{ id: 1, title: '...' }] }]
-
-// getRawMany：返回原始数据
-const rawResults = await userRepo
-  .createQueryBuilder("user")
-  .leftJoin("user.posts", "post")
-  .select(["user.id", "user.name", "post.title"])
-  .getRawMany();
-// [{ user_id: 1, user_name: '张三', post_title: '...' }]
-```
-
-### 自定义映射
-
-```typescript
-// 使用 getRawAndEntities
-const { raw, entities } = await userRepo
-  .createQueryBuilder("user")
-  .leftJoinAndSelect("user.posts", "post")
-  .addSelect("COUNT(post.id)", "postCount")
-  .groupBy("user.id")
-  .getRawAndEntities();
-// entities: 实体数组
-// raw: 原始数据数组（包含聚合字段）
-
-// 手动映射
-interface PostWithStats {
-  id: number;
-  title: string;
-  authorName: string;
-  commentCount: number;
-  tagNames: string[];
+interface DashboardStats {
+  workspaceSummary: WorkspaceSummary[];
+  projectSummary: ProjectSummary[];
+  taskStats: TaskStats;
+  recentTasks: Task[];
 }
 
-const posts: PostWithStats[] = await postRepo
-  .createQueryBuilder("post")
-  .leftJoin("post.author", "author")
-  .leftJoin("post.comments", "comment")
-  .select(["post.id AS id", "post.title AS title", "author.name AS authorName"])
-  .addSelect("COUNT(DISTINCT comment.id)", "commentCount")
-  .groupBy("post.id, author.name")
-  .getRawMany();
-```
+interface WorkspaceSummary {
+  workspaceId: number;
+  workspaceName: string;
+  projectCount: number;
+  taskCount: number;
+}
 
----
+interface ProjectSummary {
+  projectId: number;
+  projectName: string;
+  totalTasks: number;
+  completedTasks: number;
+  completionRate: number;
+}
 
-## 实战：文章搜索和统计 API
+interface TaskStats {
+  byStatus: Record<string, number>;
+  byPriority: Record<string, number>;
+  overdueCount: number;
+}
 
-```typescript
 @Injectable()
-export class PostQueryService {
+export class DashboardService {
   constructor(
-    @InjectRepository(Post)
-    private postRepo: Repository<Post>
+    @InjectRepository(Task)
+    private taskRepo: Repository<Task>,
+    @InjectRepository(Project)
+    private projectRepo: Repository<Project>
   ) {}
 
-  // 搜索文章
-  async search(params: {
-    keyword?: string;
-    status?: PostStatus;
-    authorId?: number;
-    tagId?: number;
-    page: number;
-    limit: number;
-  }) {
-    const { keyword, status, authorId, tagId, page, limit } = params;
+  async getDashboardStats(workspaceId: number): Promise<DashboardStats> {
+    const [workspaceSummary, projectSummary, taskStats, recentTasks] =
+      await Promise.all([
+        this.getWorkspaceSummary(workspaceId),
+        this.getProjectSummary(workspaceId),
+        this.getTaskStats(workspaceId),
+        this.getRecentTasks(workspaceId),
+      ]);
 
-    const qb = this.postRepo
-      .createQueryBuilder("post")
-      .leftJoinAndSelect("post.author", "author")
-      .leftJoinAndSelect("post.tags", "tag");
-
-    // 关键字搜索
-    if (keyword) {
-      qb.andWhere(
-        new Brackets((subQb) => {
-          subQb
-            .where("post.title ILIKE :kw", { kw: `%${keyword}%` })
-            .orWhere("post.content ILIKE :kw", { kw: `%${keyword}%` });
-        })
-      );
-    }
-
-    // 状态过滤
-    if (status) {
-      qb.andWhere("post.status = :status", { status });
-    }
-
-    // 作者过滤
-    if (authorId) {
-      qb.andWhere("post.authorId = :authorId", { authorId });
-    }
-
-    // 标签过滤
-    if (tagId) {
-      qb.andWhere("tag.id = :tagId", { tagId });
-    }
-
-    // 分页
-    qb.orderBy("post.createdAt", "DESC")
-      .skip((page - 1) * limit)
-      .take(limit);
-
-    const [data, total] = await qb.getManyAndCount();
-    return { data, total, page, limit };
+    return {
+      workspaceSummary,
+      projectSummary,
+      taskStats,
+      recentTasks,
+    };
   }
 
-  // 文章统计
-  async getStats() {
-    // 总览统计
-    const overview = await this.postRepo
-      .createQueryBuilder("post")
-      .select("post.status", "status")
-      .addSelect("COUNT(*)", "count")
-      .addSelect("SUM(post.viewCount)", "totalViews")
-      .groupBy("post.status")
-      .getRawMany();
-
-    // 热门文章
-    const topPosts = await this.postRepo
-      .createQueryBuilder("post")
-      .leftJoinAndSelect("post.author", "author")
-      .where("post.status = :status", { status: "PUBLISHED" })
-      .orderBy("post.viewCount", "DESC")
-      .limit(10)
+  async getWorkspaceSummary(workspaceId: number) {
+    const projects = await this.projectRepo
+      .createQueryBuilder("project")
+      .leftJoinAndSelect("project.workspace", "workspace")
+      .select(["project.id", "project.name", "workspace.id"])
+      .where("workspace.id = :workspaceId", { workspaceId })
       .getMany();
 
-    // 月度发布趋势
-    const monthlyTrend = await this.postRepo
-      .createQueryBuilder("post")
-      .select("DATE_TRUNC('month', post.publishedAt)", "month")
-      .addSelect("COUNT(*)", "count")
-      .where("post.status = :status", { status: "PUBLISHED" })
-      .groupBy("DATE_TRUNC('month', post.publishedAt)")
-      .orderBy("month", "DESC")
-      .limit(12)
+    const projectIds = projects.map((p) => p.id);
+
+    // 统计每个项目的任务数
+    const taskCounts = await this.taskRepo
+      .createQueryBuilder("task")
+      .select("task.projectId", "projectId")
+      .addSelect("COUNT(*)", "taskCount")
+      .where("task.projectId IN (:...projectIds)", { projectIds })
+      .groupBy("task.projectId")
       .getRawMany();
 
-    return { overview, topPosts, monthlyTrend };
+    const taskCountMap = taskCounts.reduce(
+      (acc, item) => {
+        acc[item.projectId] = parseInt(item.taskCount);
+        return acc;
+      },
+      {} as Record<number, number>
+    );
+
+    return projects.map((project) => ({
+      workspaceId,
+      workspaceName: project.workspace.name,
+      projectId: project.id,
+      projectName: project.name,
+      projectCount: 1,
+      taskCount: taskCountMap[project.id] || 0,
+    }));
+  }
+
+  async getProjectSummary(workspaceId: number) {
+    const stats = await this.taskRepo
+      .createQueryBuilder("task")
+      .leftJoin("task.project", "project")
+      .select("project.id", "projectId")
+      .addSelect("project.name", "projectName")
+      .addSelect("COUNT(*)", "totalTasks")
+      .addSelect(
+        "COUNT(CASE WHEN task.status = :completed THEN 1 END)",
+        "completedTasks"
+      )
+      .where("project.workspaceId = :workspaceId", { workspaceId })
+      .setParameter("completed", TaskStatus.COMPLETED)
+      .groupBy("project.id")
+      .getRawMany();
+
+    return stats.map((item) => {
+      const total = parseInt(item.totalTasks);
+      const completed = parseInt(item.completedTasks);
+      const rate = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+      return {
+        projectId: item.projectId,
+        projectName: item.projectName,
+        totalTasks: total,
+        completedTasks: completed,
+        completionRate: rate,
+      };
+    });
+  }
+
+  async getTaskStats(workspaceId: number) {
+    // 按状态统计
+    const byStatus = await this.taskRepo
+      .createQueryBuilder("task")
+      .leftJoin("task.project", "project")
+      .select("task.status", "status")
+      .addSelect("COUNT(*)", "count")
+      .where("project.workspaceId = :workspaceId", { workspaceId })
+      .groupBy("task.status")
+      .getRawMany();
+
+    const statusMap = byStatus.reduce(
+      (acc, item) => {
+        acc[item.status] = parseInt(item.count);
+        return acc;
+      },
+      {} as Record<string, number>
+    );
+
+    // 按优先级统计
+    const byPriority = await this.taskRepo
+      .createQueryBuilder("task")
+      .leftJoin("task.project", "project")
+      .select("task.priority", "priority")
+      .addSelect("COUNT(*)", "count")
+      .where("project.workspaceId = :workspaceId", { workspaceId })
+      .groupBy("task.priority")
+      .getRawMany();
+
+    const priorityMap = byPriority.reduce(
+      (acc, item) => {
+        acc[item.priority] = parseInt(item.count);
+        return acc;
+      },
+      {} as Record<string, number>
+    );
+
+    // 统计逾期任务
+    const overdueCount = await this.taskRepo
+      .createQueryBuilder("task")
+      .leftJoin("task.project", "project")
+      .where("project.workspaceId = :workspaceId", { workspaceId })
+      .andWhere("task.dueDate < :now", { now: new Date() })
+      .andWhere("task.status != :status", { status: TaskStatus.COMPLETED })
+      .getCount();
+
+    return {
+      byStatus: statusMap,
+      byPriority: priorityMap,
+      overdueCount,
+    };
+  }
+
+  async getRecentTasks(workspaceId: number, limit = 10) {
+    return this.taskRepo
+      .createQueryBuilder("task")
+      .leftJoinAndSelect("task.project", "project")
+      .leftJoinAndSelect("task.assignee", "user")
+      .leftJoinAndSelect("task.tags", "tag")
+      .where("project.workspaceId = :workspaceId", { workspaceId })
+      .orderBy("task.createdAt", "DESC")
+      .limit(limit)
+      .getMany();
   }
 }
 ```
 
----
+这个 Dashboard 查询服务展示了 QueryBuilder 的各种高级用法：JOIN、GROUP BY、CASE WHEN、子查询、计数等。它返回一个工作空间的完整统计数据：项目概览、任务统计、最近任务。
 
-## 最佳实践
+## Trade-off 分析
 
-### 1. 始终使用参数绑定
+QueryBuilder vs Repository.find 如何选择？
 
-```typescript
-// ✅ 安全：使用参数绑定
-qb.where("user.email = :email", { email: userInput });
+Repository.find 简单直观，对于基础查询（条件、排序、分页、关联加载）完全够用。而且代码更简洁，可读性更好。
 
-// ❌ 危险：SQL 注入风险
-qb.where(`user.email = '${userInput}'`);
-```
+QueryBuilder 表达能力更强，可以处理任意复杂的查询（JOIN、GROUP BY、子查询），但代码会更冗长。一个实用的经验法则是：能用 find 解决的就用 find，find 写不出来的（比如统计查询）再用 QueryBuilder。
 
-### 2. 合理使用 JOIN
+getMany vs getRawMany 如何选择？
 
-```typescript
-// ✅ 需要关联数据时使用 leftJoinAndSelect
-const users = await userRepo
-  .createQueryBuilder("user")
-  .leftJoinAndSelect("user.posts", "post")
-  .getMany();
+getMany 返回实体对象，字段名是驼峰命名（task.title），适合需要继续操作实体的场景。
 
-// ✅ 仅用于条件过滤时使用 leftJoin
-const users = await userRepo
-  .createQueryBuilder("user")
-  .leftJoin("user.posts", "post")
-  .where("post.status = :status", { status: "PUBLISHED" })
-  .getMany();
-```
-
-### 3. 避免笛卡尔积
-
-```typescript
-// ❌ 多个 one-to-many JOIN 会产生笛卡尔积
-qb.leftJoinAndSelect("user.posts", "post").leftJoinAndSelect(
-  "user.comments",
-  "comment"
-);
-// 如果用户有 10 篇文章和 20 条评论，结果会有 200 行
-
-// ✅ 分开查询或使用子查询
-const users = await userRepo
-  .createQueryBuilder("user")
-  .loadRelationCountAndMap("user.postCount", "user.posts")
-  .loadRelationCountAndMap("user.commentCount", "user.comments")
-  .getMany();
-```
-
-### 4. 调试技巧
-
-```typescript
-// 打印生成的 SQL
-const sql = qb.getSql();
-console.log(sql);
-
-// 打印带参数的 SQL
-console.log(qb.getQueryAndParameters());
-
-// 启用 SQL 日志
-const dataSource = new DataSource({
-  // ...
-  logging: true, // 打印所有 SQL
-  // 或只打印特定类型
-  // logging: ["query", "error"],
-});
-```
-
----
+getRawMany 返回原始数据，字段名是查询中定义的别名（taskTitle），适合只读查询和统计场景。原始数据性能稍好，但失去了类型安全。
 
 ## 总结
 
-### 核心要点
+这篇文章我们深入了 QueryBuilder 的各种用法：从基础的 WHERE、ORDER BY，到高级的 JOIN、GROUP BY、子查询。我们还实现了一个完整的 Dashboard 查询服务，展示了如何在实际项目中应用这些知识。
 
-1. **QueryBuilder 基础**
-   - 链式 API：`select` → `where` → `orderBy` → `getMany`
-   - 参数绑定防止 SQL 注入
-   - `Brackets` 用于复杂条件组合
-
-2. **JOIN 操作**
-   - `leftJoinAndSelect`：左连接并加载数据
-   - `innerJoinAndSelect`：内连接并加载数据
-   - `leftJoin` / `innerJoin`：仅用于条件过滤
-
-3. **子查询**
-   - WHERE 子查询：过滤条件
-   - FROM 子查询：派生表
-   - SELECT 子查询：计算字段
-
-4. **聚合统计**
-   - `groupBy` + `having`
-   - `loadRelationCountAndMap`
-   - 常用函数：COUNT、SUM、AVG、MAX、MIN
-
-5. **搜索实现**
-   - LIKE / ILIKE 模糊搜索
-   - PostgreSQL 全文搜索
-   - 加权排序
-
-### 下一步
-
-在下一篇文章中，我们将学习：
-
-- **数据库迁移**
-- TypeORM CLI 配置
-- 迁移文件结构
-- 生成、执行、回滚迁移
-- 数据种子（seeding）
-
-敬请期待！
+但还有一个重要问题没讲：当 Entity 定义改变后，数据库表结构怎么同步更新？直接用 synchronize: true 在生产环境是危险的。下一篇文章我们会讲数据库迁移，让你安全地管理数据库结构变更。
 
 ---
 
 ## 参考资源
 
-- [TypeORM QueryBuilder 文档](https://typeorm.io/select-query-builder)
-- [TypeORM JOIN 文档](https://typeorm.io/join-query-builder)
-- [PostgreSQL 全文搜索](https://www.postgresql.org/docs/current/textsearch.html)
-
----
+- [TypeORM Select Query Builder](https://typeorm.io/select-query-builder)
+- [TypeORM Join Query Builder](https://typeorm.io/join-query-builder)
+- [PostgreSQL Group By](https://www.postgresql.org/docs/current/sql-groupby.html)

@@ -9,90 +9,32 @@ series: "TypeORM 渐进式学习计划"
 seriesOrder: 8
 ---
 
-## 前言
+前面七篇文章我们学习了 TypeORM 的核心概念——从实体定义、关系映射、Repository 查询、QueryBuilder 高级查询、数据库迁移，到事务处理。但这些都是"知识点"，怎么把它们组装成一个真正能跑的项目呢？这一篇我们把这些知识整合到 NestJS 框架中，构建项目管理平台的任务模块。
 
-前面我们学习了 TypeORM 的核心概念和 API，现在让我们将所学知识整合到 NestJS 框架中，构建一个完整的博客 REST API。
+## NestJS 与 TypeORM 的集成方式
 
-**本篇你将学到**：
+NestJS 提供了 `@nestjs/typeorm` 包，让 TypeORM 的集成变得很简单。核心是两个模块配置：
 
-- `TypeOrmModule` 的配置（`forRoot` / `forFeature`）
-- 完整的 Posts 模块实现（Entity → DTO → Service → Controller）
-- DTO 验证（class-validator + class-transformer）
-- 统一响应格式（拦截器）
-- 异常过滤器
+- `TypeOrmModule.forRootAsync()`：配置数据库连接，在 AppModule 中全局注册
+- `TypeOrmModule.forFeature()`：注册特定模块使用的 Entity 和 Repository
 
----
-
-## 项目搭建
-
-### 创建 NestJS 项目
-
-```bash
-# 创建项目
-nest new typeorm-blog-api
-
-# 安装 TypeORM 相关依赖
-npm install @nestjs/typeorm typeorm pg
-npm install reflect-metadata
-
-# 安装验证和转换
-npm install class-validator class-transformer
-
-# 安装配置管理
-npm install @nestjs/config
-```
-
-### 项目结构
-
-```
-src/
-├── app.module.ts
-├── main.ts
-├── common/
-│   ├── filters/
-│   │   └── http-exception.filter.ts
-│   ├── interceptors/
-│   │   └── transform.interceptor.ts
-│   └── dto/
-│       └── pagination.dto.ts
-├── config/
-│   └── typeorm.config.ts
-├── modules/
-│   └── posts/
-│       ├── posts.module.ts
-│       ├── posts.controller.ts
-│       ├── posts.service.ts
-│       ├── entities/
-│       │   ├── post.entity.ts
-│       │   ├── category.entity.ts
-│       │   └── tag.entity.ts
-│       └── dto/
-│           ├── create-post.dto.ts
-│           └── update-post.dto.ts
-```
-
----
-
-## TypeOrmModule 配置
-
-### app.module.ts
+先看最基础的配置：
 
 ```typescript
 // src/app.module.ts
 import { Module } from "@nestjs/common";
 import { ConfigModule, ConfigService } from "@nestjs/config";
 import { TypeOrmModule } from "@nestjs/typeorm";
-import { PostsModule } from "./modules/posts/posts.module";
 
 @Module({
   imports: [
-    // 配置模块
+    // 环境变量配置
     ConfigModule.forRoot({
       isGlobal: true,
       envFilePath: `.env.${process.env.NODE_ENV || "development"}`,
     }),
 
-    // TypeORM 配置
+    // TypeORM 全局配置
     TypeOrmModule.forRootAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
@@ -102,508 +44,291 @@ import { PostsModule } from "./modules/posts/posts.module";
         port: configService.get<number>("DB_PORT", 5432),
         username: configService.get("DB_USERNAME", "postgres"),
         password: configService.get("DB_PASSWORD", "postgres"),
-        database: configService.get("DB_DATABASE", "typeorm_demo"),
+        database: configService.get("DB_DATABASE", "project_management"),
         entities: [__dirname + "/**/*.entity{.ts,.js}"],
         synchronize: configService.get("NODE_ENV") === "development",
         logging: configService.get("NODE_ENV") === "development",
-        autoLoadEntities: true,
       }),
     }),
-
-    PostsModule,
   ],
 })
 export class AppModule {}
 ```
 
-### 环境配置
+`useFactory` 允许我们从环境变量动态读取配置，而不是硬编码。这样开发、测试、生产环境可以用不同的数据库连接。
 
-```bash
-# .env.development
-DB_HOST=localhost
-DB_PORT=5432
-DB_USERNAME=postgres
-DB_PASSWORD=postgres
-DB_DATABASE=typeorm_demo
-NODE_ENV=development
-```
+## 定义 Entity
 
----
-
-## 实体定义
-
-### Post 实体
+先定义任务相关的实体。还是用我们的项目管理平台案例，工作空间 `ws_fe_8x9k2m` 里有项目，项目下有任务：
 
 ```typescript
-// src/modules/posts/entities/post.entity.ts
+// src/tasks/entities/task.entity.ts
 import {
   Entity,
   PrimaryGeneratedColumn,
   Column,
   CreateDateColumn,
   UpdateDateColumn,
-  DeleteDateColumn,
   ManyToOne,
   ManyToMany,
   JoinTable,
   Index,
 } from "typeorm";
-import { Category } from "./category.entity";
+import { Project } from "./project.entity";
+import { User } from "./user.entity";
 import { Tag } from "./tag.entity";
 
-export enum PostStatus {
-  DRAFT = "DRAFT",
-  PUBLISHED = "PUBLISHED",
-  ARCHIVED = "ARCHIVED",
+export enum TaskStatus {
+  TODO = "TODO",
+  IN_PROGRESS = "IN_PROGRESS",
+  DONE = "DONE",
+  CANCELLED = "CANCELLED",
 }
 
-@Entity("posts")
-@Index(["status", "publishedAt"])
-export class Post {
+export enum TaskPriority {
+  LOW = "LOW",
+  MEDIUM = "MEDIUM",
+  HIGH = "HIGH",
+  URGENT = "URGENT",
+}
+
+@Entity("tasks")
+@Index(["projectId", "status"])
+@Index(["assigneeId", "status"])
+export class Task {
   @PrimaryGeneratedColumn()
   id: number;
 
   @Column({ length: 255 })
   title: string;
 
-  @Column({ unique: true, length: 255 })
-  slug: string;
+  @Column({ type: "text", nullable: true })
+  description: string;
 
-  @Column({ nullable: true, length: 500 })
-  excerpt: string;
+  @Column({ name: "project_id" })
+  projectId: number;
 
-  @Column({ type: "text" })
-  content: string;
+  @ManyToOne(() => Project, { onDelete: "CASCADE" })
+  project: Project;
 
-  @Column({ nullable: true, name: "cover_image", length: 500 })
-  coverImage: string;
+  @Column({ name: "assignee_id", nullable: true })
+  assigneeId: number;
 
-  @Column({ name: "author_id" })
-  authorId: number;
+  @ManyToOne(() => User, { onDelete: "SET NULL", nullable: true })
+  assignee: User;
 
-  @ManyToOne(() => Category, { nullable: true, onDelete: "SET NULL" })
-  category: Category;
+  @Column({
+    type: "enum",
+    enum: TaskStatus,
+    default: TaskStatus.TODO,
+  })
+  status: TaskStatus;
 
-  @Column({ nullable: true })
-  categoryId: number;
+  @Column({
+    type: "enum",
+    enum: TaskPriority,
+    default: TaskPriority.MEDIUM,
+  })
+  priority: TaskPriority;
 
-  @ManyToMany(() => Tag, (tag) => tag.posts, { eager: true })
+  @ManyToMany(() => Tag, { eager: true })
   @JoinTable({
-    name: "post_tags",
-    joinColumn: { name: "post_id", referencedColumnName: "id" },
+    name: "task_tags",
+    joinColumn: { name: "task_id", referencedColumnName: "id" },
     inverseJoinColumn: { name: "tag_id", referencedColumnName: "id" },
   })
   tags: Tag[];
 
-  @Column({
-    type: "enum",
-    enum: PostStatus,
-    default: PostStatus.DRAFT,
-  })
-  status: PostStatus;
-
-  @Column({ default: 0, name: "view_count" })
-  viewCount: number;
-
-  @Column({ default: false, name: "is_featured" })
-  isFeatured: boolean;
-
-  @Column({ nullable: true, name: "published_at", type: "timestamptz" })
-  publishedAt: Date;
+  @Column({ name: "due_date", type: "timestamptz", nullable: true })
+  dueDate: Date;
 
   @CreateDateColumn({ name: "created_at" })
   createdAt: Date;
 
   @UpdateDateColumn({ name: "updated_at" })
   updatedAt: Date;
-
-  @DeleteDateColumn({ name: "deleted_at" })
-  deletedAt: Date;
 }
 ```
 
-### Category 实体
+注意 `@Index` 装饰器，我们在 `(projectId, status)` 和 `(assigneeId, status)` 上建了复合索引，这是为了优化常见的查询："查询某个项目下特定状态的任务"、"查询某人负责的特定状态的任务"。
+
+## 创建模块和注册 Repository
+
+接下来创建 Tasks 模块，注册 Entity 和注入 Repository：
 
 ```typescript
-// src/modules/posts/entities/category.entity.ts
-import {
-  Entity,
-  PrimaryGeneratedColumn,
-  Column,
-  CreateDateColumn,
-  OneToMany,
-} from "typeorm";
-import { Post } from "./post.entity";
+// src/tasks/tasks.module.ts
+import { Module } from "@nestjs/common";
+import { TypeOrmModule } from "@nestjs/typeorm";
+import { TasksController } from "./tasks.controller";
+import { TasksService } from "./tasks.service";
+import { Task } from "./entities/task.entity";
+import { Project } from "./entities/project.entity";
+import { User } from "./entities/user.entity";
+import { Tag } from "./entities/tag.entity";
 
-@Entity("categories")
-export class Category {
-  @PrimaryGeneratedColumn()
-  id: number;
-
-  @Column({ length: 100, unique: true })
-  name: string;
-
-  @Column({ length: 100, unique: true })
-  slug: string;
-
-  @Column({ type: "text", nullable: true })
-  description: string;
-
-  @OneToMany(() => Post, (post) => post.category)
-  posts: Post[];
-
-  @CreateDateColumn({ name: "created_at" })
-  createdAt: Date;
-}
+@Module({
+  imports: [TypeOrmModule.forFeature([Task, Project, User, Tag])],
+  controllers: [TasksController],
+  providers: [TasksService],
+  exports: [TasksService],
+})
+export class TasksModule {}
 ```
 
-### Tag 实体
+`TypeOrmModule.forFeature()` 会为这些 Entity 创建 Repository，然后我们可以在 Service 中通过 `@InjectRepository()` 注入。
 
 ```typescript
-// src/modules/posts/entities/tag.entity.ts
-import {
-  Entity,
-  PrimaryGeneratedColumn,
-  Column,
-  CreateDateColumn,
-  ManyToMany,
-} from "typeorm";
-import { Post } from "./post.entity";
+// src/tasks/tasks.service.ts
+import { Injectable, NotFoundException } from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { Repository, In } from "typeorm";
+import { Task, TaskStatus } from "./entities/task.entity";
+import { CreateTaskDto } from "./dto/create-task.dto";
+import { UpdateTaskDto } from "./dto/update-task.dto";
 
-@Entity("tags")
-export class Tag {
-  @PrimaryGeneratedColumn()
-  id: number;
+@Injectable()
+export class TasksService {
+  constructor(
+    @InjectRepository(Task)
+    private taskRepo: Repository<Task>
+  ) {}
 
-  @Column({ length: 50, unique: true })
-  name: string;
+  async create(createTaskDto: CreateTaskDto): Promise<Task> {
+    const task = this.taskRepo.create({
+      ...createTaskDto,
+      tags: createTaskDto.tagIds?.map((id) => ({ id })),
+    });
 
-  @Column({ length: 50, unique: true })
-  slug: string;
+    return this.taskRepo.save(task);
+  }
 
-  @ManyToMany(() => Post, (post) => post.tags)
-  posts: Post[];
+  async findAll(projectId: number, status?: TaskStatus) {
+    return this.taskRepo.find({
+      where: { projectId, status },
+      relations: ["assignee", "tags"],
+      order: { createdAt: "DESC" },
+    });
+  }
 
-  @CreateDateColumn({ name: "created_at" })
-  createdAt: Date;
-}
-```
+  async findOne(id: number): Promise<Task> {
+    const task = await this.taskRepo.findOne({
+      where: { id },
+      relations: ["project", "assignee", "tags"],
+    });
 
----
+    if (!task) {
+      throw new NotFoundException(`任务 #${id} 不存在`);
+    }
 
-## DTO 验证
+    return task;
+  }
 
-### 分页 DTO
+  async update(id: number, updateTaskDto: UpdateTaskDto): Promise<Task> {
+    const task = await this.findOne(id);
 
-```typescript
-// src/common/dto/pagination.dto.ts
-import { IsOptional, IsInt, Min, Max } from "class-validator";
-import { Type } from "class-transformer";
-import { ApiPropertyOptional } from "@nestjs/swagger";
+    if (updateTaskDto.tagIds) {
+      task.tags = updateTaskDto.tagIds.map((id) => ({ id })) as any;
+    }
 
-export class PaginationDto {
-  @ApiPropertyOptional({ default: 1 })
-  @IsOptional()
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  page: number = 1;
+    Object.assign(task, updateTaskDto);
 
-  @ApiPropertyOptional({ default: 10 })
-  @IsOptional()
-  @Type(() => Number)
-  @IsInt()
-  @Min(1)
-  @Max(100)
-  limit: number = 10;
+    return this.taskRepo.save(task);
+  }
 
-  @ApiPropertyOptional()
-  @IsOptional()
-  orderBy: string = "createdAt";
-
-  @ApiPropertyOptional({ enum: ["ASC", "DESC"] })
-  @IsOptional()
-  orderDirection: "ASC" | "DESC" = "DESC";
-
-  get skip(): number {
-    return (this.page - 1) * this.limit;
+  async remove(id: number): Promise<void> {
+    const task = await this.findOne(id);
+    await this.taskRepo.remove(task);
   }
 }
 ```
 
-### 创建文章 DTO
+## DTO 验证
+
+NestJS 推荐用 DTO 来验证请求数据，结合 `class-validator` 和 `class-transformer`，可以实现声明式的验证规则。
 
 ```typescript
-// src/modules/posts/dto/create-post.dto.ts
+// src/tasks/dto/create-task.dto.ts
 import {
   IsString,
+  IsNotEmpty,
   IsOptional,
   IsEnum,
-  IsArray,
   IsInt,
-  IsBoolean,
+  IsArray,
   MaxLength,
-  IsNotEmpty,
+  IsDateString,
 } from "class-validator";
+import { TaskStatus, TaskPriority } from "../entities/task.entity";
 
-export class CreatePostDto {
+export class CreateTaskDto {
   @IsString()
   @IsNotEmpty()
   @MaxLength(255)
   title: string;
 
   @IsString()
-  @IsNotEmpty()
-  @MaxLength(255)
-  slug: string;
-
-  @IsString()
   @IsOptional()
-  @MaxLength(500)
-  excerpt?: string;
-
-  @IsString()
-  @IsNotEmpty()
-  content: string;
-
-  @IsString()
-  @IsOptional()
-  coverImage?: string;
+  description?: string;
 
   @IsInt()
-  authorId: number;
+  projectId: number;
 
   @IsInt()
   @IsOptional()
-  categoryId?: number;
+  assigneeId?: number;
+
+  @IsEnum(TaskStatus)
+  @IsOptional()
+  status?: TaskStatus;
+
+  @IsEnum(TaskPriority)
+  @IsOptional()
+  priority?: TaskPriority;
 
   @IsArray()
   @IsInt({ each: true })
   @IsOptional()
   tagIds?: number[];
 
-  @IsEnum(["DRAFT", "PUBLISHED", "ARCHIVED"])
+  @IsDateString()
   @IsOptional()
-  status?: string;
-
-  @IsBoolean()
-  @IsOptional()
-  isFeatured?: boolean;
+  dueDate?: string;
 }
 ```
 
-### 更新文章 DTO
+然后在 `main.ts` 中全局启用 `ValidationPipe`：
 
 ```typescript
-// src/modules/posts/dto/update-post.dto.ts
-import { PartialType } from "@nestjs/swagger";
-import { CreatePostDto } from "./create-post.dto";
+// src/main.ts
+import { ValidationPipe } from "@nestjs/common";
+import { NestFactory } from "@nestjs/core";
+import { AppModule } from "./app.module";
 
-export class UpdatePostDto extends PartialType(CreatePostDto) {}
-```
+async function bootstrap() {
+  const app = await NestFactory.create(AppModule);
 
----
+  app.useGlobalPipes(
+    new ValidationPipe({
+      whitelist: true, // 过滤掉 DTO 中没有定义的属性
+      forbidNonWhitelisted: true, // 如果传入了未定义的属性，抛出错误
+      transform: true, // 自动转换类型（比如字符串 "123" 转为数字 123）
+    })
+  );
 
-## Service 层
-
-```typescript
-// src/modules/posts/posts.service.ts
-import {
-  Injectable,
-  NotFoundException,
-  ConflictException,
-} from "@nestjs/common";
-import { InjectRepository } from "@nestjs/typeorm";
-import { Repository, Like, ILike, In } from "typeorm";
-import { Post, PostStatus } from "./entities/post.entity";
-import { CreatePostDto } from "./dto/create-post.dto";
-import { UpdatePostDto } from "./dto/update-post.dto";
-import { PaginationDto } from "../../common/dto/pagination.dto";
-
-@Injectable()
-export class PostsService {
-  constructor(
-    @InjectRepository(Post)
-    private postRepo: Repository<Post>
-  ) {}
-
-  // 创建文章
-  async create(createPostDto: CreatePostDto): Promise<Post> {
-    // 检查 slug 是否已存在
-    const existing = await this.postRepo.findOneBy({
-      slug: createPostDto.slug,
-    });
-    if (existing) {
-      throw new ConflictException(`Slug "${createPostDto.slug}" 已被使用`);
-    }
-
-    const post = this.postRepo.create({
-      ...createPostDto,
-      status: (createPostDto.status as PostStatus) || PostStatus.DRAFT,
-      tags: createPostDto.tagIds?.map((id) => ({ id })),
-    });
-
-    // 如果发布，设置发布时间
-    if (post.status === PostStatus.PUBLISHED) {
-      post.publishedAt = new Date();
-    }
-
-    return this.postRepo.save(post);
-  }
-
-  // 查询文章列表（分页）
-  async findAll(pagination: PaginationDto) {
-    const { page, limit, skip, orderBy, orderDirection } = pagination;
-
-    const [data, total] = await this.postRepo.findAndCount({
-      skip,
-      take: limit,
-      order: { [orderBy]: orderDirection },
-      relations: ["category"],
-    });
-
-    return {
-      data,
-      total,
-      page,
-      limit,
-      totalPages: Math.ceil(total / limit),
-    };
-  }
-
-  // 查询已发布文章
-  async findPublished(pagination: PaginationDto) {
-    const { page, limit, skip, orderBy, orderDirection } = pagination;
-
-    const [data, total] = await this.postRepo.findAndCount({
-      where: { status: PostStatus.PUBLISHED },
-      skip,
-      take: limit,
-      order: { [orderBy]: orderDirection },
-      relations: ["category"],
-    });
-
-    return {
-      data,
-      total,
-      page,
-      limit,
-      totalPages: Math.ceil(total / limit),
-    };
-  }
-
-  // 搜索文章
-  async search(keyword: string, pagination: PaginationDto) {
-    const { page, limit, skip } = pagination;
-
-    const qb = this.postRepo
-      .createQueryBuilder("post")
-      .leftJoinAndSelect("post.category", "category")
-      .leftJoinAndSelect("post.tags", "tag")
-      .where("post.status = :status", { status: PostStatus.PUBLISHED })
-      .andWhere(
-        "(post.title ILIKE :kw OR post.content ILIKE :kw OR post.excerpt ILIKE :kw)",
-        { kw: `%${keyword}%` }
-      )
-      .orderBy("post.publishedAt", "DESC")
-      .skip(skip)
-      .take(limit);
-
-    const [data, total] = await qb.getManyAndCount();
-
-    return {
-      data,
-      total,
-      page,
-      limit,
-      totalPages: Math.ceil(total / limit),
-    };
-  }
-
-  // 查询单篇文章
-  async findOne(id: number): Promise<Post> {
-    const post = await this.postRepo.findOne({
-      where: { id },
-      relations: ["category", "tags"],
-    });
-
-    if (!post) {
-      throw new NotFoundException(`文章 #${id} 不存在`);
-    }
-
-    return post;
-  }
-
-  // 通过 slug 查询
-  async findBySlug(slug: string): Promise<Post> {
-    const post = await this.postRepo.findOne({
-      where: { slug },
-      relations: ["category", "tags"],
-    });
-
-    if (!post) {
-      throw new NotFoundException(`文章 "${slug}" 不存在`);
-    }
-
-    return post;
-  }
-
-  // 更新文章
-  async update(id: number, updatePostDto: UpdatePostDto): Promise<Post> {
-    const post = await this.findOne(id);
-
-    // 如果 slug 被修改，检查唯一性
-    if (updatePostDto.slug && updatePostDto.slug !== post.slug) {
-      const existing = await this.postRepo.findOneBy({
-        slug: updatePostDto.slug,
-      });
-      if (existing) {
-        throw new ConflictException(`Slug "${updatePostDto.slug}" 已被使用`);
-      }
-    }
-
-    // 更新标签
-    if (updatePostDto.tagIds) {
-      post.tags = updatePostDto.tagIds.map((id) => ({ id })) as any;
-    }
-
-    // 如果从草稿变为发布，设置发布时间
-    if (
-      updatePostDto.status === PostStatus.PUBLISHED &&
-      post.status !== PostStatus.PUBLISHED &&
-      !post.publishedAt
-    ) {
-      post.publishedAt = new Date();
-    }
-
-    Object.assign(post, {
-      ...updatePostDto,
-      tags: post.tags,
-      publishedAt: post.publishedAt,
-    });
-
-    return this.postRepo.save(post);
-  }
-
-  // 增加浏览量
-  async incrementViewCount(id: number): Promise<void> {
-    await this.postRepo.increment({ id }, "viewCount", 1);
-  }
-
-  // 软删除文章
-  async remove(id: number): Promise<void> {
-    const post = await this.findOne(id);
-    await this.postRepo.softRemove(post);
-  }
+  await app.listen(3000);
 }
+bootstrap();
 ```
 
----
+这样如果客户端传入了 `{ title: '新任务', priority: 'INVALID' }`，ValidationPipe 会自动返回 400 错误，提示 `priority must be one of: LOW, MEDIUM, HIGH, URGENT`。
 
 ## Controller 层
 
+Controller 负责处理 HTTP 请求，调用 Service，返回响应。
+
 ```typescript
-// src/modules/posts/posts.controller.ts
+// src/tasks/tasks.controller.ts
 import {
   Controller,
   Get,
@@ -617,341 +342,378 @@ import {
   HttpCode,
   HttpStatus,
 } from "@nestjs/common";
-import { PostsService } from "./posts.service";
-import { CreatePostDto } from "./dto/create-post.dto";
-import { UpdatePostDto } from "./dto/update-post.dto";
-import { PaginationDto } from "../../common/dto/pagination.dto";
+import { TasksService } from "./tasks.service";
+import { CreateTaskDto } from "./dto/create-task.dto";
+import { UpdateTaskDto } from "./dto/update-task.dto";
 
-@Controller("posts")
-export class PostsController {
-  constructor(private readonly postsService: PostsService) {}
+@Controller("tasks")
+export class TasksController {
+  constructor(private readonly tasksService: TasksService) {}
 
-  // POST /posts - 创建文章
   @Post()
   @HttpCode(HttpStatus.CREATED)
-  async create(@Body() createPostDto: CreatePostDto) {
-    const post = await this.postsService.create(createPostDto);
+  async create(@Body() createTaskDto: CreateTaskDto) {
+    const task = await this.tasksService.create(createTaskDto);
     return {
       success: true,
-      data: post,
-      message: "文章创建成功",
+      data: task,
     };
   }
 
-  // GET /posts - 查询所有文章（管理用）
   @Get()
-  async findAll(@Query() pagination: PaginationDto) {
-    const result = await this.postsService.findAll(pagination);
-    return {
-      success: true,
-      data: result,
-    };
-  }
-
-  // GET /posts/published - 查询已发布文章
-  @Get("published")
-  async findPublished(@Query() pagination: PaginationDto) {
-    const result = await this.postsService.findPublished(pagination);
-    return {
-      success: true,
-      data: result,
-    };
-  }
-
-  // GET /posts/search?keyword=xxx - 搜索文章
-  @Get("search")
-  async search(
-    @Query("keyword") keyword: string,
-    @Query() pagination: PaginationDto
+  async findAll(
+    @Query("projectId", ParseIntPipe) projectId: number,
+    @Query("status") status?: string
   ) {
-    const result = await this.postsService.search(keyword, pagination);
+    const tasks = await this.tasksService.findAll(projectId, status as any);
     return {
       success: true,
-      data: result,
+      data: tasks,
     };
   }
 
-  // GET /posts/slug/:slug - 通过 slug 查询
-  @Get("slug/:slug")
-  async findBySlug(@Param("slug") slug: string) {
-    const post = await this.postsService.findBySlug(slug);
-    // 增加浏览量（异步执行，不阻塞响应）
-    this.postsService.incrementViewCount(post.id);
-    return {
-      success: true,
-      data: post,
-    };
-  }
-
-  // GET /posts/:id - 查询单篇文章
   @Get(":id")
   async findOne(@Param("id", ParseIntPipe) id: number) {
-    const post = await this.postsService.findOne(id);
+    const task = await this.tasksService.findOne(id);
     return {
       success: true,
-      data: post,
+      data: task,
     };
   }
 
-  // PUT /posts/:id - 更新文章
   @Put(":id")
   async update(
     @Param("id", ParseIntPipe) id: number,
-    @Body() updatePostDto: UpdatePostDto
+    @Body() updateTaskDto: UpdateTaskDto
   ) {
-    const post = await this.postsService.update(id, updatePostDto);
+    const task = await this.tasksService.update(id, updateTaskDto);
     return {
       success: true,
-      data: post,
-      message: "文章更新成功",
+      data: task,
     };
   }
 
-  // DELETE /posts/:id - 删除文章
   @Delete(":id")
   @HttpCode(HttpStatus.NO_CONTENT)
   async remove(@Param("id", ParseIntPipe) id: number) {
-    await this.postsService.remove(id);
+    await this.tasksService.remove(id);
   }
 }
 ```
 
----
+`ParseIntPipe` 会自动把路径参数从字符串转为数字，如果转换失败（比如 `/tasks/abc`）会返回 400 错误。
 
-## 统一响应格式
+## 在事务中创建任务
 
-### 响应拦截器
+上一篇文章我们学习了事务，现在把它集成到 NestJS 中。比如创建任务时需要关联标签、记录活动日志、更新项目统计：
 
 ```typescript
-// src/common/interceptors/transform.interceptor.ts
-import {
-  Injectable,
-  NestInterceptor,
-  ExecutionContext,
-  CallHandler,
-} from "@nestjs/common";
-import { Observable, map } from "rxjs";
-
-export interface Response<T> {
-  success: boolean;
-  data: T;
-  message?: string;
-}
+// src/tasks/tasks.service.ts
+import { Injectable, NotFoundException } from "@nestjs/common";
+import { InjectRepository } from "@nestjs/typeorm";
+import { DataSource, Repository, In } from "typeorm";
+import { Task } from "./entities/task.entity";
+import { ActivityLog } from "./entities/activity-log.entity";
+import { Project } from "./entities/project.entity";
 
 @Injectable()
-export class TransformInterceptor<T> implements NestInterceptor<
-  T,
-  Response<T>
-> {
-  intercept(
-    context: ExecutionContext,
-    next: CallHandler
-  ): Observable<Response<T>> {
-    return next.handle().pipe(
-      map((data) => {
-        // 如果已经是标准格式，直接返回
-        if (data?.success !== undefined) {
-          return data;
-        }
-        return {
-          success: true,
-          data,
-        };
-      })
-    );
-  }
-}
-```
+export class TasksService {
+  constructor(
+    @InjectRepository(Task)
+    private taskRepo: Repository<Task>,
+    private dataSource: DataSource // 注入 DataSource
+  ) {}
 
-### 异常过滤器
+  async createWithTransaction(createTaskDto: CreateTaskDto): Promise<Task> {
+    return this.dataSource.transaction(async (manager) => {
+      // 创建任务
+      const task = manager.create(Task, {
+        ...createTaskDto,
+        tags: createTaskDto.tagIds?.map((id) => ({ id })),
+      });
+      await manager.save(task);
 
-```typescript
-// src/common/filters/http-exception.filter.ts
-import {
-  ExceptionFilter,
-  Catch,
-  ArgumentsHost,
-  HttpException,
-  HttpStatus,
-} from "@nestjs/common";
-import { Response } from "express";
+      // 记录活动日志
+      await manager.save(ActivityLog, {
+        workspaceId: createTaskDto.workspaceId,
+        action: "TASK_CREATED",
+        entityType: "TASK",
+        entityId: task.id,
+        userId: createTaskDto.creatorId,
+      });
 
-@Catch()
-export class AllExceptionsFilter implements ExceptionFilter {
-  catch(exception: unknown, host: ArgumentsHost) {
-    const ctx = host.switchToHttp();
-    const response = ctx.getResponse<Response>();
+      // 更新项目统计
+      await manager.increment(
+        Project,
+        { id: createTaskDto.projectId },
+        "taskCount",
+        1
+      );
 
-    let status = HttpStatus.INTERNAL_SERVER_ERROR;
-    let message = "服务器内部错误";
-
-    if (exception instanceof HttpException) {
-      status = exception.getStatus();
-      const exceptionResponse = exception.getResponse();
-      message =
-        typeof exceptionResponse === "string"
-          ? exceptionResponse
-          : (exceptionResponse as any).message || exception.message;
-    }
-
-    response.status(status).json({
-      success: false,
-      statusCode: status,
-      message: Array.isArray(message) ? message : [message],
-      timestamp: new Date().toISOString(),
+      return task;
     });
   }
 }
 ```
 
-### main.ts 配置
+注意这里注入了 `DataSource` 而不是 Repository，因为事务需要通过 `manager` 来操作，而不是普通的 Repository。
+
+## 自定义 Repository
+
+如果有一些通用的查询逻辑，可以封装到自定义 Repository 中：
 
 ```typescript
-// src/main.ts
-import { NestFactory } from "@nestjs/core";
-import { ValidationPipe } from "@nestjs/common";
-import { AppModule } from "./app.module";
-import { TransformInterceptor } from "./common/interceptors/transform.interceptor";
-import { AllExceptionsFilter } from "./common/filters/http-exception.filter";
+// src/tasks/repositories/task.repository.ts
+import { EntityRepository, Repository } from "typeorm";
+import { Task, TaskStatus } from "../entities/task.entity";
 
-async function bootstrap() {
-  const app = await NestFactory.create(AppModule);
+@EntityRepository(Task)
+export class TaskRepository extends Repository<Task> {
+  // 查询逾期任务
+  async findOverdueTasks(projectId: number): Promise<Task[]> {
+    return this.createQueryBuilder("task")
+      .where("task.projectId = :projectId", { projectId })
+      .andWhere("task.dueDate < :now", { now: new Date() })
+      .andWhere("task.status NOT IN (:...completedStatuses)", {
+        completedStatuses: [TaskStatus.DONE, TaskStatus.CANCELLED],
+      })
+      .leftJoinAndSelect("task.assignee", "assignee")
+      .orderBy("task.dueDate", "ASC")
+      .getMany();
+  }
 
-  // 全局验证管道
-  app.useGlobalPipes(
-    new ValidationPipe({
-      whitelist: true, // 过滤掉 DTO 中没有的属性
-      forbidNonWhitelisted: true, // 禁止传入 DTO 中没有的属性
-      transform: true, // 自动类型转换
-      transformOptions: {
-        enableImplicitConversion: true,
+  // 统计各状态的任务数
+  async countByStatus(projectId: number): Promise<Record<TaskStatus, number>> {
+    const result = await this.createQueryBuilder("task")
+      .select("task.status", "status")
+      .addSelect("COUNT(*)", "count")
+      .where("task.projectId = :projectId", { projectId })
+      .groupBy("task.status")
+      .getRawMany();
+
+    return result.reduce(
+      (acc, { status, count }) => {
+        acc[status] = parseInt(count, 10);
+        return acc;
       },
-    })
-  );
-
-  // 全局响应拦截器
-  app.useGlobalInterceptors(new TransformInterceptor());
-
-  // 全局异常过滤器
-  app.useGlobalFilters(new AllExceptionsFilter());
-
-  // CORS
-  app.enableCors();
-
-  // API 前缀
-  app.setGlobalPrefix("api");
-
-  await app.listen(3000);
-  console.log("应用已启动：http://localhost:3000/api");
+      {} as Record<TaskStatus, number>
+    );
+  }
 }
-bootstrap();
 ```
 
----
-
-## Posts 模块注册
+然后在模块中注册自定义 Repository：
 
 ```typescript
-// src/modules/posts/posts.module.ts
+// src/tasks/tasks.module.ts
 import { Module } from "@nestjs/common";
 import { TypeOrmModule } from "@nestjs/typeorm";
-import { PostsController } from "./posts.controller";
-import { PostsService } from "./posts.service";
-import { Post } from "./entities/post.entity";
-import { Category } from "./entities/category.entity";
-import { Tag } from "./entities/tag.entity";
+import { TaskRepository } from "./repositories/task.repository";
 
 @Module({
-  imports: [TypeOrmModule.forFeature([Post, Category, Tag])],
-  controllers: [PostsController],
-  providers: [PostsService],
-  exports: [PostsService],
+  imports: [TypeOrmModule.forFeature([Task])],
+  providers: [
+    {
+      provide: "TaskRepository",
+      useClass: TaskRepository,
+    },
+    TasksService,
+  ],
 })
-export class PostsModule {}
+export class TasksModule {}
 ```
 
----
+在 Service 中注入使用：
 
-## API 接口测试
+```typescript
+// src/tasks/tasks.service.ts
+@Injectable()
+export class TasksService {
+  constructor(
+    @Inject("TaskRepository")
+    private taskRepo: TaskRepository
+  ) {}
 
-```bash
-# 创建文章
-curl -X POST http://localhost:3000/api/posts \
-  -H "Content-Type: application/json" \
-  -d '{
-    "title": "TypeORM 入门",
-    "slug": "typeorm-introduction",
-    "content": "这是一篇关于 TypeORM 的入门文章...",
-    "authorId": 1,
-    "categoryId": 1,
-    "tagIds": [1, 2],
-    "status": "PUBLISHED"
-  }'
-
-# 响应
-# {
-#   "success": true,
-#   "data": { "id": 1, "title": "TypeORM 入门", ... },
-#   "message": "文章创建成功"
-# }
-
-# 查询文章列表
-curl http://localhost:3000/api/posts?page=1&limit=10
-
-# 搜索文章
-curl http://localhost:3000/api/posts/search?keyword=TypeORM
-
-# 通过 slug 查询
-curl http://localhost:3000/api/posts/slug/typeorm-introduction
-
-# 更新文章
-curl -X PUT http://localhost:3000/api/posts/1 \
-  -H "Content-Type: application/json" \
-  -d '{
-    "title": "TypeORM 入门（已更新）",
-    "content": "更新后的内容..."
-  }'
-
-# 删除文章
-curl -X DELETE http://localhost:3000/api/posts/1
+  async getOverdueTasks(projectId: number) {
+    return this.taskRepo.findOverdueTasks(projectId);
+  }
+}
 ```
 
----
+不过要注意，TypeORM 0.3.x 版本推荐使用"扩展 Repository"的方式，而不是继承：
 
-## 总结
+```typescript
+// src/tasks/repositories/task.repository.ts
+import { Repository } from "typeorm";
+import { Task } from "../entities/task.entity";
+import { CustomRepository } from "../decorators/custom-repository.decorator";
 
-### 核心要点
+@CustomRepository(Task)
+export class TaskRepository extends Repository<Task> {
+  // 同上的方法
+}
 
-1. **TypeOrmModule 配置**
-   - `forRoot()`：全局数据库连接
-   - `forFeature()`：模块级 Repository 注册
-   - 使用 `ConfigService` 管理环境变量
+// src/tasks/decorators/custom-repository.decorator.ts
+export function CustomRepository(entity: Function) {
+  return function (target: Function) {
+    // 注册自定义 Repository 的逻辑
+  };
+}
+```
 
-2. **完整模块结构**
-   - Entity：数据模型
-   - DTO：数据验证
-   - Service：业务逻辑
-   - Controller：路由处理
+## Entity 到 DTO 的转换
 
-3. **DTO 验证**
-   - `class-validator`：字段验证
-   - `class-transformer`：类型转换
-   - `ValidationPipe`：全局验证管道
+直接把 Entity 返回给客户端不是好主意，可能会泄露内部字段（比如 deletedAt），或者包含不必要的关联数据。推荐用专门的响应 DTO。
 
-4. **统一响应**
-   - 拦截器：包装成功响应
-   - 异常过滤器：统一错误格式
+```typescript
+// src/tasks/dto/task-response.dto.ts
+import { Task } from "../entities/task.entity";
 
-### 下一步
+export class TaskResponseDto {
+  id: number;
+  title: string;
+  description: string | null;
+  status: string;
+  priority: string;
+  dueDate: Date | null;
+  assignee: {
+    id: number;
+    name: string;
+    email: string;
+  } | null;
+  tags: Array<{
+    id: number;
+    name: string;
+    color: string;
+  }>;
+  createdAt: Date;
+  updatedAt: Date;
 
-在下一篇文章中，我们将学习：
+  static fromEntity(task: Task): TaskResponseDto {
+    return {
+      id: task.id,
+      title: task.title,
+      description: task.description,
+      status: task.status,
+      priority: task.priority,
+      dueDate: task.dueDate,
+      assignee: task.assignee
+        ? {
+            id: task.assignee.id,
+            name: task.assignee.name,
+            email: task.assignee.email,
+          }
+        : null,
+      tags: task.tags.map((tag) => ({
+        id: tag.id,
+        name: tag.name,
+        color: tag.color,
+      })),
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
+    };
+  }
+}
+```
 
-- **JWT 认证与授权**
-- User 和 RefreshToken 实体设计
-- Passport + JWT 策略
-- 角色权限和资源级访问控制
+在 Service 中转换后再返回：
 
-敬请期待！
+```typescript
+// src/tasks/tasks.service.ts
+async findOne(id: number): Promise<TaskResponseDto> {
+  const task = await this.taskRepo.findOne({
+    where: { id },
+    relations: ['assignee', 'tags'],
+  });
+
+  if (!task) {
+    throw new NotFoundException(`任务 #${id} 不存在`);
+  }
+
+  return TaskResponseDto.fromEntity(task);
+}
+```
+
+或者用 `class-transformer` 的 `@Exclude()` 装饰器自动过滤字段：
+
+```typescript
+// src/tasks/entities/task.entity.ts
+import { Entity, PrimaryGeneratedColumn, Column } from "typeorm";
+import { Exclude } from "class-transformer";
+
+@Entity("tasks")
+export class Task {
+  @PrimaryGeneratedColumn()
+  id: number;
+
+  @Column()
+  title: string;
+
+  @Exclude()
+  @Column({ name: "internal_notes", nullable: true })
+  internalNotes: string;
+}
+```
+
+然后在 Controller 中用 `classToPlain` 转换：
+
+```typescript
+import { classToPlain } from 'class-transformer';
+
+@Get(':id')
+async findOne(@Param('id', ParseIntPipe) id: number) {
+  const task = await this.tasksService.findOne(id);
+  return classToPlain(task);
+}
+```
+
+## 模块化设计
+
+随着业务变复杂，单个模块会变得臃肿。可以按业务域拆分子模块：
+
+```typescript
+src/
+├── tasks/
+│   ├── tasks.module.ts
+│   ├── tasks.controller.ts
+│   ├── tasks.service.ts
+│   ├── entities/
+│   ├── dto/
+│   └── repositories/
+├── projects/
+│   ├── projects.module.ts
+│   ├── projects.controller.ts
+│   └── ...
+└── workspaces/
+    ├── workspaces.module.ts
+    ├── workspaces.controller.ts
+    └── ...
+```
+
+模块之间通过 `imports` 和 `exports` 协作：
+
+```typescript
+// src/tasks/tasks.module.ts
+@Module({
+  imports: [ProjectsModule], // 如果需要访问 Project
+  providers: [TasksService],
+  exports: [TasksService], // 导出给其他模块使用
+})
+export class TasksModule {}
+```
+
+## Trade-off 分析
+
+NestJS 和 TypeORM 的集成很自然，但也有一些设计选择需要权衡。
+
+- **forFeature vs 手动注册**：`TypeOrmModule.forFeature()` 自动注册 Repository，简单但不够灵活；手动注册可以自定义 Repository，但需要额外代码。大多数场景用 forFeature 就够了。
+- **Entity 直接返回 vs DTO 转换**：直接返回 Entity 简单快速，但可能泄露字段；DTO 转换更安全，但需要手写转换逻辑。可以用 `class-transformer` 简化这个过程。
+- **全局 ValidationPipe vs 局部 Pipe**：全局 Pipe 统一验证，但可能影响所有接口；局部 Pipe 精细控制，但重复代码多。推荐全局启用，特殊情况用局部 Pipe 覆盖。
+- **模块拆分粒度**：细粒度模块职责清晰，但模块间通信复杂；粗粒度模块简单，但容易变成大泥球。按业务域拆分通常是好的起点。
+
+TypeORM 和 NestJS 的集成方案已经比较成熟，大部分场景照着官方文档做就行。关键是要理解背后的原理——依赖注入、模块系统、装饰器——这样遇到问题时才能快速定位。
+
+下一篇我们聊性能优化，看看如何让查询跑得更快，如何避免 N+1 问题，如何调优连接池。
 
 ---
 
@@ -960,5 +722,3 @@ curl -X DELETE http://localhost:3000/api/posts/1
 - [NestJS TypeORM 文档](https://docs.nestjs.com/techniques/database)
 - [NestJS Validation 文档](https://docs.nestjs.com/techniques/validation)
 - [class-validator 文档](https://github.com/typestack/class-validator)
-
----

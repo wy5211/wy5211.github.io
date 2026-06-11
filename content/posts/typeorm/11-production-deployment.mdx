@@ -1,5 +1,5 @@
 ---
-title: "11. 生产部署：Docker + CI/CD"
+title: "11. 生产部署：从开发到生产"
 date: "2026-03-29"
 tags: ["TypeORM"]
 category: "typeorm"
@@ -9,56 +9,70 @@ series: "TypeORM 渐进式学习计划"
 seriesOrder: 11
 ---
 
-## 前言
+在上一篇文章中，我们给项目加上了测试——Repository 集成测试验证 SQL 正确性，Service 单元测试验证业务逻辑，E2E 测试验证 API 的完整流程。有了这些测试，每次改动代码时都能快速发现是否引入了问题。
 
-经过前面 11 篇的学习，我们已经掌握了 TypeORM 的核心知识。最后一篇，我们将把博客系统部署到生产环境，并回顾全系列的知识要点。
+但测试只是在开发环境中运行，真正的挑战是生产环境。你肯定遇到过这种情况：本地跑得好好的，一部署就出问题——数据库连不上、迁移执行失败、端口被占用、环境变量没传过去……这些问题很常见，但也很烦人。
 
-**本篇你将学到**：
+这篇文章的目标是让项目从"本地能跑"变成"生产能用"。我们会讨论：
 
-- Docker 容器化（多阶段构建）
-- Docker Compose 编排
-- CI/CD 自动迁移
-- 健康检查
-- 全系列知识回顾
+1. **Docker 容器化**——把应用和数据库打包成容器，保证开发、测试、生产环境一致
+2. **环境变量管理**——不同环境用不同的配置，敏感信息不能写死在代码里
+3. **数据库迁移**——生产环境的表结构变更必须通过迁移，不能手改
+4. **健康检查**——监控应用和数据库的状态，出问题能及时发现
+5. **日志和监控**——生产环境的日志要能帮你快速定位问题
 
----
+这些内容不是为了追求"完美的生产环境"，而是给你一个"能用的起点"。你可以在此基础上根据项目需求继续优化。
 
-## Docker 容器化
+## Docker 容器化：让环境一致
 
-### 多阶段构建 Dockerfile
+Docker 的核心价值是"一次构建，到处运行"。你在本地打包的 Docker 镜像，在测试服务器、生产服务器上跑起来是完全一样的——不会出现"我本地是好的，怎么到你这就不行了"这种问题。
+
+Docker 有两个层面：
+
+1. **Dockerfile**——定义单个应用的镜像（比如 NestJS 应用）
+2. **Docker Compose**——编排多个应用（比如 App + PostgreSQL）
+
+先看 Dockerfile。一个生产级的 Dockerfile 通常用"多阶段构建"——构建阶段用完整的 Node 镜像（能编译 TypeScript），运行阶段用精简的 Alpine 镜像（体积小、攻击面小）：
 
 ```dockerfile
 # Dockerfile
 
-# ========== 构建阶段 ==========
-FROM node:20-alpine AS builder
+# ========== 阶段 1：构建 ==========
+FROM node:22-alpine AS builder
 
+# 设置工作目录
 WORKDIR /app
 
-# 安装依赖
+# 先复制 package.json，利用 Docker 缓存
+# 只要 package.json 不变，这一层就不会重新执行
 COPY package*.json ./
+
+# 安装依赖（包括 devDependencies，因为要编译 TypeScript）
 RUN npm ci
 
 # 复制源代码
 COPY . .
 
-# 构建 TypeScript
+# 编译 TypeScript
 RUN npm run build
 
-# ========== 生产阶段 ==========
-FROM node:20-alpine AS production
+# ========== 阶段 2：生产运行 ==========
+FROM node:22-alpine AS production
 
 WORKDIR /app
 
 # 设置环境变量
 ENV NODE_ENV=production
 
-# 只安装生产依赖
+# 只复制生产依赖（devDependencies 不会被打包进来）
 COPY package*.json ./
 RUN npm ci --only=production
 
 # 从构建阶段复制编译后的代码
 COPY --from=builder /app/dist ./dist
+
+# 复制迁移文件（生产环境需要执行迁移）
+COPY -from=builder /app/migrations ./migrations
 
 # 暴露端口
 EXPOSE 3000
@@ -67,41 +81,62 @@ EXPOSE 3000
 CMD ["node", "dist/main.js"]
 ```
 
-### .dockerignore
+这个 Dockerfile 的几个细节：
 
-```
+1. **用 Alpine 镜像**——`node:22-alpine` 比 `node:22` 小很多（100MB vs 900MB），下载和部署都更快
+2. **npm ci 而不是 npm install**——`ci` 是"clean install"的缩写，它会严格按照 package-lock.json 安装，更可预测
+3. **多阶段构建**——最终的镜像不包含 TypeScript 源码和 devDependencies，体积小、安全性高
+4. **复制迁移文件**——生产环境需要 migrations 目录来执行数据库迁移
+
+接下来是 `.dockerignore`，告诉 Docker 哪些文件不需要打包：
+
+```dockerignore
+# .dockerignore
+
+# 依赖目录（重新安装）
 node_modules
+
+# 编译产物（重新构建）
 dist
+
+# Git 文件
 .git
+.gitignore
+
+# 环境变量文件（包含敏感信息）
 .env
-*.md
+.env.local
+.env.*.local
+
+# 测试和文档
 test
 coverage
+*.md
+
+# IDE 配置
+.vscode
+.idea
 ```
 
----
-
-## Docker Compose 编排
-
-### 开发环境
+然后是 Docker Compose，用于编排多个容器。开发环境和生产环境的需求不同，通常写两个文件：
 
 ```yaml
-# docker-compose.dev.yml
+# docker-compose.dev.yml（开发环境）
 version: "3.8"
 
 services:
   # PostgreSQL 数据库
   postgres:
     image: postgres:16-alpine
-    container_name: typeorm_blog_db
+    container_name: pm_platform_db_dev
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: typeorm_blog
+      POSTGRES_DB: pm_platform_dev
     ports:
-      - "5432:5432"
+      - "5432:5432" # 暴露端口，方便本地连接工具（如 pgAdmin）
     volumes:
-      - pg_data:/var/lib/postgresql/data
+      - pg_dev_data:/var/lib/postgresql/data # 数据持久化
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 5s
@@ -113,9 +148,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-      target: builder
-    container_name: typeorm_blog_app
-    command: npm run start:dev
+      target: builder # 停留在构建阶段，支持热重载
+    container_name: pm_platform_app_dev
+    command: npm run start:dev # 开发模式，支持热重载
     ports:
       - "3000:3000"
     environment:
@@ -123,37 +158,34 @@ services:
       DB_PORT: 5432
       DB_USERNAME: postgres
       DB_PASSWORD: postgres
-      DB_DATABASE: typeorm_blog
+      DB_DATABASE: pm_platform_dev
       NODE_ENV: development
-      JWT_SECRET: dev-secret-key
     depends_on:
       postgres:
-        condition: service_healthy
+        condition: service_healthy # 等数据库健康检查通过后再启动
     volumes:
-      - .:/app
-      - /app/node_modules
+      - .:/app # 挂载源代码，实现热重载
+      - /app/node_modules # 防止本地的 node_modules 覆盖容器内的
 
 volumes:
-  pg_data:
+  pg_dev_data:
 ```
 
-### 生产环境
-
 ```yaml
-# docker-compose.prod.yml
+# docker-compose.prod.yml（生产环境）
 version: "3.8"
 
 services:
   postgres:
     image: postgres:16-alpine
-    container_name: typeorm_blog_db_prod
+    container_name: pm_platform_db_prod
     environment:
       POSTGRES_USER: ${DB_USERNAME}
       POSTGRES_PASSWORD: ${DB_PASSWORD}
       POSTGRES_DB: ${DB_DATABASE}
     volumes:
-      - pg_data:/var/lib/postgresql/data
-    restart: always
+      - pg_prod_data:/var/lib/postgresql/data
+    restart: always # 自动重启
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME}"]
       interval: 10s
@@ -166,7 +198,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: typeorm_blog_app_prod
+    container_name: pm_platform_app_prod
     ports:
       - "3000:3000"
     environment:
@@ -184,10 +216,10 @@ services:
     networks:
       - app-network
 
-  # Nginx 反向代理
+  # Nginx 反向代理（可选）
   nginx:
     image: nginx:alpine
-    container_name: typeorm_blog_nginx
+    container_name: pm_platform_nginx
     ports:
       - "80:80"
     volumes:
@@ -203,13 +235,28 @@ networks:
     driver: bridge
 
 volumes:
-  pg_data:
+  pg_prod_data:
 ```
 
-### Nginx 配置
+开发环境和生产环境的主要区别：
+
+1. **开发环境**：
+   - 暴露数据库端口，方便本地连接工具调试
+   - 挂载源代码，支持热重载
+   - 不用 Nginx，直接访问应用端口
+   - 用固定的开发密码
+
+2. **生产环境**：
+   - 不暴露数据库端口，只通过应用访问
+   - 用环境变量传递敏感信息
+   - 加 Nginx 反向代理，处理静态文件和负载均衡
+   - 所有服务设置 `restart: always`，崩溃自动重启
+
+Nginx 配置文件示例：
 
 ```nginx
 # nginx.conf
+
 events {
     worker_connections 1024;
 }
@@ -232,7 +279,7 @@ http {
             proxy_set_header X-Forwarded-Proto $scheme;
         }
 
-        # 健康检查
+        # 健康检查（不用认证）
         location /health {
             proxy_pass http://app;
         }
@@ -240,11 +287,210 @@ http {
 }
 ```
 
----
+## 环境变量管理：敏感信息不能写死
 
-## CI/CD 自动迁移
+生产环境有很多敏感信息——数据库密码、JWT 密钥、第三方 API 密钥。这些不能写死在代码里，否则一旦代码泄露，密钥就泄露了。
 
-### GitHub Actions 配置
+通常的做法是用 `.env` 文件（开发环境）和环境变量注入（生产环境）：
+
+```env
+# .env（开发环境，提交到 Git）
+
+# 数据库配置
+DB_HOST=localhost
+DB_PORT=5432
+DB_USERNAME=postgres
+DB_PASSWORD=postgres
+DB_DATABASE=pm_platform_dev
+
+# 应用配置
+PORT=3000
+NODE_ENV=development
+
+# JWT 配置
+JWT_SECRET=dev-secret-key-do-not-use-in-production
+JWT_EXPIRES_IN=7d
+```
+
+```env
+# .env.example（提交到 Git，作为模板）
+
+# 数据库配置
+DB_HOST=
+DB_PORT=5432
+DB_USERNAME=
+DB_PASSWORD=
+DB_DATABASE=
+
+# 应用配置
+PORT=3000
+NODE_ENV=
+
+# JWT 配置
+JWT_SECRET=
+JWT_EXPIRES_IN=
+```
+
+```env
+# .env.production（生产环境，不提交到 Git）
+
+DB_HOST=postgres
+DB_PORT=5432
+DB_USERNAME=pm_user
+DB_PASSWORD=strong_random_password_here
+DB_DATABASE=pm_platform_prod
+
+PORT=3000
+NODE_ENV=production
+
+JWT_SECRET=another_strong_random_secret
+JWT_EXPIRES_IN=7d
+```
+
+在 NestJS 中，用 `@nestjs/config` 模块来管理环境变量：
+
+```typescript
+// src/config/app.config.ts
+export default () => ({
+  port: parseInt(process.env.PORT, 10) || 3000,
+  nodeEnv: process.env.NODE_ENV || "development",
+
+  database: {
+    host: process.env.DB_HOST,
+    port: parseInt(process.env.DB_PORT, 10) || 5432,
+    username: process.env.DB_USERNAME,
+    password: process.env.DB_PASSWORD,
+    database: process.env.DB_DATABASE,
+  },
+
+  jwt: {
+    secret: process.env.JWT_SECRET,
+    expiresIn: process.env.JWT_EXPIRES_IN || "7d",
+  },
+});
+```
+
+```typescript
+// src/app.module.ts
+import { ConfigModule } from "@nestjs/config";
+import appConfig from "./config/app.config";
+
+@Module({
+  imports: [
+    ConfigModule.forRoot({
+      isGlobal: true,
+      load: [appConfig],
+      envFilePath: [".env.local", ".env"], // 优先加载 .env.local
+    }),
+    // ...
+  ],
+})
+export class AppModule {}
+```
+
+```typescript
+// src/database/database.module.ts
+import { Module } from "@nestjs/common";
+import { TypeOrmModule } from "@nestjs/typeorm";
+import { ConfigService } from "@nestjs/config";
+
+@Module({
+  imports: [
+    TypeOrmModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        type: "postgres",
+        host: config.get("database.host"),
+        port: config.get("database.port"),
+        username: config.get("database.username"),
+        password: config.get("database.password"),
+        database: config.get("database.database"),
+        entities: [__dirname + "/../**/*.entity{.ts,.js}"],
+        synchronize: false, // 生产环境必须关闭
+        migrations: [__dirname + "/../migrations/*{.ts,.js}"],
+        logging: config.get("nodeEnv") === "development", // 只在开发环境打印 SQL
+      }),
+    }),
+  ],
+})
+export class DatabaseModule {}
+```
+
+## 数据库迁移：生产环境必须规范
+
+在开发环境中，我们用了 `synchronize: true` 让 TypeORM 自动同步表结构。但这在生产环境是绝对禁止的——自动同步可能会删除列、丢失数据，而且无法追溯变更历史。
+
+生产环境的表结构变更必须通过迁移（Migration）：
+
+```bash
+# 1. 生成迁移文件（根据 Entity 变更）
+npm run migration:generate -- src/migrations/AddTaskPriorityColumn
+
+# 2. 检查生成的迁移文件，确认 SQL 正确
+# src/migrations/timestamp-AddTaskPriorityColumn.ts
+
+# 3. 在测试环境执行迁移，验证没问题
+npm run migration:run
+
+# 4. 如果有问题，可以回滚
+npm run migration:revert
+
+# 5. 确认无误后，在生产环境执行迁移
+npm run migration:run
+```
+
+一个典型的迁移文件：
+
+```typescript
+// src/migrations/1704096000000-AddTaskPriorityColumn.ts
+import { MigrationInterface, QueryRunner, Table, TableIndex } from "typeorm";
+
+export class AddTaskPriorityColumn1704096000000 implements MigrationInterface {
+  public async up(queryRunner: QueryRunner): Promise<void> {
+    // 添加 priority 列
+    await queryRunner.query(`
+      ALTER TABLE "tasks"
+      ADD COLUMN "priority" varchar(20)
+    `);
+
+    // 设置默认值
+    await queryRunner.query(`
+      UPDATE "tasks"
+      SET "priority" = 'medium'
+      WHERE "priority" IS NULL
+    `);
+
+    // 添加 NOT NULL 约束
+    await queryRunner.query(`
+      ALTER TABLE "tasks"
+      ALTER COLUMN "priority" SET NOT NULL
+    `);
+
+    // 添加索引
+    await queryRunner.createIndex(
+      "tasks",
+      new TableIndex({
+        name: "IDX_TASK_PRIORITY",
+        columnNames: ["priority"],
+      })
+    );
+  }
+
+  public async down(queryRunner: QueryRunner): Promise<void>> {
+    // 删除索引
+    await queryRunner.dropIndex("tasks", "IDX_TASK_PRIORITY");
+
+    // 删除列
+    await queryRunner.query(`
+      ALTER TABLE "tasks"
+      DROP COLUMN "priority"
+    `);
+  }
+}
+```
+
+在 CI/CD 流程中，迁移通常在部署前自动执行：
 
 ```yaml
 # .github/workflows/deploy.yml
@@ -255,67 +501,15 @@ on:
     branches: [main]
 
 jobs:
-  test:
+  deploy:
     runs-on: ubuntu-latest
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_DB: test_db
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-          cache: "npm"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Run lint
-        run: npm run lint
-
-      - name: Run unit tests
-        run: npm run test:cov
-        env:
-          DB_HOST: localhost
-          DB_PORT: 5432
-          DB_USERNAME: postgres
-          DB_PASSWORD: postgres
-          DB_DATABASE: test_db
-
-      - name: Run E2E tests
-        run: npm run test:e2e
-        env:
-          DB_HOST: localhost
-          DB_PORT: 5432
-          DB_USERNAME: postgres
-          DB_PASSWORD: postgres
-          DB_DATABASE: test_db
-
-  migrate:
-    needs: test
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install dependencies
         run: npm ci
@@ -332,34 +526,27 @@ jobs:
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_DATABASE: ${{ secrets.DB_DATABASE }}
 
-  deploy:
-    needs: migrate
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build and push Docker image
+      - name: Deploy to production
+        # 部署逻辑（比如 SSH 到服务器、拉取镜像、重启容器）
         run: |
-          docker build -t typeorm-blog:latest .
-          docker tag typeorm-blog:latest typeorm-blog:${{ github.sha }}
-
-      # 推送到容器仓库并部署
-      # ...
+          # ...
 ```
 
----
+## 健康检查：及时发现问题
 
-## 健康检查
+生产环境出问题时，越早发现越好。健康检查（Health Check）就是定期检查应用和依赖服务的状态，出问题时及时报警。
 
-### 健康检查模块
+NestJS 推荐用 `@nestjs/terminus` 包来实现健康检查：
+
+```bash
+npm install @nestjs/terminus
+```
 
 ```typescript
-// src/modules/health/health.module.ts
+// src/health/health.module.ts
 import { Module } from "@nestjs/common";
 import { TerminusModule } from "@nestjs/terminus";
-import { TypeOrmModule } from "@nestjs/typeorm";
 import { HealthController } from "./health.controller";
-import { TypeOrmHealthIndicator } from "@nestjs/terminus";
 
 @Module({
   imports: [TerminusModule],
@@ -369,7 +556,7 @@ export class HealthModule {}
 ```
 
 ```typescript
-// src/modules/health/health.controller.ts
+// src/health/health.controller.ts
 import { Controller, Get } from "@nestjs/common";
 import {
   HealthCheck,
@@ -377,7 +564,6 @@ import {
   HealthCheckResult,
   TypeOrmHealthIndicator,
   MemoryHealthIndicator,
-  DiskHealthIndicator,
 } from "@nestjs/terminus";
 
 @Controller("health")
@@ -385,31 +571,29 @@ export class HealthController {
   constructor(
     private health: HealthCheckService,
     private db: TypeOrmHealthIndicator,
-    private memory: MemoryHealthIndicator,
-    private disk: DiskHealthIndicator
+    private memory: MemoryHealthIndicator
   ) {}
 
   @Get()
   @HealthCheck()
   async check(): Promise<HealthCheckResult> {
     return this.health.check([
-      // 数据库连接检查
+      // 数据库连接检查（3 秒超时）
       () => this.db.pingCheck("database", { timeout: 3000 }),
 
-      // 内存检查（堆内存不超过 150MB）
+      // 堆内存检查（不超过 150MB）
       () => this.memory.checkHeap("memory_heap", 150 * 1024 * 1024),
 
-      // RSS 内存检查
+      // RSS 内存检查（不超过 150MB）
       () => this.memory.checkRSS("memory_rss", 150 * 1024 * 1024),
     ]);
   }
 }
 ```
 
-### 健康检查响应
+访问 `GET /health` 会返回：
 
 ```json
-// GET /health
 {
   "status": "ok",
   "info": {
@@ -438,162 +622,208 @@ export class HealthController {
 }
 ```
 
----
+如果数据库挂了，返回会是这样：
 
-## 全系列回顾
-
-### 架构总结
-
-```
-┌─────────────────────────────────────────────────┐
-│                   NestJS 应用                     │
-├─────────────────────────────────────────────────┤
-│  Controller (路由)                               │
-│    ├── DTO 验证（class-validator）               │
-│    ├── Guards（认证授权）                         │
-│    ├── Interceptors（响应转换）                   │
-│    └── Filters（异常处理）                        │
-├─────────────────────────────────────────────────┤
-│  Service (业务逻辑)                              │
-│    ├── 事务管理                                   │
-│    ├── 业务规则                                   │
-│    └── 数据转换                                   │
-├─────────────────────────────────────────────────┤
-│  Repository (数据访问)                            │
-│    ├── find / findOne (简单查询)                  │
-│    ├── QueryBuilder (复杂查询)                    │
-│    ├── save / insert (创建)                       │
-│    ├── update (更新)                              │
-│    └── delete / softDelete (删除)                │
-├─────────────────────────────────────────────────┤
-│  Entity (数据模型)                                │
-│    ├── @Entity (表定义)                           │
-│    ├── @Column (列定义)                           │
-│    ├── @ManyToOne / @OneToMany (关系)             │
-│    ├── @Index (索引)                              │
-│    └── @BeforeInsert (生命周期钩子)               │
-├─────────────────────────────────────────────────┤
-│  Database (PostgreSQL)                           │
-│    ├── 迁移管理                                    │
-│    ├── 连接池                                      │
-│    └── 查询缓存                                    │
-└─────────────────────────────────────────────────┘
+```json
+{
+  "status": "error",
+  "info": {
+    "memory_heap": {
+      "status": "up"
+    }
+  },
+  "error": {
+    "database": {
+      "status": "down",
+      "message": "Connection refused"
+    }
+  }
+}
 ```
 
-### 知识点回顾
+你可以用监控工具（如 UptimeRobot、Datadog）定期访问 `/health` 端点，发现问题时发送报警。
 
-| 篇章 | 主题            | 核心知识点                                         |
-| ---- | --------------- | -------------------------------------------------- |
-| 01   | 快速入门        | DataSource、Active Record vs Data Mapper、环境搭建 |
-| 02   | 实体定义        | @Entity、@Column、主键策略、索引、软删除、监听器   |
-| 03   | 关系映射        | @OneToOne、@ManyToOne、@ManyToMany、级联、加载策略 |
-| 04   | Repository CRUD | FindOptions、FindOperator、分页封装                |
-| 05   | QueryBuilder    | JOIN、子查询、分组聚合、搜索、原始 SQL             |
-| 06   | 数据库迁移      | CLI 配置、QueryRunner API、种子数据、CI/CD         |
-| 07   | 事务处理        | DataSource.transaction、QueryRunner、隔离级别、锁  |
-| 08   | NestJS 集成     | TypeOrmModule、Service/Controller、DTO 验证        |
-| 09   | JWT 认证        | User 实体、Passport JWT、角色权限、资源级控制      |
-| 10   | 性能优化        | N+1 解决、连接池、批量操作、缓存、索引策略         |
-| 11   | 测试策略        | 内存数据库、Mock、单元/集成/E2E 测试               |
-| 12   | 生产部署        | Docker、CI/CD、健康检查                            |
+## 日志管理：快速定位问题
 
-### 最佳实践清单
+生产环境的日志要能帮你快速定位问题，而不是输出一堆没用的信息。
+
+TypeORM 的日志配置：
+
+```typescript
+// src/database/database.module.ts
+TypeOrmModule.forRootAsync({
+  useFactory: (config: ConfigService) => ({
+    // ...
+    logging: config.get('nodeEnv') === 'development'
+      ? ['error', 'warn', 'query', 'slow']
+      : ['error', 'warn'],  // 生产环境只记录错误和警告
+    maxQueryExecutionTime: 1000,  // 超过 1 秒的查询会被记录为 slow
+  }),
+}),
+```
+
+生产环境的日志应该：
+
+1. **记录错误和警告**——包括数据库连接失败、查询超时、死锁等
+2. **记录慢查询**——超过阈值的查询要记录，方便优化
+3. **结构化日志**——用 JSON 格式，方便日志工具（如 ELK、Splunk）解析
+4. **日志级别可配置**——开发环境 DEBUG，生产环境 INFO 或 WARN
+5. **避免敏感信息**——不要记录密码、token 等敏感数据
+
+## 系列回顾：TypeORM 学习路径
+
+到这里，TypeORM 系列的 11 篇文章就全部结束了。我们从一个简单的"为什么选 TypeORM"开始，逐步构建了一个完整的 SaaS 项目管理平台的数据层，最后完成了测试和生产部署。
+
+让我回顾一下整个系列的学习路径：
+
+**基础篇（01-03）**——建立对 TypeORM 的直觉
+
+- 第 01 篇：TypeORM 快速入门
+  - 为什么选 TypeORM（vs Prisma vs Drizzle）
+  - Active Record vs Data Mapper
+  - 第一个 Entity 和 Repository
+
+- 第 02 篇：实体定义与数据建模
+  - @Column、@Entity 装饰器详解
+  - 主键策略、索引、约束
+  - 软删除、监听器、嵌入式实体
+
+- 第 03 篇：关系映射
+  - @OneToOne、@ManyToOne、@ManyToMany
+  - 级联操作、加载策略
+  - 自引用关系
+
+**核心篇（04-07）**——深入 SaaS 项目管理平台案例
+
+- 第 04 篇：Repository 与 CRUD
+  - find 选项详解、FindOperator
+  - 分页查询、批量操作
+  - save vs insert vs update
+
+- 第 05 篇：QueryBuilder 高级查询
+  - JOIN、子查询、分组聚合
+  - 统计类查询、复杂搜索
+  - QueryBuilder vs find
+
+- 第 06 篇：数据库迁移
+  - 为什么不能用 synchronize
+  - 迁移文件生成、执行、回滚
+  - 数据迁移策略
+
+- 第 07 篇：事务处理
+  - DataSource.transaction、QueryRunner
+  - 隔离级别、乐观锁、悲观锁
+  - 事务的最佳实践
+
+**进阶篇（08-09）**——框架集成与性能优化
+
+- 第 08 篇：NestJS 集成实战
+  - TypeOrmModule 配置
+  - Entity、Repository、Service、Controller 的组装
+  - DTO 验证、模块化设计
+
+- 第 09 篇：性能优化
+  - N+1 查询问题及解决方案
+  - 连接池调优、批量操作
+  - 索引策略、查询缓存
+
+**实战篇（10-11）**——测试与部署
+
+- 第 10 篇：测试策略
+  - SQLite 内存数据库测试
+  - Repository 集成测试、Service 单元测试、E2E 测试
+  - 测试工厂、测试覆盖率
+
+- 第 11 篇：生产部署（本篇）
+  - Docker 容器化、Docker Compose 编排
+  - 环境变量管理、数据库迁移
+  - 健康检查、日志管理
+
+## 最佳实践总结
+
+经过这 11 篇文章的实践，我总结了几个 TypeORM 的最佳实践：
 
 **实体设计**：
 
-- 使用 Data Mapper 模式
-- snake_case 数据库列名
-- 敏感字段 `select: false`
-- 使用枚举而非魔法字符串
-- 实体监听器处理密码加密等逻辑
+- 用 Data Mapper 模式，不要把业务逻辑塞进 Entity
+- 数据库列名用 snake_case，TypeScript 属性用 camelCase
+- 敏感字段（如密码）设置 `select: false`
+- 用枚举代替魔法字符串
+- 用 `@BeforeInsert` 等监听器处理数据预处理
 
 **查询优化**：
 
-- 避免 N+1 查询
-- 只查询需要的字段（select）
-- 合理使用 JOIN 和索引
-- 使用分页限制结果集
+- 避免 N+1 查询，用 `relations` 或 `leftJoinAndSelect`
+- 只查需要的字段，用 `select` 精确控制
+- 合理使用索引，但要避免过度索引（影响写入性能）
+- 分页查询用 `findAndCount`，一次返回数据和总数
 
 **事务管理**：
 
-- 事务保持简短
-- 不在事务中执行耗时操作
-- 选择合适的锁策略
-- 正确处理冲突
+- 事务保持简短，不要在事务中调外部 API
+- 根据场景选择合适的隔离级别
+- 高并发场景用乐观锁，低并发用悲观锁
+- 嵌套事务要谨慎，避免死锁
+
+**迁移策略**：
+
+- 生产环境永远不要用 `synchronize: true`
+- 每次表结构变更都要生成迁移文件
+- 迁移前先备份数据库
+- 大表迁移要分批执行，避免长时间锁表
+
+**测试策略**：
+
+- Repository 层测复杂查询，简单 CRUD 不测
+- Service 层重点测业务逻辑，用 Mock 隔离数据库
+- E2E 测试只测核心 API，不需要覆盖所有边界
+- 测试覆盖率目标是 70%-80%，不是 100%
 
 **部署运维**：
 
-- 生产环境禁用 synchronize
-- 使用迁移管理表结构
-- 配置连接池和缓存
-- 设置健康检查和监控
+- 用 Docker 保证环境一致性
+- 敏感信息用环境变量，不要写死在代码里
+- 配置健康检查，及时发现问题
+- 日志要结构化，方便检索和分析
 
----
+## 下一步可以学什么
 
-## 进阶学习方向
+TypeORM 系列结束了，但数据库相关的学习还有很多方向：
 
-### 1. 深入数据库
+**深入数据库**：
 
 - PostgreSQL 高级特性（窗口函数、CTE、物化视图）
-- 数据库分库分表
-- 读写分离
+- 数据库分库分表、读写分离
+- 数据库性能调优（执行计划、统计信息、 Vacuum）
 
-### 2. 微服务架构
+**微服务架构**：
 
 - TypeORM 在微服务中的使用
 - 分布式事务（Saga 模式）
-- 事件驱动架构
+- 事件驱动架构（Event Sourcing + CQRS）
 
-### 3. 其他 ORM 对比
+**其他 ORM 对比**：
 
-- Prisma 深入学习
-- Drizzle ORM（Edge Computing）
-- Kysely（类型安全查询构建器）
+- Prisma 的类型生成和 Schema 管理
+- Drizzle ORM 的 Edge Computing 支持
+- Kysely 的类型安全查询构建器
 
-### 4. 周边工具
+**实战项目**：
 
-- TypeORM Schema Viewer（可视化 ER 图）
-- TypeORM Schema to GraphQL
-- TypeORM View Entity（数据库视图映射）
+- CMS 内容管理系统（复杂的树形结构、版本管理）
+- 电商后台（高并发事务、库存扣减）
+- SaaS 多租户系统（数据隔离、权限管理）
 
-### 5. 实战项目建议
+## 最后的话
 
-- CMS 内容管理系统
-- 电商后台（复杂事务）
-- SaaS 多租户系统
-- 实时聊天应用（WebSocket + TypeORM）
+写这个系列的初衷，是想给"有一定基础但非精通"的开发者提供一个实用的 TypeORM 学习路径。我从 2020 年开始用 TypeORM，踩过不少坑——N+1 查询、事务死锁、迁移失败、连接泄漏……这些经验都写进了系列文章里。
 
----
+希望这个系列能帮你：
 
-## 总结
+- 建立 TypeORM 的知识体系，而不是零散的 API 记忆
+- 知道"为什么这么做"，而不是"照着做就行"
+- 能独立设计数据层，解决实际问题
 
-恭喜你完成了 **TypeORM 实战：NestJS 数据库开发** 全系列的学习！
+如果这个系列对你有帮助，欢迎分享给你的朋友。如果你在学习过程中遇到问题，可以在 GitHub 上提 Issue，或者在评论区留言。
 
-通过 12 篇文章，我们从零开始学习了：
-
-1. TypeORM 的核心概念和环境搭建
-2. 实体定义的完整体系
-3. 关系映射的四种类型
-4. Repository API 的 CRUD 操作
-5. QueryBuilder 的高级查询能力
-6. 数据库迁移的版本管理
-7. 事务处理的并发控制
-8. NestJS 的深度集成
-9. JWT 认证授权系统
-10. 性能优化策略
-11. 完整的测试体系
-12. 生产部署和运维
-
-希望这个系列能帮助你在 NestJS + TypeORM 的开发中游刃有余。继续实践，不断精进！
-
----
-
-## 参考资源
-
-- [TypeORM 官方文档](https://typeorm.io)
-- [NestJS 官方文档](https://docs.nestjs.com)
-- [PostgreSQL 官方文档](https://www.postgresql.org/docs/)
-- [Docker 官方文档](https://docs.docker.com/)
-- [GitHub Actions 文档](https://docs.github.com/actions)
-
----
+谢谢阅读，祝你编码愉快！

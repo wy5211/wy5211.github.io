@@ -9,74 +9,48 @@ series: "TypeORM 渐进式学习计划"
 seriesOrder: 6
 ---
 
-## 前言
+在前面的文章中，我们一直用 synchronize: true 来自动同步 Entity 定义到数据库表结构。这在开发阶段很方便，但在生产环境中这样做等于玩火——它可能意外删除列、修改表类型导致数据丢失，而且你不知道具体做了哪些变更，也无法回滚。
 
-在生产环境中，`synchronize: true` 是危险的——它可能意外删除列或修改表结构，导致数据丢失。**数据库迁移**（Migration）是安全地管理数据库结构变更的标准方案。
+数据库迁移（Migration）是安全地管理数据库结构变更的标准方案。每次变更都对应一个迁移文件，记录了 up（执行）和 down（回滚）两个方法，让变更可追溯、可回滚、可审计。
 
-**本篇你将学到**：
+这篇文章会带你了解 TypeORM 的迁移系统：从配置 data-source.ts 到生成迁移文件，从执行迁移到回滚，再到生产环境的最佳实践。
 
-- TypeORM CLI 配置（`data-source.ts`）
-- 迁移文件的创建和编写
-- 生成、执行、回滚迁移
-- 数据种子（seeding）
-- 生产迁移策略
+## 为什么需要迁移
 
----
-
-## 为什么需要迁移？
-
-### synchronize 的局限
+在讲具体用法之前，先理解为什么 synchronize 不适合生产环境。
 
 ```typescript
-// ❌ synchronize 的问题：
+// synchronize 的问题
 const dataSource = new DataSource({
   synchronize: true, // 自动同步实体定义到表结构
 });
-
-// 问题 1：不可控
-// - 不知道具体做了哪些变更
-// - 没有变更历史记录
-
-// 问题 2：不安全
-// - 可能删除已有的列
-// - 可能修改列类型导致数据丢失
-
-// 问题 3：不可回滚
-// - 变更出错后无法撤销
-// - 没有回滚机制
-
-// 问题 4：不可审计
-// - 无法追溯谁在什么时候做了什么变更
-// - 没有变更记录
 ```
 
-### 迁移的优势
+synchronize 会在应用启动时自动对比 Entity 定义和数据库结构，然后执行 SQL 让两者一致。问题在于：
 
-```typescript
-// ✅ 迁移的优势：
+**不可控**：你不知道具体做了哪些变更，是加了列还是删了索引，是改了类型还是重命名字段。当生产环境出现问题时，你无法快速定位是什么变更导致的。
 
-// 1. 可控
-// - 每次变更都有明确的迁移文件
-// - 可以 code review
+**不安全**：synchronize 可能删除已有列、修改列类型导致数据丢失。比如你把 Entity 中的一个字段删了，synchronize 会直接删掉数据库中的这一列，里面的数据就没了。
 
-// 2. 安全
-// - 只执行文件中定义的操作
-// - 不会意外删除数据
+**不可回滚**：变更出错后无法撤销。如果一次 synchronize 导致数据丢失，你只能从备份恢复，无法精确回滚某次变更。
 
-// 3. 可回滚
-// - 每个迁移都有 up 和 down 方法
-// - 出错时可以回滚
+**不可审计**：无法追溯谁在什么时候做了什么变更。数据库结构变更应该像代码变更一样有记录、可 review。
 
-// 4. 可审计
-// - 迁移文件纳入版本控制
-// - 变更历史清晰可追溯
-```
+迁移方案解决了这些问题：
 
----
+**可控**：每次变更都有明确的迁移文件，可以 code review，变更内容清晰可见。
 
-## CLI 配置
+**安全**：只执行文件中定义的操作，不会意外删除数据。
 
-### 创建数据源文件
+**可回滚**：每个迁移都有 up 和 down 方法，出错时可以回滚。
+
+**可审计**：迁移文件纳入版本控制，变更历史清晰可追溯。
+
+## 配置 TypeORM CLI
+
+迁移功能需要 TypeORM CLI，首先要配置数据源文件。
+
+### 创建 data-source.ts
 
 ```typescript
 // src/data-source.ts
@@ -92,12 +66,15 @@ export const AppDataSource = new DataSource({
   port: Number(process.env.DB_PORT) || 5432,
   username: process.env.DB_USERNAME || "postgres",
   password: process.env.DB_PASSWORD || "postgres",
-  database: process.env.DB_DATABASE || "typeorm_demo",
+  database: process.env.DB_DATABASE || "project_management",
+
+  // 实体配置（用于生成迁移）
+  entities: ["src/entity/**/*.ts"],
+
   // 迁移配置
   migrations: ["src/migration/**/*.ts"],
   migrationsTableName: "migrations", // 迁移记录表名
-  // 实体配置（用于生成迁移）
-  entities: ["src/entity/**/*.ts"],
+
   // 生产环境关闭 synchronize
   synchronize: false,
   logging: true,
@@ -119,23 +96,93 @@ export const AppDataSource = new DataSource({
 }
 ```
 
----
+这些命令的作用：
+
+- migration:generate：根据 Entity 变更自动生成迁移文件
+- migration:create：创建一个空的迁移文件（手动编写）
+- migration:run：执行所有未执行的迁移
+- migration:revert：回滚最近一次迁移
+- migration:show：查看已执行和未执行的迁移
 
 ## 迁移文件结构
 
+迁移文件是一个实现了 MigrationInterface 的类，包含 up 和 down 两个方法。
+
 ### 自动生成的迁移文件
 
+```bash
+# 根据实体变更自动生成迁移文件
+npm run migration:generate src/migration/AddTaskDueDate
+```
+
 ```typescript
-// src/migration/1709000000000-CreateUsers.ts
+// src/migration/1709000000000-AddTaskDueDate.ts
 
-import { MigrationInterface, QueryRunner } from "typeorm";
+import { MigrationInterface, QueryRunner, Table, TableColumn } from "typeorm";
 
-export class CreateUsers1709000000000 implements MigrationInterface {
+export class AddTaskDueDate1709000000000 implements MigrationInterface {
   // up：执行迁移
+  public async up(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.addColumn(
+      "tasks",
+      new TableColumn({
+        name: "due_date",
+        type: "timestamp",
+        isNullable: true,
+      })
+    );
+  }
+
+  // down：回滚迁移
+  public async down(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.dropColumn("tasks", "due_date");
+  }
+}
+```
+
+文件名中的时间戳（1709000000000）是迁移的执行顺序，TypeORM 按照时间戳从小到大执行迁移。
+
+### 手动创建迁移文件
+
+```bash
+# 创建空迁移文件
+npm run migration:create src/migration/AddTaskPriority
+```
+
+然后手动编写 up 和 down 方法：
+
+```typescript
+import { MigrationInterface, QueryRunner, TableColumn } from "typeorm";
+
+export class AddTaskPriority1709000000001 implements MigrationInterface {
+  public async up(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.addColumn(
+      "tasks",
+      new TableColumn({
+        name: "priority",
+        type: "enum",
+        enum: ["LOW", "MEDIUM", "HIGH", "URGENT"],
+        default: "'MEDIUM'",
+      })
+    );
+  }
+
+  public async down(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.dropColumn("tasks", "priority");
+  }
+}
+```
+
+### 创建新表
+
+```typescript
+import { MigrationInterface, QueryRunner, Table } from "typeorm";
+
+export class CreateTags1709000000002 implements MigrationInterface {
   public async up(queryRunner: QueryRunner): Promise<void> {
     await queryRunner.createTable(
       new Table({
-        name: "users",
+        name: "tags",
         columns: [
           {
             name: "id",
@@ -145,130 +192,34 @@ export class CreateUsers1709000000000 implements MigrationInterface {
           {
             name: "name",
             type: "varchar",
-            length: "100",
+            length: "50",
           },
           {
-            name: "email",
+            name: "color",
             type: "varchar",
-            length: "255",
-            isUnique: true,
-          },
-          {
-            name: "password_hash",
-            type: "varchar",
-            length: "255",
-          },
-          {
-            name: "is_active",
-            type: "boolean",
-            default: true,
+            length: "7",
+            default: "'#007bff'",
           },
           {
             name: "created_at",
             type: "timestamp",
             default: "now()",
           },
-          {
-            name: "updated_at",
-            type: "timestamp",
-            default: "now()",
-          },
         ],
       }),
-      true // 如果表存在则跳过
-    );
-  }
-
-  // down：回滚迁移
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.dropTable("users");
-  }
-}
-```
-
-### 手动创建迁移文件
-
-```bash
-# 创建空迁移文件
-npx typeorm migration:create src/migration/AddUserBio
-```
-
-```typescript
-// src/migration/AddUserBio.ts
-
-import { MigrationInterface, QueryRunner } from "typeorm";
-
-export class AddUserBio1709000000001 implements MigrationInterface {
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    // 添加 bio 列
-    await queryRunner.addColumn(
-      "users",
-      new TableColumn({
-        name: "bio",
-        type: "text",
-        isNullable: true,
-      })
+      true // 如果表已存在则跳过
     );
   }
 
   public async down(queryRunner: QueryRunner): Promise<void> {
-    // 回滚：删除 bio 列
-    await queryRunner.dropColumn("users", "bio");
+    await queryRunner.dropTable("tags");
   }
 }
 ```
-
----
-
-## 迁移操作
-
-### 生成迁移
-
-```bash
-# 根据实体变更自动生成迁移文件
-npx typeorm -d src/data-source.ts migration:generate src/migration/AddUserBio
-```
-
-TypeORM 会对比实体定义和数据库结构，自动生成迁移文件。
-
-### 执行迁移
-
-```bash
-# 执行所有未执行的迁移
-npx typeorm -d src/data-source.ts migration:run
-```
-
-执行的迁移会记录在 `migrations` 表中：
-
-```
- migrations 表：
- | id | timestamp    | name                          |
- |----|------------- |-------------------------------|
- | 1  | 1709000000000 | CreateUsers1709000000000      |
- | 2  | 1709000000001 | AddUserBio1709000000001       |
-```
-
-### 回滚迁移
-
-```bash
-# 回滚最近一次迁移
-npx typeorm -d src/data-source.ts migration:revert
-```
-
-回滚会执行迁移文件的 `down` 方法，并从 `migrations` 表中删除记录。
-
-### 查看迁移状态
-
-```bash
-# 查看已执行和未执行的迁移
-npx typeorm -d src/data-source.ts migration:show
-```
-
----
 
 ## QueryRunner API
 
-QueryRunner 是迁移中操作数据库的核心工具。
+QueryRunner 是迁移中操作数据库的核心工具，提供了丰富的 API。
 
 ### 表操作
 
@@ -277,24 +228,23 @@ public async up(queryRunner: QueryRunner): Promise<void> {
   // 创建表
   await queryRunner.createTable(
     new Table({
-      name: "posts",
+      name: "task_tags",
       columns: [
-        { name: "id", type: "serial", isPrimary: true },
-        { name: "title", type: "varchar", length: "255" },
-        { name: "content", type: "text" },
-        { name: "author_id", type: "integer" },
-        { name: "status", type: "enum", enum: ["DRAFT", "PUBLISHED", "ARCHIVED"], default: "'DRAFT'" },
-        { name: "created_at", type: "timestamp", default: "now()" },
+        { name: "taskId", type: "integer" },
+        { name: "tagId", type: "integer" },
+      ],
+      uniques: [
+        { columnNames: ["taskId", "tagId"] },
       ],
     }),
     true
   );
 
   // 重命名表
-  await queryRunner.renameTable("old_name", "new_name");
+  await queryRunner.renameTable("task_tags", "tasks_tags");
 
   // 删除表
-  await queryRunner.dropTable("posts");
+  await queryRunner.dropTable("tasks_tags");
 }
 ```
 
@@ -303,23 +253,31 @@ public async up(queryRunner: QueryRunner): Promise<void> {
 ```typescript
 public async up(queryRunner: QueryRunner): Promise<void> {
   // 添加列
-  await queryRunner.addColumn("users", new TableColumn({
-    name: "avatar",
-    type: "varchar",
-    length: "500",
-    isNullable: true,
-  }));
+  await queryRunner.addColumn(
+    "tasks",
+    new TableColumn({
+      name: "description",
+      type: "text",
+      isNullable: true,
+    })
+  );
 
-  // 修改列
-  await queryRunner.changeColumn("users", "name",
-    new TableColumn({ name: "name", type: "varchar", length: "200" })
+  // 修改列（改变类型或属性）
+  await queryRunner.changeColumn(
+    "tasks",
+    "description",
+    new TableColumn({
+      name: "description",
+      type: "varchar",
+      length: "500",
+    })
   );
 
   // 重命名列
-  await queryRunner.renameColumn("users", "name", "full_name");
+  await queryRunner.renameColumn("tasks", "description", "desc");
 
   // 删除列
-  await queryRunner.dropColumn("users", "avatar");
+  await queryRunner.dropColumn("tasks", "desc");
 }
 ```
 
@@ -328,20 +286,35 @@ public async up(queryRunner: QueryRunner): Promise<void> {
 ```typescript
 public async up(queryRunner: QueryRunner): Promise<void> {
   // 创建索引
-  await queryRunner.createIndex("users", new TableIndex({
-    name: "idx_users_email",
-    columnNames: ["email"],
-    isUnique: true,
-  }));
+  await queryRunner.createIndex(
+    "tasks",
+    new TableIndex({
+      name: "idx_tasks_status",
+      columnNames: ["status"],
+    })
+  );
 
   // 创建复合索引
-  await queryRunner.createIndex("posts", new TableIndex({
-    name: "idx_posts_author_status",
-    columnNames: ["author_id", "status"],
-  }));
+  await queryRunner.createIndex(
+    "tasks",
+    new TableIndex({
+      name: "idx_tasks_project_status",
+      columnNames: ["project_id", "status"],
+    })
+  );
+
+  // 创建唯一索引
+  await queryRunner.createIndex(
+    "tags",
+    new TableIndex({
+      name: "idx_tags_name_unique",
+      columnNames: ["name"],
+      isUnique: true,
+    })
+  );
 
   // 删除索引
-  await queryRunner.dropIndex("users", "idx_users_email");
+  await queryRunner.dropIndex("tasks", "idx_tasks_status");
 }
 ```
 
@@ -350,16 +323,19 @@ public async up(queryRunner: QueryRunner): Promise<void> {
 ```typescript
 public async up(queryRunner: QueryRunner): Promise<void> {
   // 添加外键
-  await queryRunner.createForeignKey("posts", new TableForeignKey({
-    name: "fk_posts_author",
-    columnNames: ["author_id"],
-    referencedTableName: "users",
-    referencedColumnNames: ["id"],
-    onDelete: "CASCADE",
-  }));
+  await queryRunner.createForeignKey(
+    "tasks",
+    new TableForeignKey({
+      name: "fk_tasks_project",
+      columnNames: ["project_id"],
+      referencedTableName: "projects",
+      referencedColumnNames: ["id"],
+      onDelete: "CASCADE",
+    })
+  );
 
   // 删除外键
-  await queryRunner.dropForeignKey("posts", "fk_posts_author");
+  await queryRunner.dropForeignKey("tasks", "fk_tasks_project");
 }
 ```
 
@@ -369,28 +345,175 @@ public async up(queryRunner: QueryRunner): Promise<void> {
 public async up(queryRunner: QueryRunner): Promise<void> {
   // 执行自定义 SQL
   await queryRunner.query(`
-    ALTER TABLE users
-    ADD COLUMN IF NOT EXISTS search_vector tsvector
+    ALTER TABLE tasks
+    ADD COLUMN search_vector tsvector
   `);
 
   await queryRunner.query(`
-    CREATE INDEX IF NOT EXISTS idx_users_search
-    ON users USING gin(search_vector)
+    CREATE INDEX idx_tasks_search
+    ON tasks USING gin(search_vector)
   `);
 
-  // 更新数据
+  // 更新数据（数据迁移）
   await queryRunner.query(`
-    UPDATE users
-    SET search_vector = to_tsvector('simple', name || ' ' || email)
+    UPDATE tasks
+    SET search_vector = to_tsvector('simple', title || ' ' || description)
   `);
 }
 ```
 
----
+## 执行和回滚迁移
+
+### 执行迁移
+
+```bash
+# 执行所有未执行的迁移
+npm run migration:run
+```
+
+TypeORM 会在数据库中创建一个 migrations 表来记录已执行的迁移：
+
+```sql
+CREATE TABLE migrations (
+  id SERIAL PRIMARY KEY,
+  timestamp BIGINT NOT NULL,
+  name VARCHAR NOT NULL
+);
+```
+
+每次执行迁移时，TypeORM 会：
+
+1. 检查 migrations 表，找出未执行的迁移
+2. 按时间戳顺序执行这些迁移的 up 方法
+3. 在 migrations 表中插入记录
+
+### 回滚迁移
+
+```bash
+# 回滚最近一次迁移
+npm run migration:revert
+```
+
+回滚会执行最近一次迁移的 down 方法，并从 migrations 表中删除记录。
+
+### 查看迁移状态
+
+```bash
+# 查看已执行和未执行的迁移
+npm run migration:show
+```
+
+输出类似：
+
+```
+# 迁移文件列表
+[ ] 1709000000000-AddTaskDueDate.ts        [ ] 未执行
+[X] 1709000000001-AddTaskPriority.ts        [X] 已执行
+[X] 1709000000002-CreateTags.ts             [X] 已执行
+```
+
+## 数据迁移
+
+迁移不只是改表结构，还要迁移现有数据。
+
+### 添加带默认值的新列
+
+```typescript
+export class AddTaskStatus1709000000003 implements MigrationInterface {
+  public async up(queryRunner: QueryRunner): Promise<void> {
+    // 步骤 1：添加可空列
+    await queryRunner.addColumn(
+      "tasks",
+      new TableColumn({
+        name: "status",
+        type: "enum",
+        enum: ["TODO", "IN_PROGRESS", "COMPLETED", "CANCELLED"],
+        isNullable: true,
+      })
+    );
+
+    // 步骤 2：设置默认值
+    await queryRunner.query(`UPDATE tasks SET status = 'TODO'`);
+
+    // 步骤 3：改为 NOT NULL
+    await queryRunner.changeColumn(
+      "tasks",
+      "status",
+      new TableColumn({
+        name: "status",
+        type: "enum",
+        enum: ["TODO", "IN_PROGRESS", "COMPLETED", "CANCELLED"],
+        isNullable: false,
+        default: "'TODO'",
+      })
+    );
+  }
+
+  public async down(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.dropColumn("tasks", "status");
+  }
+}
+```
+
+为什么分三步？如果直接添加 NOT NULL 列，对于已有数据的表会报错（因为已有记录的 status 为 NULL）。正确的做法是：先添加可空列，然后更新现有数据，最后改为 NOT NULL。
+
+### 拆分表
+
+```typescript
+export class SplitTaskDescription1709000000004 implements MigrationInterface {
+  public async up(queryRunner: QueryRunner): Promise<void> {
+    // 1. 创建新表
+    await queryRunner.createTable(
+      new Table({
+        name: "task_details",
+        columns: [
+          { name: "id", type: "serial", isPrimary: true },
+          { name: "task_id", type: "integer", isUnique: true },
+          { name: "description", type: "text" },
+          { name: "attachments", type: "jsonb" },
+        ],
+      })
+    );
+
+    // 2. 迁移数据
+    await queryRunner.query(`
+      INSERT INTO task_details (task_id, description)
+      SELECT id, description FROM tasks
+      WHERE description IS NOT NULL
+    `);
+
+    // 3. 删除旧列
+    await queryRunner.dropColumn("tasks", "description");
+  }
+
+  public async down(queryRunner: QueryRunner): Promise<void> {
+    // 恢复旧列
+    await queryRunner.addColumn(
+      "tasks",
+      new TableColumn({
+        name: "description",
+        type: "text",
+        isNullable: true,
+      })
+    );
+
+    // 恢复数据
+    await queryRunner.query(`
+      UPDATE tasks
+      SET description = task_details.description
+      FROM task_details
+      WHERE tasks.id = task_details.task_id
+    `);
+
+    // 删除新表
+    await queryRunner.dropTable("task_details");
+  }
+}
+```
 
 ## 数据种子（Seeding）
 
-种子数据用于初始化系统必需的数据，如管理员账号、默认配置等。
+种子数据用于初始化系统必需的数据，如默认配置、管理员账号等。
 
 ### 创建种子文件
 
@@ -399,12 +522,12 @@ public async up(queryRunner: QueryRunner): Promise<void> {
 
 import { DataSource } from "typeorm";
 import { User, UserRole } from "../entity/User";
-import { Category } from "../entity/Category";
+import { Workspace } from "../entity/Workspace";
 import * as bcrypt from "bcrypt";
 
 export async function seedInitialData(dataSource: DataSource) {
   const userRepo = dataSource.getRepository(User);
-  const categoryRepo = dataSource.getRepository(Category);
+  const workspaceRepo = dataSource.getRepository(Workspace);
 
   // 检查是否已有数据
   const userCount = await userRepo.count();
@@ -415,28 +538,28 @@ export async function seedInitialData(dataSource: DataSource) {
 
   // 创建管理员
   const admin = userRepo.create({
-    name: "管理员",
+    name: "系统管理员",
     username: "admin",
-    email: "admin@example.com",
+    email: "admin@local.dev",
     passwordHash: await bcrypt.hash("admin123", 10),
     role: UserRole.ADMIN,
     isActive: true,
   });
   await userRepo.save(admin);
 
-  // 创建默认分类
-  const categories = categoryRepo.create([
-    { name: "技术", slug: "tech" },
-    { name: "生活", slug: "life" },
-    { name: "随笔", slug: "essay" },
-  ]);
-  await categoryRepo.save(categories);
+  // 创建示例工作空间
+  const workspace = workspaceRepo.create({
+    name: "示例工作空间",
+    slug: "example-workspace",
+    owner: admin,
+  });
+  await workspaceRepo.save(workspace);
 
   console.log("种子数据创建完成");
 }
 ```
 
-### 创建种子脚本
+### 执行种子
 
 ```typescript
 // src/seed/index.ts
@@ -462,51 +585,62 @@ main().catch(console.error);
 // package.json
 {
   "scripts": {
-    "seed": "tsx src/seed/index.ts",
-    "seed:prod": "node dist/seed/index.js"
+    "seed": "tsx src/seed/index.ts"
   }
 }
 ```
-
-### 将种子集成到迁移中
-
-```typescript
-// 也可以在迁移中执行种子
-export class SeedAdminUser1709000000002 implements MigrationInterface {
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.query(`
-      INSERT INTO users (name, username, email, password_hash, role, is_active)
-      VALUES ('管理员', 'admin', 'admin@example.com', '$2b$10$...', 'ADMIN', true)
-    `);
-  }
-
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.query(`
-      DELETE FROM users WHERE username = 'admin'
-    `);
-  }
-}
-```
-
----
 
 ## 生产迁移策略
 
-### 1. CI/CD 自动迁移
+### 1. 迁移最佳实践
+
+每个迁移只做一件事：一个迁移创建一个表、添加一个列、或创建一个索引。不要把多个变更混在一个迁移里，这样出问题时难以定位和回滚。
+
+迁移必须可回滚：每个 up 都要有对应的 down。如果无法回滚（比如删除了数据），要在文档中明确说明。
+
+数据迁移和结构迁移分开：不要在一个迁移里同时改表结构和迁移数据，分两个迁移做。如果数据迁移出错，结构迁移已经执行了，回滚会很麻烦。
+
+使用事务：QueryRunner 默认在事务中运行，如果出错，所有变更都会回滚。这保证了迁移的原子性。
+
+幂等性（可选）：使用 IF NOT EXISTS 确保幂等，这样迁移可以重复执行。
+
+```typescript
+export async function up(queryRunner: QueryRunner): Promise<void> {
+  // 使用 IF NOT EXISTS 确保幂等
+  await queryRunner.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      name VARCHAR(255) NOT NULL
+    )
+  `);
+}
+```
+
+### 2. 大表迁移注意事项
+
+对于大表的迁移，直接执行 ALTER TABLE 可能锁表很久，影响线上服务。正确的做法是分步进行：
+
+1. 先添加可空列（不加默认值，这样不需要重写全表）
+2. 逐步更新数据（小批量）
+3. 改为 NOT NULL
+4. 添加索引（如果需要）
+
+或者使用 PostgreSQL 的扩展工具如 pg_repack 或 pg_squeeze 来在线重写表。
+
+### 3. CI/CD 集成
+
+在生产环境，迁移应该作为部署流程的一部分自动执行。在 GitHub Actions 中：
 
 ```yaml
-# .github/workflows/migrate.yml
-name: Database Migration
+# .github/workflows/deploy.yml
+name: Deploy
 
 on:
   push:
     branches: [main]
-    paths:
-      - "src/migration/**"
-      - "src/entity/**"
 
 jobs:
-  migrate:
+  deploy:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -514,7 +648,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install dependencies
         run: npm ci
@@ -527,67 +661,19 @@ jobs:
           DB_USERNAME: ${{ secrets.DB_USERNAME }}
           DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
           DB_DATABASE: ${{ secrets.DB_DATABASE }}
+
+      - name: Deploy application
+        run: # ... 部署逻辑
 ```
 
-### 2. 迁移最佳实践
+关键是迁移要在应用部署之前执行，这样新版本的代码才能匹配新的数据库结构。
 
-```typescript
-// ✅ 1. 每个迁移只做一件事
-// 好：一个迁移创建 users 表，另一个迁移添加 bio 列
-// 坏：一个迁移同时创建多个表和添加多个列
+### 4. 多环境管理
 
-// ✅ 2. 迁移必须可回滚
-// 每个 up 都要有对应的 down
-
-// ✅ 3. 数据迁移和结构迁移分开
-export class AddUserBioColumn1709000000003 implements MigrationInterface {
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    // 步骤 1：添加可空列
-    await queryRunner.addColumn(
-      "users",
-      new TableColumn({
-        name: "bio",
-        type: "text",
-        isNullable: true, // 先允许为空
-      })
-    );
-
-    // 步骤 2：迁移数据（如果需要）
-    await queryRunner.query(`
-      UPDATE users SET bio = '暂无简介' WHERE bio IS NULL
-    `);
-  }
-
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.dropColumn("users", "bio");
-  }
-}
-
-// ✅ 4. 使用事务
-export class SafeMigration1709000000004 implements MigrationInterface {
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    // QueryRunner 默认在事务中运行
-    // 如果出错，所有变更都会回滚
-    await queryRunner.createTable(/* ... */);
-    await queryRunner.createIndex(/* ... */);
-  }
-}
-
-// ✅ 5. 幂等性（可选）
-export async function up(queryRunner: QueryRunner): Promise<void> {
-  // 使用 IF NOT EXISTS 确保幂等
-  await queryRunner.query(`
-    CREATE TABLE IF NOT EXISTS users (...)
-  `);
-}
-```
-
-### 3. 多环境管理
+不同环境（开发、测试、生产）应该使用不同的数据库，迁移在各自环境独立执行。
 
 ```typescript
 // src/data-source.ts
-import { DataSource } from "typeorm";
-
 const isProduction = process.env.NODE_ENV === "production";
 
 export const AppDataSource = new DataSource({
@@ -602,180 +688,34 @@ export const AppDataSource = new DataSource({
     ? ["dist/migration/**/*.js"]
     : ["src/migration/**/*.ts"],
   synchronize: false, // 所有环境都关闭
-  logging: !isProduction,
+  logging: !isProduction, // 生产环境关闭日志
 });
 ```
 
----
+## Trade-off 分析
 
-## 常见迁移场景
+迁移 vs synchronize 如何选择？
 
-### 添加带默认值的新列
+开发环境快速原型阶段可以用 synchronize，能快速迭代。但一旦项目进入稳定阶段或准备上线，就应该切换到迁移。
 
-```typescript
-export class AddUserStatus1709000000005 implements MigrationInterface {
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    // 步骤 1：添加可空列
-    await queryRunner.addColumn(
-      "users",
-      new TableColumn({
-        name: "status",
-        type: "varchar",
-        length: "20",
-        isNullable: true,
-      })
-    );
+生产环境永远不要用 synchronize，这是铁律。你可能觉得"我就改一个小字段"，但万一出问题就是数据丢失，得不偿失。
 
-    // 步骤 2：设置默认值
-    await queryRunner.query(`UPDATE users SET status = 'ACTIVE'`);
+自动生成 vs 手动编写迁移如何选择？
 
-    // 步骤 3：改为 NOT NULL
-    await queryRunner.changeColumn(
-      "users",
-      "status",
-      new TableColumn({
-        name: "status",
-        type: "varchar",
-        length: "20",
-        isNullable: false,
-        default: "'ACTIVE'",
-      })
-    );
-  }
+migration:generate 可以自动检测 Entity 变更并生成迁移文件，适合简单的表结构变更。但对于复杂的数据迁移、或需要特殊 SQL 的场景，还是要手动编写。
 
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.dropColumn("users", "status");
-  }
-}
-```
-
-### 重命名列（安全方式）
-
-```typescript
-export class RenameUserName1709000000006 implements MigrationInterface {
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.renameColumn("users", "name", "display_name");
-  }
-
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    await queryRunner.renameColumn("users", "display_name", "name");
-  }
-}
-```
-
-### 迁移数据到新表
-
-```typescript
-export class SplitUserAddress1709000000007 implements MigrationInterface {
-  public async up(queryRunner: QueryRunner): Promise<void> {
-    // 1. 创建新表
-    await queryRunner.createTable(
-      new Table({
-        name: "addresses",
-        columns: [
-          { name: "id", type: "serial", isPrimary: true },
-          { name: "user_id", type: "integer" },
-          { name: "street", type: "varchar", length: "255" },
-          { name: "city", type: "varchar", length: "100" },
-        ],
-      })
-    );
-
-    // 2. 迁移数据
-    await queryRunner.query(`
-      INSERT INTO addresses (user_id, street, city)
-      SELECT id, street, city FROM users
-      WHERE street IS NOT NULL
-    `);
-
-    // 3. 删除旧列
-    await queryRunner.dropColumn("users", "street");
-    await queryRunner.dropColumn("users", "city");
-  }
-
-  public async down(queryRunner: QueryRunner): Promise<void> {
-    // 恢复旧列
-    await queryRunner.addColumn(
-      "users",
-      new TableColumn({
-        name: "street",
-        type: "varchar",
-        length: "255",
-        isNullable: true,
-      })
-    );
-    await queryRunner.addColumn(
-      "users",
-      new TableColumn({
-        name: "city",
-        type: "varchar",
-        length: "100",
-        isNullable: true,
-      })
-    );
-
-    // 恢复数据
-    await queryRunner.query(`
-      UPDATE users SET
-        street = a.street,
-        city = a.city
-      FROM addresses a
-      WHERE users.id = a.user_id
-    `);
-
-    // 删除新表
-    await queryRunner.dropTable("addresses");
-  }
-}
-```
-
----
+一个实用的做法是：先用 migration:generate 生成基础迁移文件，然后检查生成的 SQL 是否符合预期，再手动调整。
 
 ## 总结
 
-### 核心要点
+这篇文章我们讲了 TypeORM 的迁移系统：从配置 data-source.ts 到编写迁移文件，从执行迁移到回滚，再到生产环境的最佳实践。迁移是数据库变更管理的标准方案，它让变更可控、安全、可追溯。
 
-1. **迁移 vs synchronize**
-   - 生产环境必须使用迁移
-   - synchronize 仅用于开发环境快速原型
-
-2. **迁移流程**
-   - 修改实体 → 生成迁移 → 检查 → 执行
-   - 每个迁移包含 `up`（执行）和 `down`（回滚）
-
-3. **QueryRunner API**
-   - `createTable` / `dropTable`
-   - `addColumn` / `changeColumn` / `dropColumn`
-   - `createIndex` / `createForeignKey`
-   - `query`（原始 SQL）
-
-4. **种子数据**
-   - 初始化必要数据（管理员、默认配置）
-   - 独立于迁移管理
-
-5. **生产策略**
-   - CI/CD 自动执行迁移
-   - 数据迁移和结构迁移分开
-   - 确保迁移可回滚
-
-### 下一步
-
-在下一篇文章中，我们将学习：
-
-- **事务处理**
-- DataSource.transaction()
-- QueryRunner 手动事务管理
-- 事务隔离级别
-- 乐观锁和悲观锁
-
-敬请期待！
+但还有一个重要问题：当多个操作需要作为一个原子单元执行时（比如创建任务时同时创建标签关联和活动日志），如何保证"要么全成功，要么全失败"？这就需要事务了。下一篇文章我们会讲事务处理，保证数据的一致性。
 
 ---
 
 ## 参考资源
 
-- [TypeORM 迁移文档](https://typeorm.io/migrations)
-- [TypeORM CLI 文档](https://typeorm.io/using-cli)
-- [数据库迁移最佳实践](https://www.postgresql.org/docs/current/ddl.html)
-
----
+- [TypeORM Migrations](https://typeorm.io/migrations)
+- [TypeORM CLI](https://typeorm.io/using-cli)
+- [PostgreSQL ALTER TABLE](https://www.postgresql.org/docs/current/sql-altertable.html)
