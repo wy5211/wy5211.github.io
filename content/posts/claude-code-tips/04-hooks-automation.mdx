@@ -1,0 +1,289 @@
+---
+title: "04 Hooks：把重复操作自动化"
+date: "2026-06-11"
+summary: "每天和 Claude Code 交互几十次，有多少是在做重复的事？用 Hooks 把它们自动化掉。"
+tags: ["claude-code", "ai-tooling", "hooks", "automation"]
+category: "claude-code-tips"
+cover: ""
+draft: false
+series: "Claude Code 实战技巧"
+seriesOrder: 4
+---
+
+上一篇我们聊了 Plan 模式——让 Claude 想清楚再动手。但即使方案对了，每次改完代码还得手动跑 lint、手动跑测试、手动格式化……这些重复操作才是真正消磨耐心的东西。
+
+Hooks 就是 Claude Code 的自动化机制。你定义好规则，Claude Code 在特定的时间点自动执行对应的操作——不用你每次都提醒它。
+
+## Hooks 是什么
+
+Hooks 本质上是事件驱动的脚本。Claude Code 在执行过程中会触发各种"事件"——编辑文件、执行命令、会话开始、会话结束等。你可以绑定脚本到这些事件上，让它们自动执行。
+
+有点像 Git Hooks——你定义了 pre-commit 钩子，Git 在 commit 之前自动跑你的检查脚本。Claude Code Hooks 的逻辑一样，只是事件的类型更多。
+
+## 12 个触发点，但常用的就 5 个
+
+Claude Code 的 Hooks 系统支持 12 个生命周期触发点。但你不需要全部记住，日常真正用到的就这几个：
+
+| 触发点         | 什么时候触发              | 适合做什么                  |
+| -------------- | ------------------------- | --------------------------- |
+| `SessionStart` | 新会话启动时              | 自动 git pull、加载项目配置 |
+| `PostEdit`     | Claude 编辑文件后         | 自动格式化、lint 检查       |
+| `PreCommit`    | Claude 执行 git commit 前 | 类型检查、测试运行          |
+| `Stop`         | Claude 完成任务停止时     | 发送通知、记录变更摘要      |
+| `PostToolUse`  | Claude 使用工具后         | 记录操作日志、验证结果      |
+
+下面逐个讲怎么配。
+
+## 5 个最实用的 Hook 配置
+
+所有 Hook 都配置在 `.claude/settings.json` 里（项目级）或 `~/.claude/settings.json` 里（全局级）。
+
+### 1. PostEdit → 自动格式化
+
+Claude 写的代码有时格式不太标准——缩进不一致、多余的空行、单引号双引号混用。与其每次手动跑 formatter，不如让它在编辑后自动执行。
+
+```json
+{
+  "hooks": {
+    "PostEdit": [
+      {
+        "command": "npx prettier --write $FILE",
+        "description": "自动格式化编辑过的文件"
+      }
+    ]
+  }
+}
+```
+
+`$FILE` 是 Hook 的内置变量，代表 Claude 刚编辑过的文件路径。你不需要手动传参。
+
+加了这条 Hook 之后，每次 Claude 编辑完文件，Prettier 会自动格式化。你看到的代码永远是整齐的，Claude 后续读取文件时也看到的是格式化后的版本，不会因为格式混乱产生误判。
+
+如果你的项目用 ESLint 而不是 Prettier，替换命令就行：
+
+```json
+{
+  "command": "npx eslint --fix $FILE",
+  "description": "自动 lint 修复编辑过的文件"
+}
+```
+
+### 2. PreCommit → 类型检查 + lint
+
+Claude 有时会写出类型不安全的代码——尤其是当你让它改多个文件时，改了 A 文件的类型定义但忘了同步 B 文件。这种问题构建时才会发现，但如果你能提前在 commit 前拦截，就不用等构建失败了。
+
+```json
+{
+  "hooks": {
+    "PreCommit": [
+      {
+        "command": "npx tsc --noEmit && npx eslint .",
+        "description": "提交前检查类型和 lint"
+      }
+    ]
+  }
+}
+```
+
+这条 Hook 在 Claude 执行 `git commit` 之前自动运行 TypeScript 类型检查和 ESLint。如果检查失败，commit 会被阻止，Claude 会看到错误信息并自动修复。
+
+效果是：你几乎不会再看到"提交后构建失败"的情况。因为不合规的代码根本提交不进去。
+
+### 3. Stop → 桌面通知
+
+当 Claude 完成一个耗时较长的任务（比如批量重构 20 个文件），你可能已经切到浏览器做别的事了。有了通知 Hook，Claude 一停你就会知道。
+
+macOS 下用 osascript 发送桌面通知：
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "command": "osascript -e 'display notification \"Claude Code 任务完成\" with title \"Claude Code\"'",
+        "description": "任务完成时发送桌面通知"
+      }
+    ]
+  }
+}
+```
+
+Linux 下可以用 `notify-send`：
+
+```json
+{
+  "command": "notify-send 'Claude Code' '任务完成'",
+  "description": "任务完成时发送桌面通知"
+}
+```
+
+这个 Hook 看起来简单，但实际使用中非常实用——特别是当你让 Claude 执行一些不需要密切关注的批量任务时。
+
+### 4. SessionStart → 自动 git pull
+
+如果你在多台机器上开发，或者和团队成员协作，每次打开 Claude Code 时先拉取最新代码是个好习惯。但人总是会忘的。
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "command": "git pull --rebase 2>/dev/null || true",
+        "description": "新会话开始时自动拉取最新代码"
+      }
+    ]
+  }
+}
+```
+
+`|| true` 确保即使没有远程仓库或者网络问题，也不会阻断 Claude 的启动。
+
+### 5. PostToolUse → 记录修改文件
+
+有时候你想知道 Claude 这一次会话到底改了哪些文件。Claude 的对话记录里虽然能看到操作过程，但要从几十轮对话中提取出完整的文件修改列表并不方便。
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "command": "echo \"$(date '+%Y-%m-%d %H:%M') - $TOOL - $FILE\" >> .claude/activity.log",
+        "description": "记录 Claude 的工具使用日志"
+        "matcher": "Edit|Write"
+      }
+    ]
+  }
+}
+```
+
+`matcher` 字段可以过滤只在特定工具触发。这里只记录 Edit 和 Write 操作（文件修改），忽略搜索和读取操作。日志文件会记录每次修改的时间和文件路径，方便你事后回顾。
+
+## Hook 的编写方式
+
+Hook 支持两种编写方式：
+
+### 内联命令（适合简单场景）
+
+直接在 JSON 里写命令，像上面那些例子一样。适合单行就能搞定的操作。
+
+### Shell 脚本（适合复杂逻辑）
+
+如果 Hook 需要做多步判断，可以把逻辑放到脚本文件里：
+
+```json
+{
+  "hooks": {
+    "PreCommit": [
+      {
+        "command": "bash .claude/hooks/pre-commit.sh",
+        "description": "提交前运行自定义检查脚本"
+      }
+    ]
+  }
+}
+```
+
+脚本文件 `.claude/hooks/pre-commit.sh`：
+
+```bash
+#!/bin/bash
+# 运行类型检查
+npx tsc --noEmit
+if [ $? -ne 0 ]; then
+  echo "TypeScript 类型检查失败，请修复后再提交"
+  exit 1
+fi
+
+# 运行 lint（只检查修改的文件）
+CHANGED_FILES=$(git diff --cached --name-only --diff-filter=ACM | grep -E '\.(ts|tsx)$')
+if [ -n "$CHANGED_FILES" ]; then
+  npx eslint $CHANGED_FILES
+  if [ $? -ne 0 ]; then
+    echo "ESLint 检查失败，请修复后再提交"
+    exit 1
+  fi
+fi
+
+# 检查是否有 console.log 残留
+if grep -r "console\.log" --include="*.ts" --include="*.tsx" src/; then
+  echo "发现 console.log，请清理后再提交"
+  exit 1
+fi
+
+echo "所有检查通过"
+```
+
+这种方式更灵活——你可以在脚本里写任意复杂的逻辑，包括条件判断、多步检查、自定义规则等。
+
+## Hook 的边界
+
+不是所有事情都该用 Hook。有几个判断标准：
+
+**该用 Hook 的**：每次都要做的、有明确触发时机的、自动化后不引入风险的。比如格式化、lint、通知——这些操作本身是安全的，即使 Hook 出了问题也不会破坏代码。
+
+**不该用 Hook 的**：需要人工判断的操作、可能产生副作用的操作、执行时间很长的操作。比如：
+
+- 不要用 Hook 自动 push 代码——这个操作需要人工确认
+- 不要用 Hook 自动发部署——风险太高，出了问题回滚很麻烦
+- 不要用 Hook 跑很重的测试套件——会拖慢每次编辑的响应速度
+
+一个实用的原则：**Hook 应该让事情变得更快更可靠，而不是让你失去控制。** 如果你发现某个 Hook 让你感到"不放心"，说明它可能不适合自动化。
+
+## 调试 Hook
+
+Hook 出问题时的排查方法：
+
+**1. 看 Claude 的输出日志**
+
+Hook 执行失败时，Claude Code 会在对话中显示错误信息。注意看有没有 "Hook failed" 或 "command exited with code 1" 之类的提示。
+
+**2. 手动运行 Hook 命令**
+
+把 Hook 的 command 复制出来，在终端里手动跑一遍。很多 Hook 的问题都是路径不对、权限不够、或者依赖没装。
+
+**3. 检查环境变量**
+
+Hook 运行的环境和你的终端环境不完全一样。特别是 PATH 可能不同——你在终端里能用 `prettier`，Hook 里可能需要写完整路径 `npx prettier` 或 `/usr/local/bin/prettier`。
+
+**4. Hook 执行超时**
+
+如果一个 Hook 执行时间超过 30 秒，Claude Code 会自动终止它。如果你的检查脚本确实需要很长时间（比如完整的测试套件），考虑把它从 Hook 里移出来，改成手动触发或者在 CI 里跑。
+
+## 一个完整的 settings.json 示例
+
+把上面几个 Hook 组合起来，一个实用的项目级配置大概长这样：
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "command": "git pull --rebase 2>/dev/null || true",
+        "description": "自动拉取最新代码"
+      }
+    ],
+    "PostEdit": [
+      {
+        "command": "npx prettier --write $FILE 2>/dev/null || true",
+        "description": "自动格式化"
+      }
+    ],
+    "PreCommit": [
+      {
+        "command": "bash .claude/hooks/pre-commit.sh",
+        "description": "提交前检查"
+      }
+    ],
+    "Stop": [
+      {
+        "command": "osascript -e 'display notification \"Claude Code 任务完成\" with title \"Claude Code\"'",
+        "description": "完成通知"
+      }
+    ]
+  }
+}
+```
+
+四条 Hook，覆盖了一天中使用 Claude Code 最常见的自动化需求。配置一次，后续每次使用都自动生效。
+
+Hooks 是"被动"的自动化——在特定时间点自动执行。但有些能力你需要"主动"调用，比如让 Claude 用 TDD 流程开发、自动生成文档、按特定格式创建文件。这些就需要 Skills 了，下一篇我们详细聊。
