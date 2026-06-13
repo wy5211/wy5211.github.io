@@ -1,0 +1,287 @@
+---
+title: "04 Hooks 自动化：对照 Claude Code 的 Hook 系统"
+date: "2026-06-13"
+summary: "Kiro 用 YAML 声明式配置 Hook，Claude Code 用 JSON + Shell。两种方式各有千秋，对照着看更清楚。"
+tags: ["kiro", "ai-tooling", "hooks", "automation"]
+category: "kiro-tips"
+cover: ""
+draft: false
+series: "Kiro 实战技巧"
+seriesOrder: 4
+---
+
+前两篇聊了 Kiro 的配置体系（Steering Files）和开发方法论（SDD）。这篇聊自动化——Kiro 和 Claude Code 都有 Hooks 系统，但设计思路差异很大。
+
+在 [Claude Code 系列第四篇](/posts/claude-code-tips/04-hooks-automation) 里，我详细讲过 Claude Code 的 Hooks：在 `.claude/settings.json` 里用 JSON 配置 Shell 命令，绑定到 12 个生命周期触发点上。它的风格是"命令式"——你告诉它具体执行什么命令。
+
+Kiro 的 Hooks 用了另一种方式：YAML 声明式配置。你描述"什么条件下做什么"，而不是"执行什么命令"。配置文件放在 `.kiro/hooks/` 目录下，每个 Hook 一个文件。
+
+两种方式没有绝对优劣，适合不同的场景和个人偏好。我们对照着来看。
+
+## 事件模型对比
+
+先看两边都支持哪些触发事件：
+
+| 场景       | Claude Code    | Kiro             |
+| ---------- | -------------- | ---------------- |
+| 文件编辑后 | `PostEdit`     | `onSave`         |
+| 提交代码前 | `PreCommit`    | `preCommit`      |
+| 提交代码后 | —              | `postCommit`     |
+| 推送代码前 | —              | `prePush`        |
+| 新会话启动 | `SessionStart` | —                |
+| 任务完成后 | `Stop`         | —                |
+| 文件创建后 | —              | `onCreate`       |
+| 文件删除后 | —              | `onDelete`       |
+| 工具使用后 | `PostToolUse`  | —                |
+| 测试完成后 | —              | `onTestComplete` |
+
+Claude Code 偏向"会话生命周期"——会话开始、编辑、提交、停止。Kiro 偏向"文件生命周期"——保存、创建、删除、测试完成。
+
+这意味着 Claude Code 的 Hooks 更适合"开发流程自动化"（比如会话开始时 git pull、任务完成时通知），而 Kiro 的 Hooks 更适合"文件操作自动化"（比如保存时跑测试、创建文件时生成文档）。
+
+## 配置方式对比
+
+用同一个任务来对比。比如"每次保存文件后自动格式化"。
+
+### Claude Code 的配置
+
+```json
+{
+  "hooks": {
+    "PostEdit": [
+      {
+        "command": "npx prettier --write $FILE",
+        "description": "自动格式化编辑过的文件"
+      }
+    ]
+  }
+}
+```
+
+所有的 Hook 都在 `settings.json` 一个文件里。命令是 Shell 命令，直接告诉它"执行什么"。
+
+### Kiro 的配置
+
+```yaml
+# .kiro/hooks/format-on-save.yaml
+trigger: onSave
+condition: path_matches("src/**/*.{ts,tsx}")
+actions:
+  - run: npx prettier --write {{file}}
+  - notify: "文件已格式化"
+```
+
+每个 Hook 一个 YAML 文件。配置是声明式的——你说"什么条件下做什么"，而不是"执行什么命令"。
+
+### 核心区别
+
+**命令式 vs 声明式**：Claude Code 让你写命令，Kiro 让你描述意图。命令式更灵活（可以写任意 Shell），声明式更结构化（更容易理解和维护）。
+
+**集中 vs 分散**：Claude Code 所有 Hook 在一个 JSON 文件里，Kiro 每个 Hook 一个 YAML 文件。集中管理方便全局查看，分散管理方便单独维护。
+
+**变量引用**：Claude Code 用 `$FILE`，Kiro 用 `{{file}}`。语法不同，功能类似。
+
+## Kiro 的 YAML 配置详解
+
+Kiro 的 Hook 配置有三个核心部分：trigger（触发时机）、condition（触发条件）、actions（执行动作）。
+
+### trigger——触发时机
+
+```yaml
+trigger: onSave          # 文件保存时
+trigger: onCreate        # 文件创建时
+trigger: onDelete        # 文件删除时
+trigger: preCommit       # git commit 之前
+trigger: postCommit      # git commit 之后
+trigger: prePush         # git push 之前
+trigger: onTestComplete  # 测试完成后
+```
+
+### condition——触发条件
+
+不是每次触发都要执行。condition 让你精确控制什么时候该跑：
+
+```yaml
+# 只在后端文件保存时触发
+condition: path_matches("src/backend/**/*.ts")
+
+# 只在测试文件创建时触发
+condition: path_matches("tests/**/*.spec.ts")
+
+# 只在特定分支提交时触发
+condition: branch_matches("feature/*")
+```
+
+这个 condition 字段是 Kiro 比 Claude Code 的一个明显优势。Claude Code 的 Hook 要实现条件过滤，你得在 Shell 命令里写 `if` 判断。Kiro 直接在配置层面支持条件，更清晰。
+
+### actions——执行动作
+
+```yaml
+actions:
+  # 运行命令
+  - run: npm run test:backend
+
+  # 发送通知
+  - notify: "后端测试完成"
+
+  # 自动提交（可以，但要注意不要滥用）
+  - commit: "chore: auto-format"
+
+  # 失败时阻止操作
+  - block_on_failure: true
+```
+
+`block_on_failure: true` 很有用——如果命令失败了，操作会被阻止。比如 preCommit Hook 里跑类型检查，检查失败就阻止提交，这和 Claude Code 的 PreCommit Hook 效果一样。
+
+## 最实用的 Hook 配置案例
+
+### 1. 保存后端文件时自动跑测试
+
+```yaml
+# .kiro/hooks/backend-tests.yaml
+trigger: onSave
+condition: path_matches("src/backend/**/*.ts")
+actions:
+  - run: npm run test:backend
+  - notify: "后端测试完成"
+```
+
+Claude Code 里实现同样的效果需要在 Shell 里做路径判断：
+
+```json
+{
+  "command": "if [[ $FILE == src/backend/* ]]; then npm run test:backend; fi",
+  "description": "后端文件保存时跑测试"
+}
+```
+
+功能一样，但 Kiro 的条件写在配置层面，可读性更好。
+
+### 2. 创建 React 组件时自动生成文档
+
+```yaml
+# .kiro/hooks/react-docs.yaml
+trigger: onCreate
+condition: path_matches("src/components/**/*.tsx")
+actions:
+  - run: npx typedoc --out docs {{file}}
+  - notify: "组件文档已生成"
+```
+
+这个用到了 `onCreate` 触发器——Claude Code 没有对应的事件。如果你经常需要在创建新文件时执行一些初始化操作，Kiro 的 `onCreate` 比 Claude Code 更方便。
+
+### 3. 提交前安全扫描
+
+```yaml
+# .kiro/hooks/security-scan.yaml
+trigger: preCommit
+actions:
+  - run: npm audit
+  - run: npx semgrep --config=auto
+  - block_on_failure: true
+```
+
+和 Claude Code 的 PreCommit Hook 类似——提交前跑检查，失败了阻止提交。区别是 Kiro 支持多个 action 按顺序执行，不需要用 `&&` 连接。
+
+## Hook Chain：串联多步自动化
+
+Kiro 的一个特色是 Hook Chain——把多个 Hook 串联起来，前一个的输出触发后一个。
+
+```yaml
+# .kiro/hooks/save-test-commit.yaml
+sequence:
+  - trigger: onSave
+    condition: path_matches("src/**/*.ts")
+    actions:
+      - run: npm run test
+
+  - trigger: onTestComplete
+    condition: result == "success"
+    actions:
+      - run: npm run lint
+
+  - trigger: onTestComplete
+    condition: result == "success"
+    actions:
+      - commit: "chore: auto-test-and-lint"
+```
+
+这个 Chain 的意思是：保存文件 → 跑测试 → 测试通过后跑 lint → lint 通过后自动提交。
+
+Claude Code 没有原生的 Chain 支持。要实现类似效果，你得把所有逻辑写在一个 Shell 脚本里。Kiro 把它提到了配置层面，更直观。
+
+不过要注意：Chain 越长，出问题越难排查。建议 Chain 不超过 3 步——如果需要更多步骤，考虑用 Skill 而不是 Hook。
+
+## 各自适合什么场景
+
+### 选 Kiro Hooks 的场景
+
+- 你更喜欢声明式配置，不想写 Shell 脚本
+- 你需要按文件路径或分支做条件过滤
+- 你需要文件创建/删除等文件级事件
+- 你需要 Hook Chain 做多步串联
+- 你的团队习惯 YAML 配置（比如 Kubernetes 用户）
+
+### 选 Claude Code Hooks 的场景
+
+- 你需要灵活的 Shell 命令，包括管道、重定向、条件判断
+- 你需要在会话开始/结束时做操作（git pull、通知）
+- 你习惯把所有配置集中在一个文件里管理
+- 你的 Hook 逻辑比较简单，不需要复杂的条件
+
+### 实际上可以两者共用
+
+如果你同时用 Kiro 和 Claude Code 开发同一个项目，两边的 Hook 可以共存——它们各自监听各自的事件，互不干扰。
+
+一个实际的做法：用 Kiro Hooks 处理"文件级自动化"（保存、创建、删除），用 Claude Code Hooks 处理"会话级自动化"（新会话、完成通知）。各取所长。
+
+## 踩坑经验
+
+### Hook 死循环
+
+和 Claude Code 一样，Kiro 也有死循环的风险。比如 `onSave` Hook 跑格式化，格式化触发了新的保存事件，保存又触发格式化……
+
+解决方案：确保 Hook 的 action 不产生新的事件。格式化一个已经格式化过的文件不应该有任何变更——这就是"幂等性"。
+
+### 性能影响
+
+如果 onSave Hook 跑的是一个很重的测试套件，每次保存文件都要等好几秒。这会严重影响开发体验。
+
+解决方案：给重测试用条件过滤——只在特定目录或特定文件类型触发。或者把重测试放到 preCommit 而不是 onSave 里。
+
+### YAML 格式问题
+
+YAML 对缩进敏感，一个空格的错误就可能导致 Hook 不生效。建议用有 YAML lint 功能的编辑器来写 Hook 配置。
+
+## 一份实用的 Kiro Hooks 配置集
+
+```yaml
+# .kiro/hooks/format-on-save.yaml
+trigger: onSave
+condition: path_matches("src/**/*.{ts,tsx,js,jsx}")
+actions:
+  - run: npx prettier --write {{file}}
+
+# .kiro/hooks/lint-on-save.yaml
+trigger: onSave
+condition: path_matches("src/**/*.{ts,tsx}")
+actions:
+  - run: npx eslint --fix {{file}}
+
+# .kiro/hooks/pre-commit.yaml
+trigger: preCommit
+actions:
+  - run: npx tsc --noEmit
+  - run: npx eslint src/
+  - block_on_failure: true
+
+# .kiro/hooks/auto-docs.yaml
+trigger: onCreate
+condition: path_matches("src/components/**/*.tsx")
+actions:
+  - run: npx typedoc --out docs {{file}}
+```
+
+四条 Hook，覆盖了日常开发中最常见的自动化需求。简单、清晰、不容易出错。
+
+下一篇聊 Kiro 的能力扩展体系——Powers、Subagents 和 Skills。对照 Claude Code 的 Skills + MCP 生态，看看两种扩展模型各自的优势。
