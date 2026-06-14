@@ -1,0 +1,233 @@
+---
+title: "02 配置加载机制：合并、覆盖、优先级"
+date: "2026-06-14"
+summary: "全局和项目都有 settings.json，到底谁说了算？数组是追加还是替换？一篇文章讲透加载规则。"
+tags: ["claude-code", "ai-tooling", "dev-workflow"]
+category: "claude-code-files"
+cover: ""
+draft: false
+series: "Claude Code 目录文件说明"
+seriesOrder: 2
+---
+
+上一篇我们建立了地图：Claude Code 有两个家——全局 `~/.claude/` 和项目 `.claude/`。你知道了每个家装什么、哪些进 git、哪些不进。
+
+但地图只告诉你"有什么"，没告诉你"怎么生效"。于是你会遇到一个高频诡异问题：
+
+> 我明明在项目里配了权限规则，怎么没生效？排查半天发现是被全局配置覆盖了。
+
+这一篇就来解决这个核心问题——**配置加载机制**。搞懂它，你才能精准控制"改一个配置到底生效在哪一层"。
+
+## 加载的三层：全局 → 项目 → 项目本地
+
+Claude Code 启动一个会话时，配置是**按层叠加**加载的。顺序从宽到窄：
+
+```
+全局设置        ~/.claude/settings.json         （所有项目通用）
+    ↓
+项目设置        .claude/settings.json           （团队共享）
+    ↓
+项目本地设置    .claude/settings.local.json     （只对你生效）
+```
+
+**越靠后的层，优先级越高。**也就是说，项目本地 > 项目 > 全局。后加载的会覆盖、或追加到先加载的之上。
+
+这个直觉很重要：**你写在一层的配置，会被更窄的那一层"压住"。**全局写的东西，项目和本地能覆盖；项目写的东西，本地能覆盖；但反过来不行。
+
+## 关键问题：合并还是覆盖？
+
+这是最容易踩坑的地方。很多人以为"覆盖"就是简单替换，其实 Claude Code 对不同类型的字段用不同的合并语义：
+
+- **标量字段**（字符串、数字、布尔）：直接覆盖。后层赢了。
+- **对象字段**：深合并（按 key 合并），不是整体替换。
+- **数组字段**：通常是追加（尤其是 `permissions.allow` 这种列表），不是替换。
+
+拿最常见的 `permissions` 举例。假设三层都有配置：
+
+```json
+// ~/.claude/settings.json （全局）
+{
+  "permissions": {
+    "allow": ["Bash(npm run test)"],
+    "deny": ["Bash(rm -rf *)"]
+  }
+}
+
+// .claude/settings.json （项目）
+{
+  "permissions": {
+    "allow": ["Bash(pnpm run test)"]
+  }
+}
+
+// .claude/settings.local.json （本地）
+{
+  "permissions": {
+    "allow": ["Bash(pnpm run lint)"]
+  }
+}
+```
+
+最终生效的结果是**三层 allow 数组合并**，不是覆盖：
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run test)",
+      "Bash(pnpm run test)",
+      "Bash(pnpm run lint)"
+    ],
+    "deny": ["Bash(rm -rf *)"]
+  }
+}
+```
+
+**这就是为什么"全局配的规则在项目里也生效"——因为它是追加的。**理解了这一点，前面那个"配了不生效"的 bug 就有思路了：它不是被覆盖，而是被合并后规则冲突导致优先级问题。
+
+### 反例：标量字段会被覆盖
+
+如果是标量字段（比如 `model`），就是直接覆盖，不会合并：
+
+```json
+// ~/.claude/settings.json
+{ "model": "sonnet" }
+
+// .claude/settings.local.json
+{ "model": "opus" }
+```
+
+最终生效的是 `opus`——本地的覆盖了全局的。`model` 这种字段没有"合并"的概念，谁在更窄的层谁赢。
+
+## 权限匹配的优先级：deny > ask > allow
+
+合并只是第一步。当一条工具调用进来时，Claude Code 要在合并后的规则里做决策，决策有**优先级**：
+
+```
+deny（拒绝） > ask（询问） > allow（放行）
+```
+
+更具体的规则，优先级更高。看个例子：
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(npm run *)"], // 允许所有 npm run
+    "deny": ["Bash(npm run deploy)"] // 但禁止 npm run deploy
+  }
+}
+```
+
+当你执行 `npm run deploy`，虽然它匹配了 `allow` 里的 `npm run *`，但同时匹配了更具体的 `deny` 规则。**deny 赢**，命令被拒绝。
+
+这个"更具体优先"是防误操作的关键。你可以放心地 `allow` 一大类命令，再用更具体的 `deny` 把危险子命令钉死。比如：
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(git *)"],
+    "deny": ["Bash(git push --force*)", "Bash(git reset --hard*)"]
+  }
+}
+```
+
+允许所有 git 命令，但强制拦截危险操作。这就是权限设计的精髓——**宽口子放行，窄口子收口。**详细的权限语法我们在第 4 篇专门讲。
+
+## 实操：如何确认当前生效的配置
+
+配了一堆，到底生效了没有？Claude Code 提供了一个直接查看的命令。在会话里输入：
+
+```
+/config
+```
+
+会显示当前生效的关键设置（模型、权限等）。对于权限规则，更直接的是观察实际行为——执行一个命令时，它是自动放行、要求确认、还是被拒绝，本身就是配置生效与否的最直接证据。
+
+排查"配了不生效"的标准流程：
+
+**第 1 步：确认配置写在了正确的层。**
+
+很多人把"团队共享"的规则误写进了 `settings.local.json`，结果只有自己生效，同事没生效。或者反过来，把"个人偏好"写进了 `settings.json`，提交后污染了全团队。
+
+**第 2 步：检查是否被更窄的层覆盖。**
+
+如果是标量字段（如 `model`），本地的会覆盖项目和全局。去查 `settings.local.json` 有没有覆盖你的设置。
+
+**第 3 步：检查是否被更高优先级的规则压住。**
+
+权限规则如果是 `allow`，可能被同名的 `deny` 压住。检查三层合并后的 `deny` 列表。
+
+**第 4 步：检查 JSON 语法。**
+
+这是低级但高频的错误——多了一个逗号、少了一个引号，整个文件解析失败，配置全部不生效。用 `cat` 看一眼，或者用 `python -m json.tool xxx.json` 验证语法。
+
+## 两个真实的踩坑案例
+
+### 坑 1：本地配置覆盖团队配置导致协作事故
+
+场景：团队 leader 在 `.claude/settings.json`（进 git）里配了一条 `deny`，禁止 `git push --force`。但有个同事图省事，在 `.claude/settings.local.json` 里把这条命令放进了 `allow`。
+
+```json
+// .claude/settings.local.json （误配）
+{
+  "permissions": {
+    "allow": ["Bash(git push --force*)"]
+  }
+}
+```
+
+结果：**`deny` 优先级高于 `allow`，团队规则依然生效，force push 被拦截。**这其实是件好事，说明权限系统的设计是对的——个人无法用 `allow` 推翻团队的 `deny`。
+
+但如果反过来，团队 `allow` 了某个危险操作，个人想在本地 `deny`——是可以生效的，因为 `deny` 永远赢。这是设计上的安全偏向：**收口容易，开口难。**
+
+### 坑 2：把团队配置误写进 local 文件
+
+场景：你花了一下午给项目写了完整的权限策略，结果发现同事 clone 后都没生效。一查——写进了 `settings.local.json`，这个文件不进 git。
+
+教训：**新建配置文件时，先想清楚是共享还是本地。**团队规则一律写 `settings.json`，只有涉及个人密钥、个人路径的才写 `settings.local.json`。
+
+## CLAUDE.md 的加载也遵循同样的层级
+
+`settings.json` 是这样，`CLAUDE.md` 也是。Claude Code 会加载多层 CLAUDE.md：
+
+```
+~/.claude/CLAUDE.md              （用户级，跨项目）
+./CLAUDE.md                      （项目级，团队共享）
+./src/CLAUDE.md                  （子目录级，进入该目录时加载）
+```
+
+但 CLAUDE.md 的"合并"不是覆盖，而是**叠加注入**——三层的指令都会进入上下文，Claude 会全部看到。所以 CLAUDE.md 没有覆盖问题，但有"冲突"问题：如果全局说"用函数组件"，项目说"用 class 组件"，Claude 就懵了。
+
+这个我们在第 3 篇（CLAUDE.md 记忆系统）会专门讲怎么避免冲突、怎么分层。
+
+## 一张图记住加载机制
+
+```
+        ┌─────────────────────────────────────┐
+        │   ~/.claude/settings.json           │  最宽，所有项目通用
+        │   ~/.claude/CLAUDE.md               │
+        └────────────────┬────────────────────┘
+                         ▼ 叠加（settings 按字段合并，CLAUDE.md 全部注入）
+        ┌─────────────────────────────────────┐
+        │   .claude/settings.json             │  项目级，进 git
+        │   ./CLAUDE.md                       │
+        └────────────────┬────────────────────┘
+                         ▼ 叠加（更窄的层优先级更高）
+        ┌─────────────────────────────────────┐
+        │   .claude/settings.local.json       │  本地，不进 git，优先级最高
+        └─────────────────────────────────────┘
+
+权限决策：deny > ask > allow；更具体的规则优先
+```
+
+记住三个核心结论：
+
+1. **加载顺序**：全局 → 项目 → 本地，越窄优先级越高。
+2. **合并语义**：标量覆盖，对象深合并，权限数组追加。
+3. **权限优先级**：deny 永远赢，更具体的规则赢。
+
+## 系列衔接
+
+加载机制搞懂了，你已经能回答"配置到底生效在哪一层"。接下来三篇文章，我们逐个深入最高频的配置文件。
+
+下一篇从 **CLAUDE.md** 开始——它是"软规则"层（建议、记忆），和 settings.json 这个"硬规则"层（强制、权限）形成对照。我们会讲它的多层加载、`@import` 语法、以及为什么"写了规则 Claude 却不遵守"。

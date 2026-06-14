@@ -1,0 +1,273 @@
+---
+title: "06 skills：技能体系与自动激活"
+date: "2026-06-14"
+summary: "skill 和 command 有什么区别？为什么 skill 能自动判断要不要用？答案在渐进式披露。"
+tags: ["claude-code", "ai-tooling", "dev-workflow"]
+category: "claude-code-files"
+cover: ""
+draft: false
+series: "Claude Code 目录文件说明"
+seriesOrder: 6
+---
+
+上一篇讲 commands（斜杠命令），它的特点是**主动触发**——你输入 `/xxx` 它才执行。这一篇讲扩展三件套的第二个：**skills（技能）**。
+
+skill 和 command 最让人困惑的区别是：
+
+> skill 不需要我喊它，它怎么知道什么时候该用？
+
+答案是一个叫**渐进式披露**的机制。理解了它，你就理解了 skill 的全部精髓。
+
+## skill 解决什么问题
+
+设想这个场景：你希望 Claude 在写 React 组件时，自动遵守"用 server component 为默认""props 用 type 不用 interface""文件用 kebab-case"这些规范。
+
+你有几个选择：
+
+1. **写进 CLAUDE.md** → 可以，但这些规范**一直占着上下文**。即使你在写后端代码、写文档，这些 React 规范也在那儿挤位置。
+2. **写成 command** → 不行，命令要你主动 `/xxx`，你写组件时不会记得喊。
+3. **写成 skill** → 完美。Claude 检测到你在写 React 组件，**自动**激活这个 skill，加载 React 规范；写别的时不加载。
+
+**skill 的核心价值：按需、自动、不浪费上下文。**它让 Claude 拥有大量专业知识，但只在需要时调出来。
+
+## skill 的文件结构
+
+一个 skill 是一个目录，里面有 `SKILL.md` 和资源文件：
+
+```
+.claude/skills/react-component/
+├── SKILL.md              # 技能定义（必需）
+├── templates/            # 模板文件
+│   └── component.tsx
+├── references/           # 参考文档
+│   └── patterns.md
+└── scripts/              # 辅助脚本
+    └── validate.js
+```
+
+`SKILL.md` 是核心，长这样：
+
+```markdown
+---
+name: react-component
+description: 编写 React 组件时使用。涵盖 server/client 组件边界、props 类型、文件命名、状态管理等 React 项目专属规范。
+---
+
+# React 组件编写规范
+
+## 组件类型
+
+- 默认用 server component（不加 "use client"）
+- 只有需要状态、事件、浏览器 API 时才加 "use client"
+
+## Props
+
+- 用 type 定义 props，不用 interface
+- 必须显式解构 props，不要 props.xxx
+
+## 命名
+
+- 组件文件用 kebab-case：user-card.tsx
+- 组件符号用 PascalCase：UserCard
+
+（详细规范...）
+```
+
+注意 frontmatter 里的 `name` 和 `description`——**这两个字段决定了 skill 能否被正确激活。**下面专门讲。
+
+### SKILL.md 的 frontmatter
+
+| 字段          | 作用                                                      |
+| ------------- | --------------------------------------------------------- |
+| `name`        | 技能的唯一标识，也是目录名                                |
+| `description` | **决定激活的关键字段**——Claude 靠它判断要不要用这个 skill |
+
+`description` 为什么这么重要？因为 skill 的自动激活机制就靠它。Claude 启动时只把所有 skill 的 `description` 读进上下文（很省 token），当你的任务匹配某个 description 时，才加载对应的 SKILL.md 正文。
+
+所以 **description 写得好不好，直接决定 skill 能不能被正确激活。**
+
+## 核心机制：渐进式披露
+
+这是 skill 区别于 command 和 CLAUDE.md 的根本原理。信息分三层逐步加载：
+
+### 第一层：description 始终在上下文
+
+会话启动时，Claude Code 把所有 skill 的 `description` 读进上下文：
+
+```
+- react-component: 编写 React 组件时使用...
+- sql-optimization: 优化 SQL 查询时使用...
+- git-workflow: 执行 git 操作时使用...
+```
+
+这一层很轻——每个 skill 只占一两句话。你可以装几十个 skill，描述加起来也不到一千 token。
+
+### 第二层：匹配触发时加载 SKILL.md 正文
+
+当你的任务匹配某个 skill 的 description，Claude 才加载它的完整正文。比如你说"帮我写一个用户卡片组件"，匹配到 `react-component`，于是 `react-component/SKILL.md` 的完整内容被加载进来。
+
+**这就是"按需"——写组件时加载 React 规范，写 SQL 时加载 SQL 规范，互不干扰。**
+
+### 第三层：按需读取 skill 内的资源文件
+
+如果 SKILL.md 正文里引用了模板、参考文档，Claude 还会进一步按需读取。比如 SKILL.md 里写"组件模板见 templates/component.tsx"，Claude 在真正需要模板时才读那个文件。
+
+```
+第一层：description（始终在，几十 token）
+   ↓ 匹配触发
+第二层：SKILL.md 正文（按需加载，几百 token）
+   ↓ 引用资源
+第三层：templates/references/scripts（真正需要时才读）
+```
+
+**这个三层结构是 skill 省 token 的关键。**如果你把所有规范都塞进 CLAUDE.md，它们 100% 占用上下文；用 skill，只有真正相关的才被加载。
+
+## description 怎么写才能被正确激活
+
+这是写 skill 最容易翻车的地方。description 写得不好，skill 就"不触发"或"乱触发"。
+
+### 好的 description：说清"什么时候用"
+
+```markdown
+# ✅ 好
+
+description: 编写或修改 React 组件时使用。包括创建新组件、给组件加 props、处理 server/client 边界、写自定义 hooks。涵盖 React 18/19。
+
+# ✅ 好
+
+description: 优化 PostgreSQL 查询性能时使用。当遇到慢查询、需要加索引、分析 EXPLAIN 结果、设计表结构时激活。
+
+# ❌ 差（太模糊）
+
+description: 关于 React 的技能。
+
+# ❌ 差（没说触发场景）
+
+description: 包含组件规范、props 类型、命名约定等。
+```
+
+好的 description 包含两部分：
+
+1. **做什么**（编写 React 组件 / 优化 SQL）
+2. **什么时候触发**（创建新组件、加 props、处理边界 / 慢查询、加索引、分析 EXPLAIN）
+
+Claude 是靠这些"触发词"判断要不要激活的。写得越具体、越贴近你实际的表达，激活越准。
+
+### 用触发词覆盖用户的真实表达
+
+想想你平时怎么描述任务——"帮我写个组件""这个查询太慢了""加个 hook"。你的 description 里要包含这些表达对应的场景词：
+
+```markdown
+# 涵盖多种触发表达
+
+description: 编写 React 组件、创建组件、加 props、写自定义 hook、处理 use client 边界时使用。
+```
+
+这样无论你说"写个组件"还是"创建组件"还是"加个 hook"，都能匹配上。
+
+## 全局 skill vs 项目 skill
+
+跟其他配置一样：
+
+```
+~/.claude/skills/xxx/         全局技能，所有项目可用
+.claude/skills/xxx/           项目技能，只在该项目可用
+```
+
+**哪些放哪？**
+
+- **通用专业领域技能** → 全局。比如 `git-workflow`、`sql-optimization`、`accessibility`——跨项目都用得上。
+- **项目专属技能** → 项目。比如 `my-blog-deploy`（这个博客的部署流程）、`my-db-migration`（这个项目的迁移规范）——只对这个项目有意义。
+
+项目 skill 进 git，团队共享。
+
+## skill vs command vs agent：完整对比
+
+扩展三件套的对比表，到这里能填完整了：
+
+| 维度   | command            | skill                | agent            |
+| ------ | ------------------ | -------------------- | ---------------- |
+| 触发   | 主动 `/xxx`        | 自动匹配             | 主对话调度       |
+| 上下文 | 主对话             | 主对话               | **独立上下文**   |
+| 加载   | 即时全量           | 渐进式披露           | 隔离的           |
+| 适合   | 明确的一次性工作流 | 按场景的专业能力     | 隔离的专业子任务 |
+| 例子   | `/ship` 提交推送   | React 组件规范自动用 | 代码审查专家     |
+
+**选型口诀：**
+
+- 想要"我喊一声就做" → **command**
+- 想要"它自己知道什么时候用" → **skill**
+- 想要"另起一个房间、不污染主对话" → **agent**
+
+很多能力三种都能实现，区别在触发方式和上下文。比如"代码审查"：
+
+- 写成 command `/review` → 你主动喊
+- 写成 skill `code-review` → 你说"看看这段代码"时自动激活
+- 写成 agent `reviewer` → Claude 派一个独立子代理去审，只把结论带回来
+
+下一篇讲 agent，会展开第三种。
+
+## 实战：写一个项目专属 skill
+
+假设你有个项目，部署流程很特殊（先跑迁移、再构建、再传到 S3、最后刷新 CDN）。你希望每次说"部署"时 Claude 自动按这个流程走。写一个 skill：
+
+**第 1 步：建目录和 SKILL.md。**
+
+```bash
+mkdir -p .claude/skills/deploy
+```
+
+```markdown
+## <!-- .claude/skills/deploy/SKILL.md -->
+
+name: deploy
+description: 部署本项目时使用。当用户说"部署""上线""发布到生产"时激活。覆盖迁移、构建、上传、刷新 CDN 的完整流程。
+
+---
+
+# 本项目部署流程
+
+## 步骤（严格按顺序）
+
+1. **跑数据库迁移**
+   `pnpm run db:migrate`
+   失败就停止，不要继续。
+
+2. **构建生产包**
+   `pnpm run build`
+
+3. **上传到 S3**
+   `pnpm run upload:s3`
+
+4. **刷新 CDN 缓存**
+   `pnpm run cdn:refresh`
+
+## 注意
+
+- 部署前必须确认当前分支是 main
+- 部署前必须跑过测试
+- 任何一步失败都要停下来报告，不要跳过
+```
+
+**第 2 步：验证 description 写得够好。**
+
+确认 description 里包含了你平时会用的表达（"部署""上线""发布到生产"）。
+
+**第 3 步：测试激活。**
+
+在新会话里说"帮我部署到生产"，看 Claude 有没有自动加载这个 skill 并按流程走。如果没激活，回头改 description——加更多触发词。
+
+**第 4 步：提交到 git。**
+
+```bash
+git add .claude/skills/deploy/
+git commit -m "feat: 添加部署 skill"
+```
+
+团队成员 clone 后，说"部署"也能自动按这个流程走。
+
+## 系列衔接
+
+skill 讲完了——核心是渐进式披露，靠 description 自动激活，按需加载，省上下文。它是"共享主对话上下文"的扩展方式。
+
+下一篇讲扩展三件套的最后一个：**agents（子代理）**。它和 skill 最大的区别是——agent 有**独立的上下文窗口**，子代理干活时主对话不会被它的中间过程污染，只把结论带回来。这是处理大任务、保护主上下文的关键机制。

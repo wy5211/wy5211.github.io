@@ -1,0 +1,250 @@
+---
+title: "05 commands：斜杠命令的文件结构"
+date: "2026-06-14"
+summary: "每天都要重复输入一长串指令？把它封装成一个 /xxx 命令，文件名即命令名。"
+tags: ["claude-code", "ai-tooling", "dev-workflow"]
+category: "claude-code-files"
+cover: ""
+draft: false
+series: "Claude Code 目录文件说明"
+seriesOrder: 5
+---
+
+前四篇讲了目录地图、加载机制、CLAUDE.md 记忆、settings 权限——这些是 Claude Code 的"基础设施"。从这一篇开始，我们进入"扩展三件套"：commands、skills、agents。它们是你扩展 Claude Code 能力的三种主要方式。
+
+先讲最简单也最高频的：**commands（斜杠命令）**。
+
+## 命令解决什么问题
+
+你一定有过这种体验：每次想发布代码，都要对 Claude 说一长串——"先看下当前 diff，然后跑测试，测试过了就按 conventional commits 规范提交，最后推到当前分支"。每个项目、每个会话都要重复说，烦死了。
+
+**命令就是把这段重复的指令封装成一个 `/xxx`。**你输入 `/ship`，Claude 就自动执行那串操作。文件名即命令名，写一次到处用。
+
+## 命令文件结构：文件名即命令名
+
+命令就是一个 Markdown 文件，放在 `commands/` 目录下。**文件名（去掉扩展名）就是命令名。**
+
+```
+~/.claude/commands/
+├── ship.md          →  /ship
+├── review.md        →  /review
+└── fix-tests.md     →  /fix-tests
+```
+
+把 `ship.md` 放进 `~/.claude/commands/`，在任何项目里输入 `/ship` 就触发它。放进项目 `.claude/commands/`，只在该项目生效。
+
+一个最小的命令文件长这样：
+
+```markdown
+<!-- ~/.claude/commands/ship.md -->
+
+审查当前 git diff，然后运行测试。测试通过后，按 conventional commits 规范提交并推送到当前分支。
+```
+
+就这么简单——文件正文就是你要对 Claude 说的指令。`/ship` 等价于你把这段话发给 Claude。
+
+## frontmatter：给命令加元信息
+
+命令文件可以带 frontmatter（文件开头的 YAML 块），配置命令的元信息：
+
+```markdown
+---
+description: 审查 diff、跑测试、规范提交、推送
+argument-hint: "[可选的提交信息]"
+allowed-tools: Bash(git *), Bash(npm run test)
+---
+
+审查当前 git diff，指出问题。然后运行 `npm run test`，全过之后按 conventional commits 规范提交，最后推送到当前分支。
+```
+
+几个常用字段：
+
+| 字段            | 作用                                          |
+| --------------- | --------------------------------------------- |
+| `description`   | 命令的描述，显示在 `/` 命令列表里，帮你认出它 |
+| `argument-hint` | 参数提示，告诉用户怎么传参                    |
+| `allowed-tools` | 这个命令允许调用的工具（额外的权限范围）      |
+
+`description` 很重要——你装的命令一多，`/` 之后会弹出一长串列表，没描述就认不出哪个是哪个。
+
+## 命令模板：三种注入语法
+
+命令真正的威力来自模板注入。命令正文不是死字符串，它可以注入动态内容：
+
+### 1. `$ARGUMENTS`：注入用户输入的参数
+
+```markdown
+## <!-- ~/.claude/commands/explain.md -->
+
+description: 解释某个文件或函数的作用
+argument-hint: "<文件路径或函数名>"
+
+---
+
+详细解释 `$ARGUMENTS` 的作用、调用关系、关键逻辑。面向有一定基础但不熟悉这块的读者。
+```
+
+输入 `/explain src/lib/auth.ts`，`$ARGUMENTS` 就被替换成 `src/lib/auth.ts`，Claude 拿到的指令是"详细解释 `src/lib/auth.ts` 的作用..."。
+
+### 2. `!命令`：注入 shell 命令的输出
+
+```markdown
+## <!-- ~/.claude/commands/review-staged.md -->
+
+## description: 审查已暂存的改动
+
+这是当前已暂存的 diff：
+
+!git diff --staged
+
+请审查这段改动的正确性、安全性、可维护性，指出问题。
+```
+
+`!git diff --staged` 会在命令触发时**先执行这条 shell 命令**，把输出注入到指令里。Claude 拿到的是"这是当前已暂存的 diff：<实际 diff 内容>，请审查..."。
+
+这个机制让命令能拿到实时状态——当前 diff、当前分支、当前日期，全都能注入。
+
+### 3. `@文件路径`：注入文件内容
+
+```markdown
+## <!-- ~/.claude/commands/align.md -->
+
+## description: 让代码对齐项目的规范
+
+这是项目规范：
+
+@CLAUDE.md
+
+请审查以下代码是否符合规范，不符合的地方指出并给出修改建议：
+$ARGUMENTS
+```
+
+`@CLAUDE.md` 会把 CLAUDE.md 文件的内容注入进来。三种注入可以混用——上面这个例子同时用了 `@` 注入规范、`$ARGUMENTS` 注入参数。
+
+## 全局命令 vs 项目命令
+
+跟其他配置一样，命令分两层：
+
+```
+~/.claude/commands/xxx.md      全局命令，所有项目可用
+.claude/commands/xxx.md        项目命令，只在该项目可用
+```
+
+**哪些放全局，哪些放项目？**
+
+- **通用工作流命令** → 全局。比如 `/ship`（提交推送）、`/review`（代码审查）、`/explain`（解释代码）——这些跟具体项目无关。
+- **项目专属命令** → 项目。比如 `/deploy`（这个项目的部署流程）、`/db-reset`（这个项目的数据库重置）——只在这个项目有意义。
+
+项目命令进 git，团队成员 clone 后自动拥有。全局命令是你个人的工具箱，跟着你的 `~/.claude/` 走。
+
+## 命令 vs CLAUDE.md：主动触发 vs 被动加载
+
+很多人分不清命令和 CLAUDE.md。它们的本质区别：
+
+| 维度       | 命令（commands）               | CLAUDE.md                  |
+| ---------- | ------------------------------ | -------------------------- |
+| 触发方式   | **主动**，你输入 `/xxx` 才触发 | **被动**，每次会话自动加载 |
+| 上下文占用 | 触发时才占用，平时不占         | 一直占用上下文             |
+| 适合       | 需要按需触发的完整工作流       | 始终生效的约定和偏好       |
+
+**一句话区分：命令是"我现在要做这件事"的触发器，CLAUDE.md 是"你永远要记住"的背景知识。**
+
+举例：
+
+- "提交代码时用 conventional commits 规范" → 写进 CLAUDE.md（每次都生效）
+- "/ship：审查 + 测试 + 提交 + 推送" → 写成命令（按需触发）
+
+不要把工作流塞进 CLAUDE.md（一直占上下文），也不要把核心约定只写成命令（不触发就不生效）。
+
+## 命令 vs skills vs agents：三种扩展的定位
+
+既然讲到扩展三件套，先把三者的定位说清楚，后面两篇会展开：
+
+| 扩展        | 触发方式         | 上下文         | 适合                   |
+| ----------- | ---------------- | -------------- | ---------------------- |
+| **command** | 主动输入 `/xxx`  | 主对话上下文   | 明确的、一次性的工作流 |
+| **skill**   | 自动判断是否需要 | 主对话上下文   | 按场景自动激活的能力   |
+| **agent**   | 主对话调度       | **独立上下文** | 隔离的、专业的子任务   |
+
+这一篇讲 command，下一篇讲 skill，再下一篇讲 agent。记住核心区别：**命令是"你喊它"，技能是"它自己来"，代理是"另起一个房间干活"。**
+
+## 实战：写 3 个高频命令
+
+照着这 3 个模板写，立刻能用。
+
+### 命令 1：`/review`（代码审查）
+
+```markdown
+## <!-- .claude/commands/review.md -->
+
+## description: 审查当前改动，按严重级别输出问题
+
+审查当前的改动，从以下几个维度：
+
+!git diff HEAD
+
+输出格式：
+
+- 🔴 CRITICAL：必须修复（安全漏洞、数据丢失风险）
+- 🟠 HIGH：应该修复（bug、重大质量问题）
+- 🟡 MEDIUM：建议修复（可维护性）
+- 🟢 LOW：可选（风格建议）
+
+先列 CRITICAL 和 HIGH，最后简单提一下 MEDIUM 和 LOW。
+```
+
+触发 `/review`，自动拿到当前 diff 并按级别审查。
+
+### 命令 2：`/commit`（规范化提交）
+
+```markdown
+## <!-- .claude/commands/commit.md -->
+
+## description: 按 conventional commits 规范提交当前改动
+
+分析当前已暂存的改动：
+
+!git diff --staged
+
+根据改动内容生成 conventional commits 规范的提交信息：
+
+- 类型从 feat/fix/refactor/docs/test/chore/perf 里选
+- 描述用中文，简洁概括改动
+- 如果改动复杂，正文分点说明
+
+生成后直接执行提交。不要推送。
+```
+
+触发 `/commit`，自动分析改动并规范提交。
+
+### 命令 3：`/precheck`（环境检查）
+
+```markdown
+## <!-- .claude/commands/precheck.md -->
+
+## description: 提交前的全面检查
+
+运行提交前检查，逐项报告：
+
+1. 代码风格：
+   !npm run lint
+
+2. 类型检查：
+   !npm run typecheck
+
+3. 测试：
+   !npm run test
+
+4. 当前分支状态：
+   !git status -s
+
+任何一项失败就明确指出，不要继续。全过后告诉我"可以提交了"。
+```
+
+触发 `/precheck`，跑完 lint/typecheck/test 并报告状态。
+
+## 系列衔接
+
+命令是扩展三件套里最简单直接的——文件名即命令名，正文即指令，三种注入让模板活起来。
+
+下一篇讲 **skills（技能）**。它和命令最大的区别是：命令需要你主动输入 `/xxx` 触发，而 skill 能**自动判断要不要用**。比如你让 Claude 写 React 组件，它能自动激活"React 组件规范"这个 skill，不需要你提醒。这就是"渐进式披露"机制，下一篇细讲。

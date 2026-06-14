@@ -1,0 +1,331 @@
+---
+title: "04 settings.json：权限系统原理"
+date: "2026-06-14"
+summary: "同样是跑命令，为什么有的直接执行、有的要确认、有的被拒？答案在 permissions 的三态机制里。"
+tags: ["claude-code", "ai-tooling", "dev-workflow"]
+category: "claude-code-files"
+cover: ""
+draft: false
+series: "Claude Code 目录文件说明"
+seriesOrder: 4
+---
+
+上一篇讲 CLAUDE.md 时，我们留了一个对比：CLAUDE.md 是"软规则"（建议，Claude 偶尔会违反），而 settings.json 的权限系统是"硬规则"（强制，工具无法绕过）。
+
+这一篇我们就深入这个硬规则——**权限系统**。你日常会反复遇到的现象：
+
+> 同样是跑命令，有的直接执行（不问你），有的每次都要你点确认，有的干脆被拒绝。为什么？
+
+答案全在 `permissions` 这个配置里。搞懂它，你就能精确控制 Claude"能做什么、不能做什么、必须问你"。
+
+## 权限三态：allow / deny / ask
+
+Claude Code 的权限系统有三个状态，对应三个动作：
+
+| 状态    | 行为                 | 适用场景                                   |
+| ------- | -------------------- | ------------------------------------------ |
+| `allow` | 自动放行，不询问     | 安全的、高频的命令（读文件、跑测试）       |
+| `ask`   | 每次执行前问你       | 有一定风险但你可能想做的（装依赖、改配置） |
+| `deny`  | 直接拒绝，连问都不问 | 危险的、不可逆的（删库、force push）       |
+
+这三个状态在 settings.json 里这样配：
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(npm run test)", "Bash(npm run lint)"],
+    "ask": ["Bash(npm install)"],
+    "deny": ["Bash(rm -rf *)", "Bash(git push --force)"]
+  }
+}
+```
+
+**直觉理解**：
+
+- `allow` 是绿灯——"这些你随便做，别烦我"
+- `ask` 是黄灯——"这些你要先问问我"
+- `deny` 是红灯——"这些你想都别想"
+
+很多新手的痛苦来源就是没配 `allow`——结果每跑一个测试都要手动确认，烦得要命。配好了 `allow` 高频安全命令，体验立刻丝滑。
+
+## 权限规则语法
+
+权限规则的核心语法是 `工具名(参数模式)`。看几个真实例子：
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm run test)", // 精确匹配这条命令
+      "Bash(npm run test:*)", // 前缀匹配：npm run test:unit、test:e2e 都行
+      "Bash(pnpm *)", // 所有 pnpm 命令
+      "Read(./src/**)", // 读取 src 下所有文件（glob 匹配）
+      "Edit(src/components/**)", // 编辑 components 下的文件
+      "WebFetch(domain:github.com)" // 抓取 github.com
+    ],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force*)",
+      "Read(./secrets/**)", // 禁止读取 secrets 目录
+      "Edit(.env)" // 禁止改 .env
+    ]
+  }
+}
+```
+
+### Bash 规则：命令前缀匹配
+
+Bash 是最常配的工具。规则是**前缀匹配**：
+
+- `Bash(npm run test)` —— 只匹配完全相等的 `npm run test`
+- `Bash(npm run test:*)` —— 匹配 `npm run test` 开头的所有命令（`test:unit`、`test:e2e`）
+- `Bash(npm *)` —— 匹配所有 npm 命令
+- `Bash(git *)` —— 匹配所有 git 命令
+
+`*` 是通配符。注意 `Bash(npm run test)` 和 `Bash(npm run test:*)` 的区别——前者严格相等，后者前缀匹配。一般用 `:*` 更实用，能覆盖一类命令。
+
+### Read / Write / Edit 规则：路径通配
+
+文件操作类工具用**路径匹配**，支持 glob：
+
+- `Read(./src/**)` —— 读取 src 下所有文件，包括子目录
+- `Read(./secrets/**)` —— 匹配 secrets 下所有文件
+- `Edit(src/components/**/*.tsx)` —— 编辑 components 下所有 tsx
+- `Read(.env)` —— 精确匹配 .env 文件
+
+`**` 表示递归所有子目录，`*` 表示单层通配。这跟大多数 glob 实现一致。
+
+### WebFetch / WebSearch 规则：域名限制
+
+网络类工具可以限制域名：
+
+- `WebFetch(domain:github.com)` —— 只允许抓 github.com
+- `WebFetch(domain:*)` —— 所有域名（慎用）
+
+## 规则匹配优先级
+
+上一章讲加载机制时提过，这里再强调一遍，因为它是设计权限策略的关键：
+
+```
+1. deny 永远赢（最高优先级）
+2. 更具体的规则赢过更宽泛的
+3. ask 赢过 allow
+```
+
+看个综合例子：
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(npm *)"],
+    "ask": ["Bash(npm publish)"],
+    "deny": ["Bash(npm publish --force)"]
+  }
+}
+```
+
+执行不同命令的结果：
+
+| 命令                  | 决策    | 原因                        |
+| --------------------- | ------- | --------------------------- |
+| `npm run test`        | ✅ 放行 | 匹配 allow 的 `npm *`       |
+| `npm publish`         | ⚠️ 询问 | ask 比 allow 优先，且更具体 |
+| `npm publish --force` | ❌ 拒绝 | deny 永远赢                 |
+| `npm install`         | ✅ 放行 | 匹配 allow 的 `npm *`       |
+
+**这个"宽口子 + 窄口子"的组合是权限设计的精髓：**用宽泛的 `allow` 放行一大类安全命令，用具体的 `ask` / `deny` 收住风险子命令。
+
+## 工具粒度：哪些工具能配权限
+
+不是所有工具都能配权限。可以配的主要是"有副作用、需要控制"的工具：
+
+| 工具                   | 能否配权限 | 典型用法                |
+| ---------------------- | ---------- | ----------------------- |
+| `Bash`                 | ✅         | 命令前缀匹配            |
+| `Read`                 | ✅         | 路径通配                |
+| `Write`                | ✅         | 路径通配                |
+| `Edit`                 | ✅         | 路径通配                |
+| `WebFetch`             | ✅         | 域名限制                |
+| `WebSearch`            | ✅         | 限制搜索                |
+| MCP 工具               | ✅         | `mcp__服务器名__工具名` |
+| `TodoWrite` 等内部工具 | ❌         | 无副作用，无需配        |
+
+为什么有的工具不能配权限？因为像 `TodoWrite`（写任务列表）、`Task`（管理 todo）这类是纯内部状态管理，没有外部副作用，没必要拦。
+
+**MCP 工具的权限规则**值得一提。当你装了 MCP 服务器（第 8 篇讲），它提供的工具也能配权限：
+
+```json
+{
+  "permissions": {
+    "allow": ["mcp__postgres__query", "mcp__github__*"]
+  }
+}
+```
+
+格式是 `mcp__服务器名__工具名`，同样支持 `*` 通配。
+
+## settings.json vs settings.local.json：权限该放哪
+
+权限配置也要分共享和本地。原则跟上一篇地图里讲的一样：
+
+```json
+// .claude/settings.json —— 进 git，团队共享
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force main)",
+      "Read(./secrets/**)"
+    ],
+    "ask": ["Bash(npm publish)"]
+  }
+}
+```
+
+```json
+// .claude/settings.local.json —— 不进 git，只对你生效
+{
+  "permissions": {
+    "allow": ["Bash(npm run test)", "Bash(pnpm dev)", "Bash(pnpm lint)"]
+  }
+}
+```
+
+**分工原则：**
+
+- **`deny` 和团队强制的 `ask`** → 写 `settings.json`，进 git。让所有人自动继承安全规则。
+- **个人高频的 `allow`** → 写 `settings.local.json`。因为每个人常用命令可能不同，且避免污染团队。
+
+一个团队的最佳实践：**`settings.json` 只放"防呆"规则**（deny 危险操作 + ask 重要操作），**`settings.local.json` 放"提效"规则**（allow 高频命令）。前者保护，后者舒服。
+
+## 原理：一条工具调用怎么过权限这道闸
+
+把前面的知识串起来，看一条工具调用从发出到执行的全过程：
+
+```
+Claude 决定调用 Bash("npm run test")
+            │
+            ▼
+   ┌────────────────────┐
+   │  合并三层配置        │  ~/.claude + .claude + .claude.local
+   │  得到完整的规则集    │
+   └─────────┬──────────┘
+             ▼
+   ┌────────────────────┐
+   │  匹配规则           │  命令 vs 规则
+   └─────────┬──────────┘
+             ▼
+   ┌────────────────────┐
+   │  决策               │
+   │  匹配 deny? → 拒绝  │
+   │  匹配 ask?  → 询问  │
+   │  匹配 allow?→ 放行  │
+   │  都没匹配? → 询问   │  默认是询问
+   └─────────┬──────────┘
+             ▼
+   执行 / 阻断 / 等待用户确认
+```
+
+注意最后一行：**如果一条命令没匹配任何规则，默认是 `ask`（询问）。**这是安全默认——没明确允许的，都先问一下。所以你想让 Claude 自动跑某些命令，必须显式写进 `allow`。
+
+## 推荐的权限配置策略
+
+根据项目类型，推荐三种策略：
+
+### 策略 1：只读探索（最保守）
+
+适合：审查别人的代码、阅读文档、调研技术。
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read(**)",
+      "Bash(git log *)",
+      "Bash(git diff *)",
+      "Bash(ls *)",
+      "Bash(cat *)"
+    ],
+    "deny": ["Edit(**)", "Write(**)"]
+  }
+}
+```
+
+只允许读和查看，禁止任何修改。Claude 变成一个纯调研助手。
+
+### 策略 2：受限沙箱（推荐默认）
+
+适合：日常开发。允许读写代码，但禁止危险操作。
+
+```json
+{
+  "permissions": {
+    "allow": [
+      "Read(**)",
+      "Edit(src/**)",
+      "Write(src/**)",
+      "Bash(npm run test*)",
+      "Bash(npm run lint*)",
+      "Bash(npm run typecheck*)",
+      "Bash(git add *)",
+      "Bash(git commit *)"
+    ],
+    "ask": ["Bash(npm install*)", "Bash(npm uninstall*)", "Bash(git push*)"],
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force*)",
+      "Bash(git reset --hard*)",
+      "Read(.env*)",
+      "Edit(.env*)"
+    ]
+  }
+}
+```
+
+读写代码顺畅，跑测试不询问，装依赖和 push 要确认，危险操作钉死。
+
+### 策略 3：全开模式（个人玩具项目）
+
+适合：你自己一个人的实验项目，图省事。
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(*)", "Read(**)", "Edit(**)", "Write(**)"],
+    "deny": ["Bash(rm -rf /)", "Bash(rm -rf ~)"]
+  }
+}
+```
+
+几乎全自动，只保留最极端的兜底。**只在你完全信任、可丢可重建的项目里用，团队项目绝对不要这样配。**
+
+## 实战：给团队配一套防呆权限
+
+假设你带一个团队，要给项目配一套"既安全又不烦人"的权限。照这个模板：
+
+```json
+// .claude/settings.json —— 进 git
+{
+  "permissions": {
+    "deny": [
+      "Bash(rm -rf *)",
+      "Bash(git push --force*)",
+      "Bash(git reset --hard*)",
+      "Bash(sudo *)",
+      "Read(.env*)",
+      "Edit(.env*)",
+      "Read(./secrets/**)",
+      "Edit(./secrets/**)"
+    ],
+    "ask": ["Bash(npm publish*)", "Bash(git push*)", "Bash(docker *)"]
+  }
+}
+```
+
+然后告诉同事：**把你的高频命令写进 `.claude/settings.local.json` 的 `allow`，享受丝滑体验。**团队规则保护，个人偏好提效，各司其职。
+
+## 系列衔接
+
+权限系统讲完了——这是 settings.json 最核心、最高频的部分。settings.json 还有其他字段（默认模型、env 变量、hooks 注册等），其中 **hooks 注册**尤其重要，我们会在第 9 篇专门讲。
+
+接下来三篇文章，进入"扩展三件套"——commands、skills、agents。它们是扩展 Claude Code 能力的三种主要方式，从下一篇的 **commands（斜杠命令）** 开始。你会看到，权限是"控制 Claude 能做什么"，而 commands 是"教 Claude 一个新的触发方式"。

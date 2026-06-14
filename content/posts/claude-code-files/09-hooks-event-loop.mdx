@@ -1,0 +1,361 @@
+---
+title: "09 hooks：事件循环与会话生命周期"
+date: "2026-06-14"
+summary: "hooks 到底什么时候触发？它怎么拦截工具调用？一篇文章讲透生命周期、JSON 协议、配置方式。"
+tags: ["claude-code", "ai-tooling", "dev-workflow"]
+category: "claude-code-files"
+cover: ""
+draft: false
+series: "Claude Code 目录文件说明"
+seriesOrder: 9
+---
+
+上一篇讲 MCP——"被动提供能力"。这一篇讲一个"主动"的扩展：**hooks**。
+
+hooks 是 Claude Code 自动化的核心。你想实现的这些需求，全靠它：
+
+> 每次写文件后自动跑 prettier 格式化。
+> 每次跑 `rm -rf` 前自动拦截。
+> 每次会话结束前自动跑一遍测试。
+
+这些"在某事件发生时自动做某事"的逻辑，就是 hooks 的活。这一篇讲清楚它的生命周期、触发流程、配置方式，以及最容易踩的坑。
+
+## hooks 解决什么问题
+
+回想第 4 篇讲的权限系统——它能"允许 / 询问 / 拒绝"工具调用。但它只能决策，不能"做额外的事"。
+
+比如你想"每次 Claude 写完文件，自动用 prettier 格式化一下"。权限系统做不到——它只会说"允许写"，写完就完了。你需要在"写完"这个时间点**插入一个额外动作**。
+
+**hooks 就是这些插入点。**它在会话和工具调用的各个生命周期节点上提供钩子，让你挂自己的脚本。
+
+## 会话生命周期事件全览
+
+Claude Code 的会话有一系列生命周期事件，每个事件都能挂 hook：
+
+| 事件               | 触发时机          | 典型用途                 |
+| ------------------ | ----------------- | ------------------------ |
+| `SessionStart`     | 会话开始时        | 初始化环境、加载上下文   |
+| `UserPromptSubmit` | 用户提交输入后    | 给输入加额外上下文、记录 |
+| `PreToolUse`       | 工具执行**前**    | **拦截、修改工具调用**   |
+| `PostToolUse`      | 工具执行**后**    | 自动格式化、跑检查       |
+| `Stop`             | Claude 响应结束时 | 跑测试、最终验证         |
+| `SubagentStop`     | 子代理结束时      | 处理子代理结果           |
+| `SessionEnd`       | 会话结束时        | 清理、汇报               |
+
+最常用的是中间四个：`PreToolUse`（拦截）、`PostToolUse`（后续动作）、`Stop`（收尾验证）、`UserPromptSubmit`（输入增强）。
+
+## 触发流程：事件 → 匹配 → 执行 → 解析输出
+
+一个 hook 触发的完整流程：
+
+```
+1. 事件发生（比如 Claude 要执行 Bash("npm run test")）
+            │
+            ▼
+2. 匹配 hook（按 event + matcher）
+   event: PreToolUse
+   matcher: Bash  ← 只匹配 Bash 工具
+            │
+            ▼
+3. 执行 hook 脚本（把上下文通过 stdin 传给脚本）
+            │
+            ▼
+4. 解析脚本输出（exit code + stdout/stderr）
+   exit 0 → 放行
+   exit 2 → 阻断
+   JSON 输出 → 反馈内容
+```
+
+第 4 步是关键——**脚本的退出码和输出决定了 hook 怎么影响 Claude 的行为。**
+
+## hook 输出如何影响行为
+
+### exit code：放行 or 阻断
+
+对于 `PreToolUse` 这种"可拦截"的事件，脚本的退出码决定动作：
+
+| exit code | 含义                                           |
+| --------- | ---------------------------------------------- |
+| `0`       | 放行，工具正常执行                             |
+| `2`       | **阻断**，工具不执行，stderr 内容反馈给 Claude |
+| 其他      | 非致命错误，工具照常执行，stderr 作为警告      |
+
+最常见的拦截模式：脚本检查工具调用，发现危险就 `exit 2`，把原因写到 stderr，Claude 看到后会调整。
+
+```bash
+#!/bin/bash
+# 拦截 rm -rf 的 hook
+if echo "$TOOL_INPUT" | grep -q "rm -rf"; then
+  echo "禁止执行 rm -rf，请用更安全的方式删除" >&2
+  exit 2
+fi
+exit 0
+```
+
+### JSON 输出：结构化反馈
+
+更进阶的方式是用 JSON 输出。脚本在 stdout 输出一段 JSON，Claude Code 解析后做更精细的控制——比如修改工具参数、追加系统消息、决定决策。
+
+```json
+{
+  "decision": "block",
+  "reason": "检测到敏感操作，已拦截"
+}
+```
+
+JSON 输出能表达比 exit code 更丰富的信息。但日常用 exit code + stderr 就够了，JSON 是高级场景。
+
+## hook 的 JSON 输入协议
+
+hook 脚本执行时，Claude Code 会通过 **stdin** 把当前上下文传给它，是一段 JSON。包含：
+
+```json
+{
+  "session_id": "abc123",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "npm run test"
+  },
+  "cwd": "/path/to/project"
+}
+```
+
+脚本读 stdin，解析 JSON，就能拿到"哪个工具、什么参数、在哪个目录"等信息，据此做决策。
+
+```bash
+#!/bin/bash
+# 读取 stdin 的 JSON
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command')
+
+# 检查命令是否危险
+if echo "$COMMAND" | grep -qE "rm -rf|git push --force"; then
+  echo "检测到危险命令：$COMMAND" >&2
+  exit 2
+fi
+exit 0
+```
+
+`jq` 是处理 hook 输入 JSON 的常用工具，建议装上。
+
+## 在 settings.json 里配置 hooks
+
+hooks 配置在 settings.json 的 `hooks` 字段里。结构是 `事件 → matcher → hooks → command`：
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "prettier --write \"$FILE_PATH\""
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/path/to/block-dangerous.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npm run test"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+逐层解读：
+
+- 最外层是事件名（`PostToolUse` / `PreToolUse` / `Stop`）
+- 每个事件下是数组，每个元素含 `matcher`（匹配哪些工具）和 `hooks`
+- `matcher` 用 `|` 分隔多个工具名，比如 `Write|Edit` 匹配写和编辑
+- `hooks` 是数组，每个含 `type: "command"` 和 `command`（要执行的脚本）
+
+**全局 hooks vs 项目 hooks**：写在 `~/.claude/settings.json` 是全局，写在 `.claude/settings.json` 是项目。逻辑跟其他配置一致。
+
+## 高频实战：三个最实用的 hook
+
+### 实战 1：PostToolUse 自动格式化
+
+每次 Claude 写或编辑文件后，自动跑 prettier 格式化。这是 hooks 最经典的应用：
+
+```json
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "prettier --write \"$FILE_PATH\" 2>/dev/null || true"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`$FILE_PATH` 是 Claude Code 注入的环境变量，指向刚被写/编辑的文件。prettier 处理它，处理失败也不报错（`|| true`）。
+
+可以类似地配 eslint、stylelint、tsc 检查，让每次编辑后自动保证代码质量。
+
+### 实战 2：PreToolUse 拦截危险命令
+
+在工具执行前检查，拦截危险命令：
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/block-dangerous.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+```bash
+#!/bin/bash
+# ~/.claude/hooks/block-dangerous.sh
+INPUT=$(cat)
+COMMAND=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
+
+# 危险命令清单
+if echo "$COMMAND" | grep -qE "rm -rf|git push --force|git reset --hard|DROP TABLE"; then
+  echo "🚫 拦截危险命令：$COMMAND" >&2
+  echo "如需执行，请手动操作" >&2
+  exit 2
+fi
+exit 0
+```
+
+注意 `exit 2`——它让 Claude Code 阻断这次工具调用，把 stderr 反馈给 Claude，Claude 就知道这个命令不能跑，会换别的方式。
+
+### 实战 3：Stop 自动跑测试
+
+每次 Claude 响应结束时（它觉得"做完了"），自动跑测试确认没破坏东西：
+
+```json
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "npm run test --silent 2>&1 | tail -20"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+注意 `Stop` 没有 `matcher`——它不是针对工具的，是针对"响应结束"这个事件，所以直接配 hooks。
+
+## 踩坑：hooks 最常见的失败模式
+
+hooks 调试起来比较痛苦，因为它在后台跑，错误经常静默。几个高频坑：
+
+### 坑 1：脚本超时
+
+hook 脚本如果跑太久（比如跑了 60 秒的测试），会阻塞整个会话。
+
+**对策**：给耗时操作加 `timeout`，或者只配在合适的事件上（耗时测试配 `Stop` 而不是 `PostToolUse`，因为后者每次编辑都触发）。
+
+### 坑 2：输出到 stderr 还是 stdout 搞错
+
+很多人把"反馈给 Claude"的内容写到了 stdout，结果 Claude Code 没识别。记住：
+
+- **stderr** + exit 2 → 作为阻断原因反馈给 Claude
+- **stdout** → 作为附加信息（普通事件）或 JSON（结构化控制）
+
+写错了管道，hook 就"不工作"。不确定时写到 stderr 试试。
+
+### 坑 3：退出码用错导致静默失败
+
+```bash
+# ❌ 错：用了 exit 1，被当作非致命错误，工具照常执行
+echo "禁止！" >&2
+exit 1
+
+# ✅ 对：用 exit 2 才是阻断
+echo "禁止！" >&2
+exit 2
+```
+
+`exit 1` 和 `exit 2` 在 hooks 里语义不同。`exit 2` 才是"阻断"，其他非零退出码被当作软错误，工具还是执行了。这是最隐蔽的坑——你以为拦截了，其实没有。
+
+### 坑 4：脚本没执行权限
+
+```bash
+# hook 脚本要可执行
+chmod +x ~/.claude/hooks/block-dangerous.sh
+```
+
+忘了加执行权限，脚本根本跑不起来，hook 静默失败。
+
+### 坑 5：matcher 写错
+
+```json
+// ❌ 写成工具的小写或全称
+"matcher": "bash"
+"matcher": "BashTool"
+
+// ✅ 工具名是 PascalCase
+"matcher": "Bash"
+"matcher": "Write|Edit"
+```
+
+matcher 要精确匹配工具名（PascalCase），写错就不触发。
+
+## 调试 hook 的技巧
+
+hook 出问题时怎么排查：
+
+1. **先单独跑脚本**：手动 echo 一段假 JSON 给脚本，看它行为对不对。
+   ```bash
+   echo '{"tool_name":"Bash","tool_input":{"command":"rm -rf x"}}' | bash ~/.claude/hooks/block-dangerous.sh
+   ```
+2. **加日志**：脚本里把输入和决策写到日志文件，事后查看。
+   ```bash
+   echo "$(date) $INPUT" >> ~/.claude/hooks/debug.log
+   ```
+3. **检查退出码**：手动跑后 `echo $?` 看退出码对不对。
+
+hooks 的错误不会在主对话里大喊大叫，靠日志和手动测试是排查的唯一可靠方式。
+
+## 系列衔接
+
+hooks 讲完了——它是 Claude Code 的事件循环与会话生命周期的扩展点。从会话开始到结束，每个关键节点都能挂自己的逻辑。这是实现"自动化"的核心机制。
+
+到这里，我们已经讲完了 Claude Code 几乎所有的高频机制：目录结构、加载合并、CLAUDE.md、权限、commands、skills、agents、MCP、hooks。
+
+最后一篇是收尾——把这些散落的机制串成一个**活的系统**。我们会讲**上下文管理与会话**：所有这些配置、记忆、工具、扩展，最后都在抢同一个上下文窗口；聊久了 Claude 会"忘事"，怎么治。下一篇把整个系列串成一条数据流。
