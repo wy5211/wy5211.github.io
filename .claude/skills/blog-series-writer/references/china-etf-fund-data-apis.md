@@ -127,3 +127,54 @@ def get_kline_eastmoney(secid, beg="20250101", end="20261231"):
 - **复权**：Sina K线默认前复权；计算长期收益时注意价格收益 ≠ 全收益（ETF 需加回分红）
 - **红利/高息ETF 的复权陷阱**：前复权数据会大幅压低高分红 ETF 的长期收益——512890 红利低波ETF 前复权数据看起来 5 年跌 27%，但实际含分红全收益约 +30%。**对比 ETF 长期表现时，务必用后复权数据（近似全收益）或手动加回年均股息率**。Eastmoney K线 API 理论上支持 `fqt=2`（后复权），但 push2his 端点稳定性差（高频调用会被 connection reset），实测大量获取时几乎不可用。可靠方案：用 Sina 前复权 K线算价格收益，再手动加上估算的年均股息率（红利低波~5.5%，沪深300~2%，纳指~1%）作为全收益近似。
 - **费率悬崖**：2023 年后成立的新 ETF 普遍 0.20% 总费率，老 ETF 常常 0.50-0.60%，对比时务必展示费率差
+
+## 4. Eastmoney 基金持仓数据（通过浏览器抓取）
+
+获取 ETF/基金的前十大持仓和行业配置。fundf10 的 JSONP API（`FundArchivesDatas.aspx`）解析困难（嵌套转义引号、HTML 混在 JSON 里），**推荐用浏览器直接抓取，比 Python urllib 解析可靠得多**。
+
+### 方法：browser_navigate + browser_console
+
+```text
+# 1. 导航到持仓页
+browser_navigate(url="https://fundf10.eastmoney.com/ccmx_{code}.html")
+
+# 2. 用 browser_console 执行 DOM 提取（返回干净的表格数据）
+```
+
+browser_console 的 expression 参数填：
+
+```javascript
+(() => {
+  const tables = document.querySelectorAll("table");
+  let result = [];
+  for (const table of tables) {
+    const rows = table.querySelectorAll("tr");
+    if (rows.length > 3) {
+      const data = [];
+      for (const row of rows) {
+        const cells = row.querySelectorAll("td, th");
+        if (cells.length >= 3) {
+          const rowData = Array.from(cells)
+            .map((c) => c.textContent.trim())
+            .join(" | ");
+          if (rowData) data.push(rowData);
+        }
+      }
+      if (data.length > 3) result.push(data.join("\n"));
+    }
+  }
+  return result.join("\n\n---\n\n");
+})();
+```
+
+返回格式：`序号 | 股票代码 | 股票名称 | 最新价 | 涨跌幅 | ... | 占净值比例 | 持股数 | 持仓市值`
+
+### 相关页面
+
+| 页面     | URL 模式                                   | 数据                            |
+| -------- | ------------------------------------------ | ------------------------------- |
+| 基金持仓 | `fundf10.eastmoney.com/ccmx_{code}.html`   | 前十大重仓股                    |
+| 基本概况 | `fundf10.eastmoney.com/jbgk_{code}.html`   | 费率/规模/跟踪标的              |
+| 特色数据 | `fundf10.eastmoney.com/tsdata_{code}.html` | 风险指标(标准差/夏普)、投资风格 |
+
+**注意**：`HYCC_{code}.html`（行业配置页）返回 404，行业数据需要从持仓表手动按行业归类。
