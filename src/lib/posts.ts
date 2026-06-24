@@ -1,10 +1,9 @@
 import fs from "fs";
 import path from "path";
 import matter from "gray-matter";
-import { compileMDX } from "next-mdx-remote/rsc";
-import { ReactElement } from "react";
-import rehypeRaw from "rehype-raw";
-import remarkGfm from "remark-gfm";
+import { encryptForSite } from "./encrypt";
+import type { EncryptedPayload } from "./crypto-config";
+
 const postsDirectory = path.join(process.cwd(), "content/posts");
 
 export type PostMeta = {
@@ -18,8 +17,17 @@ export type PostMeta = {
   draft: boolean;
 };
 
-export type Post = PostMeta & {
-  content: ReactElement;
+// 单篇文章的完整显示数据（标题、摘要、标签、正文、下一篇）。
+// 全部加密成「一个」JSON 密文块，确保文章页静态 HTML 中不含任何明文 ——
+// 陌生人 view-source 也只能看到密文。需密码解密后才能渲染。
+export type ArticleData = {
+  title: string;
+  date: string;
+  summary: string;
+  tags: string[];
+  category: string;
+  body: string;
+  nextPost: { slug: string; title: string; category: string } | null;
 };
 
 // 递归读取目录下的所有 .mdx 文件
@@ -125,11 +133,12 @@ function findFileByCategoryAndSlug(
   return null;
 }
 
-// 获取单篇文章详情（包含编译后的内容）
+// 获取单篇文章：将标题/摘要/标签/正文/下一篇等全部显示数据加密成一个 JSON 密文块。
+// 返回密文 —— 文章页 HTML 中无任何明文，需密码解密后渲染。
 export async function getPostBySlug(
   category: string,
   slug: string
-): Promise<Post | null> {
+): Promise<EncryptedPayload | null> {
   const realSlug = slug.replace(/\.mdx$/, "");
   const fullPath = findFileByCategoryAndSlug(category, realSlug);
 
@@ -138,37 +147,31 @@ export async function getPostBySlug(
   }
 
   const fileContents = fs.readFileSync(fullPath, "utf8");
+  const { data, content } = matter(fileContents);
+  const nextPost = getNextPost(category, realSlug);
 
-  const { content, frontmatter } = await compileMDX<{
-    title: string;
-    date: string;
-    summary: string;
-    tags: string[];
-    category: string;
-    cover?: string;
-    draft: boolean;
-  }>({
-    source: fileContents,
-    options: {
-      parseFrontmatter: true,
-      mdxOptions: {
-        remarkPlugins: [remarkGfm],
-        rehypePlugins: [rehypeRaw],
-      },
-    },
-  });
-
-  return {
-    slug: realSlug,
-    title: frontmatter.title,
-    date: frontmatter.date,
-    summary: frontmatter.summary,
-    tags: frontmatter.tags || [],
-    category: frontmatter.category,
-    cover: frontmatter.cover,
-    draft: frontmatter.draft || false,
-    content,
+  const articleData: ArticleData = {
+    title: data.title,
+    date: data.date,
+    summary: data.summary,
+    tags: data.tags || [],
+    category: data.category || decodeURIComponent(category),
+    body: content,
+    nextPost: nextPost
+      ? {
+          slug: nextPost.slug,
+          title: nextPost.title,
+          category: nextPost.category,
+        }
+      : null,
   };
+
+  return encryptForSite(JSON.stringify(articleData));
+}
+
+// 获取全站文章列表（完整 meta 加密为单个 JSON 密文块，首页需密码解密）
+export async function getEncryptedPostsList(): Promise<EncryptedPayload> {
+  return encryptForSite(JSON.stringify(getAllPosts()));
 }
 
 // 获取当前分类下的下一篇

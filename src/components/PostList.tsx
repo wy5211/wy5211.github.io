@@ -125,7 +125,7 @@ export default function PostList({ posts }: PostListProps) {
 
             <div className="flex flex-wrap gap-2 mb-4">
               <span
-                className={`px-2.5 py-1 rounded-full text-xs font-medium ${getCategoryColor(post.category)}`}
+                className={`px-2.5 py-1 rounded-full text-xs font-medium ${getCategoryColor()}`}
               >
                 {post.category}
               </span>
