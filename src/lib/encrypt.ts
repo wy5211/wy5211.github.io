@@ -28,6 +28,23 @@ function randomBytes(length: number): ArrayBuffer {
   return buf;
 }
 
+/**
+ * 从密码确定性派生 salt（取 SHA-256 摘要前 SALT_LENGTH 字节）。
+ *
+ * 关键：Next.js turbopack 在 build 时为不同路由段（layout / page）独立求值模块，
+ * 不保证 layout.tsx 与 page.tsx 共享同一个模块级单例。
+ * 若用随机 salt，两段会各自生成不同的 salt → 不同的派生 key →
+ * verifyToken（layout 加密）能解、文章列表（page 加密）解不开 → 解锁后主页空白。
+ * 改为从密码派生，保证任意调用都得到完全相同的 salt 与 key。
+ */
+async function deriveSaltFromPassword(password: string): Promise<ArrayBuffer> {
+  const digest = await subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(password)
+  );
+  return digest.slice(0, SALT_LENGTH);
+}
+
 function deriveKey(password: string, salt: ArrayBuffer): Promise<CryptoKey> {
   return subtle
     .importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, [
@@ -75,7 +92,7 @@ export async function getSiteCrypto(): Promise<SiteCrypto> {
     );
   }
 
-  const salt = randomBytes(SALT_LENGTH);
+  const salt = await deriveSaltFromPassword(password);
   const key = await deriveKey(password, salt);
   const verifyToken = await encrypt(VERIFY_PLAINTEXT, key);
 
