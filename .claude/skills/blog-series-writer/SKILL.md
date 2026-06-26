@@ -202,6 +202,8 @@ seriesOrder: N
 
 **1. 确认主题信息** —— 主题名称、文章类型（A/B/C/D/E）、核心话题（可选）。
 
+**1.5 检查内容重叠（必须）** —— 新系列确定方向后，先读取已有相关系列的 plan.md 和文章内容，确认不会重复。如果发现已有系列覆盖了计划中的核心话题，调整方向或聚焦在互补内容上，而不是重写一遍。在 plan.md 的「与已有系列的关系」表格中明确列出重叠内容和处理方式。
+
 **2. 生成计划书** —— 写入 `content/posts/{category}/plan.md`，结构如下：
 
 ```markdown
@@ -240,13 +242,15 @@ seriesOrder: N
 - 每篇写完按【质量自检】逐项检查，保存文件，简单提示进度
 - **并行写文章（用 write_file 成对写，默认策略）**：同一轮里对两篇非相邻文章同时调用 write_file，效率接近 delegate_task 但不受模型限流影响。相邻文章保持串行（后一篇需要引用前一篇的具体措辞）。这是首选策略——实践中 delegate_task 因模型限流（429）频繁失败，自己成对写反而更快更可靠。
 - **delegate_task 仅作为大量文章时的补充**：仅在文章总数超过 10 篇且自己写太慢时尝试，且降低并行度（每次最多 2 个子任务）。delegate_task 可能因模型限流（429）失败（尤其是 glm 系列模型），失败后立即切回自己写。delegate_task context 必须包含：语调规则、禁用词清单、MDX 格式陷阱、完整大纲、所需数据、frontmatter 模板。delegate_task 写完的文件要验证是否实际写入（429 可能导致文件未生成或为空）。
-- **数据预取**：如果系列需要真实市场数据，先在主会话用 execute_code 批量拉取所有数据（Sina Finance API 等），再作为 context 传入 delegate_task 或直接用于自己写文章。避免重复请求数据。
+- **数据预取**：如果系列需要真实市场数据，先在主会话用 execute_code 批量拉取所有数据（Sina Finance API 等），再作为 context 传入 delegate_task 或直接用于自己写文章。避免重复请求数据。多 ETF 对比指标（收益/波动率/回撤/夏普）的计算流程见 [references/investment-metrics-computation.md](references/investment-metrics-computation.md)。
+- **跨系列并行写作**：同时写两个系列时，把两个系列的同序号文章（如 A-01 + B-01）放在同一轮 write_file 里并行——它们互不相邻所以不依赖彼此的具体措辞，效率翻倍。实测 14 篇（2 系列 × 7 篇）可以在 7 轮内完成，全程不需要 delegate_task。
+- **进度通知（必须，用户多次强调）**：连续撰写阶段每完成约 30% 主动报一次进度（如"7/14 篇写完，继续"）。遇到阻塞（API 限流、构建报错、数据拉不到）不能默默 retry，必须告知用户卡在哪了。不要等用户问"任务状态"才回复——问了才回不叫主动通知。
 
 **4.5 MDX 格式预检（批量写完后必须做）** —— 用 [scripts/check-mdx.py](scripts/check-mdx.py) 对新系列所有 .mdx 文件做批量检查，覆盖：summary 嵌套引号、JSX 标签陷阱（`<[^a-zA-Z/!]`）、禁用词扫描。在跑 `npm run build` 之前先扫一遍，避免 build 失败后逐文件排查。
 
 **5. 构建验证** —— 确认 .env.local 存在且含 BLOG_ACCESS_PASSWORD（缺失会导致 build 报环境变量错误），然后运行构建命令，按错误信息修复直到通过。
 
-**6. 提交推送** —— commit message 用 `feat: add {系列名称} series with N articles`，`git push`，展示结果和已完成文章列表。
+**6. 提交推送** —— commit message 用 `feat: add {系列名称} series with N articles`，`git push`，然后**立即发一条独立的完成通知**（不要把通知埋在对话回复里等用户发现）。通知包含：系列名称、篇数、构建结果。用户必须在第一时间知道任务完成了——不能等他们来问"任务状态"，问了才回不叫主动通知。
 
 ## 投资类文章的数据获取
 

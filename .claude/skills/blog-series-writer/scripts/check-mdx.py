@@ -50,11 +50,16 @@ def check_file(filepath):
         if '\\"' in val or (val.count('"') > 0 and '\\' in val):
             issues.append(f"[summary] {filename}: summary 可能含嵌套引号: {val[:60]}...")
 
-    # 2. JSX 标签陷阱（正文部分）
+    # 2. JSX 标签陷阱（正文部分，跳过代码块内部）
     body = extract_body(content)
+    in_code_block = False
     for i, line in enumerate(body.split('\n'), 1):
-        # 跳过表格行和代码块
-        if line.strip().startswith('|') or line.strip().startswith('```'):
+        if line.strip().startswith('```'):
+            in_code_block = not in_code_block
+            continue
+        if in_code_block:
+            continue
+        if line.strip().startswith('|'):
             continue
         matches = re.findall(r'<[^a-zA-Z/!=]', line)
         if matches:

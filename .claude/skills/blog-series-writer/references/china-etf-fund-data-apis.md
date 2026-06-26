@@ -124,9 +124,11 @@ def get_kline_eastmoney(secid, beg="20250101", end="20261231"):
 - **Referer header**：Sina API 必须带 `Referer: https://finance.sina.com.cn/`，否则 403
 - **搜索引擎不可靠**：Google/百度/Bing 在浏览器自动化中几乎必然触发验证码，直接用上面的 API
 - **ETF vs 场外基金**：ETF 代码 5/1 开头可场内交易；场外基金（如 025518）在 fundf10 也能查但无法通过证券行情 API 拿 K线
+- **Eastmoney datacenter API 不可用于指数估值**：`datacenter-web.eastmoney.com/api/data/v1/get` 的 `RPT_LICO_FN_CPD` 报告不支持 `VAL_PE` 等估值字段（返回错误"VAL_PE返回字段不存在"），指数 PE/PB 需从其他数据源获取（乌龟量化、中证官网、或自己算）
 - **复权**：Sina K线默认前复权；计算长期收益时注意价格收益 ≠ 全收益（ETF 需加回分红）
 - **红利/高息ETF 的复权陷阱**：前复权数据会大幅压低高分红 ETF 的长期收益——512890 红利低波ETF 前复权数据看起来 5 年跌 27%，但实际含分红全收益约 +30%。**对比 ETF 长期表现时，务必用后复权数据（近似全收益）或手动加回年均股息率**。Eastmoney K线 API 理论上支持 `fqt=2`（后复权），但 push2his 端点稳定性差（高频调用会被 connection reset），实测大量获取时几乎不可用。可靠方案：用 Sina 前复权 K线算价格收益，再手动加上估算的年均股息率（红利低波~5.5%，沪深300~2%，纳指~1%）作为全收益近似。
 - **费率悬崖**：2023 年后成立的新 ETF 普遍 0.20% 总费率，老 ETF 常常 0.50-0.60%，对比时务必展示费率差
+- **大 datalen 控制字符陷阱**：Sina K线 API 当 datalen 较大（如 500）时，返回的 JSON 在约 20000 字符处包含控制字符（`\x00-\x1f`），导致 `json.loads()` 报 `Invalid control character` 或 `Expecting property name` 错误。**两种解法**：① 降低 datalen 到 100-250（约 6-12 个月日线，大多数场景够用）；② 写入文件后用 `tr -d '\000-\037'` 过滤控制字符再解析。从 `execute_code` 里直接 `json.loads()` 时优先用方案①，需要长周期数据时用方案②。
 
 ## 4. Eastmoney 基金持仓数据（通过浏览器抓取）
 
