@@ -15,11 +15,12 @@
 
 用 Sina API（详见 [china-etf-fund-data-apis.md](china-etf-fund-data-apis.md)），对每只 ETF 拉取日线数据写入文件。
 
+**关键：URL 必须带 `&ma=no` 参数。** 不带 `ma=no` 时，API 返回的数据会内嵌多余的 MA 字段，其中包含控制字符导致 JSON 解析失败。**不要用 `tr -d` 管道来过滤控制字符**——在 f-string + shell 上下文中，`tr -d '\000-\037'` 的反斜杠转义会被错误解释，连冒号也被一起删掉，导致 JSON 完全损坏。正确做法是加 `&ma=no` 从源头避免多余字段。
+
 ```python
 from hermes_tools import terminal
 import json
 
-# 注意 datalen 不要太大（控制字符陷阱），100≈5个月，250≈1年，500≈2年(需 tr -d 过滤)
 etfs = {
     "sh513100": "纳指100ETF",
     "sh563020": "红利低波100ETF",
@@ -27,9 +28,12 @@ etfs = {
 }
 
 for code, name in etfs.items():
-    # datalen <= 250 可以直接 json.loads；>250 需要 tr -d '\000-\037' 过滤
-    cmd = f'''curl -s "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={code}&scale=240&datalen=500" 2>/dev/null | tr -d '\\000-\\037' > /tmp/kline_{code}.json'''
+    # ✓ 正确：用 &ma=no 从源头避免控制字符，不需要 tr 过滤
+    cmd = f'''curl -s "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData?symbol={code}&scale=240&ma=no&datalen=500" > /tmp/kline_{code}.json'''
     terminal(cmd, timeout=10)
+
+    # ✗ 错误（旧方法）：tr -d '\000-\037' 在 shell 中会删掉冒号，破坏 JSON
+    # cmd = f'''curl -s "...symbol={code}&scale=240&datalen=500" | tr -d '\\\\000-\\\\037' > /tmp/kline_{code}.json'''
 ```
 
 ### 第二步：计算关键指标
@@ -84,6 +88,15 @@ def compute_metrics(filepath, risk_free_rate=2.0):
     # --- 夏普比率 ---
     sharpe = (ann_return - risk_free_rate) / ann_volatility * 100 if ann_volatility > 0 else 0
 
+    # --- Sortino 比率（只惩罚下行波动）---
+    downside = [min(0, r) for r in log_returns]
+    ds_var = sum(d ** 2 for d in downside) / len(downside) if downside else 0
+    ann_downside_vol = math.sqrt(ds_var) * math.sqrt(240) * 100 if ds_var > 0 else 0
+    sortino = (ann_return - risk_free_rate) / ann_downside_vol * 100 if ann_downside_vol > 0 else 0
+
+    # --- Calmar 比率（年化收益 / 最大回撤绝对值）---
+    calmar = ann_return / abs(max_dd) * 100 if max_dd != 0 else 0
+
     return {
         "date_range": f"{data[0]['day'][:10]} → {data[-1]['day'][:10]}",
         "trading_days": len(data),
@@ -92,6 +105,8 @@ def compute_metrics(filepath, risk_free_rate=2.0):
         "ann_volatility": ann_volatility,
         "max_drawdown": max_dd,
         "sharpe": sharpe,
+        "sortino": sortino,
+        "calmar": calmar,
         "ret_1y": ret_1y,
         "ret_2y": ret_2y,
     }
