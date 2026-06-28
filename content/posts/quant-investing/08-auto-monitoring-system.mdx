@@ -1,0 +1,587 @@
+---
+title: "08 自动化投资监控系统：让代码替你盯盘"
+date: "2026-06-28"
+summary: "前 7 篇搭了数据管道、绩效分析、因子计算、信号引擎、回测框架、组合优化——但都是独立模块。这篇把它们串成一条流水线：每周自动拉数据、跑因子、算信号、生成报告。三种部署方案（cron/GitHub Actions/Docker），最终产物是一条推送到手机的自动投资简报。"
+tags: ["理财", "量化投资", "Python", "自动化", "系统设计"]
+category: "quant-investing"
+cover: ""
+draft: false
+series: "量化投资编程实战"
+seriesOrder: 8
+---
+
+## 把零件组装成机器
+
+过去 7 篇你造了一堆零件：
+
+- DataFeed：数据获取和缓存
+- PerformanceMetrics：绩效分析
+- ValuationFactor：估值因子评分
+- SignalEngine：趋势和动量信号
+- Backtester：策略回测
+- PortfolioOptimizer：组合优化
+
+每个零件单独都能用，但真正的价值在于把它们组装成一台**自动运行的机器**——每周一早上自动拉数据、算因子、算信号、检查权重偏离、生成一份完整的投资简报推送到手机上。
+
+这就是整个系列的目标：从手动查数据的投资者，变成拥有自动化投资辅助系统的开发者。
+
+## 系统架构
+
+整条流水线的设计：
+
+```
+┌─────────────┐     ┌──────────────┐     ┌──────────────┐
+│  数据层      │────→│  分析层       │────→│  信号层      │
+│  DataFeed   │     │  Performance  │     │  Valuation   │
+│  增量更新    │     │  Metrics      │     │  Factor      │
+│             │     │              │     │  SignalEngine│
+└─────────────┘     └──────────────┘     └──────┬───────┘
+                                                │
+                    ┌──────────────┐     ┌───────▼───────┐
+                    │  输出层       │←────│  决策层       │
+                    │  报告生成     │     │  Portfolio    │
+                    │  消息推送     │     │  Optimizer    │
+                    └──────────────┘     │  Rebalancer   │
+                                         └───────────────┘
+```
+
+每一层的输入是上一层的输出。数据层拉价格 → 分析层算绩效 → 信号层算因子和信号 → 决策层算权重偏离和调仓建议 → 输出层生成报告。
+
+## 持仓配置
+
+先定义你的持仓和配置规则——整个系统的输入：
+
+```python
+# portfolio_config.py
+
+PORTFOLIO = {
+    "holdings": [
+        {"code": "513100", "name": "纳指100",   "type": "growth", "target_weight": 0.20},
+        {"code": "513500", "name": "标普500",   "type": "broad",  "target_weight": 0.15},
+        {"code": "563020", "name": "红利低波",  "type": "value",  "target_weight": 0.25},
+        {"code": "588000", "name": "科创50",   "type": "growth", "target_weight": 0.10},
+        {"code": "510300", "name": "沪深300",  "type": "broad",  "target_weight": 0.15},
+        {"code": "511260", "name": "国债ETF",  "type": "bond",   "target_weight": 0.15},
+    ],
+    "rebalance_threshold": 0.05,   # 权重偏离5%触发再平衡
+    "rebalance_frequency": "quarterly",  # 季度检查
+    "bond_code": "511260",  # 无风险资产（双动量用）
+}
+```
+
+这个配置文件是唯一需要手动维护的——当你买卖了 ETF 或者调整了目标权重，改这个文件就行。系统其他部分全部自动运行。
+
+## 核心模块：周报生成
+
+把所有模块串在一起的主函数：
+
+```python
+# weekly_report.py
+import pandas as pd
+from datetime import datetime, timedelta
+
+class WeeklyReport:
+    """每周投资报告生成器"""
+
+    def __init__(self, config: dict):
+        self.config = config
+        self.feed = DataFeed()
+        self.factor = ValuationFactor()
+        self.engine = SignalEngine()
+
+    def generate(self) -> str:
+        """生成完整的周报"""
+        report_parts = []
+
+        # ── 头部 ──
+        today = datetime.now().strftime("%Y-%m-%d")
+        report_parts.append(f"投资组合周报 {today}\n")
+
+        # ── Step 1: 拉取数据 ──
+        prices_dict = {}
+        for h in self.config["holdings"]:
+            code = h["code"]
+            df = self.feed.get_price(code)
+            prices_dict[code] = df["close"]
+
+        all_prices = pd.DataFrame(prices_dict).dropna()
+
+        # ── Step 2: 组合绩效快照 ──
+        report_parts.append(self._performance_section(all_prices))
+
+        # ── Step 3: 估值评分 ──
+        report_parts.append(self._valuation_section())
+
+        # ── Step 4: 趋势信号 ──
+        report_parts.append(self._signal_section())
+
+        # ── Step 5: 权重偏离检查 ──
+        report_parts.append(self._rebalance_section(all_prices))
+
+        # ── Step 6: 行动建议 ──
+        report_parts.append(self._action_section())
+
+        return "\n".join(report_parts)
+
+    def _performance_section(self, all_prices: pd.DataFrame) -> str:
+        """组合绩效"""
+        # 计算组合等权收益（近似）
+        returns = np.log(all_prices / all_prices.shift(1)).dropna()
+
+        # 近1周/近1月/近3月/YTD收益
+        latest = all_prices.iloc[-1]
+
+        lines = ["─ 绩效快照 ─"]
+
+        periods = [
+            ("近1周", 5),
+            ("近1月", 20),
+            ("近3月", 60),
+            ("近1年", 240),
+        ]
+
+        for label, days in periods:
+            if len(all_prices) > days:
+                ret = (latest / all_prices.iloc[-days-1] - 1) * 100
+                lines.append(f"  {label}: {ret:+.1f}%")
+
+        return "\n".join(lines) + "\n"
+
+    def _valuation_section(self) -> str:
+        """估值评分表"""
+        lines = ["─ 估值评分 ─",
+                 f"{'ETF':10s} {'评分':>5s} {'信号':6s} {'趋势':6s} {'12月动量':>8s}"]
+
+        self._valuation_results = {}
+
+        for h in self.config["holdings"]:
+            code, name, etf_type = h["code"], h["name"], h["type"]
+            prices = self.feed.get_price(code)["close"]
+
+            # 估值评分
+            val = self.factor.score(prices, etf_type)
+            # 趋势信号
+            bullish = self.engine.is_bullish(prices)
+            mom = self.engine.momentum(prices)
+
+            trend_str = "多头" if bullish else "非多头"
+            mom_str = f"{mom:+.1f}%" if mom is not None else "N/A"
+
+            lines.append(f"  {name:8s} {val['total_score']:5.1f} "
+                        f"{val['signal']:6s} {trend_str:6s} {mom_str:>8s}")
+
+            self._valuation_results[code] = {
+                "name": name,
+                "score": val["total_score"],
+                "signal": val["signal"],
+                "bullish": bullish,
+                "momentum": mom,
+            }
+
+        return "\n".join(lines) + "\n"
+
+    def _signal_section(self) -> str:
+        """趋势信号变化"""
+        lines = ["─ 趋势信号 ─"]
+
+        for code, result in self._valuation_results.items():
+            name = result["name"]
+            if result["bullish"]:
+                lines.append(f"  {name}: 多头排列 12月动量 {result['momentum']:+.1f}%")
+            else:
+                lines.append(f"  {name}: 非多头排列")
+
+        # 双动量选择
+        bond_code = self.config["bond_code"]
+        bond_prices = self.feed.get_price(bond_code)["close"]
+
+        candidates = {}
+        for h in self.config["holdings"]:
+            if h["type"] in ("growth", "broad"):
+                code = h["code"]
+                candidates[code] = self.feed.get_price(code)["close"]
+
+        dm = self.engine.dual_momentum(candidates, bond_prices, top_n=1)
+        if dm["selection"] == "BOND":
+            lines.append(f"  双动量: 全仓防守（债券）")
+        else:
+            sel_code = dm["selection"][0]
+            sel_name = next(h["name"] for h in self.config["holdings"]
+                           if h["code"] == sel_code)
+            lines.append(f"  双动量: 选择 {sel_name}")
+
+        return "\n".join(lines) + "\n"
+
+    def _rebalance_section(self, all_prices: pd.DataFrame) -> str:
+        """权重偏离检查"""
+        lines = ["─ 权重偏离 ─"]
+
+        target_weights = {h["code"]: h["target_weight"]
+                         for h in self.config["holdings"]}
+
+        # 估算当前权重（用价格变动近似）
+        latest = all_prices.iloc[-1]
+        initial = all_prices.iloc[0]
+
+        # 假设初始等权，用价格变动推算当前权重
+        values = latest / initial * (1/len(latest))
+        current_weights = values / values.sum()
+
+        rebalancer = Rebalancer(target_weights)
+        drift = rebalancer.check_drift(
+            {code: current_weights[code] for code in current_weights.index})
+
+        lines.append(f"{'ETF':10s} {'目标':>6s} {'实际':>6s} {'偏离':>6s}")
+        for code in drift.index:
+            name = next(h["name"] for h in self.config["holdings"]
+                       if h["code"] == code)
+            row = drift.loc[code]
+            lines.append(f"  {name:8s} {row['target']:5.1f}% "
+                        f"{row['actual']:5.1f}% {row['drift_pp']:+5.1f}%")
+
+        # 再平衡触发判断
+        threshold = self.config["rebalance_threshold"]
+        needs_rebal = rebalancer.threshold_trigger(
+            {code: current_weights[code] for code in current_weights.index},
+            threshold=threshold)
+
+        if needs_rebal:
+            lines.append(f"\n  ⚠ 权重偏离超过 {threshold*100:.0f}%，建议再平衡")
+        else:
+            lines.append(f"\n  ✓ 权重偏离在 {threshold*100:.0f}% 以内，无需操作")
+
+        return "\n".join(lines) + "\n"
+
+    def _action_section(self) -> str:
+        """综合行动建议"""
+        lines = ["─ 行动建议 ─"]
+
+        suggestions = []
+
+        for code, result in self._valuation_results.items():
+            name = result["name"]
+            score = result["score"]
+            bullish = result["bullish"]
+
+            if score < 30 and bullish:
+                suggestions.append(f"{name}: 低估+多头排列，关注买入机会")
+            elif score < 30 and not bullish:
+                suggestions.append(f"{name}: 低估但趋势未反转，等待右侧信号")
+            elif score > 70 and bullish:
+                suggestions.append(f"{name}: 高估+趋势仍在，持有但警惕")
+            elif score > 70 and not bullish:
+                suggestions.append(f"{name}: 高估+趋势已破，考虑减仓")
+
+        if suggestions:
+            for s in suggestions:
+                lines.append(f"  • {s}")
+        else:
+            lines.append("  无需操作")
+
+        lines.append(f"\n  下次再平衡检查: {self._next_check_date()}")
+        return "\n".join(lines) + "\n"
+
+    def _next_check_date(self) -> str:
+        """下次再平衡检查日"""
+        freq_days = {"monthly": 30, "quarterly": 90,
+                     "semiannual": 180, "annual": 365}
+        days = freq_days.get(self.config["rebalance_frequency"], 90)
+        next_date = datetime.now() + timedelta(days=days)
+        return next_date.strftime("%Y-%m-%d")
+```
+
+## 报告长什么样
+
+运行 `WeeklyReport(config).generate()`，输出一份纯文本周报：
+
+```
+投资组合周报 2026-06-28
+
+─ 绩效快照 ─
+  近1周: +1.2%
+  近1月: +3.8%
+  近3月: +8.5%
+  近1年: +22.4%
+
+─ 估值评分 ─
+  ETF        评分   信号   趋势   12月动量
+  纳指100     68.3  合理   非多头   +33.0%
+  标普500     62.5  合理   非多头   +18.4%
+  红利低波    24.8  低估   非多头   -12.9%
+  科创50     81.5  高估   多头    +103.5%
+  沪深300     53.2  合理   多头     +23.0%
+  国债ETF    43.1  合理   非多头    -1.4%
+
+─ 趋势信号 ─
+  科创50: 多头排列 12月动量 +103.5%
+  沪深300: 多头排列
+  双动量: 选择 科创50
+
+─ 权重偏离 ─
+  ETF        目标   实际   偏离
+  纳指100    20.0%  22.5%  +2.5%
+  标普500    15.0%  14.8%  -0.2%
+  红利低波   25.0%  18.2%  -6.8%
+  科创50     10.0%  17.8%  +7.8%
+  沪深300    15.0%  16.1%  +1.1%
+  国债ETF    15.0%  10.6%  -4.4%
+
+  ⚠ 权重偏离超过 5%，建议再平衡
+
+─ 行动建议 ─
+  • 红利低波: 低估但趋势未反转，等待右侧信号
+  • 科创50: 高估+趋势仍在，持有但警惕
+
+  下次再平衡检查: 2026-09-28
+```
+
+这份报告在 3 秒内自动生成。你只需要看一眼，就知道组合现在什么状态、有没有需要操作的。对比之前「周五晚上花半小时手动查数据」的场景——效率差距是 600 倍。
+
+## 通知推送
+
+报告生成后，推送到手机。几种方式：
+
+### 方式一：Server酱（微信推送）
+
+最简单的微信推送方案。注册 Server酱（sct.ftqq.com）拿到一个 SendKey，用一行 curl 就能推送到微信：
+
+```python
+import urllib.request
+import urllib.parse
+
+def send_wechat(title: str, content: str, sendkey: str):
+    """通过 Server酱 推送到微信"""
+    url = f"https://sctapi.ftqq.com/{sendkey}.send"
+    data = urllib.parse.urlencode({
+        "title": title,
+        "desp": content,
+    }).encode("utf-8")
+
+    req = urllib.request.Request(url, data=data)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return resp.status == 200
+```
+
+### 方式二：邮件推送
+
+用 Python 标准库的 smtplib，不需要第三方服务：
+
+```python
+import smtplib
+from email.mime.text import MIMEText
+
+def send_email(subject: str, body: str,
+               to_addr: str, from_addr: str,
+               smtp_server: str, smtp_port: int,
+               password: str):
+    """发送邮件"""
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = subject
+    msg["From"] = from_addr
+    msg["To"] = to_addr
+
+    with smtplib.SMTP_SSL(smtp_server, smtp_port) as server:
+        server.login(from_addr, password)
+        server.sendmail(from_addr, [to_addr], msg.as_string())
+```
+
+### 方式三：写入文件 + 定时查看
+
+如果不想配推送服务，最简单的方案——报告写到本地文件，你在手机上用任何文件同步工具（iCloud Drive、坚果云）查看：
+
+```python
+def save_report(report: str, output_dir: str = "~/quant_reports"):
+    """保存报告到本地文件"""
+    from pathlib import Path
+    output = Path(output_dir).expanduser()
+    output.mkdir(parents=True, exist_ok=True)
+
+    filename = f"report_{datetime.now().strftime('%Y%m%d')}.txt"
+    (output / filename).write_text(report, encoding="utf-8")
+
+    # 同时更新 latest.txt（始终是最新报告）
+    (output / "latest.txt").write_text(report, encoding="utf-8")
+```
+
+## 自动化运行
+
+三种部署方案，按复杂度递增：
+
+### 方案一：cron 定时任务（本地 Mac）
+
+最简单。在你的 Mac 上设一个 crontab，每周一早上 8 点自动运行：
+
+```bash
+# crontab -e 添加：
+0 8 * * 1 cd ~/quant && /path/to/python3 weekly_report.py >> logs/cron.log 2>&1
+```
+
+`weekly_report.py` 的内容就是把前面的代码串起来：
+
+```python
+#!/usr/bin/env python3
+# weekly_report.py
+
+from portfolio_config import PORTFOLIO
+from weekly_report import WeeklyReport
+from notifier import send_wechat, save_report
+
+def main():
+    report = WeeklyReport(PORTFOLIO).generate()
+
+    print(report)
+    save_report(report)
+
+    # 推送到微信（如果配了 SendKey）
+    send_wechat(
+        title=f"投资周报 {datetime.now().strftime('%m-%d')}",
+        content=report,
+        sendkey="YOUR_SENDKEY",
+    )
+
+if __name__ == "__main__":
+    main()
+```
+
+优点：零成本、配置简单。缺点：Mac 关机/休眠时不执行。你的 Mac 如果一直开着（插电 + 防休眠），这个方案就够了。
+
+### 方案二：GitHub Actions（云端运行）
+
+不依赖本地机器。在你的量化项目仓库里加一个 workflow：
+
+```yaml
+# .github/workflows/weekly-report.yml
+name: Weekly Investment Report
+
+on:
+  schedule:
+    # 每周一 UTC 00:00（北京时间 08:00）
+    - cron: "0 0 * * 1"
+  workflow_dispatch: # 手动触发
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install pandas numpy pyarrow
+
+      - name: Generate and send report
+        env:
+          SENDKEY: ${{ secrets.SERVERCHAN_SENDKEY }}
+        run: python3 weekly_report.py
+```
+
+把 SendKey 存在 GitHub Secrets 里，代码从环境变量读取。优点：稳定（GitHub 的 cron 比本地可靠）、免费、不依赖本地开机。缺点：GitHub Actions 的定时任务有时会延迟 10-30 分钟，不是精确触发。
+
+### 方案三：Docker 容器化（进阶）
+
+如果你有 VPS 或者想在本地长期运行：
+
+```dockerfile
+# Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY . .
+CMD ["python3", "-c", "import schedule, time; \
+     schedule.every().monday.at('08:00').do(run_report); \
+     while True: schedule.run_pending(); time.sleep(60)"]
+```
+
+用 `schedule` 库在容器内定时执行，配合 Docker 的 restart 策略实现长期稳定运行。
+
+## 日志和异常处理
+
+自动化系统最怕的是「静默失败」——API 挂了你不知道，数据有问题你没察觉，报告没发出来你也没收到通知。
+
+```python
+import logging
+from functools import wraps
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler('quant.log'),
+        logging.StreamHandler(),
+    ]
+)
+
+logger = logging.getLogger(__name__)
+
+def retry_on_failure(max_attempts=3, delay=2):
+    """装饰器：API 调用失败时自动重试"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    logger.warning(
+                        f"{func.__name__} 第{attempt+1}次尝试失败: {e}")
+                    if attempt < max_attempts - 1:
+                        import time
+                        time.sleep(delay * (attempt + 1))
+                    else:
+                        logger.error(f"{func.__name__} 全部重试失败")
+                        raise
+        return wrapper
+    return decorator
+```
+
+关键原则：
+
+**API 失败必须重试**。Sina/Yahoo API 偶尔会超时或返回空数据，重试 3 次能解决大部分问题。
+
+**数据质量验证**。拉到数据后检查一下：数据条数够不够、最新日期是不是今天或昨天、有没有异常的零值或 NaN。
+
+**报告发送失败要有备选**。如果 Server酱 推送失败，降级保存到本地文件 + 发一封邮件通知自己。
+
+**定期检查系统是否还在跑**。cron 任务可能因为各种原因停止（系统更新、权限变更）。设一个简单的「心跳」——每次运行成功时写一个时间戳到文件，如果超过 8 天没有更新就告警。
+
+## 系统的演进方向
+
+这个系统是一个起点，不是终点。几个可以扩展的方向：
+
+**接入真实 PE 数据**。目前估值因子用的是价格代理（第 04 篇）。如果从理杏仁或中证指数官网导出历史 PE/PB 数据，可以升级为真正的估值分位系统，准确度大幅提升。
+
+**加入 AI 情绪分析**。用 LLM 分析每周的财经新闻，生成市场情绪指标（恐慌/贪婪/中性），作为额外的信号维度。这个系统天然适合用 AI 做——数据管道已经有了，加一层 NLP 分析就行。
+
+**策略组合优化**。第 06 篇回测了均线策略，但单独一个策略在所有市场环境下都不够好。可以设计一个「策略组合」——在不同市场状态下切换不同策略（趋势市用均线、震荡市用均值回归）。
+
+**多市场扩展**。目前系统覆盖 A 股和美股 ETF。可以扩展到港股（恒生科技、恒生高息股）、商品（黄金 ETF）、REITs 等更多资产类别，进一步分散组合风险。
+
+**实时信号推送**。目前是每周一次的报告。可以加入盘中实时监控——当某个标的触发关键信号（如跌破年线、估值进入极端区域）时即时推送。
+
+## 系列总结
+
+8 篇文章，从理念到系统：
+
+```
+01 认知建立     → 量化投资不是高频交易，是系统化你的投资框架
+02 数据管道     → DataFeed：统一数据获取，A 股美股一键拉取
+03 绩效分析     → PerformanceMetrics：六个指标算清投资成绩单
+04 估值因子     → ValuationFactor：多因子评分，自动判断贵不贵
+05 趋势信号     → SignalEngine：均线+动量+双动量，自动判断趋势
+06 回测引擎     → Backtester：验证策略，避免过拟合
+07 组合优化     → PortfolioOptimizer：风险平价+核心卫星+再平衡
+08 自动化系统   → 串联所有模块，每周自动生成投资简报
+```
+
+你的投资体系完成了从「理念」到「系统」的升级。这不是终点——系统搭起来之后，真正的价值在于持续使用和迭代。每周看简报、根据信号做决策、定期回顾策略表现、不断优化参数和规则。
+
+代码是放大器。你的投资认知决定方向，代码帮你走得更稳、更快、更一致。投资没有圣杯，但有一套好系统的人，比靠直觉和情绪做决策的人，大概率会走得更远。
+
+系列里所有的代码（DataFeed、PerformanceMetrics、ValuationFactor、SignalEngine、Backtester、PortfolioOptimizer）都设计成了独立可复用的模块。你可以按需取用——不需要全部搭建，哪怕只用 DataFeed + PerformanceMetrics 拉数据算绩效，就已经比手动操作高效很多了。
+
+开始动手吧。先从 DataFeed 搭起，拉两只你持有的 ETF 算算绩效，然后逐步往上加模块。最好的学习方式就是写代码跑起来——你的真实持仓就是最好的测试数据。

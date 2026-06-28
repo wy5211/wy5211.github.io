@@ -1,0 +1,459 @@
+---
+title: "05 趋势与动量：用代码实现右侧交易信号"
+date: "2026-06-28"
+summary: "理解均线原理和用代码实现是两码事。这篇把多头排列判断、动量排名、双动量策略全部写成可执行函数，再用估值因子（第04篇）+ 趋势信号做组合，实现低估值+多头排列才买入的双重过滤。"
+tags: ["理财", "量化投资", "Python", "技术分析", "动量策略"]
+category: "quant-investing"
+cover: ""
+draft: false
+series: "量化投资编程实战"
+seriesOrder: 5
+---
+
+## 估值低就买？你可能买在半山腰
+
+上一篇结束时我们有了估值因子——能算出某只 ETF 处于低估区还是高估区。但低估值本身不是买入信号。
+
+红利低波现在评分 24.8（低估区），但它过去一年跌了 12.9%。如果你一年前在它「看起来低估」的时候买入，到现在还在亏。
+
+问题在于：估值低只告诉你「便宜」，不告诉你「什么时候开始涨」。一只 ETF 可以在低估区待很长时间——半年、一年甚至更久。在底部反转之前买入，你要忍受漫长的浮亏和磨人的横盘。
+
+解决这个问题的办法是加一层**趋势确认**——等价格开始向上走的时候再买。这就是所谓的「右侧交易」：不去猜底，等趋势走出来再行动。
+
+估值因子负责找「便宜的标的」，趋势信号负责找「什么时候动手」。两层叠加，比任何单一信号都可靠。
+
+这篇把趋势判断写成代码——均线系统、动量排名、双动量策略。
+
+## 均线系统程序化
+
+[看懂行情](/posts/market-reading/04-moving-average-system) 系列讲过均线系统的原理和失效区。核心结论是：均线是趋势的骨架，不是预测器；它在趋势市有效，在震荡市反复打脸。
+
+程序化均线系统，本质上是把人的视觉判断（「你看，5 日线在 20 日线上面，多头排列」）翻译成代码。
+
+### 计算均线
+
+pandas 的 `rolling().mean()` 是计算移动平均最直接的方式：
+
+```python
+import pandas as pd
+import numpy as np
+
+def moving_averages(prices: pd.Series, periods: list = [5, 20, 60, 250]) -> dict:
+    """计算多条移动平均线
+
+    Args:
+        periods: 均线周期列表，默认 5/20/60/250
+                 5日=周线, 20日=月线, 60日=季线, 250日=年线
+    """
+    mas = {}
+    for p in periods:
+        if len(prices) >= p:
+            mas[f"ma{p}"] = prices.rolling(p).mean()
+    return mas
+```
+
+用真实的科创50 ETF 数据看看（截至 2026-06-26）：
+
+```
+科创50 ETF 当前价格: 2.133
+MA5(周):   2.097
+MA20(月):  1.882
+MA60(季):  1.714
+MA250(年): 1.450
+```
+
+价格在所有均线之上，而且均线从短到长依次排列——MA5 大于 MA20 大于 MA60 大于 MA250。这就是多头排列。
+
+### 多头排列判断
+
+多头排列的含义：短期均线高于长期均线，说明价格在全面上涨趋势中。代码只需要一行条件判断：
+
+```python
+def is_bullish_alignment(prices: pd.Series) -> bool:
+    """判断当前是否处于均线多头排列
+
+    条件：MA5 > MA20 > MA60 > MA250 且当前价格 > MA5
+    """
+    mas = moving_averages(prices)
+
+    required = ["ma5", "ma20", "ma60", "ma250"]
+    if not all(k in mas for k in required):
+        return False
+
+    current = prices.iloc[-1]
+    ma_values = [mas[k].iloc[-1] for k in required]
+
+    # 依次递减 = 多头排列
+    for i in range(len(ma_values) - 1):
+        if ma_values[i] <= ma_values[i + 1]:
+            return False
+
+    # 价格在 MA5 之上
+    return current > mas["ma5"].iloc[-1]
+```
+
+再对比一下 6 只 ETF 的均线状态（截至 2026-06-26）：
+
+| ETF      | MA5     | MA20    | MA60    | MA250   | 排列                    |
+| -------- | ------- | ------- | ------- | ------- | ----------------------- |
+| 科创50   | 2.097   | 1.882   | 1.714   | 1.450   | 多头 ✓                  |
+| 沪深300  | 4.991   | 4.905   | 4.816   | 4.610   | 多头 ✓                  |
+| 纳指100  | 2.195   | 2.227   | 2.046   | 1.856   | 非多头（MA5 跌破 MA20） |
+| 标普500  | 2.519   | 2.551   | 2.440   | 2.335   | 非多头（MA5 跌破 MA20） |
+| 红利低波 | 1.094   | 1.144   | 1.174   | 1.208   | 空头（完全倒序）        |
+| 国债ETF  | 135.440 | 135.779 | 135.350 | 135.305 | 非多头                  |
+
+纳指和标普虽然在长期均线上方（价格高于 MA250），但短期均线（MA5）跌破了中期均线（MA20）——这说明它们近期在回调。均线系统不是非黑即白的「多头 vs 空头」，中间有很多灰色地带。
+
+### 均线信号生成
+
+多头排列只是一个快照——今天是不是多头。但做策略需要的是时间序列：每一天是什么状态，状态切换的时候产生买卖信号。
+
+```python
+def ma_signals(prices: pd.Series) -> pd.DataFrame:
+    """生成逐日的均线信号
+
+    信号：
+    - 1: 多头排列（持仓/买入）
+    - 0: 非多头（空仓/卖出）
+    - 状态切换时产生 BUY/SELL 事件
+    """
+    mas = moving_averages(prices)
+
+    # 每天的多头排列判断
+    df = pd.DataFrame(index=prices.index)
+    df["price"] = prices
+
+    for p in [5, 20, 60, 250]:
+        df[f"ma{p}"] = prices.rolling(p).mean()
+
+    # 多头排列条件
+    df["bullish"] = (
+        (df["ma5"] > df["ma20"]) &
+        (df["ma20"] > df["ma60"]) &
+        (df["ma60"] > df["ma250"]) &
+        (df["price"] > df["ma5"])
+    ).astype(int)
+
+    # 信号：状态从 0→1 = BUY，从 1→0 = SELL
+    df["signal"] = df["bullish"].diff()
+    df["event"] = df["signal"].map({1: "BUY", -1: "SELL"}).fillna("HOLD")
+
+    return df
+```
+
+这个函数输出的 DataFrame 里，每一天都有明确的信号状态。`event` 列只有在状态切换时显示 BUY 或 SELL，其余时间 HOLD。这个信号序列会直接喂给第 06 篇的回测引擎。
+
+### 均线信号的失效区
+
+均线在震荡市会反复打脸——在 [看懂行情](/posts/market-reading/04-moving-average-system) 里讲过，这是散户用均线亏钱的主因。
+
+代码层面怎么应对？加一个**趋势强度过滤**——用 ADX 指标或波动率比率判断当前是趋势市还是震荡市。如果是震荡市，均线信号不生效。
+
+一个简单的方法：计算价格波动范围和移动幅度的比率。如果价格在原地横跳（高波动但低位移），说明是震荡市，均线信号不可靠：
+
+```python
+def trend_strength(prices: pd.Series, window: int = 20) -> float:
+    """趋势强度指标（简化版 ADX 思路）
+
+    高分 = 趋势明确，均线信号可靠
+    低分 = 震荡市，均线信号容易反复
+    """
+    # 位移：起止价格变动
+    displacement = abs(prices.iloc[-1] / prices.iloc[-window] - 1)
+    # 波动：窗口内每日波动幅度之和
+    daily_changes = prices.pct_change().iloc[-window:].abs()
+    volatility = daily_changes.sum()
+
+    if volatility == 0:
+        return 0
+    # 位移占波动的比例——越高说明趋势越清晰
+    return displacement / volatility * 100
+```
+
+位移/波动比率大于 30 说明趋势比较明确，均线信号可以信任；低于 15 说明价格在原地来回跳，均线信号大概率会反复打脸。
+
+## 动量因子
+
+均线系统回答「现在是什么趋势」，动量回答「涨/跌了多久、多猛」。动量是趋势的量化度量。
+
+### 绝对动量
+
+绝对动量就是过去 N 个时间段的收益率——简单直接。
+
+```python
+def absolute_momentum(prices: pd.Series, lookback: int = 240) -> float:
+    """绝对动量：过去 N 个交易日的收益率（%）
+
+    240 交易日 ≈ 12 个月，是动量因子最常用的时间窗口
+    研究表明 12 个月动量在大多数市场上有持续性
+    """
+    if len(prices) < lookback:
+        return None
+    return (prices.iloc[-1] / prices.iloc[-lookback] - 1) * 100
+```
+
+12 个月动量是学术研究中最常用的窗口——太短（1-3 个月）容易受短期波动干扰，太长（3-5 年）可能捕捉到反转效应。研究表明，3-12 个月的动量在大多数市场上有持续性，而 3-5 年反而出现反转（涨多了的要跌回来）。
+
+### 相对动量
+
+相对动量是把多个标的的动量排名——谁的动量最强就买谁。
+
+```python
+def relative_momentum_rank(price_dict: dict, lookback: int = 240) -> pd.DataFrame:
+    """相对动量排名
+
+    Args:
+        price_dict: {code: price_series}
+        lookback: 动量回看周期
+
+    Returns:
+        DataFrame 按动量从强到弱排序
+    """
+    results = []
+    for code, prices in price_dict.items():
+        mom = absolute_momentum(prices, lookback)
+        if mom is not None:
+            results.append({"code": code, "momentum": mom})
+
+    df = pd.DataFrame(results).set_index("code")
+    df["rank"] = df["momentum"].rank(ascending=False).astype(int)
+    return df.sort_values("momentum", ascending=False)
+```
+
+用真实数据排名（12 个月动量，截至 2026-06-26）：
+
+```
+code       momentum  rank
+588000     +103.5%     1  (科创50)
+513100      +33.0%     2  (纳指100)
+510300      +23.0%     3  (沪深300)
+513500      +18.4%     4  (标普500)
+511260       -1.4%     5  (国债ETF)
+563020      -12.9%     6  (红利低波)
+```
+
+科创50 的动量一骑绝尘，红利低波垫底。如果你用纯动量策略——只买动量最强的——现在应该满仓科创50。但这合理吗？动量策略在趋势延续时赚翻，在拐点反转时亏惨。2024 年初追高纳指的人，也体验过 -24% 的回撤。
+
+## 双动量策略
+
+单用绝对动量（趋势跟踪）或单用相对动量（轮动）都有缺陷。Gary Antonacci 提出的**双动量（Dual Momentum）**把两者结合：
+
+- **绝对动量过滤**：标的的动量为正才持有，动量为负就退回到无风险资产（债券/现金）
+- **相对动量选择**：在动量为正的标的中，买动量最强的
+
+逻辑很直觉：市场好的时候进攻（买动量最强的权益资产），市场差的时候防守（退回债券）。
+
+```python
+def dual_momentum(price_dict: dict, bond_prices: pd.Series,
+                  lookback: int = 240, top_n: int = 1) -> dict:
+    """双动量策略信号
+
+    Args:
+        price_dict: 候选标的 {code: price_series}
+        bond_prices: 无风险资产（债券ETF）的价格序列
+        lookback: 动量回看周期
+        top_n: 选动量前几名
+
+    Returns:
+        选中的标的列表和选择逻辑
+    """
+    # Step 1: 计算每个标的的绝对动量
+    moments = {}
+    for code, prices in price_dict.items():
+        mom = absolute_momentum(prices, lookback)
+        if mom is not None:
+            moments[code] = mom
+
+    # 债券的动量作为「无风险基准」
+    bond_mom = absolute_momentum(bond_prices, lookback)
+
+    # Step 2: 绝对动量过滤——只保留比债券动量强的
+    candidates = {}
+    for code, mom in moments.items():
+        if bond_mom is not None and mom > bond_mom:
+            candidates[code] = mom
+
+    # Step 3: 相对动量选择——在通过过滤的标的中选 top_n
+    if not candidates:
+        return {
+            "selection": "BOND",
+            "reason": f"所有权益标动量({max(moments.values()):.1f}%) "
+                      f"低于债券({bond_mom:.1f}%)，全仓债券防守",
+        }
+
+    ranked = sorted(candidates.items(), key=lambda x: x[1], reverse=True)
+    selected = ranked[:top_n]
+
+    return {
+        "selection": [s[0] for s in selected],
+        "momentum": dict(selected),
+        "all_momentum": moments,
+        "bond_momentum": bond_mom,
+        "reason": f"选择动量最强的 {top_n} 只标的",
+    }
+```
+
+用你的 ETF 组合模拟一下（纳指100 + 红利低波 + 科创50 作为候选，国债 ETF 作为无风险资产）：
+
+```python
+candidates = {
+    "513100": nasdaq_prices,   # 纳指100
+    "563020": dividend_prices, # 红利低波
+    "588000": kechuang_prices, # 科创50
+}
+
+result = dual_momentum(candidates, bond_prices, lookback=240, top_n=1)
+```
+
+当前结果：
+
+```
+选中: 588000 (科创50)
+动量: +103.5%
+
+所有候选动量:
+  科创50: +103.5%  ← 通过绝对动量过滤，选中
+  纳指100: +33.0%  ← 通过绝对动量过滤
+  红利低波: -12.9% ← 绝对动量为负，过滤掉
+
+债券(无风险): -1.4%
+```
+
+双动量策略选择科创50——因为它动量最强且为正。红利低波被过滤掉了（动量为负），说明根据这个策略，现在不应该持有红利低波，应该退回债券。
+
+但这和你的投资体系有冲突——你的配置逻辑是「美股进攻 + 红利防守」，不是纯动量轮动。双动量策略提供的是信号参考，不是替代你的配置逻辑。怎么把策略信号和你的投资体系结合，是第 07 篇组合优化要解决的。
+
+## 信号融合：估值 + 趋势
+
+现在你有两套信号：估值因子（第 04 篇）和趋势信号（本篇）。把它们组合在一起：
+
+```python
+def combined_signal(prices: pd.Series, etf_type: str = "broad") -> dict:
+    """估值 + 趋势的组合信号
+
+    组合规则:
+    - 低估 + 多头排列 = 强买入（便宜且开始涨了）
+    - 低估 + 非多头 = 观望（便宜但还没反转）
+    - 合理 + 多头排列 = 持有（估值正常，趋势好）
+    - 合理 + 非多头 = 中性（什么都不做）
+    - 高估 + 多头排列 = 警惕（趋势还在但贵了）
+    - 高估 + 非多头 = 减仓（贵且趋势已破）
+    """
+    from valuation_factor import ValuationFactor
+
+    vf = ValuationFactor()
+    val_result = vf.score(prices, etf_type)
+    trend_bullish = is_bullish_alignment(prices)
+    mom = absolute_momentum(prices, 240)
+
+    val_signal = val_result["signal"]  # 低估/合理/高估
+    score = val_result["total_score"]
+
+    # 组合判断
+    if val_signal == "低估" and trend_bullish:
+        action = "强买入"
+    elif val_signal == "低估" and not trend_bullish:
+        action = "观望（等趋势反转）"
+    elif val_signal == "合理" and trend_bullish:
+        action = "持有"
+    elif val_signal == "合理" and not trend_bullish:
+        action = "中性"
+    elif val_signal == "高估" and trend_bullish:
+        action = "警惕（趋势好但贵）"
+    else:  # 高估 + 非多头
+        action = "减仓"
+
+    return {
+        "valuation_score": score,
+        "valuation_signal": val_signal,
+        "trend_bullish": trend_bullish,
+        "momentum_12m": mom,
+        "action": action,
+    }
+```
+
+对 6 只 ETF 跑一遍组合信号：
+
+```
+ETF         估值评分  信号    趋势     12月动量    → 行动
+科创50       81.5    高估    多头     +103.5%    → 警惕（趋势好但贵）
+纳指100      68.3    合理    非多头    +33.0%    → 中性
+沪深300      53.2    合理    多头     +23.0%    → 持有
+标普500      62.5    合理    非多头    +18.4%    → 中性
+国债ETF     43.1    合理    非多头    -1.4%     → 中性
+红利低波     24.8    低估    非多头   -12.9%    → 观望（等趋势反转）
+```
+
+这些信号符合直觉：
+
+- **科创50**：趋势极强但估值到了高位——可以继续持有，但加仓要谨慎，随时准备在趋势反转时止盈
+- **红利低波**：估值确实便宜，但趋势还在往下——典型的右侧交易等待区。等它均线开始多头排列了再考虑建仓
+- **沪深300**：估值合理 + 趋势向上——正常的持有状态
+
+这个组合信号系统比任何单一指标都更有参考价值。估值告诉你「贵不贵」，趋势告诉你「动没动」，组合起来才能做出有依据的决策。
+
+## 避免过拟合的代码实践
+
+[看懂行情](/posts/market-reading/13-indicator-failure) 第 13 篇详细讲过技术指标为什么会失效——过拟合、参数寻优、未来函数。在代码层面，有具体的做法来避免这些陷阱：
+
+**参数不要太多**。你的均线系统用了固定的 5/20/60/250，不是在历史数据上「搜索」出来的最优参数。如果改用 7/23/55/271 因为回测表现更好——那就是过拟合。参数越接近「整数」越不容易过拟合，因为它们不是 cherry-pick 出来的。
+
+**不用未来数据（未来函数）**。在 `ma_signals` 函数里，计算每一天的均线和信号时，只用到当天及之前的数据。`rolling(20).mean()` 计算的是过去 20 天的均值，不会偷看未来的数据。如果你在代码里不小心用了 `shift(-1)`（取下一天的数据），那就是未来函数——回测无敌，实盘暴亏。
+
+**不在信号生成阶段调参**。信号规则在回测之前就定好了（5/20/60/250），回测只是验证。如果回测结果不好就回去改参数，然后再回测——这就是参数寻优，几乎必然导致过拟合。
+
+第 06 篇的回测引擎会专门讲怎么做参数敏感性分析和样本外验证——确认你的策略不是过拟合的产物。
+
+## 封装成类
+
+```python
+class SignalEngine:
+    """趋势与动量信号引擎
+
+    用法:
+        engine = SignalEngine()
+
+        # 单个标的信号
+        signal = engine.ma_signals(prices)
+
+        # 多头排列判断
+        bullish = engine.is_bullish(prices)
+
+        # 双动量选择
+        selection = engine.dual_momentum(etf_dict, bond_prices)
+
+        # 组合信号
+        combined = engine.combined_signal(prices, "value")
+    """
+
+    def __init__(self, ma_periods: list = None, momentum_lookback: int = 240):
+        self.ma_periods = ma_periods or [5, 20, 60, 250]
+        self.momentum_lookback = momentum_lookback
+
+    def moving_averages(self, prices: pd.Series) -> dict:
+        return moving_averages(prices, self.ma_periods)
+
+    def is_bullish(self, prices: pd.Series) -> bool:
+        return is_bullish_alignment(prices)
+
+    def ma_signals(self, prices: pd.Series) -> pd.DataFrame:
+        return ma_signals(prices)
+
+    def momentum(self, prices: pd.Series) -> float:
+        return absolute_momentum(prices, self.momentum_lookback)
+
+    def dual_momentum(self, price_dict: dict, bond_prices: pd.Series,
+                      top_n: int = 1) -> dict:
+        return dual_momentum(price_dict, bond_prices,
+                             self.momentum_lookback, top_n)
+
+    def combined_signal(self, prices: pd.Series, etf_type: str = "broad") -> dict:
+        return combined_signal(prices, etf_type)
+```
+
+## 这篇的产物
+
+一个 `SignalEngine` 类，覆盖均线系统、动量排名、双动量策略、估值+趋势组合信号。和第 04 篇的 `ValuationFactor` 一起，构成了完整的分析层——输入价格数据，输出买卖信号。
+
+下一篇是整个系列的技术核心——把这些信号串成策略，用回测引擎验证它们在历史数据上的表现。到底「估值低+多头排列才买入」这个策略能不能赚钱？回测说了算。

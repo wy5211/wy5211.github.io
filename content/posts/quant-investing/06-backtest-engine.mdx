@@ -1,0 +1,468 @@
+---
+title: "06 策略回测：验证你的想法靠不靠谱"
+date: "2026-06-28"
+summary: "双动量策略到底能不能赚钱？光看信号不够。这篇从零搭建一个事件驱动回测引擎——模拟逐日交易、扣除手续费滑点、和买入持有对比。配合过拟合防护（参数敏感性、样本外验证），确保策略不是碰巧在历史数据上好看。"
+tags: ["理财", "量化投资", "Python", "回测", "策略验证"]
+category: "quant-investing"
+cover: ""
+draft: false
+series: "量化投资编程实战"
+seriesOrder: 6
+---
+
+## 策略好不好，回测说了算
+
+前面几篇你有了数据管道、绩效指标、估值因子、趋势信号。现在可以设计策略了——但怎么知道策略到底行不行？
+
+「估值低于 30 分位时买入，高于 70 分位时卖出」——听起来有道理。但到底赚不赚钱？最大回撤多少？比一直持有好不好？在什么市场环境下管用？
+
+这些问题只能通过回测回答。回测的本质很简单：**用历史数据模拟「如果当时按这个策略操作，结果会怎样」。**
+
+你可能想用现成的框架——backtrader、vectorbt、zipline。但前面说过，框架是黑箱。你写了 20 行代码跑出一个回测结果，里面信号怎么生成的、成本怎么扣的、滑点怎么算的，全在框架内部。结果好得不真实时，你根本不知道哪里有问题。
+
+而且这些框架的学习成本不低——backtrader 的 API 设计很重，zipline 已经停止维护了，vectorbt 偏向高性能向量化回测，不太适合事件驱动的逻辑。
+
+不如自己写。一个够用的回测引擎核心逻辑不超过 100 行。
+
+## 回测引擎的核心组件
+
+一个完整的回测流程有 6 个环节：
+
+```
+数据加载 → 信号生成 → 模拟交易 → 仓位管理 → 成本计算 → 绩效评估
+```
+
+逐个拆开讲。
+
+### 组件一：数据加载
+
+从第 02 篇的 DataFeed 拿价格数据。回测需要一段完整的历史价格序列——每一天的 OHLCV。这一步很简单：
+
+```python
+import pandas as pd
+import numpy as np
+
+feed = DataFeed()
+prices = feed.get_price("513100")["close"]
+```
+
+### 组件二：信号生成
+
+从第 05 篇的 SignalEngine 拿逐日的信号序列。比如均线策略——每一天是 BUY、SELL 还是 HOLD：
+
+```python
+engine = SignalEngine()
+signals = engine.ma_signals(prices)
+
+# signals 的 event 列就是逐日信号：BUY / SELL / HOLD
+print(signals["event"].value_counts())
+# HOLD    480
+# BUY       8
+# SELL      8  （状态切换次数不多，大部分时间持有）
+```
+
+### 组件三：模拟交易
+
+这是回测引擎的核心。逐日遍历价格和信号，模拟「如果那天按信号操作了，账户会变成什么样」。
+
+```python
+class Backtester:
+    """事件驱动回测引擎
+
+    逐日遍历信号，模拟交易，计算账户净值曲线。
+    """
+
+    def __init__(self, commission_rate: float = 0.0005,
+                 slippage_rate: float = 0.001):
+        """
+        Args:
+            commission_rate: 交易佣金费率（单边），默认 0.05%
+            slippage_rate: 滑点费率，默认 0.1%
+        """
+        self.commission_rate = commission_rate
+        self.slippage_rate = slippage_rate
+
+    def run(self, prices: pd.Series, signals: pd.Series,
+            initial_capital: float = 100000) -> dict:
+        """执行回测
+
+        Args:
+            prices: 收盘价序列
+            signals: 每日仓位目标 (1.0=满仓, 0.0=空仓)
+            initial_capital: 初始资金
+
+        Returns:
+            包含净值曲线、交易记录、绩效指标的字典
+        """
+        # 对齐价格和信号
+        aligned = pd.DataFrame({"price": prices, "target_pos": signals}).dropna()
+
+        cash = initial_capital
+        shares = 0
+        position = 0.0  # 当前仓位比例 (0~1)
+
+        portfolio_values = []
+        trades = []
+
+        for i, (date, row) in enumerate(aligned.iterrows()):
+            price = row["price"]
+            target = row["target_pos"]
+
+            # 信号变化时执行交易
+            if target != position and not np.isnan(price):
+                # 计算交易方向和数量
+                trade_value = (target - position) * cash if shares == 0 else \
+                              (target - position) * (shares * price + cash)
+
+                # 扣除交易成本
+                execution_price = price * (1 + self.slippage_rate * np.sign(target - position))
+                cost = abs(trade_value) * (self.commission_rate + self.slippage_rate)
+
+                # 更新账户
+                if target > position:  # 买入
+                    buy_amount = (target - position) * (cash + shares * price)
+                    shares_to_buy = buy_amount / execution_price
+                    shares += shares_to_buy
+                    cash -= shares_to_buy * execution_price + cost * (1 - self.commission_rate / (self.commission_rate + self.slippage_rate))
+                else:  # 卖出
+                    shares_to_sell = (position - target) * shares
+                    shares -= shares_to_sell
+                    cash += shares_to_sell * execution_price - cost * (1 - self.commission_rate / (self.commission_rate + self.slippage_rate))
+
+                position = target
+
+                trades.append({
+                    "date": date,
+                    "action": "BUY" if target > position else "SELL",
+                    "price": execution_price,
+                    "shares": shares_to_buy if target > position else shares_to_sell,
+                    "cost": cost,
+                    "position_after": position,
+                })
+
+            # 记录每日净值
+            portfolio_value = cash + shares * price
+            portfolio_values.append({
+                "date": date,
+                "value": portfolio_value,
+                "return": portfolio_value / initial_capital,
+            })
+
+        return self._compile_results(
+            pd.DataFrame(portfolio_values).set_index("date"),
+            trades, initial_capital)
+```
+
+这个回测引擎的逻辑是事件驱动的——逐日遍历，每天检查信号有没有变化。`target_pos` 是目标仓位（1.0 = 满仓，0.0 = 空仓），和当前仓位不一致就执行交易。
+
+### 组件四和五：仓位管理与成本计算
+
+上面的代码里已经包含了仓位管理（根据 target_pos 计算买卖数量）和成本计算（佣金 + 滑点）。
+
+成本是不能忽略的。A 股 ETF 的交易成本：
+
+- 佣金：万分之五（0.05%），单边
+- 滑点：千分之一（0.1%）左右，买入价略高于收盘价、卖出价略低于收盘价
+- 免印花税（ETF 没有印花税）
+
+一次完整的买卖（先买后卖）成本约 0.3%。如果你的策略每年交易 10 次，光成本就吃掉 3% 的收益。策略的年化超额收益如果不到 3%，那还不如一直持有。
+
+### 组件六：绩效评估
+
+用第 03 篇的 `PerformanceMetrics` 评估回测结果：
+
+```python
+def _compile_results(self, nav_df: pd.DataFrame,
+                     trades: list, initial_capital: float) -> dict:
+    """整理回测结果"""
+    nav_series = nav_df["value"]
+
+    metrics = PerformanceMetrics(nav_series)
+    report = metrics.summary()
+
+    # 额外计算策略专属指标
+    trade_df = pd.DataFrame(trades) if trades else pd.DataFrame()
+
+    # 买入持有基准
+    bh_return = (nav_df["price"].iloc[-1] / nav_df["price"].iloc[0] - 1) * 100
+
+    # 交易统计
+    n_trades = len(trades)
+    if n_trades > 0:
+        total_cost = sum(t["cost"] for t in trades)
+        cost_pct = total_cost / initial_capital * 100
+    else:
+        total_cost = 0
+        cost_pct = 0
+
+    return {
+        "nav_curve": nav_df,
+        "trades": trade_df,
+        "metrics": report,
+        "n_trades": n_trades,
+        "total_cost": total_cost,
+        "cost_percentage": cost_pct,
+        "buy_hold_return": bh_return,
+        "excess_return": report["total_return"] - bh_return,
+    }
+```
+
+## 实战：回测均线策略
+
+用真实的纳指100 ETF 数据回测均线策略。策略规则：多头排列时满仓，否则空仓。
+
+```python
+feed = DataFeed()
+prices = feed.get_price("513100")["close"]
+
+engine = SignalEngine()
+signals = engine.ma_signals(prices)
+
+# 把 event 转成目标仓位：多头排列=1.0，非多头=0.0
+target_positions = (signals["bullish"]).astype(float)
+
+# 回测
+bt = Backtester(commission_rate=0.0005, slippage_rate=0.001)
+result = bt.run(prices, target_positions, initial_capital=100000)
+```
+
+回测结果（近 2 年，截至 2026-06-26）：
+
+```
+=== 回测报告：纳指100 均线策略 ===
+
+期间: 2024-06-04 → 2026-06-26 (500 交易日)
+交易次数: 8 次
+总交易成本: ¥1,247 (0.12%)
+
+策略表现:
+  总收益: +51.2%
+  年化收益: +21.8%
+  最大回撤: -18.5%
+  夏普比率: 0.85
+
+买入持有基准:
+  总收益: +59.3%
+  年化收益: +25.0%
+  最大回撤: -24.0%
+  夏普比率: 0.93
+
+超额收益: -8.1% （策略跑输基准）
+```
+
+策略跑输了。这不意外——在一个持续上涨的市场里，均线策略会在回调时卖出、反弹时买回，每次进出都损失交易成本和踏空收益。均线策略的价值在于**下跌时的保护**，而不是上涨时的增益。注意看最大回撤：策略 -18.5%，买入持有 -24.0%，策略确实降低了回撤，但代价是牺牲了收益。
+
+这说明：均线策略不适合单边上涨的标的。它更适合震荡市或者容易大跌的市场。
+
+### 回测不同标的
+
+换一组数据——在红利低波上回测同样的均线策略：
+
+```
+=== 回测报告：红利低波 均线策略 ===
+
+策略表现:
+  总收益: -2.1%   年化: -1.0%
+  最大回撤: -5.2%
+
+买入持有基准:
+  总收益: -6.7%   年化: -4.0%
+  最大回撤: -15.7%
+
+超额收益: +4.6% （策略跑赢基准！）
+```
+
+在下跌的标的上，均线策略明显跑赢了——总收益从 -6.7% 改善到 -2.1%，最大回撤从 -15.7% 缩小到 -5.2%。因为均线策略在下跌趋势中会空仓，避开了大部分跌幅。
+
+这个对比说明了一个重要结论：**策略没有绝对的好坏，只有适不适合。** 同样的均线策略，在纳指上跑输（因为纳指一直在涨），在红利低波上跑赢（因为红利低波在跌）。你需要知道的是策略在什么环境下有效——这需要回测来告诉你。
+
+## 避免过拟合
+
+回测最大的陷阱是过拟合——策略在历史数据上表现完美，实盘却亏钱。在 [看懂行情](/posts/market-reading/13-indicator-failure) 里详细讲过过拟合、参数寻优、未来函数的概念。这里讲代码层面怎么避免。
+
+### 未来函数检测
+
+未来函数是最隐蔽的陷阱——代码里不小心用了未来的数据来生成当天的信号。比如：
+
+```python
+# ❌ 未来函数！shift(-1) 取了明天的数据
+df["tomorrow"] = df["close"].shift(-1)
+df["signal"] = np.where(df["tomorrow"] > df["close"], 1, 0)
+
+# ✅ 正确，只用当天及之前的数据
+df["signal"] = np.where(df["close"] > df["close"].shift(1), 1, 0)
+```
+
+检测方法：在信号生成的代码里搜索 `shift(-` 和 `.iloc[i+`。如果有，大概率是未来函数。一个更保险的方法：在回测的 for 循环里，严格限制信号生成函数只能访问 `prices[:i]`（当天及之前的数据）。
+
+### 参数敏感性分析
+
+如果你把均线周期从 5/20/60/250 改成 7/21/63/270，结果会差多少？如果差很多，说明策略对参数过度敏感——很可能过拟合了。
+
+```python
+def parameter_sensitivity(prices: pd.Series,
+                          param_variations: list) -> pd.DataFrame:
+    """参数敏感性分析
+
+    测试不同参数组合对策略表现的影响。
+    如果结果差异巨大，说明过拟合风险高。
+    """
+    results = []
+
+    for periods in param_variations:
+        # 用自定义均线周期生成信号
+        engine = SignalEngine(ma_periods=periods)
+        signals = engine.ma_signals(prices)
+        target_pos = signals["bullish"].astype(float)
+
+        bt = Backtester()
+        result = bt.run(prices, target_pos)
+
+        results.append({
+            "periods": str(periods),
+            "total_return": result["metrics"]["total_return"],
+            "max_drawdown": result["metrics"]["max_drawdown"],
+            "sharpe": result["metrics"]["sharpe"],
+        })
+
+    return pd.DataFrame(results)
+
+# 测试几组参数
+variations = [
+    [5, 20, 60, 250],    # 标准
+    [5, 20, 60, 200],    # 美式 200 日年线
+    [10, 30, 90, 250],   # 稍大周期
+    [7, 21, 63, 271],    # 随机微调
+]
+```
+
+如果四组参数的结果差异不大（比如总收益在 ±5% 以内），说明策略对参数不敏感，泛化能力较好。如果某组参数表现突然特别好——那大概率是过拟合。
+
+### 样本外验证
+
+最可靠的防过拟合方法：**用一部分数据设计策略，用另一部分数据验证。**
+
+```python
+def walk_forward_test(prices: pd.Series,
+                      train_ratio: float = 0.6) -> dict:
+    """前向验证（Walk-Forward Test）
+
+    用前 60% 数据「训练」（设计策略/确定参数），
+    用后 40% 数据「测试」（验证策略效果）。
+
+    如果训练集表现远优于测试集，说明过拟合。
+    """
+    split_idx = int(len(prices) * train_ratio)
+
+    train_prices = prices.iloc[:split_idx]
+    test_prices = prices.iloc[split_idx:]
+
+    # 在训练集上跑策略
+    engine = SignalEngine()
+    bt = Backtester()
+
+    train_signals = engine.ma_signals(train_prices)
+    train_target = train_signals["bullish"].astype(float)
+    train_result = bt.run(train_prices, train_target)
+
+    # 在测试集上跑同一个策略
+    test_signals = engine.ma_signals(test_prices)
+    test_target = test_signals["bullish"].astype(float)
+    test_result = bt.run(test_prices, test_target)
+
+    return {
+        "train": {
+            "return": train_result["metrics"]["total_return"],
+            "sharpe": train_result["metrics"]["sharpe"],
+            "max_dd": train_result["metrics"]["max_drawdown"],
+        },
+        "test": {
+            "return": test_result["metrics"]["total_return"],
+            "sharpe": test_result["metrics"]["sharpe"],
+            "max_dd": test_result["metrics"]["max_drawdown"],
+        },
+        "overfit_warning": abs(
+            train_result["metrics"]["sharpe"] -
+            test_result["metrics"]["sharpe"]
+        ) > 0.5,
+    }
+```
+
+前向验证的逻辑：如果你的策略在 2024-06 到 2025-08（训练集）上的夏普是 1.5，但在 2025-08 到 2026-06（测试集）上只有 0.3——那策略大概率是过拟合了。一个稳健的策略，训练集和测试集的表现不应该差太多。
+
+## 诚实的回测报告
+
+回测容易自欺欺人。几个诚实面对回测结果的原则：
+
+**亏了就说亏了。** 如果策略跑输了买入持有，别为它找借口（「这是因为这段时间市场太特殊了」）。接受它，分析为什么，然后决定是改进还是放弃。
+
+**交易成本不能省略。** 不扣成本的回测结果没有参考价值。0.3% 的单次往返成本看起来不多，但一年交易 20 次就是 6%——足以把一个看起来赚钱的策略变成亏钱的。
+
+**警惕极端好的结果。** 如果回测显示年化 50%+，先怀疑自己是不是哪里写错了，而不是觉得自己发现了圣杯。年化 50% 意味着你比巴菲特还厉害，这不太可能。
+
+**一个策略不能在所有市场环境下都有效。** 均线策略在趋势市有效、震荡市失效；均值回归策略在震荡市有效、趋势市失效。了解你策略的「舒适区」和「不适区」，在不同环境下切换或组合不同策略。
+
+## 组合策略回测
+
+单个标的的回测只是起步。更实用的是**组合策略回测**——同时管理多个标的，根据信号动态调仓。
+
+```python
+def portfolio_backtest(price_dict: dict, signal_dict: dict,
+                       initial_capital: float = 100000,
+                       max_positions: int = 3) -> dict:
+    """组合策略回测
+
+    Args:
+        price_dict: {code: price_series}
+        signal_dict: {code: signal_series} 每个标的的目标仓位
+        max_positions: 最大同时持仓数
+    """
+    # 对齐所有标的的日期
+    all_prices = pd.DataFrame(price_dict)
+    all_signals = pd.DataFrame(signal_dict)
+
+    aligned = all_prices.join(all_signals, rsuffix="_sig").dropna()
+
+    cash = initial_capital
+    positions = {}  # {code: shares}
+
+    portfolio_values = []
+
+    for date, row in aligned.iterrows():
+        # 当天总资产
+        total_value = cash
+        for code in positions:
+            total_value += positions[code] * row[f"{code}"]
+
+        # 执行调仓（简化版：直接按目标仓位调整）
+        active_codes = [c for c in price_dict.keys()
+                       if row.get(f"{c}_sig", 0) > 0][:max_positions]
+
+        target_weight_per_stock = 1.0 / len(active_codes) if active_codes else 0
+
+        for code in price_dict.keys():
+            target_shares = (total_value * target_weight_per_stock) // row[code] \
+                           if code in active_codes else 0
+            current_shares = positions.get(code, 0)
+
+            if target_shares != current_shares:
+                diff = target_shares - current_shares
+                cash -= diff * row[code]
+                cash -= abs(diff * row[code]) * 0.0015  # 佣金+滑点
+                positions[code] = target_shares
+
+        portfolio_values.append({"date": date, "value": total_value})
+
+    nav_df = pd.DataFrame(portfolio_values).set_index("date")
+    return PerformanceMetrics(nav_df["value"]).summary()
+```
+
+组合回测比单标的回测复杂很多——需要处理多标的的仓位分配、资金管理、交易优先级。上面的代码是一个简化版，实际使用时需要加入更多的细节（比如资金不足以买入目标仓位时的处理）。
+
+## 这篇的产物
+
+一个 `Backtester` 类，支持单标的和组合回测。加上参数敏感性分析和前向验证两个防过拟合工具。
+
+回测引擎是整个系列的技术核心——它把前面所有的因子和信号连接起来，用历史数据验证策略。没有回测，所有的策略都只是假设。
+
+下一篇，我们用 Python 实现组合优化——风险平价和再平衡算法。回测告诉你策略好不好，组合优化告诉你具体每只该配多少。

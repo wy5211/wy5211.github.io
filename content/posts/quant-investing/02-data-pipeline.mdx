@@ -1,0 +1,432 @@
+---
+title: "02 搭建你的量化数据管道"
+date: "2026-06-28"
+summary: "拉数据是一切分析的基础。这篇把 Sina/Yahoo API 封装成统一的 DataFeed 类——输入代码自动判断市场、拉取日线、清洗缓存，不管是 A 股还是美股都返回干净格式。附带三个数据处理的坑和解决方案。"
+tags: ["理财", "量化投资", "Python", "数据处理"]
+category: "quant-investing"
+cover: ""
+draft: false
+series: "量化投资编程实战"
+seriesOrder: 2
+---
+
+## 同样的数据源，不同的麻烦
+
+上一篇讲了为什么要用代码做投资。现在开始搭第一块积木——数据管道。
+
+你的持仓涵盖 A 股和美股，数据源天然不同：
+
+- A 股 ETF：Sina Finance API，代码格式 `sh563020`/`sz159119`
+- 美股 ETF：Yahoo Finance API，代码格式 `513100` 不带前缀，或者 `^GSPC`（标普500指数）
+- 国际指数：Yahoo Finance，代码格式 `^N225`（日经）、`^IXIC`（纳指）
+
+你想要的效果很简单：
+
+```python
+feed = DataFeed()
+prices = feed.get_price("513100", start="2024-01-01")
+```
+
+不管它是 A 股还是美股，不管底层调的是 Sina 还是 Yahoo，你只管传代码、传日期范围，拿回来一个干净的 DataFrame——有日期索引、有 OHLCV 列、数据已经对齐好了。
+
+这看起来不难，但实际有几个坑等着你。
+
+## 封装 Sina K 线 API
+
+A 股 ETF 的主力数据源。之前在 [估值工具箱](/posts/valuation-toolkit/01-where-to-find-data) 里已经接触过这个 API，但当时是直接 curl 调用，现在要封装成可复用的 Python 函数。
+
+先看原始 API 返回什么：
+
+```
+GET https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/
+    CN_MarketData.getKLineData
+    ?symbol=sh513100&scale=240&ma=no&datalen=500
+```
+
+参数说明：`scale=240` 表示日线（一天 4 小时 = 240 分钟），`ma=no` 只返回原始 OHLCV 不带均线，`datalen=500` 拉最近 500 个交易日（约 2 年）。
+
+返回的是一个 JSON 数组：
+
+```json
+[
+  {"day":"2024-06-04","open":"1.357","high":"1.368","low":"1.342","close":"1.355","volume":"12345600"},
+  {"day":"2024-06-05","open":"1.355","high":"1.372","low":"1.348","close":"1.365","volume":"9876500"},
+  ...
+]
+```
+
+封装的第一步——把它变成 pandas DataFrame：
+
+```python
+import json
+import urllib.request
+import pandas as pd
+from io import StringIO
+from datetime import datetime, timedelta
+
+def fetch_sina_kline(symbol: str, datalen: int = 500) -> pd.DataFrame:
+    """从 Sina Finance 拉取 A 股 ETF/指数的日线数据
+
+    Args:
+        symbol: 带交易所前缀的代码，如 'sh513100'、'sz159119'
+        datalen: 拉取的交易日数量，250≈1年，500≈2年
+
+    Returns:
+        DataFrame，index 为日期，列包含 open/high/low/close/volume
+    """
+    url = (
+        "https://money.finance.sina.com.cn"
+        "/quotes_service/api/json_v2.php/"
+        "CN_MarketData.getKLineData"
+        f"?symbol={symbol}&scale=240&ma=no&datalen={datalen}"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    df = pd.DataFrame(data)
+    # 转换数据类型
+    df["day"] = pd.to_datetime(df["day"])
+    df = df.set_index("day")
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return df[["open", "high", "low", "close", "volume"]]
+```
+
+注意几个细节：Sina API 不需要 API Key，也不限流（实测连续调用几百次没问题），但需要加 `User-Agent` 头，否则可能被拒。`errors="coerce"` 确保异常值（比如停牌日的 `.` 占位符）变成 NaN 而不是报错。
+
+## 封装 Yahoo Finance API
+
+美股和国际指数用 Yahoo Finance 的 chart API：
+
+```
+GET https://query1.finance.yahoo.com/v8/finance/chart/513100.SS
+    ?period1=1718294400&period2=1781500800&interval=1d
+```
+
+这里有个细节——Yahoo 的代码格式和 Sina 不同。A 股在 Yahoo 上的后缀是 `.SS`（上交所）或 `.SZ`（深交所），比如 `513100.SS`。港股是 `.HK`，美股无后缀。
+
+```python
+def fetch_yahoo_chart(symbol: str, period_years: float = 2) -> pd.DataFrame:
+    """从 Yahoo Finance 拉取日线数据
+
+    Args:
+        symbol: Yahoo 格式代码，如 '513100.SS'、'^GSPC'、'QQQ'
+        period_years: 拉取多少年的数据
+    """
+    end_ts = int(datetime.now().timestamp())
+    start_ts = int((datetime.now() - timedelta(days=period_years * 365)).timestamp())
+
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
+        f"?period1={start_ts}&period2={end_ts}&interval=1d"
+    )
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        result = json.loads(resp.read().decode("utf-8"))
+
+    chart = result["chart"]["result"][0]
+    timestamps = chart["timestamp"]
+    quotes = chart["indicators"]["quote"][0]
+
+    df = pd.DataFrame({
+        "open": quotes["open"],
+        "high": quotes["high"],
+        "low": quotes["low"],
+        "close": quotes["close"],
+        "volume": quotes["volume"],
+    }, index=pd.to_datetime(timestamps, unit="s").tz_localize(None))
+
+    # Yahoo 返回的数据里可能包含休市日的 NaN，直接丢掉
+    df = df.dropna(subset=["close"])
+
+    return df[["open", "high", "low", "close", "volume"]]
+```
+
+Yahoo API 有时候会返回 `rate limited` 错误（返回 JSON 里没有 `result` 字段）。实际使用时需要加重试逻辑——后面在 DataFeed 类里统一处理。
+
+## 数据清洗的三个坑
+
+### 坑一：交易日历不同
+
+A 股和美股的交易日不一样。中国的节假日（春节、国庆）美股不休市，美国的节假日（感恩节、独立日）A 股也不休市。当你需要对齐多只 ETF 的收益率时，日期不匹配会导致大量 NaN。
+
+处理方法：取所有标的日期的**交集**。pandas 的 `join` 天然支持：
+
+```python
+# 对齐多只 ETF 的收盘价
+all_closes = pd.DataFrame()
+for code, df in data_dict.items():
+    all_closes[code] = df["close"]
+
+# 只保留所有标的都有数据的日期
+all_closes = all_closes.dropna()
+```
+
+但这里有一个取舍：如果你做的是日线级别的策略回测，用交集没问题（损失的是不同时交易的日期）。如果你做的是跨市场相关性分析，缺失日期太多会影响结果——这时候应该用周线或月线数据来对齐。
+
+### 坑二：前复权 vs 不复权
+
+Sina API 返回的是**前复权**数据——历史价格已经按分红除权调整过了。这意味着：高分红的 ETF（比如红利低波，年股息率约 5%），它的历史价格会比实际交易价格低，因为每次分红都把历史价格往下调了。
+
+前复权数据的优点是价格序列连续，适合做技术分析（均线、MACD 不会因为除权跳空）。缺点是：如果你用价格涨幅来算收益率，会**低估**分红型 ETF 的实际回报。
+
+对比一下纳指100 ETF（年股息率约 1%）和红利低波 ETF（年股息率约 5%）在过去 2 年的价格表现：
+
+| ETF               | 近 2 年价格收益 | 年股息率约 | 近 2 年全收益估算 |
+| ----------------- | --------------- | ---------- | ----------------- |
+| 纳指100 (513100)  | +43.8%          | 1%         | +45.8%            |
+| 红利低波 (563020) | -6.7%           | 5%         | +3.3%             |
+
+红利低波的价格显示亏了 6.7%，但加上分红的实际回报大约是 +3.3%。差距不小。
+
+在你的 DataFeed 里，默认使用前复权数据（因为大部分技术指标需要连续序列），但在计算收益率时要提醒自己：高分红标的的实际回报比价格涨幅更高。第 03 篇算投资绩效时会处理这个问题。
+
+### 坑三：跨境 ETF 的汇率因素
+
+513100（纳指100 ETF）在 A 股上市，用人民币计价，但它跟踪的是美元计价的纳指100 指数。汇率变动会影响 ETF 的价格——即使指数本身没涨没跌，人民币贬值 3%，ETF 价格也会涨 3%。
+
+这意味着 513100 的收益 = 纳指100 指数收益 + 美元兑人民币汇率变动。过去两年美元兑人民币从 7.25 附近涨到 7.3 左右，汇率因素贡献了约 1-2% 的额外收益。
+
+短期影响不大，但如果你在做长期回测或者对比美股 ETF 和直接持有美股的差异，需要把汇率因素考虑进去。
+
+## 组装 DataFeed 类
+
+把上面的 API 封装、数据清洗、市场判断组合在一起，就是一个统一的 DataFeed 类：
+
+```python
+import os
+import pandas as pd
+from pathlib import Path
+
+class DataFeed:
+    """统一的数据获取接口
+
+    自动判断市场（A股/美股/国际指数），选择对应 API，
+    支持本地缓存和增量更新。
+    """
+
+    CACHE_DIR = Path.home() / ".quant" / "cache"
+
+    # A 股交易所前缀映射
+    SH_PREFIXES = {"5", "6", "9"}  # 5xx=基金, 6xx=主板, 9xx=B股
+    SZ_PREFIXES = {"0", "1", "2", "3"}  # 0xx=主板, 1xx=基金, 3xx=创业板
+
+    def __init__(self, use_cache: bool = True):
+        self.use_cache = use_cache
+        self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    def _detect_market(self, code: str) -> str:
+        """根据代码格式判断市场和对应的 API"""
+        code = code.upper()
+        if code.startswith("SH") or code.startswith("SZ"):
+            return "sina"
+        elif code.startswith("^") or "." in code:
+            return "yahoo"  # 国际指数或 Yahoo 格式
+        elif code[0] in self.SH_PREFIXES:
+            return "sina"  # 纯数字代码，上交所
+        elif code[0] in self.SZ_PREFIXES:
+            return "sina"  # 纯数字代码，深交所
+        else:
+            return "yahoo"  # 默认尝试 Yahoo（美股代码）
+
+    def _to_sina_symbol(self, code: str) -> str:
+        """把纯数字代码转成 Sina 格式"""
+        code = code.lower()
+        if code.startswith("sh") or code.startswith("sz"):
+            return code
+        prefix = "sh" if code[0] in self.SH_PREFIXES else "sz"
+        return f"{prefix}{code}"
+
+    def _cache_path(self, code: str) -> Path:
+        return self.CACHE_DIR / f"{code}.parquet"
+
+    def get_price(self, code: str, start: str = None,
+                  end: str = None, datalen: int = 500) -> pd.DataFrame:
+        """获取日线价格数据
+
+        Args:
+            code: 代码，支持多种格式：'513100'、'sh513100'、'513100.SS'、'^GSPC'
+            start: 起始日期 'YYYY-MM-DD'（可选）
+            end: 结束日期 'YYYY-MM-DD'（可选）
+            datalen: Sina API 的返回条数上限
+
+        Returns:
+            DataFrame, columns: open/high/low/close/volume
+        """
+        # 检查缓存
+        cache = self._cache_path(code)
+        use_cached = False
+        if self.use_cache and cache.exists():
+            file_mtime = pd.Timestamp(cache.stat().st_mtime, unit='s')
+            # 缓存当天有效——今天拉过就不再重复请求
+            if file_mtime.date() >= pd.Timestamp.now().date():
+                use_cached = True
+
+        if use_cached:
+            df = pd.read_parquet(cache)
+        else:
+            market = self._detect_market(code)
+            if market == "sina":
+                sina_code = self._to_sina_symbol(code)
+                df = fetch_sina_kline(sina_code, datalen=datalen)
+            else:
+                yahoo_code = self._to_yahoo_symbol(code)
+                df = fetch_yahoo_chart(yahoo_code, period_years=3)
+
+            # 写入缓存
+            if self.use_cache and len(df) > 0:
+                df.to_parquet(cache)
+
+        # 按日期范围过滤
+        if start:
+            df = df[df.index >= pd.Timestamp(start)]
+        if end:
+            df = df[df.index <= pd.Timestamp(end)]
+
+        return df
+
+    def _to_yahoo_symbol(self, code: str) -> str:
+        """把纯数字代码转成 Yahoo 格式"""
+        code = code.upper()
+        if code.startswith("^") or "." in code:
+            return code
+        if code.startswith("SH"):
+            return f"{code[2:]}.SS"
+        if code.startswith("SZ"):
+            return f"{code[2:]}.SZ"
+        if code[0] in self.SH_PREFIXES:
+            return f"{code}.SS"
+        return code  # 美股代码直接用
+```
+
+这个类的设计目标是：**调用者不需要知道数据从哪来**。传代码进去，拿 DataFrame 出来。市场判断、API 选择、缓存逻辑全部藏在内部。
+
+用起来是这样的：
+
+```python
+feed = DataFeed()
+
+# A 股 ETF
+nasdaq = feed.get_price("513100", start="2024-06-01")
+dividend = feed.get_price("563020", start="2024-06-01")
+
+# 美股指数
+sp500 = feed.get_price("^GSPC", start="2024-06-01")
+
+# 批量拉取
+etf_list = ["513100", "513500", "563020", "588000", "510300", "511260"]
+all_prices = {}
+for code in etf_list:
+    all_prices[code] = feed.get_price(code)
+
+# 对齐到统一日期索引
+closes = pd.DataFrame({code: df["close"] for code, df in all_prices.items()})
+closes = closes.dropna()  # 取交集
+```
+
+## 增量更新
+
+第一次运行时，DataFeed 会拉完整的历史数据并缓存。但下次运行时，你只需要最新的几天数据——不需要重新拉 500 天。
+
+增量更新的思路：读缓存拿到最后一条日期，只拉这之后的数据，拼接到缓存上。
+
+```python
+def update_cache(self, code: str) -> pd.DataFrame:
+    """增量更新缓存——只拉取缓存中没有的最新数据"""
+    cache = self._cache_path(code)
+
+    if cache.exists():
+        old_df = pd.read_parquet(cache)
+        last_date = old_df.index[-1]
+    else:
+        old_df = pd.DataFrame()
+        last_date = None
+
+    market = self._detect_market(code)
+    if market == "sina":
+        # Sina API 只返回最近 N 条，拉一小段足够增量了
+        sina_code = self._to_sina_symbol(code)
+        new_df = fetch_sina_kline(sina_code, datalen=20)
+    else:
+        yahoo_code = self._to_yahoo_symbol(code)
+        new_df = fetch_yahoo_chart(yahoo_code, period_years=0.1)
+
+    if last_date is not None:
+        # 只保留缓存中没有的新数据
+        new_df = new_df[new_df.index > last_date]
+
+    if len(new_df) > 0:
+        updated = pd.concat([old_df, new_df])
+        updated = updated[~updated.index.duplicated(keep='last')]
+        updated.to_parquet(cache)
+        return updated
+
+    return old_df
+```
+
+增量更新把每次的 API 请求从 500 条降到 20 条，速度快很多，也不容易触发 API 限制。在后面的自动化监控系统（第 08 篇）里，这个方法会被定时调用。
+
+## 缓存格式选择
+
+缓存用 parquet 格式而不是 CSV——parquet 读取速度快 3-5 倍，文件体积小一半，而且自动保留数据类型（CSV 每次读取都要重新推断日期和数值类型）。
+
+如果没有 parquet 依赖（`pip install pyarrow`），CSV 也行，但建议装上 parquet：
+
+```bash
+pip install pyarrow pandas numpy
+```
+
+这是整个系列唯一的第三方依赖。后面的绩效分析、因子计算、回测引擎全部基于 pandas + numpy，不引入量化框架。
+
+## 实际运行
+
+跑一下看看效果。拉取 6 只 ETF 的近 2 年数据，检查数据完整性：
+
+```python
+feed = DataFeed(use_cache=False)
+
+etfs = {
+    "513100": "纳指100",
+    "513500": "标普500",
+    "563020": "红利低波",
+    "588000": "科创50",
+    "510300": "沪深300",
+    "511260": "国债ETF",
+}
+
+for code, name in etfs.items():
+    df = feed.get_price(code)
+    print(f"{name:8s} {code}  "
+          f"{df.index[0].date()} → {df.index[-1].date()}  "
+          f"{len(df)}交易日  "
+          f"最新收盘: {df['close'].iloc[-1]:.3f}")
+```
+
+输出（截至 2026-06-26）：
+
+```
+纳指100   513100  2024-06-04 → 2026-06-26  500交易日  最新收盘: 2.158
+标普500   513500  2024-06-04 → 2026-06-26  500交易日  最新收盘: 2.482
+红利低波   563020  2024-06-04 → 2026-06-26  500交易日  最新收盘: 1.076
+科创50   588000  2024-06-04 → 2026-06-26  500交易日  最新收盘: 2.133
+沪深300   510300  2024-06-04 → 2026-06-26  500交易日  最新收盘: 4.907
+国债ETF   511260  2024-06-04 → 2026-06-26  500交易日  最新收盘: 134.796
+```
+
+6 只 ETF 都是 500 个交易日，日期对齐良好。数据管道搭好了。
+
+## 这篇的产物
+
+一个 `DataFeed` 类，两个 API 封装函数（`fetch_sina_kline` + `fetch_yahoo_chart`）。后面所有的分析模块都从这里取数据——绩效分析、因子计算、信号引擎、回测框架、组合优化——全部建立在统一数据管道之上。
+
+几个注意事项：
+
+**Sina API 的稳定性**：实测连续调用几百次不限流，但偶尔会返回空数据（可能是临时故障）。DataFeed 里应该加重试逻辑——`fetch_sina_kline` 失败时重试 2 次，间隔 2 秒。
+
+**Yahoo API 的限制**：Yahoo 比 Sina 容易触发限流（连续调用 20-30 次就可能被拒）。如果你需要大量拉取美股数据，加一个请求间隔（每次调用后 `time.sleep(0.5)`），或者优先使用 Sina 拉在 A 股上市的跨境 ETF（513100、513500 等）。
+
+**数据质量验证**：拿到数据后养成习惯检查一下——首尾日期对不对、有没有异常的缺失值、最新收盘价和行情软件对一下。脏数据会导致后面的分析全错，而且你很难发现。
+
+下一篇，我们用这根数据管道算出你投资成绩单——收益率、波动率、最大回撤、夏普比率。知道自己的持仓到底表现怎么样，是改进的前提。

@@ -1,0 +1,375 @@
+---
+title: "03 用 Python 算清投资成绩单"
+date: "2026-06-28"
+summary: "同样年化 10%，一个回撤 5% 一个回撤 30%——持有体验完全不同。这篇用 pandas 从零实现收益、波动率、最大回撤、夏普、Sortino、Calmar 六大指标，拿真实 ETF 数据横向对比，搞清楚你的持仓到底表现怎么样。"
+tags: ["理财", "量化投资", "Python", "绩效分析"]
+category: "quant-investing"
+cover: ""
+draft: false
+series: "量化投资编程实战"
+seriesOrder: 3
+---
+
+## 光看收益率是不够的
+
+假设你同时持有两只 ETF：
+
+- 纳指100（513100）：近 2 年涨了 43.8%
+- 国债 ETF（511260）：近 2 年涨了 4.5%
+
+谁的「表现」更好？
+
+如果只看收益率，纳指碾压国债。但 2024 年 8 月那波纳指回撤，你账面浮亏超过 20% 的那两周——那段时间你睡得好吗？
+
+再换一组数据。科创50 近 2 年涨了 190%，年化 61%。但它的年化波动率是 37.5%，最大回撤 -19.3%。你能扛得住吗？
+
+收益率告诉你「赚了多少」，但不告诉你「过程中受了多少罪」。而过程中的波动——尤其是回撤的深度和持续时间——直接决定了一件事：**你能不能拿得住。**
+
+一个年化 15% 但最大回撤 -40% 的策略，和一个年化 10% 但最大回撤 -8% 的策略，对大多数人来说后者才是更好的选择——因为前者大概率在回撤中途就被恐慌卖出去了。
+
+这篇讲怎么用 Python 把收益、风险、风险调整后收益全部算清楚。
+
+## 收益率：不只是看总账
+
+先从最基础的开始。拿到一个价格序列，怎么算收益率？
+
+### 累计收益率
+
+最直觉的算法：用最后一天的价格除以第一天的价格，减一。
+
+```python
+import numpy as np
+import pandas as pd
+
+def cumulative_return(prices: pd.Series) -> float:
+    """累计收益率"""
+    return (prices.iloc[-1] / prices.iloc[0] - 1) * 100
+```
+
+纳指100 从 1.355 涨到 2.158，累计收益率 `(2.158 / 1.355 - 1) * 100 = 59.2%`。但这个数字有一个问题——它没告诉你这个收益花了多长时间。59.2% 用 1 年赚到和用 5 年赚到是完全不同的概念。
+
+### 年化收益率
+
+把累计收益率「标准化」到一年的尺度上，方便比较不同时间跨度的投资。
+
+```python
+def annualized_return(prices: pd.Series, trading_days_per_year: int = 240) -> float:
+    """年化收益率
+
+    核心公式：(终值/初值)^(1/年数) - 1
+    年数 = 交易日数 / 每年交易日（A股约240天，美股约252天）
+    """
+    years = len(prices) / trading_days_per_year
+    if years <= 0:
+        return 0.0
+    return ((prices.iloc[-1] / prices.iloc[0]) ** (1 / years) - 1) * 100
+```
+
+纳指100 用 500 个交易日（约 2.08 年）赚了 59.2%，年化收益 = `(1.592)^(1/2.08) - 1 = 25.0%`。
+
+这里用 240 而不是 252 作为每年交易日数——A 股一年大约 240-244 个交易日，用 240 更保守。如果你算的是纯美股，改用 252。
+
+### 滚动收益率
+
+很多时候你不想看从第一天到最后一天的总收益，而是想知道「过去 1 个月/3 个月/1 年的收益是多少」——这就是滚动收益率。
+
+```python
+def rolling_return(prices: pd.Series, window: int) -> pd.Series:
+    """滚动窗口收益率
+
+    Args:
+        window: 窗口大小（交易日），20≈1月，60≈3月，240≈1年
+    """
+    return (prices / prices.shift(window) - 1) * 100
+```
+
+滚动收益率可以告诉你：纳指100 过去一年的收益率在每个时间点是多少。如果当前滚动收益率是 33% 但 3 个月前的滚动收益率是 50%，说明最近 3 个月涨速放缓了。
+
+## 波动率：度量「颠簸程度」
+
+收益率告诉你方向，波动率告诉你路上的颠簸有多严重。
+
+### 日对数收益率
+
+计算波动率之前，需要先把价格序列转换成收益率序列。为什么用对数收益率而不是简单收益率？
+
+因为对数收益率具有可加性——连续多期的对数收益率之和等于总对数收益率。而简单收益率需要连乘，计算不方便。
+
+```python
+def log_returns(prices: pd.Series) -> pd.Series:
+    """日对数收益率序列"""
+    return np.log(prices / prices.shift(1)).dropna()
+```
+
+### 年化波动率
+
+日对数收益率的标准差乘以根号下年交易日数——这就是年化波动率。
+
+```python
+def annualized_volatility(prices: pd.Series, trading_days_per_year: int = 240) -> float:
+    """年化波动率
+
+    日收益率标准差 × √年交易日数
+    """
+    daily_returns = log_returns(prices)
+    daily_std = daily_returns.std()
+    return daily_std * np.sqrt(trading_days_per_year) * 100
+```
+
+用真实数据对比一下（近 2 年，截至 2026-06-26）：
+
+| ETF      | 年化收益 | 年化波动率 | 持有体验           |
+| -------- | -------- | ---------- | ------------------ |
+| 科创50   | +61.2%   | 37.5%      | 大涨大跌，心脏考验 |
+| 纳指100  | +25.0%   | 24.7%      | 涨多跌也不少       |
+| 标普500  | +15.5%   | 20.0%      | 温和上涨           |
+| 沪深300  | +15.8%   | 19.2%      | 和标普差不多       |
+| 红利低波 | -4.0%    | 14.5%      | 波动最小，但在跌   |
+| 国债ETF  | +2.6%    | 2.6%       | 几乎一条直线       |
+
+波动率的直觉：数值越大，日常涨跌越剧烈。国债 2.6% 意味着一年内的涨跌幅度很小（像一条平缓的线），科创50 的 37.5% 意味着一年内经常出现 10% 以上的波动。
+
+## 最大回撤：你最多亏过多少
+
+波动率衡量「日常颠簸」，最大回撤衡量「最极端的噩梦」。
+
+最大回撤的定义：从历史最高点到之后最低点的跌幅。它回答的问题是：**如果你在最倒霉的时候买入（最高点），在最倒霉的时候卖出（最低点），最多亏多少？**
+
+```python
+def max_drawdown(prices: pd.Series) -> tuple:
+    """最大回撤及其起止日期
+
+    算法：逐日追踪历史最高点，计算当前价格相对最高点的跌幅
+
+    Returns:
+        (最大回撤百分比, 回撤起始日, 回撤最低日)
+    """
+    peak = prices.expanding().max()  # 逐日累计最高点
+    drawdown = (prices / peak - 1) * 100  # 当前相对最高点的跌幅
+
+    max_dd = drawdown.min()
+    trough_date = drawdown.idxmin()
+    peak_date = prices.loc[:trough_date].idxmax()
+
+    return max_dd, peak_date, trough_date
+```
+
+核心逻辑是 `prices.expanding().max()`——pandas 的 expanding 操作会逐步计算从起点到当前行的最大值，生成一条「历史最高价」曲线。当前价格除以历史最高价减一，就是每一时点的回撤幅度。取最小值就是最大回撤。
+
+真实数据（近 2 年）：
+
+| ETF      | 最大回撤 | 含义                             |
+| -------- | -------- | -------------------------------- |
+| 标普500  | -24.9%   | 最高点下来最多亏了 1/4           |
+| 纳指100  | -24.0%   | 同样惨烈                         |
+| 科创50   | -19.3%   | 回撤反而小（涨太猛，底部抬高了） |
+| 沪深300  | -16.3%   | A 股相对温和                     |
+| 红利低波 | -15.7%   | 低波本色                         |
+| 国债ETF  | -2.5%    | 债券就是稳                       |
+
+标普500 的最大回撤 -24.9% 意味着：如果你在最高点全仓买入，到最低点时账面只剩 75%。这种回撤对满仓持有的人来说，心理压力是巨大的。
+
+**回撤恢复时间**也是一个重要指标——从最低点回到前高花了多久。有些标的回撤 -20% 但 3 个月就回来了（V 型反转），有些回撤 -20% 但花了一年才回来。前者的持有体验远好于后者。
+
+```python
+def drawdown_recovery_time(prices: pd.Series) -> int:
+    """最大回撤的恢复时间（交易日）
+
+    从回撤最低点到价格恢复到回撤前高点的天数
+    """
+    peak = prices.expanding().max()
+    drawdown = prices / peak - 1
+
+    trough_idx = drawdown.idxmin()
+    peak_val = prices.loc[:trough_idx].max()
+
+    # 从最低点往后找，什么时候价格回到 peak_val
+    after_trough = prices.loc[trough_idx:]
+    recovered = after_trough[after_trough >= peak_val]
+
+    if len(recovered) == 0:
+        return -1  # 还没恢复
+    return len(after_trough.loc[:recovered.index[0]])
+```
+
+## 风险调整后收益：三大比率
+
+到这里你已经有了收益和风险两个维度的指标。但人是贪心的——想要一个数字同时衡量「赚钱能力」和「风险水平」。这就是风险调整后收益指标。
+
+### 夏普比率（Sharpe Ratio）
+
+最经典的风险调整指标。公式：
+
+```
+夏普比率 = (年化收益率 - 无风险利率) / 年化波动率
+```
+
+分子是「超额收益」——你比无风险投资（比如国债/货基）多赚了多少。分母是波动率——你冒了多大风险。两者一除，得到「每承担一单位风险获得了多少超额收益」。
+
+```python
+def sharpe_ratio(prices: pd.Series, risk_free_rate: float = 2.0,
+                 trading_days_per_year: int = 240) -> float:
+    """夏普比率
+
+    Args:
+        risk_free_rate: 无风险年化利率(%)，中国用2%（货基/国债近似）
+    """
+    ann_ret = annualized_return(prices, trading_days_per_year)
+    ann_vol = annualized_volatility(prices, trading_days_per_year)
+
+    if ann_vol == 0:
+        return 0.0
+    return (ann_ret - risk_free_rate) / ann_vol
+```
+
+夏普比率的参考标准：大于 1 算不错，大于 2 算优秀，负数意味着还不如买国债。但不同资产类别的夏普差异很大——低波动资产（债券、红利低波）天然容易获得较高夏普，不代表它比高波动资产更值得持有。
+
+### Sortino 比率
+
+夏普比率的改进版。夏普用总波动率做分母——但上涨的波动是好事（你在赚钱），只有下跌的波动才是坏事。Sortino 只用下行波动做分母：
+
+```python
+def sortino_ratio(prices: pd.Series, risk_free_rate: float = 2.0,
+                  trading_days_per_year: int = 240) -> float:
+    """Sortino 比率——只惩罚下行波动
+
+    区别于夏普：分母只计算负收益率的标准差
+    """
+    daily_returns = log_returns(prices)
+    ann_ret = annualized_return(prices, trading_days_per_year)
+
+    # 只取负收益率
+    downside_returns = daily_returns[daily_returns < 0]
+    if len(downside_returns) == 0:
+        return float('inf')
+
+    downside_std = downside_returns.std()
+    # 下行波动率的年化方式与普通波动率相同
+    ann_downside_vol = downside_std * np.sqrt(trading_days_per_year) * 100
+
+    if ann_downside_vol == 0:
+        return 0.0
+    return (ann_ret - risk_free_rate) / ann_downside_vol
+```
+
+Sortino 的意义：如果你持有的标的涨的时候大涨、跌的时候小跌，Sortino 会明显高于夏普——说明它的下行风险特别低。这对于收益非对称分布的标的（比如期权策略、趋势跟踪策略）比夏普更有区分度。
+
+### Calmar 比率
+
+用最大回撤做分母——直接衡量「你每承受 1% 的最大回撤，换来了多少年化收益」：
+
+```python
+def calmar_ratio(prices: pd.Series) -> float:
+    """Calmar 比率——年化收益 / 最大回撤绝对值"""
+    ann_ret = annualized_return(prices)
+    max_dd, _, _ = max_drawdown(prices)
+
+    if max_dd == 0:
+        return float('inf')
+    return ann_ret / abs(max_dd)
+```
+
+Calmar 的直觉：如果年化 20%、最大回撤 -10%，Calmar = 2.0，意味着你每承受 1% 的最大回撤换来 2% 的年化收益。这个指标对于看重「回撤控制」的投资者特别有用。
+
+## 横向对比：你的持仓到底怎么样
+
+把上面所有指标组装成一个统一的评估函数，横向对比 6 只 ETF：
+
+```python
+def performance_report(prices: pd.Series, name: str = "",
+                       risk_free_rate: float = 2.0) -> dict:
+    """完整的投资绩效报告"""
+    ann_ret = annualized_return(prices)
+    ann_vol = annualized_volatility(prices)
+    max_dd, peak_date, trough_date = max_drawdown(prices)
+    sharpe = sharpe_ratio(prices, risk_free_rate)
+    sortino = sortino_ratio(prices, risk_free_rate)
+    calmar = calmar_ratio(prices)
+
+    return {
+        "name": name,
+        "ann_return": ann_ret,
+        "ann_volatility": ann_vol,
+        "max_drawdown": max_dd,
+        "sharpe": sharpe,
+        "sortino": sortino,
+        "calmar": calmar,
+    }
+```
+
+用真实数据跑一遍（近 2 年，截至 2026-06-26，无风险利率 2%）：
+
+| ETF      | 年化收益 | 波动率 | 最大回撤 | 夏普  | Sortino | Calmar |
+| -------- | -------- | ------ | -------- | ----- | ------- | ------ |
+| 科创50   | +61.2%   | 37.5%  | -19.3%   | 1.58  | 2.74    | 3.18   |
+| 纳指100  | +25.0%   | 24.7%  | -24.0%   | 0.93  | 1.34    | 1.04   |
+| 沪深300  | +15.8%   | 19.2%  | -16.3%   | 0.72  | 1.07    | 0.97   |
+| 标普500  | +15.5%   | 20.0%  | -24.9%   | 0.67  | 0.94    | 0.62   |
+| 国债ETF  | +2.6%    | 2.6%   | -2.5%    | 0.22  | 0.29    | 1.03   |
+| 红利低波 | -4.0%    | 14.5%  | -15.7%   | -0.41 | -0.56   | -0.26  |
+
+数据说话，几个结论：
+
+**科创50 的数据最好看**——年化 61%、Calmar 3.18，但这是近 2 年的特殊行情（AI 热潮 + 科创板改革）。拉长到 5 年，这个数字会回归正常。不要被短期数据骗了——这恰恰是 [看懂行情](/posts/market-reading/13-indicator-failure) 里讲的「过拟合」陷阱。
+
+**纳指的夏普 0.93 看着不如科创50 的 1.58**，但纳指的长期稳定性远高于科创50。夏普是后视镜——它衡量的是过去，不是未来。
+
+**国债的 Calmar 1.03 反而高于纳指的 1.04**（几乎持平）。这说明：如果纯看「收益/回撤」比，近 2 年的国债并不输纳指——只是绝对收益低了太多。这是低波动资产的天然优势。
+
+**红利低波全面为负**——近 2 年价格在跌（前复权数据，没算分红）。但加上约 5% 的年股息率，实际全收益大约持平。这里提醒一下：第 02 篇讲过前复权数据会低估分红型 ETF 的实际回报，算绩效时需要手动加上股息率。
+
+## 指标的局限
+
+这些指标是工具，不是结论。几个常见误区：
+
+**夏普高不等于好**。一个年化 5%、波动率 2% 的债券组合，夏普是 1.5。一个年化 30%、波动率 20% 的成长股组合，夏普是 1.4。夏普说债券组合「更好」，但如果你投资期限够长、能承受波动，后者的绝对收益远超前者。夏普衡量的是效率，不是绝对回报。
+
+**最大回撤是历史的**。近 2 年最大回撤 -20% 不代表未来最大也是 -20%。极端事件（如 2008 金融危机、2020 疫情）可能导致远超历史水平的回撤。
+
+**Calmar 受时间窗口影响极大**。在牛市里随便挑一段，Calmar 都很好看；在熊市里，Calmar 全是负数。不要用一个时间窗口的 Calmar 去预测另一个时间窗口的表现。
+
+正确的用法是：把这些指标放在一起看，横向对比同类标的，纵向对比不同时间段。没有任何单一指标能告诉你「该买还是该卖」——它们只是帮你更全面地理解自己的持仓。
+
+## 封装成类
+
+把所有绩效指标封装成一个可复用的类：
+
+```python
+class PerformanceMetrics:
+    """投资绩效分析工具包
+
+    用法:
+        metrics = PerformanceMetrics(prices)
+        report = metrics.summary()
+        print(metrics.format_report())
+    """
+
+    def __init__(self, prices: pd.Series,
+                 risk_free_rate: float = 2.0,
+                 trading_days_per_year: int = 240):
+        self.prices = prices.dropna()
+        self.rf = risk_free_rate
+        self.tdp = trading_days_per_year
+
+    def summary(self) -> dict:
+        """返回所有指标的字典"""
+        return {
+            "date_range": f"{self.prices.index[0].date()} → {self.prices.index[-1].date()}",
+            "trading_days": len(self.prices),
+            "total_return": cumulative_return(self.prices),
+            "ann_return": annualized_return(self.prices, self.tdp),
+            "ann_volatility": annualized_volatility(self.prices, self.tdp),
+            "max_drawdown": max_drawdown(self.prices)[0],
+            "sharpe": sharpe_ratio(self.prices, self.rf, self.tdp),
+            "sortino": sortino_ratio(self.prices, self.rf, self.tdp),
+            "calmar": calmar_ratio(self.prices),
+        }
+```
+
+这个类在第 06 篇的回测引擎里会被复用来评估策略表现，在第 08 篇的自动化报告里会被用来生成每周的绩效快照。
+
+## 这篇的产物
+
+一组独立的绩效分析函数 + 一个 `PerformanceMetrics` 类。它们不依赖外部量化库，纯粹基于 pandas + numpy，每一行逻辑都是透明的。
+
+下一篇，我们往上走一层——用数据管道（第 02 篇）拉来的价格数据，计算出估值因子信号，让代码自动告诉你「这个 ETF 现在是贵了还是便宜了」。

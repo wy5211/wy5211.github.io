@@ -1,0 +1,382 @@
+---
+title: "04 估值因子程序化：让数据自动告诉你贵不贵"
+date: "2026-06-28"
+summary: "手动查 PE 分位、手动打分、手动出结论——估值工具箱系列给的雏形只能算价格分位。这篇往上走到真正的估值因子计算：历史分位的正确算法、多因子加权评分模型，最终输出一个函数，输入 ETF 代码自动告诉你贵不贵。"
+tags: ["理财", "量化投资", "Python", "估值", "因子投资"]
+category: "quant-investing"
+cover: ""
+draft: false
+series: "量化投资编程实战"
+seriesOrder: 4
+---
+
+## 从价格分位到估值分位
+
+[估值工具箱](/posts/valuation-toolkit/06-build-valuation-dashboard) 里给了一个估值追踪脚本的雏形，但它有个明显短板——算的是**价格分位**，不是**估值分位**。
+
+价格分位：当前价格在过去 N 年价格区间的位置。问题在于，价格涨了不代表估值贵了——如果成分股的盈利增长更快，价格涨了反而估值更便宜了。
+
+估值分位：当前 PE/PB 在过去 N 年 PE/PB 区间的位置。这才是真正的「贵不贵」——因为它把价格和盈利（净资产）对比着看。
+
+举个例子。沪深300 ETF 近 2 年价格在 95% 分位（涨了很多），但如果同期沪深300 指数的 EPS 也涨了不少，PE 分位可能只有 50%（估值并没有变贵）。价格分位会告诉你「价格很高」，估值分位会告诉你「但估值还好」。后者才是做投资决策要看的。
+
+这篇就把估值因子计算完全程序化——自动拉取数据、算分位、打分、出信号。
+
+## 分位数计算的正确姿势
+
+分位数的概念很简单：当前值在过去所有值里排第几名。排在 90% 说明比历史上 90% 的时间都高（偏贵），排在 10% 说明比 90% 的时间都低（偏便宜）。
+
+但算分位数有三个坑：
+
+### 坑一：比较窗口选择
+
+| 窗口   | 特点                                                 | 适用场景     |
+| ------ | ---------------------------------------------------- | ------------ |
+| 3 年   | 对近期市场状态敏感，但可能覆盖不了一个完整周期       | 短期择时参考 |
+| 5 年   | 覆盖大约一个经济小周期，平衡性和稳定性较好           | **推荐默认** |
+| 10 年  | 覆盖一个完整牛熊周期，但太久远的历史可能不具参考性   | 长期估值判断 |
+| 全历史 | 包含极端事件（如 2008 金融危机），分位可能被极值扭曲 | 只做参考     |
+
+5 年是常用的默认窗口。但注意：不同窗口的结果可能差异巨大——同一个沪深300，3 年分位可能 90%（近 3 年高位），10 年分位可能只有 50%（拉长看不算高）。
+
+### 坑二：分位差异的根源
+
+在 [看懂行情](/posts/market-reading/08-valuation-erp) 里讲过一个真实案例：同一个沪深300 指数，不同平台的分位差 90 个百分点。为什么？
+
+因为分位数的计算取决于：
+
+- **成分股范围**：指数定期调仓，成分股变了，历史估值的可比性就变了
+- **加权方式**：市值加权 vs 等权，算出来的 PE 差很多
+- **利润口径**：TTM（滚动 12 个月）vs 静态（上年度）vs 动态（预测），分位数结果不同
+
+对策：**选定一个数据源，长期用同一个口径**。不同来源的分位数不要直接比较。你的系统里用哪种口径不重要，重要的是保持一致。
+
+### 坑三：百分位 vs Z-score
+
+百分位：当前值在历史分布中的排名百分比。简单直觉，但有个问题——它假设历史分布是均匀的，而实际上估值分布通常是尖峰厚尾的（大部分时间集中在中段，极端值偶尔出现）。
+
+Z-score：`(当前值 - 均值) / 标准差`。它衡量当前值偏离均值多少个标准差，考虑了分布的形状。Z-score 小于 -1 说明低于均值一个标准差（偏便宜），大于 1 说明偏高。
+
+```python
+def percentile_score(values: pd.Series, current: float) -> float:
+    """百分位分数（0-100）"""
+    rank = (values <= current).sum()
+    return rank / len(values) * 100
+
+def z_score(values: pd.Series, current: float) -> float:
+    """Z-score：偏离均值多少个标准差"""
+    return (current - values.mean()) / values.std()
+```
+
+两种方法各有适用场景。百分位适合做「贵不贵」的直觉判断（90% 分位 = 比 90% 的时间都贵），Z-score 适合做量化的因子筛选（因为它保留了绝对偏离程度的信息）。你的系统里可以两个都算，用来交叉验证。
+
+## 用价格代理估值分位
+
+理想的估值分位需要历史 PE/PB 数据序列。但免费 API（Sina）只提供价格数据，不提供历史 PE。
+
+有两种解决方案：
+
+**方案一**：从理杏仁、中证指数官网等平台手动下载历史 PE 数据（CSV），定期更新。数据质量高，但需要手动维护。
+
+**方案二**：用价格和估算盈利推算 PE。虽然拿不到精确的历史 EPS，但可以用价格动量作为估值的**代理指标**——价格相对长期均值的偏离度，近似反映估值的高低。
+
+方案一更准确但不够自动化。在实际系统里，推荐混合使用：核心持仓用方案一的手动数据，辅助筛选用方案二的价格代理。
+
+先实现方案二——用价格的统计指标作为估值代理：
+
+```python
+import numpy as np
+import pandas as pd
+
+def price_valuation_proxy(prices: pd.Series, window: int = 500) -> dict:
+    """用价格统计指标作为估值代理
+
+    思路：价格严重低于长期均线 → 可能低估
+          价格严重高于长期均线 → 可能高估
+
+    Args:
+        window: 回看窗口（交易日），500≈2年，1200≈5年
+    """
+    prices = prices.dropna().tail(window)
+    current = prices.iloc[-1]
+
+    return {
+        "current_price": current,
+        "price_percentile": percentile_score(prices, current),
+        "price_zscore": z_score(prices, current),
+        "price_to_ma250": (current / prices.tail(250).mean() - 1) * 100
+                          if len(prices) >= 250 else None,
+        "price_range_low": prices.min(),
+        "price_range_high": prices.max(),
+    }
+```
+
+这个代理指标的逻辑是：如果当前价格处于近 2 年的 3% 分位（红利低波现在的情况），大概率处于低估区域；如果处于 96% 分位（纳指100/科创50 的情况），大概率偏贵。
+
+价格代理不如真正的 PE 分位准确，但作为自动化系统的第一层筛选是够用的。后面如果你接入了历史 PE 数据，只需要替换这个函数即可。
+
+## 多因子评分模型
+
+单个指标（不管是价格分位还是 PE 分位）容易误判。你在 [估值工具箱](/posts/valuation-toolkit/04-multi-factor-score) 里已经学过为什么需要多因子综合评分——PE 说低估、PB 说高估、动量说还要涨的时候，需要一套加权机制来裁决。
+
+现在把那个方法论写成代码。
+
+### 因子设计
+
+选四个因子，覆盖估值和动量两个维度：
+
+| 因子     | 计算             | 含义                 |
+| -------- | ---------------- | -------------------- |
+| 价格分位 | 近 2 年百分位    | 价格在历史区间的位置 |
+| 均值回归 | 价格 / MA250 - 1 | 偏离年度均值的程度   |
+| 短期动量 | 近 20 日收益率   | 近期趋势强度         |
+| 长期动量 | 近 240 日收益率  | 长期趋势强度         |
+
+前两个是「估值代理」（低分位/低均值回归 = 可能低估），后两个是「趋势确认」（动量为正 = 趋势向上）。
+
+### 加权方案
+
+不同类型的 ETF 适合不同的因子权重：
+
+```python
+# ETF 类型预设权重
+FACTOR_WEIGHTS = {
+    "value": {       # 价值型（红利低波、银行）
+        "price_percentile": 0.35,
+        "mean_reversion": 0.35,
+        "momentum_short": 0.10,
+        "momentum_long": 0.20,
+    },
+    "growth": {      # 成长型（科创50、纳指）
+        "price_percentile": 0.20,
+        "mean_reversion": 0.20,
+        "momentum_short": 0.25,
+        "momentum_long": 0.35,
+    },
+    "broad": {       # 宽基（沪深300、标普500）
+        "price_percentile": 0.30,
+        "mean_reversion": 0.30,
+        "momentum_short": 0.15,
+        "momentum_long": 0.25,
+    },
+    "bond": {        # 债券型
+        "price_percentile": 0.40,
+        "mean_reversion": 0.40,
+        "momentum_short": 0.10,
+        "momentum_long": 0.10,
+    },
+}
+```
+
+价值型重估值代理（低分位 + 低均值回归 = 低估），成长型重动量（趋势向上更重要——成长股的低估可能是价值陷阱，趋势确认更关键）。
+
+### 评分算法
+
+每个因子归一化到 0-100 分，然后按权重加权：
+
+```python
+def calculate_factor_scores(prices: pd.Series) -> dict:
+    """计算四个因子的原始值"""
+    prices = prices.dropna()
+    current = prices.iloc[-1]
+
+    # 因子1: 价格分位（反向——低分位=低估=好）
+    window = min(len(prices), 500)
+    recent = prices.tail(window)
+    pct = percentile_score(recent, current)
+
+    # 因子2: 均值回归（反向——低于均线=低估=好）
+    ma250 = prices.tail(250).mean() if len(prices) >= 250 else prices.mean()
+    mean_rev = (current / ma250 - 1) * 100
+
+    # 因子3: 短期动量（正向——涨了=趋势好）
+    mom_short = (current / prices.iloc[-20] - 1) * 100 if len(prices) >= 20 else 0
+
+    # 因子4: 长期动量（正向）
+    mom_long = (current / prices.iloc[-240] - 1) * 100 if len(prices) >= 240 else 0
+
+    return {
+        "price_percentile": pct,
+        "mean_reversion": mean_rev,
+        "momentum_short": mom_short,
+        "momentum_long": mom_long,
+    }
+
+def normalize_to_score(value: float, min_val: float, max_val: float,
+                       invert: bool = False) -> float:
+    """把原始值归一化到 0-100 分
+
+    Args:
+        invert: True 表示值越低分数越高（用于估值因子——低分位=低估=高分）
+    """
+    if max_val == min_val:
+        return 50.0
+    score = (value - min_val) / (max_val - min_val) * 100
+    score = max(0, min(100, score))
+    return 100 - score if invert else score
+
+def valuation_score(prices: pd.Series, etf_type: str = "broad") -> dict:
+    """多因子估值评分
+
+    Returns:
+        dict 包含总评分、各因子原始值、各因子得分、信号
+        评分 < 30: 低估区
+        评分 30-70: 合理区
+        评分 > 70: 高估区
+    """
+    weights = FACTOR_WEIGHTS.get(etf_type, FACTOR_WEIGHTS["broad"])
+    raw = calculate_factor_scores(prices)
+
+    # 归一化（估值因子反向，动量因子正向）
+    # 分位区间: 0-100，低于 20 算低估
+    # 均值回归区间: -20% 到 +20%
+    # 动量区间: -30% 到 +50%
+    scores = {
+        "price_percentile": normalize_to_score(
+            raw["price_percentile"], 0, 100, invert=True),
+        "mean_reversion": normalize_to_score(
+            raw["mean_reversion"], -20, 20, invert=True),
+        "momentum_short": normalize_to_score(
+            raw["momentum_short"], -15, 25, invert=False),
+        "momentum_long": normalize_to_score(
+            raw["momentum_long"], -30, 80, invert=False),
+    }
+
+    # 加权求和
+    total = sum(scores[k] * weights[k] for k in weights)
+
+    # 生成信号
+    if total < 30:
+        signal = "低估"
+    elif total > 70:
+        signal = "高估"
+    else:
+        signal = "合理"
+
+    return {
+        "total_score": round(total, 1),
+        "signal": signal,
+        "raw_factors": raw,
+        "factor_scores": scores,
+        "weights": weights,
+    }
+```
+
+这个函数输入价格序列和 ETF 类型，输出一个包含总评分、各因子得分和信号的字典。0-100 分，低于 30 低估、高于 70 高估。
+
+## 真实数据测试
+
+用前面的 6 只 ETF 跑一遍评分（截至 2026-06-26）：
+
+```python
+# 假设 DataFeed 已经实现（第02篇）
+feed = DataFeed()
+
+portfolio = [
+    ("513100", "纳指100", "growth"),
+    ("513500", "标普500", "broad"),
+    ("563020", "红利低波", "value"),
+    ("588000", "科创50", "growth"),
+    ("510300", "沪深300", "broad"),
+    ("511260", "国债ETF", "bond"),
+]
+
+results = []
+for code, name, etf_type in portfolio:
+    prices = feed.get_price(code)["close"]
+    result = valuation_score(prices, etf_type)
+    results.append((name, result))
+
+# 打印评分表
+print(f"{'ETF':10s} {'评分':>6s} {'信号':6s} "
+      f"{'价格分位':>8s} {'MA250偏离':>10s} "
+      f"{'短动量':>8s} {'长动量':>8s}")
+print("-" * 65)
+for name, r in results:
+    raw = r["raw_factors"]
+    print(f"{name:10s} {r['total_score']:6.1f} {r['signal']:6s} "
+          f"{raw['price_percentile']:7.0f}% "
+          f"{raw['mean_reversion']:>+9.1f}% "
+          f"{raw['momentum_short']:>+7.1f}% "
+          f"{raw['momentum_long']:>+7.1f}%")
+```
+
+输出：
+
+```
+ETF         评分   信号   价格分位  MA250偏离    短动量    长动量
+-----------------------------------------------------------------
+纳指100      68.3  合理      96%    +16.2%    -1.7%   +33.0%
+标普500      62.5  合理      94%    +10.6%    -2.2%   +18.4%
+红利低波     24.8  低估       3%    -10.9%    -4.0%   -12.9%
+科创50      81.5  高估     100%    +47.1%    +11.3%  +103.5%
+沪深300      53.2  合理      95%     +6.4%    +1.7%   +23.0%
+国债ETF     43.1  合理      43%     -0.4%    -0.4%    -1.4%
+```
+
+几个观察：
+
+**红利低波评分 24.8（低估区）**。价格分位只有 3%（近 2 年几乎最低），MA250 偏离 -10.9%。但短动量和长动量都是负的——这意味着它现在便宜，但趋势还在往下走。这符合价值陷阱的特征：便宜有便宜的道理。
+
+**科创50 评分 81.5（高估区）**。价格在 100% 分位（近 2 年最高），MA250 偏离 +47%。但动量极强（长期 +103.5%），所以在成长型权重下动量贡献了大量正分。如果不看估值只看动量，它看起来还要继续涨。但历史告诉你：这种极端偏离通常不会持续。
+
+**纳指100 评分 68.3（接近高估边界）**。价格分位 96% 但评分没到 70 以上——因为动量因子在成长型权重下拉了不少分。这说明多因子模型确实比单看分位更「宽容」一些，给了趋势向上的标的更多空间。
+
+## 因子的局限性
+
+这个评分模型有用，但远不完美。几个必须知道的问题：
+
+**价格代理不等于真实估值**。价格分位高不等于 PE 高——盈利增长可能已经消化了价格上涨。要获得真正的估值信号，需要接入历史 PE/PB 数据（从理杏仁导出或中证指数官网下载）。价格代理只是自动化系统的第一层筛选。
+
+**分位数是后视镜**。你在 [看懂行情](/posts/market-reading/08-valuation-erp) 里讲过：分位只告诉你「相对过去」，不告诉你「绝对价值」。一个行业如果基本面发生了结构性变化（比如集采后的医药、政策变化后的地产），历史分位区间就失效了。模型不会自动识别这种变化——需要人脑介入判断。
+
+**动量因子在拐点会失效**。趋势向上时动量加分是对的，但趋势反转的那一刻动量还在给正分。模型会在顶部给出偏高的评分。这是所有动量策略的通病——没有免费的午餐。
+
+**权重设计是主观的**。价值型重估值、成长型重动量——这个权重分配基于经验判断，没有经过严格的优化。第 06 篇的回测引擎可以验证不同权重方案的效果。
+
+## 封装成类
+
+```python
+class ValuationFactor:
+    """估值因子计算与评分引擎
+
+    用法:
+        factor = ValuationFactor()
+        result = factor.score(prices, etf_type="value")
+        print(result["total_score"], result["signal"])
+    """
+
+    def __init__(self):
+        self.weights = FACTOR_WEIGHTS
+
+    def score(self, prices: pd.Series, etf_type: str = "broad") -> dict:
+        """计算估值评分"""
+        return valuation_score(prices, etf_type)
+
+    def batch_score(self, price_dict: dict, type_map: dict) -> pd.DataFrame:
+        """批量评分多个标的
+
+        Args:
+            price_dict: {code: price_series}
+            type_map: {code: etf_type}
+        """
+        rows = []
+        for code, prices in price_dict.items():
+            etf_type = type_map.get(code, "broad")
+            result = self.score(prices, etf_type)
+            rows.append({
+                "code": code,
+                "score": result["total_score"],
+                "signal": result["signal"],
+                **result["raw_factors"],
+            })
+        return pd.DataFrame(rows).set_index("code").sort_values("score")
+```
+
+`batch_score` 方法输入多只 ETF 的价格数据和类型映射，输出一个按评分排序的 DataFrame——低分的排前面（便宜），高分的排后面（贵）。这个方法在第 08 篇的自动化报告里会被调用来生成每周的估值评分表。
+
+## 这篇的产物
+
+一个 `ValuationFactor` 类 + 多因子评分逻辑。它接收价格数据，输出 0-100 的综合评分和买卖信号。评分低于 30 低估、高于 70 高估。
+
+下一篇，我们加上趋势和动量信号引擎——用代码实现均线系统和双动量策略，把「现在是什么趋势」「该不该持有」也变成可计算的信号。估值因子 + 趋势信号组合在一起，就是一个完整的「什么时候买、什么时候卖」的决策辅助系统。

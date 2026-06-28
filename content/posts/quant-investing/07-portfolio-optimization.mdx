@@ -1,0 +1,413 @@
+---
+title: "07 组合优化：用算法管理你的配置"
+date: "2026-06-28"
+summary: "等权配置不是最优的——波动率不同的资产等权，风险全集中在高波动的那几只上。这篇用 Python 实现风险平价（让风险等权而非资金等权）和核心-卫星再平衡算法，把资产配置系列的理念变成代码。真实数据：等权组合科创50占了37.5%的风险，而风险平价把它压到了16.3%。"
+tags: ["理财", "量化投资", "Python", "资产配置", "风险平价"]
+category: "quant-investing"
+cover: ""
+draft: false
+series: "量化投资编程实战"
+seriesOrder: 7
+---
+
+## 你的组合可能不是你以为的那样
+
+你有 8 只 ETF，按「40% 美股 + 40% 红利 + 20% 债券」配置。听起来很均衡——进攻和防守各占四成，债券做安全垫。
+
+但如果你看一眼**风险分布**，可能大吃一惊。
+
+用真实数据算一下（近 1 年，截至 2026-06-26）。6 只 ETF 等权配置（各占 16.7%），每只 ETF 对组合总风险的贡献：
+
+| ETF      | 资金占比 | 风险占比  | 结论                      |
+| -------- | -------- | --------- | ------------------------- |
+| 科创50   | 16.7%    | **37.5%** | 吃掉了组合 1/3 以上的风险 |
+| 纳指100  | 16.7%    | 24.2%     |                           |
+| 沪深300  | 16.7%    | 18.9%     |                           |
+| 标普500  | 16.7%    | 17.2%     |                           |
+| 红利低波 | 16.7%    | 2.5%      | 几乎不贡献风险            |
+| 国债ETF  | 16.7%    | -0.3%     | 对冲了组合风险            |
+
+你以为是均衡配置，实际上科创50一个标的就占了 37.5% 的风险。如果科创50暴跌，你的整个组合跟着大幅回撤——即使你的资金里只有 1/6 配在科创50上。
+
+[资产配置](/posts/asset-allocation/05-risk-budget) 系列讲过这个道理——不是让资金等权，而是让**风险**等权。当时讲的是理念，这篇用代码实现。
+
+## 波动率反比加权
+
+最简单的风险平价方法：用波动率的反比作为权重。波动率高的少配，波动率低的多配。
+
+先看 6 只 ETF 近 1 年的年化波动率：
+
+| ETF      | 年化波动率 |
+| -------- | ---------- |
+| 科创50   | 34.8%      |
+| 纳指100  | 22.1%      |
+| 标普500  | 16.0%      |
+| 沪深300  | 15.9%      |
+| 红利低波 | 10.7%      |
+| 国债ETF  | 2.3%       |
+
+科创50 的波动率是国债的 15 倍。如果你等权配置，科创50 对组合风险的贡献远大于国债。波动率反比加权的思路是：给波动率高的少分配资金，波动率低的多分配，让每只 ETF 对组合风险的贡献大致相等。
+
+```python
+import numpy as np
+import pandas as pd
+
+def inverse_volatility_weights(returns: pd.DataFrame,
+                                trading_days: int = 240) -> pd.Series:
+    """波动率反比加权（简单风险平价）
+
+    权重 ∝ 1 / 年化波动率
+
+    Args:
+        returns: 日收益率 DataFrame，每列一个标的
+    """
+    ann_vol = returns.std() * np.sqrt(trading_days)
+    inv_vol = 1 / ann_vol
+    weights = inv_vol / inv_vol.sum()
+    return weights * 100  # 返回百分比
+```
+
+等权 vs 波动率反比加权的对比：
+
+| ETF      | 等权  | 波动率反比 |
+| -------- | ----- | ---------- |
+| 国债ETF  | 16.7% | **59.9%**  |
+| 红利低波 | 16.7% | 12.8%      |
+| 标普500  | 16.7% | 8.6%       |
+| 沪深300  | 16.7% | 8.6%       |
+| 纳指100  | 16.7% | 6.2%       |
+| 科创50   | 16.7% | **3.9%**   |
+
+国债占了 60%，科创50 只占 3.9%。看起来极端，但逻辑是对的——国债波动率只有 2.3%，需要大量配置才能让它的风险贡献和科创50 匹配。
+
+这个方法有一个明显的问题：60% 配国债，组合收益会非常低。真实数据验证：等权组合近 1 年收益 +21.6%，波动率反比组合只有 +5.2%。风险确实降低了（最大回撤从 -10.0% 降到 -4.5%），但收益牺牲太大。
+
+实际使用中，纯风险平价太保守。更实用的做法是**对权益子组合做风险平价**，然后整体上控制权益 vs 债券的比例。下面会讲到。
+
+## 用协方差矩阵优化
+
+波动率反比只考虑了单个标的的波动率，没考虑标的之间的相关性。如果两个标的高度相关（比如纳指100 和标普500，相关性 0.88），同时持有它们的分散效果很差——等于变相加仓了同一个东西。
+
+完整的风险平价需要用**协方差矩阵**来计算：
+
+```python
+def risk_parity_weights(returns: pd.DataFrame,
+                        trading_days: int = 240,
+                        max_iter: int = 1000,
+                        tol: float = 1e-6) -> pd.Series:
+    """基于协方差矩阵的风险平价权重（迭代优化）
+
+    目标：让每个标的对组合总风险的贡献相等
+
+    算法：不断调整权重，直到每个标的的边际风险贡献相等
+    """
+    cov = returns.cov().values * trading_days  # 年化协方差矩阵
+    n = len(cov)
+
+    # 初始权重：波动率反比
+    vols = np.sqrt(np.diag(cov))
+    weights = (1 / vols) / np.sum(1 / vols)
+
+    for _ in range(max_iter):
+        # 组合总方差
+        portfolio_var = weights @ cov @ weights
+
+        # 每个标的的边际风险贡献
+        marginal_contrib = cov @ weights
+        risk_contrib = weights * marginal_contrib / portfolio_var
+
+        # 目标：所有标的的风险贡献相等 = 1/n
+        target = 1.0 / n
+
+        # 调整权重：风险贡献偏大的减权，偏小的加权
+        adjustment = target / risk_contrib
+        weights = weights * adjustment
+        weights = weights / weights.sum()  # 归一化
+
+        # 检查收敛
+        if np.max(np.abs(risk_contrib - target)) < tol:
+            break
+
+    return pd.Series(weights * 100, index=returns.columns)
+```
+
+迭代优化的逻辑：每一轮检查每个标的的实际风险贡献和目标（1/n）的偏差，偏差大的就调整权重。反复迭代直到收敛。
+
+6 只 ETF 的相关性矩阵（近 1 年）：
+
+```
+          纳指100  标普500  红利低波  科创50  沪深300  国债ETF
+纳指100    1.00    0.88    0.12    0.35    0.52   -0.06
+标普500    0.88    1.00    0.18    0.33    0.51   -0.02
+红利低波    0.12    0.18    1.00   -0.21    0.19    0.05
+科创50     0.35    0.33   -0.21    1.00    0.74   -0.16
+沪深300     0.52    0.51    0.19    0.74    1.00   -0.15
+国债ETF   -0.06   -0.02    0.05   -0.16   -0.15    1.00
+```
+
+几个关键发现：
+
+- **纳指100 和标普500 相关性 0.88**——极高。同时持有等于变相加仓美股，分散效果很差。你在 [资产配置](/posts/asset-allocation/03-correlation-trap) 里讲过相关性陷阱，这就是典型案例
+- **科创50 和沪深300 相关性 0.74**——也偏高。A 股内部的相关性比跨市场高
+- **国债和所有权益资产负相关或接近零相关**——这就是债券的配置价值：它在你亏钱的时候大概率不亏甚至小赚
+- **红利低波和科创50 相关性 -0.21**——负相关。这两只一起持有，天然互相对冲
+
+## 核心-卫星策略的代码化
+
+[资产配置](/posts/asset-allocation/02-core-satellite) 系列讲过核心-卫星策略：用低波动的核心仓位打底，高弹性的卫星仓位进攻。现在用代码实现。
+
+核心思路：先把资产分成「核心」和「卫星」，分别给不同的总权重，然后在各自组内做风险平价。
+
+```python
+def core_satellite_weights(returns: pd.DataFrame,
+                           core_assets: list,
+                           satellite_assets: list,
+                           core_ratio: float = 0.6,
+                           trading_days: int = 240) -> pd.Series:
+    """核心-卫星配置
+
+    Args:
+        core_assets: 核心仓位标的列表（低波动底仓）
+        satellite_assets: 卫星仓位标的列表（高弹性进攻）
+        core_ratio: 核心仓位占总资金的比例
+    """
+    sat_ratio = 1 - core_ratio
+
+    # 在核心组和卫星组内分别做风险平价
+    core_returns = returns[core_assets]
+    sat_returns = returns[satellite_assets]
+
+    core_w = risk_parity_weights(core_returns, trading_days) / 100
+    sat_w = risk_parity_weights(sat_returns, trading_days) / 100
+
+    # 缩放到目标比例
+    core_w = core_w * core_ratio * 100
+    sat_w = sat_w * sat_ratio * 100
+
+    return pd.concat([core_w, sat_w])
+```
+
+用你的组合演示——核心是红利低波 + 国债（低波动防守），卫星是纳指100 + 科创50（高弹性进攻），核心占 60%、卫星占 40%：
+
+```python
+feed = DataFeed()
+returns_dict = {}
+for code in ["563020", "511260", "513100", "588000"]:
+    prices = feed.get_price(code)["close"]
+    returns_dict[code] = np.log(prices / prices.shift(1))
+
+returns = pd.DataFrame(returns_dict).dropna()
+
+weights = core_satellite_weights(
+    returns,
+    core_assets=["563020", "511260"],     # 红利低波 + 国债
+    satellite_assets=["513100", "588000"], # 纳指 + 科创50
+    core_ratio=0.6,
+)
+```
+
+输出（概念性）：
+
+```
+核心组 (60%):
+  红利低波  → 约 30-35%  (波动率更高，风险平价下权重稍低)
+  国债ETF  → 约 25-30%  (波动率极低，需要更多资金配平风险)
+
+卫星组 (40%):
+  纳指100  → 约 20-25%  (波动率较低，权重稍高)
+  科创50   → 约 15-20%  (波动率极高，权重压缩)
+```
+
+核心-卫星比纯风险平价实用得多——它先用人工判断确定「攻守比例」（60:40），然后在各组内用算法分配具体权重。既保留了人的战略性判断，又用了代码做战术性的权重优化。
+
+## 再平衡的触发规则
+
+配置好初始权重后，随着价格变化，实际权重会偏离目标。比如你初始配了 40% 科创50，它涨了 100% 后变成了 60%——你的组合变得比计划激进得多。
+
+再平衡就是把偏了的权重拉回目标。三种触发方式：
+
+```python
+class Rebalancer:
+    """组合再平衡管理器"""
+
+    def __init__(self, target_weights: dict):
+        """
+        Args:
+            target_weights: {code: 目标权重}，如 {"513100": 0.25, "563020": 0.35}
+        """
+        self.target = target_weights
+
+    def check_drift(self, current_weights: dict) -> pd.DataFrame:
+        """检查权重偏离度"""
+        rows = []
+        for code, target_w in self.target.items():
+            actual_w = current_weights.get(code, 0)
+            drift = (actual_w - target_w) * 100  # 百分点
+            drift_pct = (actual_w / target_w - 1) * 100 if target_w > 0 else 0
+            rows.append({
+                "code": code,
+                "target": target_w * 100,
+                "actual": actual_w * 100,
+                "drift_pp": drift,
+                "drift_pct": drift_pct,
+            })
+        return pd.DataFrame(rows).set_index("code")
+
+    def calendar_trigger(self, last_rebalance_date,
+                         frequency: str = "quarterly") -> bool:
+        """日历触发：固定周期再平衡"""
+        # 简化版：检查距离上次再平衡是否过了一个季度/半年
+        from datetime import datetime, timedelta
+        intervals = {
+            "monthly": 30,
+            "quarterly": 90,
+            "semiannual": 180,
+            "annual": 365,
+        }
+        days = intervals.get(frequency, 90)
+        return (datetime.now() - last_rebalance_date).days >= days
+
+    def threshold_trigger(self, current_weights: dict,
+                          threshold: float = 0.05) -> bool:
+        """阈值触发：任一资产偏离目标超过阈值时再平衡
+
+        Args:
+            threshold: 偏离阈值，默认 5%（0.05 = 5个百分点）
+        """
+        for code, target_w in self.target.items():
+            actual_w = current_weights.get(code, 0)
+            if abs(actual_w - target_w) > threshold:
+                return True
+        return False
+
+    def signal_trigger(self, current_weights: dict,
+                       valuation_scores: dict,
+                       low_threshold: float = 30,
+                       high_threshold: float = 70) -> dict:
+        """信号触发：结合估值信号动态调整
+
+        低估的标的可以超配，高估的标的低配
+
+        Returns:
+            调整后的目标权重
+        """
+        adjusted = {}
+        for code, target_w in self.target.items():
+            score = valuation_scores.get(code, 50)
+
+            if score < low_threshold:
+                # 低估区：超配 10-20%
+                multiplier = 1.2
+            elif score > high_threshold:
+                # 高估区：低配 20-30%
+                multiplier = 0.7
+            else:
+                multiplier = 1.0
+
+            adjusted[code] = target_w * multiplier
+
+        # 归一化
+        total = sum(adjusted.values())
+        return {k: v / total for k, v in adjusted.items()}
+```
+
+三种触发方式各有特点：
+
+**日历再平衡**（每季度/每半年）：最简单，不看市场。缺点是可能在不需要的时候频繁交易（浪费成本），或者在需要的时候反应太慢。
+
+**阈值再平衡**（偏离超 5% 时触发）：更灵活——只在权重偏离足够大时才操作。这是大多数个人投资者的最佳选择。5% 是常用阈值——太小会频繁交易（成本高），太大会让组合风险偏离目标太久。
+
+**信号再平衡**（结合估值）：最智能，但也最复杂——它在再平衡的同时加入了估值判断。低估的标的超配一点，高估的低配一点。这已经不是纯被动的再平衡了，而是半主动的仓位管理。
+
+用你的组合看一个实际例子。假设初始配置是：
+
+```
+纳指100:  25%   红利低波: 30%
+科创50:   15%   国债ETF:  30%
+```
+
+近 1 年后（科创50 涨了 103%，红利低波跌了 13%），实际权重变成了：
+
+| ETF      | 目标 | 实际    | 偏离            |
+| -------- | ---- | ------- | --------------- |
+| 科创50   | 15%  | **32%** | +17% ← 严重超配 |
+| 纳指100  | 25%  | 28%     | +3%             |
+| 红利低波 | 30%  | 18%     | -12% ← 严重低配 |
+| 国债ETF  | 30%  | 22%     | -8%             |
+
+科创板从 15% 涨到了 32%——组合的实际风险水平远超目标。这时候触发再平衡：卖出科创50 的一部分，买入红利低波和国债，把权重拉回目标。
+
+## 再平衡的成本-收益
+
+再平衡不是免费的——每次调仓都有交易成本（佣金 + 滑点约 0.3%）。太频繁再平衡，成本会吃掉分散化带来的收益。
+
+等权组合近 1 年的数据（6 只 ETF）：
+
+| 策略                 | 总收益 | 说明                        |
+| -------------------- | ------ | --------------------------- |
+| 买入持有（不再平衡） | +25.8% | 涨的涨、跌的跌，自然漂移    |
+| 季度再平衡           | +24.2% | 每季度拉回等权，扣 4 次成本 |
+
+这个例子里再平衡反而略低——因为过去一年是单边牛市（科创50 暴涨），再平衡相当于不断卖出涨得最好的、买入涨得慢的，在趋势市中拖累了收益。但在震荡市或下跌市，再平衡的价值就体现出来了——它强制你「低买高卖」，而不是追涨杀跌。
+
+所以再平衡的核心价值不是提高收益，而是**控制风险**——确保你的组合风险水平不会因为某些标的的大涨大跌而偏离你的承受能力。
+
+## 封装成类
+
+```python
+class PortfolioOptimizer:
+    """组合优化管理器
+
+    用法:
+        opt = PortfolioOptimizer(returns_df)
+
+        # 风险平价权重
+        rp = opt.risk_parity()
+
+        # 核心-卫星配置
+        cs = opt.core_satellite(core=["563020","511260"],
+                                satellite=["513100","588000"],
+                                core_ratio=0.6)
+
+        # 再平衡检查
+        rebalancer = opt.rebalancer(target_weights)
+        drift = rebalancer.check_drift(current_weights)
+        if rebalancer.threshold_trigger(current_weights, threshold=0.05):
+            print("需要再平衡")
+    """
+
+    def __init__(self, returns: pd.DataFrame, trading_days: int = 240):
+        self.returns = returns
+        self.tdp = trading_days
+
+    def equal_weight(self) -> pd.Series:
+        """等权配置"""
+        n = len(self.returns.columns)
+        return pd.Series(100/n, index=self.returns.columns)
+
+    def inverse_volatility(self) -> pd.Series:
+        """波动率反比加权"""
+        return inverse_volatility_weights(self.returns, self.tdp)
+
+    def risk_parity(self) -> pd.Series:
+        """风险平价权重"""
+        return risk_parity_weights(self.returns, self.tdp)
+
+    def core_satellite(self, core: list, satellite: list,
+                       core_ratio: float = 0.6) -> pd.Series:
+        """核心-卫星配置"""
+        return core_satellite_weights(
+            self.returns, core, satellite, core_ratio, self.tdp)
+
+    def rebalancer(self, target_weights: dict) -> Rebalancer:
+        """创建再平衡管理器"""
+        return Rebalancer(target_weights)
+```
+
+## 这篇的产物
+
+一个 `PortfolioOptimizer` 类（风险平价 + 核心-卫星）和一个 `Rebalancer` 类（三种再平衡触发方式）。
+
+[资产配置](/posts/asset-allocation/01-why-diversify) 系列讲了「为什么要分散」，这篇讲了「具体怎么分散」。风险平价不是万能的——纯风险平价会给出 60% 国债这种极端配置。但作为一个分析工具，它告诉你「你的组合风险到底集中在哪里」，这本身就是有价值的。
+
+最后一篇，把前 7 篇的所有模块串联成一个可日常运行的自动化投资监控系统。
