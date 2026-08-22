@@ -1,0 +1,183 @@
+---
+title: "07 统一入口：API 网关"
+date: "2026-08-22"
+summary: "ShopLite 四个服务四个端口，App 团队要维护四套地址；JWT 校验逻辑四个服务各写一份；想给秒杀接口限流，发现根本没有一个统一的下手位置。这篇讲网关解决的三件事——路由转发、统一鉴权、横切逻辑，Spring Cloud Gateway 的路由/断言/过滤器三件套，以及网关层鉴权和服务层鉴权的分工。"
+tags: ["Java", "Spring Cloud Gateway", "网关", "限流", "JWT"]
+category: "backend-map"
+cover: ""
+draft: false
+series: "Java 后端技术地图"
+seriesOrder: 7
+---
+
+ShopLite 拆成四个服务后，App 团队找上门了。
+
+第一个抱怨：「以前一个域名搞定，现在你们给我的文档里四个地址：商品 `8001`、订单 `8002`、用户 `8003`、支付 `8004`。我配置写四套，你们哪个服务换机器我就得发版。」
+
+第二个更疼：安全团队扫描发现，订单服务直接暴露在公网，而且**它的 JWT 校验代码是从用户服务复制过去的——复制的时候漏了一个过期时间检查**。四个服务四份鉴权代码，第四份已经出现漂移了。
+
+第三个是产品经理提的：「秒杀要开始了，能不能只对那一个接口限流？」——问题来了：在哪个组件上限？请求散落在四个服务里，没有一个能统一下手的位置。
+
+这三个问题指向同一个缺失的部件：**网关（Gateway）**——整个系统对外的唯一入口。
+
+## 网关是什么：入口 + 横切逻辑的家
+
+网关做的事可以概括成公式：**路由转发 + 横切关注点**。
+
+**路由转发**：所有外部请求只打网关一个地址，网关按规则把请求转发给对应的后端服务。App 只需要知道 `api.shoplite.com`，后面的服务怎么拆、怎么迁移，客户端无感。
+
+**横切关注点（cross-cutting concerns）**：那些"每个请求都要做、但不属于任何业务"的事——鉴权、限流、日志、跨域处理、灰度路由。单体时代它们写在过滤器/拦截器里（写在单体里，天然只有一份）；拆成微服务后，如果不收口，它们就会变成"每个服务复制一份"的漂移源头。网关是它们的新家：
+
+```
+                        ┌──────────────────────────────┐
+ 所有外部流量           │        API 网关              │
+ ───────────────────▶  │  ┌────────────────────────┐  │
+ 只暴露一个地址         │  │ 横切层：JWT 校验、限流、  │  │
+                        │  │ 访问日志、CORS          │  │
+                        │  └────────────────────────┘  │
+                        │  ┌────────────────────────┐  │
+                        │  │ 路由层：按规则转发        │──┼──▶ product-service
+                        │  │ /api/product/**         │  │
+                        │  │ /api/order/**           │──┼──▶ order-service
+                        │  │ /api/user/**            │  │
+                        │  └────────────────────────┘  │
+                        └──────────────────────────────┘
+                              按服务名从 Nacos 拉列表，自带负载均衡
+```
+
+注意最后那行小字：网关路由的目标写的是**服务名**而不是 IP——它自己也是注册中心的订阅者，转发的负载均衡顺带解决了。第 5、6 篇的基础设施在这里直接复用。
+
+## Spring Cloud Gateway 三件套：Route、Predicate、Filter
+
+国内网关的主流选择是 Spring Cloud Gateway（取代了 Netflix 的 Zuul）。它的配置模型只有三个概念：
+
+- **Route（路由）**：一条转发规则 = 目标地址 + 一组匹配条件 + 一组过滤器
+- **Predicate（断言）**：匹配条件——路径、请求头、参数、时间……决定请求命中哪条路由
+- **Filter（过滤器）**：命中前后插入的处理逻辑——改请求头、鉴权、限流都在这
+
+用 ShopLite 的需求写一遍就清楚了：
+
+```yaml
+spring:
+  cloud:
+    gateway:
+      routes:
+        - id: product-route # 规则名
+          uri: lb://product-service # 目标：按服务名转发，lb = 负载均衡
+          predicates:
+            - Path=/api/product/** # 断言：路径匹配才走这条规则
+          filters:
+            - StripPrefix=1 # 过滤器：转发前去掉路径第一段
+              # /api/product/1001 → /product/1001
+
+        - id: order-route
+          uri: lb://order-service
+          predicates:
+            - Path=/api/order/**
+          filters:
+            - StripPrefix=1
+            - name: RequestRateLimiter # 限流过滤器（下面讲）
+              args:
+                redis-rate-limiter.replenishRate: 100 # 令牌生成速率：100/秒
+                redis-rate-limiter.burstCapacity: 200 # 桶容量：允许的瞬时突发
+                key-resolver: "#{@userKeyResolver}" # 按什么维度限：这里按用户
+```
+
+十行配置解决了 App 团队的第一和第三个抱怨：一个入口地址 + 按用户维度每秒 100 次的订单接口限流。第二个抱怨（鉴权漂移）需要写一点代码——一个全局过滤器：
+
+```java
+@Component
+public class JwtAuthFilter implements GlobalFilter, Ordered {
+
+    private final JwtService jwtService;
+
+    public JwtAuthFilter(JwtService jwtService) {
+        this.jwtService = jwtService;
+    }
+
+    @Override
+    public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+        String token = exchange.getRequest().getHeaders().getFirst("Authorization");
+
+        // 放行白名单：登录、注册这类不需要 token 的接口
+        if (isWhiteListed(exchange.getRequest().getPath().value())) {
+            return chain.filter(exchange);   // 直接放行，交给下一个过滤器
+        }
+
+        if (token == null || !jwtService.verify(token)) {
+            exchange.getResponse().setStatusCode(HttpStatus.UNAUTHORIZED);
+            return exchange.getResponse().setComplete();   // 401，请求到此为止，不会到后端
+        }
+
+        // 校验通过：解析出 userId，塞进请求头传给后端服务
+        // 后端从此不需要再解析 JWT——只管信任网关传递的用户身份
+        ServerHttpRequest mutated = exchange.getRequest().mutate()
+                .header("X-User-Id", jwtService.extractUserId(token))
+                .build();
+        return chain.filter(exchange.mutate().request(mutated).build());
+    }
+
+    @Override
+    public int getOrder() {
+        return -1;   // 数字越小越先执行——鉴权要在业务转发之前
+    }
+}
+```
+
+这段代码是网关价值的浓缩：**JWT 校验逻辑全系统只此一份**，四个服务删掉各自的鉴权代码，只信任 `X-User-Id` 请求头（网关是唯一能写这个头的入口，服务不直接暴露公网）。
+
+代码里出现了 `Mono` 和 `ServerWebExchange` 这类 WebFlux 响应式 API——Spring Cloud Gateway 建立在 Netty + 响应式编程之上，**不阻塞线程**。原因很实际：网关是所有流量的必经之路，一个请求占一个线程的同步模型在这里会先于所有后端服务成为瓶颈。你不需要精通响应式编程也能用好 Gateway（上面的过滤器就是普通命令式写法），但要知道它的设计动机。
+
+## 网关鉴权与服务鉴权的分工
+
+「鉴权收口到网关」容易引出一个错误理解：后端服务从此不用管安全了。正确的分工是两层：
+
+- **网关做认证（Authentication）**：这个请求是谁发的、token 是否有效——「**你是不是系统的合法用户**」
+- **服务做授权（Authorization）**：这个用户能不能动这条数据——「**张三能不能改李四的订单**」
+
+`X-User-Id` 只能证明"这是张三"，改李四的订单这种业务规则校验，必须留在订单服务里。把授权也塞进网关会导致网关必须理解所有业务规则——网关会膨胀成一个新的单体，而且是最难维护的那种。
+
+## 顺带回答：那 Nginx 呢
+
+第 2 篇就认识了 Nginx，它和网关什么关系？功能确实重叠（都能反向代理、转发、限流），但定位不同：**Nginx 工作得更靠前**——静态资源、TLS 终止、四层/七层高性能转发；**Gateway 工作在业务层**——理解服务名、集成注册中心、写 Java 自定义逻辑。生产环境常见两层并存：
+
+```
+外网 → Nginx（TLS/静态/粗粒度转发） → Spring Cloud Gateway（路由/鉴权/细粒度限流） → 微服务
+```
+
+小规模系统只用 Nginx 做全部转发也完全成立——网关的价值和微服务数量正相关，这又回到了本系列反复出现的模式。
+
+## 限流的两种桶：令牌与漏桶
+
+配置里那句 `replenishRate` 背后是限流的主流算法，面试常考，一句话分清：
+
+- **令牌桶**：以固定速率往桶里放令牌，请求拿到令牌才放行，桶满了多余的令牌丢弃——**允许突发**（攒了一桶令牌的瞬间可以放过一小波高峰），上面配的 `burstCapacity: 200` 就是这个语义
+- **漏桶**：请求进桶，以恒定速率流出处理——**削平一切突发**，输出绝对平滑
+
+对外 API 多用令牌桶（体验友好），保护脆弱下游多用漏桶（绝对平稳）。Gateway 的 RequestRateLimiter 用 Redis 存计数，天然支持集群多网关实例——限流状态不能放网关内存里，否则两台网关各限 100，实际放行 200。
+
+## 什么时候不需要
+
+- **单体应用**：一个 Nginx 转发就够了，网关是纯增负
+- **服务少且流量小**：三五个服务，Nginx 手写 upstream + 各服务自带一个鉴权拦截器，虽然重复但总量可控——引入 Gateway 的运维成本（又一个要部署监控的组件、响应式排障门槛）可能不划算
+- **BFF 层已存在**：如果已经有 Node/前端网关做聚合，要理清两层网关的边界，避免叠床架屋
+
+一个警示：网关是单点，所有流量必经的地方挂了就是全站挂。生产上至少两实例 + 前面 Nginx 做主备/负载，网关自身逻辑保持轻薄——**别把业务逻辑写进网关**，它是门卫，不是办公室。
+
+## 名词卡片
+
+| 名词                       | 一句话定义                                                 |
+| -------------------------- | ---------------------------------------------------------- |
+| API 网关                   | 系统唯一入口，负责路由转发与横切逻辑收口                   |
+| 横切关注点                 | 每个请求都要做但不属于业务的事：鉴权/限流/日志/CORS        |
+| Route / Predicate / Filter | Gateway 三要素：转发规则 / 匹配条件 / 前后置处理           |
+| lb://                      | 按服务名转发并做客户端负载均衡的 URI 写法                  |
+| GlobalFilter               | 作用于所有路由的过滤器，统一鉴权的标准位置                 |
+| 认证 vs 授权               | 你是谁（网关管）/ 你能不能（服务管）                       |
+| 令牌桶 / 漏桶              | 允许突发的限流 / 绝对平滑的限流                            |
+| RequestRateLimiter         | Gateway 内置限流过滤器，基于 Redis 实现集群计数            |
+| BFF                        | 为前端定制的聚合层（Backend for Frontend），网关思想的近亲 |
+
+## 回顾与预告
+
+至此 ShopLite 的"入口"修好了：外部流量从网关进，鉴权、限流、日志一处收口，四个服务退到内网。但回看第 4 篇那张账单，还剩最大的一项：**下单要跨订单/商品/用户三个服务三个库，事务怎么保证**——以及在此之前，一个更日常的问题：下单成功后的扣库存、加积分、发短信，同步串行调用又慢又脆。下一篇讲消息队列：把"必须现在做完"变成"保证最终会做完"。

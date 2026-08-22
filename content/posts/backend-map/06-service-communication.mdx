@@ -1,0 +1,173 @@
+---
+title: "06 服务间怎么说话：OpenFeign、gRPC 与 Dubbo"
+date: "2026-08-22"
+summary: "订单服务拿到了商品服务的实例列表，然后呢？用 RestTemplate 手拼 HTTP 请求——拼 URL、解析 JSON、处理异常，每个调用写 20 行。这篇讲微服务间调用的演进：从 RestTemplate 的原始时代到 OpenFeign 声明式调用的优雅，超时重试与幂等的暗坑，以及什么时候才真的需要 gRPC 和 Dubbo。"
+tags: ["Java", "OpenFeign", "RPC", "gRPC", "Dubbo"]
+category: "backend-map"
+cover: ""
+draft: false
+series: "Java 后端技术地图"
+seriesOrder: 6
+---
+
+上一篇结尾，订单服务已经能从 Nacos 查到 `product-service` 的存活实例列表了。现在它要真正发出那个调用：查商品价格、扣库存。团队里最年轻的同事交了第一版代码：
+
+```java
+// 用 Spring 自带的 RestTemplate 手写 HTTP 调用
+public DeductResult deductStock(Long productId, int quantity) {
+    String url = "http://" + pickInstance() + "/stock/deduct"
+            + "?productId=" + productId + "&quantity=" + quantity;
+    try {
+        ResponseEntity<String> resp = restTemplate.postForEntity(url, null, String.class);
+        ObjectMapper mapper = new ObjectMapper();
+        return mapper.readValue(resp.getBody(), DeductResult.class);   // 手动反序列化
+    } catch (RestClientException e) {
+        throw new OrderException("扣库存失败", e);                     // 异常全靠手接
+    } catch (JsonProcessingException e) {
+        throw new OrderException("响应解析失败", e);
+    }
+}
+```
+
+能跑，但每个远程调用都要手写一遍：挑实例、拼 URL、序列化、解析、异常处理。ShopLite 有几十个跨服务调用，这样写到第三个月，一半的代码在干 HTTP 的脏活，而且每个手写版本的超时策略、错误处理都不一样——出了事故查起来各自为政。
+
+这个问题有个统一的解法方向，先看它背后的思想。
+
+## RPC 的梦想：让远程调用像本地方法一样
+
+所有远程调用框架（这一整类技术统称 **RPC，Remote Procedure Call**）追求的是同一件事：**把"网络调用"这个基础设施问题藏起来，让开发者写 `productService.deduct(...)` 这样的普通方法调用，框架在背后替你完成寻址、序列化、传输、反序列化、异常传递**。
+
+第 4 篇说过，微服务的本质代价是"方法调用降级成网络调用"；RPC 框架做的事就是把这次降级尽量"升"回来——升不到原来的高度（网络该超时还是超时），但至少让你写起来的体感回到方法调用。
+
+Spring Cloud 生态里这个 dream job 的默认人选是 **OpenFeign**。
+
+## OpenFeign：写个接口就完事了
+
+OpenFeign 的用法可以浓缩成一句话：**你只定义接口，实现类它动态生成**。
+
+```java
+// 订单服务里定义一个接口——注意这只是接口，没有任何实现类
+@FeignClient(name = "product-service")     // 目标服务名，走 Nacos 寻址
+public interface ProductClient {
+
+    @GetMapping("/products/{id}")
+    Product getProduct(@PathVariable("id") Long id);
+
+    @PostMapping("/stock/deduct")
+    DeductResult deductStock(@RequestBody DeductRequest request);
+}
+```
+
+```java
+@Service
+public class OrderService {
+
+    private final ProductClient productClient;   // 像注入本地 Bean 一样注入它
+
+    public OrderService(ProductClient productClient) {
+        this.productClient = productClient;
+    }
+
+    public void createOrder(CreateOrderCmd cmd) {
+        // 用起来的体感：完全是一次普通的方法调用
+        Product product = productClient.getProduct(cmd.productId());
+        DeductResult result = productClient.deductStock(
+                new DeductRequest(cmd.productId(), cmd.quantity()));
+        // ...
+    }
+}
+```
+
+对比开头那 20 行 RestTemplate：业务代码里只剩方法调用。URL 拼接、实例选择、JSON 序列化、响应解析——全部消失在接口背后。
+
+消失的活去哪了？OpenFeign 在启动时为 `@FeignClient` 接口生成**动态代理**，你对 `productClient.getProduct(...)` 的每一次调用都被代理拦截，背后依次发生：
+
+```
+productClient.getProduct(1001)
+   │
+   ▼ 动态代理拦截
+   │  ① 从 Nacos 拿 product-service 的实例列表（本地缓存，订阅更新）
+   │  ② LoadBalancer 按策略选一台（轮询/权重）——客户端负载均衡
+   │  ③ 按注解生成 HTTP 请求：GET http://10.0.0.30:8081/products/1001
+   │  ④ 发送，拿到 JSON 响应，反序列化成 Product 对象
+   ▼
+   返回，或者抛出异常（网络错误映射成 FeignException）
+```
+
+这就是面试问"Feign 的工作原理"的标准答案骨架：**接口 + 动态代理 + 注册中心寻址 + 客户端负载均衡 + HTTP**。注意②——负载均衡发生在**调用方**进程内（所以叫客户端负载均衡），和第 2 篇 Nginx 那种集中式负载均衡是两个位置两种流派：Nginx 在入口分活，Feign 在每次调用时分活。
+
+## 超时与重试：远程调用的成人礼
+
+写了几天 OpenFeign，生产上出了第一次事故，教科书级别的：
+
+大促时商品服务压力大涨，某个接口响应从 50ms 涨到 3s。订单服务的每个请求都要等它 3 秒，**订单服务自己的线程池迅速被等待的线程占满**，于是订单服务也停止响应——依赖它的支付服务线程池也被占满。**三个服务像多米诺一样顺序倒下**，这叫**雪崩**（第 9 篇之前的第 8 篇会遇到它的另一半故事，熔断器）。
+
+这次的教训是两个必须显式配置的参数：
+
+```yaml
+# OpenFeign 默认超时是 connectTimeout 10s / readTimeout 60s——对互联网请求来说长得离谱
+spring:
+  cloud:
+    openfeign:
+      client:
+        config:
+          default:
+            connect-timeout: 2000 # 建立连接最多等 2 秒
+            read-timeout: 3000 # 等响应最多等 3 秒——宁可失败，不要干等
+```
+
+**超时是远程调用的安全带**：调不通就快速失败，把线程还回去，别陪葬。
+
+快速失败之后自然的冲动是重试。重试有效，但有一个必须刻在脑子里的前提——**重试要求被调用的操作是幂等的**：
+
+> 扣库存请求超时了，你不知道商品服务是"没收到"还是"收到了但响应丢了"。重试一次？如果第一次其实成功了，库存就扣了两次。
+
+这是分布式系统最经典的坑，完整解法（幂等设计）是第 8 篇的主题，这里先记住结论：**只对查询和显式设计过幂等的写操作开重试，其余场景宁可让用户重试**（用户点两次"提交订单"和程序默默重试的性质完全不同——前者用户看得见，后者是隐形事故）。
+
+## 另一条路：gRPC 和 Dubbo
+
+OpenFeign 底层走的是 HTTP + JSON——文本协议，人眼可读，调试方便，但报文体积大、解析靠反射。当调用规模上去（内部每秒几十万次服务间调用），这两个开销开始被计较，于是有了另一条技术路线：**二进制协议 + 接口契约**。
+
+**gRPC**（Google 出品）：接口定义写在 `.proto` 文件里（**IDL，接口定义语言**），编译器直接生成双方语言的调用代码，传输走 HTTP/2 + **Protobuf** 二进制编码。报文比 JSON 小 3-10 倍，解析快一个数量级，且 HTTP/2 支持长连接多路复用。代价是放弃可读性、跨团队要统一管理 proto 文件。
+
+**Dubbo**（阿里出品，国内微服务另一大流派）：思路与 gRPC 相近（接口契约 + 高性能序列化 + 自带服务治理），历史上配合 Zookeeper 注册中心使用，与 Spring Cloud 体系分庭抗礼多年。今天 Dubbo 也已兼容 Spring Cloud 生态，边界在融合。
+
+| 维度        | OpenFeign + HTTP/JSON  | gRPC / Dubbo                   |
+| ----------- | ---------------------- | ------------------------------ |
+| 报文        | 文本，大，可读         | 二进制，小 3-10 倍             |
+| 序列化/解析 | JSON 反射，慢          | Protobuf 预生成代码，快        |
+| 连接        | 短连接为主（HTTP/1.1） | 长连接多路复用                 |
+| 调试        | curl / 抓包直接看      | 要专门工具                     |
+| 契约管理    | 无强制（靠文档）       | IDL 强制，双方代码生成         |
+| 适合        | 绝大多数业务系统       | 内部高频调用、性能敏感、多语言 |
+
+选型判断其实很朴素：**先 Feign，量到再换**。服务间调用还没成为可测量的瓶颈时，JSON 的可读性和生态便利远比省下的序列化时间值钱。ShopLite 现阶段全部 Feign，足够。
+
+## 什么时候不需要
+
+这一篇的"不需要"有两层：
+
+**不需要更重的方案**：服务少、调用量小，Feign + 合理的超时就是最优解。为 3 个服务之间的每秒 50 次调用引入 proto 文件管理和 gRPC 工具链，是典型的提前优化。
+
+**甚至不需要框架**：如果整个系统只有一两处跨服务调用，RestTemplate 的丑陋是可控的——加个超时配置，封装一个工具方法，别急着上全家桶。框架的每一分优雅都用依赖和心智成本换的。
+
+另外提醒一个反方向：**服务间调用能少则少**。第 4 篇说"一个好的拆分让每个需求只改一个服务"，反过来说，如果你发现某两个服务之间每天冒出新的互相调用，多半是拆分边界画错了——该合并或者重新切。通信是有成本的，最好的远程调用是不发生的那次。
+
+## 名词卡片
+
+| 名词           | 一句话定义                                                      |
+| -------------- | --------------------------------------------------------------- |
+| RPC            | 远程过程调用——让跨机器调用写起来像本地方法的整类技术            |
+| OpenFeign      | Spring Cloud 的声明式 HTTP 客户端：接口 + 注解，动态代理实现    |
+| 动态代理       | 运行时生成接口实现，拦截方法调用转成 HTTP 请求的机制            |
+| 客户端负载均衡 | 调用方自己从实例列表选一台（LoadBalancer），区别于 Nginx 集中式 |
+| 雪崩           | 慢依赖占满线程池、故障沿调用链向上传导的连锁崩溃                |
+| 超时 / 重试    | 快速失败的安全带 / 失败后再试——重试必须配幂等                   |
+| 幂等           | 同一操作执行一次和执行 N 次结果相同（重试安全的前提）           |
+| IDL / proto    | 接口定义语言；gRPC 用它生成双方调用代码，强制契约               |
+| Protobuf       | 二进制序列化格式，比 JSON 小且快，代价是不可读                  |
+| Dubbo          | 阿里系高性能 RPC 框架，国内与 Spring Cloud 并立的另一流派       |
+
+## 回顾与预告
+
+服务之间会说话了：Feign 声明式调用、超时安全带、按需重试。但到此为止，解决的都是"内政"。下一篇把镜头转向系统外部：App 和浏览器面对的还是四个端口四套地址，鉴权代码散在四个服务里已经开始漂移——ShopLite 需要一扇统一的门：API 网关。
