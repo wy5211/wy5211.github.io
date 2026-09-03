@@ -1,0 +1,221 @@
+---
+title: "19 Maven 依赖管理：从 package.json 到 pom.xml"
+date: "2026-09-03"
+summary: "为什么 Spring Boot 引依赖不用写版本号？讲清 starter 和 BOM 机制、依赖仲裁的潜规则，以及用 dependency:tree 排查版本冲突的完整过程。"
+tags: ["Spring Boot", "Maven", "依赖管理", "Java"]
+category: "springboot"
+cover: ""
+draft: false
+series: "Spring Boot 实战"
+seriesOrder: 19
+---
+
+正篇 18 篇在微服务入门收了官。回头看这一路，有两个主题当时的篇幅，配不上它们给我造成的困扰——依赖管理是第一个。
+
+事情出在给 CMS 加点赞功能的时候。点赞数存 Redis、用分布式锁防并发重复计数，于是往 pom.xml 里加了 `redisson-spring-boot-starter`；顺手又把注册短信的第三方 SDK 引了进来。重启，然后看到这个：
+
+```
+java.lang.NoSuchMethodError: 'void com.fasterxml.jackson.databind.ObjectMapper
+    .configure(com.fasterxml.jackson.core.JsonParser$Feature, boolean)'
+    at com.techblog.lib.sms.SmsClient.parseResponse(SmsClient.java:57)
+```
+
+这个报错让我愣了一会儿。用 Node.js 写了两年后端，依赖装不上、版本对不上这种事，pnpm install 报个 ERESOLVE 我看一眼就解决了，从来轮不到运行时炸。为什么到了 Maven 这里，冲突不报错，憋到启动才炸？
+
+这篇文章把这个问题彻底讲清楚。01 篇给过一张 package.json 和 pom.xml 的对照表，这篇不再重复对照，直接进机制。
+
+## 没有 node_modules 的世界
+
+第一件事：Maven 没有 node_modules。
+
+npm 装依赖，是把包实实在在复制进项目目录。Maven 装依赖，只是把 jar 下载到用户目录下的 `~/.m2/repository`，项目里永远只有 pom.xml 里的几行声明。编译、打包的时候，Maven 按坐标（`groupId:artifactId:version`）去这个仓库里找 jar。
+
+所以删掉 node_modules 重装是前端的项目仪式，删 `~/.m2/repository` 是 Java 世界的同款仪式（通常是被"本地仓库 jar 损坏"逼的）。
+
+这里有个意外的好消息：**如果你用 pnpm，你已经理解 Maven 的一半了。** pnpm 的全局 store 内容寻址存储，所有项目共享一份包文件，node_modules 里只是硬链接——这个模型和 `~/.m2` 几乎同构。区别只在链接方式：pnpm 用符号链接把 store 里的文件连进项目，Maven 直接拿仓库路径当 classpath。
+
+坐标系统也值得说一句。npm 里一个包只有一个名字，Maven 里一个 jar 有三段式坐标：`com.fasterxml.jackson.core:jackson-databind:2.15.3`。groupId 像反向域名命名空间，artifactId 才是包名，version 是版本。看到依赖冲突报错时，先从堆栈里认出这三段式坐标，后面的排查全靠它。
+
+## starter：为什么你从来不用写版本号
+
+写 Node.js 的时候，搭一个 Web 服务要自己装一轮：express、cors、helmet、morgan、body-parser（早年还要单独装）。Spring Boot 里只需要一个：
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-web</artifactId>
+</dependency>
+```
+
+注意，连版本号都没有。npm 里少写版本会装 latest，Maven 这里为什么不报错？
+
+版本来自 starter 的来源。项目 pom.xml 的 parent 指向 `spring-boot-starter-parent`，它继承自 `spring-boot-dependencies`——这个东西叫 **BOM**（Bill of Materials），里面有一个巨大的 `dependencyManagement` 段，把 Jackson、Spring 全家、Tomcat、SLF4J 等 200 多个常用库的版本全部钉死：
+
+```xml
+<!-- spring-boot-dependencies 里（节选，实际有几百条） -->
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.15.3</version>
+        </dependency>
+        <!-- ... -->
+    </dependencies>
+</dependencyManagement>
+```
+
+`dependencyManagement` 的语义要读准：它**只声明"如果这个依赖出现在你的依赖树里，用我钉的版本"，自己并不引入依赖**。真正引入依赖的是 `dependencies` 段。所以你在自己的 pom.xml 里写 `spring-boot-starter-web` 不带版本，Maven 沿 parent 找到 BOM，发现版本已经被钉成 2.15.3 配套的一整套——齐活。
+
+starter 本身则是一份打包好的依赖清单。`spring-boot-starter-web` 拆开就是 spring-web、spring-webmvc、spring-boot-starter-json（里面才有 Jackson）、内嵌 Tomcat。所谓 starter，就是把"跑起一个 Web 服务需要的最小依赖集合"预先配好，你不用像 Express 那样自己拼。
+
+用过 pnpm workspace 的话，可以把 BOM 理解成 `pnpm-workspace.yaml` 里的 `catalog:`——统一管理一批包的版本，所有子项目（这里是整个 Spring 生态）引用同一份目录。区别在于 pnpm 的 catalog 是你自己仓库的私货，Spring 的 BOM 是全生态共享的官方目录。
+
+## 依赖仲裁：两条规则和一个残酷事实
+
+现在回到开场的 NoSuchMethodError。要理解它，先接受一个和 npm 完全相反的事实：
+
+**Maven 的 classpath 上，同一个 `groupId:artifactId` 只能存在一个版本。**
+
+npm 的依赖树里，包 a@1.0 和 a@2.0 可以嵌套共存——依赖 a@1 的包用自己的 a@1，依赖 a@2 的包用自己的 a@2，node_modules 嵌套结构天然支持。Maven 没有这个机制：两个版本进来了，必须二选一，而且选择过程是**静默的**——构建不报错、不警告，直接把落选的丢掉。
+
+选谁？两条规则，按顺序：
+
+1. **最短路径优先**：离你的 pom.xml 路径近的赢。
+2. **路径一样长，先声明的赢**：pom.xml 里 `dependencies` 段谁写在前面谁赢。
+
+代入开场的案例。短信 SDK 自己依赖 jackson-databind 2.13.4（路径：你的项目 → sms-sdk → jackson，深度 3）；starter-web 经由 starter-json 依赖 jackson-databind 2.15.3（深度 3，声明在前）。仲裁结果：2.15.3 留下，2.13.4 被标记为 `omitted for conflict` 丢掉。
+
+到这一步为止，一切符合预期——整个应用统一用新版 Jackson，听起来还挺健康。问题出在短信 SDK 这边：它是**编译期**就绑定在 2.13 的 API 上打的包。如果它调用的某个方法签名在 2.15 里被移动或删除，编译期不会有任何异常（classpath 上确实有 jackson，编译时看的只是字节码引用），要等到运行时真正执行到那一行，才抛出 NoSuchMethodError。
+
+这就是 npm 和 Maven 最深的一个心智差异：
+
+- npm 的哲学是**让所有人各用各的版本，冲突尽量共存**，实在装不了才报 ERESOLVE；
+- Maven 的哲学是**冲突必须裁决出一个唯一版本**，裁决本身永远成功，裁决错了运行时才爆。
+
+npm 用户刚切过来最不适应的就是这个：没有报错不代表没问题，只代表 Maven 已经替你做了决定。
+
+## 没有 lockfile 的构建
+
+第二个认知差更隐蔽：**Maven 至今没有官方 lockfile**。package-lock.json、pnpm-lock.yaml 锁定整棵依赖树的机制，在 Maven 的世界里没有第一方等价物（Gradle 有 dependency locking 能生成 gradle.lockfile，但默认关闭）。
+
+这意味着什么？npm 项目里，lockfile 把"我到底用了哪些包的哪些版本"完整冻结下来，CI 和三年后重装都精确复现。Maven 项目里，传递依赖的版本是构建时按仲裁规则**现场决定**的——某个上游库某天发布新版，改了自己内部的依赖声明，你一行代码没动，下次构建拉到的版本就变了。
+
+那 Spring Boot 项目为什么平时感觉不到这个问题？因为 starter-parent 那个 BOM 已经把 200 多个常用库全部钉死了，你的依赖树里绝大部分叶子节点的版本都被它接管——相当于官方帮你做了一份"准 lockfile"。这是 Spring Boot 全家桶最实际的价值之一。
+
+但 BOM 只保护它管的库。你自己引入的第三方 SDK 带进来的传递依赖，防护就有缺口。两个补法：
+
+```xml
+<!-- 法一：把关键依赖也纳入 dependencyManagement，钉住版本 -->
+<dependencyManagement>
+    <dependencies>
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.15.3</version>
+        </dependency>
+    </dependencies>
+</dependencyManagement>
+```
+
+```xml
+<!-- 法二：maven-enforcer-plugin，发现版本仲裁不符合预期直接让构建失败 -->
+<plugin>
+    <groupId>org.apache.maven.plugins</groupId>
+    <artifactId>maven-enforcer-plugin</artifactId>
+    <executions>
+        <execution>
+            <goals><goal>enforce</goal></goals>
+            <configuration>
+                <rules>
+                    <requireUpperBoundDeps/>
+                </rules>
+            </configuration>
+        </execution>
+    </executions>
+</plugin>
+```
+
+日常开发里法一是主力，法二在多人协作或 CI 环境值得配上。
+
+## 排查实战：从 NoSuchMethodError 到一行修复
+
+现在把开场的案子办了。标准流程三步。
+
+**第一步，读堆栈，锁定出事的坐标。** `com.fasterxml.jackson.databind.ObjectMapper` → groupId 是 `com.fasterxml.jackson.core`，artifactId 是 `jackson-databind`。
+
+**第二步，看依赖树里这个包有几条路径、谁赢了：**
+
+```bash
+mvn dependency:tree -Dincludes=com.fasterxml.jackson.core:jackson-databind -Dverbose
+```
+
+输出（节选）：
+
+```
+[INFO] com.techblog:cms-api:jar:1.0.0
+[INFO] +- org.springframework.boot:spring-boot-starter-web:jar:3.2.5:compile
+[INFO] |  \- org.springframework.boot:spring-boot-starter-json:jar:3.2.5:compile
+[INFO] |     \- com.fasterxml.jackson.core:jackson-databind:jar:2.15.4:compile
+[INFO] +- com.techblog.lib:sms-sdk:jar:1.4.2:compile
+[INFO] |  \- com.fasterxml.jackson.core:jackson-databind:jar:2.13.4:compile
+[INFO] |     \- (omitted for conflict with 2.15.4)
+[INFO] \- redisson-spring-boot-starter:jar:3.27.2:compile
+```
+
+`-Dverbose` 会把被仲裁掉的路上标注出来：`omitted for conflict`（因冲突被丢弃）和 `omitted for duplicate`（同版本重复路径，无害）。一眼看到：sms-sdk 想要 2.13.4，被 2.15.4 顶掉了。
+
+**第三步，按优先级选修复方案：**
+
+1. **升级 SDK**。sms-sdk 1.4.2 是两年前打的包，作者大概率已经发过适配新版 Jackson 的版本。升到最新，冲突自然消失——这是唯一真正的修复。
+2. **排除它的传递依赖，让它吃宿主的版本**。如果暂时升不了 SDK，把它的旧 Jackson 排掉：
+
+```xml
+<dependency>
+    <groupId>com.techblog.lib</groupId>
+    <artifactId>sms-sdk</artifactId>
+    <version>1.4.2</version>
+    <exclusions>
+        <exclusion>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+        </exclusion>
+    </exclusions>
+</dependency>
+```
+
+赌的是 SDK 只用了 Jackson 的基础 API，2.13 和 2.15 之间没动它用的那些。赌输了还是 NoSuchMethodError，回到方案一。3. **最下策**：为了迁就 SDK 去降低整个项目的 Jackson 版本。别。你等于用全项目的安全性换一个角落能跑。
+
+排查这类问题的通用心法就一句：**运行时找不到方法或类（NoSuchMethodError / NoClassDefFoundError / ClassNotFoundException），先怀疑依赖冲突，直接上 dependency:tree，不要先怀疑自己的代码。**
+
+## 多模块和 Gradle：知道就好
+
+两块收尾的知识，现阶段不深挖。
+
+**多模块工程**：一个仓库里放一个父 pom 和若干子模块，子模块之间可以互相依赖。公共的 domain 实体抽成一个模块，几个应用共享。什么时候需要？代码量和团队规模到了，或者确实有多个应用要复用同一批类。CMS 现在单模块跑得好好的，不需要。看到别人项目里有 `parent/pom.xml` 加一堆子目录时，知道那是在做这件事就行。
+
+**Gradle**：和 Maven 同样的依赖模型（坐标、仓库、仲裁规则几乎一致），换了一种构建脚本写法（Kotlin/Groovy DSL），增量构建更快，Android 官方指定。为什么两派并存？老项目和大量企业教程用 Maven，新 Android 和部分大厂用 Gradle。新手建议：跟教程走 Maven，语法和 npm scripts 的心智距离更近；入职看团队用什么就用什么，依赖管理的底层认知是通用的。
+
+## Node.js vs Maven/Gradle：依赖管理对照
+
+| 维度         | npm / pnpm                              | Maven                                                 |
+| ------------ | --------------------------------------- | ----------------------------------------------------- |
+| 依赖存储     | node_modules（pnpm：全局 store + 链接） | `~/.m2/repository` 全局仓库                           |
+| 版本锁定     | lockfile 默认生成，精确复现             | 无官方 lockfile，靠 BOM / dependencyManagement 钉版本 |
+| 多版本共存   | 支持（嵌套安装，各用各的）              | 不支持（每个坐标只留一个版本）                        |
+| 冲突处理     | 安装时尽量兼容，装不了就报错            | 静默仲裁，运行时才可能炸                              |
+| 传递依赖版本 | lockfile 记录全树，构建可复现           | 构建时按仲裁规则现场决定                              |
+| 不写版本号   | 装 latest                               | 从 parent 的 BOM 里继承                               |
+| 官方 starter | 无（自己拼 express + cors + …）         | 有（starter-web 一个顶一套）                          |
+
+## 什么时候这套模型是好设计
+
+坦白说，写这篇之前我觉得 Maven 没有 lockfile 是落后的。写完发现这个判断下早了。
+
+npm 的多版本共存 + lockfile，代价在别处：去任意一个 node_modules 里数一数有多少个不同版本的 lodash，每一个都是要下载、要打包、可能有安全漏洞要单独升级的实体。前端的 bundle 体积问题、幽灵依赖问题，根源都在"每个项目自带一整个依赖宇宙"。
+
+Maven 的单版本仲裁 + 生态级 BOM，牺牲了精确复现和多版本自由，换来的是**整个生态的版本对齐**——一个 parent 让几百个库不打架，应用打进 jar 包里不会拖着一堆重复实现。你实际付的成本，只是要理解两条仲裁规则和会跑一个 dependency:tree。
+
+所以实践建议三条：版本冲突先跑 `dependency:tree` 再动代码；引入第三方 SDK 前先 `dependency:tree -Dverbose` 看一眼它拖了谁进来；别在自己的 pom.xml 里和 Spring Boot 的 BOM 抢版本管理权，它钉过的版本，让给它是损失最小解。
+
+依赖这块算补齐了。番外还有最后一篇，讲另一个我在 Node.js 经验里完全找不到锚点的概念——事务。它比依赖冲突更本质：前端的世界里，"做了一半"从来没人管，Java 后端用一整个机制来管这件事。

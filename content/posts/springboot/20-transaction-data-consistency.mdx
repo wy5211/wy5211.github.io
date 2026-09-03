@@ -1,0 +1,194 @@
+---
+title: "20 事务：一个注解背后的数据一致性"
+date: "2026-09-03"
+summary: "注册成功但优惠券没发出去怎么办？从事务要解决的半成功问题，讲到 @Transactional 的回滚规则、传播行为和三个最常见的失效场景。"
+tags: ["Spring Boot", "事务", "@Transactional", "数据库"]
+category: "springboot"
+cover: ""
+draft: false
+series: "Spring Boot 实战"
+seriesOrder: 20
+---
+
+上一篇补齐了依赖管理。番外最后一篇讲事务——正篇 18 篇里 [第 5 篇讲 JPA](/posts/springboot/05-spring-data-jpa) 时顺手用过 `@Transactional`，但没讲它是什么。这是我有意留的：因为它是我转过来之后遇到的第一个**在 Node.js 世界找不到任何对应物**的机制，三言两语讲不透。
+
+场景是 CMS 上线注册送优惠券活动。注册逻辑两步：创建用户，发一张欢迎券。
+
+```java
+public void register(RegisterRequest request) {
+    User user = new User(request.username(), request.email(),
+            passwordEncoder.encode(request.password()));
+    userRepository.save(user);                       // 第一步，成功
+    couponService.issueWelcomeCoupon(user.getId());  // 第二步，这里超时了
+}
+```
+
+发券接口超时抛异常。此刻数据库里躺着一个完整的用户，但没有券。接口返回 500，用户以为是网络问题，点重试，撞上唯一约束——用户名已存在。从此这个用户名永久无法注册，客服要在数据库里手动清掉这半条数据。
+
+这就是"做了一半没人收拾"。两个写操作，第一个成功了，第二个失败了，系统没有任何机制把第一个撤销。
+
+## Express 里这件事怎么解决
+
+Node.js 不是没有这个问题，是没有**自动**的解决方案。用 TypeORM 的话，你手动管：
+
+```js
+const queryRunner = dataSource.createQueryRunner();
+await queryRunner.connect();
+await queryRunner.startTransaction();
+try {
+  await queryRunner.manager.save(User, user);
+  await issueCoupon(user.id); // 远程调用
+  await queryRunner.commitTransaction();
+} catch (err) {
+  await queryRunner.rollbackTransaction(); // 撤销第一步
+  throw err;
+} finally {
+  await queryRunner.release(); // 忘了这行 = 连接池泄漏
+}
+```
+
+写过的人都记得这有多啰嗦，而且每一层调用都要传递同一个 queryRunner——只要有一段代码用了别的连接，事务就是假的。Java 世界把这团东西压缩成方法上的一个注解。
+
+## @Transactional：begin 和 commit 交给代理
+
+```java
+@Transactional
+public void register(RegisterRequest request) {
+    User user = new User(request.username(), request.email(),
+            passwordEncoder.encode(request.password()));
+    userRepository.save(user);
+    couponService.issueWelcomeCoupon(user.getId());
+}
+```
+
+机制一句话：Spring 启动时给你的 Service 生成一个代理对象（原理就是 [第 8 篇讲的 AOP](/posts/springboot/08-interceptors-aop)），调用方拿到的其实是代理。代理在进入方法前申请数据库连接、开启事务；方法正常返回就 commit；抛出它认定的异常就 rollback，连接归还池子。
+
+手动版的 startTransaction、commit、rollback、release 全被代理代劳了，而且事务通过连接绑定传播——方法里调用的所有 repository 操作自动共享同一个连接、同一个事务，不用传任何东西。
+
+但"代理"这个机制也埋下了本篇最重要的推论：**注解生效的前提是调用走了代理**。这不是废话，后面的失效三坑全部来自这一句。
+
+## 默认回滚规则：一个反直觉的设计
+
+先说结论：`@Transactional` 默认只回滚 `RuntimeException` 和 `Error`。受检异常（比如 `IOException`）抛出来，事务**照常提交**。
+
+对 JS 背景的人来说这里有个前置知识要补：Java 把异常分两类。checked 异常是编译器强制你处理（catch 或声明抛出）的，官方认为它们是"业务上可预期的状况"，比如文件不存在；unchecked（`RuntimeException` 及其子类）被视为程序 bug，比如空指针。JavaScript 没有这个分类，所有异常一个待遇，所以这条规则对前端出身的人毫无直觉可言。
+
+Spring 的设计逻辑是：bug 该回滚（数据可能已经写到一半），预期内的业务失败不该连累整个事务。这个设计业界吵了十几年，你只需要记住规则和对策。对策无脑但有效：
+
+```java
+@Transactional(rollbackFor = Exception.class)
+```
+
+`rollbackFor` 把回滚范围扩大到所有异常。成本是每次多打一行，收益是不用再维护一张"哪些异常会回滚"的心算表。很多团队的编码规范直接强制全这么写，我建议照做。
+
+## 传播行为：先只学两档
+
+传播行为回答的问题是：一个事务方法调用另一个事务方法时，事务怎么合并？完整定义有 7 种，日常 95% 的场景只用两档。
+
+**REQUIRED（默认）**：调用方有事务就加入，没有就新建。大多数方法用它就对了。
+
+**REQUIRES_NEW**：把当前事务挂起，自己开一个全新的事务，独立提交或回滚，不受外层影响。
+
+用 CMS 的场景讲为什么需要第二档：注册流程要求写审计日志，而且无论注册成败，日志都必须落库——失败本身就是要记录的信息。
+
+```java
+@Service
+public class UserService {
+
+    private final AuditLogService auditLogService;
+
+    @Transactional
+    public void register(RegisterRequest request) {
+        auditLogService.record("register", request.username()); // 独立事务，立即落库
+        userRepository.save(toUser(request));
+        couponService.issueWelcomeCoupon(...);                  // 假设这里抛异常
+    }
+}
+
+@Service
+public class AuditLogService {
+
+    @Transactional(propagation = Propagation.REQUIRES_NEW)
+    public void record(String action, String username) {
+        auditLogRepository.save(new AuditLog(action, username));
+    }
+}
+```
+
+注册回滚了，用户数据没进去，但审计日志留下了——这正是审计想要的语义。如果 `record` 用默认的 REQUIRED，它会加入主事务，主事务回滚时把日志一起带走，审计就瞎了。
+
+剩下的 5 种传播行为，等你在真实代码里遇到再说，现在背了也会忘。
+
+## 失效三坑：每个都看起来像正确代码
+
+事务最阴的地方在这儿：注解失效不报错、不打日志、单测还可能通过。三个坑，每个都源于"调用必须走代理"。
+
+**坑一：自调用。**
+
+```java
+@Service
+public class UserService {
+
+    public void registerWithReferral(RegisterRequest request) {
+        this.register(request);   // 事务不生效！
+    }
+
+    @Transactional
+    public void register(RegisterRequest request) { ... }
+}
+```
+
+`this.register()` 是类内部的普通方法调用，直接跑在原始对象上，压根没经过代理——注解形同虚设，等价于没写。最坑的是单测里直接调 `register()` 走的是代理（Spring 注入的对象），能正常回滚，测试通过；上线从 `registerWithReferral` 进来，事务消失，一致性出问题。
+
+修法首选把 `register` 拆到另一个 Service，顺带符合单一职责；快速方案是注入自身代理再调用。
+
+**坑二：private 方法。** 代理要拦截方法，前提是能覆盖它——private 方法代理够不着，注解无效，IDE 通常也不报错。规范收敛成一条：`@Transactional` 只加在 Service 的 public 方法上。
+
+**坑三：try-catch 吞异常。**
+
+```java
+@Transactional
+public void register(RegisterRequest request) {
+    try {
+        userRepository.save(toUser(request));
+        couponService.issueWelcomeCoupon(...);
+    } catch (Exception e) {
+        log.error("注册流程失败", e);   // 吞掉了
+    }
+}
+```
+
+代理判断回滚的依据只有一个：方法有没有把异常抛出来。异常在方法内部被 catch 住没有再抛，代理看来一切正常，照常 commit。第一步写入的数据照样提交，开场的半成功问题原样回来——而且这次连 500 都没有，表面上一切安好。
+
+修法：catch 之后要么 `throw new RuntimeException(e)` 重新抛，要么确实需要"记录后不失败"的业务语义时，手动标记回滚 `TransactionAspectSupport.currentTransactionStatus().setRollbackOnly()`。绝大多数时候是前者。
+
+## 事务里别做的事
+
+事务不是越大越好。数据库连接是池化的稀缺资源，事务每多活一毫秒，连接就多被占一毫秒；高并发下连接池耗尽，整个应用跟着卡死。两条红线：
+
+**事务里不做慢操作。** HTTP 调用、发消息、写文件、传图，全都挪出去。回头看开场的例子——`issueCoupon` 如果是跨服务的远程调用，把它包在事务里，等于让事务时长被对方接口的性能绑架。合理的设计是：本地事务只保证用户落库，发券改成事件或消息队列异步补偿，失败就重试。
+
+**大批量写拆批次。** 一个事务里写 10 万行，回滚代价和锁持有时间都会失控。
+
+想通这一层会发现，事务的边界其实是设计问题：它保证的是**单个数据库内**的一致性。跨服务、跨库的一致性是另一个世界的话题（分布式事务），等你真的在微服务场景里撞上它再学不迟——正篇 [第 18 篇](/posts/springboot/18-microservices-intro) 拆评论服务时提到的"服务间不共享数据库"，防的就是这类问题。
+
+## Node.js vs Spring：事务对照
+
+| 维度        | Express + TypeORM         | Spring Boot                                 |
+| ----------- | ------------------------- | ------------------------------------------- |
+| 开启方式    | 手动 `startTransaction()` | `@Transactional` 注解                       |
+| 提交 / 回滚 | 手动调用，忘了就是事故    | 代理根据返回 / 异常自动处理                 |
+| 连接管理    | 手动 release，忘了就泄漏  | 代理统一管理                                |
+| 事务传播    | 手动传递 queryRunner      | 传播行为自动合并                            |
+| 回滚条件    | 自己决定                  | 默认仅 RuntimeException，`rollbackFor` 扩大 |
+| 典型事故    | 忘 release、忘 rollback   | 自调用、吞异常、private 导致注解失效        |
+
+## 什么时候值得用一个注解
+
+交易型系统离不开事务——转账、库存扣减、任何"两个写必须同生共死"的场景，这是它的本职。纯读的接口不用加，加了反而白白占住连接；单个 save 自带原子性，也不需要。
+
+`@Transactional` 用一层代理换掉了手动事务的全部样板代码，代价是"心智不可见"：失效场景全是看起来对的代码。把规则收敛到三条就安全了——注解只放在 public 的 Service 方法上；`rollbackFor = Exception.class` 无脑带上；事务方法里只写数据库操作，远程调用和慢操作挪出去。
+
+遵守这三条，事务会是你转 Java 后端过程中"理解成本最高、日常心智负担最低"的机制：学懂那一个下午很疼，之后每个业务方法只需要想业务，不用再想 begin 和 commit。
+
+番外到这里就真的写完了。正篇 18 篇加这两篇，凑成我从前端转过来时踩过的所有"没有锚点"的概念清单。18 篇结尾说过，框架会变、API 会变，理解两种技术栈设计取舍的能力不会过时——这两篇番外补的正是取舍里最不起眼、又最常绊倒人的两块砖。

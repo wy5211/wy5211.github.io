@@ -80,4 +80,52 @@ Comment: id, content, postId, authorId, parentId, createdAt
 4. 用 Docker 容器化部署 Spring Boot 应用
 5. 具备 Java 后端开发的生产级能力
 
+## 番外篇计划（2026-09-03 补充）
+
+### 背景
+
+作者本人正在系统学习 Spring Boot（前端转全栈），发现包管理是盲区。复查 18 篇正篇后确认两个缺口：依赖管理没有专篇（01 只有一张 package.json ↔ pom.xml 对照表），事务没有专篇（05 篇 JPA 只顺手用了 `@Transactional`，没展开）。补 2 篇番外，seriesOrder 接在 18 之后。
+
+### 与已有内容的关系（重叠检查）
+
+| 已有内容                                             | 番外篇处理                                          |
+| ---------------------------------------------------- | --------------------------------------------------- |
+| 01 篇 package.json ↔ pom.xml 对照表、Initializr 流程 | 19 篇不重复对照表和安装流程，直接讲机制深水区       |
+| 05 篇 JPA 中顺手使用 `@Transactional`                | 20 篇展开原理：传播行为、回滚规则、失效场景         |
+| 08 篇拦截器与 AOP                                    | 20 篇点明"事务就是 AOP 的最大应用"，不重复 AOP 概念 |
+| 16 篇 Docker 依赖缓存（`dependency:go-offline`）     | 19 篇补完其原理（本地仓库），不重复 Docker 内容     |
+| java / redis / docker / devops2 / backend-map 系列   | 无重叠，互不引用                                    |
+
+### 番外 19：Maven 依赖管理：从 package.json 到 pom.xml
+
+- **学习目标**：搞懂"为什么引入依赖不用写版本号"；遇到依赖冲突能自己用 `dependency:tree` 排查
+- **核心问题**："pnpm 有 lockfile 锁版本，Maven 靠什么保证两次构建拿到同一批 jar？"+ "NoClassDefFoundError 一屏，从哪查起？"
+- **主线场景**：CMS 想接入一个新的 Redis starter，结果启动报 Jackson 版本冲突——随排查过程展开全部知识点
+- **内容要点**：
+  - 心智模型迁移：node_modules 扁平化 vs `~/.m2` 本地仓库 + 坐标系统（groupId:artifactId:version）
+  - starter 的本质：打包好的依赖清单；BOM（`spring-boot-dependencies`）的 `dependencyManagement` 如何统一版本号——这就是"不用写版本号"的答案
+  - 依赖仲裁：最短路径优先 → 路径同长先声明者赢；与 npm 版本树策略的差异；Maven 默认没有 lockfile 意味着什么（CI 与本地不一致的风险）
+  - 实战：`mvn dependency:tree` 定位冲突、`<exclusions>`、`<dependencyManagement>` 强制版本
+  - 多模块/父子 POM 一瞥：什么规模才值得拆
+  - Gradle 一段话带过：为什么两派并存，新手选哪个
+- **与前篇关联**：01 篇对照表的机制深入篇；16 篇依赖缓存的原理补完
+
+### 番外 20：事务：一个注解背后的数据一致性
+
+- **学习目标**：说清事务解决什么问题；掌握传播行为常用两档；知道注解失效的三大场景
+- **核心问题**："注册成功但发券失败，为什么用户还是创建了？"——前端世界没有事务对应物，这是转全栈最大的认知补丁之一
+- **主线场景**：CMS 两条业务线——"用户注册送优惠券"、"文章发布 + 标签关联保存"
+- **内容要点**：
+  - 为什么需要事务：半成功状态没人收拾；Express + TypeORM 手动 begin/commit 对照，Spring 用 AOP 代劳了
+  - `@Transactional` 基础：加在 Service 层；默认只回滚 RuntimeException——checked exception 不回滚这个反直觉点
+  - 传播行为只讲常用两档：REQUIRED vs REQUIRES_NEW（操作日志永远要落库的场景）
+  - 失效三坑：自调用（`this` 不走代理）、private 方法、try-catch 吞异常——每个配一个"看似正确却失效"的代码片段
+  - 什么时候不用事务：纯读操作、跨服务的部分（指向 backend-map 归档系列的分布式事务思路，仅文字提及）
+- **与前篇关联**：05 篇 JPA 的 saveAll/关联保存；08 篇 AOP 的最大实际应用
+
+### 番外篇写作规范
+
+沿用正篇规范：Node.js vs Spring Boot 对比表每篇保留；贯穿案例继续用 TechBlog CMS；写作日期 2026-09-03。
+
+_番外计划创建日期：2026-09-03_
 _计划创建日期：2026-03-30_
