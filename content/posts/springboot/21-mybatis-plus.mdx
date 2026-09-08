@@ -1,0 +1,261 @@
+---
+title: "21 MyBatis 与 MyBatis-Plus：把 SQL 拿回手里"
+date: "2026-09-08"
+summary: "正篇只讲了 JPA，但国内公司主流是 MyBatis-Plus。从 mapper 接口绑定、预编译占位符与字符串拼接的注入之分、动态 SQL，到 LambdaQueryWrapper 与分页插件，对照 TypeORM 重走一遍数据访问层。"
+tags: ["Spring Boot", "MyBatis", "MyBatis-Plus", "数据访问"]
+category: "springboot"
+cover: ""
+draft: false
+series: "Spring Boot 实战"
+seriesOrder: 21
+---
+
+番外 20 的结尾我说"番外到这里就真的写完了"。五天后被打脸——我继续往下学，找了个国内开源的 Spring Boot 后台项目读代码，满怀期待地打开 entity 目录，看到的不是 [第 5 篇](/posts/springboot/05-spring-data-jpa) 教的 `@Entity`，是 `@TableName`；Repository 接口也不见了，取而代之的是一个个 Mapper 和满屏的 `LambdaQueryWrapper`。再翻国内 Java 岗的招聘要求，"熟练使用 MyBatis-Plus"出现的频率比 JPA 高一个数量级。
+
+正篇 18 篇的数据访问层全押在 JPA 上，对着国内的现实环境，这是一块没画的地图。所以番外复活，补上这条线。对照物继续用 TypeORM——好消息是，MyBatis 的思路离 TypeORM 比 JPA 离 TypeORM 近得多：如果你学 JPA 时总觉得隔着一层，这篇可能会让你舒服一些。
+
+## 先分清：MyBatis 和 MyBatis-Plus 是两层东西
+
+MyBatis 是 SQL 映射框架：你写 SQL，它负责把参数安全地塞进 SQL、把查询结果装进 Java 对象。它不做对象关系映射——没有实体状态跟踪，没有级联保存，SQL 是什么结果就是什么。
+
+MyBatis-Plus（国内团队的作品，下文简称 MP）是架在 MyBatis 上的增强层，官方口号是"只做增强，不做改变"：通用 CRUD、条件构造器、分页插件这些便利能力都加在 MyBatis 上面，底层的 SQL 映射机制原封不动。
+
+放到 TypeORM 的坐标系里看：MyBatis 是"让你写 SQL 的那一半"，MP 是给这一半补上 find options 和内置分页的那层糖。JPA/Hibernate 则是完全相反的另一半世界——对象优先，SQL 被藏到看不见。
+
+学习顺序因此很明确：先懂 MyBatis 本身（mapper 绑定、参数占位、动态 SQL），再看 MP 的增强。顺序反了，Wrapper 拼不出查询的时候，你会完全不知道底下发生了什么。
+
+## Mapper：接口加一段 SQL，没有实现类
+
+CMS 的文章详情页要按 slug 查文章。JPA 里你声明 `findBySlug`，方法名即查询；MyBatis 里你写一个接口方法，再配一段 SQL：
+
+```java
+@Mapper
+public interface PostMapper {
+    Post selectBySlug(@Param("slug") String slug);
+}
+```
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN"
+        "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.techblog.mapper.PostMapper">
+
+    <select id="selectBySlug" resultType="com.techblog.entity.Post">
+        SELECT id, title, slug, content, status, view_count, created_at
+        FROM posts
+        WHERE slug = #{slug}
+    </select>
+</mapper>
+```
+
+接口没有实现类。MyBatis 启动时扫描 Mapper 接口，按 namespace 找到对应的 XML，把方法和 SQL 绑定——调用方法就是执行 SQL，参数进 `#{slug}` 这个位置，结果集的列按名字装进 Post 的字段（view_count 和 viewCount 的驼峰互转是自动的）。简单查询也可以用注解直接写在接口上，但条件一多就不可读，国内项目的主流是 XML。
+
+第一眼像倒退：TypeORM 里一行 `repo.findOne({ where: { slug } })` 的事，这里要动两个文件加一段 SQL。但这是设计取舍——SQL 就在手边，所见即所得。没有框架替你"猜"着生成 SQL 的环节，查什么字段、走什么索引，全是你自己写的。
+
+## 一个字符之差：预编译占位和字符串拼接
+
+`#{slug}` 在运行时变成 JDBC 的预编译占位符：SQL 先交给数据库解析成执行计划，参数随后单独传入。值永远被当成数据，不可能变成 SQL 语法——这是防 SQL 注入的根基，TypeORM 里 where 传值走的是同一套机制。
+
+`${}` 长得几乎一样，机制完全不同：字符串替换，参数被原样拼进 SQL 文本再执行。
+
+什么时候你会被迫认识这个区别？排序。CMS 列表支持按不同字段排序，前端传 `?sort=viewCount&order=desc`，你很自然地在 XML 里写 `ORDER BY #{sortField}`——跑起来发现排序完全失效，因为占位符传进去的是字符串常量，这条 SQL 等价于按 `'view_count'` 这个常量值排序，结果当然不动。"为什么排序坏了"会比注入更早找上你。
+
+查文档，答案是换成 `${}`。排序生效了，注入也进来了——`sortField` 来自前端，把 `view_count UNION SELECT ...` 这样的内容传进来，就能顺着查询把别的表的数据带出去（JDBC 驱动默认不允许一次执行多条语句，删库那种 payload 跑不了，但拖数据足够了）。正确做法不是背"哪里能用哪个"，而是收敛成一条规则：**表名、列名、排序方向这类 SQL 结构的一部分，永远不从参数直接来**——后端做白名单映射：
+
+```java
+private static final Map<String, String> SORTABLE = Map.of(
+    "viewCount", "view_count",
+    "createdAt", "created_at",
+    "title", "title"
+);
+
+String column = SORTABLE.getOrDefault(request.sort(), "created_at");
+String direction = "asc".equalsIgnoreCase(request.order()) ? "ASC" : "DESC";
+```
+
+不在白名单里的字段落到默认值，方向是二选一的常量，拼上去没有风险。TypeORM 用户对这套应该眼熟——QueryBuilder 的 `.orderBy("post.createdAt", "DESC")` 里，字段名也是你在代码里写死的字符串，方向是框架枚举校验过的参数。结构参数白名单、数据参数预编译，两边是同一条原则。
+
+## 动态 SQL：XML 里的条件渲染
+
+文章列表的筛选条件是变化的：可能只按状态筛，可能状态加关键词，可能什么都不传。一条写死的 SQL 满足不了，MyBatis 的答案是 XML 标签：
+
+```xml
+<select id="selectByCondition" resultType="com.techblog.entity.Post">
+    SELECT id, title, slug, status, view_count, created_at
+    FROM posts
+    <where>
+        <if test="status != null">
+            AND status = #{status}
+        </if>
+        <if test="keyword != null and keyword != ''">
+            AND title LIKE CONCAT('%', #{keyword}, '%')
+        </if>
+        <if test="tagId != null">
+            AND id IN (SELECT post_id FROM post_tags WHERE tag_id = #{tagId})
+        </if>
+    </where>
+    ORDER BY created_at DESC
+</select>
+```
+
+where 标签负责收拾残局：条件全空时整个 WHERE 子句不出现，有条件时自动吃掉开头多余的 AND。if 标签就是字面意思——test 成立才把这段 SQL 渲染进去。
+
+对照 TypeORM：find options 的 where 对象里只放有值的字段、QueryBuilder 里 if 套 addAndWhere，做的是同一件事，只是载体不同——TypeORM 用宿主语言的 if，MyBatis 把 XML 当模板引擎。写过 JSX 的话这里的 Mental model 是现成的：数据决定最终渲染出的 SQL 长什么样。还有一组 choose/when 标签做互斥分支、foreach 标签把集合展开成 IN 列表（对应 TypeORM 的 `In()` 操作符），遇到再查文档，心智模型不变。
+
+## MyBatis-Plus：把通用 CRUD 加回来
+
+纯 MyBatis 有个明显的痛：每个实体都要手写一遍 selectById、insert、update——这些 SQL 闭着眼都能写，但纯体力劳动。MP 把这部分自动化了。
+
+引入依赖，第一个坑就来了：
+
+```xml
+<dependency>
+    <groupId>com.baomidou</groupId>
+    <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+    <version>3.5.7</version>
+</dependency>
+```
+
+两件事值得停一下。其一，Spring Boot 3 必须用带 spring-boot3 后缀的这个 starter——网上大量老教程写的是给 Boot 2 的 `mybatis-plus-boot-starter`，配 Boot 3 启动直接报错，这是 MP 新人榜上有名的坑。其二，version 标签必须写：[番外 19](/posts/springboot/19-maven-dependency-management) 讲过 Spring Boot BOM 统一管了一批依赖的版本，MP 不在其中，版本号自己写、升级自己盯。
+
+实体的映射注解和 JPA 一一对应，换个包名而已：
+
+```java
+@TableName("posts")
+public class Post {
+
+    @TableId(type = IdType.AUTO)
+    private Long id;
+
+    private String title;
+    private String slug;
+
+    private Integer viewCount;   // 驼峰转下划线默认开启，不用注解
+}
+```
+
+Mapper 这边：
+
+```java
+@Mapper
+public interface PostMapper extends BaseMapper<Post> {
+    // 什么也不用写
+}
+```
+
+继承 BaseMapper，insert、deleteById、updateById、selectById、selectList、selectCount……十几个通用方法直接可用，不需要 XML。对照正篇第 5 篇：JPA 给的是"方法名查询"，靠命名约定生成 SQL；MP 的方向相反——简单 CRUD 全部预置，复杂条件用 Wrapper 在调用处构造。之前手写的 XML mapper 也依然有效，两套在同一项目里共存，这正是"只做增强"的含义。
+
+MP 还有 IService/ServiceImpl 这层对 Service 的封装（批量保存之类的便利方法），是可选项——直接用 BaseMapper 完全能干活，知道存在即可。
+
+## LambdaQueryWrapper：find options 的既视感
+
+后台文章列表：状态筛选加标题关键词，创建时间倒序。MP 的写法：
+
+```java
+LambdaQueryWrapper<Post> wrapper = new LambdaQueryWrapper<Post>()
+        .eq(Post::getStatus, PostStatus.PUBLISHED)
+        .like(Post::getTitle, keyword)
+        .orderByDesc(Post::getCreatedAt);
+
+List<Post> posts = postMapper.selectList(wrapper);
+```
+
+对照 TypeORM：
+
+```typescript
+const posts = await postRepository.find({
+  where: { status: "PUBLISHED", title: Like(`%${keyword}%`) },
+  order: { createdAt: "DESC" },
+});
+```
+
+结构上是同一件事：用代码描述条件，框架生成 SQL。一个值得表扬的细节是方法引用 `Post::getTitle`——字段名是编译期检查的，实体改名时 IDE 直接标红；TypeORM 的 `"createdAt"` 是字符串，拼错了要等运行时才炸。这一点上 MP 甚至比 TypeORM 走得远，倒有几分正篇第 5 篇提过的 Prisma 那种类型安全的味道。
+
+动态条件（status 可能不传）也有对应物——每个条件方法都有带布尔开关的重载：
+
+```java
+LambdaQueryWrapper<Post> wrapper = new LambdaQueryWrapper<Post>()
+        .eq(status != null, Post::getStatus, status)
+        .like(keyword != null && !keyword.isBlank(), Post::getTitle, keyword)
+        .orderByDesc(Post::getCreatedAt);
+```
+
+第一个参数为 false 时整个条件跳过——上一节 XML 里的 if 标签，到了 Java 里就是一个布尔表达式。条件简单时这比 XML 舒服得多；条件之间有依赖（"关键词搜标题或正文"要 or 嵌套）时，两边都开始变丑，各有各的忍耐边界。
+
+## 分页：一个不配就不生效的插件
+
+分页是 MP 用插件机制实现的，也是新人必踩的第二个坑。先配拦截器：
+
+```java
+@Configuration
+public class MybatisPlusConfig {
+
+    @Bean
+    public MybatisPlusInterceptor mybatisPlusInterceptor() {
+        MybatisPlusInterceptor interceptor = new MybatisPlusInterceptor();
+        interceptor.addInnerInterceptor(new PaginationInnerInterceptor(DbType.MYSQL));
+        return interceptor;
+    }
+}
+```
+
+然后用 Page 对象：
+
+```java
+Page<Post> page = postMapper.selectPage(new Page<>(pageNo, pageSize), wrapper);
+long total = page.getTotal();
+List<Post> records = page.getRecords();
+```
+
+顺带一提，MP 的 Page 第 1 页就是 1——正篇第 5 篇里 JPA 的 `PageRequest.of` 从 0 开始、要手动减一的那次转换，这里反而不需要了，同一个生态里两套约定。
+
+坑在于：不配上面那个拦截器 Bean，selectPage 不报错——SQL 原样执行，没有 LIMIT，全表数据进 records，total 也不可靠。开发环境几百条数据看起来一切正常，上了生产数据量一大，接口直接拖死。机制上这是 MyBatis 的 Interceptor：插件拦下待执行的 SQL，物理改写成 LIMIT 加 offset，再补发一条 COUNT。TypeORM 的 skip/take 是框架内置功能，MP 把它做成默认关闭的可选组件。
+
+"不报错但行为不对"是我对 MyBatis 生态最深的印象，和 [番外 20](/posts/springboot/20-transaction-data-consistency) 的事务失效三坑是同一家族：配置对了才生效，配错了没人提醒你。
+
+## Wrapper 的边界：回到手写 SQL 的时刻
+
+CMS 要加一个标签看板：每个标签下的文章数、总浏览量。这种联表加 GROUP BY 的聚合，Wrapper 理论上能拼（它有 groupBy），但拼出来返回的是 Map 或者要专门建 VO，联表超过一张后几乎不可读。这就是回到 XML 手写 SQL 的时刻：
+
+```xml
+<select id="selectTagStats" resultType="com.techblog.dto.TagStat">
+    SELECT t.id, t.name,
+           COUNT(pt.post_id) AS postCount,
+           COALESCE(SUM(p.view_count), 0) AS totalViews
+    FROM tags t
+    LEFT JOIN post_tags pt ON pt.tag_id = t.id
+    LEFT JOIN posts p ON p.id = pt.post_id AND p.status = 'PUBLISHED'
+    GROUP BY t.id, t.name
+</select>
+```
+
+这条 SQL 写出来，索引怎么加、执行计划什么样，全在你眼皮底下。你在 TypeORM 里做过同样的事——[用 QueryBuilder 拼 Dashboard 聚合查询](/posts/typeorm/05-query-builder)，最后写到 `addSelect("COUNT(...)", "cnt")` 那个程度，本质上已经是换种语法写 SQL 了。MyBatis 只是承认了这个终点：复杂查询就是 SQL，别用构造器模拟它。
+
+所以真实的工程面貌是混用：单表 CRUD 和条件查询用 BaseMapper 加 Wrapper，占日常代码的大头；联表、聚合、报表回 XML 手写。至于逻辑删除（`@TableLogic`，delete 自动变 UPDATE）、乐观锁（`@Version`）、字段自动填充（MetaObjectHandler 填 createdAt），都是注解一开就能用的开关，记住名字，用到再查。
+
+## 三条路线对照
+
+| 维度       | TypeORM               | Spring Data JPA            | MyBatis-Plus          |
+| ---------- | --------------------- | -------------------------- | --------------------- |
+| 心智模型   | 对象优先，可退回 SQL  | 对象优先，SQL 尽量藏       | SQL 优先，CRUD 是补丁 |
+| 通用 CRUD  | Repository find/save  | JpaRepository 内置         | BaseMapper 内置       |
+| 动态条件   | where 对象 / addWhere | 方法名查询 / Specification | Wrapper / XML if 标签 |
+| 分页       | skip/take 内置        | Pageable 内置              | 插件，不配不生效      |
+| 复杂查询   | QueryBuilder          | JPQL / 原生 SQL            | 手写 SQL（本职）      |
+| 类型安全   | 字符串字段名          | 编译期                     | 方法引用，编译期      |
+| SQL 可控性 | 中                    | 低（Hibernate 生成）       | 高                    |
+
+这张表没有"哪个好"的答案，只有"团队信任谁"的答案——信任框架生成 SQL 的团队选前两列，信任自己 SQL 功底的团队选第三列。国内大量业务系统是列表页和报表驱动的，第三列的胜出有现实土壤。
+
+## 什么时候选哪条路线
+
+给和当时的我一样的转型者一个结论版本。
+
+求职导向看目标市场：进国内公司，MP 是必修、JPA 是选修——这个优先级在海外语境里正好反过来。好在两者概念上大半重叠（实体映射、事务、分页），迁移成本远小于第一眼的陌生感，真正的增量就是这篇的内容。
+
+学习顺序上，MyBatis 先、MP 后。占位符和拼接、动态 SQL 这层不懂，Wrapper 就只是背 API；懂了，MP 半天就能上手，剩下的都是查文档的事。
+
+最后别把 Wrapper 当信仰。它的舒适区是单表。团队里"明明该手写 SQL 却硬用 Wrapper 拼出三十行链式调用"的代码，和当年 Express 里硬用 ORM 拼复杂 JOIN 的代码，是同一种病——工具给了你退路，就用它。
+
+番外 20 说"番外到这里就真的写完了"，这篇证明那是句 flag。学习还在继续，下一个盲区可能是多模块工程，也可能是缓存一致性——按番外的老规矩，等我真的撞上那个坑，再来补下一篇。

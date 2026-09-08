@@ -94,6 +94,9 @@ Comment: id, content, postId, authorId, parentId, createdAt
 | 05 篇 JPA 中顺手使用 `@Transactional`                | 20 篇展开原理：传播行为、回滚规则、失效场景         |
 | 08 篇拦截器与 AOP                                    | 20 篇点明"事务就是 AOP 的最大应用"，不重复 AOP 概念 |
 | 16 篇 Docker 依赖缓存（`dependency:go-offline`）     | 19 篇补完其原理（本地仓库），不重复 Docker 内容     |
+| 05 篇 JPA 全面讲解（Repository、方法名查询）         | 21 篇只把 JPA 当对照物，聚焦 MyBatis/MP 自身机制    |
+| 19 篇 BOM 与版本管理                                 | 21 篇引用其结论：MP 不在 BOM，需显式写版本号        |
+| typeorm 系列 05 QueryBuilder                         | 21 篇互链作 Node.js 对照（Dashboard 聚合场景）      |
 | java / redis / docker / devops2 / backend-map 系列   | 无重叠，互不引用                                    |
 
 ### 番外 19：Maven 依赖管理：从 package.json 到 pom.xml
@@ -122,6 +125,24 @@ Comment: id, content, postId, authorId, parentId, createdAt
   - 失效三坑：自调用（`this` 不走代理）、private 方法、try-catch 吞异常——每个配一个"看似正确却失效"的代码片段
   - 什么时候不用事务：纯读操作、跨服务的部分（指向 backend-map 归档系列的分布式事务思路，仅文字提及）
 - **与前篇关联**：05 篇 JPA 的 saveAll/关联保存；08 篇 AOP 的最大实际应用
+
+### 番外 21：MyBatis 与 MyBatis-Plus：把 SQL 拿回手里
+
+- **学习目标**：分清 MyBatis 与 MP 两层；掌握 mapper 接口绑定、预编译占位与字符串拼接之分、动态 SQL；会用 BaseMapper / LambdaQueryWrapper / 分页插件；知道什么时候回到手写 SQL
+- **核心问题**："正篇只学了 JPA，国内公司全在用 MyBatis-Plus，怎么快速建立对照？"+ "Wrapper 拼不出来的查询怎么办？"
+- **主线场景**：CMS 后台文章管理列表（多条件筛选 + 排序 + 分页）与标签看板（联表聚合）
+- **内容要点**：
+  - mapper 接口与 XML 的绑定机制，对照 Repository / QueryBuilder
+  - 预编译占位符 vs 字符串拼接：ORDER BY 排序失效引出注入场景，白名单对策
+  - 动态 SQL 的 where/if 标签，对照 find options 的条件对象；foreach 对应 In()
+  - MP 依赖两个坑：Spring Boot 3 要用 spring-boot3 starter；不在 BOM 要显式版本号
+  - BaseMapper + 实体注解（@TableName/@TableId 对照 @Entity/@Id）；IService 一句带过
+  - LambdaQueryWrapper 对照 TypeORM find options；方法引用的编译期类型安全
+  - 分页插件不配拦截器不报错但查全表的坑；Page 从 1 开始（对照 JPA PageRequest 从 0）
+  - Wrapper 边界：联表聚合回 XML 手写 SQL，互链 typeorm 05 的 Dashboard 场景
+  - 逻辑删除 / 乐观锁 / 自动填充一句带过
+- **与前篇关联**：05 篇 JPA 的镜像篇；19 篇 BOM 结论的应用；20 篇"不报错的失效"家族的延续
+- **写作日期**：2026-09-08
 
 ### 番外篇写作规范
 
