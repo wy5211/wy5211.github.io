@@ -1,0 +1,107 @@
+---
+title: "21 动手篇：用 Python 画出你城市的十年空气曲线"
+date: "2026-10-19"
+summary: "系列里所有图表的绘图代码：清洗历史浓度数据、画年均曲线加三条标准参考线、做月度热力图。数据口径的坑比代码多。"
+tags: ["Python", "数据分析", "空气质量", "数据可视化"]
+category: "air-quality"
+cover: ""
+draft: false
+series: "呼吸这笔账"
+seriesOrder: 21
+---
+
+前 20 篇里出现的图——十年曲线、日历热力图、四象限散点——都是我自己画的。这一篇把方法交出来：拿你老家或者候选城市的浓度数据，六十行代码画出和第 11 篇同款的图。
+
+先说结论给打算跳过代码的读者：这一篇真正的产出不是图，是画图过程中被迫做的那些口径检查。哪些数字和哪些数字能画在一张图里，比怎么画重要得多。
+
+## 数据从哪来
+
+三个来源按省事程度排：
+
+1. **真气网之类的历史数据页面**：城市逐月数据齐全，网页可以整理成表格导出，最省事
+2. **生态环境部每月的全国城市空气质量报告**：官方口径，PDF 需要自己整理成 CSV，适合追求权威的
+3. **IQAir 年报**：全球城市年均值，适合做跨城市对比，粒度到年
+
+把任一来源的数据整理成一个最简单的 CSV：两列，日期和 PM2.5 浓度（微克每立方米），存成 `hangzhou.csv`。下面全部基于它。
+
+## 清洗和聚合：三级口径
+
+拿到手的数据多半是日均或月均值。先统一成时间序列，再按需聚合。这段代码做了三件事：读入、解析日期、把日均聚合成年均——小时到日、日到年，每一步聚合都是一次口径转换，后面会讲为什么要在意。
+
+```python
+import pandas as pd
+
+df = pd.read_csv("hangzhou.csv", parse_dates=["date"])
+df = df.set_index("date").sort_index()
+
+# 日均 → 年均：每年一个点
+yearly = df["pm25"].resample("YE").mean()
+
+# 基础质检：看看哪些年份缺数据，缺超过两个月的年份别直接用
+missing = df["pm25"].resample("YE").apply(lambda s: s.isna().sum())
+print(missing)
+```
+
+`resample` 是这段代码的主角：`"YE"` 按年聚合，换成 `"ME"` 得到月均，换成 `"D"` 得到日均。质检那两行别省——某年如果只统计了半年，年均值会假性偏高，直接画进图里就是一条误导性曲线。
+
+## 十年曲线加三条参考线
+
+第 3 篇那张「同一片天空三把尺子」的图，核心就是均值曲线加国标、美标、WHO 三条横线。城市年均落在哪两条线之间，一眼定档位。
+
+```python
+import matplotlib.pyplot as plt
+
+plt.rcParams["font.sans-serif"] = ["PingFang SC", "Microsoft YaHei"]
+
+fig, ax = plt.subplots(figsize=(10, 5))
+ax.plot(yearly.index.year, yearly.values, marker="o", label="杭州 PM2.5 年均")
+
+for level, name in [(35, "国标年均 35"), (9, "美标年均 9"), (5, "WHO 指导值 5")]:
+    ax.axhline(level, linestyle="--", linewidth=1)
+    ax.text(yearly.index.year[0], level, " " + name, va="bottom", fontsize=9)
+
+ax.set_ylabel("微克每立方米")
+ax.legend()
+plt.tight_layout()
+plt.savefig("ten-year.png", dpi=150)
+```
+
+`axhline` 画横线，三条线把图分成四个档位区。你所在城市的曲线尾部落点，比任何「空气质量排名」的新闻标题都直观：落在 35 线之上是超标区，35 到 9 之间是国标达标但未达美标，9 以下是全球一线水平。
+
+## 月度热力图：看见一年的节律
+
+第 10 篇那张「课程表」式的图，原理是把数据透成年×月的矩阵再上色。PM2.5 和臭氧各画一张，叠着看就是一座城市的污染日历。
+
+```python
+monthly = df["pm25"].resample("ME").mean()
+matrix = monthly.to_frame("value")
+matrix["year"] = matrix.index.year
+matrix["month"] = matrix.index.month
+pivot = matrix.pivot(index="year", columns="month", values="value")
+
+fig, ax = plt.subplots(figsize=(10, 5))
+im = ax.imshow(pivot.values, aspect="auto", cmap="YlOrRd")
+ax.set_xticks(range(12), [f"{m}月" for m in range(1, 13)])
+ax.set_yticks(range(len(pivot.index)), pivot.index)
+fig.colorbar(im, label="微克每立方米")
+plt.tight_layout()
+plt.savefig("calendar.png", dpi=150)
+```
+
+看图方法回到第 10 篇的结论：找两块红色区域——冬天那块是 PM2.5 的，夏天单独给臭氧再画一张，红色会换个位置。两张图并排贴墙上，比任何记忆都诚实。
+
+## 比代码更重要的四个坑
+
+**口径一：站点还是城市。** 同一「杭州」，千岛湖站和城北站的年均能差出好几微克。官方的城市均值是全城国控站的平均，第三方 App 可能默认给你最近的站点。画长期趋势用城市均值，别混。
+
+**口径二：统计范围变了。** 第 11 篇提过，全国排名从 74 城扩到 168 城再到三百多城——同一份「全国平均」，分母换了三次。跨年对比先确认口径没换，换了就分段画。
+
+**口径三：单位。** 臭氧在欧洲和美国的资料里常用 ppb，国标用微克每立方米，直接画进一张图等于把公里和英里加在一起。换算系数查标准文本，别抄二手帖。
+
+**口径四：来源别混用。** 官方报告、第三方聚合、海外机构的数值各有系统偏差（站点选择、聚合方法不同）。一张图里只用一个来源，跨来源的对比分开画、标清出处。这一条对所有数据活都成立，统计上的门道在「数据素养」系列里讲得更细。
+
+## 收工：这笔账的答案
+
+代码交完，系列收工。回到第 1 篇我妈那句「今天雾真大」——这个系列走完 21 篇之后，我们家发生的实际变化是：知道看湿度分辨雾和霾，手机里留了浓度和指数两个 App，卧室净化器灰季常开，孩子自己会看冰箱上的色块决定放学去哪，明年寒假全家准备去海南躲峰。搬家的选项算过账后搁置了——不是杭州完美，是四象限算下来它对我们的家庭仍是总分最高的那格。
+
+这就是呼吸这笔账在我这里的结果。你的账本数字会不一样，但算法是通用的，全在这 21 篇里。
