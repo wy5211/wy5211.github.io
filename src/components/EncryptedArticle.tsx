@@ -44,6 +44,14 @@ export default function EncryptedArticle({ encrypted }: EncryptedArticleProps) {
     }
   }, [data]);
 
+  // 切换文章（如点击下一篇）时立即回到页面顶部：
+  // html 的 scroll-behavior: smooth 会把 Next.js Link 自带的置顶变成平滑动画，
+  // 动画又被换页时的 DOM 变化打断而停在半路，这里显式瞬时置顶兜底。
+  // page.tsx 已用 key 按 slug 强制重挂载，本 effect 每篇文章只跑一次
+  useEffect(() => {
+    window.scrollTo({ top: 0, left: 0, behavior: "instant" });
+  }, []);
+
   // 未解锁 / 解密中：返回 null，由 PasswordGate 的全屏 overlay 覆盖
   if (!data) return null;
 
